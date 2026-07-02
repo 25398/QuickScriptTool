@@ -56,7 +56,16 @@ std::wstring TrimToken(const std::wstring& text) {
     return text.substr(start, end - start);
 }
 
-std::wstring ResolveConditionOperand(const std::wstring& token, const MacroVariableContext& ctx) {
+}  // namespace
+
+bool TryParseDouble(const std::wstring& text, double& out) {
+    if (text.empty()) return false;
+    wchar_t* end = nullptr;
+    out = wcstod(text.c_str(), &end);
+    return end != text.c_str() && *end == L'\0';
+}
+
+std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableContext& ctx) {
     std::wstring t = TrimToken(token);
     if (t.empty()) return L"";
 
@@ -85,15 +94,14 @@ std::wstring ResolveConditionOperand(const std::wstring& token, const MacroVaria
         }
     }
 
+    // Plain numeric literal: return as-is rather than mangling via {…} resolution
+    double unused;
+    if (TryParseDouble(t, unused)) return t;
+
     return ResolveMacroVariables(L"{" + t + L"}", ctx);
 }
 
-bool TryParseDouble(const std::wstring& text, double& out) {
-    if (text.empty()) return false;
-    wchar_t* end = nullptr;
-    out = wcstod(text.c_str(), &end);
-    return end != text.c_str() && *end == L'\0';
-}
+namespace {
 
 int CompareResolvedValues(const std::wstring& left, const std::wstring& right) {
     double lNum = 0.0, rNum = 0.0;
@@ -118,8 +126,8 @@ bool EvalSingleClause(const std::wstring& clause, const MacroVariableContext& ct
         if (pos == std::wstring::npos) continue;
         const std::wstring left = TrimToken(c.substr(0, pos));
         const std::wstring right = TrimToken(c.substr(pos + op.len));
-        const std::wstring lVal = ResolveConditionOperand(left, ctx);
-        const std::wstring rVal = ResolveConditionOperand(right, ctx);
+        const std::wstring lVal = ResolveMacroOperand(left, ctx);
+        const std::wstring rVal = ResolveMacroOperand(right, ctx);
         if (wcscmp(op.op, L">>") == 0) {
             return lVal.find(rVal) != std::wstring::npos;
         }
@@ -175,6 +183,21 @@ std::vector<ConditionPart> ParseConditionParts(const std::wstring& expr) {
 
 }  // namespace
 
+bool TryResolveIntOperand(const std::wstring& token, const MacroVariableContext& ctx, int& out) {
+    double num = 0.0;
+    if (!TryParseDouble(ResolveMacroOperand(token, ctx), num)) return false;
+    out = static_cast<int>(num);
+    return true;
+}
+
+int ResolveLoopMaxCount(const ScriptAction& action, const MacroVariableContext& ctx) {
+    if (!action.loopFromVar) return action.loopCount;
+    if (action.loopVarExpr.empty()) return 0;
+    int maxLoop = 0;
+    if (!TryResolveIntOperand(action.loopVarExpr, ctx, maxLoop)) return 0;
+    return maxLoop;
+}
+
 std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptAction>& actions) {
     std::vector<QuickInputVarItem> items;
     std::unordered_set<std::wstring> seen;
@@ -208,6 +231,7 @@ std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariable
     if (text.find(L'{') == std::wstring::npos) return text;
 
     std::wstring result = text;
+    result.reserve(text.size() * 2);  // 预分配空间，减少变量展开时的多次重新分配
     size_t pos = 0;
     while ((pos = result.find(L'{', pos)) != std::wstring::npos) {
         const size_t end = result.find(L'}', pos);

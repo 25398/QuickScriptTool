@@ -38,6 +38,7 @@ ScreenshotOverlay::~ScreenshotOverlay() {
 void ScreenshotOverlay::Show(std::function<void(RECT)> onConfirm) {
     onConfirm_ = std::move(onConfirm);
     resultCancelled_ = false;
+    pendingCancel_ = false;
     if (!classRegistered_) RegisterWindowClass();
 
     CaptureVirtualScreen();
@@ -279,9 +280,21 @@ LRESULT ScreenshotOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN: {
         resultCancelled_ = true;
-        ReleaseCapture();
-        ShowWindow(hwnd_, SW_HIDE);
-        PostQuitMessage(0);
+        pendingCancel_ = true;
+        SetCapture(hwnd_);  // grab all mouse input so the pending UP doesn't leak
+        // Move off-screen to give the user instant visual feedback that it’s closing,
+        // while keeping the HWND alive to swallow the upcoming button-up.
+        SetWindowPos(hwnd_, HWND_TOPMOST, -10000, -10000, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        return 0;
+    }
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP: {
+        if (pendingCancel_) {
+            pendingCancel_ = false;
+            ReleaseCapture();
+            ShowWindow(hwnd_, SW_HIDE);
+            PostQuitMessage(0);
+        }
         return 0;
     }
 

@@ -1,0 +1,236 @@
+================================================================================
+CODE PATTERN ANALYSIS REPORT
+Generated: 2026-07-02
+Scope: d:\other\software\src\
+================================================================================
+
+================================================================================
+1. DUPLICATED BORDER-RECTANGLE DRAWING PATTERN
+   (CreatePen(PS_SOLID, 1, ...) + Rectangle(hdc, ...))
+================================================================================
+
+This pattern appears 16 times across 4 files. The canonical form is:
+
+  HPEN pen = CreatePen(PS_SOLID, 1, color);
+  HGDIOBJ oldPen = SelectObject(hdc, pen);
+  HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+  Rectangle(hdc, left, top, right, bottom);
+  SelectObject(hdc, oldBrush);
+  SelectObject(hdc, oldPen);
+  DeleteObject(pen);
+
+INSTANCES:
+
+File: main_window.h
+  Line 3435-3441  - Dialog "自定义连点间隔" edit box border (kComboBorderGray)
+  Line 3458-3474  - Dialog "确定"/"取消" button outline (kMainGreen)
+  Line 3669-3675  - Dialog "重命名" edit box border (kComboBorderGray)
+  Line 3689-3705  - Dialog "重命名" button outline (kMainGreen)
+  Line 5930-5936  - DeleteConfirm dialog outer border (RGB(70,70,70))
+  Line 5947-5953  - DeleteConfirm cancel button border (RGB(255,205,95))
+
+  *** CRITICAL DUPLICATION ***
+  The two dialog WM_PAINT handlers at lines 3423-3479 and 3657-3711 are
+  NEAR-IDENTICAL CLONES (one for "自定义连点间隔", one for "重命名").
+  They differ ONLY in:
+    - Title text (L"自定义连点间隔" vs L"重命名")
+    - Body layout (the rename dialog has an edit field; the interval
+      dialog has a "秒" label)
+    - The rename dialog calls SetWindowTextW on st->edit
+  Everything else (green title bar, white body, cancel/ok buttons,
+  fonts, close "x") is duplicated verbatim.
+
+File: editor_paint.cpp
+  Line 129-135   - ClickerIntervalPopup border (kComboPopupBorderGray)
+  Line 182-188   - DrawEditorCombo border (dynamic borderColor)
+  Line 200-206   - PaintEditorDropPopupContent border (kComboPopupBorderGray)
+  Line 286-292   - PaintEditorTipPopupContent border (kComboPopupBorderGray)
+  Line 317-322   - PaintEditor top separator line (kLineGreen, uses
+                    MoveToEx/LineTo instead of Rectangle but same
+                    pen init/cleanup pattern)
+  Line 358-364   - DrawEditorFieldBorder (kLineGreen)
+
+File: match_overlay.cpp
+  Line 286-293   - Status bar border (RGB(120,100,40))
+  Line 360-367   - Magnifier frame border (RGB(80,80,80))
+
+File: screenshot_overlay.cpp
+  Line 586-592   - Selection rectangle border (kBorderColor, width 2)
+
+File: popup_combo.cpp
+  Line 63-69     - Combo subclass WM_NCPAINT (kComboBorderGray)
+
+
+================================================================================
+2. REPEATED "RepeatInfo" PATTERN
+   (.clickCount + .duration + .randomDuration used together)
+================================================================================
+
+The three struct fields appear together in 3 distinct contexts:
+
+CONTEXT A: Write action from UI → ScriptAction struct
+  File: main_window.h
+    Line 1354-1355 - Wait:        duration + randomDuration
+    Line 1355      - MouseClick:  clickCount + duration + randomDuration
+    Line 1386      - KeyClick:    clickCount + duration + randomDuration
+
+CONTEXT B: Read action from ScriptAction → populate UI fields
+  File: main_window.h
+    Line 1443      - Wait:        duration + randomDuration (via F3())
+    Line 1445      - MouseClick:  clickCount + duration + randomDuration (via F3())
+    Line 1472      - KeyClick:    clickCount + duration + randomDuration (via F3())
+
+CONTEXT C: Execution loop (sleep per repeat iteration)
+  File: main_window.h
+    Line 4136      - Wait:        Sleep(a.duration + RandomDelay(a.randomDuration))
+    Line 4149      - MouseClick:  for(i < a.clickCount)
+                                    Sleep(a.duration + RandomDelay(a.randomDuration))
+    Line 4160      - KeyClick:    same pattern
+    Line 4161      - HotkeyShortcut: same pattern
+    Line 4162      - QuickInput:     same pattern
+    Line 4163-4164 - ScrollWheel:    same pattern
+    Line 4230-4231 - MousePlayback:  same pattern
+
+  *** 7 action types share the identical loop pattern ***
+  All at lines 4128-4232 could be unified into a generic executor.
+
+CONTEXT D: RepeatInfo() formatter in action_utils.cpp
+  File: action_utils.cpp
+    Line 28-31  - RepeatInfo():  [重复N次等待X.XXX+随机Y.YYY秒]
+    Line 77-78  - Wait display:  same fields formatted differently
+
+
+================================================================================
+3. GetText → Trim → Comparison/Assignment Pattern
+================================================================================
+
+INSTANCES:
+
+File: main_window.h
+  Line 861    - Trim(GetText(name_))        → compared with script.name (868)
+  Line 994-997- Trim(GetText(ifValueEdit_)) → Trim(current).empty() check
+  Line 1359   - Trim(GetText(mousePlaybackCombo_)) → action.mousePlaybackName
+  Line 1369   - Trim(GetText(runMacroCombo_))     → action.runMacroName
+  Line 1407   - Trim(GetText(defineBlockName_))   → action.blockName
+  Line 1408   - Trim(GetText(runBlockCombo_))     → action.blockName
+  Line 1425   - Trim(GetText(findMatchVar_))      → action.matchVarName
+
+File: utils.cpp
+  Line 85-86  - Trim(GetText(edit)) → text.empty() → std::stoi  (ToInt)
+  Line 94-95  - Trim(GetText(edit)) → text.empty() → std::stod  (ToDouble)
+
+  *** ToInt/ToDouble already encapsulate Trim(GetText(...)) for numeric
+      fields, but string fields (blockName, matchVarName, combo selections)
+      all repeat the raw Trim(GetText(...)) pattern inline (7 times). ***
+
+
+================================================================================
+4. DUPLICATED COMBO-REFRESH FUNCTIONS
+================================================================================
+
+Three functions share an identical structure:
+
+  RefreshRunBlockCombo()      - main_window.h:834-856
+  RefreshRunMacroCombo()      - main_window.h:858-885
+  RefreshMousePlaybackCombo() - main_window.h:887-912
+
+SHARED TEMPLATE:
+  1. Guard: check if the combo HWND exists
+  2. Save: get current selection text (popup or GetText(combo_))
+  3. Clear: items.clear() (and paths.clear() where applicable)
+  4. Repopulate: iterate data source, skip self-named (Macros only)
+  5. Find: locate previous text in new items, or select index 0
+  6. Update: SetText(combo_, selected or L"")
+
+DIFFERENCES:
+  - Data source:  actions_ vs scripts_ vs recordings_
+  - Field:        blockName vs name vs name
+  - paths array:  none vs runMacroPaths_ vs mousePlaybackPaths_
+  - Self-skip:    no vs yes (script.name == currentName) vs no
+
+CALL SITES for RefreshRunBlockCombo (10 total):
+  Line 726, 775, 1133, 1462, 1492, 1898, 2160, 4556, 4694, 5265
+
+CALL SITES for RefreshRunMacroCombo (3 total):
+  Line 774, 1462, 5267
+
+
+================================================================================
+5. POTENTIAL GDI RESOURCE LEAKS
+   (CreateSolidBrush without DeleteObject in same scope)
+================================================================================
+
+RESULT: NO ACTUAL LEAKS FOUND.
+
+Every CreateSolidBrush and CreatePen call in the codebase has a
+corresponding DeleteObject. Specifically verified:
+
+  main_window.h:186-187  → deleted in Cleanup() at line 5974
+  main_window.h:5668     → green, white, panel deleted at line 5691
+  hotkey_dialog.cpp:85-88 → member brushes deleted in destructor (131-134)
+  drawing.cpp:15, 34     → deleted at lines 18, 39-40
+  screenshot_overlay.cpp:337, 526, 595, 636, 653, 665, 677 → all deleted
+  match_overlay.cpp:281  → barBrush deleted at 283
+  popup_combo.cpp:13, 20, 60, 63 → all deleted in same function
+
+MINOR INCONSISTENCY (not a leak):
+  File: screenshot_overlay.cpp, line 656
+    SelectObject(hdc, GetStockObject(NULL_PEN)) — the NULL_PEN is left
+    selected when DrawToolbar returns. This is harmless since NULL_PEN
+    is a stock object (no DeleteObject needed), but it is inconsistent
+    with the rest of the codebase which always saves/restores pens.
+
+  File: main_window.h, line 4927
+    SelectObject(hdc, GetStockObject(NULL_BRUSH)) overrides the active
+    brush inside iconType==1 branch, then oldBrush is restored at 4943.
+    Correct, but unusual pattern (overriding a selected brush mid-function).
+
+
+================================================================================
+6. F3() AND std::to_wstring PATTERNS
+================================================================================
+
+F3 FUNCTION DEFINITION:
+  utils.h:40          - std::wstring F3(double value);
+  utils.cpp:101-105   - formats double to 3 decimal places:
+                          std::fixed << std::setprecision(3)
+
+USAGE (all correct — F3 always called as a function with (arguments)):
+  main_window.h:
+    Lines 1443, 1445, 1457-1458, 1472, 1477-1478, 1484, 1486-1487,
+    1500-1501, 1512-1513
+    → F3(action.duration), F3(action.randomDuration), etc.
+
+  action_utils.cpp:
+    Lines 30-31, 77-78, 121
+    → F3(action.duration), F3(action.imageScaleMin), etc.
+
+NO COLLISIONS: F3() is never confused with keyboard VK_F3. The VK_F1
+through VK_F24 constants in utils.cpp:744 are Windows virtual key codes,
+completely unrelated to the formatting function.
+
+std::to_wstring usage is also clean — used 40+ times for integer-to-
+string conversion in SetText calls, with no collisions.
+
+
+================================================================================
+7. BUGS: Assignment-in-Condition and Logical Operator Issues
+================================================================================
+
+ASSIGNMENT-IN-CONDITION (if (a = b)):
+  No matches found. The grep for if\s*\(\s*\w+\s*=\s*[^=] returned zero
+  results. The codebase appears free of this bug pattern.
+
+&& / || CONFUSION:
+  Checked utils.cpp thoroughly — all && and || usage appears correct:
+    Line 274  - if (path.size() >= 2 && path[1] == L':')           — correct
+    Line 275  - if (path.size() >= 2 && path[0] == L'\\' && ...)   — correct
+    Line 316  - IsPathInImageDir(resolved) && ...                   — correct
+    Line 530  - ok && read == out.size()                            — correct
+    Line 740-744 - vk range checks (&&)                             — all correct
+
+  No suspects found in any utility file.
+
+================================================================================
+END OF REPORT
+================================================================================

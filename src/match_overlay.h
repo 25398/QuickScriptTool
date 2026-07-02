@@ -61,6 +61,7 @@ private:
     MatchOverlayMode mode_ = MatchOverlayMode::Test;
 
     bool cancelled_ = false;
+    bool pendingCancel_ = false;
     int clickX_ = 0, clickY_ = 0;
 
     int matchMs_ = 0;

@@ -143,7 +143,7 @@ constexpr int kFindSelectOffsetY = kFindOffsetRowY + 22 + kFindVGap;
 constexpr int kFindUntilFoundY = kFindSelectOffsetY + kFindBtnH + kFindVGap;
 constexpr int kEditorRemarkY = 516;
 constexpr int kEditorAddY = 552;
-constexpr int kEditorFooterGap = 14;
+constexpr int kEditorFooterGap = 20;
 
 // ── 控件尺寸 ──────────────────────────────────────────────────────
 constexpr int kComboArrowW = 24;
@@ -162,6 +162,7 @@ constexpr BYTE kCloseHoverAlpha = 55;
 constexpr UINT WM_RUN_DONE = WM_APP + 11;
 constexpr UINT WM_TRAY = WM_APP + 12;
 constexpr UINT WM_FIND_TEST_DONE = WM_APP + 13;
+constexpr UINT WM_GLOBAL_HOTKEY_DETECTED = WM_APP + 14;
 constexpr int HOTKEY_COMMON_ID = 701;
 constexpr int HOTKEY_GLOBAL_ID = 702;
 constexpr int HOTKEY_SCRIPT_BASE = 800;

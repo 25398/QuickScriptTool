@@ -216,6 +216,12 @@ void GetVirtualScreenRect(int& x, int& y, int& w, int& h) {
     h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 }
 
+HBITMAP CaptureVirtualScreen(int& outX, int& outY) {
+    int w = 0, h = 0;
+    GetVirtualScreenRect(outX, outY, w, h);
+    return CaptureScreenRegion(outX, outY, outX + w, outY + h);
+}
+
 ImageMatchOutput FindTemplateInFrozenScreenMulti(
     HBITMAP frozenScreen, int virtX, int virtY,
     int searchX1, int searchY1, int searchX2, int searchY2,

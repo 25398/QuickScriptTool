@@ -50,8 +50,11 @@ std::wstring TimestampName() {
 // ── 窗口文本操作 ──────────────────────────────────────────────────
 std::wstring GetText(HWND hwnd) {
     const int len = GetWindowTextLengthW(hwnd);
-    std::wstring text(static_cast<size_t>(len), L'\0');
-    if (len > 0) GetWindowTextW(hwnd, text.data(), len + 1);
+    if (len <= 0) return L"";
+    // 分配 len+1 个字符以确保 GetWindowTextW 写入的空终止符有足够空间
+    std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+    GetWindowTextW(hwnd, text.data(), len + 1);
+    text.resize(static_cast<size_t>(len)); // 去掉尾部的空终止符
     return text;
 }
 

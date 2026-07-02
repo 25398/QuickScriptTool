@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "match_overlay.h"
+#include "drawing.h"
 
 #include <cstdio>
 #include <windowsx.h>
@@ -98,6 +99,7 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     mode_ = mode;
     matchDone_ = false;
     cancelled_ = true;
+    pendingCancel_ = false;
     clickX_ = clickY_ = 0;
     matchResult_ = ImageMatchResult{};
     matchResults_.clear();
@@ -213,7 +215,18 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
         cancelled_ = true;
-        PostQuitMessage(0);
+        pendingCancel_ = true;
+        SetCapture(hwnd_);
+        SetWindowPos(hwnd_, HWND_TOPMOST, -10000, -10000, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        return 0;
+
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+        if (pendingCancel_) {
+            pendingCancel_ = false;
+            ReleaseCapture();
+            PostQuitMessage(0);
+        }
         return 0;
 
     case WM_KEYDOWN:
@@ -278,19 +291,8 @@ void MatchOverlay::DrawStatusBar(HDC hdc) {
     const int barW = textSz.cx + padX * 2;
 
     RECT barRc{8, 8, 8 + barW, 8 + barH};
-    HBRUSH barBrush = CreateSolidBrush(RGB(30, 30, 30));
-    FillRect(hdc, &barRc, barBrush);
-    DeleteObject(barBrush);
-
-    // Semi-transparent feel: thin yellow border
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(120, 100, 40));
-    HBRUSH nullBr = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
-    HGDIOBJ oldPen = SelectObject(hdc, borderPen);
-    HGDIOBJ oldBr = SelectObject(hdc, nullBr);
-    Rectangle(hdc, barRc.left, barRc.top, barRc.right, barRc.bottom);
-    SelectObject(hdc, oldBr);
-    SelectObject(hdc, oldPen);
-    DeleteObject(borderPen);
+    FillRectColor(hdc, barRc, RGB(30, 30, 30));
+    DrawBorderRect(hdc, barRc, RGB(120, 100, 40));
 
     SetTextColor(hdc, kStatusTextColor);
     TextOutW(hdc, barRc.left + padX, barRc.top + padY, status, len);

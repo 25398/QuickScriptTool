@@ -35,6 +35,9 @@ std::wstring ActionName(const ScriptAction& action) {
     if (!action.customText.empty()) return action.customText;
     switch (action.type) {
     case ActionType::MoveMouse:
+        if (action.moveFromVar) {
+            return L"移动鼠标到(" + action.moveVarExprX + L"," + action.moveVarExprY + L")";
+        }
         return L"移动鼠标到(" + std::to_wstring(action.x)
             + L"," + std::to_wstring(action.y) + L")";
     case ActionType::MouseDown: {
@@ -77,6 +80,9 @@ std::wstring ActionName(const ScriptAction& action) {
         return L"等待 " + F3(action.duration)
             + L"秒+随机0~" + F3(action.randomDuration) + L"秒";
     case ActionType::Loop:
+        if (action.loopFromVar && !action.loopVarExpr.empty()) {
+            return L"循环[" + action.loopVarExpr + L"]";
+        }
         return action.loopCount < 0
             ? L"循环[无限循环]"
             : L"循环[" + std::to_wstring(action.loopCount) + L"次]";
@@ -133,6 +139,12 @@ std::wstring ActionName(const ScriptAction& action) {
     }
     case ActionType::Else:
         return L"否则";
+    case ActionType::LockScreenshot:
+        return L"锁定截屏";
+    case ActionType::UnlockScreenshot:
+        return L"解锁截屏";
+    case ActionType::StopMacro:
+        return L"结束宏运行";
     case ActionType::CustomText:
         return action.customText;
     }
@@ -161,6 +173,9 @@ std::wstring JsonType(ActionType type) {
     case ActionType::FindImage:      return L"findImage";
     case ActionType::If:             return L"if";
     case ActionType::Else:           return L"else";
+    case ActionType::LockScreenshot: return L"lockScreenshot";
+    case ActionType::UnlockScreenshot: return L"unlockScreenshot";
+    case ActionType::StopMacro:      return L"stopMacro";
     case ActionType::CustomText:     return L"customText";
     }
     return L"customText";

@@ -1,3 +1,8 @@
+// ──────────────────────────────────────────────────────────────────
+// image_match_internal.h — 图像匹配内部辅助函数
+// 提供图像金字塔构建、峰值检测与抑制、NMS 和分数归一化等底层组件。
+// 所有函数定义在 image_match_internal 命名空间中，inline 实现。
+// ──────────────────────────────────────────────────────────────────
 #pragma once
 
 #include "image_match.h"
@@ -11,6 +16,7 @@
 
 namespace image_match_internal {
 
+// 根据模板尺寸计算最大金字塔层级数 (模板缩到 < 8px 为止)
 inline int CalcPyramidLevels(int tplW, int tplH) {
     int levels = 0;
     int w = tplW;
@@ -23,6 +29,7 @@ inline int CalcPyramidLevels(int tplW, int tplH) {
     return levels;
 }
 
+// 使用 OpenCV 构建图像金字塔
 inline void BuildPyramid(const cv::Mat& src, std::vector<cv::Mat>& out, int levels) {
     out.clear();
     out.reserve(static_cast<size_t>(levels) + 1);

@@ -43,7 +43,6 @@ std::wstring F3(double value);
 std::wstring EscapeJson(const std::wstring& value);
 std::wstring UnescapeJson(const std::wstring& value);
 std::vector<std::wstring> ExtractJsonActionBlocks(const std::wstring& content);
-std::wstring UnescapeJson(const std::wstring& value);
 
 // ── 文件操作 ──────────────────────────────────────────────────────
 std::wstring ReadAll(const std::wstring& path);

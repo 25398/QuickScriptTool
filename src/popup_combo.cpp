@@ -1,6 +1,7 @@
 // ── 弹出式下拉组合框系统实现 ──────────────────────────────────
 #include "popup_combo.h"
 #include "config.h"
+#include "drawing.h"
 #include <commctrl.h>
 #include <uxtheme.h>
 
@@ -57,16 +58,8 @@ LRESULT CALLBACK ComboSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UI
         RECT wr;
         GetWindowRect(hwnd, &wr);
         OffsetRect(&wr, -wr.left, -wr.top);
-        HBRUSH bgBrush = CreateSolidBrush(kWhite);
-        FillRect(hdc, &wr, bgBrush);
-        DeleteObject(bgBrush);
-        HPEN borderPen = CreatePen(PS_SOLID, 1, kComboBorderGray);
-        HGDIOBJ oldPen = SelectObject(hdc, borderPen);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-        Rectangle(hdc, 0, 0, wr.right - 1, wr.bottom - 1);
-        SelectObject(hdc, oldPen);
-        SelectObject(hdc, oldBrush);
-        DeleteObject(borderPen);
+        FillRectColor(hdc, wr, kWhite);
+        DrawBorderRect(hdc, RECT{0, 0, wr.right - 1, wr.bottom - 1}, kComboBorderGray);
         ReleaseDC(hwnd, hdc);
         return 0;
     }

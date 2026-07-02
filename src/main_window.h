@@ -44,6 +44,73 @@
 
 extern HINSTANCE g_instance;
 
+// ── Global-hotkey low-level hook (fallback when RegisterHotKey is unavailable) ──
+namespace {
+    HHOOK ghHotkeyKbHook = nullptr;
+    HHOOK ghHotkeyMouseHook = nullptr;
+    HWND ghHotkeyHwnd = nullptr;
+    bool ghHotkeyPending = false;
+    UINT ghHotkeyVk = 0;
+    UINT ghHotkeyMods = 0;
+    bool ghHotkeyEnabled = false;
+
+    bool CheckHotkeyModifiers(UINT required) {
+        const bool alt   = (GetAsyncKeyState(VK_LMENU)    & 0x8000) || (GetAsyncKeyState(VK_RMENU)    & 0x8000);
+        const bool ctrl  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+        const bool shift = (GetAsyncKeyState(VK_LSHIFT)   & 0x8000) || (GetAsyncKeyState(VK_RSHIFT)   & 0x8000);
+        const bool win   = (GetAsyncKeyState(VK_LWIN)     & 0x8000) || (GetAsyncKeyState(VK_RWIN)     & 0x8000);
+        if (required == 0) return !alt && !ctrl && !shift && !win;
+        if ((required & MOD_ALT)     && !alt)   return false;
+        if ((required & MOD_CONTROL) && !ctrl)  return false;
+        if ((required & MOD_SHIFT)   && !shift) return false;
+        if ((required & MOD_WIN)     && !win)   return false;
+        return true;
+    }
+
+    bool IsMouseVk(UINT vk) {
+        return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON
+            || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+    }
+
+    LRESULT CALLBACK HotkeyKbProc(int code, WPARAM wp, LPARAM lp) {
+        if (code >= 0 && ghHotkeyEnabled && !ghHotkeyPending && !IsMouseVk(ghHotkeyVk)) {
+            const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+            const bool up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
+            auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+            if (down && ks->vkCode == ghHotkeyVk && CheckHotkeyModifiers(ghHotkeyMods)) {
+                ghHotkeyPending = true;
+                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
+            }
+            if (up && ks->vkCode == ghHotkeyVk)
+                ghHotkeyPending = false;
+        }
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+
+    LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
+        if (code >= 0 && ghHotkeyEnabled && !ghHotkeyPending && IsMouseVk(ghHotkeyVk)) {
+            bool down = false, up = false; UINT btnVk = 0;
+            if      (wp == WM_LBUTTONDOWN) { down = true; btnVk = VK_LBUTTON; }
+            else if (wp == WM_LBUTTONUP)   { up   = true; btnVk = VK_LBUTTON; }
+            else if (wp == WM_RBUTTONDOWN) { down = true; btnVk = VK_RBUTTON; }
+            else if (wp == WM_RBUTTONUP)   { up   = true; btnVk = VK_RBUTTON; }
+            else if (wp == WM_MBUTTONDOWN) { down = true; btnVk = VK_MBUTTON; }
+            else if (wp == WM_MBUTTONUP)   { up   = true; btnVk = VK_MBUTTON; }
+            else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
+                auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
+                btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+                if (wp == WM_XBUTTONDOWN) down = true; else up = true;
+            }
+            if (down && btnVk == ghHotkeyVk && CheckHotkeyModifiers(ghHotkeyMods)) {
+                ghHotkeyPending = true;
+                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
+            }
+            if (up && btnVk == ghHotkeyVk) ghHotkeyPending = false;
+        }
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+} // anonymous namespace
+
 class MainWindow {
 public:
     bool Create() {
@@ -74,12 +141,13 @@ private:
     friend LRESULT CALLBACK EditorDropPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
-    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList };
+    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList };
     enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
     struct EditorControlLayout { HWND hwnd = nullptr; RECT base{}; };
     struct PopupCombo { bool open = false; std::vector<std::wstring> items; int sel = 0; };
+    struct ModifierHolds { HWND lWin = nullptr; HWND rWin = nullptr; HWND lCtrl = nullptr; HWND rCtrl = nullptr; HWND lAlt = nullptr; HWND rAlt = nullptr; HWND lShift = nullptr; HWND rShift = nullptr; };
     enum class QuickInputTipKind { None, TextExample, VariableHelp };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -112,6 +180,7 @@ private:
             }
             if (msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) { EndCrosshairDrag(); return 0; }
             if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { EndCrosshairDrag(); return 0; }
+            if (msg == WM_HOTKEY) { OnHotkey(static_cast<int>(wp)); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         }
         switch (msg) {
@@ -151,6 +220,13 @@ private:
                 if (fg != hwnd_ && fg != editorDropPopup_ && fg != editorTipPopup_) {
                     CloseEditorPopup();
                     CancelQuickInputTip();
+                    // 窗口失焦时取消拖拽状态，避免拖拽卡死
+                    if (dragging_) {
+                        EndCrosshairDrag();
+                        dragging_ = false;
+                        dragIndex_ = -1;
+                        ReleaseCapture();
+                    }
                 }
             }
             return DefWindowProcW(hwnd_, msg, wp, lp);
@@ -159,6 +235,7 @@ private:
             if (wp == kQuickInputTipTimerId) { OnQuickInputTipTimer(); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_HOTKEY: OnHotkey(static_cast<int>(wp)); return 0;
+        case WM_GLOBAL_HOTKEY_DETECTED: OnHotkey(HOTKEY_GLOBAL_ID); return 0;
         case WM_RUN_DONE: OnRunDone(); return 0;
         case WM_FIND_TEST_DONE: OnFindTestDone(static_cast<int>(wp), static_cast<int>(lp)); return 0;
         case WM_TRAY: if (LOWORD(lp) == WM_LBUTTONUP) RestoreFromTray(); return 0;
@@ -208,6 +285,7 @@ private:
         CreateEditorTipPopup();
         ShowHome();
         RegisterAllHotkeys();
+        InstallGlobalHotkeyHooks();
     }
 
     // ── Editor control creation ────────────────────────────────────
@@ -246,7 +324,8 @@ private:
             L"移动鼠标到", L"等待", L"鼠标点击", L"鼠标回放", L"运行鼠标宏",
             L"鼠标按下", L"鼠标松开", L"滚动滚轮", L"按键点击", L"键盘按下", L"键盘松开",
             L"快捷按键", L"快捷输入", L"循环", L"结束循环", L"定义宏指令块", L"运行宏指令块",
-            L"找图(返回最匹配的)", L"条件-如果", L"条件-否则"
+            L"找图(返回最匹配的)", L"条件-如果", L"条件-否则",
+            L"锁定截屏", L"解锁截屏", L"结束宏运行"
         };
         popupAction_.sel = 0;
         CreateParamControls();
@@ -271,11 +350,11 @@ private:
         AddGroup(moveControls_, MakeLabel(hwnd_, L"±随机:", -1, 921, 251, 50, 22));
         AddGroup(moveControls_, moveRandomY_ = MakeEdit(hwnd_, L"0", kMoveRandomY, 976, 251, 25, 22));
         AddGroup(moveControls_, crosshairBtn_ = MakeGreenButton(hwnd_, L"拖动准星获取坐标", kCrosshair, 807, 283, 186, 32));
-        AddGroup(moveControls_, MakeLabel(hwnd_, L"□ 来自变量表达式", -1, 807, 322, 180, 25));
+        AddGroup(moveControls_, moveFromVar_ = MakeCheckBox(hwnd_, L"来自变量表达式", kMoveFromVar, 807, 322, 180, 25));
         AddGroup(moveControls_, MakeLabel(hwnd_, L"X:", -1, 807, 354, 25, 22));
-        AddGroup(moveControls_, moveVarX_ = MakeEdit(hwnd_, L"0", 0, 833, 354, 168, 22));
+        AddGroup(moveControls_, moveVarX_ = MakeEdit(hwnd_, L"0", kMoveVarX, 833, 354, 168, 22));
         AddGroup(moveControls_, MakeLabel(hwnd_, L"Y:", -1, 807, 391, 25, 22));
-        AddGroup(moveControls_, moveVarY_ = MakeEdit(hwnd_, L"0", 0, 833, 391, 168, 22));
+        AddGroup(moveControls_, moveVarY_ = MakeEdit(hwnd_, L"0", kMoveVarY, 833, 391, 168, 22));
         AddGroup(moveControls_, MakeHint(hwnd_, L"*提示:可使用来自找图、找色，获取颜色，文字识别保存到变量中的值", 807, 421, 198, 56));
         AddGroup(waitControls_, MakeLabel(hwnd_, L"等待时间", -1, 807, 185, 90, 25));
         AddGroup(waitControls_, waitDuration_ = MakeEdit(hwnd_, L"0.500", kWaitDuration, 818, 216, 76, 22));
@@ -435,15 +514,15 @@ private:
         AddGroup(quickInputControls_, MakeLabel(hwnd_, L"字输入间隔", -1, 817, 358, 90, 22));
         AddGroup(quickInputControls_, quickInputCharInterval_ = MakeEdit(hwnd_, L"0.010", kQuickInputCharInterval, 908, 358, 54, 22));
         AddGroup(quickInputControls_, MakeLabel(hwnd_, L"秒", -1, 968, 358, 32, 25));
-        AddGroup(quickInputControls_, MakeHint(hwnd_, L"*提示:直接输入文字或变量中的值: 使用来自变量中的", 817, 386, 198, 28));
-        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"循环次数", -1, 817, 420, 75, 22));
-        AddGroup(quickInputControls_, quickInputCount_ = MakeEdit(hwnd_, L"0", kQuickInputCount, 908, 420, 54, 22));
-        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"等待时间", -1, 817, 452, 75, 22));
-        AddGroup(quickInputControls_, quickInputWait_ = MakeEdit(hwnd_, L"0.010", kQuickInputWait, 908, 452, 54, 22));
-        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"秒", -1, 968, 452, 32, 25));
-        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"随机时间", -1, 817, 484, 75, 22));
-        AddGroup(quickInputControls_, quickInputRandom_ = MakeEdit(hwnd_, L"0.000", kQuickInputRandom, 908, 484, 54, 22));
-        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"秒", -1, 968, 484, 32, 25));
+        AddGroup(quickInputControls_, MakeHint(hwnd_, L"*提示:直接输入文字或变量中的值: 使用来自变量中的", 817, 386, 198, 56));
+        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"循环次数", -1, 817, 458, 75, 22));
+        AddGroup(quickInputControls_, quickInputCount_ = MakeEdit(hwnd_, L"0", kQuickInputCount, 908, 458, 54, 22));
+        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"等待时间", -1, 817, 490, 75, 22));
+        AddGroup(quickInputControls_, quickInputWait_ = MakeEdit(hwnd_, L"0.010", kQuickInputWait, 908, 490, 54, 22));
+        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"秒", -1, 968, 490, 32, 25));
+        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"随机时间", -1, 817, 522, 75, 22));
+        AddGroup(quickInputControls_, quickInputRandom_ = MakeEdit(hwnd_, L"0.000", kQuickInputRandom, 908, 522, 54, 22));
+        AddGroup(quickInputControls_, MakeLabel(hwnd_, L"秒", -1, 968, 522, 32, 25));
         AddGroup(loopControls_, MakeEditorLabel(hwnd_, L"循环类型", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
         AddGroup(loopControls_, loopTypeCombo_ = MakeLabel(hwnd_, L"次数循环", 0, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, kEditorActionComboH));
         popupLoopType_.items = {L"次数循环", L"变量"}; popupLoopType_.sel = 0;
@@ -478,6 +557,9 @@ private:
         AddGroup(ifControls_, ifConditionList_ = MakeMultilineEdit(hwnd_, L"", kIfConditionList, kEditorPanelLeft, 436, kEditorActionComboW, 72));
         AddGroup(ifControls_, MakeHint(hwnd_, L"*提示:如需要更复杂的条件判断，请导出脚本操作", kEditorPanelLeft, 512, kEditorActionComboW, 28));
         AddGroup(elseControls_, MakeHint(hwnd_, L"*提示:必须和如果成对出现，作为如果节点的下方兄弟节点 (非子节点)！", 807, 183, 195, 48));
+        AddGroup(lockScreenshotControls_, MakeHint(hwnd_, L"*提示:锁定屏幕截图，锁定后后续的找图、找色、颜色匹配不会再次截图，而是使用锁定时的屏幕截图进行处理", 807, 183, 195, 96));
+        AddGroup(unlockScreenshotControls_, MakeHint(hwnd_, L"*提示:解锁定屏幕截图，与锁定截屏成对出现，取消锁定后找图、找色、颜色匹配每次使用都会再次截图进行处理", 807, 183, 195, 96));
+        AddGroup(stopMacroControls_, MakeHint(hwnd_, L"*提示:会结束宏的运行，与您按下快捷键停止是一样的", 807, 183, 195, 48));
         AddEditorControl(remarkLabel_ = MakeLabel(hwnd_, L"备注", -1, 807, kEditorRemarkY, 44, 22));
         AddEditorControl(remark_ = MakeEdit(hwnd_, L"", kRemark, 857, kEditorRemarkY, 117, 22));
         AddEditorControl(modifyBtn_ = MakeGreenButton(hwnd_, L"修改", kModify, 837, kEditorAddY, 76, 30));
@@ -553,6 +635,9 @@ private:
             break;
         case 18: append(ifControls_); break;
         case 19: append(elseControls_); break;
+        case 20: append(lockScreenshotControls_); break;
+        case 21: append(unlockScreenshotControls_); break;
+        case 22: append(stopMacroControls_); break;
         default: break;
         }
     }
@@ -767,6 +852,9 @@ private:
         ShowGroup(findImageVarControls_, sel == 17);
         ShowGroup(ifControls_, sel == 18);
         ShowGroup(elseControls_, sel == 19);
+        ShowGroup(lockScreenshotControls_, sel == 20);
+        ShowGroup(unlockScreenshotControls_, sel == 21);
+        ShowGroup(stopMacroControls_, sel == 22);
         if (sel != 17) ClearGrayButtonHover();
         if (sel == 17) RefreshFindImageSubPanel();
         ApplyEditorFooterLayout();
@@ -776,6 +864,22 @@ private:
         if (sel == 12) RefreshQuickInputVarCombo();
         if (sel == 18) RefreshIfVarCombo();
         HideEditorComboHwnds();
+        UpdateMoveVarControls();
+        UpdateLoopVarControls();
+    }
+
+    void UpdateMoveVarControls() {
+        const bool fromVar = moveFromVar_ && Checked(moveFromVar_);
+        if (moveX_) EnableWindow(moveX_, fromVar ? FALSE : TRUE);
+        if (moveY_) EnableWindow(moveY_, fromVar ? FALSE : TRUE);
+        if (moveVarX_) EnableWindow(moveVarX_, fromVar ? TRUE : FALSE);
+        if (moveVarY_) EnableWindow(moveVarY_, fromVar ? TRUE : FALSE);
+    }
+
+    void UpdateLoopVarControls() {
+        const bool fromVar = loopFromVar_ && Checked(loopFromVar_);
+        if (loopCount_) EnableWindow(loopCount_, fromVar ? FALSE : TRUE);
+        if (loopVarExpr_) EnableWindow(loopVarExpr_, fromVar ? TRUE : FALSE);
     }
 
     void HideEditorComboHwnds() {
@@ -1157,6 +1261,9 @@ private:
         case ActionType::FindImage: return 17;
         case ActionType::If: return 18;
         case ActionType::Else: return 19;
+        case ActionType::LockScreenshot: return 20;
+        case ActionType::UnlockScreenshot: return 21;
+        case ActionType::StopMacro: return 22;
         default: return 14;
         }
     }
@@ -1164,7 +1271,8 @@ private:
     bool IsImplementedActionPopup(int idx) const {
         return idx == 0 || idx == 1 || idx == 2 || idx == 3 || idx == 4 || idx == 5 || idx == 6 || idx == 7 || idx == 8 || idx == 9 || idx == 10
             || idx == 11 || idx == 12
-            || idx == 13 || idx == 14 || idx == 15 || idx == 16 || idx == 17 || idx == 18 || idx == 19;
+            || idx == 13 || idx == 14 || idx == 15 || idx == 16 || idx == 17 || idx == 18 || idx == 19
+            || idx == 20 || idx == 21 || idx == 22;
     }
 
     void UpdateEditMode() {
@@ -1290,69 +1398,36 @@ private:
     bool Checked(HWND h) const { return SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; }
     void SetChecked(HWND h, bool checked) { SendMessageW(h, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0); }
 
-    void ReadMousePressHolds(ScriptAction& action) {
-        action.holdLeftWin = Checked(mousePressLWin_); action.holdRightWin = Checked(mousePressRWin_);
-        action.holdLeftCtrl = Checked(mousePressLCtrl_); action.holdRightCtrl = Checked(mousePressRCtrl_);
-        action.holdLeftAlt = Checked(mousePressLAlt_); action.holdRightAlt = Checked(mousePressRAlt_);
-        action.holdLeftShift = Checked(mousePressLShift_); action.holdRightShift = Checked(mousePressRShift_);
+    void ReadModifierHolds(ScriptAction& action, HWND lWin, HWND rWin, HWND lCtrl, HWND rCtrl, HWND lAlt, HWND rAlt, HWND lShift, HWND rShift) {
+        action.holdLeftWin = Checked(lWin); action.holdRightWin = Checked(rWin);
+        action.holdLeftCtrl = Checked(lCtrl); action.holdRightCtrl = Checked(rCtrl);
+        action.holdLeftAlt = Checked(lAlt); action.holdRightAlt = Checked(rAlt);
+        action.holdLeftShift = Checked(lShift); action.holdRightShift = Checked(rShift);
     }
 
-    void WriteMousePressHolds(const ScriptAction& action) {
-        SetChecked(mousePressLWin_, action.holdLeftWin); SetChecked(mousePressRWin_, action.holdRightWin);
-        SetChecked(mousePressLCtrl_, action.holdLeftCtrl); SetChecked(mousePressRCtrl_, action.holdRightCtrl);
-        SetChecked(mousePressLAlt_, action.holdLeftAlt); SetChecked(mousePressRAlt_, action.holdRightAlt);
-        SetChecked(mousePressLShift_, action.holdLeftShift); SetChecked(mousePressRShift_, action.holdRightShift);
-    }
-
-    void ReadClickHolds(ScriptAction& action) {
-        action.holdLeftWin = Checked(clickLWin_); action.holdRightWin = Checked(clickRWin_);
-        action.holdLeftCtrl = Checked(clickLCtrl_); action.holdRightCtrl = Checked(clickRCtrl_);
-        action.holdLeftAlt = Checked(clickLAlt_); action.holdRightAlt = Checked(clickRAlt_);
-        action.holdLeftShift = Checked(clickLShift_); action.holdRightShift = Checked(clickRShift_);
-    }
-
-    void ReadKeyHolds(ScriptAction& action) {
-        action.holdLeftWin = Checked(keyLWin_); action.holdRightWin = Checked(keyRWin_);
-        action.holdLeftCtrl = Checked(keyLCtrl_); action.holdRightCtrl = Checked(keyRCtrl_);
-        action.holdLeftAlt = Checked(keyLAlt_); action.holdRightAlt = Checked(keyRAlt_);
-        action.holdLeftShift = Checked(keyLShift_); action.holdRightShift = Checked(keyRShift_);
-    }
-
-    void WriteClickHolds(const ScriptAction& action) {
-        SetChecked(clickLWin_, action.holdLeftWin); SetChecked(clickRWin_, action.holdRightWin);
-        SetChecked(clickLCtrl_, action.holdLeftCtrl); SetChecked(clickRCtrl_, action.holdRightCtrl);
-        SetChecked(clickLAlt_, action.holdLeftAlt); SetChecked(clickRAlt_, action.holdRightAlt);
-        SetChecked(clickLShift_, action.holdLeftShift); SetChecked(clickRShift_, action.holdRightShift);
-    }
-
-    void WriteKeyHolds(const ScriptAction& action) {
-        SetChecked(keyLWin_, action.holdLeftWin); SetChecked(keyRWin_, action.holdRightWin);
-        SetChecked(keyLCtrl_, action.holdLeftCtrl); SetChecked(keyRCtrl_, action.holdRightCtrl);
-        SetChecked(keyLAlt_, action.holdLeftAlt); SetChecked(keyRAlt_, action.holdRightAlt);
-        SetChecked(keyLShift_, action.holdLeftShift); SetChecked(keyRShift_, action.holdRightShift);
-    }
-
-    void ReadKeyPressHolds(ScriptAction& action) {
-        action.holdLeftWin = Checked(keyPressLWin_); action.holdRightWin = Checked(keyPressRWin_);
-        action.holdLeftCtrl = Checked(keyPressLCtrl_); action.holdRightCtrl = Checked(keyPressRCtrl_);
-        action.holdLeftAlt = Checked(keyPressLAlt_); action.holdRightAlt = Checked(keyPressRAlt_);
-        action.holdLeftShift = Checked(keyPressLShift_); action.holdRightShift = Checked(keyPressRShift_);
-    }
-
-    void WriteKeyPressHolds(const ScriptAction& action) {
-        SetChecked(keyPressLWin_, action.holdLeftWin); SetChecked(keyPressRWin_, action.holdRightWin);
-        SetChecked(keyPressLCtrl_, action.holdLeftCtrl); SetChecked(keyPressRCtrl_, action.holdRightCtrl);
-        SetChecked(keyPressLAlt_, action.holdLeftAlt); SetChecked(keyPressRAlt_, action.holdRightAlt);
-        SetChecked(keyPressLShift_, action.holdLeftShift); SetChecked(keyPressRShift_, action.holdRightShift);
+    void WriteModifierHolds(const ScriptAction& action, HWND lWin, HWND rWin, HWND lCtrl, HWND rCtrl, HWND lAlt, HWND rAlt, HWND lShift, HWND rShift) {
+        SetChecked(lWin, action.holdLeftWin); SetChecked(rWin, action.holdRightWin);
+        SetChecked(lCtrl, action.holdLeftCtrl); SetChecked(rCtrl, action.holdRightCtrl);
+        SetChecked(lAlt, action.holdLeftAlt); SetChecked(rAlt, action.holdRightAlt);
+        SetChecked(lShift, action.holdLeftShift); SetChecked(rShift, action.holdRightShift);
     }
 
     ScriptAction ActionFromForm() {
         ScriptAction action{};
         action.remark = GetText(remark_);
         const int sel = popupAction_.sel;
-        if (sel == 0) { action.type = ActionType::MoveMouse; action.x = ToInt(moveX_); action.y = ToInt(moveY_); action.randomX = std::max(0, ToInt(moveRandomX_)); action.randomY = std::max(0, ToInt(moveRandomY_)); }
+        if (sel == 0) {
+            action.type = ActionType::MoveMouse;
+            action.moveFromVar = Checked(moveFromVar_);
+            action.moveVarExprX = Trim(GetText(moveVarX_));
+            action.moveVarExprY = Trim(GetText(moveVarY_));
+            action.x = ToInt(moveX_);
+            action.y = ToInt(moveY_);
+            action.randomX = std::max(0, ToInt(moveRandomX_));
+            action.randomY = std::max(0, ToInt(moveRandomY_));
+        }
         else if (sel == 1) { action.type = ActionType::Wait; action.duration = std::max(0.0, ToDouble(waitDuration_, 0.5)); action.randomDuration = std::max(0.0, ToDouble(waitRandom_)); }
-        else if (sel == 2) { action.type = ActionType::MouseClick; action.button = static_cast<MouseButtonType>(std::max(0, popupClickBtn_.sel)); action.clickCount = std::max(1, ToInt(clickCount_, 1)); action.duration = std::max(0.0, ToDouble(clickWait_, 0.01)); action.randomDuration = std::max(0.0, ToDouble(clickRandom_)); ReadClickHolds(action); }
+        else if (sel == 2) { action.type = ActionType::MouseClick; action.button = static_cast<MouseButtonType>(std::max(0, popupClickBtn_.sel)); action.clickCount = std::max(1, ToInt(clickCount_, 1)); action.duration = std::max(0.0, ToDouble(clickWait_, 0.01)); action.randomDuration = std::max(0.0, ToDouble(clickRandom_)); ReadModifierHolds(action, clickLWin_, clickRWin_, clickLCtrl_, clickRCtrl_, clickLAlt_, clickRAlt_, clickLShift_, clickRShift_); }
         else if (sel == 3) {
             action.type = ActionType::MousePlayback;
             action.blockName = popupMousePlayback_.sel >= 0 && popupMousePlayback_.sel < static_cast<int>(popupMousePlayback_.items.size())
@@ -1370,8 +1445,8 @@ private:
             action.targetPath = popupRunMacro_.sel >= 0 && popupRunMacro_.sel < static_cast<int>(runMacroPaths_.size())
                 ? runMacroPaths_[static_cast<size_t>(popupRunMacro_.sel)] : L"";
         }
-        else if (sel == 5) { action.type = ActionType::MouseDown; action.button = static_cast<MouseButtonType>(std::max(0, popupMouseBtn_.sel)); ReadMousePressHolds(action); }
-        else if (sel == 6) { action.type = ActionType::MouseUp; action.button = static_cast<MouseButtonType>(std::max(0, popupMouseBtn_.sel)); ReadMousePressHolds(action); }
+        else if (sel == 5) { action.type = ActionType::MouseDown; action.button = static_cast<MouseButtonType>(std::max(0, popupMouseBtn_.sel)); ReadModifierHolds(action, mousePressLWin_, mousePressRWin_, mousePressLCtrl_, mousePressRCtrl_, mousePressLAlt_, mousePressRAlt_, mousePressLShift_, mousePressRShift_); }
+        else if (sel == 6) { action.type = ActionType::MouseUp; action.button = static_cast<MouseButtonType>(std::max(0, popupMouseBtn_.sel)); ReadModifierHolds(action, mousePressLWin_, mousePressRWin_, mousePressLCtrl_, mousePressRCtrl_, mousePressLAlt_, mousePressRAlt_, mousePressLShift_, mousePressRShift_); }
         else if (sel == 7) {
             action.type = ActionType::ScrollWheel;
             action.scrollVertical = Checked(scrollVertical_);
@@ -1383,9 +1458,9 @@ private:
             action.duration = std::max(0.0, ToDouble(scrollWait_, 0.01));
             action.randomDuration = std::max(0.0, ToDouble(scrollRandom_));
         }
-        else if (sel == 8) { action.type = ActionType::KeyClick; action.keyText = formKeyText_.empty() ? L"7" : formKeyText_; action.keyVk = formKeyVk_ == 0 ? '7' : formKeyVk_; action.clickCount = std::max(1, ToInt(keyCount_, 1)); action.duration = std::max(0.0, ToDouble(keyWait_, 0.01)); action.randomDuration = std::max(0.0, ToDouble(keyRandom_)); ReadKeyHolds(action); }
-        else if (sel == 9) { action.type = ActionType::KeyDown; action.keyText = formKeyPressText_.empty() ? L"7" : formKeyPressText_; action.keyVk = formKeyPressVk_ == 0 ? '7' : formKeyPressVk_; ReadKeyPressHolds(action); }
-        else if (sel == 10) { action.type = ActionType::KeyUp; action.keyText = formKeyPressText_.empty() ? L"7" : formKeyPressText_; action.keyVk = formKeyPressVk_ == 0 ? '7' : formKeyPressVk_; ReadKeyPressHolds(action); }
+        else if (sel == 8) { action.type = ActionType::KeyClick; action.keyText = formKeyText_.empty() ? L"7" : formKeyText_; action.keyVk = formKeyVk_ == 0 ? '7' : formKeyVk_; action.clickCount = std::max(1, ToInt(keyCount_, 1)); action.duration = std::max(0.0, ToDouble(keyWait_, 0.01)); action.randomDuration = std::max(0.0, ToDouble(keyRandom_)); ReadModifierHolds(action, keyLWin_, keyRWin_, keyLCtrl_, keyRCtrl_, keyLAlt_, keyRAlt_, keyLShift_, keyRShift_); }
+        else if (sel == 9) { action.type = ActionType::KeyDown; action.keyText = formKeyPressText_.empty() ? L"7" : formKeyPressText_; action.keyVk = formKeyPressVk_ == 0 ? '7' : formKeyPressVk_; ReadModifierHolds(action, keyPressLWin_, keyPressRWin_, keyPressLCtrl_, keyPressRCtrl_, keyPressLAlt_, keyPressRAlt_, keyPressLShift_, keyPressRShift_); }
+        else if (sel == 10) { action.type = ActionType::KeyUp; action.keyText = formKeyPressText_.empty() ? L"7" : formKeyPressText_; action.keyVk = formKeyPressVk_ == 0 ? '7' : formKeyPressVk_; ReadModifierHolds(action, keyPressLWin_, keyPressRWin_, keyPressLCtrl_, keyPressRCtrl_, keyPressLAlt_, keyPressRAlt_, keyPressLShift_, keyPressRShift_); }
         else if (sel == 11) {
             action.type = ActionType::HotkeyShortcut;
             action.shortcutPreset = std::clamp(popupHotkeyShortcut_.sel, 0, ShortcutPresetCount() - 1);
@@ -1432,6 +1507,15 @@ private:
         else if (sel == 19) {
             action.type = ActionType::Else;
         }
+        else if (sel == 20) {
+            action.type = ActionType::LockScreenshot;
+        }
+        else if (sel == 21) {
+            action.type = ActionType::UnlockScreenshot;
+        }
+        else if (sel == 22) {
+            action.type = ActionType::StopMacro;
+        }
         else { action.type = ActionType::MoveMouse; }
         return action;
     }
@@ -1439,10 +1523,19 @@ private:
     void LoadForm(const ScriptAction& action) {
         loadingForm_ = true;
         SetText(remark_, action.remark);
-        if (action.type == ActionType::MoveMouse) { SetPopupSel(popupAction_, actionCombo_, 0); SetText(moveX_, std::to_wstring(action.x)); SetText(moveY_, std::to_wstring(action.y)); SetText(moveRandomX_, std::to_wstring(action.randomX)); SetText(moveRandomY_, std::to_wstring(action.randomY)); }
+        if (action.type == ActionType::MoveMouse) {
+            SetPopupSel(popupAction_, actionCombo_, 0);
+            SetText(moveX_, std::to_wstring(action.x));
+            SetText(moveY_, std::to_wstring(action.y));
+            SetText(moveRandomX_, std::to_wstring(action.randomX));
+            SetText(moveRandomY_, std::to_wstring(action.randomY));
+            SetChecked(moveFromVar_, action.moveFromVar);
+            SetText(moveVarX_, action.moveVarExprX.empty() ? L"0" : action.moveVarExprX);
+            SetText(moveVarY_, action.moveVarExprY.empty() ? L"0" : action.moveVarExprY);
+        }
         else if (action.type == ActionType::Wait) { SetPopupSel(popupAction_, actionCombo_, 1); SetText(waitDuration_, F3(action.duration)); SetText(waitRandom_, F3(action.randomDuration)); }
-        else if (action.type == ActionType::MouseDown || action.type == ActionType::MouseUp) { SetPopupSel(popupAction_, actionCombo_, ComboSelForType(action.type)); SetPopupSel(popupMouseBtn_, mousePressButton_, static_cast<int>(action.button)); WriteMousePressHolds(action); }
-        else if (action.type == ActionType::MouseClick) { SetPopupSel(popupAction_, actionCombo_, 2); SetPopupSel(popupClickBtn_, clickButton_, static_cast<int>(action.button)); SetText(clickCount_, std::to_wstring(action.clickCount)); SetText(clickWait_, F3(action.duration)); SetText(clickRandom_, F3(action.randomDuration)); WriteClickHolds(action); }
+        else if (action.type == ActionType::MouseDown || action.type == ActionType::MouseUp) { SetPopupSel(popupAction_, actionCombo_, ComboSelForType(action.type)); SetPopupSel(popupMouseBtn_, mousePressButton_, static_cast<int>(action.button)); WriteModifierHolds(action, mousePressLWin_, mousePressRWin_, mousePressLCtrl_, mousePressRCtrl_, mousePressLAlt_, mousePressRAlt_, mousePressLShift_, mousePressRShift_); }
+        else if (action.type == ActionType::MouseClick) { SetPopupSel(popupAction_, actionCombo_, 2); SetPopupSel(popupClickBtn_, clickButton_, static_cast<int>(action.button)); SetText(clickCount_, std::to_wstring(action.clickCount)); SetText(clickWait_, F3(action.duration)); SetText(clickRandom_, F3(action.randomDuration)); WriteModifierHolds(action, clickLWin_, clickRWin_, clickLCtrl_, clickRCtrl_, clickLAlt_, clickRAlt_, clickLShift_, clickRShift_); }
         else if (action.type == ActionType::MousePlayback) {
             SetPopupSel(popupAction_, actionCombo_, 3);
             RefreshMousePlaybackCombo();
@@ -1468,8 +1561,8 @@ private:
                 SetPopupSel(popupRunMacro_, runMacroCombo_, idx);
             }
         }
-        else if (action.type == ActionType::KeyDown || action.type == ActionType::KeyUp) { SetPopupSel(popupAction_, actionCombo_, ComboSelForType(action.type)); formKeyPressText_ = action.keyText.empty() ? L"7" : action.keyText; formKeyPressVk_ = action.keyVk == 0 ? '7' : action.keyVk; SetText(keyPressEdit_, formKeyPressText_); WriteKeyPressHolds(action); }
-        else if (action.type == ActionType::KeyClick) { SetPopupSel(popupAction_, actionCombo_, 8); formKeyText_ = action.keyText.empty() ? L"7" : action.keyText; formKeyVk_ = action.keyVk == 0 ? '7' : action.keyVk; SetText(keyEdit_, formKeyText_); SetText(keyCount_, std::to_wstring(action.clickCount)); SetText(keyWait_, F3(action.duration)); SetText(keyRandom_, F3(action.randomDuration)); WriteKeyHolds(action); }
+        else if (action.type == ActionType::KeyDown || action.type == ActionType::KeyUp) { SetPopupSel(popupAction_, actionCombo_, ComboSelForType(action.type)); formKeyPressText_ = action.keyText.empty() ? L"7" : action.keyText; formKeyPressVk_ = action.keyVk == 0 ? '7' : action.keyVk; SetText(keyPressEdit_, formKeyPressText_); WriteModifierHolds(action, keyPressLWin_, keyPressRWin_, keyPressLCtrl_, keyPressRCtrl_, keyPressLAlt_, keyPressRAlt_, keyPressLShift_, keyPressRShift_); }
+        else if (action.type == ActionType::KeyClick) { SetPopupSel(popupAction_, actionCombo_, 8); formKeyText_ = action.keyText.empty() ? L"7" : action.keyText; formKeyVk_ = action.keyVk == 0 ? '7' : action.keyVk; SetText(keyEdit_, formKeyText_); SetText(keyCount_, std::to_wstring(action.clickCount)); SetText(keyWait_, F3(action.duration)); SetText(keyRandom_, F3(action.randomDuration)); WriteModifierHolds(action, keyLWin_, keyRWin_, keyLCtrl_, keyRCtrl_, keyLAlt_, keyRAlt_, keyLShift_, keyRShift_); }
         else if (action.type == ActionType::HotkeyShortcut) {
             SetPopupSel(popupAction_, actionCombo_, 11);
             SetPopupSel(popupHotkeyShortcut_, hotkeyShortcutCombo_, std::clamp(action.shortcutPreset, 0, ShortcutPresetCount() - 1));
@@ -1528,6 +1621,15 @@ private:
         }
         else if (action.type == ActionType::Else) {
             SetPopupSel(popupAction_, actionCombo_, 19);
+        }
+        else if (action.type == ActionType::LockScreenshot) {
+            SetPopupSel(popupAction_, actionCombo_, 20);
+        }
+        else if (action.type == ActionType::UnlockScreenshot) {
+            SetPopupSel(popupAction_, actionCombo_, 21);
+        }
+        else if (action.type == ActionType::StopMacro) {
+            SetPopupSel(popupAction_, actionCombo_, 22);
         }
         else { SetPopupSel(popupAction_, actionCombo_, 14); }
         RefreshParamPanel();
@@ -1777,6 +1879,11 @@ private:
         if (id == kFindClearImage) { ClearFindImage(); return; }
         if (id == kFindTest) { TestFindImage(); return; }
         if (id == kFindSelectOffset) { BeginFindOffsetSelect(); return; }
+        if ((id == kMoveFromVar || id == kLoopFromVar) && code == BN_CLICKED) {
+            UpdateMoveVarControls();
+            UpdateLoopVarControls();
+            return;
+        }
         if (id == kListRemarkEdit && code == EN_KILLFOCUS) { CommitInlineRemark(); return; }
         if (id == kModify) { ModifySelected(); return; }
         if (id == kAdd) { ShowAddMenu(); return; }
@@ -1792,6 +1899,13 @@ private:
         pos = std::min(pos, actions_.size());
         actions_.insert(actions_.begin() + static_cast<std::ptrdiff_t>(pos), action);
         selectedIndex_ = static_cast<int>(pos);
+        {
+            std::set<int> updated;
+            for (int idx : collapsedContainers_) {
+                updated.insert(idx >= static_cast<int>(pos) ? idx + 1 : idx);
+            }
+            collapsedContainers_ = std::move(updated);
+        }
         if (IsExpandableContainer(action.type)) collapsedContainers_.erase(static_cast<int>(pos));
         RenumberActions();
         EnsureSelectedVisible();
@@ -1962,7 +2076,11 @@ private:
     void SaveIfEditor() {
         if (page_ != Page::Editor) return;
         EnsureScriptsDir();
-        if (currentPath_.empty()) currentPath_ = ScriptsDir() + L"\\" + GetText(name_) + L".json";
+        if (currentPath_.empty()) {
+            std::wstring scriptName = GetText(name_);
+            if (scriptName.empty()) scriptName = L"未命名脚本";
+            currentPath_ = ScriptsDir() + L"\\" + scriptName + L".json";
+        }
         SaveScriptFile(currentPath_);
     }
 
@@ -1993,6 +2111,9 @@ private:
             file << L"      \"y\": " << a.y << L",\n";
             file << L"      \"randomX\": " << a.randomX << L",\n";
             file << L"      \"randomY\": " << a.randomY << L",\n";
+            file << L"      \"moveFromVar\": " << (a.moveFromVar ? 1 : 0) << L",\n";
+            file << L"      \"moveVarExprX\": \"" << EscapeJson(a.moveVarExprX) << L"\",\n";
+            file << L"      \"moveVarExprY\": \"" << EscapeJson(a.moveVarExprY) << L"\",\n";
             file << L"      \"button\": \"" << JsonButton(a.button) << L"\",\n";
             file << L"      \"keyText\": \"" << EscapeJson(a.keyText) << L"\",\n";
             file << L"      \"keyVk\": " << a.keyVk << L",\n";
@@ -2077,6 +2198,9 @@ private:
         else if (type == L"runBlock") a.type = ActionType::RunBlock;
         else if (type == L"if") a.type = ActionType::If;
         else if (type == L"else") a.type = ActionType::Else;
+        else if (type == L"lockScreenshot") a.type = ActionType::LockScreenshot;
+        else if (type == L"unlockScreenshot") a.type = ActionType::UnlockScreenshot;
+        else if (type == L"stopMacro") a.type = ActionType::StopMacro;
         else a.type = ActionType::CustomText;
         a.customText = ExtractString(block, L"text");
         a.remark = ExtractString(block, L"remark");
@@ -2086,6 +2210,9 @@ private:
         a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
         a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
         a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
+        a.moveFromVar = ExtractNumber(block, L"moveFromVar", 0) != 0;
+        a.moveVarExprX = ExtractString(block, L"moveVarExprX");
+        a.moveVarExprY = ExtractString(block, L"moveVarExprY");
         const auto button = ExtractString(block, L"button");
         a.button = button == L"right" ? MouseButtonType::Right : button == L"middle" ? MouseButtonType::Middle : MouseButtonType::Left;
         a.keyText = ExtractString(block, L"keyText");
@@ -3423,29 +3550,19 @@ private:
                 if (msg == WM_PAINT) {
                     PAINTSTRUCT ps{};
                     HDC hdc = BeginPaint(hwnd, &ps);
-                    HBRUSH green = CreateSolidBrush(kMainGreen);
-                    RECT title{0, 0, 340, 40};
-                    FillRect(hdc, &title, green);
-                    DeleteObject(green);
-                    HBRUSH white = CreateSolidBrush(kWhite);
-                    RECT body{0, 40, 340, 180};
-                    FillRect(hdc, &body, white);
-                    DeleteObject(white);
+                    RECT titleRc{0, 0, 340, 40};
+                    FillRectColor(hdc, titleRc, kMainGreen);
+                    RECT bodyRc{0, 40, 340, 180};
+                    FillRectColor(hdc, bodyRc, kWhite);
                     RECT edit = editRect();
-                    HPEN editPen = CreatePen(PS_SOLID, 1, kComboBorderGray);
-                    HGDIOBJ oldPen = SelectObject(hdc, editPen);
-                    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    Rectangle(hdc, edit.left, edit.top, edit.right, edit.bottom);
-                    SelectObject(hdc, oldBrush);
-                    SelectObject(hdc, oldPen);
-                    DeleteObject(editPen);
+                    DrawBorderRect(hdc, edit, kComboBorderGray);
                     SetBkMode(hdc, TRANSPARENT);
                     SetTextColor(hdc, RGB(255, 255, 255));
                     HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
                     HFONT btnFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
                     HFONT closeFont = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
                     HGDIOBJ oldFont = SelectObject(hdc, titleFont);
-                    DrawTextW(hdc, L"  鼠大侠-自定义连点间隔", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    DrawTextW(hdc, L"  鼠大侠-自定义连点间隔", -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                     SelectObject(hdc, closeFont);
                     RECT close = closeRect();
                     DrawTextW(hdc, L"×", -1, &close, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -3455,10 +3572,7 @@ private:
                     DrawTextW(hdc, L"秒", -1, &unitRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                     RECT cancel = cancelRect();
                     RECT ok = okRect();
-                    HPEN outline = CreatePen(PS_SOLID, 1, kMainGreen);
-                    HGDIOBJ oldPen2 = SelectObject(hdc, outline);
-                    HGDIOBJ oldBrush2 = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    RoundRect(hdc, cancel.left, cancel.top, cancel.right, cancel.bottom, 6, 6);
+                    DrawBorderRoundRect(hdc, cancel, kMainGreen, 6);
                     SetTextColor(hdc, kMainGreen);
                     DrawTextW(hdc, L"取消", -1, &cancel, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                     HBRUSH okBrush = CreateSolidBrush(kMainGreen);
@@ -3468,10 +3582,7 @@ private:
                     SetTextColor(hdc, RGB(255, 255, 255));
                     DrawTextW(hdc, L"确定", -1, &ok, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                     SelectObject(hdc, oldPen3);
-                    SelectObject(hdc, oldBrush2);
-                    SelectObject(hdc, oldPen2);
                     DeleteObject(okBrush);
-                    DeleteObject(outline);
                     SelectObject(hdc, oldFont);
                     DeleteObject(titleFont);
                     DeleteObject(btnFont);
@@ -3657,39 +3768,26 @@ private:
                 if (msg == WM_PAINT) {
                     PAINTSTRUCT ps{};
                     HDC hdc = BeginPaint(hwnd, &ps);
-                    HBRUSH green = CreateSolidBrush(kMainGreen);
-                    RECT title{0, 0, 340, 40};
-                    FillRect(hdc, &title, green);
-                    DeleteObject(green);
-                    HBRUSH white = CreateSolidBrush(kWhite);
-                    RECT body{0, 40, 340, 180};
-                    FillRect(hdc, &body, white);
-                    DeleteObject(white);
+                    RECT titleRc{0, 0, 340, 40};
+                    FillRectColor(hdc, titleRc, kMainGreen);
+                    RECT bodyRc{0, 40, 340, 180};
+                    FillRectColor(hdc, bodyRc, kWhite);
                     RECT edit = editRect();
-                    HPEN editPen = CreatePen(PS_SOLID, 1, kComboBorderGray);
-                    HGDIOBJ oldPen = SelectObject(hdc, editPen);
-                    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    Rectangle(hdc, edit.left, edit.top, edit.right, edit.bottom);
-                    SelectObject(hdc, oldBrush);
-                    SelectObject(hdc, oldPen);
-                    DeleteObject(editPen);
+                    DrawBorderRect(hdc, edit, kComboBorderGray);
                     SetBkMode(hdc, TRANSPARENT);
                     SetTextColor(hdc, RGB(255, 255, 255));
                     HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
                     HFONT btnFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
                     HFONT closeFont = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
                     HGDIOBJ oldFont = SelectObject(hdc, titleFont);
-                    DrawTextW(hdc, L"  鼠大侠-重命名", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    DrawTextW(hdc, L"  鼠大侠-重命名", -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                     SelectObject(hdc, closeFont);
                     RECT close = closeRect();
                     DrawTextW(hdc, L"×", -1, &close, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                     SelectObject(hdc, btnFont);
                     RECT cancel = cancelRect();
                     RECT ok = okRect();
-                    HPEN outline = CreatePen(PS_SOLID, 1, kMainGreen);
-                    HGDIOBJ oldPen2 = SelectObject(hdc, outline);
-                    HGDIOBJ oldBrush2 = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    RoundRect(hdc, cancel.left, cancel.top, cancel.right, cancel.bottom, 6, 6);
+                    DrawBorderRoundRect(hdc, cancel, kMainGreen, 6);
                     SetTextColor(hdc, kMainGreen);
                     DrawTextW(hdc, L"取消", -1, &cancel, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                     HBRUSH okBrush = CreateSolidBrush(kMainGreen);
@@ -3699,10 +3797,7 @@ private:
                     SetTextColor(hdc, RGB(255, 255, 255));
                     DrawTextW(hdc, L"确定", -1, &ok, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                     SelectObject(hdc, oldPen3);
-                    SelectObject(hdc, oldBrush2);
-                    SelectObject(hdc, oldPen2);
                     DeleteObject(okBrush);
-                    DeleteObject(outline);
                     SelectObject(hdc, oldFont);
                     DeleteObject(titleFont);
                     DeleteObject(btnFont);
@@ -4023,9 +4118,48 @@ private:
             const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
             if (hk.enabled && hk.vk) RegisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i, hk.modifiers, hk.vk);
         }
+        RefreshGlobalHotkeyHooks();
+    }
+
+    void InstallGlobalHotkeyHooks() {
+        ghHotkeyHwnd      = hwnd_;
+        ghHotkeyEnabled   = true;
+        ghHotkeyVk        = globalHotkey_.vk;
+        ghHotkeyMods      = globalHotkey_.modifiers;
+        ghHotkeyPending   = false;
+        HINSTANCE inst    = GetModuleHandleW(nullptr);
+        if (!ghHotkeyKbHook)
+            ghHotkeyKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, HotkeyKbProc, inst, 0);
+        if (IsMouseVk(ghHotkeyVk) && !ghHotkeyMouseHook)
+            ghHotkeyMouseHook = SetWindowsHookExW(WH_MOUSE_LL, HotkeyMouseProc, inst, 0);
+    }
+
+    void UninstallGlobalHotkeyHooks() {
+        ghHotkeyEnabled = false;
+        if (ghHotkeyKbHook)     { UnhookWindowsHookEx(ghHotkeyKbHook);     ghHotkeyKbHook     = nullptr; }
+        if (ghHotkeyMouseHook)  { UnhookWindowsHookEx(ghHotkeyMouseHook);  ghHotkeyMouseHook  = nullptr; }
+    }
+
+    void RefreshGlobalHotkeyHooks() {
+        ghHotkeyVk      = globalHotkey_.vk;
+        ghHotkeyMods    = globalHotkey_.modifiers;
+        ghHotkeyEnabled = globalHotkey_.enabled;
+        ghHotkeyPending = false;
+        HINSTANCE inst  = GetModuleHandleW(nullptr);
+        if (IsMouseVk(ghHotkeyVk) && !ghHotkeyMouseHook)
+            ghHotkeyMouseHook = SetWindowsHookExW(WH_MOUSE_LL, HotkeyMouseProc, inst, 0);
+        else if (!IsMouseVk(ghHotkeyVk) && ghHotkeyMouseHook)
+            { UnhookWindowsHookEx(ghHotkeyMouseHook); ghHotkeyMouseHook = nullptr; }
     }
 
     void OnHotkey(int id) {
+        // Debounce: suppress duplicate global-hotkey triggers that arrive within 300 ms
+        // (happens when both RegisterHotKey and the low-level fallback hook fire for the same event)
+        if (id == HOTKEY_GLOBAL_ID) {
+            DWORD now = GetTickCount();
+            if (now - lastHotkeyTick_ < 300) return;
+            lastHotkeyTick_ = now;
+        }
         if (running_ && ShouldIgnoreHotkeyStop()) return;
         if (id == HOTKEY_GLOBAL_ID) {
             if (clicking_) { StopClicking(); return; }
@@ -4080,14 +4214,19 @@ private:
     void SendKey(UINT vk, bool down) {
         if (running_) MarkSimulatedInput();
         SendKeyboardKey(vk, down);
+        if (running_) UnmarkSimulatedInput();
     }
 
     void MarkSimulatedInput() {
-        suppressHotkeyStopUntilTick_.store(GetTickCount() + 120, std::memory_order_relaxed);
+        simulatingInputDepth_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void UnmarkSimulatedInput() {
+        simulatingInputDepth_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     bool ShouldIgnoreHotkeyStop() const {
-        return GetTickCount() < suppressHotkeyStopUntilTick_.load(std::memory_order_relaxed);
+        return simulatingInputDepth_.load(std::memory_order_relaxed) > 0;
     }
 
     void SendHeldModifiers(const ScriptAction& a, bool down) {
@@ -4102,8 +4241,19 @@ private:
     }
 
     // ── Script execution (worker thread) ───────────────────────────
+    void SyncFormIntoActionsBeforeRun() {
+        if (page_ != Page::Editor) return;
+        if (selectedIndex_ < 0 || selectedIndex_ >= static_cast<int>(actions_.size())) return;
+        ScriptAction action = ActionFromForm();
+        if (action.type == ActionType::DefineBlock && !IsValidBlockName(action.blockName)) return;
+        action.originalNo = actions_[static_cast<size_t>(selectedIndex_)].originalNo;
+        action.indent = actions_[static_cast<size_t>(selectedIndex_)].indent;
+        actions_[static_cast<size_t>(selectedIndex_)] = action;
+    }
+
     void RunCurrentActions() {
         if (running_) return;
+        SyncFormIntoActionsBeforeRun();
         running_ = true; stopFlag_ = false; wasVisibleBeforeRun_ = IsWindowVisible(hwnd_) == TRUE; wasMinimizedBeforeRun_ = IsIconic(hwnd_) == TRUE;
         CloseEditorPopup(); CancelQuickInputTip(); AddTray(); ShowWindow(hwnd_, SW_HIDE);
         const auto actions = actions_;
@@ -4113,10 +4263,15 @@ private:
             loopVars_.clear();
             curLoops_ = 0;
             UINT heldKeyVk = 0;
+            HBITMAP lockedScreen_ = nullptr;
+            int lockedVirtX_ = 0;
+            int lockedVirtY_ = 0;
 
-            auto repeatHeldKey = [this](UINT vk) {
-                SendKey(vk, false);
-                SendKey(vk, true);
+            auto clearLockedScreen = [&]() {
+                if (lockedScreen_) {
+                    DeleteBitmapHandle(lockedScreen_);
+                    lockedScreen_ = nullptr;
+                }
             };
 
             const std::vector<ScriptAction>* activeActions = &actions;
@@ -4130,36 +4285,47 @@ private:
             std::function<void(const std::wstring&)> runBlockByName;
             std::unordered_set<std::wstring> blockCallStack;
 
-            auto executeOne = [this, &heldKeyVk, &repeatHeldKey, &runRange, &runningScriptPath, &activeActions](const ScriptAction& a) {
-                if (a.type == ActionType::MoveMouse) SetCursorPos(a.x + RandomInt(a.randomX), a.y + RandomInt(a.randomY));
+            auto executeOne = [this, &heldKeyVk, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen](const ScriptAction& a) {
+                if (a.type == ActionType::MoveMouse) {
+                    int x = a.x;
+                    int y = a.y;
+                    if (a.moveFromVar) {
+                        MacroVariableContext ctx;
+                        ctx.matchVars = &matchVars_;
+                        ctx.loopVars = &loopVars_;
+                        ctx.curLoops = curLoops_;
+                        if (!TryResolveIntOperand(a.moveVarExprX, ctx, x)) x = 0;
+                        if (!TryResolveIntOperand(a.moveVarExprY, ctx, y)) y = 0;
+                    }
+                    SetCursorPos(x + RandomInt(a.randomX), y + RandomInt(a.randomY));
+                }
                 else if (a.type == ActionType::Wait) {
                     const double totalSec = a.duration + RandomDelay(a.randomDuration);
                     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int>(totalSec * 1000.0));
                     while (!stopFlag_ && std::chrono::steady_clock::now() < end) {
-                        if (heldKeyVk != 0) {
-                            repeatHeldKey(heldKeyVk);
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        } else {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
                 }
-                else if (a.type == ActionType::MouseDown) { MarkSimulatedInput(); SendHeldModifiers(a, true); MouseButtonEvent(a.button, true); }
-                else if (a.type == ActionType::MouseUp) { MarkSimulatedInput(); MouseButtonEvent(a.button, false); SendHeldModifiers(a, false); }
-                else if (a.type == ActionType::MouseClick) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendHeldModifiers(a, true); MouseClick(a.button); SendHeldModifiers(a, false); } }
+                else if (a.type == ActionType::MouseDown) { MarkSimulatedInput(); SendHeldModifiers(a, true); MouseButtonEvent(a.button, true); UnmarkSimulatedInput(); }
+                else if (a.type == ActionType::MouseUp) { MarkSimulatedInput(); MouseButtonEvent(a.button, false); SendHeldModifiers(a, false); UnmarkSimulatedInput(); }
+                else if (a.type == ActionType::MouseClick) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendHeldModifiers(a, true); MouseClick(a.button); SendHeldModifiers(a, false); UnmarkSimulatedInput(); } }
                 else if (a.type == ActionType::KeyDown) {
+                    MarkSimulatedInput();
                     SendHeldModifiers(a, true);
                     SendKey(a.keyVk, true);
                     heldKeyVk = a.keyVk;
+                    UnmarkSimulatedInput();
                 }
                 else if (a.type == ActionType::KeyUp) {
+                    MarkSimulatedInput();
                     SendKey(a.keyVk, false);
                     if (heldKeyVk == a.keyVk) heldKeyVk = 0;
                     SendHeldModifiers(a, false);
+                    UnmarkSimulatedInput();
                 }
-                else if (a.type == ActionType::KeyClick) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { SendHeldModifiers(a, true); SendKey(a.keyVk, true); SendKey(a.keyVk, false); SendHeldModifiers(a, false); } }
-                else if (a.type == ActionType::HotkeyShortcut) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendShortcutCombo(a); } }
-                else if (a.type == ActionType::QuickInput) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendQuickInputText(ResolveQuickInputText(a.inputText), a.charInterval); } }
+                else if (a.type == ActionType::KeyClick) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendHeldModifiers(a, true); SendKey(a.keyVk, true); SendKey(a.keyVk, false); SendHeldModifiers(a, false); UnmarkSimulatedInput(); } }
+                else if (a.type == ActionType::HotkeyShortcut) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendShortcutCombo(a); UnmarkSimulatedInput(); } }
+                else if (a.type == ActionType::QuickInput) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) { SleepInterruptible(a.duration + RandomDelay(a.randomDuration)); if (!stopFlag_) { MarkSimulatedInput(); SendQuickInputText(ResolveQuickInputText(a.inputText), a.charInterval); UnmarkSimulatedInput(); } }
                 else if (a.type == ActionType::ScrollWheel) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) {
                     SleepInterruptible(a.duration + RandomDelay(a.randomDuration));
                     if (!stopFlag_) {
@@ -4167,6 +4333,7 @@ private:
                         const bool positive = a.scrollDirection == 0;
                         if (a.scrollVertical) SendMouseWheel(a.scrollSteps, true, false, positive);
                         if (a.scrollHorizontal) SendMouseWheel(a.scrollSteps, false, true, positive);
+                        UnmarkSimulatedInput();
                     }
                 }
                 else if (a.type == ActionType::FindImage) {
@@ -4186,7 +4353,13 @@ private:
                         opt.scaleStep = 0.05;
                         opt.maxMatches = 20;
                         opt.maxOverlap = 0.5;
-                        ImageMatchOutput output = FindTemplateOnScreenMulti(x1, y1, x2, y2, tmpl, opt);
+                        ImageMatchOutput output;
+                        if (lockedScreen_) {
+                            output = FindTemplateInFrozenScreenMulti(
+                                lockedScreen_, lockedVirtX_, lockedVirtY_, x1, y1, x2, y2, tmpl, opt);
+                        } else {
+                            output = FindTemplateOnScreenMulti(x1, y1, x2, y2, tmpl, opt);
+                        }
                         DeleteBitmapHandle(tmpl);
                         if (output.matches.empty()) return {};
                         return output.matches.front();
@@ -4204,6 +4377,7 @@ private:
                                 SetCursorPos(tx, ty);
                                 MarkSimulatedInput();
                                 MouseClick(MouseButtonType::Left);
+                                UnmarkSimulatedInput();
                             } else if (a.findImageFollowUp == 1) {
                                 SetCursorPos(tx, ty);
                             }
@@ -4226,6 +4400,16 @@ private:
                     runRange(0, nested.size());
                     activeActions = prevActions;
                     runningScriptPath = prevPath;
+                }
+                else if (a.type == ActionType::LockScreenshot) {
+                    clearLockedScreen();
+                    lockedScreen_ = CaptureVirtualScreen(lockedVirtX_, lockedVirtY_);
+                }
+                else if (a.type == ActionType::UnlockScreenshot) {
+                    clearLockedScreen();
+                }
+                else if (a.type == ActionType::StopMacro) {
+                    stopFlag_ = true;
                 }
                 else if (a.type == ActionType::MousePlayback) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) {
                     SleepInterruptible(a.duration + RandomDelay(a.randomDuration));
@@ -4271,8 +4455,14 @@ private:
                         const size_t bodyEnd = containerBodyEnd(i);
                         int iter = 1;
                         bool broke = false;
-                        while (!stopFlag_ && !broke && (a.loopCount < 0 || iter <= a.loopCount)) {
+                        while (!stopFlag_ && !broke) {
                             if (!a.loopVarName.empty()) loopVars_[a.loopVarName] = iter;
+                            MacroVariableContext ctx;
+                            ctx.matchVars = &matchVars_;
+                            ctx.loopVars = &loopVars_;
+                            ctx.curLoops = curLoops_;
+                            const int maxLoop = ResolveLoopMaxCount(a, ctx);
+                            if (!(maxLoop < 0 || iter <= maxLoop)) break;
                             broke = runRange(i + 1, bodyEnd);
                             ++iter;
                         }
@@ -4289,6 +4479,7 @@ private:
                         int elseIdx = -1;
                         for (size_t j = trueEnd; j < activeActions->size(); ++j) {
                             if ((*activeActions)[j].indent < level) break;
+                            if ((*activeActions)[j].indent == level && (*activeActions)[j].type == ActionType::If) break;
                             if ((*activeActions)[j].indent == level && (*activeActions)[j].type == ActionType::Else) {
                                 elseIdx = static_cast<int>(j);
                                 break;
@@ -4309,17 +4500,9 @@ private:
                     } else if (a.type == ActionType::RunBlock) {
                         runBlockByName(a.blockName);
                         ++i;
-                        if (heldKeyVk != 0 && !stopFlag_ && i < end) {
-                            repeatHeldKey(heldKeyVk);
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        }
                     } else {
                         executeOne(a);
                         ++i;
-                        if (heldKeyVk != 0 && !stopFlag_ && i < end) {
-                            repeatHeldKey(heldKeyVk);
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        }
                     }
                 }
                 return false;
@@ -4338,6 +4521,7 @@ private:
             if (stopFlag_) {
                 ReleaseAllHeldInputs();
             }
+            clearLockedScreen();
             PostMessageW(hwnd_, WM_RUN_DONE, 0, 0);
         });
     }
@@ -4362,6 +4546,7 @@ private:
                 SendInput(1, &input, sizeof(INPUT));
             }
         }
+        if (running_) UnmarkSimulatedInput();
     }
     void OnRunDone() { running_ = false; if (worker_.joinable()) worker_.join(); RemoveTray(); if (wasVisibleBeforeRun_) ShowWindow(hwnd_, wasMinimizedBeforeRun_ ? SW_MINIMIZE : SW_SHOW); }
     void AddTray() { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON; nid.uCallbackMessage = WM_TRAY; nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wcscpy_s(nid.szTip, L"鼠大侠-鼠标宏运行中"); Shell_NotifyIconW(NIM_ADD, &nid); }
@@ -4459,8 +4644,8 @@ private:
                 continue;
             }
 
-            // Key down / up
-            if (e.msg == WM_KEYDOWN) {
+            // Key down / up (including system keys like LWin/RWin)
+            if (e.msg == WM_KEYDOWN || e.msg == WM_SYSKEYDOWN) {
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
                 double gap = timeSec - prevSec;
                 if (gap > 0.001) {
@@ -4478,7 +4663,7 @@ private:
                 isKeyHeld = true;
                 continue;
             }
-            if (e.msg == WM_KEYUP) {
+            if (e.msg == WM_KEYUP || e.msg == WM_SYSKEYUP) {
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
                 double gap = timeSec - prevSec;
                 if (gap > 0.001) {
@@ -5924,16 +6109,8 @@ private:
         GetClientRect(hwnd_, &rc);
         FillAlphaRect(hdc, rc, RGB(0, 0, 0), 145);
         RECT d = DeleteDialogRect();
-        HBRUSH dialogBrush = CreateSolidBrush(RGB(18, 18, 18));
-        FillRect(hdc, &d, dialogBrush);
-        DeleteObject(dialogBrush);
-        HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
-        HGDIOBJ oldPen = SelectObject(hdc, borderPen);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        RoundRect(hdc, d.left, d.top, d.right, d.bottom, 6, 6);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(borderPen);
+        FillRectColor(hdc, d, RGB(18, 18, 18));
+        DrawBorderRoundRect(hdc, d, RGB(70, 70, 70), 6);
 
         std::wstring name = pendingDeleteIndex_ >= 0 && pendingDeleteIndex_ < static_cast<int>(scripts_.size()) ? scripts_[static_cast<size_t>(pendingDeleteIndex_)].name : L"";
         SelectObject(hdc, titleFont_);
@@ -5941,16 +6118,8 @@ private:
 
         RECT ok = DeleteOkRect();
         RECT cancel = DeleteCancelRect();
-        HBRUSH okBrush = CreateSolidBrush(RGB(255, 188, 75));
-        FillRect(hdc, &ok, okBrush);
-        DeleteObject(okBrush);
-        HPEN yellowPen = CreatePen(PS_SOLID, 1, RGB(255, 205, 95));
-        oldPen = SelectObject(hdc, yellowPen);
-        oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, cancel.left, cancel.top, cancel.right, cancel.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(yellowPen);
+        FillRectColor(hdc, ok, RGB(255, 188, 75));
+        DrawBorderRect(hdc, cancel, RGB(255, 205, 95));
         SelectObject(hdc, font_);
         DrawTextIn(hdc, L"确定", ok, RGB(70, 45, 10), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         DrawTextIn(hdc, L"取消", cancel, RGB(255, 226, 110), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -5971,7 +6140,7 @@ private:
 
     LRESULT OnCtlColor(HDC hdc) { SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, kText); return reinterpret_cast<LRESULT>(whiteBrush_); }
     LRESULT OnEditColor(HDC hdc) { SetBkMode(hdc, OPAQUE); SetTextColor(hdc, kText); SetBkColor(hdc, kWhite); return reinterpret_cast<LRESULT>(whiteBrush_); }
-    void Cleanup() { CloseEditorPopup(); CancelQuickInputTip(); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); RemoveTray(); UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(lineGreenBrush_); }
+    void Cleanup() { CloseEditorPopup(); CancelQuickInputTip(); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); RemoveTray(); UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() { if (recording_) { g_recording = false; recording_ = false; UninstallRecordingHooks(); } }
 
@@ -5979,7 +6148,7 @@ private:
     HWND name_ = nullptr; HWND mode_ = nullptr; HWND labelList_ = nullptr; HWND labelBatchCount_ = nullptr; HWND actionCombo_ = nullptr; HWND addBtn_ = nullptr; HWND modifyBtn_ = nullptr; HWND clearBtn_ = nullptr; HWND loadBtn_ = nullptr;
     HWND batchExitBtn_ = nullptr; HWND batchSelectAllBtn_ = nullptr; HWND batchDeselectBtn_ = nullptr; HWND batchDeleteBtn_ = nullptr; HWND batchCopyBtn_ = nullptr;
     HWND cancelBtn_ = nullptr; HWND saveBtn_ = nullptr; HWND crosshairBtn_ = nullptr;
-    HWND moveX_ = nullptr; HWND moveY_ = nullptr; HWND moveRandomX_ = nullptr; HWND moveRandomY_ = nullptr; HWND moveVarX_ = nullptr; HWND moveVarY_ = nullptr; HWND waitDuration_ = nullptr; HWND waitRandom_ = nullptr; HWND clickButton_ = nullptr; HWND clickCount_ = nullptr; HWND clickWait_ = nullptr; HWND clickRandom_ = nullptr;
+    HWND moveX_ = nullptr; HWND moveY_ = nullptr; HWND moveRandomX_ = nullptr; HWND moveRandomY_ = nullptr; HWND moveFromVar_ = nullptr; HWND moveVarX_ = nullptr; HWND moveVarY_ = nullptr; HWND waitDuration_ = nullptr; HWND waitRandom_ = nullptr; HWND clickButton_ = nullptr; HWND clickCount_ = nullptr; HWND clickWait_ = nullptr; HWND clickRandom_ = nullptr;
     HWND keyEdit_ = nullptr; HWND keyPressEdit_ = nullptr; HWND keyCount_ = nullptr; HWND keyWait_ = nullptr; HWND keyRandom_ = nullptr; HWND loopTypeCombo_ = nullptr; HWND loopCount_ = nullptr; HWND loopFromVar_ = nullptr; HWND loopVarExpr_ = nullptr; HWND loopVarName_ = nullptr; HWND defineBlockName_ = nullptr; HWND runBlockCombo_ = nullptr; HWND remarkLabel_ = nullptr; HWND remark_ = nullptr; HWND listRemarkEdit_ = nullptr;
     HWND clickLWin_ = nullptr; HWND clickRWin_ = nullptr; HWND clickLCtrl_ = nullptr; HWND clickRCtrl_ = nullptr; HWND clickLAlt_ = nullptr; HWND clickRAlt_ = nullptr; HWND clickLShift_ = nullptr; HWND clickRShift_ = nullptr;
     HWND mousePressButton_ = nullptr; HWND mousePressLWin_ = nullptr; HWND mousePressRWin_ = nullptr; HWND mousePressLCtrl_ = nullptr; HWND mousePressRCtrl_ = nullptr; HWND mousePressLAlt_ = nullptr; HWND mousePressRAlt_ = nullptr; HWND mousePressLShift_ = nullptr; HWND mousePressRShift_ = nullptr;
@@ -5995,7 +6164,7 @@ private:
     HWND findMatchThreshold_ = nullptr; HWND findScaleMin_ = nullptr; HWND findScaleMax_ = nullptr; HWND findOffsetX_ = nullptr; HWND findOffsetY_ = nullptr; HWND findSelectOffsetBtn_ = nullptr; HWND findUntilFound_ = nullptr; HWND findMatchVar_ = nullptr;
     HWND quickInputEdit_ = nullptr; HWND quickInputVarCombo_ = nullptr; HWND quickInputInsertBtn_ = nullptr; HWND quickInputCharInterval_ = nullptr; HWND quickInputCount_ = nullptr; HWND quickInputWait_ = nullptr; HWND quickInputRandom_ = nullptr;
     HWND ifVarCombo_ = nullptr; HWND ifOperatorCombo_ = nullptr; HWND ifValueEdit_ = nullptr; HWND ifConnectorCombo_ = nullptr; HWND ifAddConditionBtn_ = nullptr; HWND ifConditionList_ = nullptr;
-    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ifControls_, elseControls_;
+    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ifControls_, elseControls_, lockScreenshotControls_, unlockScreenshotControls_, stopMacroControls_;
     std::vector<EditorControlLayout> editorLayouts_;
     std::vector<HotkeyMenuItem> hotkeyMenuItems_;
     std::vector<ScriptMeta> scripts_; std::vector<ScriptMeta> recordings_; std::vector<ScriptAction> actions_;
@@ -6040,7 +6209,8 @@ private:
     std::unordered_map<std::wstring, ImageMatchResult> matchVars_;
     std::unordered_map<std::wstring, int> loopVars_;
     int curLoops_ = 0;
-    std::atomic<DWORD> suppressHotkeyStopUntilTick_{0};
+    std::atomic<int> simulatingInputDepth_{0};
+    DWORD lastHotkeyTick_ = 0;
     std::atomic_bool running_{false}, stopFlag_{false}; std::thread worker_; std::mt19937 rng_{std::random_device{}()};
     // Recording
     std::atomic_bool recording_{false};

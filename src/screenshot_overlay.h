@@ -64,6 +64,7 @@ private:
     std::function<void(RECT)> onConfirm_;
     std::wstring title_ = L"屏幕截图";
     bool resultCancelled_ = false;   // true when user cancelled (Esc/right-click), false when confirmed
+    bool pendingCancel_ = false;     // right-click DOWN consumed; waiting for UP before hiding
 
     // ── Screen resources ─────────────────────────────────────────
     HBITMAP screenBitmap_ = nullptr;

@@ -5,9 +5,7 @@
 // --------------------------------------------------
     void MainWindow::PaintActionListLocal(HDC hdc, int width, int height) {
         RECT outer{0, 0, width, height};
-        HBRUSH white = CreateSolidBrush(kWhite);
-        FillRect(hdc, &outer, white);
-        DeleteObject(white);
+        FillRectColor(hdc, outer, kWhite);
         const int pad = kListInnerPad;
         const int contentTop = pad + 1;
         const int contentRight = width - pad - (MaxEditorScroll() > 0 ? kEditorScrollW + 6 : 0);
@@ -25,9 +23,7 @@
             COLORREF bg = batchEditMode_
                 ? (batchChecked ? kBatchSelectedRow : (i == hoverIndex_ ? kHoverGray : kWhite))
                 : (i == selectedIndex_ ? kMainGreen : (i == hoverIndex_ ? kHoverGray : kWhite));
-            HBRUSH b = CreateSolidBrush(bg);
-            FillRect(hdc, &r, b);
-            DeleteObject(b);
+            FillRectColor(hdc, r, bg);
             const auto& a = actions_[static_cast<size_t>(i)];
             COLORREF fg = (!batchEditMode_ && i == selectedIndex_) ? kWhite : kText;
             const int textLeft = ActionTextLeftLocal(a.indent, a.type, batchEditMode_, pad);
@@ -66,9 +62,7 @@
         if (MaxEditorScroll() <= 0) return;
         const int pad = kListInnerPad;
         RECT track{width - kEditorScrollW - 4, pad + 2, width - pad - 4, height - pad - 2};
-        HBRUSH trackBrush = CreateSolidBrush(kScrollTrackGray);
-        FillRect(hdc, &track, trackBrush);
-        DeleteObject(trackBrush);
+        FillRectColor(hdc, track, kScrollTrackGray);
         RECT thumb = EditorScrollThumbRect();
         const int trackH = track.bottom - track.top;
         const int thumbH = thumb.bottom - thumb.top;
@@ -76,9 +70,7 @@
         const int range = std::max(1, trackH - thumbH);
         const int top = track.top + range * scrollOffset_ / std::max(1, maxScroll);
         RECT localThumb{track.left, top, track.right, top + thumbH};
-        HBRUSH thumbBrush = CreateSolidBrush(kScrollThumbGray);
-        FillRect(hdc, &localThumb, thumbBrush);
-        DeleteObject(thumbBrush);
+        FillRectColor(hdc, localThumb, kScrollThumbGray);
     }
 
 // --------------------------------------------------
@@ -87,9 +79,7 @@
         if (active) {
             FillGradientRect(hdc, rc, RGB(59, 157, 92), RGB(44, 128, 75), true);
         } else {
-            HBRUSH bg = CreateSolidBrush(kMainGreen);
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
+            FillRectColor(hdc, rc, kMainGreen);
         }
         DrawNavIcon(hdc, rc, iconType);
         SelectObject(hdc, homeTabFont_);
@@ -123,16 +113,8 @@
     void MainWindow::PaintClickerIntervalPopup(HDC hdc) {
         if (!clickerIntervalOpen_) return;
         RECT popup = ClickerIntervalPopupRect();
-        HBRUSH white = CreateSolidBrush(kWhite);
-        FillRect(hdc, &popup, white);
-        DeleteObject(white);
-        HPEN border = CreatePen(PS_SOLID, 1, kComboPopupBorderGray);
-        HGDIOBJ oldPen = SelectObject(hdc, border);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, popup.left, popup.top, popup.right, popup.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(border);
+        FillRectColor(hdc, popup, kWhite);
+        DrawBorderRect(hdc, popup, kComboPopupBorderGray);
 
         const quickscript::ClickIntervalMode modes[3] = {
             quickscript::ClickIntervalMode::Custom,
@@ -147,9 +129,7 @@
         for (int i = 0; i < 3; ++i) {
             RECT row = ClickerIntervalOptionRect(i);
             const bool checked = clickerSettings_.intervalMode == modes[i];
-            HBRUSH rowBrush = CreateSolidBrush(checked ? RGB(232, 245, 238) : kWhite);
-            FillRect(hdc, &row, rowBrush);
-            DeleteObject(rowBrush);
+            FillRectColor(hdc, row, checked ? RGB(232, 245, 238) : kWhite);
             RECT box{row.left + 20, row.top + 19, row.left + 38, row.top + 37};
             DrawListCheckbox(hdc, box, checked);
             DrawTextIn(hdc, ClickIntervalTitle(modes[i]), RECT{row.left + 78, row.top + 12, row.right - 20, row.top + 39}, RGB(50, 50, 50));
@@ -160,9 +140,7 @@
 // --------------------------------------------------
     void MainWindow::DrawEditorCombo(HDC hdc, HWND label, RECT rc, bool dropped) {
         const COLORREF borderColor = dropped ? kMainGreen : kComboBorderGray;
-        HBRUSH white = CreateSolidBrush(kWhite);
-        FillRect(hdc, &rc, white);
-        DeleteObject(white);
+        FillRectColor(hdc, rc, kWhite);
         const int arrowW = 26;
         DrawTextIn(hdc, GetText(label).empty() ? L" " : GetText(label), RECT{rc.left + 10, rc.top, rc.right - arrowW, rc.bottom}, kText);
         const int arrowCenterX = rc.right - arrowW / 2;
@@ -179,13 +157,7 @@
         SelectObject(hdc, oldBrush);
         SelectObject(hdc, oldPen);
         DeleteObject(arrowBrush);
-        HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
-        oldPen = SelectObject(hdc, borderPen);
-        oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(borderPen);
+        DrawBorderRect(hdc, rc, borderColor);
     }
 
 // --------------------------------------------------
@@ -194,16 +166,8 @@
         if (!pc || pc->items.empty()) return;
         RECT client{};
         GetClientRect(popupHwnd, &client);
-        HBRUSH white = CreateSolidBrush(kWhite);
-        FillRect(hdc, &client, white);
-        DeleteObject(white);
-        HPEN border = CreatePen(PS_SOLID, 1, kComboPopupBorderGray);
-        HGDIOBJ oldPen = SelectObject(hdc, border);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, client.left, client.top, client.right, client.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(border);
+        FillRectColor(hdc, client, kWhite);
+        DrawBorderRect(hdc, client, kComboPopupBorderGray);
         MoveToEx(hdc, client.right - 1, client.top, nullptr);
         LineTo(hdc, client.right - 1, client.bottom - 1);
 
@@ -221,24 +185,18 @@
             const bool selected = pc->sel == i;
             const bool hovered = !selected && editorPopupHover_ == i;
             COLORREF rowBg = selected ? kComboMenuSelectBlue : (hovered ? kComboMenuHoverBlue : kWhite);
-            HBRUSH rowBrush = CreateSolidBrush(rowBg);
-            FillRect(hdc, &row, rowBrush);
-            DeleteObject(rowBrush);
+            FillRectColor(hdc, row, rowBg);
             DrawTextIn(hdc, pc->items[static_cast<size_t>(i)], RECT{row.left + 10, row.top, row.right - 6, row.bottom},
                 selected ? kComboMenuSelectText : kText);
         }
         if (scrollMax > 0) {
             RECT track{client.right - 10, client.top + 1, client.right - 1, client.bottom - 1};
-            HBRUSH trackBrush = CreateSolidBrush(kComboScrollTrackGray);
-            FillRect(hdc, &track, trackBrush);
-            DeleteObject(trackBrush);
+            FillRectColor(hdc, track, kComboScrollTrackGray);
             const int trackH = track.bottom - track.top;
             const int thumbH = std::max(18, trackH * visible / total);
             const int thumbTop = track.top + (trackH - thumbH) * editorPopupScroll_ / scrollMax;
             RECT thumb{track.left, thumbTop, track.right, thumbTop + thumbH};
-            HBRUSH thumbBrush = CreateSolidBrush(kComboScrollThumbGray);
-            FillRect(hdc, &thumb, thumbBrush);
-            DeleteObject(thumbBrush);
+            FillRectColor(hdc, thumb, kComboScrollThumbGray);
         }
     }
 
@@ -280,16 +238,8 @@
     void MainWindow::PaintEditorTipPopupContent(HDC hdc, HWND popupHwnd) {
         RECT client{};
         GetClientRect(popupHwnd, &client);
-        HBRUSH bg = CreateSolidBrush(kWhite);
-        FillRect(hdc, &client, bg);
-        DeleteObject(bg);
-        HPEN pen = CreatePen(PS_SOLID, 1, kComboPopupBorderGray);
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, client.left, client.top, client.right, client.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
+        FillRectColor(hdc, client, kWhite);
+        DrawBorderRect(hdc, client, kComboPopupBorderGray);
         SelectObject(hdc, editorFont_);
         if (quickInputTipShown_ == QuickInputTipKind::TextExample) {
             DrawTextIn(hdc, kQuickInputTextExampleTip,
@@ -302,9 +252,7 @@
             if (idx < 0 || idx >= static_cast<int>(quickInputVarItems_.size())) return;
             const auto& item = quickInputVarItems_[static_cast<size_t>(idx)];
             RECT header{client.left + 1, client.top + 1, client.right - 1, client.top + 25};
-            HBRUSH headerBrush = CreateSolidBrush(kComboMenuHoverBlue);
-            FillRect(hdc, &header, headerBrush);
-            DeleteObject(headerBrush);
+            FillRectColor(hdc, header, kComboMenuHoverBlue);
             DrawTextIn(hdc, item.display, RECT{header.left + 8, header.top, header.right - 4, header.bottom}, kText);
             DrawTextIn(hdc, item.tooltip,
                 RECT{client.left + 8, client.top + 28, client.right - 8, client.bottom - 4}, kText,
@@ -355,13 +303,7 @@
         if (!ctrl || !IsWindowVisible(ctrl)) return;
         RECT rc = WindowClientRect(ctrl);
         if (ctrl != name_) InflateRect(&rc, 1, 1);
-        HPEN pen = CreatePen(PS_SOLID, 1, kLineGreen);
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
+        DrawBorderRect(hdc, rc, kLineGreen);
     }
 
 // --------------------------------------------------
