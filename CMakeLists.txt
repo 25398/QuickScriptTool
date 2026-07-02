@@ -29,6 +29,7 @@ add_executable(QuickScriptTool WIN32
     src/editor_dropdown.cpp
     src/hotkey_dialog.cpp
     src/image_match.cpp
+    src/image_match_engines.cpp
     src/macro_variables.cpp
     src/match_overlay.cpp
     src/popup_combo.cpp

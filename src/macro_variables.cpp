@@ -1,5 +1,7 @@
 #include "macro_variables.h"
 
+#include <algorithm>
+#include <cmath>
 #include <unordered_set>
 
 namespace {
@@ -44,6 +46,131 @@ std::wstring LookupMatchVarProperty(const ImageMatchResult& match, const std::ws
     if (prop == L"x1") return std::to_wstring(match.bottomRightX);
     if (prop == L"y1") return std::to_wstring(match.bottomRightY);
     return L"";
+}
+
+std::wstring TrimToken(const std::wstring& text) {
+    size_t start = 0;
+    while (start < text.size() && iswspace(text[start])) ++start;
+    size_t end = text.size();
+    while (end > start && iswspace(text[end - 1])) --end;
+    return text.substr(start, end - start);
+}
+
+std::wstring ResolveConditionOperand(const std::wstring& token, const MacroVariableContext& ctx) {
+    std::wstring t = TrimToken(token);
+    if (t.empty()) return L"";
+
+    if (t.front() == L'{' && t.back() == L'}') {
+        return ResolveMacroVariables(t, ctx);
+    }
+
+    if (t == L"ctrl:CurLoops()") {
+        return std::to_wstring(ctx.curLoops);
+    }
+
+    const size_t dot = t.find(L'.');
+    if (dot != std::wstring::npos && ctx.matchVars) {
+        const std::wstring varName = t.substr(0, dot);
+        const std::wstring prop = t.substr(dot + 1);
+        const auto it = ctx.matchVars->find(varName);
+        if (it != ctx.matchVars->end()) {
+            return LookupMatchVarProperty(it->second, prop);
+        }
+    }
+
+    if (ctx.loopVars) {
+        const auto it = ctx.loopVars->find(t);
+        if (it != ctx.loopVars->end()) {
+            return std::to_wstring(it->second);
+        }
+    }
+
+    return ResolveMacroVariables(L"{" + t + L"}", ctx);
+}
+
+bool TryParseDouble(const std::wstring& text, double& out) {
+    if (text.empty()) return false;
+    wchar_t* end = nullptr;
+    out = wcstod(text.c_str(), &end);
+    return end != text.c_str() && *end == L'\0';
+}
+
+int CompareResolvedValues(const std::wstring& left, const std::wstring& right) {
+    double lNum = 0.0, rNum = 0.0;
+    if (TryParseDouble(left, lNum) && TryParseDouble(right, rNum)) {
+        if (lNum < rNum) return -1;
+        if (lNum > rNum) return 1;
+        return 0;
+    }
+    return left.compare(right);
+}
+
+bool EvalSingleClause(const std::wstring& clause, const MacroVariableContext& ctx) {
+    const std::wstring c = TrimToken(clause);
+    if (c.empty()) return false;
+
+    static const struct { const wchar_t* op; size_t len; } ops[] = {
+        { L"==", 2 }, { L"!=", 2 }, { L"<=", 2 }, { L">=", 2 },
+        { L">>", 2 }, { L"<", 1 }, { L">", 1 },
+    };
+    for (const auto& op : ops) {
+        const size_t pos = c.find(op.op);
+        if (pos == std::wstring::npos) continue;
+        const std::wstring left = TrimToken(c.substr(0, pos));
+        const std::wstring right = TrimToken(c.substr(pos + op.len));
+        const std::wstring lVal = ResolveConditionOperand(left, ctx);
+        const std::wstring rVal = ResolveConditionOperand(right, ctx);
+        if (wcscmp(op.op, L">>") == 0) {
+            return lVal.find(rVal) != std::wstring::npos;
+        }
+        const int cmp = CompareResolvedValues(lVal, rVal);
+        if (wcscmp(op.op, L"==") == 0) return cmp == 0;
+        if (wcscmp(op.op, L"!=") == 0) return cmp != 0;
+        if (wcscmp(op.op, L"<") == 0) return cmp < 0;
+        if (wcscmp(op.op, L"<=") == 0) return cmp <= 0;
+        if (wcscmp(op.op, L">") == 0) return cmp > 0;
+        if (wcscmp(op.op, L">=") == 0) return cmp >= 0;
+    }
+    return false;
+}
+
+struct ConditionPart {
+    std::wstring clause;
+    std::wstring connector;
+};
+
+std::vector<ConditionPart> ParseConditionParts(const std::wstring& expr) {
+    std::vector<ConditionPart> parts;
+    std::wstring line;
+    for (size_t i = 0; i <= expr.size(); ++i) {
+        const wchar_t ch = i < expr.size() ? expr[i] : L'\n';
+        if (ch == L'\r' || ch == L'\n') {
+            if (!line.empty()) {
+                std::wstring trimmed = TrimToken(line);
+                if (!trimmed.empty()) {
+                    ConditionPart part{};
+                    size_t connPos = trimmed.rfind(L' ');
+                    if (connPos != std::wstring::npos) {
+                        const std::wstring maybeConn = TrimToken(trimmed.substr(connPos + 1));
+                        if (maybeConn == L"and" || maybeConn == L"or" || maybeConn == L"not") {
+                            part.clause = TrimToken(trimmed.substr(0, connPos));
+                            part.connector = maybeConn;
+                        } else {
+                            part.clause = trimmed;
+                        }
+                    } else {
+                        part.clause = trimmed;
+                    }
+                    if (!part.clause.empty()) parts.push_back(part);
+                }
+                line.clear();
+            }
+            if (ch == L'\r' && i + 1 < expr.size() && expr[i + 1] == L'\n') ++i;
+            continue;
+        }
+        line.push_back(ch);
+    }
+    return parts;
 }
 
 }  // namespace
@@ -132,4 +259,19 @@ std::wstring DecodeQuickInputEscapes(const std::wstring& text) {
         }
     }
     return out;
+}
+
+bool EvaluateConditionExpr(const std::wstring& expr, const MacroVariableContext& ctx) {
+    const auto parts = ParseConditionParts(expr);
+    if (parts.empty()) return false;
+
+    bool result = EvalSingleClause(parts[0].clause, ctx);
+    for (size_t i = 1; i < parts.size(); ++i) {
+        const bool next = EvalSingleClause(parts[i].clause, ctx);
+        const std::wstring& conn = parts[i - 1].connector;
+        if (conn == L"or") result = result || next;
+        else if (conn == L"not") result = result && !next;
+        else result = result && next;
+    }
+    return result;
 }

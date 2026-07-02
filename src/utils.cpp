@@ -1,6 +1,11 @@
 // ── 通用工具函数实现 ──────────────────────────────────────────
 #include "utils.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <unordered_set>
+
 // ── 字符串处理 ────────────────────────────────────────────────────
 std::wstring Trim(const std::wstring& value) {
     const auto first = value.find_first_not_of(L" \t\r\n");
@@ -229,13 +234,505 @@ double ExtractNumber(const std::wstring& src,
 }
 
 int CountActionsInJson(const std::wstring& content) {
-    int count = 0;
-    size_t pos = 0;
-    while ((pos = content.find(L"\"type\"", pos)) != std::wstring::npos) {
-        ++count;
-        pos += 6;
+    return static_cast<int>(ExtractJsonActionBlocks(content).size());
+}
+
+std::wstring UpdateJsonStringField(const std::wstring& content,
+                                    const std::wstring& key,
+                                    const std::wstring& value) {
+    const auto pos = content.find(L"\"" + key + L"\"");
+    if (pos == std::wstring::npos) return content;
+    const auto colon = content.find(L':', pos);
+    if (colon == std::wstring::npos) return content;
+    const auto firstQuote = content.find(L'\"', colon + 1);
+    if (firstQuote == std::wstring::npos) return content;
+    const size_t secondQuote = FindJsonStringEnd(content, firstQuote);
+    if (secondQuote == std::wstring::npos) return content;
+    std::wstring out = content;
+    out.replace(firstQuote + 1, secondQuote - firstQuote - 1, EscapeJson(value));
+    return out;
+}
+
+// ── 图片管理 ──────────────────────────────────────────────────────
+std::wstring FindImagesDir() {
+    return ScriptsDir() + L"\\images";
+}
+
+void EnsureFindImagesDir() {
+    CreateDirectoryW(ScriptsDir().c_str(), nullptr);
+    CreateDirectoryW(FindImagesDir().c_str(), nullptr);
+}
+
+bool IsPathInImageDir(const std::wstring& path) {
+    if (path.empty()) return false;
+    const std::wstring imgDir = FindImagesDir() + L"\\";
+    return path.size() >= imgDir.size() &&
+           _wcsnicmp(path.c_str(), imgDir.c_str(), imgDir.size()) == 0;
+}
+
+static bool IsAbsolutePath(const std::wstring& path) {
+    if (path.size() >= 2 && path[1] == L':') return true;
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') return true;
+    return false;
+}
+
+std::wstring ResolveImagePath(const std::wstring& stored) {
+    if (stored.empty()) return L"";
+    if (IsAbsolutePath(stored)) return stored;
+    std::wstring normalized = stored;
+    for (wchar_t& ch : normalized) {
+        if (ch == L'/') ch = L'\\';
     }
-    return count;
+    if (normalized.rfind(L"images\\", 0) == 0) {
+        return ScriptsDir() + L"\\" + normalized;
+    }
+    if (normalized.find(L'\\') == std::wstring::npos) {
+        return FindImagesDir() + L"\\" + normalized;
+    }
+    return ScriptsDir() + L"\\" + normalized;
+}
+
+std::wstring ImagePathForJson(const std::wstring& absolutePath) {
+    if (absolutePath.empty()) return L"";
+    std::wstring normalized = absolutePath;
+    for (wchar_t& ch : normalized) {
+        if (ch == L'/') ch = L'\\';
+    }
+    const std::wstring imgDir = FindImagesDir();
+    if (_wcsnicmp(normalized.c_str(), imgDir.c_str(), imgDir.size()) == 0) {
+        const wchar_t* rest = normalized.c_str() + imgDir.size();
+        if (*rest == L'\\') ++rest;
+        if (*rest == L'\0') return L"";
+        return L"images\\" + std::wstring(rest);
+    }
+    const auto slash = normalized.find_last_of(L"\\/");
+    const std::wstring fileName = slash == std::wstring::npos ? normalized : normalized.substr(slash + 1);
+    return fileName.empty() ? L"" : L"images\\" + fileName;
+}
+
+std::wstring EnsureImageInLibrary(const std::wstring& path) {
+    if (path.empty()) return L"";
+    const std::wstring resolved = ResolveImagePath(path);
+    if (IsPathInImageDir(resolved) &&
+        GetFileAttributesW(resolved.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return resolved;
+    }
+    const std::wstring source = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES ? path : resolved;
+    if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES) return resolved;
+
+    EnsureFindImagesDir();
+    const auto slash = source.find_last_of(L"\\/");
+    std::wstring fileName = slash == std::wstring::npos ? source : source.substr(slash + 1);
+    if (fileName.empty()) return resolved;
+
+    std::wstring dest = FindImagesDir() + L"\\" + fileName;
+    if (GetFileAttributesW(dest.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const auto dot = fileName.find_last_of(L'.');
+        const std::wstring stem = dot == std::wstring::npos ? fileName : fileName.substr(0, dot);
+        const std::wstring ext = dot == std::wstring::npos ? L"" : fileName.substr(dot);
+        dest = FindImagesDir() + L"\\" + stem + L"_" + std::to_wstring(GetTickCount()) + ext;
+    }
+    if (CopyFileW(source.c_str(), dest.c_str(), FALSE)) return dest;
+    return resolved;
+}
+
+std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& jsonContent) {
+    std::unordered_set<std::wstring> paths;
+    const auto blocks = ExtractJsonActionBlocks(jsonContent);
+    for (const auto& block : blocks) {
+        const auto type = ExtractString(block, L"type");
+        if (type == L"findImage") {
+            const auto imgPath = ExtractString(block, L"imagePath");
+            if (!imgPath.empty()) {
+                paths.insert(ResolveImagePath(imgPath));
+            }
+        }
+    }
+    return paths;
+}
+
+std::unordered_set<std::wstring> CollectAllReferencedImages() {
+    std::unordered_set<std::wstring> allPaths;
+    WIN32_FIND_DATAW fd{};
+    const auto scriptsDir = ScriptsDir();
+    const auto recordingsDir = RecordingsDir();
+    const std::vector<std::wstring> dirs = {scriptsDir, recordingsDir};
+    for (const auto& dir : dirs) {
+        const std::wstring pattern = dir + L"\\*.json";
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::wstring filePath = dir + L"\\" + fd.cFileName;
+            const auto content = ReadAll(filePath);
+            if (content.empty()) continue;
+            auto imgPaths = CollectImagePathsFromJson(content);
+            allPaths.insert(imgPaths.begin(), imgPaths.end());
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    return allPaths;
+}
+
+int CleanOrphanImages() {
+    const auto imgDir = FindImagesDir();
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = imgDir + L"\\*.*";
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
+    const auto referenced = CollectAllReferencedImages();
+    int deleted = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring filePath = imgDir + L"\\" + fd.cFileName;
+        bool isReferenced = referenced.find(filePath) != referenced.end();
+        if (!isReferenced) {
+            for (const auto& ref : referenced) {
+                if (_wcsicmp(ref.c_str(), filePath.c_str()) == 0) {
+                    isReferenced = true;
+                    break;
+                }
+            }
+        }
+        if (!isReferenced && DeleteFileW(filePath.c_str())) ++deleted;
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+    return deleted;
+}
+
+void DeleteUnreferencedImagesOfScript(const std::wstring& scriptPath) {
+    if (scriptPath.empty()) return;
+    const auto content = ReadAll(scriptPath);
+    if (content.empty()) return;
+    const auto scriptImages = CollectImagePathsFromJson(content);
+    if (scriptImages.empty()) return;
+    // 检查其他脚本是否引用了这些图片
+    const auto allReferenced = CollectAllReferencedImages();
+    // 注意：CollectAllReferencedImages 会包含当前脚本的引用（因为文件还在），
+    // 但实际上我们在删除脚本文件之后才调用此函数，所以文件已经不存在了。
+    // 这里传入的是路径，但脚本可能已被删除。为了安全，我们重新收集所有引用（排除当前脚本）。
+    // 由于当前脚本文件可能已被删除，CollectAllReferencedImages 已经不会包含它的引用了。
+    // 所以我们直接检查 allReferenced 中是否包含这些图片即可。
+    // 但如果脚本文件尚未删除，我们需要排除当前脚本的引用。
+    
+    // 为安全起见，手动排除当前脚本的引用后检查
+    std::unordered_set<std::wstring> otherRefs;
+    const auto scriptsDir = ScriptsDir();
+    const auto recordingsDir = RecordingsDir();
+    const std::vector<std::wstring> dirs = {scriptsDir, recordingsDir};
+    WIN32_FIND_DATAW fd{};
+    for (const auto& dir : dirs) {
+        const std::wstring pattern = dir + L"\\*.json";
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::wstring fp = dir + L"\\" + fd.cFileName;
+            if (_wcsicmp(fp.c_str(), scriptPath.c_str()) == 0) continue; // 跳过当前脚本
+            const auto c = ReadAll(fp);
+            if (!c.empty()) {
+                auto imgs = CollectImagePathsFromJson(c);
+                otherRefs.insert(imgs.begin(), imgs.end());
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    for (const auto& img : scriptImages) {
+        if (otherRefs.find(img) == otherRefs.end()) {
+            DeleteFileW(img.c_str());
+        }
+    }
+}
+
+// ── ZIP 压缩包操作（stored 方式）────────────────────────────────
+
+#pragma pack(push, 1)
+struct ZipLocalFileHeader {
+    uint32_t signature = 0x04034b50;
+    uint16_t versionNeeded = 20;
+    uint16_t flags = 0;
+    uint16_t compression = 0; // 0 = stored
+    uint16_t modTime = 0;
+    uint16_t modDate = 0;
+    uint32_t crc32 = 0;
+    uint32_t compSize = 0;
+    uint32_t uncompSize = 0;
+    uint16_t fileNameLen = 0;
+    uint16_t extraLen = 0;
+};
+
+struct ZipCentralDirHeader {
+    uint32_t signature = 0x02014b50;
+    uint16_t versionMadeBy = 20;
+    uint16_t versionNeeded = 20;
+    uint16_t flags = 0;
+    uint16_t compression = 0;
+    uint16_t modTime = 0;
+    uint16_t modDate = 0;
+    uint32_t crc32 = 0;
+    uint32_t compSize = 0;
+    uint32_t uncompSize = 0;
+    uint16_t fileNameLen = 0;
+    uint16_t extraLen = 0;
+    uint16_t commentLen = 0;
+    uint16_t diskStart = 0;
+    uint16_t internalAttr = 0;
+    uint32_t externalAttr = 0;
+    uint32_t localHeaderOffset = 0;
+};
+
+struct ZipEndOfCentralDir {
+    uint32_t signature = 0x06054b50;
+    uint16_t diskNum = 0;
+    uint16_t centralDirDisk = 0;
+    uint16_t entriesOnDisk = 0;
+    uint16_t totalEntries = 0;
+    uint32_t centralDirSize = 0;
+    uint32_t centralDirOffset = 0;
+    uint16_t commentLen = 0;
+};
+#pragma pack(pop)
+
+static uint32_t ComputeCrc32(const void* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= p[i];
+        for (int j = 0; j < 8; ++j) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320;
+            else crc >>= 1;
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+static std::string ArchiveNameUtf8(const std::wstring& ws) {
+    if (ws.empty()) return "";
+    const int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return "";
+    std::string out(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+static bool ReadBinaryFileW(const std::wstring& path, std::vector<uint8_t>& out) {
+    out.clear();
+    const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > 0x7FFFFFFF) {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    const BOOL ok = ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+    CloseHandle(h);
+    return ok && read == out.size();
+}
+
+static bool WriteAllBytes(HANDLE h, const void* data, size_t size) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    size_t written = 0;
+    while (written < size) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(size - written, 0x7FFFFFFF));
+        DWORD n = 0;
+        if (!WriteFile(h, p + written, chunk, &n, nullptr) || n == 0) return false;
+        written += n;
+    }
+    return true;
+}
+
+static bool FindEocdInBuffer(const std::vector<uint8_t>& buf, ZipEndOfCentralDir& eocd, uint32_t& eocdOffset) {
+    if (buf.size() < sizeof(ZipEndOfCentralDir)) return false;
+    const size_t searchStart = (buf.size() > 65557) ? (buf.size() - 65557) : 0;
+    for (size_t pos = searchStart; pos + 4 <= buf.size(); ++pos) {
+        uint32_t sig = 0;
+        memcpy(&sig, buf.data() + pos, 4);
+        if (sig == 0x06054b50) {
+            if (pos + sizeof(ZipEndOfCentralDir) > buf.size()) return false;
+            memcpy(&eocd, buf.data() + pos, sizeof(eocd));
+            eocdOffset = static_cast<uint32_t>(pos);
+            return true;
+        }
+    }
+    return false;
+}
+
+CreateZipResult CreateZipFile(const std::wstring& zipPath,
+                              const std::vector<std::pair<std::wstring, std::wstring>>& files,
+                              const std::wstring& requiredLocalPath) {
+    CreateZipResult result{};
+    struct FileEntry {
+        std::string name;
+        std::vector<uint8_t> data;
+        uint32_t crc32 = 0;
+    };
+    std::vector<FileEntry> entries;
+    entries.reserve(files.size());
+
+    for (const auto& [archiveName, localPath] : files) {
+        std::vector<uint8_t> data;
+        if (!ReadBinaryFileW(localPath, data)) {
+            if (!requiredLocalPath.empty() && _wcsicmp(localPath.c_str(), requiredLocalPath.c_str()) == 0) {
+                return result;
+            }
+            result.skippedFiles.push_back(localPath);
+            continue;
+        }
+        FileEntry entry;
+        entry.name = ArchiveNameUtf8(archiveName);
+        if (entry.name.empty()) {
+            result.skippedFiles.push_back(localPath);
+            continue;
+        }
+        entry.data = std::move(data);
+        entry.crc32 = ComputeCrc32(entry.data.data(), entry.data.size());
+        entries.push_back(std::move(entry));
+    }
+    if (entries.empty()) return result;
+
+    std::vector<uint32_t> localOffsets;
+    localOffsets.reserve(entries.size());
+    uint32_t offset = 0;
+    for (const auto& e : entries) {
+        localOffsets.push_back(offset);
+        offset += static_cast<uint32_t>(sizeof(ZipLocalFileHeader) + e.name.size() + e.data.size());
+    }
+    const uint32_t centralDirStart = offset;
+
+    const HANDLE h = CreateFileW(zipPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return result;
+
+    auto fail = [&]() {
+        CloseHandle(h);
+        DeleteFileW(zipPath.c_str());
+        result.success = false;
+        return result;
+    };
+
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
+        ZipLocalFileHeader lh{};
+        lh.compSize = static_cast<uint32_t>(e.data.size());
+        lh.uncompSize = static_cast<uint32_t>(e.data.size());
+        lh.crc32 = e.crc32;
+        lh.fileNameLen = static_cast<uint16_t>(e.name.size());
+        if (!WriteAllBytes(h, &lh, sizeof(lh)) ||
+            !WriteAllBytes(h, e.name.data(), e.name.size()) ||
+            !WriteAllBytes(h, e.data.data(), e.data.size())) {
+            return fail();
+        }
+    }
+
+    uint32_t centralDirSize = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
+        ZipCentralDirHeader cd{};
+        cd.compSize = static_cast<uint32_t>(e.data.size());
+        cd.uncompSize = static_cast<uint32_t>(e.data.size());
+        cd.crc32 = e.crc32;
+        cd.fileNameLen = static_cast<uint16_t>(e.name.size());
+        cd.localHeaderOffset = localOffsets[i];
+        centralDirSize += static_cast<uint32_t>(sizeof(ZipCentralDirHeader) + e.name.size());
+        if (!WriteAllBytes(h, &cd, sizeof(cd)) ||
+            !WriteAllBytes(h, e.name.data(), e.name.size())) {
+            return fail();
+        }
+    }
+
+    ZipEndOfCentralDir eocd{};
+    eocd.entriesOnDisk = static_cast<uint16_t>(entries.size());
+    eocd.totalEntries = static_cast<uint16_t>(entries.size());
+    eocd.centralDirSize = centralDirSize;
+    eocd.centralDirOffset = centralDirStart;
+    if (!WriteAllBytes(h, &eocd, sizeof(eocd))) {
+        return fail();
+    }
+
+    CloseHandle(h);
+    result.success = true;
+    return result;
+}
+
+int ExtractZipFile(const std::wstring& zipPath, const std::wstring& destDir) {
+    std::vector<uint8_t> buf;
+    if (!ReadBinaryFileW(zipPath, buf)) return -1;
+
+    ZipEndOfCentralDir eocd{};
+    uint32_t eocdOffset = 0;
+    if (!FindEocdInBuffer(buf, eocd, eocdOffset)) return -1;
+    if (eocd.totalEntries == 0) return 0;
+
+    CreateDirectoryW(destDir.c_str(), nullptr);
+
+    size_t pos = eocd.centralDirOffset;
+    int extracted = 0;
+    for (uint16_t i = 0; i < eocd.totalEntries; ++i) {
+        if (pos + sizeof(ZipCentralDirHeader) > buf.size()) break;
+        ZipCentralDirHeader cd{};
+        memcpy(&cd, buf.data() + pos, sizeof(cd));
+        pos += sizeof(cd);
+        if (cd.signature != 0x02014b50) break;
+
+        if (pos + cd.fileNameLen > buf.size()) break;
+        std::string archiveName(reinterpret_cast<const char*>(buf.data() + pos), cd.fileNameLen);
+        pos += cd.fileNameLen + cd.extraLen + cd.commentLen;
+
+        if (!archiveName.empty() && archiveName.back() == '/') continue;
+
+        if (cd.localHeaderOffset + sizeof(ZipLocalFileHeader) > buf.size()) continue;
+        ZipLocalFileHeader lh{};
+        memcpy(&lh, buf.data() + cd.localHeaderOffset, sizeof(lh));
+        if (lh.signature != 0x04034b50) continue;
+
+        const size_t dataOffset = cd.localHeaderOffset + sizeof(ZipLocalFileHeader)
+            + lh.fileNameLen + lh.extraLen;
+        if (dataOffset + cd.compSize > buf.size()) continue;
+
+        const std::wstring destPath = destDir + L"\\" +
+            std::wstring(archiveName.begin(), archiveName.end());
+        const HANDLE h = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        const bool ok = WriteAllBytes(h, buf.data() + dataOffset, cd.compSize);
+        CloseHandle(h);
+        if (ok) ++extracted;
+    }
+    return extracted;
+}
+
+std::string ReadTextFromZip(const std::wstring& zipPath, const std::string& archiveName) {
+    std::vector<uint8_t> buf;
+    if (!ReadBinaryFileW(zipPath, buf)) return "";
+
+    ZipEndOfCentralDir eocd{};
+    uint32_t eocdOffset = 0;
+    if (!FindEocdInBuffer(buf, eocd, eocdOffset)) return "";
+
+    size_t pos = eocd.centralDirOffset;
+    for (uint16_t i = 0; i < eocd.totalEntries; ++i) {
+        if (pos + sizeof(ZipCentralDirHeader) > buf.size()) break;
+        ZipCentralDirHeader cd{};
+        memcpy(&cd, buf.data() + pos, sizeof(cd));
+        pos += sizeof(cd);
+        if (cd.signature != 0x02014b50) break;
+
+        if (pos + cd.fileNameLen > buf.size()) break;
+        std::string name(reinterpret_cast<const char*>(buf.data() + pos), cd.fileNameLen);
+        pos += cd.fileNameLen + cd.extraLen + cd.commentLen;
+
+        if (name == archiveName && cd.compSize > 0) {
+            if (cd.localHeaderOffset + sizeof(ZipLocalFileHeader) > buf.size()) return "";
+            ZipLocalFileHeader lh{};
+            memcpy(&lh, buf.data() + cd.localHeaderOffset, sizeof(lh));
+            const size_t dataOffset = cd.localHeaderOffset + sizeof(ZipLocalFileHeader)
+                + lh.fileNameLen + lh.extraLen;
+            if (dataOffset + cd.compSize > buf.size()) return "";
+            return std::string(reinterpret_cast<const char*>(buf.data() + dataOffset), cd.compSize);
+        }
+    }
+    return "";
 }
 
 // ── 热键与按键名称 ────────────────────────────────────────────────

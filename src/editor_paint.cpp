@@ -343,6 +343,9 @@
         if (IsParamComboVisible(9)) DrawEditorCombo(hdc, mousePlaybackCombo_, WindowClientRect(mousePlaybackCombo_), editorPopupOpen_ == 9);
         if (IsParamComboVisible(10)) DrawEditorCombo(hdc, scrollDirectionCombo_, WindowClientRect(scrollDirectionCombo_), editorPopupOpen_ == 10);
         if (IsParamComboVisible(11)) DrawEditorCombo(hdc, findFollowUpCombo_, WindowClientRect(findFollowUpCombo_), editorPopupOpen_ == 11);
+        if (IsParamComboVisible(12)) DrawEditorCombo(hdc, ifVarCombo_, WindowClientRect(ifVarCombo_), editorPopupOpen_ == 12);
+        if (IsParamComboVisible(13)) DrawEditorCombo(hdc, ifOperatorCombo_, WindowClientRect(ifOperatorCombo_), editorPopupOpen_ == 13);
+        if (IsParamComboVisible(14)) DrawEditorCombo(hdc, ifConnectorCombo_, WindowClientRect(ifConnectorCombo_), editorPopupOpen_ == 14);
         PaintActionList(hdc);
         PaintDragMarker(hdc);
     }

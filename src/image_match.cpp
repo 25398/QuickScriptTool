@@ -1,27 +1,26 @@
-// image_match.cpp — OpenCV pyramid + multi-scale template matching
+// image_match.cpp — OpenCV pyramid + multi-engine consensus template matching
 //
-// Algorithm (参考 MatchTool / OpenCV matchTemplate):
-//   1. Convert screen/template to grayscale cv::Mat
-//   2. For each scale in [scaleMin, scaleMax]:
-//      a. Resize template
-//      b. Build image pyramids (cv::buildPyramid)
-//      c. Top-level exhaustive TM_CCOEFF_NORMED scan, collect peaks
-//      d. Cascade refine through finer pyramid levels (±window search)
-//   3. Global NMS across all scales, sort by score, return top N matches
+// Primary path: 3 independent pyramid matchers (NCC / SQDIFF / CCORR) run in
+// parallel, plus SIMD SAD patch verification. A location is accepted only when
+// all engines agree within tolerance.
 
 #include "image_match.h"
 
+#include "image_match_engines.h"
+#include "image_match_internal.h"
+
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-#include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace {
+
+using namespace image_match_internal;
 
 struct RawBitmap {
     int width = 0;
@@ -53,15 +52,28 @@ bool ReadBitmapPixels(HBITMAP bitmap, RawBitmap& out) {
     return lines > 0;
 }
 
-cv::Mat BitmapToGrayMat(HBITMAP bitmap) {
+cv::Mat BitmapToBgrMat(HBITMAP bitmap) {
     RawBitmap raw{};
     if (!ReadBitmapPixels(bitmap, raw)) return {};
     cv::Mat bgra(raw.height, raw.width, CV_8UC4, raw.pixels.data());
     cv::Mat bgr;
     cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+    return bgr.clone();
+}
+
+cv::Mat BitmapToGrayMat(HBITMAP bitmap) {
+    const cv::Mat bgr = BitmapToBgrMat(bitmap);
+    if (bgr.empty()) return {};
     cv::Mat gray;
     cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-    return gray.clone();
+    return gray;
+}
+
+cv::Mat CropBgrMat(const cv::Mat& full, int x, int y, int w, int h) {
+    const cv::Rect roi(x, y, w, h);
+    if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > full.cols || roi.y + roi.height > full.rows)
+        return {};
+    return full(roi).clone();
 }
 
 cv::Mat CropGrayMat(const cv::Mat& full, int x, int y, int w, int h) {
@@ -69,270 +81,6 @@ cv::Mat CropGrayMat(const cv::Mat& full, int x, int y, int w, int h) {
     if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > full.cols || roi.y + roi.height > full.rows)
         return {};
     return full(roi).clone();
-}
-
-int CalcPyramidLevels(int tplW, int tplH) {
-    int levels = 0;
-    int w = tplW;
-    int h = tplH;
-    while (w >= 8 && h >= 8) {
-        w /= 2;
-        h /= 2;
-        ++levels;
-    }
-    return levels;
-}
-
-void BuildPyramid(const cv::Mat& src, std::vector<cv::Mat>& out, int levels) {
-    out.clear();
-    out.reserve(static_cast<size_t>(levels) + 1);
-    cv::buildPyramid(src, out, levels);
-}
-
-void SuppressPeak(cv::Mat& result, cv::Point pt, int tplW, int tplH, double maxOverlap) {
-    const int padX = std::max(1, static_cast<int>(tplW * (1.0 - maxOverlap)));
-    const int padY = std::max(1, static_cast<int>(tplH * (1.0 - maxOverlap)));
-    const int x1 = std::max(0, pt.x - padX);
-    const int y1 = std::max(0, pt.y - padY);
-    const int x2 = std::min(result.cols - 1, pt.x + padX);
-    const int y2 = std::min(result.rows - 1, pt.y + padY);
-    cv::rectangle(result, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(-1.0), cv::FILLED);
-}
-
-std::vector<std::pair<cv::Point, double>> FindPeaks(
-    const cv::Mat& result, double threshold, int tplW, int tplH,
-    double maxOverlap, int maxCount) {
-    cv::Mat work = result.clone();
-    std::vector<std::pair<cv::Point, double>> peaks;
-    peaks.reserve(static_cast<size_t>(maxCount));
-    for (int i = 0; i < maxCount; ++i) {
-        double maxVal = 0.0;
-        cv::Point maxLoc;
-        cv::minMaxLoc(work, nullptr, &maxVal, nullptr, &maxLoc);
-        if (maxVal < threshold) break;
-        peaks.emplace_back(maxLoc, maxVal);
-        SuppressPeak(work, maxLoc, tplW, tplH, maxOverlap);
-    }
-    return peaks;
-}
-
-ImageMatchResult MakeResult(const cv::Point& tl, int tplW, int tplH, double score01, double scale) {
-    ImageMatchResult r{};
-    r.found = true;
-    r.scale = scale;
-    r.score = score01 * 100.0;
-    r.topLeftX = tl.x;
-    r.topLeftY = tl.y;
-    r.bottomRightX = tl.x + tplW;
-    r.bottomRightY = tl.y + tplH;
-    r.x = tl.x + tplW / 2;
-    r.y = tl.y + tplH / 2;
-    return r;
-}
-
-bool RectsOverlapTooMuch(const ImageMatchResult& a, const ImageMatchResult& b, double maxOverlap) {
-    const int ax1 = a.topLeftX;
-    const int ay1 = a.topLeftY;
-    const int ax2 = a.bottomRightX;
-    const int ay2 = a.bottomRightY;
-    const int bx1 = b.topLeftX;
-    const int by1 = b.topLeftY;
-    const int bx2 = b.bottomRightX;
-    const int by2 = b.bottomRightY;
-
-    const int ix1 = std::max(ax1, bx1);
-    const int iy1 = std::max(ay1, by1);
-    const int ix2 = std::min(ax2, bx2);
-    const int iy2 = std::min(ay2, by2);
-    if (ix2 <= ix1 || iy2 <= iy1) return false;
-
-    const double inter = static_cast<double>(ix2 - ix1) * (iy2 - iy1);
-    const double areaA = static_cast<double>(ax2 - ax1) * (ay2 - ay1);
-    const double areaB = static_cast<double>(bx2 - bx1) * (by2 - by1);
-    const double minArea = std::min(areaA, areaB);
-    if (minArea <= 0.0) return false;
-    return (inter / minArea) > maxOverlap;
-}
-
-std::vector<ImageMatchResult> GlobalNms(std::vector<ImageMatchResult> matches,
-                                        double maxOverlap, int maxMatches) {
-    std::sort(matches.begin(), matches.end(),
-              [](const ImageMatchResult& a, const ImageMatchResult& b) { return a.score > b.score; });
-
-    std::vector<ImageMatchResult> kept;
-    kept.reserve(static_cast<size_t>(maxMatches));
-    for (const auto& m : matches) {
-        bool dup = false;
-        for (const auto& k : kept) {
-            if (RectsOverlapTooMuch(m, k, maxOverlap)) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) kept.push_back(m);
-        if (static_cast<int>(kept.size()) >= maxMatches) break;
-    }
-    return kept;
-}
-
-ImageMatchResult RefineAtLevel(
-    const cv::Mat& src, const cv::Mat& tmpl, cv::Point predTL,
-    int searchRadius, double threshold01) {
-    ImageMatchResult r{};
-    const int tplW = tmpl.cols;
-    const int tplH = tmpl.rows;
-    const int maxX = src.cols - tplW;
-    const int maxY = src.rows - tplH;
-    if (maxX < 0 || maxY < 0) return r;
-
-    const int x1 = std::max(0, predTL.x - searchRadius);
-    const int y1 = std::max(0, predTL.y - searchRadius);
-    const int x2 = std::min(maxX, predTL.x + searchRadius);
-    const int y2 = std::min(maxY, predTL.y + searchRadius);
-    if (x1 > x2 || y1 > y2) return r;
-
-    const cv::Rect roi(x1, y1, x2 - x1 + tplW, y2 - y1 + tplH);
-    cv::Mat roiSrc = src(roi);
-    cv::Mat result;
-    cv::matchTemplate(roiSrc, tmpl, result, cv::TM_CCOEFF_NORMED);
-
-    double maxVal = 0.0;
-    cv::Point maxLoc;
-    cv::minMaxLoc(result, nullptr, &maxVal, nullptr, &maxLoc);
-    if (maxVal < threshold01) return r;
-
-    return MakeResult(cv::Point(x1 + maxLoc.x, y1 + maxLoc.y), tplW, tplH, maxVal, 1.0);
-}
-
-std::vector<ImageMatchResult> MatchSingleScale(
-    const cv::Mat& srcGray, const cv::Mat& tplGray,
-    double scale, const ImageMatchOptions& opt) {
-    std::vector<ImageMatchResult> results;
-    if (srcGray.empty() || tplGray.empty()) return results;
-
-    cv::Mat scaledTpl;
-    if (std::abs(scale - 1.0) > 0.001) {
-        cv::resize(tplGray, scaledTpl, cv::Size(), scale, scale, cv::INTER_AREA);
-    } else {
-        scaledTpl = tplGray;
-    }
-
-    const int tplW = scaledTpl.cols;
-    const int tplH = scaledTpl.rows;
-    if (tplW < 4 || tplH < 4 || tplW > srcGray.cols || tplH > srcGray.rows) return results;
-
-    const int levels = CalcPyramidLevels(tplW, tplH);
-    if (levels <= 0) {
-        cv::Mat result;
-        cv::matchTemplate(srcGray, scaledTpl, result, cv::TM_CCOEFF_NORMED);
-        const double threshold01 = opt.thresholdPercent / 100.0;
-        const auto peaks = FindPeaks(result, threshold01, tplW, tplH, opt.maxOverlap, opt.maxMatches);
-        for (const auto& [pt, score] : peaks) {
-            auto m = MakeResult(pt, tplW, tplH, score, scale);
-            m.scale = scale;
-            results.push_back(m);
-        }
-        return results;
-    }
-
-    std::vector<cv::Mat> srcPyr;
-    std::vector<cv::Mat> tplPyr;
-    BuildPyramid(srcGray, srcPyr, levels);
-    BuildPyramid(scaledTpl, tplPyr, levels);
-
-    const int top = levels;
-    const double threshold01 = opt.thresholdPercent / 100.0;
-    const double coarseThresh = std::max(0.3, threshold01 * 0.75);
-
-    cv::Mat topResult;
-    cv::matchTemplate(srcPyr[top], tplPyr[top], topResult, cv::TM_CCOEFF_NORMED);
-    const int topTplW = tplPyr[top].cols;
-    const int topTplH = tplPyr[top].rows;
-    auto topPeaks = FindPeaks(topResult, coarseThresh, topTplW, topTplH, opt.maxOverlap, opt.maxMatches);
-    if (topPeaks.empty()) {
-        topPeaks = FindPeaks(topResult, 0.3, topTplW, topTplH, opt.maxOverlap, opt.maxMatches);
-    }
-    if (topPeaks.empty()) return results;
-
-    for (const auto& [topPt, topScore] : topPeaks) {
-        cv::Point loc = topPt;
-        double bestScore = topScore;
-        int bestLevel = top;
-
-        for (int lvl = top - 1; lvl >= 0; --lvl) {
-            loc.x *= 2;
-            loc.y *= 2;
-            const int R = (lvl == 0) ? 32 : 20;
-            const double lvlThresh = (lvl == 0) ? threshold01 : 0.0;
-            ImageMatchResult refined = RefineAtLevel(srcPyr[lvl], tplPyr[lvl], loc, R, lvlThresh);
-            if (refined.found) {
-                loc = cv::Point(refined.topLeftX, refined.topLeftY);
-                bestScore = refined.score / 100.0;
-                bestLevel = lvl;
-            } else if (lvl == 0) {
-                bestLevel = -1;
-                break;
-            }
-        }
-
-        if (bestLevel < 0) continue;
-
-        if (bestLevel > 0) {
-            const int R = std::min(64, 16 << bestLevel);
-            ImageMatchResult rescore = RefineAtLevel(srcGray, scaledTpl, loc, R, threshold01);
-            if (!rescore.found) continue;
-            loc = cv::Point(rescore.topLeftX, rescore.topLeftY);
-            bestScore = rescore.score / 100.0;
-        }
-
-        auto m = MakeResult(loc, tplW, tplH, bestScore, scale);
-        results.push_back(m);
-    }
-
-    return results;
-}
-
-ImageMatchOutput MatchInGrayMats(const cv::Mat& srcGray, const cv::Mat& tplGray,
-                                 const ImageMatchOptions& opt, int offsetX, int offsetY) {
-    ImageMatchOutput out{};
-    const auto t0 = std::chrono::steady_clock::now();
-
-    if (srcGray.empty() || tplGray.empty()) {
-        out.elapsedMs = 0;
-        return out;
-    }
-
-    ImageMatchOptions normalized = opt;
-    normalized.thresholdPercent = std::clamp(normalized.thresholdPercent, 1.0, 100.0);
-    normalized.scaleMin = std::max(0.1, normalized.scaleMin);
-    normalized.scaleMax = std::max(normalized.scaleMin, normalized.scaleMax);
-    normalized.scaleStep = std::max(0.01, normalized.scaleStep);
-    normalized.maxMatches = std::clamp(normalized.maxMatches, 1, 200);
-    normalized.maxOverlap = std::clamp(normalized.maxOverlap, 0.0, 0.95);
-
-    std::vector<ImageMatchResult> all;
-    for (double scale = normalized.scaleMin; scale <= normalized.scaleMax + 1e-9; scale += normalized.scaleStep) {
-        auto batch = MatchSingleScale(srcGray, tplGray, scale, normalized);
-        all.insert(all.end(), batch.begin(), batch.end());
-    }
-
-    all = GlobalNms(std::move(all), normalized.maxOverlap, normalized.maxMatches);
-
-    for (auto& m : all) {
-        m.topLeftX += offsetX;
-        m.topLeftY += offsetY;
-        m.bottomRightX += offsetX;
-        m.bottomRightY += offsetY;
-        m.x += offsetX;
-        m.y += offsetY;
-    }
-
-    out.matches = std::move(all);
-    out.found = !out.matches.empty();
-    const auto t1 = std::chrono::steady_clock::now();
-    out.elapsedMs = static_cast<int>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-    return out;
 }
 
 ImageMatchOptions NormalizeLegacyOptions(double thresholdPercent, double scale, double scaleMax) {
@@ -475,9 +223,14 @@ ImageMatchOutput FindTemplateInFrozenScreenMulti(
     ImageMatchOutput out{};
     if (!frozenScreen || !templateBmp) return out;
 
-    const cv::Mat full = BitmapToGrayMat(frozenScreen);
-    const cv::Mat templ = BitmapToGrayMat(templateBmp);
-    if (full.empty() || templ.empty()) return out;
+    const cv::Mat fullBgr = BitmapToBgrMat(frozenScreen);
+    const cv::Mat templBgr = BitmapToBgrMat(templateBmp);
+    if (fullBgr.empty() || templBgr.empty()) return out;
+
+    cv::Mat fullGray;
+    cv::Mat templGray;
+    cv::cvtColor(fullBgr, fullGray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(templBgr, templGray, cv::COLOR_BGR2GRAY);
 
     const int left = std::min(searchX1, searchX2);
     const int top = std::min(searchY1, searchY2);
@@ -488,10 +241,11 @@ ImageMatchOutput FindTemplateInFrozenScreenMulti(
 
     const int cx = left - virtX;
     const int cy = top - virtY;
-    cv::Mat crop = CropGrayMat(full, cx, cy, rw, rh);
-    if (crop.empty()) return out;
+    cv::Mat cropGray = CropGrayMat(fullGray, cx, cy, rw, rh);
+    cv::Mat cropBgr = CropBgrMat(fullBgr, cx, cy, rw, rh);
+    if (cropGray.empty()) return out;
 
-    return MatchInGrayMats(crop, templ, options, left, top);
+    return MatchInGrayMatsMultiVerify(cropGray, templGray, cropBgr, templBgr, options, left, top);
 }
 
 ImageMatchOutput FindTemplateOnScreenMulti(
@@ -508,12 +262,18 @@ ImageMatchOutput FindTemplateOnScreenMulti(
     HBITMAP regionBmp = CaptureScreenRegion(left, top, right, bottom);
     if (!regionBmp) return out;
 
-    const cv::Mat screen = BitmapToGrayMat(regionBmp);
-    const cv::Mat templ = BitmapToGrayMat(templateBmp);
+    const cv::Mat screenBgr = BitmapToBgrMat(regionBmp);
+    const cv::Mat templBgr = BitmapToBgrMat(templateBmp);
     DeleteBitmapHandle(regionBmp);
 
-    if (screen.empty() || templ.empty()) return out;
-    return MatchInGrayMats(screen, templ, options, left, top);
+    if (screenBgr.empty() || templBgr.empty()) return out;
+
+    cv::Mat screenGray;
+    cv::Mat templGray;
+    cv::cvtColor(screenBgr, screenGray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(templBgr, templGray, cv::COLOR_BGR2GRAY);
+
+    return MatchInGrayMatsMultiVerify(screenGray, templGray, screenBgr, templBgr, options, left, top);
 }
 
 ImageMatchResult FindTemplateInFrozenScreen(

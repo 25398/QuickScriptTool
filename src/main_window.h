@@ -74,7 +74,7 @@ private:
     friend LRESULT CALLBACK EditorDropPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
-    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar };
+    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList };
     enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
@@ -203,6 +203,7 @@ private:
         InitHotkeyShortcutPresets();
         LoadScripts();
         LoadRecordings();
+        CleanOrphanImages();  // 启动时清理孤立图片
         CreateEditorDropPopup();
         CreateEditorTipPopup();
         ShowHome();
@@ -245,7 +246,7 @@ private:
             L"移动鼠标到", L"等待", L"鼠标点击", L"鼠标回放", L"运行鼠标宏",
             L"鼠标按下", L"鼠标松开", L"滚动滚轮", L"按键点击", L"键盘按下", L"键盘松开",
             L"快捷按键", L"快捷输入", L"循环", L"结束循环", L"定义宏指令块", L"运行宏指令块",
-            L"找图(返回最匹配的)"
+            L"找图(返回最匹配的)", L"条件-如果", L"条件-否则"
         };
         popupAction_.sel = 0;
         CreateParamControls();
@@ -461,6 +462,22 @@ private:
         AddGroup(runBlockControls_, MakeEditorLabel(hwnd_, L"要运行的宏指令块名称:", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
         AddGroup(runBlockControls_, runBlockCombo_ = MakeLabel(hwnd_, L"", kRunBlockCombo, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, kEditorActionComboH));
         popupRunBlock_.items.clear(); popupRunBlock_.sel = -1;
+        AddGroup(ifControls_, MakeLabel(hwnd_, L"如果:", -1, kEditorPanelLeft, 180, 60, 22));
+        AddGroup(ifControls_, MakeLabel(hwnd_, L"变量:", -1, kEditorPanelLeft, 214, 50, 22));
+        AddGroup(ifControls_, ifVarCombo_ = MakeLabel(hwnd_, L"", kIfVarCombo, kEditorPanelLeft + 56, 212, kEditorActionComboW - 56, kEditorActionComboH));
+        AddGroup(ifControls_, MakeLabel(hwnd_, L"判断:", -1, kEditorPanelLeft, 248, 50, 22));
+        AddGroup(ifControls_, ifOperatorCombo_ = MakeLabel(hwnd_, L"等于", kIfOperator, kEditorPanelLeft + 56, 246, kEditorActionComboW - 56, kEditorActionComboH));
+        popupIfOperator_.items = {L"等于", L"不等于", L"小于", L"小于等于", L"大于", L"大于等于", L"包含"}; popupIfOperator_.sel = 0;
+        AddGroup(ifControls_, MakeLabel(hwnd_, L"值:", -1, kEditorPanelLeft, 282, 50, 22));
+        AddGroup(ifControls_, ifValueEdit_ = MakeEdit(hwnd_, L"0", kIfValue, kEditorPanelLeft + 56, 280, kEditorActionComboW - 56, 22));
+        AddGroup(ifControls_, MakeLabel(hwnd_, L"多条件连接方式:", -1, kEditorPanelLeft, 316, 120, 22));
+        AddGroup(ifControls_, ifConnectorCombo_ = MakeLabel(hwnd_, L"并且(and)", kIfConnector, kEditorPanelLeft, 346, kEditorActionComboW, kEditorActionComboH));
+        popupIfConnector_.items = {L"并且(and)", L"或者(or)", L"非(not)"}; popupIfConnector_.sel = 0;
+        AddGroup(ifControls_, ifAddConditionBtn_ = MakeButton(hwnd_, L"添加判断条件", kIfAddCondition, kEditorPanelLeft, 378, kEditorActionComboW, 28));
+        AddGroup(ifControls_, MakeLabel(hwnd_, L"判断条件:", -1, kEditorPanelLeft, 412, 80, 22));
+        AddGroup(ifControls_, ifConditionList_ = MakeMultilineEdit(hwnd_, L"", kIfConditionList, kEditorPanelLeft, 436, kEditorActionComboW, 72));
+        AddGroup(ifControls_, MakeHint(hwnd_, L"*提示:如需要更复杂的条件判断，请导出脚本操作", kEditorPanelLeft, 512, kEditorActionComboW, 28));
+        AddGroup(elseControls_, MakeHint(hwnd_, L"*提示:必须和如果成对出现，作为如果节点的下方兄弟节点 (非子节点)！", 807, 183, 195, 48));
         AddEditorControl(remarkLabel_ = MakeLabel(hwnd_, L"备注", -1, 807, kEditorRemarkY, 44, 22));
         AddEditorControl(remark_ = MakeEdit(hwnd_, L"", kRemark, 857, kEditorRemarkY, 117, 22));
         AddEditorControl(modifyBtn_ = MakeGreenButton(hwnd_, L"修改", kModify, 837, kEditorAddY, 76, 30));
@@ -534,6 +551,8 @@ private:
             if (popupFindFollowUp_.sel == 2) append(findImageVarControls_);
             else append(findImageOffsetControls_);
             break;
+        case 18: append(ifControls_); break;
+        case 19: append(elseControls_); break;
         default: break;
         }
     }
@@ -638,6 +657,8 @@ private:
         CloseEditorPopup();
         CancelQuickInputTip();
         StopHoverTimer();
+        // 清理编辑期间新增但未被任何脚本引用的图片（取消编辑时）
+        CleanupNewImages();
         ShowWindow(hwnd_, SW_HIDE);
         page_ = Page::Home;
         ShowEditorControls(false);
@@ -654,6 +675,18 @@ private:
         RegisterAllHotkeys();
         InvalidateRect(hwnd_, nullptr, TRUE);
         ShowWindow(hwnd_, SW_SHOW);
+    }
+
+    /// 清理编辑期间新增但未被任何脚本引用的图片（取消编辑或退出时调用）
+    void CleanupNewImages() {
+        if (newImagePaths_.empty()) return;
+        const auto allRefs = CollectAllReferencedImages();
+        for (const auto& path : newImagePaths_) {
+            if (allRefs.find(path) == allRefs.end()) {
+                DeleteFileW(path.c_str());
+            }
+        }
+        newImagePaths_.clear();
     }
 
     void ShowEditorFor(int index, bool createNew) {
@@ -732,6 +765,8 @@ private:
         ShowGroup(findImageControls_, sel == 17);
         ShowGroup(findImageOffsetControls_, sel == 17);
         ShowGroup(findImageVarControls_, sel == 17);
+        ShowGroup(ifControls_, sel == 18);
+        ShowGroup(elseControls_, sel == 19);
         if (sel != 17) ClearGrayButtonHover();
         if (sel == 17) RefreshFindImageSubPanel();
         ApplyEditorFooterLayout();
@@ -739,11 +774,12 @@ private:
         if (sel == 4) RefreshRunMacroCombo();
         if (sel == 16) RefreshRunBlockCombo();
         if (sel == 12) RefreshQuickInputVarCombo();
+        if (sel == 18) RefreshIfVarCombo();
         HideEditorComboHwnds();
     }
 
     void HideEditorComboHwnds() {
-        for (HWND h : {mode_, actionCombo_, mousePressButton_, clickButton_, loopTypeCombo_, runBlockCombo_, hotkeyShortcutCombo_, quickInputVarCombo_, runMacroCombo_, mousePlaybackCombo_, scrollDirectionCombo_, findFollowUpCombo_}) {
+        for (HWND h : {mode_, actionCombo_, mousePressButton_, clickButton_, loopTypeCombo_, runBlockCombo_, hotkeyShortcutCombo_, quickInputVarCombo_, runMacroCombo_, mousePlaybackCombo_, scrollDirectionCombo_, findFollowUpCombo_, ifVarCombo_, ifOperatorCombo_, ifConnectorCombo_}) {
             if (h) ShowWindow(h, SW_HIDE);
         }
     }
@@ -788,6 +824,9 @@ private:
         case 9: return sel == 3;
         case 10: return sel == 7;
         case 11: return sel == 17;
+        case 12: return sel == 18;
+        case 13: return sel == 18;
+        case 14: return sel == 18;
         default: return false;
         }
     }
@@ -885,6 +924,9 @@ private:
         if (hwnd == mousePlaybackCombo_ && IsParamComboVisible(9)) return 9;
         if (hwnd == scrollDirectionCombo_ && IsParamComboVisible(10)) return 10;
         if (hwnd == findFollowUpCombo_ && IsParamComboVisible(11)) return 11;
+        if (hwnd == ifVarCombo_ && IsParamComboVisible(12)) return 12;
+        if (hwnd == ifOperatorCombo_ && IsParamComboVisible(13)) return 13;
+        if (hwnd == ifConnectorCombo_ && IsParamComboVisible(14)) return 14;
         return -1;
     }
 
@@ -896,6 +938,7 @@ private:
             {2, mousePressButton_}, {3, clickButton_}, {4, loopTypeCombo_}, {5, runBlockCombo_},
             {6, hotkeyShortcutCombo_}, {7, quickInputVarCombo_}, {8, runMacroCombo_}, {9, mousePlaybackCombo_},
             {10, scrollDirectionCombo_}, {11, findFollowUpCombo_},
+            {12, ifVarCombo_}, {13, ifOperatorCombo_}, {14, ifConnectorCombo_},
         };
         for (const auto& hit : hits) {
             if (!hit.hwnd || !IsParamComboVisible(hit.id)) continue;
@@ -926,8 +969,47 @@ private:
             ? popupQuickInputVar_.items[static_cast<size_t>(popupQuickInputVar_.sel)] : L"");
     }
 
+    void RefreshIfVarCombo() {
+        quickInputVarItems_ = BuildQuickInputVarItems(actions_);
+        popupIfVar_.items.clear();
+        for (const auto& item : quickInputVarItems_) {
+            popupIfVar_.items.push_back(item.display);
+        }
+        if (popupIfVar_.sel < 0 || popupIfVar_.sel >= static_cast<int>(popupIfVar_.items.size())) {
+            popupIfVar_.sel = popupIfVar_.items.empty() ? -1 : 0;
+        }
+        SetText(ifVarCombo_, popupIfVar_.sel >= 0 && popupIfVar_.sel < static_cast<int>(popupIfVar_.items.size())
+            ? popupIfVar_.items[static_cast<size_t>(popupIfVar_.sel)] : L"");
+    }
+
+    void AppendIfCondition() {
+        if (!ifConditionList_) return;
+        const int varSel = popupIfVar_.sel;
+        if (varSel < 0 || varSel >= static_cast<int>(quickInputVarItems_.size())) return;
+        static const wchar_t* opSymbols[] = { L"==", L"!=", L"<", L"<=", L">", L">=", L">>" };
+        const int opSel = std::clamp(popupIfOperator_.sel, 0, 6);
+        static const wchar_t* connectors[] = { L"and", L"or", L"not" };
+        const int connSel = std::clamp(popupIfConnector_.sel, 0, 2);
+        const std::wstring varCode = quickInputVarItems_[static_cast<size_t>(varSel)].codeHint;
+        const std::wstring value = Trim(GetText(ifValueEdit_));
+        const std::wstring clause = varCode + opSymbols[opSel] + value;
+        std::wstring current = GetText(ifConditionList_);
+        if (Trim(current).empty()) {
+            SetText(ifConditionList_, clause);
+        } else {
+            while (!current.empty() && (current.back() == L'\r' || current.back() == L'\n')) current.pop_back();
+            current += L" ";
+            current += connectors[connSel];
+            current += L"\r\n";
+            current += clause;
+            SetText(ifConditionList_, current);
+        }
+        SetFocus(ifConditionList_);
+    }
+
     void OnActionsChanged() {
         if (popupAction_.sel == 12) RefreshQuickInputVarCombo();
+        if (popupAction_.sel == 18) RefreshIfVarCombo();
     }
 
     void InsertQuickInputVariable() {
@@ -1073,6 +1155,8 @@ private:
         case ActionType::RunBlock: return 16;
         case ActionType::ScrollWheel: return 7;
         case ActionType::FindImage: return 17;
+        case ActionType::If: return 18;
+        case ActionType::Else: return 19;
         default: return 14;
         }
     }
@@ -1080,7 +1164,7 @@ private:
     bool IsImplementedActionPopup(int idx) const {
         return idx == 0 || idx == 1 || idx == 2 || idx == 3 || idx == 4 || idx == 5 || idx == 6 || idx == 7 || idx == 8 || idx == 9 || idx == 10
             || idx == 11 || idx == 12
-            || idx == 13 || idx == 14 || idx == 15 || idx == 16 || idx == 17;
+            || idx == 13 || idx == 14 || idx == 15 || idx == 16 || idx == 17 || idx == 18 || idx == 19;
     }
 
     void UpdateEditMode() {
@@ -1341,6 +1425,13 @@ private:
             action.matchVarName = Trim(GetText(findMatchVar_));
             if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
         }
+        else if (sel == 18) {
+            action.type = ActionType::If;
+            action.conditionExpr = GetText(ifConditionList_);
+        }
+        else if (sel == 19) {
+            action.type = ActionType::Else;
+        }
         else { action.type = ActionType::MoveMouse; }
         return action;
     }
@@ -1427,6 +1518,17 @@ private:
             SetText(findMatchVar_, action.matchVarName.empty() ? L"matchRet" : action.matchVarName);
             UpdateFindImagePreview();
         }
+        else if (action.type == ActionType::If) {
+            SetPopupSel(popupAction_, actionCombo_, 18);
+            RefreshIfVarCombo();
+            SetText(ifConditionList_, action.conditionExpr);
+            SetText(ifValueEdit_, L"0");
+            SetPopupSel(popupIfOperator_, ifOperatorCombo_, 0);
+            SetPopupSel(popupIfConnector_, ifConnectorCombo_, 0);
+        }
+        else if (action.type == ActionType::Else) {
+            SetPopupSel(popupAction_, actionCombo_, 19);
+        }
         else { SetPopupSel(popupAction_, actionCombo_, 14); }
         RefreshParamPanel();
         loadingForm_ = false;
@@ -1435,14 +1537,7 @@ private:
         InvalidateRect(hwnd_, &panelRc, FALSE);
     }
 
-    std::wstring FindImagesDir() const {
-        return ScriptsDir() + L"\\images";
-    }
-
-    void EnsureFindImagesDir() const {
-        CreateDirectoryW(ScriptsDir().c_str(), nullptr);
-        CreateDirectoryW(FindImagesDir().c_str(), nullptr);
-    }
+    // findImagePath_ now stored in ScriptAction, above functions use utils::FindImagesDir()/EnsureFindImagesDir()
 
     void UpdateFindImagePreview() {
         if (findImagePreviewBitmap_) {
@@ -1495,6 +1590,7 @@ private:
                 HBITMAP bmp = CaptureScreenRegion(x1, y1, x2, y2);
                 if (bmp && SaveBitmapToFile(bmp, path)) {
                     findImagePath_ = path;
+                    newImagePaths_.insert(path);
                     findImageFullScreen_ = false;
                     UpdateFindImagePreview();
                 }
@@ -1575,11 +1671,25 @@ private:
         ofn.nMaxFile = MAX_PATH;
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
         if (!GetOpenFileNameW(&ofn)) return;
-        findImagePath_ = fileName;
+        const std::wstring copied = EnsureImageInLibrary(fileName);
+        findImagePath_ = copied;
+        if (IsPathInImageDir(copied)) newImagePaths_.insert(copied);
         UpdateFindImagePreview();
     }
 
     void ClearFindImage() {
+        // 如果是编辑期间新截图的图片且未保存到脚本，删除残留文件
+        if (!findImagePath_.empty() && IsPathInImageDir(findImagePath_)) {
+            auto it = newImagePaths_.find(findImagePath_);
+            if (it != newImagePaths_.end()) {
+                // 检查是否被任何已有脚本引用
+                const auto allRefs = CollectAllReferencedImages();
+                if (allRefs.find(findImagePath_) == allRefs.end()) {
+                    DeleteFileW(findImagePath_.c_str());
+                }
+                newImagePaths_.erase(it);
+            }
+        }
         findImagePath_.clear();
         UpdateFindImagePreview();
     }
@@ -1658,6 +1768,7 @@ private:
         if (id == kKeyCapture) { CaptureActionKey(); return; }
         if (id == kKeyPressCapture) { CaptureKeyPress(); return; }
         if (id == kQuickInputInsert) { InsertQuickInputVariable(); return; }
+        if (id == kIfAddCondition) { AppendIfCondition(); return; }
         if (id == kFindFullScreen) { ApplyFindImageFullScreen(); return; }
         if (id == kFindSelectRegion) { BeginFindRegionSelect(false); return; }
         if (id == kFindScreenshot) { BeginFindRegionSelect(true); return; }
@@ -1914,7 +2025,9 @@ private:
             file << L"      \"searchX2\": " << a.searchX2 << L",\n";
             file << L"      \"searchY2\": " << a.searchY2 << L",\n";
             file << L"      \"searchFullScreen\": " << (a.searchFullScreen ? 1 : 0) << L",\n";
-            file << L"      \"imagePath\": \"" << EscapeJson(a.imagePath) << L"\",\n";
+            const std::wstring savedImagePath = a.type == ActionType::FindImage
+                ? ImagePathForJson(EnsureImageInLibrary(a.imagePath)) : a.imagePath;
+            file << L"      \"imagePath\": \"" << EscapeJson(savedImagePath) << L"\",\n";
             file << L"      \"matchThreshold\": " << a.matchThreshold << L",\n";
             file << L"      \"imageScale\": " << a.imageScale << L",\n";
             file << L"      \"imageScaleMin\": " << a.imageScaleMin << L",\n";
@@ -1923,14 +2036,20 @@ private:
             file << L"      \"offsetX\": " << a.offsetX << L",\n";
             file << L"      \"offsetY\": " << a.offsetY << L",\n";
             file << L"      \"findUntilFound\": " << (a.findUntilFound ? 1 : 0) << L",\n";
-            file << L"      \"matchVarName\": \"" << EscapeJson(a.matchVarName) << L"\"\n";
+            file << L"      \"matchVarName\": \"" << EscapeJson(a.matchVarName) << L"\",\n";
+            file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\"\n";
             file << L"    }" << (i + 1 == actions_.size() ? L"\n" : L",\n");
         }
         file << L"  ]\n}\n";
         const auto bytes = ToUtf8(file.str());
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        if (!out.good()) {
+        const bool writeOk = out.good();
+        out.close();
+        if (!writeOk) {
             MessageBoxW(hwnd_, L"保存失败：无法写入文件，请检查磁盘空间和权限。", L"保存", MB_OK | MB_ICONERROR);
+        } else {
+            newImagePaths_.clear();
+            CleanOrphanImages();
         }
     }
 
@@ -1956,6 +2075,8 @@ private:
         else if (type == L"endLoop") a.type = ActionType::EndLoop;
         else if (type == L"defineBlock") a.type = ActionType::DefineBlock;
         else if (type == L"runBlock") a.type = ActionType::RunBlock;
+        else if (type == L"if") a.type = ActionType::If;
+        else if (type == L"else") a.type = ActionType::Else;
         else a.type = ActionType::CustomText;
         a.customText = ExtractString(block, L"text");
         a.remark = ExtractString(block, L"remark");
@@ -2000,6 +2121,7 @@ private:
         a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
         a.searchFullScreen = ExtractNumber(block, L"searchFullScreen", 1) != 0;
         a.imagePath = ExtractString(block, L"imagePath");
+        if (!a.imagePath.empty()) a.imagePath = ResolveImagePath(a.imagePath);
         a.matchThreshold = ExtractNumber(block, L"matchThreshold", 65.0);
         a.imageScale = ExtractNumber(block, L"imageScale", 1.0);
         a.imageScaleMin = ExtractNumber(block, L"imageScaleMin", a.imageScale);
@@ -2010,6 +2132,7 @@ private:
         a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
         a.matchVarName = ExtractString(block, L"matchVarName");
         if (a.matchVarName.empty()) a.matchVarName = L"matchRet";
+        a.conditionExpr = ExtractString(block, L"conditionExpr");
         return a;
     }
 
@@ -2074,8 +2197,66 @@ private:
     }
 
     void ImportScript() {
-        const auto path = ChooseScriptPath(false);
-        if (path.empty()) return;
+        const bool toRecordings = ImportTargetsRecordings();
+        wchar_t fileName[MAX_PATH]{};
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"脚本文件 (*.zip;*.json)\0*.zip;*.json\0ZIP 脚本包 (*.zip)\0*.zip\0JSON 脚本 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = fileName;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&ofn)) return;
+
+        const std::wstring path(fileName);
+        std::wstring lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+
+        if (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".zip") {
+            ImportScriptFromZipFile(path, toRecordings);
+        } else {
+            ImportScriptFromJsonFile(path, toRecordings);
+        }
+    }
+
+    bool ImportTargetsRecordings() const {
+        return activeHomeTab_ == quickscript::MainTab::Recorder;
+    }
+
+    std::wstring ImportTargetDir(bool toRecordings) const {
+        return toRecordings ? RecordingsDir() : ScriptsDir();
+    }
+
+    bool WriteImportedJson(const std::wstring& target, std::wstring content) {
+        content = UpdateJsonStringField(content, L"recordTime", NowText());
+        if (content.find(L"\"recordTime\"") == std::wstring::npos) {
+            const auto brace = content.find(L'{');
+            if (brace != std::wstring::npos) {
+                const std::wstring insert = L"\n  \"recordTime\": \"" + EscapeJson(NowText()) + L"\",";
+                content.insert(brace + 1, insert);
+            }
+        }
+        std::ofstream out(target, std::ios::binary);
+        if (!out) return false;
+        out.write("\xEF\xBB\xBF", 3);
+        const auto bytes = ToUtf8(content);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        return out.good();
+    }
+
+    void FinishImport(bool toRecordings) {
+        if (toRecordings) {
+            LoadRecordings();
+            ClampRecordingScroll();
+        } else {
+            LoadScripts();
+            ClampHomeScroll();
+            RegisterAllHotkeys();
+        }
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    void ImportScriptFromJsonFile(const std::wstring& path, bool toRecordings) {
         const auto content = ReadAll(path);
         std::wstring name = ExtractString(content, L"scriptName");
         if (name.empty()) {
@@ -2083,19 +2264,130 @@ private:
             return;
         }
         EnsureScriptsDir();
-        std::wstring target = ScriptsDir() + L"\\" + SafeScriptFileName(name) + L".json";
+        const auto baseDir = ImportTargetDir(toRecordings);
+        std::wstring target = baseDir + L"\\" + SafeScriptFileName(name) + L".json";
         int suffix = 1;
         while (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            target = ScriptsDir() + L"\\" + SafeScriptFileName(name) + L"-" + std::to_wstring(suffix++) + L".json";
+            target = baseDir + L"\\" + SafeScriptFileName(name) + L"-" + std::to_wstring(suffix++) + L".json";
         }
-        std::ofstream out(target, std::ios::binary);
-        if (!out) { MessageBoxW(hwnd_, L"导入失败：无法写入脚本目录。", L"导入", MB_OK | MB_ICONERROR); return; }
-        out.write("\xEF\xBB\xBF", 3);
-        const auto bytes = ToUtf8(content);
-        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        LoadScripts();
-        RegisterAllHotkeys();
-        InvalidateRect(hwnd_, nullptr, TRUE);
+        if (!WriteImportedJson(target, content)) {
+            MessageBoxW(hwnd_, L"导入失败：无法写入目标目录。", L"导入", MB_OK | MB_ICONERROR);
+            return;
+        }
+        FinishImport(toRecordings);
+    }
+
+    void ImportScriptFromZipFile(const std::wstring& zipPath, bool toRecordings) {
+        // 先读取 ZIP 中的 JSON 内容
+        std::string jsonUtf8 = ReadTextFromZip(zipPath, "script.json");
+        if (jsonUtf8.empty()) {
+            MessageBoxW(hwnd_, L"导入失败：ZIP 文件中未找到 script.json。", L"导入", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const std::wstring content = FromUtf8(jsonUtf8);
+        std::wstring name = ExtractString(content, L"scriptName");
+        if (name.empty()) {
+            MessageBoxW(hwnd_, L"导入失败：文件格式不正确，未找到脚本名称。", L"导入", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        // 解压 ZIP 到临时目录
+        wchar_t tempDir[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tempDir);
+        const std::wstring extractDir = std::wstring(tempDir) + L"qs_import_" + std::to_wstring(GetTickCount());
+        int extracted = ExtractZipFile(zipPath, extractDir);
+        if (extracted < 0) {
+            MessageBoxW(hwnd_, L"导入失败：无法解压 ZIP 文件。", L"导入", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        // 复制图片到 images 目录并重映射
+        EnsureFindImagesDir();
+        std::wstring modifiedContent = content;
+        const auto imgDir = FindImagesDir();
+
+        // 收集 ZIP 中解压出的图片文件名（排除 script.json）
+        WIN32_FIND_DATAW fd{};
+        const std::wstring pattern = extractDir + L"\\*";
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring extractedFile = extractDir + L"\\" + fd.cFileName;
+                std::wstring fileName(fd.cFileName);
+                // 跳过 script.json
+                if (_wcsicmp(fileName.c_str(), L"script.json") == 0) continue;
+                // 检查是否为图片（.bmp, .png, .jpg）
+                auto dotPos = fileName.find_last_of(L'.');
+                if (dotPos == std::wstring::npos) continue;
+                std::wstring ext = fileName.substr(dotPos);
+                std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+                if (ext != L".bmp" && ext != L".png" && ext != L".jpg" && ext != L".jpeg") continue;
+
+                // 复制到 images 目录
+                std::wstring destPath = imgDir + L"\\" + fileName;
+                // 如果目标已存在，生成新文件名
+                if (GetFileAttributesW(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    const auto nameNoExt = fileName.substr(0, dotPos);
+                    destPath = imgDir + L"\\" + nameNoExt + L"_" + std::to_wstring(GetTickCount()) + ext;
+                }
+                if (!CopyFileW(extractedFile.c_str(), destPath.c_str(), FALSE)) continue;
+
+                const std::wstring relPath = ImagePathForJson(destPath);
+                const auto blocks = ExtractJsonActionBlocks(modifiedContent);
+                for (const auto& block : blocks) {
+                    const auto type = ExtractString(block, L"type");
+                    if (type != L"findImage") continue;
+                    const auto oldImgPath = ExtractString(block, L"imagePath");
+                    if (oldImgPath.empty()) continue;
+                    const auto oldSlash = oldImgPath.find_last_of(L"\\/");
+                    const std::wstring oldFileName = (oldSlash == std::wstring::npos)
+                        ? oldImgPath : oldImgPath.substr(oldSlash + 1);
+                    const auto destSlash = destPath.find_last_of(L"\\/");
+                    const std::wstring destFileName = (destSlash == std::wstring::npos)
+                        ? destPath : destPath.substr(destSlash + 1);
+                    if (_wcsicmp(oldFileName.c_str(), fileName.c_str()) == 0 ||
+                        _wcsicmp(oldFileName.c_str(), destFileName.c_str()) == 0) {
+                        const auto key = L"\"imagePath\": \"" + EscapeJson(oldImgPath) + L"\"";
+                        const auto pos = modifiedContent.find(key);
+                        if (pos != std::wstring::npos) {
+                            modifiedContent.replace(pos + 14, EscapeJson(oldImgPath).size(), EscapeJson(relPath));
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+
+        // 清理临时目录
+        RemoveDirectoryW(extractDir.c_str());
+        // 也删除临时文件
+        WIN32_FIND_DATAW fd2{};
+        const std::wstring cleanPattern = extractDir + L"\\*";
+        HANDLE hFind2 = FindFirstFileW(cleanPattern.c_str(), &fd2);
+        if (hFind2 != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    DeleteFileW((extractDir + L"\\" + fd2.cFileName).c_str());
+                }
+            } while (FindNextFileW(hFind2, &fd2));
+            FindClose(hFind2);
+        }
+        RemoveDirectoryW(extractDir.c_str());
+
+        // 保存修改后的 JSON 到目标目录
+        EnsureScriptsDir();
+        const auto baseDir = ImportTargetDir(toRecordings);
+        std::wstring target = baseDir + L"\\" + SafeScriptFileName(name) + L".json";
+        int suffix = 1;
+        while (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            target = baseDir + L"\\" + SafeScriptFileName(name) + L"-" + std::to_wstring(suffix++) + L".json";
+        }
+        if (!WriteImportedJson(target, modifiedContent)) {
+            MessageBoxW(hwnd_, L"导入失败：无法写入目标目录。", L"导入", MB_OK | MB_ICONERROR);
+            return;
+        }
+        FinishImport(toRecordings);
     }
 
     void ExportSelectedScript() {
@@ -2104,11 +2396,70 @@ private:
             return;
         }
         const auto& script = scripts_[static_cast<size_t>(selectedScript_)];
+        const auto content = ReadAll(script.path);
+        const auto imgPaths = CollectImagePathsFromJson(content);
+
+        // 根据是否包含图片选择导出格式
+        if (!imgPaths.empty()) {
+            ExportScriptAsZip(script);
+        } else {
+            ExportScriptAsJson(script);
+        }
+    }
+
+    void ExportScriptAsJson(const ScriptMeta& script) {
         const auto chosenPath = ChooseScriptPath(true, SafeScriptFileName(script.name) + L".json");
         if (chosenPath.empty()) return;
         const auto path = EnsureJsonExtension(chosenPath);
         if (!CopyFileW(script.path.c_str(), path.c_str(), FALSE)) {
             MessageBoxW(hwnd_, L"导出失败：无法写入目标文件。", L"导出", MB_OK | MB_ICONERROR);
+        } else {
+            MessageBoxW(hwnd_, L"导出成功！", L"导出", MB_OK | MB_ICONINFORMATION);
+        }
+    }
+
+    void ExportScriptAsZip(const ScriptMeta& script) {
+        wchar_t fileName[MAX_PATH]{};
+        const auto defaultName = SafeScriptFileName(script.name) + L".zip";
+        wcsncpy_s(fileName, defaultName.c_str(), _TRUNCATE);
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"ZIP 脚本包 (*.zip)\0*.zip\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = fileName;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        if (!GetSaveFileNameW(&ofn)) return;
+
+        // 确保扩展名为 .zip
+        std::wstring zipPath(fileName);
+        if (zipPath.size() < 4 || _wcsicmp(zipPath.substr(zipPath.size() - 4).c_str(), L".zip") != 0) {
+            zipPath += L".zip";
+        }
+
+        // 收集文件列表：JSON + 所有引用的图片
+        const auto content = ReadAll(script.path);
+        const auto imgPaths = CollectImagePathsFromJson(content);
+        std::vector<std::pair<std::wstring, std::wstring>> files;
+        // JSON 文件在 ZIP 中固定命名为 script.json
+        files.push_back({L"script.json", script.path});
+        for (const auto& imgPath : imgPaths) {
+            // 图片在 ZIP 中用原始文件名
+            const auto slashPos = imgPath.find_last_of(L"\\/");
+            std::wstring imgName = (slashPos == std::wstring::npos) ? imgPath : imgPath.substr(slashPos + 1);
+            files.push_back({imgName, imgPath});
+        }
+        const auto zipResult = CreateZipFile(zipPath, files, script.path);
+        if (zipResult.success) {
+            if (zipResult.skippedFiles.empty()) {
+                MessageBoxW(hwnd_, L"导出成功！图片已一同打包。", L"导出", MB_OK | MB_ICONINFORMATION);
+            } else {
+                const std::wstring msg = L"导出成功，但有 " + std::to_wstring(zipResult.skippedFiles.size())
+                    + L" 张图片未找到已跳过。\n\n对方导入后需要重新截图或选择本地图片。";
+                MessageBoxW(hwnd_, msg.c_str(), L"导出", MB_OK | MB_ICONWARNING);
+            }
+        } else {
+            MessageBoxW(hwnd_, L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。", L"导出", MB_OK | MB_ICONERROR);
         }
     }
 
@@ -3452,7 +3803,9 @@ private:
                     return;
                 }
                 if (PtIn(RecordingDeleteRect(i), x, y)) {
-                    DeleteFileW(recordings_[static_cast<size_t>(i)].path.c_str());
+                    const auto recPath = recordings_[static_cast<size_t>(i)].path;
+                    DeleteUnreferencedImagesOfScript(recPath);
+                    DeleteFileW(recPath.c_str());
                     LoadRecordings();
                     ClampRecordingScroll();
                     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3468,21 +3821,65 @@ private:
     void ExportSelectedRecording() {
         if (selectedRecording_ < 0 || selectedRecording_ >= static_cast<int>(recordings_.size())) return;
         auto& meta = recordings_[static_cast<size_t>(selectedRecording_)];
-        OPENFILENAMEW ofn{};
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = hwnd_;
-        std::wstring name = meta.name + L".json";
-        std::wstring ext = L"JSON 文件 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0";
-        wchar_t fileBuffer[MAX_PATH + 128]{};
-        wcsncpy_s(fileBuffer, name.c_str(), name.size());
-        ofn.lpstrFile = fileBuffer;
-        ofn.nMaxFile = MAX_PATH + 128;
-        ofn.lpstrFilter = ext.c_str();
-        ofn.nFilterIndex = 1;
-        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        if (!GetSaveFileNameW(&ofn)) return;
-        CopyFileW(meta.path.c_str(), fileBuffer, FALSE);
-        MessageBoxW(hwnd_, L"录制已导出。可在\"鼠标宏\"中导入此文件。", L"导出", MB_OK | MB_ICONINFORMATION);
+        const auto content = ReadAll(meta.path);
+        const auto imgPaths = CollectImagePathsFromJson(content);
+
+        // 根据是否包含图片选择导出格式
+        if (!imgPaths.empty()) {
+            // ZIP 格式导出
+            wchar_t fileBuffer[MAX_PATH + 128]{};
+            const auto defaultName = meta.name + L".zip";
+            wcsncpy_s(fileBuffer, defaultName.c_str(), defaultName.size());
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd_;
+            ofn.lpstrFile = fileBuffer;
+            ofn.nMaxFile = MAX_PATH + 128;
+            ofn.lpstrFilter = L"ZIP 脚本包 (*.zip)\0*.zip\0所有文件 (*.*)\0*.*\0";
+            ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+            if (!GetSaveFileNameW(&ofn)) return;
+
+            std::wstring zipPath(fileBuffer);
+            if (zipPath.size() < 4 || _wcsicmp(zipPath.substr(zipPath.size() - 4).c_str(), L".zip") != 0) {
+                zipPath += L".zip";
+            }
+            std::vector<std::pair<std::wstring, std::wstring>> files;
+            files.push_back({L"script.json", meta.path});
+            for (const auto& imgPath : imgPaths) {
+                const auto slashPos = imgPath.find_last_of(L"\\/");
+                std::wstring imgName = (slashPos == std::wstring::npos) ? imgPath : imgPath.substr(slashPos + 1);
+                files.push_back({imgName, imgPath});
+            }
+            const auto zipResult = CreateZipFile(zipPath, files, meta.path);
+            if (zipResult.success) {
+                if (zipResult.skippedFiles.empty()) {
+                    MessageBoxW(hwnd_, L"录制已导出。图片已一同打包。可在\"鼠标宏\"中导入此文件。", L"导出", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    const std::wstring msg = L"录制已导出，但有 " + std::to_wstring(zipResult.skippedFiles.size())
+                        + L" 张图片未找到已跳过。\n\n可在\"鼠标宏\"中导入此文件，导入后需重新设置图片。";
+                    MessageBoxW(hwnd_, msg.c_str(), L"导出", MB_OK | MB_ICONWARNING);
+                }
+            } else {
+                MessageBoxW(hwnd_, L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。", L"导出", MB_OK | MB_ICONERROR);
+            }
+        } else {
+            // 纯 JSON 导出
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd_;
+            std::wstring name = meta.name + L".json";
+            std::wstring ext = L"JSON 文件 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0";
+            wchar_t fileBuffer[MAX_PATH + 128]{};
+            wcsncpy_s(fileBuffer, name.c_str(), name.size());
+            ofn.lpstrFile = fileBuffer;
+            ofn.nMaxFile = MAX_PATH + 128;
+            ofn.lpstrFilter = ext.c_str();
+            ofn.nFilterIndex = 1;
+            ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+            if (!GetSaveFileNameW(&ofn)) return;
+            CopyFileW(meta.path.c_str(), fileBuffer, FALSE);
+            MessageBoxW(hwnd_, L"录制已导出。可在\"鼠标宏\"中导入此文件。", L"导出", MB_OK | MB_ICONINFORMATION);
+        }
     }
 
     void OnMacroHomeClick(int x, int y) {
@@ -3552,7 +3949,10 @@ private:
 
     void ExecutePendingDelete() {
         if (pendingDeleteIndex_ >= 0 && pendingDeleteIndex_ < static_cast<int>(scripts_.size())) {
-            DeleteFileW(scripts_[static_cast<size_t>(pendingDeleteIndex_)].path.c_str());
+            const auto scriptPath = scripts_[static_cast<size_t>(pendingDeleteIndex_)].path;
+            // 删除脚本引用的孤立图片（不被其他脚本引用才删）
+            DeleteUnreferencedImagesOfScript(scriptPath);
+            DeleteFileW(scriptPath.c_str());
             selectedScript_ = -1;
             pendingDeleteIndex_ = -1;
             LoadScripts();
@@ -3878,6 +4278,34 @@ private:
                         }
                         if (!a.loopVarName.empty()) loopVars_.erase(a.loopVarName);
                         i = bodyEnd;
+                    } else if (a.type == ActionType::If) {
+                        MacroVariableContext ctx;
+                        ctx.matchVars = &matchVars_;
+                        ctx.loopVars = &loopVars_;
+                        ctx.curLoops = curLoops_;
+                        const bool cond = EvaluateConditionExpr(a.conditionExpr, ctx);
+                        const int level = a.indent;
+                        const size_t trueEnd = containerBodyEnd(i);
+                        int elseIdx = -1;
+                        for (size_t j = trueEnd; j < activeActions->size(); ++j) {
+                            if ((*activeActions)[j].indent < level) break;
+                            if ((*activeActions)[j].indent == level && (*activeActions)[j].type == ActionType::Else) {
+                                elseIdx = static_cast<int>(j);
+                                break;
+                            }
+                        }
+                        if (cond) {
+                            if (elseIdx >= 0) runRange(i + 1, static_cast<size_t>(elseIdx));
+                            else runRange(i + 1, trueEnd);
+                            i = elseIdx >= 0 ? containerBodyEnd(static_cast<size_t>(elseIdx)) : trueEnd;
+                        } else if (elseIdx >= 0) {
+                            runRange(static_cast<size_t>(elseIdx) + 1, containerBodyEnd(static_cast<size_t>(elseIdx)));
+                            i = containerBodyEnd(static_cast<size_t>(elseIdx));
+                        } else {
+                            i = trueEnd;
+                        }
+                    } else if (a.type == ActionType::Else) {
+                        i = containerBodyEnd(i);
                     } else if (a.type == ActionType::RunBlock) {
                         runBlockByName(a.blockName);
                         ++i;
@@ -4594,6 +5022,9 @@ private:
         case 9: return &popupMousePlayback_;
         case 10: return &popupScrollDir_;
         case 11: return &popupFindFollowUp_;
+        case 12: return &popupIfVar_;
+        case 13: return &popupIfOperator_;
+        case 14: return &popupIfConnector_;
         default: return nullptr;
         }
     }
@@ -4625,6 +5056,9 @@ private:
         case 9: return WindowClientRect(mousePlaybackCombo_);
         case 10: return WindowClientRect(scrollDirectionCombo_);
         case 11: return WindowClientRect(findFollowUpCombo_);
+        case 12: return WindowClientRect(ifVarCombo_);
+        case 13: return WindowClientRect(ifOperatorCombo_);
+        case 14: return WindowClientRect(ifConnectorCombo_);
         default: return RECT{};
         }
     }
@@ -4644,6 +5078,9 @@ private:
         case 9: combo = mousePlaybackCombo_; break;
         case 10: combo = scrollDirectionCombo_; break;
         case 11: combo = findFollowUpCombo_; break;
+        case 12: combo = ifVarCombo_; break;
+        case 13: combo = ifOperatorCombo_; break;
+        case 14: combo = ifConnectorCombo_; break;
         default: return RECT{};
         }
         if (!combo) return RECT{};
@@ -4829,6 +5266,7 @@ private:
         else if (id == 7) RefreshQuickInputVarCombo();
         else if (id == 8) RefreshRunMacroCombo();
         else if (id == 9) RefreshMousePlaybackCombo();
+        else if (id == 12) RefreshIfVarCombo();
         PopupCombo* pc = GetEditorPopup();
         if (pc) pc->open = true;
         SyncEditorDropPopup();
@@ -4898,6 +5336,9 @@ private:
         case 9: label = mousePlaybackCombo_; break;
         case 10: label = scrollDirectionCombo_; break;
         case 11: label = findFollowUpCombo_; break;
+        case 12: label = ifVarCombo_; break;
+        case 13: label = ifOperatorCombo_; break;
+        case 14: label = ifConnectorCombo_; break;
         }
         if (label) SetText(label, pc->items[static_cast<size_t>(idx)]);
         if (editorPopupOpen_ == 1) RefreshParamPanel();
@@ -5553,7 +5994,8 @@ private:
     HWND findTestBtn_ = nullptr; HWND findImagePreviewBtn_ = nullptr; HWND findScreenshotBtn_ = nullptr; HWND findLocalImageBtn_ = nullptr; HWND findClearImageBtn_ = nullptr;
     HWND findMatchThreshold_ = nullptr; HWND findScaleMin_ = nullptr; HWND findScaleMax_ = nullptr; HWND findOffsetX_ = nullptr; HWND findOffsetY_ = nullptr; HWND findSelectOffsetBtn_ = nullptr; HWND findUntilFound_ = nullptr; HWND findMatchVar_ = nullptr;
     HWND quickInputEdit_ = nullptr; HWND quickInputVarCombo_ = nullptr; HWND quickInputInsertBtn_ = nullptr; HWND quickInputCharInterval_ = nullptr; HWND quickInputCount_ = nullptr; HWND quickInputWait_ = nullptr; HWND quickInputRandom_ = nullptr;
-    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_;
+    HWND ifVarCombo_ = nullptr; HWND ifOperatorCombo_ = nullptr; HWND ifValueEdit_ = nullptr; HWND ifConnectorCombo_ = nullptr; HWND ifAddConditionBtn_ = nullptr; HWND ifConditionList_ = nullptr;
+    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ifControls_, elseControls_;
     std::vector<EditorControlLayout> editorLayouts_;
     std::vector<HotkeyMenuItem> hotkeyMenuItems_;
     std::vector<ScriptMeta> scripts_; std::vector<ScriptMeta> recordings_; std::vector<ScriptAction> actions_;
@@ -5585,10 +6027,11 @@ private:
     UINT formKeyVk_ = '7', formKeyPressVk_ = '7';
     quickscript::ClickerSettings clickerSettings_{};
     quickscript::RecorderSettings recorderSettings_{};
-    PopupCombo popupMode_, popupAction_, popupMouseBtn_, popupClickBtn_, popupLoopType_, popupRunBlock_, popupHotkeyShortcut_, popupQuickInputVar_, popupRunMacro_, popupMousePlayback_, popupScrollDir_, popupFindFollowUp_;
+    PopupCombo popupMode_, popupAction_, popupMouseBtn_, popupClickBtn_, popupLoopType_, popupRunBlock_, popupHotkeyShortcut_, popupQuickInputVar_, popupRunMacro_, popupMousePlayback_, popupScrollDir_, popupFindFollowUp_, popupIfVar_, popupIfOperator_, popupIfConnector_;
     std::vector<QuickInputVarItem> quickInputVarItems_;
     std::vector<std::wstring> runMacroPaths_, mousePlaybackPaths_;
     std::wstring findImagePath_;
+    std::unordered_set<std::wstring> newImagePaths_;      // 编辑期间新增的图片路径，用于取消时清理
     std::atomic<bool> findTestRunning_{false};
     HBITMAP findImagePreviewBitmap_ = nullptr;
     RECT findRegionSavedRect_{};

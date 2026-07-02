@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <string>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 // ── 字符串处理 ────────────────────────────────────────────────────
@@ -21,7 +22,9 @@ std::wstring Trim(const std::wstring& value);
 std::wstring AppDir();
 std::wstring ScriptsDir();
 std::wstring RecordingsDir();
+std::wstring FindImagesDir();
 void        EnsureScriptsDir();
+void        EnsureFindImagesDir();
 std::wstring NowText();
 std::wstring TimestampName();
 
@@ -47,6 +50,43 @@ std::wstring ReadAll(const std::wstring& path);
 std::wstring ExtractString(const std::wstring& src, const std::wstring& key);
 double      ExtractNumber(const std::wstring& src, const std::wstring& key, double fallback);
 int         CountActionsInJson(const std::wstring& content);
+/// 更新 JSON 中某个字符串字段的值（字段必须已存在）
+std::wstring UpdateJsonStringField(const std::wstring& content,
+                                    const std::wstring& key,
+                                    const std::wstring& value);
+
+// ── 图片管理 ──────────────────────────────────────────────────────
+/// 判断路径是否在 images 目录下（绝对路径）
+bool IsPathInImageDir(const std::wstring& path);
+/// 将 JSON 中存储的路径（相对或绝对）解析为运行时绝对路径
+std::wstring ResolveImagePath(const std::wstring& stored);
+/// 将绝对路径转为 JSON 存储用的相对路径（images\xxx.bmp）
+std::wstring ImagePathForJson(const std::wstring& absolutePath);
+/// 确保图片位于 scripts/images 下，必要时从外部路径复制进去
+std::wstring EnsureImageInLibrary(const std::wstring& path);
+/// 从 JSON 内容中收集所有引用的图片绝对路径
+std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& jsonContent);
+/// 扫描所有脚本和录制文件，收集所有被引用的图片路径
+std::unordered_set<std::wstring> CollectAllReferencedImages();
+/// 删除 images 目录下没有被任何脚本引用的孤立图片
+int CleanOrphanImages();
+/// 删除指定 JSON 文件所引用的图片（如果这些图片不被其他脚本引用）
+void DeleteUnreferencedImagesOfScript(const std::wstring& scriptPath);
+
+// ── ZIP 压缩包操作（stored 方式，无压缩，保证兼容性）──────────────
+struct CreateZipResult {
+    bool success = false;
+    std::vector<std::wstring> skippedFiles;  // 本地路径不存在而跳过的文件
+};
+/// 将多个文件打包为 ZIP，files 为 (压缩包内名称, 本地文件路径) 对
+/// requiredLocalPath 指定的文件必须存在，否则导出失败；其余缺失文件会跳过
+CreateZipResult CreateZipFile(const std::wstring& zipPath,
+                              const std::vector<std::pair<std::wstring, std::wstring>>& files,
+                              const std::wstring& requiredLocalPath = L"");
+/// 将 ZIP 中的所有文件解压到目标目录，返回解压的文件数量，失败返回 -1
+int ExtractZipFile(const std::wstring& zipPath, const std::wstring& destDir);
+/// 从 ZIP 中读取指定文件的内容（UTF-8 文本），用于读取 JSON
+std::string ReadTextFromZip(const std::wstring& zipPath, const std::string& archiveName);
 
 // ── 热键与按键名称 ────────────────────────────────────────────────
 std::wstring VkName(UINT vk);

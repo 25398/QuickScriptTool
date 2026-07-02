@@ -123,6 +123,16 @@ std::wstring ActionName(const ScriptAction& action) {
             + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%,缩放"
             + scaleText + L"]";
     }
+    case ActionType::If: {
+        std::wstring cond = action.conditionExpr;
+        for (wchar_t& ch : cond) {
+            if (ch == L'\r' || ch == L'\n') ch = L' ';
+        }
+        if (cond.size() > 36) cond = cond.substr(0, 36) + L"...";
+        return L"如果[条件:" + cond + L"]";
+    }
+    case ActionType::Else:
+        return L"否则";
     case ActionType::CustomText:
         return action.customText;
     }
@@ -149,6 +159,8 @@ std::wstring JsonType(ActionType type) {
     case ActionType::QuickInput:     return L"quickInput";
     case ActionType::ScrollWheel:    return L"scrollWheel";
     case ActionType::FindImage:      return L"findImage";
+    case ActionType::If:             return L"if";
+    case ActionType::Else:           return L"else";
     case ActionType::CustomText:     return L"customText";
     }
     return L"customText";

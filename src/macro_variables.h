@@ -23,3 +23,4 @@ struct MacroVariableContext {
 std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptAction>& actions);
 std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariableContext& ctx);
 std::wstring DecodeQuickInputEscapes(const std::wstring& text);
+bool EvaluateConditionExpr(const std::wstring& expr, const MacroVariableContext& ctx);

@@ -23,6 +23,8 @@ enum class ActionType {
     QuickInput,
     ScrollWheel,
     FindImage,
+    If,
+    Else,
     CustomText
 };
 
@@ -80,14 +82,17 @@ struct ScriptAction {
     int offsetY = 0;
     bool findUntilFound = false;
     std::wstring matchVarName = L"matchRet";
+    std::wstring conditionExpr;
 };
 
 inline bool IsExpandableContainer(ActionType type) {
-    return type == ActionType::Loop || type == ActionType::DefineBlock;
+    return type == ActionType::Loop || type == ActionType::DefineBlock
+        || type == ActionType::If || type == ActionType::Else;
 }
 
 inline bool IsSubtreeContainer(ActionType type) {
-    return type == ActionType::Loop || type == ActionType::DefineBlock;
+    return type == ActionType::Loop || type == ActionType::DefineBlock
+        || type == ActionType::If || type == ActionType::Else;
 }
 
 inline bool SkipsInMainFlow(ActionType type) {
