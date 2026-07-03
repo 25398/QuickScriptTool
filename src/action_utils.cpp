@@ -5,6 +5,60 @@
 #include <chrono>
 #include <thread>
 
+namespace {
+const RunProgramPreset kRunProgramPresets[] = {
+    {L"选择文件", L"", L""},
+    {L"快捷运行-记事本", L"notepad.exe", L"记事本"},
+    {L"快捷运行-计算器", L"calc.exe", L"计算器"},
+    {L"快捷运行-画图", L"mspaint.exe", L"画图"},
+    {L"快捷运行-文件管理器", L"explorer.exe", L"文件管理器"},
+    {L"快捷运行-命令行", L"cmd.exe", L"命令行"},
+    {L"快捷运行-PowerShell", L"powershell.exe", L"PowerShell"},
+    {L"快捷运行-进程管理器", L"taskmgr.exe", L"进程管理器"},
+    {L"快捷运行-注册表编辑器", L"regedit.exe", L"注册表编辑器"},
+    {L"快捷运行-服务", L"services.msc", L"服务"},
+    {L"快捷运行-计算机管理", L"compmgmt.msc", L"计算机管理"},
+    {L"快捷运行-控制面板", L"control.exe", L"控制面板"},
+    {L"快捷运行-设置", L"ms-settings:", L"设置"},
+};
+
+std::wstring FileNameFromPath(const std::wstring& path) {
+    const auto pos = path.find_last_of(L"\\/");
+    return pos == std::wstring::npos ? path : path.substr(pos + 1);
+}
+
+std::wstring StripExtension(std::wstring name) {
+    const auto dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) name.erase(dot);
+    return name;
+}
+} // namespace
+
+int RunProgramPresetCount() {
+    return static_cast<int>(sizeof(kRunProgramPresets) / sizeof(kRunProgramPresets[0]));
+}
+
+const RunProgramPreset& RunProgramPresetAt(int index) {
+    return kRunProgramPresets[std::clamp(index, 0, RunProgramPresetCount() - 1)];
+}
+
+std::wstring ResolveRunProgramPath(int presetIndex, const std::wstring& customPath) {
+    if (presetIndex <= 0) return Trim(customPath);
+    return RunProgramPresetAt(presetIndex).path;
+}
+
+std::wstring RunProgramDisplayName(int presetIndex, const std::wstring& customPath) {
+    if (presetIndex > 0) {
+        const auto& preset = RunProgramPresetAt(presetIndex);
+        if (preset.displayName && preset.displayName[0]) return preset.displayName;
+    }
+    const std::wstring path = Trim(customPath);
+    if (path.empty()) return L"未选择";
+    const std::wstring file = FileNameFromPath(path);
+    if (file.empty()) return path;
+    return StripExtension(file);
+}
+
 std::wstring ButtonText(MouseButtonType button) {
     if (button == MouseButtonType::Right) return L"右键";
     if (button == MouseButtonType::Middle) return L"中键";
@@ -129,6 +183,12 @@ std::wstring ActionName(const ScriptAction& action) {
             + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%,缩放"
             + scaleText + L"]";
     }
+    case ActionType::TextRecognition: {
+        const wchar_t* mode = action.ocrResultMode == 1 ? L"文字查找" : L"获取文字";
+        const wchar_t* follow = action.ocrFollowUp == 1 ? L"移动到"
+            : action.ocrFollowUp == 2 ? L"保存变量" : L"点击";
+        return std::wstring(L"文字识别[") + mode + L"," + follow + L"]";
+    }
     case ActionType::If: {
         std::wstring cond = action.conditionExpr;
         for (wchar_t& ch : cond) {
@@ -145,10 +205,37 @@ std::wstring ActionName(const ScriptAction& action) {
         return L"解锁截屏";
     case ActionType::StopMacro:
         return L"结束宏运行";
+    case ActionType::RunProgram:
+        return L"打开程序[" + RunProgramDisplayName(action.shortcutPreset, action.targetPath) + L"]";
+    case ActionType::CloseProgram: {
+        std::wstring target = action.targetPath;
+        if (target.size() > 36) target = target.substr(0, 36) + L"...";
+        return L"关闭程序[" + (target.empty() ? L"未选择" : target) + L"]";
+    }
+    case ActionType::OpenWebpage: {
+        std::wstring url = action.targetPath;
+        if (url.size() > 36) url = url.substr(0, 36) + L"...";
+        return L"打开网页[" + (url.empty() ? L"未填写" : url) + L"]";
+    }
+    case ActionType::OpenFile: {
+        std::wstring path = action.targetPath;
+        if (path.size() > 36) path = path.substr(0, 36) + L"...";
+        return L"打开文件[" + (path.empty() ? L"未选择" : path) + L"]";
+    }
+    case ActionType::TimerRecordTime:
+        return L"计时器记录时间["
+            + (action.loopVarName.empty() ? L"未命名" : action.loopVarName) + L"]";
     case ActionType::CustomText:
         return action.customText;
     }
     return L"未知动作";
+}
+
+bool ScriptUsesTextRecognition(const std::vector<ScriptAction>& actions) {
+    for (const auto& a : actions) {
+        if (a.type == ActionType::TextRecognition) return true;
+    }
+    return false;
 }
 
 std::wstring JsonType(ActionType type) {
@@ -171,11 +258,17 @@ std::wstring JsonType(ActionType type) {
     case ActionType::QuickInput:     return L"quickInput";
     case ActionType::ScrollWheel:    return L"scrollWheel";
     case ActionType::FindImage:      return L"findImage";
+    case ActionType::TextRecognition: return L"textRecognition";
     case ActionType::If:             return L"if";
     case ActionType::Else:           return L"else";
     case ActionType::LockScreenshot: return L"lockScreenshot";
     case ActionType::UnlockScreenshot: return L"unlockScreenshot";
     case ActionType::StopMacro:      return L"stopMacro";
+    case ActionType::RunProgram:     return L"runProgram";
+    case ActionType::CloseProgram:   return L"closeProgram";
+    case ActionType::OpenWebpage:    return L"openWebpage";
+    case ActionType::OpenFile:       return L"openFile";
+    case ActionType::TimerRecordTime: return L"timerRecordTime";
     case ActionType::CustomText:     return L"customText";
     }
     return L"customText";

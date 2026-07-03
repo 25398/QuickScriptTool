@@ -35,8 +35,13 @@
 #include "macro_variables.h"
 #include "main_features.h"
 #include "popup_combo.h"
+#include "crosshair_drag.h"
+#include "ocr_install_dialog.h"
+#include "ocr_engine.h"
+#include "process_utils.h"
 #include "recorder.h"
 #include "match_overlay.h"
+#include "ocr_overlay.h"
 #include "screenshot_overlay.h"
 #include "editor_dropdown.h"
 #include "script_types.h"
@@ -141,7 +146,7 @@ private:
     friend LRESULT CALLBACK EditorDropPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
-    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList };
+    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName };
     enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
@@ -162,25 +167,16 @@ private:
     }
 
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp) {
-        if (crosshairActive_) {
-            if (msg == WM_SETCURSOR) {
-                SetCursor(crosshairDragCursor_);
-                return TRUE;
-            }
-            if (msg == WM_MOUSEMOVE) {
-                POINT pt{}; GetCursorPos(&pt);
-                if (moveX_) SetText(moveX_, std::to_wstring(pt.x));
-                if (moveY_) SetText(moveY_, std::to_wstring(pt.y));
-                SetCursor(crosshairDragCursor_);
+        if (crosshairDrag_.IsActive()) {
+            if (msg == WM_HOTKEY) { OnHotkey(static_cast<int>(wp)); return 0; }
+            if (crosshairDrag_.HandleMessage(msg, wp, lp,
+                [this](int x, int y) {
+                    if (moveX_) SetText(moveX_, std::to_wstring(x));
+                    if (moveY_) SetText(moveY_, std::to_wstring(y));
+                },
+                nullptr)) {
                 return 0;
             }
-            if (msg == WM_LBUTTONDOWN) return 0;
-            if (msg == WM_LBUTTONUP) {
-                EndCrosshairDrag(); return 0;
-            }
-            if (msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) { EndCrosshairDrag(); return 0; }
-            if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { EndCrosshairDrag(); return 0; }
-            if (msg == WM_HOTKEY) { OnHotkey(static_cast<int>(wp)); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         }
         switch (msg) {
@@ -221,8 +217,8 @@ private:
                     CloseEditorPopup();
                     CancelQuickInputTip();
                     // 窗口失焦时取消拖拽状态，避免拖拽卡死
+                    if (crosshairDrag_.IsActive()) crosshairDrag_.End();
                     if (dragging_) {
-                        EndCrosshairDrag();
                         dragging_ = false;
                         dragIndex_ = -1;
                         ReleaseCapture();
@@ -324,8 +320,9 @@ private:
             L"移动鼠标到", L"等待", L"鼠标点击", L"鼠标回放", L"运行鼠标宏",
             L"鼠标按下", L"鼠标松开", L"滚动滚轮", L"按键点击", L"键盘按下", L"键盘松开",
             L"快捷按键", L"快捷输入", L"循环", L"结束循环", L"定义宏指令块", L"运行宏指令块",
-            L"找图(返回最匹配的)", L"条件-如果", L"条件-否则",
-            L"锁定截屏", L"解锁截屏", L"结束宏运行"
+            L"找图(返回最匹配的)", L"文字识别", L"条件-如果", L"条件-否则",
+            L"锁定截屏", L"解锁截屏", L"结束宏运行", L"运行程序", L"关闭程序",
+            L"打开网页", L"打开文件", L"计时器记录时间"
         };
         popupAction_.sel = 0;
         CreateParamControls();
@@ -466,6 +463,59 @@ private:
         SizeFindFullScreenButton();
         ApplyFindImageFullScreen();
 
+        AddGroup(ocrDepControls_, ocrDepStatusLabel_ = MakeLabel(hwnd_, L"文字识别未安装", -1, kFindContentLeft, kOcrDepRowY, 130, kFindBtnH));
+        AddGroup(ocrDepControls_, ocrDepInstallBtn_ = MakeGrayButton(hwnd_, L"一键安装", kOcrInstallDep, kFindActionBtnX, kOcrDepRowY, kFindBtnW, kFindBtnH));
+        AddGroup(ocrFindRegionToggleControls_, ocrRegionByImageCheck_ = MakeCheckBox(hwnd_, L"根据图片选取区域", kOcrRegionByImage, kFindContentLeft, kOcrRegionRowY, 180, 22));
+        AddGroup(ocrControls_, ocrRegionLabel_ = MakeLabel(hwnd_, L"识别区域", -1, kFindContentLeft, kOcrRegionRowY, kFindRegionLabelW, kFindBtnH));
+        AddGroup(ocrControls_, ocrFullScreenBtn_ = MakeGrayButton(hwnd_, L"全图", kOcrFullScreen, kFindContentLeft + kFindRegionLabelW + 8, kOcrRegionRowY, 44, kFindBtnH));
+        AddGroup(ocrControls_, ocrSelectRegionBtn_ = MakeGrayButton(hwnd_, L"选取区域", kOcrSelectRegion, kFindContentLeft + kFindRegionLabelW + 58, kOcrRegionRowY, kFindBtnW, kFindBtnH));
+        AddGroup(ocrControls_, MakeLabel(hwnd_, L"X1", -1, kFindXLabelX, kOcrCoordRow1Y, kFindCoordLabelW, 22));
+        AddGroup(ocrControls_, ocrX1_ = MakeFieldEdit(hwnd_, L"0", kOcrX1, kFindXEditX, kOcrCoordRow1Y, kFindEditW, 22));
+        AddGroup(ocrControls_, MakeLabel(hwnd_, L"Y1", -1, kFindYLabelX, kOcrCoordRow1Y, kFindCoordLabelW, 22));
+        AddGroup(ocrControls_, ocrY1_ = MakeFieldEdit(hwnd_, L"0", kOcrY1, kFindYEditX, kOcrCoordRow1Y, kFindEditW, 22));
+        AddGroup(ocrControls_, MakeLabel(hwnd_, L"X2", -1, kFindXLabelX, kOcrCoordRow2Y, kFindCoordLabelW, 22));
+        AddGroup(ocrControls_, ocrX2_ = MakeFieldEdit(hwnd_, L"0", kOcrX2, kFindXEditX, kOcrCoordRow2Y, kFindEditW, 22));
+        AddGroup(ocrControls_, MakeLabel(hwnd_, L"Y2", -1, kFindYLabelX, kOcrCoordRow2Y, kFindCoordLabelW, 22));
+        AddGroup(ocrControls_, ocrY2_ = MakeFieldEdit(hwnd_, L"0", kOcrY2, kFindYEditX, kOcrCoordRow2Y, kFindEditW, 22));
+        AddGroup(ocrControls_, ocrResultModeLabel_ = MakeLabel(hwnd_, L"结果处理", -1, kFindContentLeft, kOcrResultModeY, kFindFollowLabelW, kFindBtnH));
+        AddGroup(ocrControls_, ocrResultModeCombo_ = MakeLabel(hwnd_, L"获取文字", kOcrResultMode, kFindContentLeft + kFindFollowLabelW + 8, kOcrResultModeY, kFindFollowComboW, kFindBtnH));
+        popupOcrResultMode_.items = {L"获取文字", L"文字查找"}; popupOcrResultMode_.sel = 0;
+        AddGroup(ocrControls_, ocrTestBtn_ = MakeGrayButton(hwnd_, L"测试", kOcrTest, kFindContentLeft, kOcrTestBtnYCompact, kFindBtnW, kFindBtnH));
+        AddGroup(ocrFindRegionControls_, ocrFindImageLabel_ = MakeLabel(hwnd_, L"要查找的图", -1, kFindContentLeft, kFindImageLabelY, 90, kFindBtnH));
+        AddGroup(ocrFindRegionControls_, ocrFindSelectRegionBtn_ = MakeGrayButton(hwnd_, L"选取区域", kOcrFindSelectRegion, kFindSelectRegionX, kFindImageLabelY, kFindBtnW, kFindBtnH));
+        AddGroup(ocrFindRegionControls_, ocrFindImagePreviewBtn_ = MakeGrayButton(hwnd_, L"", kOcrFindImagePreview, kFindContentLeft, kFindImageRowY, kFindImageSize, kFindImageSize));
+        AddGroup(ocrFindRegionControls_, ocrFindScreenshotBtn_ = MakeGrayButton(hwnd_, L"屏幕截图", kOcrFindScreenshot, kFindActionBtnX, kFindImageRowY, kFindBtnW, kFindBtnH));
+        AddGroup(ocrFindRegionControls_, ocrFindLocalImageBtn_ = MakeGrayButton(hwnd_, L"本地图片", kOcrFindLocalImage, kFindActionBtnX, kFindImageRowY + kFindBtnH + kFindBtnStackGap, kFindBtnW, kFindBtnH));
+        AddGroup(ocrFindRegionControls_, ocrFindClearImageBtn_ = MakeGrayButton(hwnd_, L"清除图片", kOcrFindClearImage, kFindActionBtnX, kFindImageRowY + (kFindBtnH + kFindBtnStackGap) * 2, kFindBtnW, kFindBtnH));
+        AddGroup(ocrFindRegionControls_, MakeLabel(hwnd_, L"匹配度大于", -1, kFindContentLeft, kFindMatchY, 90, 22));
+        AddGroup(ocrFindRegionControls_, ocrFindMatchThreshold_ = MakeFieldEdit(hwnd_, L"65", kOcrFindMatchThreshold, kFindContentLeft + 91, kFindMatchY, 40, 22));
+        AddGroup(ocrFindRegionControls_, MakeLabel(hwnd_, L"%", -1, kFindContentLeft + 135, kFindMatchY, 24, 22));
+        AddGroup(ocrFindRegionControls_, MakeLabel(hwnd_, L"最小缩放", -1, kFindContentLeft, kFindScaleY, 64, 22));
+        AddGroup(ocrFindRegionControls_, ocrFindScaleMin_ = MakeFieldEdit(hwnd_, L"0.9", kOcrFindScaleMin, kFindContentLeft + 65, kFindScaleY, 40, 22));
+        AddGroup(ocrFindRegionControls_, MakeLabel(hwnd_, L"最大", -1, kFindContentLeft + 110, kFindScaleY, 40, 22));
+        AddGroup(ocrFindRegionControls_, ocrFindScaleMax_ = MakeFieldEdit(hwnd_, L"1.1", kOcrFindScaleMax, kFindContentLeft + 151, kFindScaleY, 40, 22));
+        AddGroup(ocrSearchControls_, ocrSearchLabel_ = MakeLabel(hwnd_, L"在结果中查找的文字", -1, kFindContentLeft, kOcrSearchLabelY, kFindBlockW, 22));
+        AddGroup(ocrSearchControls_, ocrSearchEdit_ = MakeEdit(hwnd_, L"", kOcrSearchText, kFindContentLeft, kOcrSearchEditY, kFindBlockW, 22));
+        AddGroup(ocrSearchControls_, ocrSearchVarLabel_ = MakeLabel(hwnd_, L"变量:", -1, kFindContentLeft, kOcrSearchVarY, 50, 22));
+        AddGroup(ocrSearchControls_, ocrSearchVarCombo_ = MakeLabel(hwnd_, L"", kOcrSearchVarCombo, kFindContentLeft + 56, kOcrSearchVarY - 2, kFindFollowComboW, kFindBtnH));
+        AddGroup(ocrSearchControls_, ocrSearchVarInsertBtn_ = MakeButton(hwnd_, L"插入选择的变量", kOcrSearchVarInsert, kFindContentLeft, kOcrSearchVarY + kFindBtnH + 4, kFindBlockW, 28));
+        popupOcrSearchVar_.items.clear(); popupOcrSearchVar_.sel = -1;
+        AddGroup(ocrFollowControls_, ocrFollowUpLabel_ = MakeLabel(hwnd_, L"后续操作", -1, kFindContentLeft, kOcrFollowRowY, kFindFollowLabelW, kFindBtnH));
+        AddGroup(ocrFollowControls_, ocrFollowUpCombo_ = MakeLabel(hwnd_, L"点击", kOcrFollowUp, kFindContentLeft + kFindFollowLabelW + 8, kOcrFollowRowY, kFindFollowComboW, kFindBtnH));
+        popupOcrFollowUp_.items = {L"点击", L"鼠标移动到", L"保存到变量"}; popupOcrFollowUp_.sel = 0;
+        AddGroup(ocrFollowControls_, ocrUntilFound_ = MakeCheckBox(hwnd_, L"直到找到为止", kOcrUntilFound, kFindContentLeft, kOcrUntilFoundY, 140, 22));
+        AddGroup(ocrFollowOffsetControls_, ocrOffsetXLabel_ = MakeLabel(hwnd_, L"X偏", -1, kFindOffsetXLabelX, kOcrOffsetRowY, kFindOffsetLabelW, 22));
+        AddGroup(ocrFollowOffsetControls_, ocrOffsetX_ = MakeFieldEdit(hwnd_, L"0", kOcrOffsetX, kFindOffsetXEditX, kOcrOffsetRowY, kFindEditW, 22));
+        AddGroup(ocrFollowOffsetControls_, ocrOffsetYLabel_ = MakeLabel(hwnd_, L"Y偏", -1, kFindOffsetYLabelX, kOcrOffsetRowY, kFindOffsetLabelW, 22));
+        AddGroup(ocrFollowOffsetControls_, ocrOffsetY_ = MakeFieldEdit(hwnd_, L"0", kOcrOffsetY, kFindYEditX, kOcrOffsetRowY, kFindEditW, 22));
+        AddGroup(ocrFollowOffsetControls_, ocrSelectOffsetBtn_ = MakeGrayButton(hwnd_, L"选择偏移位置", kOcrSelectOffset, kFindSelectOffsetLeft, kFindSelectOffsetY, kFindSelectOffsetW, kFindBtnH));
+        AddGroup(ocrFollowVarControls_, ocrResultVarLabel_ = MakeLabel(hwnd_, L"结果保存到", -1, kFindContentLeft, kOcrResultVarY, 100, 22));
+        AddGroup(ocrFollowVarControls_, ocrResultVar_ = MakeEdit(hwnd_, L"a", kOcrResultVar, kFindContentLeft + 91, kOcrResultVarY, kOcrResultVarEditW, 22));
+        SizeOcrRegionButtons();
+        ApplyOcrFullScreen();
+        RefreshOcrSubPanel();
+        RefreshOcrDepStatus();
+
         AddGroup(keyControls_, MakeEditorLabel(hwnd_, L"选择键盘按键", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
         AddGroup(keyControls_, keyEdit_ = MakeCaptureField(hwnd_, L"点击修改", kKeyCapture, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, kEditorActionComboH));
         AddGroup(keyControls_, MakeLabel(hwnd_, L"同时按住", -1, 817, 257, 120, 25));
@@ -557,9 +607,43 @@ private:
         AddGroup(ifControls_, ifConditionList_ = MakeMultilineEdit(hwnd_, L"", kIfConditionList, kEditorPanelLeft, 436, kEditorActionComboW, 72));
         AddGroup(ifControls_, MakeHint(hwnd_, L"*提示:如需要更复杂的条件判断，请导出脚本操作", kEditorPanelLeft, 512, kEditorActionComboW, 28));
         AddGroup(elseControls_, MakeHint(hwnd_, L"*提示:必须和如果成对出现，作为如果节点的下方兄弟节点 (非子节点)！", 807, 183, 195, 48));
-        AddGroup(lockScreenshotControls_, MakeHint(hwnd_, L"*提示:锁定屏幕截图，锁定后后续的找图、找色、颜色匹配不会再次截图，而是使用锁定时的屏幕截图进行处理", 807, 183, 195, 96));
-        AddGroup(unlockScreenshotControls_, MakeHint(hwnd_, L"*提示:解锁定屏幕截图，与锁定截屏成对出现，取消锁定后找图、找色、颜色匹配每次使用都会再次截图进行处理", 807, 183, 195, 96));
+        AddGroup(lockScreenshotControls_, MakeHint(hwnd_, L"*提示:锁定屏幕截图，锁定后后续的找图、找色、颜色匹配、文字识别不会再次截图，而是使用锁定时的屏幕截图进行处理", 807, 183, 195, 96));
+        AddGroup(unlockScreenshotControls_, MakeHint(hwnd_, L"*提示:解锁定屏幕截图，与锁定截屏成对出现，取消锁定后找图、找色、颜色匹配、文字识别每次使用都会再次截图进行处理", 807, 183, 195, 96));
         AddGroup(stopMacroControls_, MakeHint(hwnd_, L"*提示:会结束宏的运行，与您按下快捷键停止是一样的", 807, 183, 195, 48));
+
+        AddGroup(runProgramControls_, MakeEditorLabel(hwnd_, L"要运行的程序:", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
+        AddGroup(runProgramControls_, runProgramCombo_ = MakeLabel(hwnd_, L"选择文件", kRunProgramCombo, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, kEditorActionComboH));
+        AddGroup(runProgramFileControls_, runProgramPath_ = MakeMultilineEdit(hwnd_, L"", kRunProgramPath, kEditorPanelLeft, 232, kEditorActionComboW, 64));
+        AddGroup(runProgramFileControls_, runProgramBrowseBtn_ = MakeButton(hwnd_, L"选择要启动的程序", kRunProgramBrowse, kEditorPanelLeft, 304, kEditorActionComboW, 28));
+        AddGroup(runProgramFileControls_, runProgramOrLabel_ = MakeLabel(hwnd_, L"或", -1, kEditorPanelLeft, 340, 20, 22));
+        AddGroup(runProgramFileControls_, runProgramCrosshairBtn_ = MakeGreenButton(hwnd_, L"拖动准星查找程序", kRunProgramCrosshair, kEditorPanelLeft + 24, 336, kEditorActionComboW - 24, 32));
+        AddGroup(runProgramControls_, MakeLabel(hwnd_, L"运行参数", -1, kEditorPanelLeft, 378, kEditorActionComboW, 22));
+        AddGroup(runProgramControls_, runProgramArgs_ = MakeMultilineEdit(hwnd_, L"", kRunProgramArgs, kEditorPanelLeft, 404, kEditorActionComboW, 56));
+
+        AddGroup(closeProgramControls_, MakeEditorLabel(hwnd_, L"要关闭的程序:", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
+        AddGroup(closeProgramControls_, closeProgramPath_ = MakeMultilineEdit(hwnd_, L"", kCloseProgramPath, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, 64));
+        AddGroup(closeProgramControls_, closeProgramBrowseBtn_ = MakeButton(hwnd_, L"选择要关闭的程序", kCloseProgramBrowse, kEditorPanelLeft, kEditorParamComboY + 64 + kEditorLabelGap, kEditorActionComboW, 28));
+        AddGroup(closeProgramControls_, closeProgramOrLabel_ = MakeLabel(hwnd_, L"或", -1, kEditorPanelLeft, kEditorParamComboY + 64 + kEditorLabelGap + 32, 20, 22));
+        AddGroup(closeProgramControls_, closeProgramCrosshairBtn_ = MakeGreenButton(hwnd_, L"拖动准星查找程序", kCloseProgramCrosshair, kEditorPanelLeft + 24, kEditorParamComboY + 64 + kEditorLabelGap + 28, kEditorActionComboW - 24, 32));
+        AddGroup(closeProgramControls_, closeProgramMatchFileName_ = MakeCheckBox(hwnd_, L"匹配全路径", kCloseProgramMatchFileName, kEditorPanelLeft, kEditorParamComboY + 64 + kEditorLabelGap + 28 + 32 + 4, 120, 25));
+        AddGroup(closeProgramControls_, MakeHint(hwnd_, L"*提示:选中只匹配文件名，否则匹配全路径", kEditorPanelLeft, kEditorParamComboY + 64 + kEditorLabelGap + 28 + 32 + 4 + 25 + kEditorLabelGap, kEditorActionComboW, kEditorParamHintH));
+
+        AddGroup(openWebpageControls_, MakeEditorLabel(hwnd_, L"要打开的网页:", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
+        AddGroup(openWebpageControls_, openWebpageUrl_ = MakeMultilineEdit(hwnd_, L"", kOpenWebpageUrl, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, 64));
+        AddGroup(openWebpageControls_, MakeHint(hwnd_, L"*提示：可仅支持http:// https://开头的网址", kEditorPanelLeft, kEditorParamComboY + 64 + kEditorLabelGap, kEditorActionComboW, kEditorParamHintH));
+
+        AddGroup(openFileControls_, MakeEditorLabel(hwnd_, L"要打开的文件:", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
+        AddGroup(openFileControls_, openFilePath_ = MakeMultilineEdit(hwnd_, L"", kOpenFilePath, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, 64));
+        AddGroup(openFileControls_, openFileBrowseBtn_ = MakeButton(hwnd_, L"选择要打开的文件", kOpenFileBrowse, kEditorPanelLeft, kEditorParamComboY + 72, kEditorActionComboW, 28));
+        AddGroup(openFileControls_, MakeHint(hwnd_, L"*提示：请确保文件扩展名已关联默认程序，否则可能出现提示窗口，导致打开文件失败", kEditorPanelLeft, kEditorParamComboY + 108, kEditorActionComboW, 48));
+
+        AddGroup(timerRecordControls_, MakeEditorLabel(hwnd_, L"计时器变量命名", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
+        AddGroup(timerRecordControls_, timerVarName_ = MakeEdit(hwnd_, L"", kTimerVarName, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, kEditorActionComboH));
+        AddGroup(timerRecordControls_, MakeHint(hwnd_, L"*提示: 记录从此动作到引用该变量时经过的秒数(向下取整); 同名变量会重置计时", kEditorPanelLeft, kEditorParamComboY + kEditorActionComboH + kEditorLabelGap, kEditorActionComboW, 40));
+
+        InitRunProgramPresets();
+        InitCrosshairDrag();
+
         AddEditorControl(remarkLabel_ = MakeLabel(hwnd_, L"备注", -1, 807, kEditorRemarkY, 44, 22));
         AddEditorControl(remark_ = MakeEdit(hwnd_, L"", kRemark, 857, kEditorRemarkY, 117, 22));
         AddEditorControl(modifyBtn_ = MakeGreenButton(hwnd_, L"修改", kModify, 837, kEditorAddY, 76, 30));
@@ -598,6 +682,13 @@ private:
             || hwnd == findOffsetX_ || hwnd == findOffsetY_ || hwnd == findMatchVar_;
     }
 
+    bool IsOcrParamEdit(HWND hwnd) const {
+        return hwnd == ocrX1_ || hwnd == ocrY1_ || hwnd == ocrX2_ || hwnd == ocrY2_
+            || hwnd == ocrSearchEdit_ || hwnd == ocrOffsetX_ || hwnd == ocrOffsetY_
+            || hwnd == ocrResultVar_
+            || hwnd == ocrFindMatchThreshold_ || hwnd == ocrFindScaleMin_ || hwnd == ocrFindScaleMax_;
+    }
+
     bool IsControlShown(HWND h) const {
         if (!h) return false;
         if (!hwnd_ || !IsWindowVisible(hwnd_)) {
@@ -633,11 +724,31 @@ private:
             if (popupFindFollowUp_.sel == 2) append(findImageVarControls_);
             else append(findImageOffsetControls_);
             break;
-        case 18: append(ifControls_); break;
-        case 19: append(elseControls_); break;
-        case 20: append(lockScreenshotControls_); break;
-        case 21: append(unlockScreenshotControls_); break;
-        case 22: append(stopMacroControls_); break;
+        case 18:
+            append(ocrDepControls_);
+            append(ocrFindRegionToggleControls_);
+            append(ocrControls_);
+            if (ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_)) {
+                append(ocrFindRegionControls_);
+            }
+            append(ocrFollowControls_);
+            if (popupOcrResultMode_.sel == 1) append(ocrSearchControls_);
+            if (popupOcrFollowUp_.sel == 2) append(ocrFollowVarControls_);
+            else append(ocrFollowOffsetControls_);
+            break;
+        case 19: append(ifControls_); break;
+        case 20: append(elseControls_); break;
+        case 21: append(lockScreenshotControls_); break;
+        case 22: append(unlockScreenshotControls_); break;
+        case 23: append(stopMacroControls_); break;
+        case 24:
+            append(runProgramControls_);
+            if (popupRunProgram_.sel <= 0) append(runProgramFileControls_);
+            break;
+        case 25: append(closeProgramControls_); break;
+        case 26: append(openWebpageControls_); break;
+        case 27: append(openFileControls_); break;
+        case 28: append(timerRecordControls_); break;
         default: break;
         }
     }
@@ -650,7 +761,7 @@ private:
         std::vector<HWND> controls;
         CollectVisibleParamControls(controls);
         for (HWND h : controls) {
-            bottom = std::max(bottom, static_cast<int>(ScaledLayoutClientRect(h).bottom));
+            bottom = std::max(bottom, static_cast<int>(WindowClientRect(h).bottom));
         }
         return bottom;
     }
@@ -660,6 +771,14 @@ private:
             if (item.hwnd != hwnd) continue;
             const RECT& b = item.base;
             if (IsFindImageHwnd(hwnd)) {
+                return RECT{
+                    MulDiv(b.left, kEditorWidth, kEditorBaseWidth),
+                    MulDiv(b.top, kEditorWidth, kEditorBaseWidth),
+                    MulDiv(b.right, kEditorWidth, kEditorBaseWidth),
+                    MulDiv(b.bottom, kEditorWidth, kEditorBaseWidth)
+                };
+            }
+            if (IsOcrDepHwnd(hwnd) || IsOcrHwnd(hwnd)) {
                 return RECT{
                     MulDiv(b.left, kEditorWidth, kEditorBaseWidth),
                     MulDiv(b.top, kEditorWidth, kEditorBaseWidth),
@@ -681,17 +800,24 @@ private:
         if (page_ != Page::Editor) return;
         const int panelBottom = ParamPanelBottomClient();
         const int gap = MulDiv(kEditorFooterGap, kEditorWidth, kEditorBaseWidth);
-        const int remarkY = panelBottom + gap;
+        int remarkY = panelBottom + gap;
         const int remarkH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
         const int addGap = MulDiv(8, kEditorWidth, kEditorBaseWidth);
-        const int addY = remarkY + remarkH + addGap;
+        int addY = remarkY + remarkH + addGap;
         const auto sx = [](int x) { return MulDiv(x, kEditorWidth, kEditorBaseWidth); };
         const auto sw = [](int w) { return std::max(1, MulDiv(w, kEditorWidth, kEditorBaseWidth)); };
         const auto sh = [](int h) { return std::max(1, MulDiv(h, kEditorHeight, kEditorBaseHeight)); };
+        const int btnH = sh(30);
+        const int cancelTop = cancelBtn_ ? WindowClientRect(cancelBtn_).top : MulDiv(702, kEditorHeight, kEditorBaseHeight);
+        const int maxAddBottom = cancelTop - sh(6);
+        if (addY + btnH > maxAddBottom) {
+            addY = maxAddBottom - btnH;
+            remarkY = addY - addGap - remarkH;
+        }
         if (remarkLabel_) MoveWindow(remarkLabel_, sx(807), remarkY, sw(44), remarkH, FALSE);
         if (remark_) MoveWindow(remark_, sx(857), remarkY, sw(117), remarkH, FALSE);
-        if (modifyBtn_) MoveWindow(modifyBtn_, sx(837), addY, sw(76), sh(30), FALSE);
-        if (addBtn_) MoveWindow(addBtn_, sx(927), addY, sw(76), sh(30), FALSE);
+        if (modifyBtn_) MoveWindow(modifyBtn_, sx(837), addY, sw(76), btnH, FALSE);
+        if (addBtn_) MoveWindow(addBtn_, sx(927), addY, sw(76), btnH, FALSE);
     }
 
     void ConfigureCombo(HWND, int) {}
@@ -715,6 +841,22 @@ private:
         return contains(findImageControls_) || contains(findImageOffsetControls_) || contains(findImageVarControls_);
     }
 
+    bool IsOcrDepHwnd(HWND hwnd) const {
+        return hwnd == ocrDepStatusLabel_ || hwnd == ocrDepInstallBtn_;
+    }
+
+    bool IsOcrHwnd(HWND hwnd) const {
+        if (IsOcrDepHwnd(hwnd)) return false;
+        auto contains = [hwnd](const std::vector<HWND>& group) {
+            for (HWND h : group) if (h == hwnd) return true;
+            return false;
+        };
+        return contains(ocrControls_) || contains(ocrSearchControls_) || contains(ocrFollowControls_)
+            || contains(ocrFollowOffsetControls_) || contains(ocrFollowVarControls_)
+            || contains(ocrFindRegionToggleControls_) || contains(ocrFindRegionControls_);
+    }
+
+
     void ApplyEditorControlScale() {
         for (const auto& item : editorLayouts_) {
             if (IsFooterControl(item.hwnd)) continue;
@@ -724,6 +866,8 @@ private:
                 const int w = std::max(1, MulDiv(item.base.right - item.base.left, kEditorWidth, kEditorBaseWidth));
                 const int h = std::max(1, MulDiv(item.base.bottom - item.base.top, kEditorWidth, kEditorBaseWidth));
                 MoveWindow(item.hwnd, x, y, w, h, FALSE);
+            } else if (IsOcrDepHwnd(item.hwnd) || IsOcrHwnd(item.hwnd)) {
+                // OCR 控件由 RefreshOcrSubPanel 统一堆叠布局，不在此按初始坐标缩放
             } else {
                 const int x = MulDiv(item.base.left, kEditorWidth, kEditorBaseWidth);
                 const int y = MulDiv(item.base.top, kEditorHeight, kEditorBaseHeight);
@@ -733,6 +877,10 @@ private:
             }
         }
         ConfigureEditorCombos();
+        if (page_ == Page::Editor && popupAction_.sel == 18) {
+            RefreshOcrDepStatus();
+            RefreshOcrSubPanel();
+        }
     }
 
     // ── Page navigation ────────────────────────────────────────────
@@ -848,21 +996,47 @@ private:
         ShowGroup(defineBlockControls_, sel == 15);
         ShowGroup(runBlockControls_, sel == 16);
         ShowGroup(findImageControls_, sel == 17);
-        ShowGroup(findImageOffsetControls_, sel == 17);
-        ShowGroup(findImageVarControls_, sel == 17);
-        ShowGroup(ifControls_, sel == 18);
-        ShowGroup(elseControls_, sel == 19);
-        ShowGroup(lockScreenshotControls_, sel == 20);
-        ShowGroup(unlockScreenshotControls_, sel == 21);
-        ShowGroup(stopMacroControls_, sel == 22);
-        if (sel != 17) ClearGrayButtonHover();
-        if (sel == 17) RefreshFindImageSubPanel();
+        if (sel == 17) {
+            RefreshFindImageSubPanel();
+        } else {
+            ShowGroup(findImageOffsetControls_, false);
+            ShowGroup(findImageVarControls_, false);
+        }
+        ShowGroup(ocrDepControls_, sel == 18);
+        ShowGroup(ocrFindRegionToggleControls_, sel == 18);
+        ShowGroup(ocrControls_, sel == 18);
+        ShowGroup(ocrFollowControls_, sel == 18);
+        if (sel == 18) {
+            RefreshOcrDepStatus();
+            RefreshOcrSubPanel();
+        } else {
+            ShowGroup(ocrSearchControls_, false);
+            ShowGroup(ocrFollowOffsetControls_, false);
+            ShowGroup(ocrFollowVarControls_, false);
+            ShowGroup(ocrFindRegionToggleControls_, false);
+            ShowGroup(ocrFindRegionControls_, false);
+        }
+        ShowGroup(ifControls_, sel == 19);
+        ShowGroup(elseControls_, sel == 20);
+        ShowGroup(lockScreenshotControls_, sel == 21);
+        ShowGroup(unlockScreenshotControls_, sel == 22);
+        ShowGroup(stopMacroControls_, sel == 23);
+        ShowGroup(runProgramControls_, sel == 24);
+        ShowGroup(runProgramFileControls_, sel == 24 && popupRunProgram_.sel <= 0);
+        ShowGroup(closeProgramControls_, sel == 25);
+        ShowGroup(openWebpageControls_, sel == 26);
+        ShowGroup(openFileControls_, sel == 27);
+        ShowGroup(timerRecordControls_, sel == 28);
+        if (sel != 17 && sel != 18) ClearGrayButtonHover();
+        if (sel == 17) { /* handled above */ }
+        else if (sel == 18) { /* handled above */ }
         ApplyEditorFooterLayout();
         if (sel == 3) RefreshMousePlaybackCombo();
         if (sel == 4) RefreshRunMacroCombo();
         if (sel == 16) RefreshRunBlockCombo();
         if (sel == 12) RefreshQuickInputVarCombo();
-        if (sel == 18) RefreshIfVarCombo();
+        if (sel == 18) RefreshOcrSearchVarCombo();
+        if (sel == 19) RefreshIfVarCombo();
         HideEditorComboHwnds();
         UpdateMoveVarControls();
         UpdateLoopVarControls();
@@ -883,7 +1057,7 @@ private:
     }
 
     void HideEditorComboHwnds() {
-        for (HWND h : {mode_, actionCombo_, mousePressButton_, clickButton_, loopTypeCombo_, runBlockCombo_, hotkeyShortcutCombo_, quickInputVarCombo_, runMacroCombo_, mousePlaybackCombo_, scrollDirectionCombo_, findFollowUpCombo_, ifVarCombo_, ifOperatorCombo_, ifConnectorCombo_}) {
+        for (HWND h : {mode_, actionCombo_, mousePressButton_, clickButton_, loopTypeCombo_, runBlockCombo_, hotkeyShortcutCombo_, quickInputVarCombo_, runMacroCombo_, mousePlaybackCombo_, scrollDirectionCombo_, findFollowUpCombo_, ocrResultModeCombo_, ocrFollowUpCombo_, ocrSearchVarCombo_, ifVarCombo_, ifOperatorCombo_, ifConnectorCombo_, runProgramCombo_}) {
             if (h) ShowWindow(h, SW_HIDE);
         }
     }
@@ -915,6 +1089,63 @@ private:
         MoveWindow(findSelectRegionBtn_, selectX, kFindRegionRowY, kFindBtnW, kFindBtnH, FALSE);
     }
 
+    static int OcrScale(int designPx) {
+        return MulDiv(designPx, kEditorWidth, kEditorBaseWidth);
+    }
+
+    void MoveOcrAt(HWND hwnd, int xDesign, int yClient, int wDesign, int hDesign) const {
+        if (!hwnd) return;
+        MoveWindow(hwnd,
+            OcrScale(xDesign),
+            yClient,
+            std::max(1, OcrScale(wDesign)),
+            std::max(1, OcrScale(hDesign)),
+            FALSE);
+    }
+
+    void MoveOcrCoordLabel(const wchar_t* text, int yClient) const {
+        const int x = (text[0] == L'X') ? kFindXLabelX : kFindYLabelX;
+        for (HWND h : ocrControls_) {
+            if (!h) continue;
+            wchar_t buf[8]{};
+            GetWindowTextW(h, buf, 8);
+            if (wcscmp(buf, text) != 0) continue;
+            wchar_t cls[16]{};
+            GetClassNameW(h, cls, 16);
+            if (wcscmp(cls, L"Static") == 0) {
+                MoveOcrAt(h, x, yClient, kFindCoordLabelW, 22);
+                return;
+            }
+        }
+    }
+
+    void SizeOcrRegionButtonsAt(int yClient) {
+        if (!ocrFullScreenBtn_ || !ocrSelectRegionBtn_ || !ocrRegionLabel_) return;
+        HDC hdc = GetDC(hwnd_);
+        HFONT old = static_cast<HFONT>(SelectObject(hdc, editorFont_ ? editorFont_ : font_));
+        SIZE labelSz{}, fullSz{};
+        GetTextExtentPoint32W(hdc, L"识别区域", 4, &labelSz);
+        GetTextExtentPoint32W(hdc, L"全图", 2, &fullSz);
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd_, hdc);
+        const int labelW = std::max(kFindRegionLabelW, static_cast<int>(labelSz.cx) + 4);
+        const int fullX = kFindContentLeft + labelW + kFindRegionLabelGap;
+        const int fullWMax = kFindSelectRegionX - kFindRegionBtnGap - fullX;
+        const int fullWWant = std::max(32, static_cast<int>(fullSz.cx) + 10);
+        const int fullW = std::max(32, std::min(fullWMax, fullWWant));
+        const int btnH = OcrScale(kFindBtnH);
+        MoveWindow(ocrRegionLabel_, OcrScale(kFindContentLeft), yClient,
+            OcrScale(labelW), btnH, FALSE);
+        MoveWindow(ocrFullScreenBtn_, OcrScale(fullX), yClient,
+            OcrScale(fullW), btnH, FALSE);
+        MoveWindow(ocrSelectRegionBtn_, OcrScale(kFindSelectRegionX), yClient,
+            OcrScale(kFindBtnW), btnH, FALSE);
+    }
+
+    void SizeOcrRegionButtons() {
+        SizeOcrRegionButtonsAt(OcrScale(kOcrRegionRowY));
+    }
+
     bool IsParamComboVisible(int comboId) const {
         const int sel = popupAction_.sel;
         switch (comboId) {
@@ -928,11 +1159,39 @@ private:
         case 9: return sel == 3;
         case 10: return sel == 7;
         case 11: return sel == 17;
-        case 12: return sel == 18;
-        case 13: return sel == 18;
-        case 14: return sel == 18;
+        case 12: return sel == 19;
+        case 13: return sel == 19;
+        case 14: return sel == 19;
+        case 15: return sel == 24;
+        case 16: return sel == 18;
+        case 17: return sel == 18;
+        case 18: return sel == 18 && popupOcrResultMode_.sel == 1;
         default: return false;
         }
+    }
+
+    void InitCrosshairDrag() {
+        crosshairDrag_.SetOwner(hwnd_);
+        crosshairDrag_.SetDragCursor(crosshairDragCursor_);
+        crosshairDrag_.ClearButtons();
+        crosshairDrag_.RegisterButton(crosshairBtn_, {CrosshairDragMode::Coordinates, nullptr});
+        crosshairDrag_.RegisterButton(runProgramCrosshairBtn_, {CrosshairDragMode::ProgramPath, runProgramPath_});
+        crosshairDrag_.RegisterButton(closeProgramCrosshairBtn_, {CrosshairDragMode::ProgramPath, closeProgramPath_});
+    }
+
+    void InitRunProgramPresets() {
+        popupRunProgram_.items.clear();
+        for (int i = 0; i < RunProgramPresetCount(); ++i) {
+            popupRunProgram_.items.push_back(RunProgramPresetAt(i).label);
+        }
+        popupRunProgram_.sel = 0;
+        if (runProgramCombo_) {
+            SetText(runProgramCombo_, popupRunProgram_.items.empty() ? L"选择文件" : popupRunProgram_.items[0]);
+        }
+    }
+
+    void UpdateRunProgramSubPanel() {
+        RefreshParamPanel();
     }
 
     void RefreshRunBlockCombo() {
@@ -1031,6 +1290,10 @@ private:
         if (hwnd == ifVarCombo_ && IsParamComboVisible(12)) return 12;
         if (hwnd == ifOperatorCombo_ && IsParamComboVisible(13)) return 13;
         if (hwnd == ifConnectorCombo_ && IsParamComboVisible(14)) return 14;
+        if (hwnd == runProgramCombo_ && IsParamComboVisible(15)) return 15;
+        if (hwnd == ocrResultModeCombo_ && IsParamComboVisible(16)) return 16;
+        if (hwnd == ocrFollowUpCombo_ && IsParamComboVisible(17)) return 17;
+        if (hwnd == ocrSearchVarCombo_ && IsParamComboVisible(18)) return 18;
         return -1;
     }
 
@@ -1042,7 +1305,8 @@ private:
             {2, mousePressButton_}, {3, clickButton_}, {4, loopTypeCombo_}, {5, runBlockCombo_},
             {6, hotkeyShortcutCombo_}, {7, quickInputVarCombo_}, {8, runMacroCombo_}, {9, mousePlaybackCombo_},
             {10, scrollDirectionCombo_}, {11, findFollowUpCombo_},
-            {12, ifVarCombo_}, {13, ifOperatorCombo_}, {14, ifConnectorCombo_},
+            {12, ifVarCombo_}, {13, ifOperatorCombo_}, {14, ifConnectorCombo_}, {15, runProgramCombo_},
+            {16, ocrResultModeCombo_}, {17, ocrFollowUpCombo_}, {18, ocrSearchVarCombo_},
         };
         for (const auto& hit : hits) {
             if (!hit.hwnd || !IsParamComboVisible(hit.id)) continue;
@@ -1113,7 +1377,8 @@ private:
 
     void OnActionsChanged() {
         if (popupAction_.sel == 12) RefreshQuickInputVarCombo();
-        if (popupAction_.sel == 18) RefreshIfVarCombo();
+        if (popupAction_.sel == 18) RefreshOcrSearchVarCombo();
+        if (popupAction_.sel == 19) RefreshIfVarCombo();
     }
 
     void InsertQuickInputVariable() {
@@ -1129,6 +1394,357 @@ private:
         const DWORD pos = start + static_cast<DWORD>(insert.size());
         SendMessageW(quickInputEdit_, EM_SETSEL, pos, pos);
         SetFocus(quickInputEdit_);
+    }
+
+    void RefreshOcrSearchVarCombo() {
+        quickInputVarItems_ = BuildQuickInputVarItems(actions_);
+        popupOcrSearchVar_.items.clear();
+        for (const auto& item : quickInputVarItems_) {
+            popupOcrSearchVar_.items.push_back(item.display);
+        }
+        if (popupOcrSearchVar_.sel < 0 || popupOcrSearchVar_.sel >= static_cast<int>(popupOcrSearchVar_.items.size())) {
+            popupOcrSearchVar_.sel = popupOcrSearchVar_.items.empty() ? -1 : 0;
+        }
+        SetText(ocrSearchVarCombo_, popupOcrSearchVar_.sel >= 0 && popupOcrSearchVar_.sel < static_cast<int>(popupOcrSearchVar_.items.size())
+            ? popupOcrSearchVar_.items[static_cast<size_t>(popupOcrSearchVar_.sel)] : L"");
+    }
+
+    void InsertOcrSearchVariable() {
+        if (!ocrSearchEdit_) return;
+        const int sel = popupOcrSearchVar_.sel;
+        if (sel < 0 || sel >= static_cast<int>(quickInputVarItems_.size())) return;
+        const std::wstring insert = quickInputVarItems_[static_cast<size_t>(sel)].insertText;
+        DWORD start = 0, end = 0;
+        SendMessageW(ocrSearchEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+        const std::wstring current = GetText(ocrSearchEdit_);
+        const std::wstring updated = current.substr(0, start) + insert + current.substr(end);
+        SetText(ocrSearchEdit_, updated);
+        const DWORD pos = start + static_cast<DWORD>(insert.size());
+        SendMessageW(ocrSearchEdit_, EM_SETSEL, pos, pos);
+        SetFocus(ocrSearchEdit_);
+        if (popupAction_.sel == 18) RefreshOcrSubPanel();
+    }
+
+    int LayoutOcrSearchBlock(int y, int rowGap, int btnH, int fieldH, int tightGap, int insertBtnH) {
+        MoveOcrAt(ocrSearchLabel_, kFindContentLeft, y, kFindBlockW, 22);
+        y += fieldH + tightGap;
+        MoveOcrAt(ocrSearchEdit_, kFindContentLeft, y, kFindBlockW, 22);
+        y += fieldH + rowGap;
+        MoveOcrAt(ocrSearchVarLabel_, kFindContentLeft, y + (btnH - fieldH) / 2, 50, 22);
+        MoveOcrAt(ocrSearchVarCombo_, kFindContentLeft + 56, y, kFindFollowComboW, kFindBtnH);
+        y += btnH + tightGap;
+        MoveOcrAt(ocrSearchVarInsertBtn_, kFindContentLeft, y, kFindBlockW, 28);
+        return y + insertBtnH + rowGap;
+    }
+
+    int LayoutOcrFindRegionBlock(int y) {
+        const int rowGap = OcrScale(kFindVGap);
+        const int btnH = OcrScale(kFindBtnH);
+        const int fieldH = OcrScale(22);
+        const int imageSize = OcrScale(kFindImageSize);
+        const int sideBtnStep = OcrScale(kFindBtnH + kFindBtnStackGap);
+        MoveOcrAt(ocrFindImageLabel_, kFindContentLeft, y, 90, kFindBtnH);
+        MoveOcrAt(ocrFindSelectRegionBtn_, kFindSelectRegionX, y, kFindBtnW, kFindBtnH);
+        y += btnH + rowGap;
+        MoveOcrAt(ocrFindImagePreviewBtn_, kFindContentLeft, y, kFindImageSize, kFindImageSize);
+        MoveOcrAt(ocrFindScreenshotBtn_, kFindActionBtnX, y, kFindBtnW, kFindBtnH);
+        MoveOcrAt(ocrFindLocalImageBtn_, kFindActionBtnX, y + sideBtnStep, kFindBtnW, kFindBtnH);
+        MoveOcrAt(ocrFindClearImageBtn_, kFindActionBtnX, y + sideBtnStep * 2, kFindBtnW, kFindBtnH);
+        y += imageSize + rowGap;
+        MoveOcrAt(ocrFindMatchThreshold_, kFindContentLeft + 91, y, 40, 22);
+        for (HWND h : ocrFindRegionControls_) {
+            if (!h) continue;
+            wchar_t buf[16]{};
+            GetWindowTextW(h, buf, 16);
+            if (wcscmp(buf, L"匹配度大于") == 0) MoveOcrAt(h, kFindContentLeft, y, 90, 22);
+            else if (wcscmp(buf, L"%") == 0) MoveOcrAt(h, kFindContentLeft + 135, y, 24, 22);
+        }
+        y += fieldH + rowGap;
+        MoveOcrAt(ocrFindScaleMin_, kFindContentLeft + 65, y, 40, 22);
+        MoveOcrAt(ocrFindScaleMax_, kFindContentLeft + 151, y, 40, 22);
+        for (HWND h : ocrFindRegionControls_) {
+            if (!h) continue;
+            wchar_t buf[16]{};
+            GetWindowTextW(h, buf, 16);
+            if (wcscmp(buf, L"最小缩放") == 0) MoveOcrAt(h, kFindContentLeft, y, 64, 22);
+            else if (wcscmp(buf, L"最大") == 0) MoveOcrAt(h, kFindContentLeft + 110, y, 40, 22);
+        }
+        return y + fieldH + rowGap;
+    }
+
+    bool OcrSearchTextContainsVariable() const {
+        if (!ocrSearchEdit_) return false;
+        const std::wstring text = GetText(ocrSearchEdit_);
+        const size_t open = text.find(L'{');
+        if (open == std::wstring::npos) return false;
+        const size_t close = text.find(L'}', open + 1);
+        return close != std::wstring::npos;
+    }
+
+    void RefreshOcrSubPanel() {
+        const bool searchMode = popupOcrResultMode_.sel == 1;
+        const bool saveVar = popupOcrFollowUp_.sel == 2;
+        const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+        ShowGroup(ocrSearchControls_, searchMode);
+        ShowGroup(ocrFollowOffsetControls_, !saveVar);
+        ShowGroup(ocrFollowVarControls_, saveVar);
+        ShowGroup(ocrFindRegionToggleControls_, true);
+        ShowGroup(ocrFindRegionControls_, regionByImage);
+        if (ocrRegionLabel_) ShowWindow(ocrRegionLabel_, regionByImage ? SW_HIDE : SW_SHOW);
+        if (ocrFullScreenBtn_) ShowWindow(ocrFullScreenBtn_, regionByImage ? SW_HIDE : SW_SHOW);
+        if (ocrSelectRegionBtn_) ShowWindow(ocrSelectRegionBtn_, regionByImage ? SW_HIDE : SW_SHOW);
+        if (editorPopupOpen_ == 18) CloseEditorPopup();
+        if (ocrUntilFound_) ShowWindow(ocrUntilFound_, searchMode ? SW_SHOW : SW_HIDE);
+
+        const int depGap = OcrScale(kOcrDepToRegionGap);
+        const int rowGap = OcrScale(kFindVGap);
+        const int btnH = OcrScale(kFindBtnH);
+        const int fieldH = OcrScale(22);
+        const int tightGap = OcrScale(4);
+        const int insertBtnH = OcrScale(28);
+
+        int y = (ocrDepStatusLabel_
+            ? WindowClientRect(ocrDepStatusLabel_).bottom
+            : OcrScale(kOcrRegionRowY)) + depGap;
+
+        if (ocrRegionByImageCheck_) {
+            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, 180, 22);
+            y += fieldH + rowGap;
+        }
+
+        if (regionByImage) {
+            y = LayoutOcrFindRegionBlock(y);
+        } else {
+            SizeOcrRegionButtonsAt(y);
+            y += btnH + rowGap;
+        }
+
+        MoveOcrCoordLabel(L"X1", y);
+        MoveOcrAt(ocrX1_, kFindXEditX, y, kFindEditW, 22);
+        MoveOcrCoordLabel(L"Y1", y);
+        MoveOcrAt(ocrY1_, kFindYEditX, y, kFindEditW, 22);
+        y += fieldH + rowGap;
+
+        MoveOcrCoordLabel(L"X2", y);
+        MoveOcrAt(ocrX2_, kFindXEditX, y, kFindEditW, 22);
+        MoveOcrCoordLabel(L"Y2", y);
+        MoveOcrAt(ocrY2_, kFindYEditX, y, kFindEditW, 22);
+        y += fieldH + rowGap;
+
+        MoveOcrAt(ocrResultModeLabel_, kFindContentLeft, y, kFindFollowLabelW, kFindBtnH);
+        MoveOcrAt(ocrResultModeCombo_, kFindContentLeft + kFindFollowLabelW + 8, y, kFindFollowComboW, kFindBtnH);
+        y += btnH + rowGap;
+
+        if (searchMode) {
+            y = LayoutOcrSearchBlock(y, rowGap, btnH, fieldH, tightGap, insertBtnH);
+        }
+
+        MoveOcrAt(ocrFollowUpLabel_, kFindContentLeft, y, kFindFollowLabelW, kFindBtnH);
+        MoveOcrAt(ocrFollowUpCombo_, kFindContentLeft + kFindFollowLabelW + 8, y, kFindFollowComboW, kFindBtnH);
+        y += btnH + rowGap;
+
+        if (!saveVar) {
+            MoveOcrAt(ocrOffsetXLabel_, kFindOffsetXLabelX, y, kFindOffsetLabelW, 22);
+            MoveOcrAt(ocrOffsetX_, kFindOffsetXEditX, y, kFindEditW, 22);
+            MoveOcrAt(ocrOffsetYLabel_, kFindOffsetYLabelX, y, kFindOffsetLabelW, 22);
+            MoveOcrAt(ocrOffsetY_, kFindYEditX, y, kFindEditW, 22);
+            y += fieldH + rowGap;
+        } else {
+            MoveOcrAt(ocrResultVarLabel_, kFindContentLeft, y, 100, 22);
+            MoveOcrAt(ocrResultVar_, kFindContentLeft + 91, y, kOcrResultVarEditW, 22);
+            y += fieldH + rowGap;
+        }
+
+        if (searchMode && ocrUntilFound_) {
+            MoveOcrAt(ocrUntilFound_, kFindContentLeft, y, 140, 22);
+            y += fieldH + rowGap;
+        }
+
+        const bool showSelectOffset = searchMode && !saveVar && !OcrSearchTextContainsVariable();
+        MoveOcrAt(ocrTestBtn_, kFindContentLeft, y, kFindBtnW, kFindBtnH);
+        if (ocrSelectOffsetBtn_) {
+            if (showSelectOffset) {
+                ShowWindow(ocrSelectOffsetBtn_, SW_SHOW);
+                MoveOcrAt(ocrSelectOffsetBtn_, kOcrTestRowOffsetBtnX, y, kOcrTestRowOffsetBtnW, kFindBtnH);
+            } else {
+                ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
+            }
+        }
+        y += btnH + rowGap;
+        ApplyEditorFooterLayout();
+        InvalidateOcrEditorPanel();
+    }
+
+    void InvalidateOcrEditorPanel() {
+        if (!hwnd_) return;
+        const RECT rc{
+            MulDiv(kFindZoneLeft, kEditorWidth, kEditorBaseWidth),
+            0,
+            kEditorWidth,
+            kEditorHeight - kBottomH
+        };
+        InvalidateRect(hwnd_, &rc, TRUE);
+    }
+
+    void RefreshOcrDepStatus() {
+        if (!ocrDepStatusLabel_ || !ocrDepInstallBtn_) return;
+        const OcrEnvStatus env = CheckOcrEnvironment(false);
+        const bool ready = env.state == OcrEnvState::Ready;
+        SetText(ocrDepStatusLabel_, ready ? L"文字识别已安装" : L"文字识别未安装");
+        SetWindowTextW(ocrDepInstallBtn_, ready ? L"修复/更新" : L"一键安装");
+        EnableWindow(ocrDepInstallBtn_, TRUE);
+        if (actionCombo_) {
+            const int gap = OcrScale(kEditorLabelGap);
+            const int depY = WindowClientRect(actionCombo_).bottom + gap;
+            const int x = OcrScale(kFindContentLeft);
+            const int labelW = OcrScale(130);
+            const int btnX = OcrScale(kFindActionBtnX);
+            const int btnW = OcrScale(kFindBtnW);
+            const int btnH = OcrScale(kFindBtnH);
+            MoveWindow(ocrDepStatusLabel_, x, depY, labelW, btnH, FALSE);
+            MoveWindow(ocrDepInstallBtn_, btnX, depY, btnW, btnH, FALSE);
+        }
+    }
+
+    void ShowOcrInstallDialog() {
+        const OcrEnvStatus env = CheckOcrEnvironment(false);
+        const bool repair = env.state == OcrEnvState::Ready;
+        OcrInstallDialog dlg;
+        dlg.Show(hwnd_, repair);
+        RefreshOcrDepStatus();
+    }
+
+    void ApplyOcrFullScreen() {
+        ocrFullScreen_ = true;
+        int x = 0, y = 0, w = 0, h = 0;
+        GetVirtualScreenRect(x, y, w, h);
+        SetText(ocrX1_, std::to_wstring(x));
+        SetText(ocrY1_, std::to_wstring(y));
+        SetText(ocrX2_, std::to_wstring(x + w));
+        SetText(ocrY2_, std::to_wstring(y + h));
+    }
+
+    void BeginOcrRegionSelect() {
+        if (!hwnd_) return;
+        if (!screenshotOverlay_) screenshotOverlay_ = std::make_unique<ScreenshotOverlay>();
+        screenshotOverlay_->SetTitle(L"选取区域");
+        GetWindowRect(hwnd_, &findRegionSavedRect_);
+        ShowWindow(hwnd_, SW_HIDE);
+        screenshotOverlay_->Show([this](RECT sel) {
+            if (sel.left == 0 && sel.top == 0 && sel.right == 0 && sel.bottom == 0) {
+                SetWindowPos(hwnd_, HWND_TOP,
+                    findRegionSavedRect_.left, findRegionSavedRect_.top,
+                    findRegionSavedRect_.right - findRegionSavedRect_.left,
+                    findRegionSavedRect_.bottom - findRegionSavedRect_.top,
+                    SWP_SHOWWINDOW);
+                return;
+            }
+            const int vsX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            const int vsY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            ocrFullScreen_ = false;
+            SetText(ocrX1_, std::to_wstring(sel.left + vsX));
+            SetText(ocrY1_, std::to_wstring(sel.top + vsY));
+            SetText(ocrX2_, std::to_wstring(sel.right + vsX));
+            SetText(ocrY2_, std::to_wstring(sel.bottom + vsY));
+            SetWindowPos(hwnd_, HWND_TOP,
+                findRegionSavedRect_.left, findRegionSavedRect_.top,
+                findRegionSavedRect_.right - findRegionSavedRect_.left,
+                findRegionSavedRect_.bottom - findRegionSavedRect_.top,
+                SWP_SHOWWINDOW);
+            SetForegroundWindow(hwnd_);
+            InvalidateRect(hwnd_, nullptr, TRUE);
+            UpdateWindow(hwnd_);
+        });
+    }
+
+    void FlushPendingUiMessages() const {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    void HideEditorForScreenCapture() {
+        if (!hwnd_) return;
+        GetWindowRect(hwnd_, &findRegionSavedRect_);
+        ShowWindow(hwnd_, SW_HIDE);
+        UpdateWindow(hwnd_);
+        FlushPendingUiMessages();
+        Sleep(150);
+    }
+
+    void RestoreEditorAfterScreenCapture() {
+        if (!hwnd_) return;
+        SetWindowPos(hwnd_, HWND_TOP,
+            findRegionSavedRect_.left, findRegionSavedRect_.top,
+            findRegionSavedRect_.right - findRegionSavedRect_.left,
+            findRegionSavedRect_.bottom - findRegionSavedRect_.top,
+            SWP_SHOWWINDOW);
+        SetForegroundWindow(hwnd_);
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        UpdateWindow(hwnd_);
+    }
+
+    void TestOcr() {
+        if (ocrTestRunning_.exchange(true)) return;
+        const OcrEnvStatus env = CheckOcrEnvironment(false);
+        if (env.state != OcrEnvState::Ready) {
+            ocrTestRunning_ = false;
+            ShowOcrInstallDialog();
+            return;
+        }
+        if (ocrTestBtn_) EnableWindow(ocrTestBtn_, FALSE);
+
+        const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+        if (regionByImage && ocrFindImagePath_.empty()) {
+            ocrTestRunning_ = false;
+            if (ocrTestBtn_) EnableWindow(ocrTestBtn_, TRUE);
+            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"测试文字识别", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        HideEditorForScreenCapture();
+
+        int sx1 = ToInt(ocrX1_), sy1 = ToInt(ocrY1_), sx2 = ToInt(ocrX2_), sy2 = ToInt(ocrY2_);
+        if (regionByImage) {
+            if (!ResolveOcrAbsRegionFromFindImage(sx1, sy1, sx2, sy2, sx1, sy1, sx2, sy2)) {
+                RestoreEditorAfterScreenCapture();
+                ocrTestRunning_ = false;
+                if (ocrTestBtn_) EnableWindow(ocrTestBtn_, TRUE);
+                MessageBoxW(hwnd_, L"未找到参考图片，无法测试识别。", L"测试文字识别", MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+        } else if (ocrFullScreen_) {
+            int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+            GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+            sx1 = vsX; sy1 = vsY; sx2 = vsX + vsW; sy2 = vsY + vsH;
+        }
+
+        if (!ocrOverlay_) ocrOverlay_ = std::make_unique<OcrOverlay>();
+
+        std::wstring searchTarget;
+        if (popupOcrResultMode_.sel == 1) {
+            MacroVariableContext ctx;
+            ctx.matchVars = &matchVars_;
+            ctx.ocrVars = &ocrVars_;
+            ctx.loopVars = &loopVars_;
+            ctx.timerStarts = &timerStarts_;
+            ctx.curLoops = curLoops_;
+            searchTarget = ResolveMacroVariables(GetText(ocrSearchEdit_), ctx);
+        }
+        EnsureOcrSession();
+        ocrOverlay_->Show(sx1, sy1, sx2, sy2, searchTarget);
+        ReleaseOcrSession();
+
+        RestoreEditorAfterScreenCapture();
+
+        ocrTestRunning_ = false;
+        if (ocrTestBtn_) EnableWindow(ocrTestBtn_, TRUE);
+        if (popupAction_.sel == 18) {
+            RefreshOcrDepStatus();
+            RefreshOcrSubPanel();
+        }
     }
 
     void CancelQuickInputTip() {
@@ -1259,11 +1875,17 @@ private:
         case ActionType::RunBlock: return 16;
         case ActionType::ScrollWheel: return 7;
         case ActionType::FindImage: return 17;
-        case ActionType::If: return 18;
-        case ActionType::Else: return 19;
-        case ActionType::LockScreenshot: return 20;
-        case ActionType::UnlockScreenshot: return 21;
-        case ActionType::StopMacro: return 22;
+        case ActionType::TextRecognition: return 18;
+        case ActionType::If: return 19;
+        case ActionType::Else: return 20;
+        case ActionType::LockScreenshot: return 21;
+        case ActionType::UnlockScreenshot: return 22;
+        case ActionType::StopMacro: return 23;
+        case ActionType::RunProgram: return 24;
+        case ActionType::CloseProgram: return 25;
+        case ActionType::OpenWebpage: return 26;
+        case ActionType::OpenFile: return 27;
+        case ActionType::TimerRecordTime: return 28;
         default: return 14;
         }
     }
@@ -1272,7 +1894,8 @@ private:
         return idx == 0 || idx == 1 || idx == 2 || idx == 3 || idx == 4 || idx == 5 || idx == 6 || idx == 7 || idx == 8 || idx == 9 || idx == 10
             || idx == 11 || idx == 12
             || idx == 13 || idx == 14 || idx == 15 || idx == 16 || idx == 17 || idx == 18 || idx == 19
-            || idx == 20 || idx == 21 || idx == 22;
+            || idx == 20 || idx == 21 || idx == 22 || idx == 23 || idx == 24
+            || idx == 25 || idx == 26 || idx == 27 || idx == 28;
     }
 
     void UpdateEditMode() {
@@ -1501,20 +2124,69 @@ private:
             if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
         }
         else if (sel == 18) {
+            action.type = ActionType::TextRecognition;
+            const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+            action.ocrRegionByImage = regionByImage;
+            action.searchX1 = ToInt(ocrX1_);
+            action.searchY1 = ToInt(ocrY1_);
+            action.searchX2 = ToInt(ocrX2_);
+            action.searchY2 = ToInt(ocrY2_);
+            action.searchFullScreen = regionByImage ? false : ocrFullScreen_;
+            action.imagePath = ocrFindImagePath_;
+            if (regionByImage) {
+                action.matchThreshold = std::clamp(ToDouble(ocrFindMatchThreshold_, 65.0), 1.0, 100.0);
+                action.imageScaleMin = std::max(0.1, ToDouble(ocrFindScaleMin_, 1.0));
+                action.imageScaleMax = std::max(action.imageScaleMin, ToDouble(ocrFindScaleMax_, action.imageScaleMin));
+                action.imageScale = (action.imageScaleMin + action.imageScaleMax) * 0.5;
+            }
+            action.ocrResultMode = std::clamp(popupOcrResultMode_.sel, 0, 1);
+            action.ocrSearchText = GetText(ocrSearchEdit_);
+            action.ocrFollowUp = std::clamp(popupOcrFollowUp_.sel, 0, 2);
+            action.offsetX = ToInt(ocrOffsetX_);
+            action.offsetY = ToInt(ocrOffsetY_);
+            action.findUntilFound = Checked(ocrUntilFound_);
+            action.matchVarName = Trim(GetText(ocrResultVar_));
+            if (action.matchVarName.empty()) action.matchVarName = L"a";
+        }
+        else if (sel == 19) {
             action.type = ActionType::If;
             action.conditionExpr = GetText(ifConditionList_);
         }
-        else if (sel == 19) {
+        else if (sel == 20) {
             action.type = ActionType::Else;
         }
-        else if (sel == 20) {
+        else if (sel == 21) {
             action.type = ActionType::LockScreenshot;
         }
-        else if (sel == 21) {
+        else if (sel == 22) {
             action.type = ActionType::UnlockScreenshot;
         }
-        else if (sel == 22) {
+        else if (sel == 23) {
             action.type = ActionType::StopMacro;
+        }
+        else if (sel == 24) {
+            action.type = ActionType::RunProgram;
+            action.shortcutPreset = std::clamp(popupRunProgram_.sel, 0, RunProgramPresetCount() - 1);
+            action.targetPath = Trim(GetText(runProgramPath_));
+            action.inputText = GetText(runProgramArgs_);
+            action.blockName = RunProgramDisplayName(action.shortcutPreset, action.targetPath);
+        }
+        else if (sel == 25) {
+            action.type = ActionType::CloseProgram;
+            action.targetPath = Trim(GetText(closeProgramPath_));
+            action.matchFileNameOnly = closeProgramMatchFileName_ && Checked(closeProgramMatchFileName_);
+        }
+        else if (sel == 26) {
+            action.type = ActionType::OpenWebpage;
+            action.targetPath = Trim(GetText(openWebpageUrl_));
+        }
+        else if (sel == 27) {
+            action.type = ActionType::OpenFile;
+            action.targetPath = Trim(GetText(openFilePath_));
+        }
+        else if (sel == 28) {
+            action.type = ActionType::TimerRecordTime;
+            action.loopVarName = Trim(GetText(timerVarName_));
         }
         else { action.type = ActionType::MoveMouse; }
         return action;
@@ -1611,8 +2283,34 @@ private:
             SetText(findMatchVar_, action.matchVarName.empty() ? L"matchRet" : action.matchVarName);
             UpdateFindImagePreview();
         }
-        else if (action.type == ActionType::If) {
+        else if (action.type == ActionType::TextRecognition) {
             SetPopupSel(popupAction_, actionCombo_, 18);
+            ocrFullScreen_ = action.searchFullScreen;
+            SetChecked(ocrRegionByImageCheck_, action.ocrRegionByImage);
+            ocrFindImagePath_ = action.ocrRegionByImage ? action.imagePath : L"";
+            if (action.ocrRegionByImage) {
+                SetText(ocrFindMatchThreshold_, std::to_wstring(static_cast<int>(action.matchThreshold)));
+                SetText(ocrFindScaleMin_, F3(action.imageScaleMin > 0.0 ? action.imageScaleMin : action.imageScale));
+                SetText(ocrFindScaleMax_, F3(action.imageScaleMax > 0.0 ? action.imageScaleMax : action.imageScale));
+                UpdateOcrFindImagePreview();
+            } else {
+                UpdateOcrFindImagePreview();
+            }
+            SetText(ocrX1_, std::to_wstring(action.searchX1));
+            SetText(ocrY1_, std::to_wstring(action.searchY1));
+            SetText(ocrX2_, std::to_wstring(action.searchX2));
+            SetText(ocrY2_, std::to_wstring(action.searchY2));
+            SetPopupSel(popupOcrResultMode_, ocrResultModeCombo_, std::clamp(action.ocrResultMode, 0, 1));
+            SetText(ocrSearchEdit_, action.ocrSearchText);
+            SetPopupSel(popupOcrFollowUp_, ocrFollowUpCombo_, std::clamp(action.ocrFollowUp, 0, 2));
+            SetText(ocrOffsetX_, std::to_wstring(action.offsetX));
+            SetText(ocrOffsetY_, std::to_wstring(action.offsetY));
+            SetChecked(ocrUntilFound_, action.findUntilFound);
+            SetText(ocrResultVar_, action.matchVarName.empty() ? L"a" : action.matchVarName);
+            RefreshOcrSearchVarCombo();
+        }
+        else if (action.type == ActionType::If) {
+            SetPopupSel(popupAction_, actionCombo_, 19);
             RefreshIfVarCombo();
             SetText(ifConditionList_, action.conditionExpr);
             SetText(ifValueEdit_, L"0");
@@ -1620,16 +2318,39 @@ private:
             SetPopupSel(popupIfConnector_, ifConnectorCombo_, 0);
         }
         else if (action.type == ActionType::Else) {
-            SetPopupSel(popupAction_, actionCombo_, 19);
-        }
-        else if (action.type == ActionType::LockScreenshot) {
             SetPopupSel(popupAction_, actionCombo_, 20);
         }
-        else if (action.type == ActionType::UnlockScreenshot) {
+        else if (action.type == ActionType::LockScreenshot) {
             SetPopupSel(popupAction_, actionCombo_, 21);
         }
-        else if (action.type == ActionType::StopMacro) {
+        else if (action.type == ActionType::UnlockScreenshot) {
             SetPopupSel(popupAction_, actionCombo_, 22);
+        }
+        else if (action.type == ActionType::StopMacro) {
+            SetPopupSel(popupAction_, actionCombo_, 23);
+        }
+        else if (action.type == ActionType::RunProgram) {
+            SetPopupSel(popupAction_, actionCombo_, 24);
+            SetPopupSel(popupRunProgram_, runProgramCombo_, std::clamp(action.shortcutPreset, 0, RunProgramPresetCount() - 1));
+            SetText(runProgramPath_, action.targetPath);
+            SetText(runProgramArgs_, action.inputText);
+        }
+        else if (action.type == ActionType::CloseProgram) {
+            SetPopupSel(popupAction_, actionCombo_, 25);
+            SetText(closeProgramPath_, action.targetPath);
+            SetChecked(closeProgramMatchFileName_, action.matchFileNameOnly);
+        }
+        else if (action.type == ActionType::OpenWebpage) {
+            SetPopupSel(popupAction_, actionCombo_, 26);
+            SetText(openWebpageUrl_, action.targetPath);
+        }
+        else if (action.type == ActionType::OpenFile) {
+            SetPopupSel(popupAction_, actionCombo_, 27);
+            SetText(openFilePath_, action.targetPath);
+        }
+        else if (action.type == ActionType::TimerRecordTime) {
+            SetPopupSel(popupAction_, actionCombo_, 28);
+            SetText(timerVarName_, action.loopVarName);
         }
         else { SetPopupSel(popupAction_, actionCombo_, 14); }
         RefreshParamPanel();
@@ -1650,6 +2371,46 @@ private:
             findImagePreviewBitmap_ = LoadBitmapFromFile(findImagePath_);
         }
         if (findImagePreviewBtn_) InvalidateRect(findImagePreviewBtn_, nullptr, FALSE);
+    }
+
+    void UpdateOcrFindImagePreview() {
+        if (ocrFindImagePreviewBitmap_) {
+            DeleteBitmapHandle(ocrFindImagePreviewBitmap_);
+            ocrFindImagePreviewBitmap_ = nullptr;
+        }
+        if (!ocrFindImagePath_.empty()) {
+            ocrFindImagePreviewBitmap_ = LoadBitmapFromFile(ocrFindImagePath_);
+        }
+        if (ocrFindImagePreviewBtn_) InvalidateRect(ocrFindImagePreviewBtn_, nullptr, FALSE);
+    }
+
+    bool ResolveOcrAbsRegionFromFindImage(int relX1, int relY1, int relX2, int relY2,
+                                          int& outX1, int& outY1, int& outX2, int& outY2) const {
+        if (ocrFindImagePath_.empty()) return false;
+        int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+        GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+        const double threshold = std::clamp(ToDouble(ocrFindMatchThreshold_, 65.0), 1.0, 100.0);
+        const double scaleMin = std::max(0.1, ToDouble(ocrFindScaleMin_, 1.0));
+        const double scaleMax = std::max(scaleMin, ToDouble(ocrFindScaleMax_, scaleMin));
+        HBITMAP tmpl = LoadBitmapFromFile(ocrFindImagePath_);
+        if (!tmpl) return false;
+        ImageMatchOptions opt;
+        opt.thresholdPercent = threshold;
+        opt.scaleMin = scaleMin;
+        opt.scaleMax = scaleMax;
+        opt.scaleStep = 0.05;
+        opt.maxMatches = 20;
+        opt.maxOverlap = 0.5;
+        const ImageMatchOutput output = FindTemplateOnScreenMulti(
+            vsX, vsY, vsX + vsW, vsY + vsH, tmpl, opt);
+        DeleteBitmapHandle(tmpl);
+        if (output.matches.empty()) return false;
+        const ImageMatchResult& match = output.matches.front();
+        outX1 = match.topLeftX + relX1;
+        outY1 = match.topLeftY + relY1;
+        outX2 = match.topLeftX + relX2;
+        outY2 = match.topLeftY + relY2;
+        return true;
     }
 
     void ApplyFindImageFullScreen() {
@@ -1690,11 +2451,14 @@ private:
                 const std::wstring path = FindImagesDir() + L"\\template_"
                     + std::to_wstring(GetTickCount()) + L".bmp";
                 HBITMAP bmp = CaptureScreenRegion(x1, y1, x2, y2);
-                if (bmp && SaveBitmapToFile(bmp, path)) {
-                    findImagePath_ = path;
-                    newImagePaths_.insert(path);
-                    findImageFullScreen_ = false;
-                    UpdateFindImagePreview();
+            if (bmp && SaveBitmapToFile(bmp, path)) {
+                findImagePath_ = path;
+                newImagePaths_.insert(path);
+                findImageFullScreen_ = false;
+                if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())) {
+                    actions_[static_cast<size_t>(selectedIndex_)].imagePath = path;
+                }
+                UpdateFindImagePreview();
                 }
                 DeleteBitmapHandle(bmp);
             } else {
@@ -1716,6 +2480,175 @@ private:
             InvalidateRect(hwnd_, nullptr, TRUE);
             UpdateWindow(hwnd_);
         });
+    }
+
+    void BeginOcrFindRegionSelect() {
+        if (!ocrRegionByImageCheck_ || !Checked(ocrRegionByImageCheck_)) return;
+        if (ocrFindImagePath_.empty()) {
+            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"选取区域", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+        GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+        const double threshold = std::clamp(ToDouble(ocrFindMatchThreshold_, 65.0), 1.0, 100.0);
+        const double scaleMin = std::max(0.1, ToDouble(ocrFindScaleMin_, 1.0));
+        const double scaleMax = std::max(scaleMin, ToDouble(ocrFindScaleMax_, scaleMin));
+
+        if (!matchOverlay_) matchOverlay_ = std::make_unique<MatchOverlay>();
+        GetWindowRect(hwnd_, &findRegionSavedRect_);
+        ShowWindow(hwnd_, SW_HIDE);
+
+        const auto result = matchOverlay_->Show(
+            ocrFindImagePath_, vsX, vsY, vsX + vsW, vsY + vsH,
+            threshold, scaleMin, scaleMax, MatchOverlayMode::RelativeRegionPick);
+
+        SetWindowPos(hwnd_, HWND_TOP,
+            findRegionSavedRect_.left, findRegionSavedRect_.top,
+            findRegionSavedRect_.right - findRegionSavedRect_.left,
+            findRegionSavedRect_.bottom - findRegionSavedRect_.top,
+            SWP_SHOWWINDOW);
+        SetForegroundWindow(hwnd_);
+        if (popupAction_.sel == 18) {
+            RefreshOcrDepStatus();
+            RefreshOcrSubPanel();
+        } else {
+            InvalidateRect(hwnd_, nullptr, TRUE);
+            UpdateWindow(hwnd_);
+        }
+
+        if (!result.cancelled && result.regionValid && matchOverlay_->matchResult_.found) {
+            const int anchorX = matchOverlay_->matchResult_.topLeftX;
+            const int anchorY = matchOverlay_->matchResult_.topLeftY;
+            ocrFullScreen_ = false;
+            SetText(ocrX1_, std::to_wstring(result.regionX1 - anchorX));
+            SetText(ocrY1_, std::to_wstring(result.regionY1 - anchorY));
+            SetText(ocrX2_, std::to_wstring(result.regionX2 - anchorX));
+            SetText(ocrY2_, std::to_wstring(result.regionY2 - anchorY));
+        }
+    }
+
+    void BeginOcrFindScreenshot() {
+        if (!hwnd_) return;
+        if (!screenshotOverlay_) screenshotOverlay_ = std::make_unique<ScreenshotOverlay>();
+        screenshotOverlay_->SetTitle(L"屏幕截图");
+        GetWindowRect(hwnd_, &findRegionSavedRect_);
+        ShowWindow(hwnd_, SW_HIDE);
+        screenshotOverlay_->Show([this](RECT sel) {
+            SetWindowPos(hwnd_, HWND_TOP,
+                findRegionSavedRect_.left, findRegionSavedRect_.top,
+                findRegionSavedRect_.right - findRegionSavedRect_.left,
+                findRegionSavedRect_.bottom - findRegionSavedRect_.top,
+                SWP_SHOWWINDOW);
+            if (sel.left == 0 && sel.top == 0 && sel.right == 0 && sel.bottom == 0) return;
+            const int vsX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            const int vsY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            const int x1 = sel.left + vsX, y1 = sel.top + vsY;
+            const int x2 = sel.right + vsX, y2 = sel.bottom + vsY;
+            EnsureFindImagesDir();
+            const std::wstring path = FindImagesDir() + L"\\template_"
+                + std::to_wstring(GetTickCount()) + L".bmp";
+            HBITMAP bmp = CaptureScreenRegion(x1, y1, x2, y2);
+            if (bmp && SaveBitmapToFile(bmp, path)) {
+                ocrFindImagePath_ = path;
+                newImagePaths_.insert(path);
+                if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())) {
+                    actions_[static_cast<size_t>(selectedIndex_)].imagePath = path;
+                }
+                UpdateOcrFindImagePreview();
+            }
+            DeleteBitmapHandle(bmp);
+            SetForegroundWindow(hwnd_);
+            InvalidateRect(hwnd_, nullptr, TRUE);
+            UpdateWindow(hwnd_);
+        });
+    }
+
+    void LoadOcrFindImageFromFile() {
+        wchar_t fileName[MAX_PATH]{};
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"图片文件\0*.bmp;*.png;*.jpg;*.jpeg\0所有文件\0*.*\0";
+        ofn.lpstrFile = fileName;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&ofn)) return;
+        const std::wstring copied = EnsureImageInLibrary(fileName);
+        ocrFindImagePath_ = copied;
+        if (IsPathInImageDir(copied)) newImagePaths_.insert(copied);
+        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())) {
+            actions_[static_cast<size_t>(selectedIndex_)].imagePath = copied;
+        }
+        UpdateOcrFindImagePreview();
+    }
+
+    void ClearOcrFindImage() {
+        if (!ocrFindImagePath_.empty() && IsPathInImageDir(ocrFindImagePath_)) {
+            auto it = newImagePaths_.find(ocrFindImagePath_);
+            if (it != newImagePaths_.end()) {
+                const auto allRefs = CollectAllReferencedImages();
+                if (allRefs.find(ocrFindImagePath_) == allRefs.end()) {
+                    DeleteFileW(ocrFindImagePath_.c_str());
+                }
+                newImagePaths_.erase(it);
+            }
+        }
+        ocrFindImagePath_.clear();
+        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())) {
+            actions_[static_cast<size_t>(selectedIndex_)].imagePath.clear();
+        }
+        UpdateOcrFindImagePreview();
+    }
+
+    void BeginOcrOffsetSelect() {
+        if (popupOcrResultMode_.sel != 1) return;
+        if (OcrSearchTextContainsVariable()) return;
+        if (Trim(GetText(ocrSearchEdit_)).empty()) {
+            MessageBoxW(hwnd_, L"请先输入要在结果中查找的文字。", L"选择偏移", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        int sx1 = ToInt(ocrX1_), sy1 = ToInt(ocrY1_), sx2 = ToInt(ocrX2_), sy2 = ToInt(ocrY2_);
+        if (ocrFullScreen_) {
+            int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+            GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+            sx1 = vsX; sy1 = vsY; sx2 = vsX + vsW; sy2 = vsY + vsH;
+        }
+        std::wstring searchTarget;
+        if (popupOcrResultMode_.sel == 1) {
+            MacroVariableContext ctx;
+            ctx.matchVars = &matchVars_;
+            ctx.ocrVars = &ocrVars_;
+            ctx.loopVars = &loopVars_;
+            ctx.timerStarts = &timerStarts_;
+            searchTarget = ResolveMacroVariables(GetText(ocrSearchEdit_), ctx);
+        }
+
+        if (!ocrOverlay_) ocrOverlay_ = std::make_unique<OcrOverlay>();
+        GetWindowRect(hwnd_, &findRegionSavedRect_);
+        ShowWindow(hwnd_, SW_HIDE);
+
+        EnsureOcrSession();
+        const auto result = ocrOverlay_->Show(sx1, sy1, sx2, sy2, searchTarget, OcrOverlayMode::OffsetPick);
+        ReleaseOcrSession();
+
+        SetWindowPos(hwnd_, HWND_TOP,
+            findRegionSavedRect_.left, findRegionSavedRect_.top,
+            findRegionSavedRect_.right - findRegionSavedRect_.left,
+            findRegionSavedRect_.bottom - findRegionSavedRect_.top,
+            SWP_SHOWWINDOW);
+        SetForegroundWindow(hwnd_);
+        if (popupAction_.sel == 18) {
+            RefreshOcrDepStatus();
+            RefreshOcrSubPanel();
+        } else {
+            InvalidateRect(hwnd_, nullptr, TRUE);
+            UpdateWindow(hwnd_);
+        }
+
+        if (!result.cancelled && result.anchorValid) {
+            SetText(ocrOffsetX_, std::to_wstring(result.offsetX));
+            SetText(ocrOffsetY_, std::to_wstring(result.offsetY));
+        }
     }
 
     void BeginFindOffsetSelect() {
@@ -1776,7 +2709,42 @@ private:
         const std::wstring copied = EnsureImageInLibrary(fileName);
         findImagePath_ = copied;
         if (IsPathInImageDir(copied)) newImagePaths_.insert(copied);
+        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())) {
+            actions_[static_cast<size_t>(selectedIndex_)].imagePath = copied;
+        }
         UpdateFindImagePreview();
+    }
+
+    void BrowseProgramExecutable(HWND targetEdit) {
+        if (!targetEdit) return;
+        wchar_t fileName[MAX_PATH]{};
+        const std::wstring current = Trim(GetText(targetEdit));
+        if (!current.empty()) wcsncpy_s(fileName, current.c_str(), _TRUNCATE);
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"可执行文件 (*.exe;*.msc;*.bat;*.cmd)\0*.exe;*.msc;*.bat;*.cmd\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = fileName;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&ofn)) return;
+        SetText(targetEdit, fileName);
+    }
+
+    void BrowseOpenFile(HWND targetEdit) {
+        if (!targetEdit) return;
+        wchar_t fileName[MAX_PATH]{};
+        const std::wstring current = Trim(GetText(targetEdit));
+        if (!current.empty()) wcsncpy_s(fileName, current.c_str(), _TRUNCATE);
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = fileName;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&ofn)) return;
+        SetText(targetEdit, fileName);
     }
 
     void ClearFindImage() {
@@ -1793,6 +2761,9 @@ private:
             }
         }
         findImagePath_.clear();
+        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())) {
+            actions_[static_cast<size_t>(selectedIndex_)].imagePath.clear();
+        }
         UpdateFindImagePreview();
     }
 
@@ -1870,7 +2841,14 @@ private:
         if (id == kKeyCapture) { CaptureActionKey(); return; }
         if (id == kKeyPressCapture) { CaptureKeyPress(); return; }
         if (id == kQuickInputInsert) { InsertQuickInputVariable(); return; }
+        if (id == kOcrSearchVarInsert) { InsertOcrSearchVariable(); return; }
+        if (id == kOcrSearchText && code == EN_CHANGE && !loadingForm_ && popupAction_.sel == 18) {
+            RefreshOcrSubPanel();
+            return;
+        }
         if (id == kIfAddCondition) { AppendIfCondition(); return; }
+        if (id == kRunProgramBrowse || id == kCloseProgramBrowse) { BrowseProgramExecutable(id == kRunProgramBrowse ? runProgramPath_ : closeProgramPath_); return; }
+        if (id == kOpenFileBrowse) { BrowseOpenFile(openFilePath_); return; }
         if (id == kFindFullScreen) { ApplyFindImageFullScreen(); return; }
         if (id == kFindSelectRegion) { BeginFindRegionSelect(false); return; }
         if (id == kFindScreenshot) { BeginFindRegionSelect(true); return; }
@@ -1879,6 +2857,17 @@ private:
         if (id == kFindClearImage) { ClearFindImage(); return; }
         if (id == kFindTest) { TestFindImage(); return; }
         if (id == kFindSelectOffset) { BeginFindOffsetSelect(); return; }
+        if (id == kOcrFullScreen) { ApplyOcrFullScreen(); return; }
+        if (id == kOcrSelectRegion) { BeginOcrRegionSelect(); return; }
+        if (id == kOcrSelectOffset) { BeginOcrOffsetSelect(); return; }
+        if (id == kOcrTest) { TestOcr(); return; }
+        if (id == kOcrInstallDep) { ShowOcrInstallDialog(); return; }
+        if (id == kOcrRegionByImage && code == BN_CLICKED) { RefreshOcrSubPanel(); return; }
+        if (id == kOcrFindSelectRegion) { BeginOcrFindRegionSelect(); return; }
+        if (id == kOcrFindScreenshot) { BeginOcrFindScreenshot(); return; }
+        if (id == kOcrFindLocalImage) { LoadOcrFindImageFromFile(); return; }
+        if (id == kOcrFindImagePreview) { LoadOcrFindImageFromFile(); return; }
+        if (id == kOcrFindClearImage) { ClearOcrFindImage(); return; }
         if ((id == kMoveFromVar || id == kLoopFromVar) && code == BN_CLICKED) {
             UpdateMoveVarControls();
             UpdateLoopVarControls();
@@ -2075,6 +3064,7 @@ private:
 
     void SaveIfEditor() {
         if (page_ != Page::Editor) return;
+        SyncFormIntoActionsBeforeRun();
         EnsureScriptsDir();
         if (currentPath_.empty()) {
             std::wstring scriptName = GetText(name_);
@@ -2146,8 +3136,15 @@ private:
             file << L"      \"searchX2\": " << a.searchX2 << L",\n";
             file << L"      \"searchY2\": " << a.searchY2 << L",\n";
             file << L"      \"searchFullScreen\": " << (a.searchFullScreen ? 1 : 0) << L",\n";
-            const std::wstring savedImagePath = a.type == ActionType::FindImage
-                ? ImagePathForJson(EnsureImageInLibrary(a.imagePath)) : a.imagePath;
+            const std::wstring savedImagePath = [&]() -> std::wstring {
+                if (a.type == ActionType::FindImage && !a.imagePath.empty()) {
+                    return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
+                }
+                if (a.type == ActionType::TextRecognition && a.ocrRegionByImage && !a.imagePath.empty()) {
+                    return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
+                }
+                return a.imagePath;
+            }();
             file << L"      \"imagePath\": \"" << EscapeJson(savedImagePath) << L"\",\n";
             file << L"      \"matchThreshold\": " << a.matchThreshold << L",\n";
             file << L"      \"imageScale\": " << a.imageScale << L",\n";
@@ -2158,7 +3155,12 @@ private:
             file << L"      \"offsetY\": " << a.offsetY << L",\n";
             file << L"      \"findUntilFound\": " << (a.findUntilFound ? 1 : 0) << L",\n";
             file << L"      \"matchVarName\": \"" << EscapeJson(a.matchVarName) << L"\",\n";
-            file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\"\n";
+            file << L"      \"ocrResultMode\": " << a.ocrResultMode << L",\n";
+            file << L"      \"ocrRegionByImage\": " << (a.ocrRegionByImage ? 1 : 0) << L",\n";
+            file << L"      \"ocrSearchText\": \"" << EscapeJson(a.ocrSearchText) << L"\",\n";
+            file << L"      \"ocrFollowUp\": " << a.ocrFollowUp << L",\n";
+            file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\",\n";
+            file << L"      \"matchFileNameOnly\": " << (a.matchFileNameOnly ? 1 : 0) << L"\n";
             file << L"    }" << (i + 1 == actions_.size() ? L"\n" : L",\n");
         }
         file << L"  ]\n}\n";
@@ -2191,6 +3193,7 @@ private:
         else if (type == L"quickInput") a.type = ActionType::QuickInput;
         else if (type == L"scrollWheel") a.type = ActionType::ScrollWheel;
         else if (type == L"findImage") a.type = ActionType::FindImage;
+        else if (type == L"textRecognition") a.type = ActionType::TextRecognition;
         else if (type == L"wait") a.type = ActionType::Wait;
         else if (type == L"loop") a.type = ActionType::Loop;
         else if (type == L"endLoop") a.type = ActionType::EndLoop;
@@ -2201,6 +3204,11 @@ private:
         else if (type == L"lockScreenshot") a.type = ActionType::LockScreenshot;
         else if (type == L"unlockScreenshot") a.type = ActionType::UnlockScreenshot;
         else if (type == L"stopMacro") a.type = ActionType::StopMacro;
+        else if (type == L"runProgram") a.type = ActionType::RunProgram;
+        else if (type == L"closeProgram") a.type = ActionType::CloseProgram;
+        else if (type == L"openWebpage") a.type = ActionType::OpenWebpage;
+        else if (type == L"openFile") a.type = ActionType::OpenFile;
+        else if (type == L"timerRecordTime") a.type = ActionType::TimerRecordTime;
         else a.type = ActionType::CustomText;
         a.customText = ExtractString(block, L"text");
         a.remark = ExtractString(block, L"remark");
@@ -2258,8 +3266,15 @@ private:
         a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
         a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
         a.matchVarName = ExtractString(block, L"matchVarName");
-        if (a.matchVarName.empty()) a.matchVarName = L"matchRet";
+        if (a.matchVarName.empty()) {
+            a.matchVarName = a.type == ActionType::TextRecognition ? L"a" : L"matchRet";
+        }
+        a.ocrResultMode = static_cast<int>(ExtractNumber(block, L"ocrResultMode", 0));
+        a.ocrRegionByImage = ExtractNumber(block, L"ocrRegionByImage", 0) != 0;
+        a.ocrSearchText = ExtractString(block, L"ocrSearchText");
+        a.ocrFollowUp = static_cast<int>(ExtractNumber(block, L"ocrFollowUp", 0));
         a.conditionExpr = ExtractString(block, L"conditionExpr");
+        a.matchFileNameOnly = ExtractNumber(block, L"matchFileNameOnly", 0) != 0;
         return a;
     }
 
@@ -2464,7 +3479,10 @@ private:
                 const auto blocks = ExtractJsonActionBlocks(modifiedContent);
                 for (const auto& block : blocks) {
                     const auto type = ExtractString(block, L"type");
-                    if (type != L"findImage") continue;
+                    const bool usesImage = type == L"findImage"
+                        || (type == L"textRecognition"
+                            && ExtractNumber(block, L"ocrRegionByImage", 0) != 0);
+                    if (!usesImage) continue;
                     const auto oldImgPath = ExtractString(block, L"imagePath");
                     if (oldImgPath.empty()) continue;
                     const auto oldSlash = oldImgPath.find_last_of(L"\\/");
@@ -2872,9 +3890,12 @@ private:
             if (wp == VK_RETURN) { self->CommitInlineRemark(); return 0; }
             if (wp == VK_ESCAPE) { self->CancelInlineRemark(); return 0; }
         }
-        if (self && msg == WM_LBUTTONDOWN && hwnd == self->crosshairBtn_) {
-            self->BeginCrosshairDrag();
-            return 0;
+        if (self && msg == WM_LBUTTONDOWN) {
+            CrosshairDragBinding binding{};
+            if (self->crosshairDrag_.TryGetBinding(hwnd, binding)) {
+                self->crosshairDrag_.Begin(binding);
+                return 0;
+            }
         }
         if (self && msg == WM_LBUTTONDOWN) {
             const int popupId = self->EditorComboPopupIdForHwnd(hwnd);
@@ -3155,7 +4176,7 @@ private:
         case HoverButton::Modify: return modifyBtn_;
         case HoverButton::Cancel: return cancelBtn_;
         case HoverButton::Save: return saveBtn_;
-        case HoverButton::Crosshair: return crosshairBtn_;
+        case HoverButton::Crosshair: return hoverCrosshairBtn_ ? hoverCrosshairBtn_ : crosshairBtn_;
         case HoverButton::BatchExit: return batchExitBtn_;
         case HoverButton::BatchSelectAll: return batchSelectAllBtn_;
         case HoverButton::BatchDeselect: return batchDeselectBtn_;
@@ -3199,6 +4220,7 @@ private:
         }
         HoverButton oldButton = hoverButton_;
         hoverButton_ = HitButton(x, y);
+        hoverCrosshairBtn_ = (hoverButton_ == HoverButton::Crosshair) ? CrosshairButtonAtPoint(x, y) : nullptr;
         UpdateGrayButtonHover(x, y);
         if (page_ == Page::Editor && PtInRemark(x, y)) SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
         else if (hoverGrayBtn_) SetCursor(LoadCursorW(nullptr, IDC_HAND));
@@ -3244,6 +4266,10 @@ private:
             if (newHb != HoverButton::None) InvalidateHoverButton(newHb);
             FlushGrayButtonHover();
         }
+    }
+
+    HWND CrosshairButtonAtPoint(int x, int y) const {
+        return crosshairDrag_.HitButton(x, y, [this](HWND hwnd) { return WindowClientRect(hwnd); });
     }
 
     HoverButton HitButton(int x, int y) const {
@@ -3321,7 +4347,7 @@ private:
         if (PtIn(ModifyButtonRect(), x, y)) return HoverButton::Modify;
         if (PtIn(CancelButtonRect(), x, y)) return HoverButton::Cancel;
         if (PtIn(SaveButtonRect(), x, y)) return HoverButton::Save;
-        if (PtIn(CrosshairButtonRect(), x, y)) return HoverButton::Crosshair;
+        if (CrosshairButtonAtPoint(x, y)) return HoverButton::Crosshair;
         if (MaxEditorScroll() > 0 && PtIn(EditorScrollTrackRect(), x, y)) return HoverButton::EditorScroll;
         int row = HitRow(x, y);
         if (row >= 0) {
@@ -4206,7 +5232,9 @@ private:
     std::wstring ResolveQuickInputText(const std::wstring& text) {
         MacroVariableContext ctx;
         ctx.matchVars = &matchVars_;
+        ctx.ocrVars = workerUsesOcrVars_ ? &ocrVars_ : nullptr;
         ctx.loopVars = &loopVars_;
+        ctx.timerStarts = &timerStarts_;
         ctx.curLoops = curLoops_;
         return DecodeQuickInputEscapes(ResolveMacroVariables(text, ctx));
     }
@@ -4244,10 +5272,12 @@ private:
     void SyncFormIntoActionsBeforeRun() {
         if (page_ != Page::Editor) return;
         if (selectedIndex_ < 0 || selectedIndex_ >= static_cast<int>(actions_.size())) return;
+        const ScriptAction& existing = actions_[static_cast<size_t>(selectedIndex_)];
+        if (ComboSelForType(existing.type) != popupAction_.sel) return;
         ScriptAction action = ActionFromForm();
         if (action.type == ActionType::DefineBlock && !IsValidBlockName(action.blockName)) return;
-        action.originalNo = actions_[static_cast<size_t>(selectedIndex_)].originalNo;
-        action.indent = actions_[static_cast<size_t>(selectedIndex_)].indent;
+        action.originalNo = existing.originalNo;
+        action.indent = existing.indent;
         actions_[static_cast<size_t>(selectedIndex_)] = action;
     }
 
@@ -4259,9 +5289,20 @@ private:
         const auto actions = actions_;
         const std::wstring selfPath = currentPath_;
         worker_ = std::thread([this, actions, selfPath]() {
+            bool usesOcr = ScriptUsesTextRecognition(actions);
+            workerUsesOcrVars_ = usesOcr;
             matchVars_.clear();
+            if (usesOcr) ocrVars_.clear();
             loopVars_.clear();
+            timerStarts_.clear();
             curLoops_ = 0;
+            bool ocrSessionHeld = false;
+            auto holdOcrSession = [&ocrSessionHeld]() {
+                if (ocrSessionHeld) return;
+                EnsureOcrSession();
+                ocrSessionHeld = true;
+            };
+            if (usesOcr) holdOcrSession();
             UINT heldKeyVk = 0;
             HBITMAP lockedScreen_ = nullptr;
             int lockedVirtX_ = 0;
@@ -4285,15 +5326,22 @@ private:
             std::function<void(const std::wstring&)> runBlockByName;
             std::unordered_set<std::wstring> blockCallStack;
 
-            auto executeOne = [this, &heldKeyVk, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen](const ScriptAction& a) {
+            auto makeVarCtx = [&]() {
+                MacroVariableContext ctx;
+                ctx.matchVars = &matchVars_;
+                ctx.ocrVars = usesOcr ? &ocrVars_ : nullptr;
+                ctx.loopVars = &loopVars_;
+                ctx.timerStarts = &timerStarts_;
+                ctx.curLoops = curLoops_;
+                return ctx;
+            };
+
+            auto executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx](const ScriptAction& a) {
                 if (a.type == ActionType::MoveMouse) {
                     int x = a.x;
                     int y = a.y;
                     if (a.moveFromVar) {
-                        MacroVariableContext ctx;
-                        ctx.matchVars = &matchVars_;
-                        ctx.loopVars = &loopVars_;
-                        ctx.curLoops = curLoops_;
+                        MacroVariableContext ctx = makeVarCtx();
                         if (!TryResolveIntOperand(a.moveVarExprX, ctx, x)) x = 0;
                         if (!TryResolveIntOperand(a.moveVarExprY, ctx, y)) y = 0;
                     }
@@ -4388,11 +5436,134 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     } while (!stopFlag_);
                 }
+                else if (a.type == ActionType::TextRecognition) {
+                    usesOcr = true;
+                    workerUsesOcrVars_ = true;
+                    holdOcrSession();
+                    const std::wstring varName = a.matchVarName.empty() ? L"a" : a.matchVarName;
+                    auto resolveOcrRegion = [&](int& x1, int& y1, int& x2, int& y2) -> bool {
+                        if (a.ocrRegionByImage) {
+                            int sx = 0, sy = 0, sw = 0, sh = 0;
+                            GetVirtualScreenRect(sx, sy, sw, sh);
+                            HBITMAP tmpl = LoadBitmapFromFile(a.imagePath);
+                            if (!tmpl) return false;
+                            ImageMatchOptions opt;
+                            opt.thresholdPercent = a.matchThreshold;
+                            opt.scaleMin = a.imageScaleMin > 0.0 ? a.imageScaleMin : a.imageScale;
+                            opt.scaleMax = a.imageScaleMax > 0.0 ? a.imageScaleMax : opt.scaleMin;
+                            opt.scaleStep = 0.05;
+                            opt.maxMatches = 20;
+                            opt.maxOverlap = 0.5;
+                            ImageMatchOutput output;
+                            if (lockedScreen_) {
+                                output = FindTemplateInFrozenScreenMulti(
+                                    lockedScreen_, lockedVirtX_, lockedVirtY_, sx, sy, sx + sw, sy + sh, tmpl, opt);
+                            } else {
+                                output = FindTemplateOnScreenMulti(sx, sy, sx + sw, sy + sh, tmpl, opt);
+                            }
+                            DeleteBitmapHandle(tmpl);
+                            if (output.matches.empty()) return false;
+                            const ImageMatchResult& match = output.matches.front();
+                            const int relX1 = a.searchX1, relY1 = a.searchY1;
+                            const int relX2 = a.searchX2, relY2 = a.searchY2;
+                            x1 = match.topLeftX + relX1;
+                            y1 = match.topLeftY + relY1;
+                            x2 = match.topLeftX + relX2;
+                            y2 = match.topLeftY + relY2;
+                            return true;
+                        }
+                        if (a.searchFullScreen) {
+                            int sx = 0, sy = 0, sw = 0, sh = 0;
+                            GetVirtualScreenRect(sx, sy, sw, sh);
+                            x1 = sx; y1 = sy; x2 = sx + sw; y2 = sy + sh;
+                        }
+                        return true;
+                    };
+                    auto runOcrAction = [&]() -> OcrVarResult {
+                        int x1 = a.searchX1, y1 = a.searchY1, x2 = a.searchX2, y2 = a.searchY2;
+                        if (!resolveOcrRegion(x1, y1, x2, y2)) {
+                            return a.ocrResultMode == 1
+                                ? MakeOcrSearchVarResult(OcrTextLine{}, false)
+                                : MakeOcrTextVarResult(L"");
+                        }
+                        const OcrEngineOutput output = RunOcrOnScreenRegion(
+                            x1, y1, x2, y2, lockedScreen_, lockedVirtX_, lockedVirtY_);
+                        if (!output.success) {
+                            return a.ocrResultMode == 1
+                                ? MakeOcrSearchVarResult(OcrTextLine{}, false)
+                                : MakeOcrTextVarResult(L"");
+                        }
+                        if (a.ocrResultMode == 0) {
+                            return MakeOcrTextVarResult(ConcatOcrLines(output));
+                        }
+                        MacroVariableContext ctx = makeVarCtx();
+                        const std::wstring target = ResolveMacroVariables(a.ocrSearchText, ctx);
+                        const auto found = FindTextInOcrLines(output, target);
+                        if (found.has_value()) return MakeOcrSearchVarResult(*found, true);
+                        return MakeOcrSearchVarResult(OcrTextLine{}, false);
+                    };
+                    auto applyFollowUpAt = [&](int centerX, int centerY) {
+                        if (a.ocrFollowUp == 2) return;
+                        const int tx = centerX + a.offsetX;
+                        const int ty = centerY + a.offsetY;
+                        if (a.ocrFollowUp == 0) {
+                            SetCursorPos(tx, ty);
+                            MarkSimulatedInput();
+                            MouseClick(MouseButtonType::Left);
+                            UnmarkSimulatedInput();
+                        } else if (a.ocrFollowUp == 1) {
+                            SetCursorPos(tx, ty);
+                        }
+                    };
+                    if (a.ocrResultMode == 0 && a.ocrFollowUp != 2) {
+                        int x1 = a.searchX1, y1 = a.searchY1, x2 = a.searchX2, y2 = a.searchY2;
+                        if (!resolveOcrRegion(x1, y1, x2, y2)) {
+                            ocrVars_[varName] = MakeOcrTextVarResult(L"");
+                            return;
+                        }
+                        const OcrEngineOutput output = RunOcrOnScreenRegion(
+                            x1, y1, x2, y2, lockedScreen_, lockedVirtX_, lockedVirtY_);
+                        ocrVars_[varName] = output.success
+                            ? MakeOcrTextVarResult(ConcatOcrLines(output))
+                            : MakeOcrTextVarResult(L"");
+                        if (output.success && !output.lines.empty()) {
+                            int minX = output.lines.front().x1, minY = output.lines.front().y1;
+                            int maxX = output.lines.front().x2, maxY = output.lines.front().y2;
+                            for (const auto& line : output.lines) {
+                                minX = std::min(minX, line.x1);
+                                minY = std::min(minY, line.y1);
+                                maxX = std::max(maxX, line.x2);
+                                maxY = std::max(maxY, line.y2);
+                            }
+                            applyFollowUpAt((minX + maxX) / 2, (minY + maxY) / 2);
+                        }
+                    } else if (a.ocrResultMode == 0) {
+                        ocrVars_[varName] = runOcrAction();
+                    } else {
+                        do {
+                            const OcrVarResult result = runOcrAction();
+                            ocrVars_[varName] = result;
+                            if (result.found && a.ocrFollowUp != 2) {
+                                const int centerX = (result.topLeftX + result.bottomRightX) / 2;
+                                const int centerY = (result.topLeftY + result.bottomRightY) / 2;
+                                applyFollowUpAt(centerX, centerY);
+                                break;
+                            }
+                            if (result.found || !a.findUntilFound) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } while (!stopFlag_);
+                    }
+                }
                 else if (a.type == ActionType::RunMacro) {
                     std::wstring path = a.targetPath;
                     if (path.empty() || path == runningScriptPath) return;
                     std::vector<ScriptAction> nested = ParseActionsFromFile(path);
                     if (nested.empty()) return;
+                    if (!usesOcr && ScriptUsesTextRecognition(nested)) {
+                        usesOcr = true;
+                        workerUsesOcrVars_ = true;
+                    }
+                    if (usesOcr) holdOcrSession();
                     const std::vector<ScriptAction>* prevActions = activeActions;
                     const std::wstring prevPath = runningScriptPath;
                     activeActions = &nested;
@@ -4410,6 +5581,24 @@ private:
                 }
                 else if (a.type == ActionType::StopMacro) {
                     stopFlag_ = true;
+                }
+                else if (a.type == ActionType::RunProgram) {
+                    const std::wstring path = ResolveRunProgramPath(a.shortcutPreset, a.targetPath);
+                    if (!path.empty()) LaunchProgram(path, a.inputText);
+                }
+                else if (a.type == ActionType::CloseProgram) {
+                    if (!a.targetPath.empty()) CloseProgramsByTarget(a.targetPath, a.matchFileNameOnly);
+                }
+                else if (a.type == ActionType::OpenWebpage) {
+                    if (!a.targetPath.empty()) LaunchProgram(a.targetPath, L"");
+                }
+                else if (a.type == ActionType::OpenFile) {
+                    if (!a.targetPath.empty()) LaunchProgram(a.targetPath, L"");
+                }
+                else if (a.type == ActionType::TimerRecordTime) {
+                    if (!a.loopVarName.empty()) {
+                        timerStarts_[a.loopVarName] = std::chrono::steady_clock::now();
+                    }
                 }
                 else if (a.type == ActionType::MousePlayback) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) {
                     SleepInterruptible(a.duration + RandomDelay(a.randomDuration));
@@ -4455,13 +5644,11 @@ private:
                         const size_t bodyEnd = containerBodyEnd(i);
                         int iter = 1;
                         bool broke = false;
+                        const auto loopStartTime = std::chrono::steady_clock::now();
                         while (!stopFlag_ && !broke) {
                             if (!a.loopVarName.empty()) loopVars_[a.loopVarName] = iter;
-                            MacroVariableContext ctx;
-                            ctx.matchVars = &matchVars_;
-                            ctx.loopVars = &loopVars_;
-                            ctx.curLoops = curLoops_;
-                            const int maxLoop = ResolveLoopMaxCount(a, ctx);
+                            MacroVariableContext ctx = makeVarCtx();
+                            const int maxLoop = ResolveLoopMaxCount(a, ctx, loopStartTime);
                             if (!(maxLoop < 0 || iter <= maxLoop)) break;
                             broke = runRange(i + 1, bodyEnd);
                             ++iter;
@@ -4469,10 +5656,7 @@ private:
                         if (!a.loopVarName.empty()) loopVars_.erase(a.loopVarName);
                         i = bodyEnd;
                     } else if (a.type == ActionType::If) {
-                        MacroVariableContext ctx;
-                        ctx.matchVars = &matchVars_;
-                        ctx.loopVars = &loopVars_;
-                        ctx.curLoops = curLoops_;
+                        MacroVariableContext ctx = makeVarCtx();
                         const bool cond = EvaluateConditionExpr(a.conditionExpr, ctx);
                         const int level = a.indent;
                         const size_t trueEnd = containerBodyEnd(i);
@@ -4510,7 +5694,9 @@ private:
             while (!stopFlag_) {
                 ++curLoops_;
                 matchVars_.clear();
+                if (usesOcr) ocrVars_.clear();
                 loopVars_.clear();
+                timerStarts_.clear();
                 runRange(0, actions.size());
             }
             // Final release (for clean state regardless of stop path)
@@ -4522,6 +5708,8 @@ private:
                 ReleaseAllHeldInputs();
             }
             clearLockedScreen();
+            if (ocrSessionHeld) ReleaseOcrSession();
+            workerUsesOcrVars_ = false;
             PostMessageW(hwnd_, WM_RUN_DONE, 0, 0);
         });
     }
@@ -5210,6 +6398,10 @@ private:
         case 12: return &popupIfVar_;
         case 13: return &popupIfOperator_;
         case 14: return &popupIfConnector_;
+        case 15: return &popupRunProgram_;
+        case 16: return &popupOcrResultMode_;
+        case 17: return &popupOcrFollowUp_;
+        case 18: return &popupOcrSearchVar_;
         default: return nullptr;
         }
     }
@@ -5244,6 +6436,10 @@ private:
         case 12: return WindowClientRect(ifVarCombo_);
         case 13: return WindowClientRect(ifOperatorCombo_);
         case 14: return WindowClientRect(ifConnectorCombo_);
+        case 15: return WindowClientRect(runProgramCombo_);
+        case 16: return WindowClientRect(ocrResultModeCombo_);
+        case 17: return WindowClientRect(ocrFollowUpCombo_);
+        case 18: return WindowClientRect(ocrSearchVarCombo_);
         default: return RECT{};
         }
     }
@@ -5266,6 +6462,10 @@ private:
         case 12: combo = ifVarCombo_; break;
         case 13: combo = ifOperatorCombo_; break;
         case 14: combo = ifConnectorCombo_; break;
+        case 15: combo = runProgramCombo_; break;
+        case 16: combo = ocrResultModeCombo_; break;
+        case 17: combo = ocrFollowUpCombo_; break;
+        case 18: combo = ocrSearchVarCombo_; break;
         default: return RECT{};
         }
         if (!combo) return RECT{};
@@ -5452,6 +6652,9 @@ private:
         else if (id == 8) RefreshRunMacroCombo();
         else if (id == 9) RefreshMousePlaybackCombo();
         else if (id == 12) RefreshIfVarCombo();
+        else if (id == 16) RefreshOcrSubPanel();
+        else if (id == 17) RefreshOcrSubPanel();
+        else if (id == 18) RefreshOcrSearchVarCombo();
         PopupCombo* pc = GetEditorPopup();
         if (pc) pc->open = true;
         SyncEditorDropPopup();
@@ -5524,10 +6727,17 @@ private:
         case 12: label = ifVarCombo_; break;
         case 13: label = ifOperatorCombo_; break;
         case 14: label = ifConnectorCombo_; break;
+        case 15: label = runProgramCombo_; break;
+        case 16: label = ocrResultModeCombo_; break;
+        case 17: label = ocrFollowUpCombo_; break;
+        case 18: label = ocrSearchVarCombo_; break;
         }
         if (label) SetText(label, pc->items[static_cast<size_t>(idx)]);
         if (editorPopupOpen_ == 1) RefreshParamPanel();
         else if (editorPopupOpen_ == 11) RefreshFindImageSubPanel();
+        else if (editorPopupOpen_ == 16) RefreshOcrSubPanel();
+        else if (editorPopupOpen_ == 17) RefreshOcrSubPanel();
+        else if (editorPopupOpen_ == 15) UpdateRunProgramSubPanel();
         const int closedId = editorPopupOpen_;
         pc->open = false;
         editorPopupOpen_ = -1;
@@ -5535,7 +6745,11 @@ private:
         SyncEditorDropPopup();
         InvalidateEditorComboArea(closedId);
         if (closedId == 1) InvalidateEditorParamPanel();
+        else if (closedId == 16) InvalidateOcrEditorPanel();
+        else if (closedId == 17) InvalidateOcrEditorPanel();
+        else if (closedId == 18) InvalidateOcrEditorPanel();
         else if (closedId == 11) InvalidateEditorParamPanel();
+        else if (closedId == 15) InvalidateEditorParamPanel();
     }
 
     bool HandleEditorPopupClick(int x, int y) {
@@ -5656,7 +6870,10 @@ private:
         if (!dis) return;
         if (dis->CtlType == ODT_MENU) { DrawHotkeyMenuItem(dis); return; }
         if (dis->CtlType == ODT_COMBOBOX) { DrawComboItem(dis); return; }
-        if (dis->hwndItem == crosshairBtn_) { DrawCrosshairButton(dis); return; }
+        if (crosshairDrag_.IsCrosshairButton(dis->hwndItem)) {
+            crosshairDrag_.DrawButton(dis, font_, hoverCrosshairBtn_);
+            return;
+        }
         if (IsGrayButton(dis->hwndItem)) { DrawGrayButton(dis); return; }
         DrawOwnerButton(dis);
     }
@@ -5665,19 +6882,36 @@ private:
         return hwnd == findFullScreenBtn_ || hwnd == findSelectRegionBtn_ || hwnd == findTestBtn_
             || hwnd == findImagePreviewBtn_
             || hwnd == findScreenshotBtn_ || hwnd == findLocalImageBtn_ || hwnd == findClearImageBtn_
-            || hwnd == findSelectOffsetBtn_;
+            || hwnd == findSelectOffsetBtn_
+            || hwnd == ocrFullScreenBtn_ || hwnd == ocrSelectRegionBtn_ || hwnd == ocrTestBtn_
+            || hwnd == ocrSelectOffsetBtn_
+            || hwnd == ocrFindSelectRegionBtn_ || hwnd == ocrFindImagePreviewBtn_
+            || hwnd == ocrFindScreenshotBtn_ || hwnd == ocrFindLocalImageBtn_ || hwnd == ocrFindClearImageBtn_;
     }
 
     HWND HitGrayButton(int x, int y) const {
-        if (popupAction_.sel != 17) return nullptr;
-        const HWND buttons[] = {
-            findFullScreenBtn_, findSelectRegionBtn_, findTestBtn_, findImagePreviewBtn_,
-            findScreenshotBtn_, findLocalImageBtn_, findClearImageBtn_,
-            findSelectOffsetBtn_
-        };
-        for (HWND btn : buttons) {
-            if (!btn || !IsWindowVisible(btn)) continue;
-            if (PtIn(WindowClientRect(btn), x, y)) return btn;
+        if (popupAction_.sel == 17) {
+            const HWND buttons[] = {
+                findFullScreenBtn_, findSelectRegionBtn_, findTestBtn_, findImagePreviewBtn_,
+                findScreenshotBtn_, findLocalImageBtn_, findClearImageBtn_,
+                findSelectOffsetBtn_
+            };
+            for (HWND btn : buttons) {
+                if (!btn || !IsWindowVisible(btn)) continue;
+                if (PtIn(WindowClientRect(btn), x, y)) return btn;
+            }
+            return nullptr;
+        }
+        if (popupAction_.sel == 18) {
+            const HWND buttons[] = {
+                ocrFullScreenBtn_, ocrSelectRegionBtn_, ocrTestBtn_, ocrSelectOffsetBtn_,
+                ocrFindSelectRegionBtn_, ocrFindImagePreviewBtn_, ocrFindScreenshotBtn_,
+                ocrFindLocalImageBtn_, ocrFindClearImageBtn_
+            };
+            for (HWND btn : buttons) {
+                if (!btn || !IsWindowVisible(btn)) continue;
+                if (PtIn(WindowClientRect(btn), x, y)) return btn;
+            }
         }
         return nullptr;
     }
@@ -5713,7 +6947,7 @@ private:
 
     bool IsGreenButtonHovered(HWND hwnd) const {
         if (IsGrayButton(hwnd)) return hwnd == hoverGrayBtn_;
-        if (hwnd == crosshairBtn_) return false;
+        if (crosshairDrag_.IsCrosshairButton(hwnd)) return false;
         if (hwnd == batchDeleteBtn_ || hwnd == batchCopyBtn_) {
             if (BatchSelectedCount() == 0) return false;
             return hwnd == batchDeleteBtn_ && hoverButton_ == HoverButton::BatchDelete ||
@@ -5734,49 +6968,6 @@ private:
         return (hwnd == batchDeleteBtn_ || hwnd == batchCopyBtn_) && BatchSelectedCount() == 0;
     }
 
-    void DrawCrosshairButton(DRAWITEMSTRUCT* dis) {
-        if (!dis) return;
-        HDC hdc = dis->hDC;
-        RECT rc = dis->rcItem;
-        const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
-        const bool active = crosshairActive_;
-        const bool hovered = hoverButton_ == HoverButton::Crosshair && !active;
-        HBRUSH bgBrush = CreateSolidBrush(kWhite);
-        FillRect(hdc, &rc, bgBrush);
-        DeleteObject(bgBrush);
-        constexpr int kIconSize = 28;
-        const int iconCx = rc.left + 2 + kIconSize / 2;
-        const int iconCy = (rc.top + rc.bottom) / 2;
-        const COLORREF iconBlue = active ? RGB(0, 100, 190) : (pressed ? RGB(0, 110, 200) : (hovered ? RGB(0, 130, 220) : kCrosshairBlue));
-        DrawCrosshairGlyph(hdc, iconCx, iconCy, kIconSize, kWhite, iconBlue, true);
-        RECT textRc{rc.left + 2 + kIconSize + 8, rc.top, rc.right, rc.bottom};
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, active ? RGB(20, 50, 180) : (pressed || hovered ? RGB(50, 90, 210) : RGB(50, 70, 180)));
-        HGDIOBJ oldFont = SelectObject(hdc, font_);
-        DrawTextW(hdc, L"拖动准星获取坐标", -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdc, oldFont);
-    }
-
-    void BeginCrosshairDrag() {
-        if (!hwnd_ || !crosshairDragCursor_) return;
-        crosshairActive_ = true;
-        crosshairSavedCursor_ = SetClassLongPtrW(hwnd_, GCLP_HCURSOR, reinterpret_cast<LONG_PTR>(crosshairDragCursor_));
-        SetCursor(crosshairDragCursor_);
-        GetWindowRect(hwnd_, &crosshairSavedRect_);
-        SetWindowPos(hwnd_, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-        SetCapture(hwnd_);
-        InvalidateRect(crosshairBtn_, nullptr, FALSE);
-    }
-
-    void EndCrosshairDrag() {
-        ReleaseCapture();
-        SetClassLongPtrW(hwnd_, GCLP_HCURSOR, crosshairSavedCursor_);
-        SetWindowPos(hwnd_, nullptr, crosshairSavedRect_.left, crosshairSavedRect_.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-        SetForegroundWindow(hwnd_);
-        crosshairActive_ = false;
-        InvalidateRect(crosshairBtn_, nullptr, FALSE);
-    }
-
     void DrawGrayButton(DRAWITEMSTRUCT* dis) {
         if (!dis) return;
         HDC hdc = dis->hDC;
@@ -5787,10 +6978,12 @@ private:
         HBRUSH brush = CreateSolidBrush(fill);
         FillRect(hdc, &rc, brush);
         DeleteObject(brush);
-        if (dis->hwndItem == findImagePreviewBtn_) {
-            if (findImagePreviewBitmap_) {
+        if (dis->hwndItem == findImagePreviewBtn_ || dis->hwndItem == ocrFindImagePreviewBtn_) {
+            HBITMAP preview = dis->hwndItem == findImagePreviewBtn_
+                ? findImagePreviewBitmap_ : ocrFindImagePreviewBitmap_;
+            if (preview) {
                 BITMAP bm{};
-                GetObjectW(findImagePreviewBitmap_, sizeof(bm), &bm);
+                GetObjectW(preview, sizeof(bm), &bm);
                 if (bm.bmWidth > 0 && bm.bmHeight > 0) {
                     const int pad = 4;
                     RECT imgRc = rc;
@@ -5799,7 +6992,7 @@ private:
                     imgRc.right -= pad;
                     imgRc.bottom -= pad;
                     HDC mem = CreateCompatibleDC(hdc);
-                    HGDIOBJ oldBmp = SelectObject(mem, findImagePreviewBitmap_);
+                    HGDIOBJ oldBmp = SelectObject(mem, preview);
                     SetStretchBltMode(hdc, HALFTONE);
                     StretchBlt(hdc, imgRc.left, imgRc.top, imgRc.right - imgRc.left, imgRc.bottom - imgRc.top,
                         mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
@@ -6140,7 +7333,7 @@ private:
 
     LRESULT OnCtlColor(HDC hdc) { SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, kText); return reinterpret_cast<LRESULT>(whiteBrush_); }
     LRESULT OnEditColor(HDC hdc) { SetBkMode(hdc, OPAQUE); SetTextColor(hdc, kText); SetBkColor(hdc, kWhite); return reinterpret_cast<LRESULT>(whiteBrush_); }
-    void Cleanup() { CloseEditorPopup(); CancelQuickInputTip(); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); RemoveTray(); UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(lineGreenBrush_); }
+    void Cleanup() { if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CancelQuickInputTip(); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); RemoveTray(); UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() { if (recording_) { g_recording = false; recording_ = false; UninstallRecordingHooks(); } }
 
@@ -6148,6 +7341,9 @@ private:
     HWND name_ = nullptr; HWND mode_ = nullptr; HWND labelList_ = nullptr; HWND labelBatchCount_ = nullptr; HWND actionCombo_ = nullptr; HWND addBtn_ = nullptr; HWND modifyBtn_ = nullptr; HWND clearBtn_ = nullptr; HWND loadBtn_ = nullptr;
     HWND batchExitBtn_ = nullptr; HWND batchSelectAllBtn_ = nullptr; HWND batchDeselectBtn_ = nullptr; HWND batchDeleteBtn_ = nullptr; HWND batchCopyBtn_ = nullptr;
     HWND cancelBtn_ = nullptr; HWND saveBtn_ = nullptr; HWND crosshairBtn_ = nullptr;
+    HWND runProgramCombo_ = nullptr; HWND runProgramPath_ = nullptr; HWND runProgramBrowseBtn_ = nullptr; HWND runProgramOrLabel_ = nullptr; HWND runProgramCrosshairBtn_ = nullptr; HWND runProgramArgs_ = nullptr;
+    HWND closeProgramPath_ = nullptr; HWND closeProgramBrowseBtn_ = nullptr; HWND closeProgramOrLabel_ = nullptr; HWND closeProgramCrosshairBtn_ = nullptr; HWND closeProgramMatchFileName_ = nullptr;
+    HWND openWebpageUrl_ = nullptr; HWND openFilePath_ = nullptr; HWND openFileBrowseBtn_ = nullptr; HWND timerVarName_ = nullptr;
     HWND moveX_ = nullptr; HWND moveY_ = nullptr; HWND moveRandomX_ = nullptr; HWND moveRandomY_ = nullptr; HWND moveFromVar_ = nullptr; HWND moveVarX_ = nullptr; HWND moveVarY_ = nullptr; HWND waitDuration_ = nullptr; HWND waitRandom_ = nullptr; HWND clickButton_ = nullptr; HWND clickCount_ = nullptr; HWND clickWait_ = nullptr; HWND clickRandom_ = nullptr;
     HWND keyEdit_ = nullptr; HWND keyPressEdit_ = nullptr; HWND keyCount_ = nullptr; HWND keyWait_ = nullptr; HWND keyRandom_ = nullptr; HWND loopTypeCombo_ = nullptr; HWND loopCount_ = nullptr; HWND loopFromVar_ = nullptr; HWND loopVarExpr_ = nullptr; HWND loopVarName_ = nullptr; HWND defineBlockName_ = nullptr; HWND runBlockCombo_ = nullptr; HWND remarkLabel_ = nullptr; HWND remark_ = nullptr; HWND listRemarkEdit_ = nullptr;
     HWND clickLWin_ = nullptr; HWND clickRWin_ = nullptr; HWND clickLCtrl_ = nullptr; HWND clickRCtrl_ = nullptr; HWND clickLAlt_ = nullptr; HWND clickRAlt_ = nullptr; HWND clickLShift_ = nullptr; HWND clickRShift_ = nullptr;
@@ -6162,9 +7358,22 @@ private:
     HWND findFollowUpLabel_ = nullptr; HWND findFollowUpCombo_ = nullptr;
     HWND findTestBtn_ = nullptr; HWND findImagePreviewBtn_ = nullptr; HWND findScreenshotBtn_ = nullptr; HWND findLocalImageBtn_ = nullptr; HWND findClearImageBtn_ = nullptr;
     HWND findMatchThreshold_ = nullptr; HWND findScaleMin_ = nullptr; HWND findScaleMax_ = nullptr; HWND findOffsetX_ = nullptr; HWND findOffsetY_ = nullptr; HWND findSelectOffsetBtn_ = nullptr; HWND findUntilFound_ = nullptr; HWND findMatchVar_ = nullptr;
+    HWND ocrDepStatusLabel_ = nullptr; HWND ocrDepInstallBtn_ = nullptr;
+    HWND ocrRegionLabel_ = nullptr; HWND ocrFullScreenBtn_ = nullptr; HWND ocrSelectRegionBtn_ = nullptr;
+    HWND ocrX1_ = nullptr; HWND ocrY1_ = nullptr; HWND ocrX2_ = nullptr; HWND ocrY2_ = nullptr;
+    HWND ocrResultModeLabel_ = nullptr; HWND ocrResultModeCombo_ = nullptr;
+    HWND ocrSearchLabel_ = nullptr; HWND ocrSearchEdit_ = nullptr; HWND ocrSearchVarLabel_ = nullptr; HWND ocrSearchVarCombo_ = nullptr; HWND ocrSearchVarInsertBtn_ = nullptr;
+    HWND ocrFollowUpLabel_ = nullptr; HWND ocrFollowUpCombo_ = nullptr;
+    HWND ocrOffsetXLabel_ = nullptr; HWND ocrOffsetX_ = nullptr; HWND ocrOffsetYLabel_ = nullptr; HWND ocrOffsetY_ = nullptr;
+    HWND ocrSelectOffsetBtn_ = nullptr;
+    HWND ocrResultVarLabel_ = nullptr; HWND ocrUntilFound_ = nullptr; HWND ocrResultVar_ = nullptr; HWND ocrTestBtn_ = nullptr;
+    HWND ocrRegionByImageCheck_ = nullptr;
+    HWND ocrFindImageLabel_ = nullptr; HWND ocrFindSelectRegionBtn_ = nullptr; HWND ocrFindImagePreviewBtn_ = nullptr;
+    HWND ocrFindScreenshotBtn_ = nullptr; HWND ocrFindLocalImageBtn_ = nullptr; HWND ocrFindClearImageBtn_ = nullptr;
+    HWND ocrFindMatchThreshold_ = nullptr; HWND ocrFindScaleMin_ = nullptr; HWND ocrFindScaleMax_ = nullptr;
     HWND quickInputEdit_ = nullptr; HWND quickInputVarCombo_ = nullptr; HWND quickInputInsertBtn_ = nullptr; HWND quickInputCharInterval_ = nullptr; HWND quickInputCount_ = nullptr; HWND quickInputWait_ = nullptr; HWND quickInputRandom_ = nullptr;
     HWND ifVarCombo_ = nullptr; HWND ifOperatorCombo_ = nullptr; HWND ifValueEdit_ = nullptr; HWND ifConnectorCombo_ = nullptr; HWND ifAddConditionBtn_ = nullptr; HWND ifConditionList_ = nullptr;
-    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ifControls_, elseControls_, lockScreenshotControls_, unlockScreenshotControls_, stopMacroControls_;
+    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ocrDepControls_, ocrFindRegionToggleControls_, ocrControls_, ocrFindRegionControls_, ocrSearchControls_, ocrFollowControls_, ocrFollowOffsetControls_, ocrFollowVarControls_, ifControls_, elseControls_, lockScreenshotControls_, unlockScreenshotControls_, stopMacroControls_, runProgramControls_, runProgramFileControls_, closeProgramControls_, openWebpageControls_, openFileControls_, timerRecordControls_;
     std::vector<EditorControlLayout> editorLayouts_;
     std::vector<HotkeyMenuItem> hotkeyMenuItems_;
     std::vector<ScriptMeta> scripts_; std::vector<ScriptMeta> recordings_; std::vector<ScriptAction> actions_;
@@ -6175,7 +7384,9 @@ private:
     HoverButton hoverButton_ = HoverButton::None;
     HWND hoverGrayBtn_ = nullptr;
     HWND pendingHoverGrayOld_ = nullptr, pendingHoverGrayNew_ = nullptr;
-    bool dragging_ = false, dragMoved_ = false, dragTargetNested_ = false, homeScrollbarDragging_ = false, editorScrollbarDragging_ = false, trackingMouse_ = false, deleteConfirmVisible_ = false, hasHomeRectBeforeEditor_ = false, wasVisibleBeforeRun_ = true, wasMinimizedBeforeRun_ = false, loadingForm_ = false, crosshairActive_ = false, batchEditMode_ = false, clickerIntervalOpen_ = false, findImageFullScreen_ = true;
+    bool dragging_ = false, dragMoved_ = false, dragTargetNested_ = false, homeScrollbarDragging_ = false, editorScrollbarDragging_ = false, trackingMouse_ = false, deleteConfirmVisible_ = false, hasHomeRectBeforeEditor_ = false, wasVisibleBeforeRun_ = true, wasMinimizedBeforeRun_ = false, loadingForm_ = false, batchEditMode_ = false, clickerIntervalOpen_ = false, findImageFullScreen_ = true, ocrFullScreen_ = true;
+    CrosshairDragController crosshairDrag_;
+    HWND hoverCrosshairBtn_ = nullptr;
     int editorPopupOpen_ = -1;
     int editorPopupHover_ = -1;
     int editorPopupScroll_ = 0;
@@ -6189,25 +7400,30 @@ private:
     double saveDurationSeconds_ = 0;
     std::optional<Hotkey> saveHotkeyOverride_;
     std::vector<bool> batchSelected_;
-    LONG_PTR crosshairSavedCursor_ = 0;
     HCURSOR crosshairDragCursor_ = nullptr;
-    RECT crosshairSavedRect_{};
     std::wstring currentPath_, currentRecordTime_, formKeyText_ = L"7", formKeyPressText_ = L"7";
     UINT formKeyVk_ = '7', formKeyPressVk_ = '7';
     quickscript::ClickerSettings clickerSettings_{};
     quickscript::RecorderSettings recorderSettings_{};
-    PopupCombo popupMode_, popupAction_, popupMouseBtn_, popupClickBtn_, popupLoopType_, popupRunBlock_, popupHotkeyShortcut_, popupQuickInputVar_, popupRunMacro_, popupMousePlayback_, popupScrollDir_, popupFindFollowUp_, popupIfVar_, popupIfOperator_, popupIfConnector_;
+    PopupCombo popupMode_, popupAction_, popupMouseBtn_, popupClickBtn_, popupLoopType_, popupRunBlock_, popupHotkeyShortcut_, popupQuickInputVar_, popupRunMacro_, popupMousePlayback_, popupScrollDir_, popupFindFollowUp_, popupOcrResultMode_, popupOcrFollowUp_, popupOcrSearchVar_, popupIfVar_, popupIfOperator_, popupIfConnector_, popupRunProgram_;
     std::vector<QuickInputVarItem> quickInputVarItems_;
     std::vector<std::wstring> runMacroPaths_, mousePlaybackPaths_;
     std::wstring findImagePath_;
+    std::wstring ocrFindImagePath_;
     std::unordered_set<std::wstring> newImagePaths_;      // 编辑期间新增的图片路径，用于取消时清理
     std::atomic<bool> findTestRunning_{false};
+    std::atomic<bool> ocrTestRunning_{false};
+    bool workerUsesOcrVars_ = false;
     HBITMAP findImagePreviewBitmap_ = nullptr;
+    HBITMAP ocrFindImagePreviewBitmap_ = nullptr;
     RECT findRegionSavedRect_{};
     std::unique_ptr<MatchOverlay> matchOverlay_;
+    std::unique_ptr<OcrOverlay> ocrOverlay_;
     std::unique_ptr<ScreenshotOverlay> screenshotOverlay_;
     std::unordered_map<std::wstring, ImageMatchResult> matchVars_;
+    std::unordered_map<std::wstring, OcrVarResult> ocrVars_;
     std::unordered_map<std::wstring, int> loopVars_;
+    std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> timerStarts_;
     int curLoops_ = 0;
     std::atomic<int> simulatingInputDepth_{0};
     DWORD lastHotkeyTick_ = 0;

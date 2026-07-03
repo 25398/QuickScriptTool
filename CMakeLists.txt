@@ -31,6 +31,11 @@ add_executable(QuickScriptTool WIN32
     src/image_match.cpp
     src/image_match_engines.cpp
     src/macro_variables.cpp
+    src/ocr_engine.cpp
+    src/ocr_install_dialog.cpp
+    src/ocr_overlay.cpp
+    src/process_utils.cpp
+    src/crosshair_drag.cpp
     src/match_overlay.cpp
     src/popup_combo.cpp
     src/recorder.cpp
@@ -55,6 +60,8 @@ target_link_libraries(QuickScriptTool PRIVATE
     shell32
     comctl32
     msimg32
+    ole32
+    oleaut32
 )
 
 if(MSVC)
@@ -73,4 +80,13 @@ if(WIN32)
                 "$<TARGET_FILE_DIR:QuickScriptTool>"
             COMMENT "Copying OpenCV runtime DLL")
     endforeach()
+    add_custom_command(TARGET QuickScriptTool POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/tools"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/tools/paddle_ocr_helper.py"
+            "$<TARGET_FILE_DIR:QuickScriptTool>/tools/paddle_ocr_helper.py"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/tools/requirements-ocr.txt"
+            "$<TARGET_FILE_DIR:QuickScriptTool>/tools/requirements-ocr.txt"
+        COMMENT "Copying PaddleOCR helper script and requirements")
 endif()

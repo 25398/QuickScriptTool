@@ -108,6 +108,10 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     loadFailed_ = false;
     cursorValid_ = false;
     loopExited_ = false;
+    regionDragging_ = false;
+    regionDragStart_ = {};
+    regionDragEnd_ = {};
+    regionSelection_ = {};
 
     if (!classRegistered_) RegisterWindowClass();
 
@@ -162,6 +166,13 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     ar.cancelled = cancelled_;
     ar.offsetX = clickX_;
     ar.offsetY = clickY_;
+    if (mode_ == MatchOverlayMode::RelativeRegionPick && !cancelled_ && IsValidRegionSelection()) {
+        ar.regionValid = true;
+        ar.regionX1 = regionSelection_.left;
+        ar.regionY1 = regionSelection_.top;
+        ar.regionX2 = regionSelection_.right;
+        ar.regionY2 = regionSelection_.bottom;
+    }
     return ar;
 }
 
@@ -201,11 +212,18 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         cursorX_ = GET_X_LPARAM(lp) + screenX_;
         cursorY_ = GET_Y_LPARAM(lp) + screenY_;
         cursorValid_ = true;
+        if (mode_ == MatchOverlayMode::RelativeRegionPick && regionDragging_ && (wp & MK_LBUTTON)) {
+            regionDragEnd_.x = GET_X_LPARAM(lp);
+            regionDragEnd_.y = GET_Y_LPARAM(lp);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
 
     case WM_SETCURSOR:
-        if (mode_ == MatchOverlayMode::OffsetPick && matchDone_ && matchResult_.found) {
+        if ((mode_ == MatchOverlayMode::OffsetPick || mode_ == MatchOverlayMode::RelativeRegionPick)
+            && matchDone_ && matchResult_.found) {
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         } else {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
@@ -238,11 +256,39 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_LBUTTONDOWN:
+        if (mode_ == MatchOverlayMode::RelativeRegionPick && matchDone_ && matchResult_.found) {
+            regionDragging_ = true;
+            regionDragStart_.x = GET_X_LPARAM(lp);
+            regionDragStart_.y = GET_Y_LPARAM(lp);
+            regionDragEnd_ = regionDragStart_;
+            regionSelection_ = RECT{};
+            SetCapture(hwnd_);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         if (mode_ == MatchOverlayMode::OffsetPick && matchDone_ && matchResult_.found) {
             clickX_ = GET_X_LPARAM(lp) + screenX_;
             clickY_ = GET_Y_LPARAM(lp) + screenY_;
             cancelled_ = false;
             PostQuitMessage(0);
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (mode_ == MatchOverlayMode::RelativeRegionPick && regionDragging_) {
+            regionDragging_ = false;
+            regionDragEnd_.x = GET_X_LPARAM(lp);
+            regionDragEnd_.y = GET_Y_LPARAM(lp);
+            NormalizeRegionSelection();
+            ReleaseCapture();
+            if (IsValidRegionSelection()) {
+                cancelled_ = false;
+                PostQuitMessage(0);
+            } else {
+                regionSelection_ = RECT{};
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             return 0;
         }
         break;
@@ -268,10 +314,57 @@ COLORREF MatchOverlay::SamplePixel(int screenX, int screenY) const {
     return c;
 }
 
+void MatchOverlay::NormalizeRegionSelection() {
+    regionSelection_.left = std::min(regionDragStart_.x, regionDragEnd_.x);
+    regionSelection_.top = std::min(regionDragStart_.y, regionDragEnd_.y);
+    regionSelection_.right = std::max(regionDragStart_.x, regionDragEnd_.x);
+    regionSelection_.bottom = std::max(regionDragStart_.y, regionDragEnd_.y);
+    regionSelection_.left += screenX_;
+    regionSelection_.top += screenY_;
+    regionSelection_.right += screenX_;
+    regionSelection_.bottom += screenY_;
+}
+
+bool MatchOverlay::IsValidRegionSelection() const {
+    const int w = regionSelection_.right - regionSelection_.left;
+    const int h = regionSelection_.bottom - regionSelection_.top;
+    return w >= 5 && h >= 5;
+}
+
+void MatchOverlay::DrawRegionSelection(HDC hdc) {
+    if (mode_ != MatchOverlayMode::RelativeRegionPick) return;
+    RECT drawRc = regionSelection_;
+    if (regionDragging_) {
+        drawRc.left = std::min(regionDragStart_.x, regionDragEnd_.x) + screenX_;
+        drawRc.top = std::min(regionDragStart_.y, regionDragEnd_.y) + screenY_;
+        drawRc.right = std::max(regionDragStart_.x, regionDragEnd_.x) + screenX_;
+        drawRc.bottom = std::max(regionDragStart_.y, regionDragEnd_.y) + screenY_;
+    } else if (!IsValidRegionSelection()) {
+        return;
+    }
+    const int left = drawRc.left - screenX_;
+    const int top = drawRc.top - screenY_;
+    const int right = drawRc.right - screenX_;
+    const int bottom = drawRc.bottom - screenY_;
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
+    HBRUSH nullBr = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    HGDIOBJ oldBr = SelectObject(hdc, nullBr);
+    Rectangle(hdc, left, top, right, bottom);
+    SelectObject(hdc, oldBr);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
 void MatchOverlay::DrawStatusBar(HDC hdc) {
     wchar_t status[256];
     if (loadFailed_) {
         swprintf_s(status, L"[按ESC退出] 错误：找不到图片路径(文件不存在或已删除)");
+    } else if (mode_ == MatchOverlayMode::RelativeRegionPick && matchCount_ > 0) {
+        swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到%d个, 请框选识别区域",
+                   matchMs_, matchCount_);
+    } else if (mode_ == MatchOverlayMode::RelativeRegionPick) {
+        swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到0个, 无法框选区域", matchMs_);
     } else if (matchCount_ > 0) {
         swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到%d个, 请在图中检查红框标志",
                    matchMs_, matchCount_);
@@ -430,6 +523,9 @@ void MatchOverlay::Paint(HDC hdc) {
 
     // 3. Red match box + score label
     DrawMatchMarkers(memDc);
+
+    // 3b. OCR relative region selection
+    DrawRegionSelection(memDc);
 
     // 4. Magnifier following cursor
     if (matchDone_) {

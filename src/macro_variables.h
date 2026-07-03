@@ -5,11 +5,14 @@
 // ──────────────────────────────────────────────────────────────────
 #pragma once
 
+#include <chrono>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "image_match.h"
+#include "ocr_result.h"
 #include "script_types.h"
 
 // 快捷输入变量提示项 (用于编辑器的变量自动提示)
@@ -23,7 +26,9 @@ struct QuickInputVarItem {
 // 宏变量执行上下文 (传递当前脚本的变量状态)
 struct MacroVariableContext {
     const std::unordered_map<std::wstring, ImageMatchResult>* matchVars = nullptr;  // 找图结果变量
+    const std::unordered_map<std::wstring, OcrVarResult>* ocrVars = nullptr;      // 文字识别变量
     const std::unordered_map<std::wstring, int>* loopVars = nullptr;                // 循环计数变量
+    const std::unordered_map<std::wstring, std::chrono::steady_clock::time_point>* timerStarts = nullptr;  // 计时器变量起始时刻
     int curLoops = 0;  // 当前外层循环累计次数
 };
 
@@ -40,7 +45,9 @@ std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableC
 bool TryResolveIntOperand(const std::wstring& token, const MacroVariableContext& ctx, int& out);
 
 // 获取循环动作的最大执行次数 (从 loopVarExpr 或 loopCount 解析)
-int ResolveLoopMaxCount(const ScriptAction& action, const MacroVariableContext& ctx);
+// loopStartTime: 传入循环进入时刻，用于计时器变量作循环次数时扣除循环体内耗时
+int ResolveLoopMaxCount(const ScriptAction& action, const MacroVariableContext& ctx,
+    std::optional<std::chrono::steady_clock::time_point> loopStartTime = std::nullopt);
 
 // 解码快捷输入文本中的转义字符 (如 \\n → 换行)
 std::wstring DecodeQuickInputEscapes(const std::wstring& text);

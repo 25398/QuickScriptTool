@@ -344,11 +344,13 @@ std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& j
     const auto blocks = ExtractJsonActionBlocks(jsonContent);
     for (const auto& block : blocks) {
         const auto type = ExtractString(block, L"type");
+        const auto imgPath = ExtractString(block, L"imagePath");
+        if (imgPath.empty()) continue;
         if (type == L"findImage") {
-            const auto imgPath = ExtractString(block, L"imagePath");
-            if (!imgPath.empty()) {
-                paths.insert(ResolveImagePath(imgPath));
-            }
+            paths.insert(ResolveImagePath(imgPath));
+        } else if (type == L"textRecognition"
+            && ExtractNumber(block, L"ocrRegionByImage", 0) != 0) {
+            paths.insert(ResolveImagePath(imgPath));
         }
     }
     return paths;

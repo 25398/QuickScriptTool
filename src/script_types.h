@@ -11,7 +11,7 @@
 #include <string>
 
 // ── 脚本动作类型枚举 ──────────────────────────────────────────────
-// 共 24 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
+// 共 27 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
 enum class ActionType {
     MoveMouse,
     Wait,
@@ -31,11 +31,17 @@ enum class ActionType {
     QuickInput,
     ScrollWheel,
     FindImage,
+    TextRecognition,
     If,
     Else,
     LockScreenshot,
     UnlockScreenshot,
     StopMacro,
+    RunProgram,
+    CloseProgram,
+    OpenWebpage,
+    OpenFile,
+    TimerRecordTime,
     CustomText
 };
 
@@ -100,7 +106,13 @@ struct ScriptAction {
     int offsetY = 0;                         // 点击偏移 Y
     bool findUntilFound = false;             // 是否循环查找直到找到
     std::wstring matchVarName = L"matchRet";  // 匹配结果变量名
+    // ── 文字识别相关 ──
+    bool ocrRegionByImage = false;           // 获取文字：根据找图结果选取相对 OCR 区域
+    int ocrResultMode = 0;                   // 0=获取文字, 1=文字查找
+    std::wstring ocrSearchText;              // 文字查找目标（可含变量）
+    int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到, 2=保存到变量
     std::wstring conditionExpr;               // 条件表达式 (If 动作)
+    bool matchFileNameOnly = false;           // 关闭程序时仅匹配文件名
 };
 
 // ── 容器动作判断辅助函数 ────────────────────────────────────────

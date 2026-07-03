@@ -9,7 +9,7 @@
 
 #include "image_match.h"
 
-enum class MatchOverlayMode { Test, OffsetPick };
+enum class MatchOverlayMode { Test, OffsetPick, RelativeRegionPick };
 
 class MatchOverlay {
 public:
@@ -20,6 +20,11 @@ public:
         bool cancelled = false;
         int offsetX = 0;
         int offsetY = 0;
+        bool regionValid = false;
+        int regionX1 = 0;
+        int regionY1 = 0;
+        int regionX2 = 0;
+        int regionY2 = 0;
     };
 
     ActionResult Show(const std::wstring& imagePath,
@@ -39,7 +44,10 @@ private:
     void Paint(HDC hdc);
     void DrawStatusBar(HDC hdc);
     void DrawMatchMarkers(HDC hdc);
+    void DrawRegionSelection(HDC hdc);
     void DrawMagnifier(HDC hdc);
+    void NormalizeRegionSelection();
+    bool IsValidRegionSelection() const;
     COLORREF SamplePixel(int screenX, int screenY) const;
 
     void CleanupGdi();
@@ -63,6 +71,10 @@ private:
     bool cancelled_ = false;
     bool pendingCancel_ = false;
     int clickX_ = 0, clickY_ = 0;
+    bool regionDragging_ = false;
+    POINT regionDragStart_{};
+    POINT regionDragEnd_{};
+    RECT regionSelection_{};
 
     int matchMs_ = 0;
     int matchCount_ = 0;

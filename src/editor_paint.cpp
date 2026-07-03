@@ -294,6 +294,10 @@
         if (IsParamComboVisible(12)) DrawEditorCombo(hdc, ifVarCombo_, WindowClientRect(ifVarCombo_), editorPopupOpen_ == 12);
         if (IsParamComboVisible(13)) DrawEditorCombo(hdc, ifOperatorCombo_, WindowClientRect(ifOperatorCombo_), editorPopupOpen_ == 13);
         if (IsParamComboVisible(14)) DrawEditorCombo(hdc, ifConnectorCombo_, WindowClientRect(ifConnectorCombo_), editorPopupOpen_ == 14);
+        if (IsParamComboVisible(15)) DrawEditorCombo(hdc, runProgramCombo_, WindowClientRect(runProgramCombo_), editorPopupOpen_ == 15);
+        if (IsParamComboVisible(16)) DrawEditorCombo(hdc, ocrResultModeCombo_, WindowClientRect(ocrResultModeCombo_), editorPopupOpen_ == 16);
+        if (IsParamComboVisible(17)) DrawEditorCombo(hdc, ocrFollowUpCombo_, WindowClientRect(ocrFollowUpCombo_), editorPopupOpen_ == 17);
+        if (IsParamComboVisible(18)) DrawEditorCombo(hdc, ocrSearchVarCombo_, WindowClientRect(ocrSearchVarCombo_), editorPopupOpen_ == 18);
         PaintActionList(hdc);
         PaintDragMarker(hdc);
     }

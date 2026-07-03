@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 /// 获取鼠标按键类型的中文名称
 std::wstring ButtonText(MouseButtonType button);
@@ -32,6 +33,9 @@ std::wstring JsonButton(MouseButtonType button);
 
 /// 验证宏指令块名称是否合法（字母开头，仅包含字母数字）
 bool IsValidBlockName(const std::wstring& name);
+
+/// 脚本是否包含文字识别动作（用于运行期按需启用 OCR 变量上下文）
+bool ScriptUsesTextRecognition(const std::vector<ScriptAction>& actions);
 
 // ── 键盘/鼠标模拟函数 ─────────────────────────────────────────────
 
@@ -59,3 +63,14 @@ void ApplyShortcutPreset(ScriptAction& action, int presetIndex);
 void SendShortcutCombo(const ScriptAction& action);
 void SendUnicodeChar(wchar_t ch);
 void SendQuickInputText(const std::wstring& text, double charInterval);
+
+struct RunProgramPreset {
+    const wchar_t* label;
+    const wchar_t* path;
+    const wchar_t* displayName;
+};
+
+int RunProgramPresetCount();
+const RunProgramPreset& RunProgramPresetAt(int index);
+std::wstring ResolveRunProgramPath(int presetIndex, const std::wstring& customPath);
+std::wstring RunProgramDisplayName(int presetIndex, const std::wstring& customPath);
