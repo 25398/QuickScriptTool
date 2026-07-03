@@ -24,7 +24,8 @@ public:
 
     ActionResult Show(int searchX1, int searchY1, int searchX2, int searchY2,
                       const std::wstring& highlightText = L"",
-                      OcrOverlayMode mode = OcrOverlayMode::Test);
+                      OcrOverlayMode mode = OcrOverlayMode::Test,
+                      bool digitsOnly = false);
 
 private:
     static void RegisterWindowClass();
@@ -57,6 +58,7 @@ private:
     int searchX1_ = 0, searchY1_ = 0, searchX2_ = 0, searchY2_ = 0;
     std::wstring highlightText_;
     OcrOverlayMode mode_ = OcrOverlayMode::Test;
+    bool digitsOnly_ = false;
 
     ActionResult actionResult_{};
     bool cancelled_ = false;

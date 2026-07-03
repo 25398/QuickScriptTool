@@ -145,7 +145,7 @@ void OcrOverlay::RunOcr() {
 
     const OcrEngineOutput output = RunOcrOnScreenRegion(
         searchX1_, searchY1_, searchX2_, searchY2_,
-        screenBitmap_, screenX_, screenY_);
+        screenBitmap_, screenX_, screenY_, digitsOnly_);
 
     ocrSuccess_ = output.success;
     errorMessage_ = output.error;
@@ -166,13 +166,14 @@ void OcrOverlay::RunOcr() {
 }
 
 OcrOverlay::ActionResult OcrOverlay::Show(int searchX1, int searchY1, int searchX2, int searchY2,
-                      const std::wstring& highlightText, OcrOverlayMode mode) {
+                      const std::wstring& highlightText, OcrOverlayMode mode, bool digitsOnly) {
     searchX1_ = searchX1;
     searchY1_ = searchY1;
     searchX2_ = searchX2;
     searchY2_ = searchY2;
     highlightText_ = highlightText;
     mode_ = mode;
+    digitsOnly_ = digitsOnly;
     actionResult_ = {};
     cancelled_ = false;
     pendingCancel_ = false;

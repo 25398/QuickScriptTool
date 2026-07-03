@@ -585,8 +585,19 @@ bool StartSessionLocked(OcrSessionState& session, std::wstring& errorOut) {
     return true;
 }
 
+std::string EscapeJsonPathUtf8(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char ch : value) {
+        if (ch == '\\') out += "\\\\";
+        else if (ch == '"') out += "\\\"";
+        else out.push_back(ch);
+    }
+    return out;
+}
+
 bool SessionRequestLocked(OcrSessionState& session, const std::wstring& imagePath,
-    std::string& jsonOut, std::wstring& errorOut) {
+    bool digitsOnly, std::string& jsonOut, std::wstring& errorOut) {
     jsonOut.clear();
     errorOut.clear();
     if (!session.process || !session.stdinWrite || !session.stdoutRead) {
@@ -594,8 +605,14 @@ bool SessionRequestLocked(OcrSessionState& session, const std::wstring& imagePat
         return false;
     }
 
-    const std::string pathUtf8 = ToUtf8(imagePath);
-    if (!WriteStdinLine(session.stdinWrite, pathUtf8)) {
+    std::string requestLine;
+    if (digitsOnly) {
+        const std::string pathUtf8 = ToUtf8(imagePath);
+        requestLine = "{\"image\":\"" + EscapeJsonPathUtf8(pathUtf8) + "\",\"digits_only\":true}";
+    } else {
+        requestLine = ToUtf8(imagePath);
+    }
+    if (!WriteStdinLine(session.stdinWrite, requestLine)) {
         errorOut = L"无法向 OCR 服务发送请求";
         return false;
     }
@@ -609,12 +626,13 @@ bool SessionRequestLocked(OcrSessionState& session, const std::wstring& imagePat
     return true;
 }
 
-OcrEngineOutput RunOcrOnImagePathOneShot(const std::wstring& imagePath) {
+OcrEngineOutput RunOcrOnImagePathOneShot(const std::wstring& imagePath, bool digitsOnly) {
     OcrEngineOutput output;
     const std::wstring pythonExe = DetectPythonExecutable();
     const std::wstring scriptPath = OcrHelperScriptPath();
-    const std::wstring commandLine = pythonExe + L" " + QuoteArg(scriptPath)
+    std::wstring commandLine = pythonExe + L" " + QuoteArg(scriptPath)
         + L" --image " + QuoteArg(imagePath) + L" --lang ch";
+    if (digitsOnly) commandLine += L" --digits-only";
 
     std::string stdoutText;
     DWORD exitCode = 1;
@@ -664,7 +682,7 @@ bool IsOcrSessionActive() {
 
 OcrEngineOutput RunOcrOnScreenRegion(
     int searchX1, int searchY1, int searchX2, int searchY2,
-    HBITMAP frozenScreen, int frozenVirtX, int frozenVirtY) {
+    HBITMAP frozenScreen, int frozenVirtX, int frozenVirtY, bool digitsOnly) {
     OcrEngineOutput output;
     const auto start = std::chrono::steady_clock::now();
 
@@ -688,7 +706,7 @@ OcrEngineOutput RunOcrOnScreenRegion(
         if (g_ocrSession.process) {
             std::string jsonOut;
             std::wstring sessionError;
-            if (SessionRequestLocked(g_ocrSession, imagePath, jsonOut, sessionError)) {
+            if (SessionRequestLocked(g_ocrSession, imagePath, digitsOnly, jsonOut, sessionError)) {
                 output = ParseOcrJson(jsonOut);
             } else {
                 output.error = sessionError.empty() ? L"OCR 服务请求失败" : sessionError;
@@ -696,7 +714,7 @@ OcrEngineOutput RunOcrOnScreenRegion(
         } else if (g_ocrSession.refCount > 0) {
             output.error = L"OCR 服务不可用";
         } else {
-            output = RunOcrOnImagePathOneShot(imagePath);
+            output = RunOcrOnImagePathOneShot(imagePath, digitsOnly);
         }
     }
     DeleteFileW(imagePath.c_str());
@@ -710,7 +728,15 @@ OcrEngineOutput RunOcrOnScreenRegion(
         return output;
     }
 
+    const int cropW = std::max(1, searchX2 - searchX1);
+    const int cropH = std::max(1, searchY2 - searchY1);
     for (auto& line : output.lines) {
+        if (digitsOnly && (line.x2 <= line.x1 || line.y2 <= line.y1)) {
+            line.x1 = 0;
+            line.y1 = 0;
+            line.x2 = cropW;
+            line.y2 = cropH;
+        }
         line.x1 += searchX1;
         line.y1 += searchY1;
         line.x2 += searchX1;

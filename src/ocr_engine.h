@@ -41,7 +41,8 @@ bool IsOcrSessionActive();
 // 对屏幕区域执行 OCR（支持锁定截图）
 OcrEngineOutput RunOcrOnScreenRegion(
     int searchX1, int searchY1, int searchX2, int searchY2,
-    HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0);
+    HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0,
+    bool digitsOnly = false);
 
 // 拼接所有识别行为单个字符串
 std::wstring ConcatOcrLines(const OcrEngineOutput& output);

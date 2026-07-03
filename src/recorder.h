@@ -18,6 +18,7 @@ struct RecordedEvent {
     UINT msg;               // WM_KEYDOWN/WM_KEYUP/WM_LBUTTONDOWN/等
     WPARAM vkOrButton;      // 虚拟键码或鼠标按键标识
     int x, y;               // 鼠标坐标（键盘事件时为0）
+    int wheelDelta = 0;     // 滚轮增量（WM_MOUSEWHEEL/WM_MOUSEHWHEEL时使用，正上/右，负下/左）
 };
 
 // ── 全局录制状态 ──────────────────────────────────────────────────

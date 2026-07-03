@@ -40,81 +40,81 @@
 #include "ocr_engine.h"
 #include "process_utils.h"
 #include "recorder.h"
+#include "recording_optimize_dialog.h"
 #include "match_overlay.h"
 #include "ocr_overlay.h"
 #include "screenshot_overlay.h"
 #include "editor_dropdown.h"
 #include "script_types.h"
+#include "script_io.h"
 #include "utils.h"
 
 extern HINSTANCE g_instance;
 
 // ── Global-hotkey low-level hook (fallback when RegisterHotKey is unavailable) ──
-namespace {
-    HHOOK ghHotkeyKbHook = nullptr;
-    HHOOK ghHotkeyMouseHook = nullptr;
-    HWND ghHotkeyHwnd = nullptr;
-    bool ghHotkeyPending = false;
-    UINT ghHotkeyVk = 0;
-    UINT ghHotkeyMods = 0;
-    bool ghHotkeyEnabled = false;
+inline HHOOK ghHotkeyKbHook = nullptr;
+inline HHOOK ghHotkeyMouseHook = nullptr;
+inline HWND ghHotkeyHwnd = nullptr;
+inline bool ghHotkeyPending = false;
+inline UINT ghHotkeyVk = 0;
+inline UINT ghHotkeyMods = 0;
+inline bool ghHotkeyEnabled = false;
 
-    bool CheckHotkeyModifiers(UINT required) {
-        const bool alt   = (GetAsyncKeyState(VK_LMENU)    & 0x8000) || (GetAsyncKeyState(VK_RMENU)    & 0x8000);
-        const bool ctrl  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-        const bool shift = (GetAsyncKeyState(VK_LSHIFT)   & 0x8000) || (GetAsyncKeyState(VK_RSHIFT)   & 0x8000);
-        const bool win   = (GetAsyncKeyState(VK_LWIN)     & 0x8000) || (GetAsyncKeyState(VK_RWIN)     & 0x8000);
-        if (required == 0) return !alt && !ctrl && !shift && !win;
-        if ((required & MOD_ALT)     && !alt)   return false;
-        if ((required & MOD_CONTROL) && !ctrl)  return false;
-        if ((required & MOD_SHIFT)   && !shift) return false;
-        if ((required & MOD_WIN)     && !win)   return false;
-        return true;
-    }
+inline bool CheckHotkeyModifiers(UINT required) {
+    const bool alt   = (GetAsyncKeyState(VK_LMENU)    & 0x8000) || (GetAsyncKeyState(VK_RMENU)    & 0x8000);
+    const bool ctrl  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+    const bool shift = (GetAsyncKeyState(VK_LSHIFT)   & 0x8000) || (GetAsyncKeyState(VK_RSHIFT)   & 0x8000);
+    const bool win   = (GetAsyncKeyState(VK_LWIN)     & 0x8000) || (GetAsyncKeyState(VK_RWIN)     & 0x8000);
+    if (required == 0) return !alt && !ctrl && !shift && !win;
+    if ((required & MOD_ALT)     && !alt)   return false;
+    if ((required & MOD_CONTROL) && !ctrl)  return false;
+    if ((required & MOD_SHIFT)   && !shift) return false;
+    if ((required & MOD_WIN)     && !win)   return false;
+    return true;
+}
 
-    bool IsMouseVk(UINT vk) {
-        return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON
-            || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
-    }
+inline bool IsMouseVk(UINT vk) {
+    return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON
+        || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+}
 
-    LRESULT CALLBACK HotkeyKbProc(int code, WPARAM wp, LPARAM lp) {
-        if (code >= 0 && ghHotkeyEnabled && !ghHotkeyPending && !IsMouseVk(ghHotkeyVk)) {
-            const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
-            const bool up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
-            auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
-            if (down && ks->vkCode == ghHotkeyVk && CheckHotkeyModifiers(ghHotkeyMods)) {
-                ghHotkeyPending = true;
-                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
-            }
-            if (up && ks->vkCode == ghHotkeyVk)
-                ghHotkeyPending = false;
+inline LRESULT CALLBACK HotkeyKbProc(int code, WPARAM wp, LPARAM lp) {
+    if (code >= 0 && ghHotkeyEnabled && !ghHotkeyPending && !IsMouseVk(ghHotkeyVk)) {
+        const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+        const bool up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
+        auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+        if (down && ks->vkCode == ghHotkeyVk && CheckHotkeyModifiers(ghHotkeyMods)) {
+            ghHotkeyPending = true;
+            PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
         }
-        return CallNextHookEx(nullptr, code, wp, lp);
+        if (up && ks->vkCode == ghHotkeyVk)
+            ghHotkeyPending = false;
     }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
 
-    LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
-        if (code >= 0 && ghHotkeyEnabled && !ghHotkeyPending && IsMouseVk(ghHotkeyVk)) {
-            bool down = false, up = false; UINT btnVk = 0;
-            if      (wp == WM_LBUTTONDOWN) { down = true; btnVk = VK_LBUTTON; }
-            else if (wp == WM_LBUTTONUP)   { up   = true; btnVk = VK_LBUTTON; }
-            else if (wp == WM_RBUTTONDOWN) { down = true; btnVk = VK_RBUTTON; }
-            else if (wp == WM_RBUTTONUP)   { up   = true; btnVk = VK_RBUTTON; }
-            else if (wp == WM_MBUTTONDOWN) { down = true; btnVk = VK_MBUTTON; }
-            else if (wp == WM_MBUTTONUP)   { up   = true; btnVk = VK_MBUTTON; }
-            else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
-                auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
-                btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
-                if (wp == WM_XBUTTONDOWN) down = true; else up = true;
-            }
-            if (down && btnVk == ghHotkeyVk && CheckHotkeyModifiers(ghHotkeyMods)) {
-                ghHotkeyPending = true;
-                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
-            }
-            if (up && btnVk == ghHotkeyVk) ghHotkeyPending = false;
+inline LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
+    if (code >= 0 && ghHotkeyEnabled && !ghHotkeyPending && IsMouseVk(ghHotkeyVk)) {
+        bool down = false, up = false; UINT btnVk = 0;
+        if      (wp == WM_LBUTTONDOWN) { down = true; btnVk = VK_LBUTTON; }
+        else if (wp == WM_LBUTTONUP)   { up   = true; btnVk = VK_LBUTTON; }
+        else if (wp == WM_RBUTTONDOWN) { down = true; btnVk = VK_RBUTTON; }
+        else if (wp == WM_RBUTTONUP)   { up   = true; btnVk = VK_RBUTTON; }
+        else if (wp == WM_MBUTTONDOWN) { down = true; btnVk = VK_MBUTTON; }
+        else if (wp == WM_MBUTTONUP)   { up   = true; btnVk = VK_MBUTTON; }
+        else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
+            auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
+            btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+            if (wp == WM_XBUTTONDOWN) down = true; else up = true;
         }
-        return CallNextHookEx(nullptr, code, wp, lp);
+        if (down && btnVk == ghHotkeyVk && CheckHotkeyModifiers(ghHotkeyMods)) {
+            ghHotkeyPending = true;
+            PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
+        }
+        if (up && btnVk == ghHotkeyVk) ghHotkeyPending = false;
     }
-} // anonymous namespace
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
 
 class MainWindow {
 public:
@@ -146,7 +146,7 @@ private:
     friend LRESULT CALLBACK EditorDropPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
-    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName };
+    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kOcrDigitsOnly, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName };
     enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
@@ -238,8 +238,10 @@ private:
         case WM_CTLCOLORSTATIC:
             return OnCtlColor(reinterpret_cast<HDC>(wp));
         case WM_CTLCOLOREDIT: return OnEditColor(reinterpret_cast<HDC>(wp));
-        case WM_CLOSE: StopRun(); DestroyWindow(hwnd_); return 0;
+        case WM_CLOSE: if (recording_) StopRecording(); StopRun(); DestroyWindow(hwnd_); return 0;
         case WM_DESTROY: Cleanup(); PostQuitMessage(0); return 0;
+        case WM_QUERYENDSESSION: if (recording_) StopRecording(); return TRUE;
+        case WM_ENDSESSION: if (recording_) StopRecordingCleanup(); return 0;
         default: return DefWindowProcW(hwnd_, msg, wp, lp);
         }
     }
@@ -465,7 +467,8 @@ private:
 
         AddGroup(ocrDepControls_, ocrDepStatusLabel_ = MakeLabel(hwnd_, L"文字识别未安装", -1, kFindContentLeft, kOcrDepRowY, 130, kFindBtnH));
         AddGroup(ocrDepControls_, ocrDepInstallBtn_ = MakeGrayButton(hwnd_, L"一键安装", kOcrInstallDep, kFindActionBtnX, kOcrDepRowY, kFindBtnW, kFindBtnH));
-        AddGroup(ocrFindRegionToggleControls_, ocrRegionByImageCheck_ = MakeCheckBox(hwnd_, L"根据图片选取区域", kOcrRegionByImage, kFindContentLeft, kOcrRegionRowY, 180, 22));
+        AddGroup(ocrFindRegionToggleControls_, ocrRegionByImageCheck_ = MakeCheckBox(hwnd_, L"根据图片选取区域", kOcrRegionByImage, kFindContentLeft, kOcrRegionRowY, kOcrRegionByImageW, 22));
+        AddGroup(ocrFindRegionToggleControls_, ocrDigitsOnlyCheck_ = MakeCheckBox(hwnd_, L"纯数字", kOcrDigitsOnly, kOcrDigitsOnlyX, kOcrRegionRowY, kOcrDigitsOnlyW, 22));
         AddGroup(ocrControls_, ocrRegionLabel_ = MakeLabel(hwnd_, L"识别区域", -1, kFindContentLeft, kOcrRegionRowY, kFindRegionLabelW, kFindBtnH));
         AddGroup(ocrControls_, ocrFullScreenBtn_ = MakeGrayButton(hwnd_, L"全图", kOcrFullScreen, kFindContentLeft + kFindRegionLabelW + 8, kOcrRegionRowY, 44, kFindBtnH));
         AddGroup(ocrControls_, ocrSelectRegionBtn_ = MakeGrayButton(hwnd_, L"选取区域", kOcrSelectRegion, kFindContentLeft + kFindRegionLabelW + 58, kOcrRegionRowY, kFindBtnW, kFindBtnH));
@@ -494,11 +497,11 @@ private:
         AddGroup(ocrFindRegionControls_, ocrFindScaleMin_ = MakeFieldEdit(hwnd_, L"0.9", kOcrFindScaleMin, kFindContentLeft + 65, kFindScaleY, 40, 22));
         AddGroup(ocrFindRegionControls_, MakeLabel(hwnd_, L"最大", -1, kFindContentLeft + 110, kFindScaleY, 40, 22));
         AddGroup(ocrFindRegionControls_, ocrFindScaleMax_ = MakeFieldEdit(hwnd_, L"1.1", kOcrFindScaleMax, kFindContentLeft + 151, kFindScaleY, 40, 22));
-        AddGroup(ocrSearchControls_, ocrSearchLabel_ = MakeLabel(hwnd_, L"在结果中查找的文字", -1, kFindContentLeft, kOcrSearchLabelY, kFindBlockW, 22));
-        AddGroup(ocrSearchControls_, ocrSearchEdit_ = MakeEdit(hwnd_, L"", kOcrSearchText, kFindContentLeft, kOcrSearchEditY, kFindBlockW, 22));
-        AddGroup(ocrSearchControls_, ocrSearchVarLabel_ = MakeLabel(hwnd_, L"变量:", -1, kFindContentLeft, kOcrSearchVarY, 50, 22));
+        AddGroup(ocrSearchControls_, ocrSearchLabel_ = MakeLabel(hwnd_, L"查找:", -1, kFindContentLeft, kOcrSearchLabelY, kOcrSearchVarLabelW, 22));
+        AddGroup(ocrSearchControls_, ocrSearchEdit_ = MakeEdit(hwnd_, L"", kOcrSearchText, kOcrSearchEditX, kOcrSearchEditY, kOcrSearchEditW, 22));
+        AddGroup(ocrSearchControls_, ocrSearchVarLabel_ = MakeLabel(hwnd_, L"变量:", -1, kFindContentLeft, kOcrSearchVarY, kOcrSearchVarLabelW, 22));
         AddGroup(ocrSearchControls_, ocrSearchVarCombo_ = MakeLabel(hwnd_, L"", kOcrSearchVarCombo, kFindContentLeft + 56, kOcrSearchVarY - 2, kFindFollowComboW, kFindBtnH));
-        AddGroup(ocrSearchControls_, ocrSearchVarInsertBtn_ = MakeButton(hwnd_, L"插入选择的变量", kOcrSearchVarInsert, kFindContentLeft, kOcrSearchVarY + kFindBtnH + 4, kFindBlockW, 28));
+        AddGroup(ocrSearchControls_, ocrSearchVarInsertBtn_ = MakeButton(hwnd_, L"插入", kOcrSearchVarInsert, kFindContentLeft, kOcrSearchVarY + kFindBtnH + 4, kOcrInsertBtnW, kOcrCompactBtnH));
         popupOcrSearchVar_.items.clear(); popupOcrSearchVar_.sel = -1;
         AddGroup(ocrFollowControls_, ocrFollowUpLabel_ = MakeLabel(hwnd_, L"后续操作", -1, kFindContentLeft, kOcrFollowRowY, kFindFollowLabelW, kFindBtnH));
         AddGroup(ocrFollowControls_, ocrFollowUpCombo_ = MakeLabel(hwnd_, L"点击", kOcrFollowUp, kFindContentLeft + kFindFollowLabelW + 8, kOcrFollowRowY, kFindFollowComboW, kFindBtnH));
@@ -639,7 +642,7 @@ private:
 
         AddGroup(timerRecordControls_, MakeEditorLabel(hwnd_, L"计时器变量命名", -1, kEditorPanelLeft, kEditorLabelAboveComboY, kEditorActionComboW, kEditorLabelAboveComboH));
         AddGroup(timerRecordControls_, timerVarName_ = MakeEdit(hwnd_, L"", kTimerVarName, kEditorPanelLeft, kEditorParamComboY, kEditorActionComboW, kEditorActionComboH));
-        AddGroup(timerRecordControls_, MakeHint(hwnd_, L"*提示: 记录从此动作到引用该变量时经过的秒数(向下取整); 同名变量会重置计时", kEditorPanelLeft, kEditorParamComboY + kEditorActionComboH + kEditorLabelGap, kEditorActionComboW, 40));
+        AddGroup(timerRecordControls_, MakeHint(hwnd_, L"*提示: 记录从此动作到引用该变量时经过的秒数(向下取整); 同名变量会重置计时", kEditorPanelLeft, kEditorParamComboY + kEditorActionComboH + kEditorLabelGap, kEditorActionComboW, 56));
 
         InitRunProgramPresets();
         InitCrosshairDrag();
@@ -1103,6 +1106,14 @@ private:
             FALSE);
     }
 
+    int OcrTextButtonWidthDesign(HDC hdc, HFONT font, const wchar_t* text, int minDesignPx, int padDesignPx) const {
+        HFONT old = static_cast<HFONT>(SelectObject(hdc, font));
+        SIZE sz{};
+        GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
+        SelectObject(hdc, old);
+        return std::max(minDesignPx, static_cast<int>(sz.cx) + padDesignPx);
+    }
+
     void MoveOcrCoordLabel(const wchar_t* text, int yClient) const {
         const int x = (text[0] == L'X') ? kFindXLabelX : kFindYLabelX;
         for (HWND h : ocrControls_) {
@@ -1134,12 +1145,10 @@ private:
         const int fullWWant = std::max(32, static_cast<int>(fullSz.cx) + 10);
         const int fullW = std::max(32, std::min(fullWMax, fullWWant));
         const int btnH = OcrScale(kFindBtnH);
-        MoveWindow(ocrRegionLabel_, OcrScale(kFindContentLeft), yClient,
-            OcrScale(labelW), btnH, FALSE);
-        MoveWindow(ocrFullScreenBtn_, OcrScale(fullX), yClient,
-            OcrScale(fullW), btnH, FALSE);
-        MoveWindow(ocrSelectRegionBtn_, OcrScale(kFindSelectRegionX), yClient,
-            OcrScale(kFindBtnW), btnH, FALSE);
+        MoveOcrAt(ocrRegionLabel_, kFindContentLeft, yClient, labelW, kFindBtnH);
+        MoveOcrAt(ocrFullScreenBtn_, fullX, yClient, fullW, kFindBtnH);
+        MoveOcrAt(ocrSelectRegionBtn_, kFindSelectRegionX, yClient, kFindBtnW, kFindBtnH);
+        (void)btnH;
     }
 
     void SizeOcrRegionButtons() {
@@ -1425,16 +1434,23 @@ private:
         if (popupAction_.sel == 18) RefreshOcrSubPanel();
     }
 
-    int LayoutOcrSearchBlock(int y, int rowGap, int btnH, int fieldH, int tightGap, int insertBtnH) {
-        MoveOcrAt(ocrSearchLabel_, kFindContentLeft, y, kFindBlockW, 22);
-        y += fieldH + tightGap;
-        MoveOcrAt(ocrSearchEdit_, kFindContentLeft, y, kFindBlockW, 22);
+    int LayoutOcrSearchBlock(int y, int rowGap, int btnH, int fieldH) {
+        (void)btnH;
+        MoveOcrAt(ocrSearchLabel_, kFindContentLeft, y, kOcrSearchVarLabelW, 22);
+        MoveOcrAt(ocrSearchEdit_, kOcrSearchEditX, y, kOcrSearchEditW, 22);
         y += fieldH + rowGap;
-        MoveOcrAt(ocrSearchVarLabel_, kFindContentLeft, y + (btnH - fieldH) / 2, 50, 22);
-        MoveOcrAt(ocrSearchVarCombo_, kFindContentLeft + 56, y, kFindFollowComboW, kFindBtnH);
-        y += btnH + tightGap;
-        MoveOcrAt(ocrSearchVarInsertBtn_, kFindContentLeft, y, kFindBlockW, 28);
-        return y + insertBtnH + rowGap;
+
+        HDC hdc = GetDC(hwnd_);
+        const int insertW = OcrTextButtonWidthDesign(hdc, editorFont_ ? editorFont_ : font_, L"插入", kOcrInsertBtnW, 16);
+        ReleaseDC(hwnd_, hdc);
+        const int insertX = kOcrPanelRight - insertW;
+        const int comboX = kFindContentLeft + kOcrSearchVarLabelW + kOcrVarComboGap;
+        const int comboW = std::max(40, insertX - kOcrVarInsertGap - comboX);
+        const int rowH = OcrScale(kOcrCompactBtnH);
+        MoveOcrAt(ocrSearchVarLabel_, kFindContentLeft, y + (rowH - fieldH) / 2, kOcrSearchVarLabelW, 22);
+        MoveOcrAt(ocrSearchVarCombo_, comboX, y + (rowH - OcrScale(kFindBtnH)) / 2, comboW, kFindBtnH);
+        MoveOcrAt(ocrSearchVarInsertBtn_, insertX, y, insertW, kOcrCompactBtnH);
+        return y + rowH + rowGap;
     }
 
     int LayoutOcrFindRegionBlock(int y) {
@@ -1485,6 +1501,8 @@ private:
         const bool searchMode = popupOcrResultMode_.sel == 1;
         const bool saveVar = popupOcrFollowUp_.sel == 2;
         const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+        ShowGroup(ocrControls_, true);
+        ShowGroup(ocrFollowControls_, true);
         ShowGroup(ocrSearchControls_, searchMode);
         ShowGroup(ocrFollowOffsetControls_, !saveVar);
         ShowGroup(ocrFollowVarControls_, saveVar);
@@ -1500,15 +1518,14 @@ private:
         const int rowGap = OcrScale(kFindVGap);
         const int btnH = OcrScale(kFindBtnH);
         const int fieldH = OcrScale(22);
-        const int tightGap = OcrScale(4);
-        const int insertBtnH = OcrScale(28);
 
         int y = (ocrDepStatusLabel_
             ? WindowClientRect(ocrDepStatusLabel_).bottom
             : OcrScale(kOcrRegionRowY)) + depGap;
 
         if (ocrRegionByImageCheck_) {
-            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, 180, 22);
+            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, kOcrRegionByImageW, 22);
+            if (ocrDigitsOnlyCheck_) MoveOcrAt(ocrDigitsOnlyCheck_, kOcrDigitsOnlyX, y, kOcrDigitsOnlyW, 22);
             y += fieldH + rowGap;
         }
 
@@ -1536,7 +1553,7 @@ private:
         y += btnH + rowGap;
 
         if (searchMode) {
-            y = LayoutOcrSearchBlock(y, rowGap, btnH, fieldH, tightGap, insertBtnH);
+            y = LayoutOcrSearchBlock(y, rowGap, btnH, fieldH);
         }
 
         MoveOcrAt(ocrFollowUpLabel_, kFindContentLeft, y, kFindFollowLabelW, kFindBtnH);
@@ -1555,23 +1572,37 @@ private:
             y += fieldH + rowGap;
         }
 
-        if (searchMode && ocrUntilFound_) {
-            MoveOcrAt(ocrUntilFound_, kFindContentLeft, y, 140, 22);
-            y += fieldH + rowGap;
-        }
-
         const bool showSelectOffset = searchMode && !saveVar && !OcrSearchTextContainsVariable();
-        MoveOcrAt(ocrTestBtn_, kFindContentLeft, y, kFindBtnW, kFindBtnH);
-        if (ocrSelectOffsetBtn_) {
-            if (showSelectOffset) {
-                ShowWindow(ocrSelectOffsetBtn_, SW_SHOW);
-                MoveOcrAt(ocrSelectOffsetBtn_, kOcrTestRowOffsetBtnX, y, kOcrTestRowOffsetBtnW, kFindBtnH);
-            } else {
-                ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
+        if (searchMode) {
+            const int compactRowH = std::max(fieldH, OcrScale(kOcrCompactBtnH));
+            const int testX = kOcrPanelRight - kOcrTestBtnW;
+            if (ocrUntilFound_) {
+                MoveOcrAt(ocrUntilFound_, kFindContentLeft, y + (compactRowH - fieldH) / 2, 140, 22);
             }
+            if (ocrSelectOffsetBtn_) {
+                if (showSelectOffset) {
+                    const int offsetX = kFindContentLeft + 148;
+                    const int offsetW = testX - kOcrTestToOffsetGap - offsetX;
+                    if (offsetW >= 80) {
+                        ShowWindow(ocrSelectOffsetBtn_, SW_SHOW);
+                        MoveOcrAt(ocrSelectOffsetBtn_, offsetX, y + (compactRowH - OcrScale(kFindBtnH)) / 2,
+                            offsetW, kOcrCompactBtnH);
+                    } else {
+                        ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
+                    }
+                } else {
+                    ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
+                }
+            }
+            MoveOcrAt(ocrTestBtn_, testX, y + (compactRowH - OcrScale(kOcrCompactBtnH)) / 2, kOcrTestBtnW, kOcrCompactBtnH);
+            y += compactRowH + rowGap;
+        } else {
+            MoveOcrAt(ocrTestBtn_, kFindContentLeft, y, kFindBtnW, kFindBtnH);
+            if (ocrSelectOffsetBtn_) ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
+            y += btnH + rowGap;
         }
-        y += btnH + rowGap;
         ApplyEditorFooterLayout();
+        HideEditorComboHwnds();
         InvalidateOcrEditorPanel();
     }
 
@@ -1697,6 +1728,7 @@ private:
         if (ocrTestBtn_) EnableWindow(ocrTestBtn_, FALSE);
 
         const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+        const bool digitsOnly = ocrDigitsOnlyCheck_ && Checked(ocrDigitsOnlyCheck_);
         if (regionByImage && ocrFindImagePath_.empty()) {
             ocrTestRunning_ = false;
             if (ocrTestBtn_) EnableWindow(ocrTestBtn_, TRUE);
@@ -1734,7 +1766,7 @@ private:
             searchTarget = ResolveMacroVariables(GetText(ocrSearchEdit_), ctx);
         }
         EnsureOcrSession();
-        ocrOverlay_->Show(sx1, sy1, sx2, sy2, searchTarget);
+        ocrOverlay_->Show(sx1, sy1, sx2, sy2, searchTarget, OcrOverlayMode::Test, digitsOnly);
         ReleaseOcrSession();
 
         RestoreEditorAfterScreenCapture();
@@ -2126,7 +2158,9 @@ private:
         else if (sel == 18) {
             action.type = ActionType::TextRecognition;
             const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+            const bool digitsOnly = ocrDigitsOnlyCheck_ && Checked(ocrDigitsOnlyCheck_);
             action.ocrRegionByImage = regionByImage;
+            action.ocrDigitsOnly = digitsOnly;
             action.searchX1 = ToInt(ocrX1_);
             action.searchY1 = ToInt(ocrY1_);
             action.searchX2 = ToInt(ocrX2_);
@@ -2287,6 +2321,7 @@ private:
             SetPopupSel(popupAction_, actionCombo_, 18);
             ocrFullScreen_ = action.searchFullScreen;
             SetChecked(ocrRegionByImageCheck_, action.ocrRegionByImage);
+            SetChecked(ocrDigitsOnlyCheck_, action.ocrDigitsOnly);
             ocrFindImagePath_ = action.ocrRegionByImage ? action.imagePath : L"";
             if (action.ocrRegionByImage) {
                 SetText(ocrFindMatchThreshold_, std::to_wstring(static_cast<int>(action.matchThreshold)));
@@ -2628,7 +2663,8 @@ private:
         ShowWindow(hwnd_, SW_HIDE);
 
         EnsureOcrSession();
-        const auto result = ocrOverlay_->Show(sx1, sy1, sx2, sy2, searchTarget, OcrOverlayMode::OffsetPick);
+        const bool digitsOnly = ocrDigitsOnlyCheck_ && Checked(ocrDigitsOnlyCheck_);
+        const auto result = ocrOverlay_->Show(sx1, sy1, sx2, sy2, searchTarget, OcrOverlayMode::OffsetPick, digitsOnly);
         ReleaseOcrSession();
 
         SetWindowPos(hwnd_, HWND_TOP,
@@ -3090,78 +3126,7 @@ private:
         file << L"  \"hotkeyModifiers\": " << hk.modifiers << L",\n";
         file << L"  \"actions\": [\n";
         for (size_t i = 0; i < actions_.size(); ++i) {
-            const auto& a = actions_[i];
-            file << L"    {\n";
-            file << L"      \"type\": \"" << JsonType(a.type) << L"\",\n";
-            file << L"      \"text\": \"" << EscapeJson(a.customText) << L"\",\n";
-            file << L"      \"remark\": \"" << EscapeJson(a.remark) << L"\",\n";
-            file << L"      \"no\": " << a.originalNo << L",\n";
-            file << L"      \"indent\": " << a.indent << L",\n";
-            file << L"      \"x\": " << a.x << L",\n";
-            file << L"      \"y\": " << a.y << L",\n";
-            file << L"      \"randomX\": " << a.randomX << L",\n";
-            file << L"      \"randomY\": " << a.randomY << L",\n";
-            file << L"      \"moveFromVar\": " << (a.moveFromVar ? 1 : 0) << L",\n";
-            file << L"      \"moveVarExprX\": \"" << EscapeJson(a.moveVarExprX) << L"\",\n";
-            file << L"      \"moveVarExprY\": \"" << EscapeJson(a.moveVarExprY) << L"\",\n";
-            file << L"      \"button\": \"" << JsonButton(a.button) << L"\",\n";
-            file << L"      \"keyText\": \"" << EscapeJson(a.keyText) << L"\",\n";
-            file << L"      \"keyVk\": " << a.keyVk << L",\n";
-            file << L"      \"holdLeftWin\": " << (a.holdLeftWin ? 1 : 0) << L",\n";
-            file << L"      \"holdRightWin\": " << (a.holdRightWin ? 1 : 0) << L",\n";
-            file << L"      \"holdLeftCtrl\": " << (a.holdLeftCtrl ? 1 : 0) << L",\n";
-            file << L"      \"holdRightCtrl\": " << (a.holdRightCtrl ? 1 : 0) << L",\n";
-            file << L"      \"holdLeftAlt\": " << (a.holdLeftAlt ? 1 : 0) << L",\n";
-            file << L"      \"holdRightAlt\": " << (a.holdRightAlt ? 1 : 0) << L",\n";
-            file << L"      \"holdLeftShift\": " << (a.holdLeftShift ? 1 : 0) << L",\n";
-            file << L"      \"holdRightShift\": " << (a.holdRightShift ? 1 : 0) << L",\n";
-            file << L"      \"clickCount\": " << a.clickCount << L",\n";
-            file << L"      \"duration\": " << a.duration << L",\n";
-            file << L"      \"randomDuration\": " << a.randomDuration << L",\n";
-            file << L"      \"loopCount\": " << a.loopCount << L",\n";
-            file << L"      \"loopVarName\": \"" << EscapeJson(a.loopVarName) << L"\",\n";
-            file << L"      \"loopFromVar\": " << (a.loopFromVar ? 1 : 0) << L",\n";
-            file << L"      \"loopVarExpr\": \"" << EscapeJson(a.loopVarExpr) << L"\",\n";
-            file << L"      \"blockName\": \"" << EscapeJson(a.blockName) << L"\",\n";
-            file << L"      \"targetPath\": \"" << EscapeJson(a.targetPath) << L"\",\n";
-            file << L"      \"shortcutPreset\": " << a.shortcutPreset << L",\n";
-            file << L"      \"inputText\": \"" << EscapeJson(a.inputText) << L"\",\n";
-            file << L"      \"charInterval\": " << a.charInterval << L",\n";
-            file << L"      \"scrollVertical\": " << (a.scrollVertical ? 1 : 0) << L",\n";
-            file << L"      \"scrollHorizontal\": " << (a.scrollHorizontal ? 1 : 0) << L",\n";
-            file << L"      \"scrollSteps\": " << a.scrollSteps << L",\n";
-            file << L"      \"scrollDirection\": " << a.scrollDirection << L",\n";
-            file << L"      \"searchX1\": " << a.searchX1 << L",\n";
-            file << L"      \"searchY1\": " << a.searchY1 << L",\n";
-            file << L"      \"searchX2\": " << a.searchX2 << L",\n";
-            file << L"      \"searchY2\": " << a.searchY2 << L",\n";
-            file << L"      \"searchFullScreen\": " << (a.searchFullScreen ? 1 : 0) << L",\n";
-            const std::wstring savedImagePath = [&]() -> std::wstring {
-                if (a.type == ActionType::FindImage && !a.imagePath.empty()) {
-                    return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
-                }
-                if (a.type == ActionType::TextRecognition && a.ocrRegionByImage && !a.imagePath.empty()) {
-                    return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
-                }
-                return a.imagePath;
-            }();
-            file << L"      \"imagePath\": \"" << EscapeJson(savedImagePath) << L"\",\n";
-            file << L"      \"matchThreshold\": " << a.matchThreshold << L",\n";
-            file << L"      \"imageScale\": " << a.imageScale << L",\n";
-            file << L"      \"imageScaleMin\": " << a.imageScaleMin << L",\n";
-            file << L"      \"imageScaleMax\": " << a.imageScaleMax << L",\n";
-            file << L"      \"findImageFollowUp\": " << a.findImageFollowUp << L",\n";
-            file << L"      \"offsetX\": " << a.offsetX << L",\n";
-            file << L"      \"offsetY\": " << a.offsetY << L",\n";
-            file << L"      \"findUntilFound\": " << (a.findUntilFound ? 1 : 0) << L",\n";
-            file << L"      \"matchVarName\": \"" << EscapeJson(a.matchVarName) << L"\",\n";
-            file << L"      \"ocrResultMode\": " << a.ocrResultMode << L",\n";
-            file << L"      \"ocrRegionByImage\": " << (a.ocrRegionByImage ? 1 : 0) << L",\n";
-            file << L"      \"ocrSearchText\": \"" << EscapeJson(a.ocrSearchText) << L"\",\n";
-            file << L"      \"ocrFollowUp\": " << a.ocrFollowUp << L",\n";
-            file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\",\n";
-            file << L"      \"matchFileNameOnly\": " << (a.matchFileNameOnly ? 1 : 0) << L"\n";
-            file << L"    }" << (i + 1 == actions_.size() ? L"\n" : L",\n");
+            WriteActionJson(file, actions_[i], i + 1 == actions_.size());
         }
         file << L"  ]\n}\n";
         const auto bytes = ToUtf8(file.str());
@@ -3177,105 +3142,7 @@ private:
     }
 
     ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo) const {
-        ScriptAction a{};
-        const auto type = ExtractString(block, L"type");
-        if (type.empty()) return a;
-        if (type == L"moveMouse") a.type = ActionType::MoveMouse;
-        else if (type == L"mouseDown") a.type = ActionType::MouseDown;
-        else if (type == L"mouseUp") a.type = ActionType::MouseUp;
-        else if (type == L"mouseClick") a.type = ActionType::MouseClick;
-        else if (type == L"mousePlayback") a.type = ActionType::MousePlayback;
-        else if (type == L"runMacro") a.type = ActionType::RunMacro;
-        else if (type == L"keyDown") a.type = ActionType::KeyDown;
-        else if (type == L"keyUp") a.type = ActionType::KeyUp;
-        else if (type == L"keyClick") a.type = ActionType::KeyClick;
-        else if (type == L"hotkeyShortcut") a.type = ActionType::HotkeyShortcut;
-        else if (type == L"quickInput") a.type = ActionType::QuickInput;
-        else if (type == L"scrollWheel") a.type = ActionType::ScrollWheel;
-        else if (type == L"findImage") a.type = ActionType::FindImage;
-        else if (type == L"textRecognition") a.type = ActionType::TextRecognition;
-        else if (type == L"wait") a.type = ActionType::Wait;
-        else if (type == L"loop") a.type = ActionType::Loop;
-        else if (type == L"endLoop") a.type = ActionType::EndLoop;
-        else if (type == L"defineBlock") a.type = ActionType::DefineBlock;
-        else if (type == L"runBlock") a.type = ActionType::RunBlock;
-        else if (type == L"if") a.type = ActionType::If;
-        else if (type == L"else") a.type = ActionType::Else;
-        else if (type == L"lockScreenshot") a.type = ActionType::LockScreenshot;
-        else if (type == L"unlockScreenshot") a.type = ActionType::UnlockScreenshot;
-        else if (type == L"stopMacro") a.type = ActionType::StopMacro;
-        else if (type == L"runProgram") a.type = ActionType::RunProgram;
-        else if (type == L"closeProgram") a.type = ActionType::CloseProgram;
-        else if (type == L"openWebpage") a.type = ActionType::OpenWebpage;
-        else if (type == L"openFile") a.type = ActionType::OpenFile;
-        else if (type == L"timerRecordTime") a.type = ActionType::TimerRecordTime;
-        else a.type = ActionType::CustomText;
-        a.customText = ExtractString(block, L"text");
-        a.remark = ExtractString(block, L"remark");
-        a.originalNo = static_cast<int>(ExtractNumber(block, L"no", static_cast<double>(fallbackNo + 1)));
-        a.indent = static_cast<int>(ExtractNumber(block, L"indent", 0));
-        a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
-        a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
-        a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
-        a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
-        a.moveFromVar = ExtractNumber(block, L"moveFromVar", 0) != 0;
-        a.moveVarExprX = ExtractString(block, L"moveVarExprX");
-        a.moveVarExprY = ExtractString(block, L"moveVarExprY");
-        const auto button = ExtractString(block, L"button");
-        a.button = button == L"right" ? MouseButtonType::Right : button == L"middle" ? MouseButtonType::Middle : MouseButtonType::Left;
-        a.keyText = ExtractString(block, L"keyText");
-        if (a.keyText.empty()) a.keyText = L"7";
-        a.keyVk = static_cast<UINT>(ExtractNumber(block, L"keyVk", a.keyText.size() == 1 ? towupper(a.keyText[0]) : '7'));
-        a.holdLeftWin = ExtractNumber(block, L"holdLeftWin", 0) != 0;
-        a.holdRightWin = ExtractNumber(block, L"holdRightWin", 0) != 0;
-        a.holdLeftCtrl = ExtractNumber(block, L"holdLeftCtrl", 0) != 0;
-        a.holdRightCtrl = ExtractNumber(block, L"holdRightCtrl", 0) != 0;
-        a.holdLeftAlt = ExtractNumber(block, L"holdLeftAlt", 0) != 0;
-        a.holdRightAlt = ExtractNumber(block, L"holdRightAlt", 0) != 0;
-        a.holdLeftShift = ExtractNumber(block, L"holdLeftShift", 0) != 0;
-        a.holdRightShift = ExtractNumber(block, L"holdRightShift", 0) != 0;
-        a.clickCount = static_cast<int>(ExtractNumber(block, L"clickCount", 1));
-        a.duration = ExtractNumber(block, L"duration", 0.1);
-        a.randomDuration = ExtractNumber(block, L"randomDuration", 0);
-        a.loopCount = static_cast<int>(ExtractNumber(block, L"loopCount", -1));
-        a.loopVarName = ExtractString(block, L"loopVarName");
-        a.loopFromVar = ExtractNumber(block, L"loopFromVar", 0) != 0;
-        a.loopVarExpr = ExtractString(block, L"loopVarExpr");
-        a.blockName = ExtractString(block, L"blockName");
-        a.targetPath = ExtractString(block, L"targetPath");
-        a.shortcutPreset = static_cast<int>(ExtractNumber(block, L"shortcutPreset", 0));
-        a.inputText = ExtractString(block, L"inputText");
-        a.charInterval = ExtractNumber(block, L"charInterval", 0.01);
-        a.scrollVertical = ExtractNumber(block, L"scrollVertical", 1) != 0;
-        a.scrollHorizontal = ExtractNumber(block, L"scrollHorizontal", 0) != 0;
-        a.scrollSteps = static_cast<int>(ExtractNumber(block, L"scrollSteps", 1));
-        a.scrollDirection = static_cast<int>(ExtractNumber(block, L"scrollDirection", 0));
-        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
-        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
-        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
-        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
-        a.searchFullScreen = ExtractNumber(block, L"searchFullScreen", 1) != 0;
-        a.imagePath = ExtractString(block, L"imagePath");
-        if (!a.imagePath.empty()) a.imagePath = ResolveImagePath(a.imagePath);
-        a.matchThreshold = ExtractNumber(block, L"matchThreshold", 65.0);
-        a.imageScale = ExtractNumber(block, L"imageScale", 1.0);
-        a.imageScaleMin = ExtractNumber(block, L"imageScaleMin", a.imageScale);
-        a.imageScaleMax = ExtractNumber(block, L"imageScaleMax", a.imageScale);
-        a.findImageFollowUp = static_cast<int>(ExtractNumber(block, L"findImageFollowUp", 0));
-        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
-        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
-        a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
-        a.matchVarName = ExtractString(block, L"matchVarName");
-        if (a.matchVarName.empty()) {
-            a.matchVarName = a.type == ActionType::TextRecognition ? L"a" : L"matchRet";
-        }
-        a.ocrResultMode = static_cast<int>(ExtractNumber(block, L"ocrResultMode", 0));
-        a.ocrRegionByImage = ExtractNumber(block, L"ocrRegionByImage", 0) != 0;
-        a.ocrSearchText = ExtractString(block, L"ocrSearchText");
-        a.ocrFollowUp = static_cast<int>(ExtractNumber(block, L"ocrFollowUp", 0));
-        a.conditionExpr = ExtractString(block, L"conditionExpr");
-        a.matchFileNameOnly = ExtractNumber(block, L"matchFileNameOnly", 0) != 0;
-        return a;
+        return ::ParseScriptActionBlock(block, fallbackNo);
     }
 
     std::vector<ScriptAction> ParseActionsFromContent(const std::wstring& content) const {
@@ -4028,6 +3895,16 @@ private:
 
     void OnMouseLeave() {
         trackingMouse_ = false;
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd_, &pt);
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        if (PtInRect(&client, pt)) {
+            UpdateGrayButtonHover(pt.x, pt.y);
+            FlushGrayButtonHover();
+            return;
+        }
         ClearGrayButtonHover();
         pendingHoverGrayOld_ = nullptr;
         pendingHoverGrayNew_ = nullptr;
@@ -4917,7 +4794,12 @@ private:
             if (x >= RecordingHotkeyRect(i).left && x <= RecordingHotkeyRect(i).right && y >= RecordingHotkeyRect(i).top && y <= RecordingHotkeyRect(i).bottom) { CaptureRecordingHotkey(i); return; }
             if (i != selectedRecording_) {
                 if (PtIn(RecordingOptimizeRect(i), x, y)) {
-                    MessageBoxW(hwnd_, L"优化功能暂未开放。", L"录制", MB_OK | MB_ICONINFORMATION); return;
+                    RecordingOptimizeDialog optimizeDlg;
+                    if (optimizeDlg.Show(hwnd_, recordings_[static_cast<size_t>(i)]).saved) {
+                        LoadRecordings();
+                    }
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return;
                 }
                 if (PtIn(RecordingRenameRect(i), x, y)) {
                     ShowRenameRecordingDialog(i);
@@ -5487,7 +5369,7 @@ private:
                                 : MakeOcrTextVarResult(L"");
                         }
                         const OcrEngineOutput output = RunOcrOnScreenRegion(
-                            x1, y1, x2, y2, lockedScreen_, lockedVirtX_, lockedVirtY_);
+                            x1, y1, x2, y2, lockedScreen_, lockedVirtX_, lockedVirtY_, a.ocrDigitsOnly);
                         if (!output.success) {
                             return a.ocrResultMode == 1
                                 ? MakeOcrSearchVarResult(OcrTextLine{}, false)
@@ -5522,7 +5404,7 @@ private:
                             return;
                         }
                         const OcrEngineOutput output = RunOcrOnScreenRegion(
-                            x1, y1, x2, y2, lockedScreen_, lockedVirtX_, lockedVirtY_);
+                            x1, y1, x2, y2, lockedScreen_, lockedVirtX_, lockedVirtY_, a.ocrDigitsOnly);
                         ocrVars_[varName] = output.success
                             ? MakeOcrTextVarResult(ConcatOcrLines(output))
                             : MakeOcrTextVarResult(L"");
@@ -5754,6 +5636,12 @@ private:
         {
             std::lock_guard<std::mutex> lock(g_recordMutex);
             g_recordedEvents.clear();
+            RecordedEvent initialPos{};
+            initialPos.timeOffsetMs = 0;
+            initialPos.msg = WM_MOUSEMOVE;
+            POINT pt{}; GetCursorPos(&pt);
+            initialPos.x = pt.x; initialPos.y = pt.y;
+            g_recordedEvents.push_back(initialPos);
         }
         g_recordStartTick.store(GetTickCount(), std::memory_order_relaxed);
         g_lastMouseMoveTick.store(g_recordStartTick.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -5781,6 +5669,7 @@ private:
         if (hk.vk == VK_LBUTTON) return e.msg == WM_LBUTTONDOWN || e.msg == WM_LBUTTONUP;
         if (hk.vk == VK_RBUTTON) return e.msg == WM_RBUTTONDOWN || e.msg == WM_RBUTTONUP;
         if (hk.vk == VK_MBUTTON) return e.msg == WM_MBUTTONDOWN || e.msg == WM_MBUTTONUP;
+        if (hk.vk == VK_XBUTTON1 || hk.vk == VK_XBUTTON2) return e.msg == WM_XBUTTONDOWN || e.msg == WM_XBUTTONUP;
         if (e.msg == WM_KEYDOWN || e.msg == WM_KEYUP) return static_cast<UINT>(e.vkOrButton) == hk.vk;
         return false;
     }
@@ -5801,9 +5690,17 @@ private:
         }
         TrimStopHotkeyTail(events, globalHotkey_);
         if (events.empty()) return;
+        saveDurationSeconds_ = events.back().timeOffsetMs / 1000.0;
 
-        bool isKeyHeld = false;    // track key-hold state to avoid dupes
-        bool isMouseHeld[3] = {};  // L, R, M
+        auto emitWait = [&](double curSec, double prevSec) {
+            double gap = curSec - prevSec;
+            if (gap > 0.001) {
+                ScriptAction wa{};
+                wa.type = ActionType::Wait;
+                wa.duration = gap;
+                actions_.push_back(wa);
+            }
+        };
 
         for (size_t i = 0; i < events.size(); ++i) {
             const auto& e = events[i];
@@ -5811,16 +5708,8 @@ private:
 
             // Move mouse
             if (e.msg == WM_MOUSEMOVE) {
-                // Add the time since the last event as a Wait
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
-                double gap = timeSec - prevSec;
-                if (gap > 0.001) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = gap;
-                    wa.remark = L"";
-                    actions_.push_back(wa);
-                }
+                emitWait(timeSec, prevSec);
 
                 ScriptAction ma{};
                 ma.type = ActionType::MoveMouse;
@@ -5835,38 +5724,24 @@ private:
             // Key down / up (including system keys like LWin/RWin)
             if (e.msg == WM_KEYDOWN || e.msg == WM_SYSKEYDOWN) {
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
-                double gap = timeSec - prevSec;
-                if (gap > 0.001) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = gap;
-                    actions_.push_back(wa);
-                }
+                emitWait(timeSec, prevSec);
 
                 ScriptAction kd{};
                 kd.type = ActionType::KeyDown;
                 kd.keyVk = static_cast<UINT>(e.vkOrButton);
                 kd.keyText = VkName(kd.keyVk);
                 actions_.push_back(kd);
-                isKeyHeld = true;
                 continue;
             }
             if (e.msg == WM_KEYUP || e.msg == WM_SYSKEYUP) {
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
-                double gap = timeSec - prevSec;
-                if (gap > 0.001) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = gap;
-                    actions_.push_back(wa);
-                }
+                emitWait(timeSec, prevSec);
 
                 ScriptAction ku{};
                 ku.type = ActionType::KeyUp;
                 ku.keyVk = static_cast<UINT>(e.vkOrButton);
                 ku.keyText = VkName(ku.keyVk);
                 actions_.push_back(ku);
-                isKeyHeld = false;
                 continue;
             }
 
@@ -5878,36 +5753,50 @@ private:
 
             if (mbtnIdx >= 0 && (e.msg == WM_LBUTTONDOWN || e.msg == WM_RBUTTONDOWN || e.msg == WM_MBUTTONDOWN)) {
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
-                double gap = timeSec - prevSec;
-                if (gap > 0.001) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = gap;
-                    actions_.push_back(wa);
-                }
+                emitWait(timeSec, prevSec);
 
                 ScriptAction md{};
                 md.type = ActionType::MouseDown;
                 md.button = static_cast<MouseButtonType>(mbtnIdx);
                 actions_.push_back(md);
-                isMouseHeld[mbtnIdx] = true;
                 continue;
             }
             if (mbtnIdx >= 0 && (e.msg == WM_LBUTTONUP || e.msg == WM_RBUTTONUP || e.msg == WM_MBUTTONUP)) {
                 double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
-                double gap = timeSec - prevSec;
-                if (gap > 0.001) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = gap;
-                    actions_.push_back(wa);
-                }
+                emitWait(timeSec, prevSec);
 
                 ScriptAction mu{};
                 mu.type = ActionType::MouseUp;
                 mu.button = static_cast<MouseButtonType>(mbtnIdx);
                 actions_.push_back(mu);
-                isMouseHeld[mbtnIdx] = false;
+                continue;
+            }
+
+            // XButton (X1/X2) down / up
+            if (e.msg == WM_XBUTTONDOWN || e.msg == WM_XBUTTONUP) {
+                int xbtnIdx = (e.vkOrButton == VK_XBUTTON1) ? 3 : 4;
+                double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
+                emitWait(timeSec, prevSec);
+                ScriptAction mb{};
+                mb.type = (e.msg == WM_XBUTTONDOWN) ? ActionType::MouseDown : ActionType::MouseUp;
+                mb.button = static_cast<MouseButtonType>(xbtnIdx);
+                actions_.push_back(mb);
+                continue;
+            }
+
+            // Scroll wheel vertical / horizontal
+            if (e.msg == WM_MOUSEWHEEL || e.msg == WM_MOUSEHWHEEL) {
+                double prevSec = (i > 0) ? (events[i - 1].timeOffsetMs / 1000.0) : 0.0;
+                emitWait(timeSec, prevSec);
+                ScriptAction sw{};
+                sw.type = ActionType::ScrollWheel;
+                sw.scrollVertical = (e.msg == WM_MOUSEWHEEL);
+                sw.scrollHorizontal = (e.msg == WM_MOUSEHWHEEL);
+                sw.scrollSteps = std::max(1, std::abs(e.wheelDelta) / WHEEL_DELTA);
+                sw.scrollDirection = (e.wheelDelta > 0) ? 0 : 1;
+                sw.clickCount = 1;
+                sw.duration = 0.01;
+                actions_.push_back(sw);
                 continue;
             }
         }
@@ -5919,10 +5808,6 @@ private:
         std::wstring path = RecordingsDir() + L"\\" + name + L".json";
         currentPath_ = path;
         currentRecordTime_ = NowText();
-        {
-            std::lock_guard<std::mutex> lock(g_recordMutex);
-            saveDurationSeconds_ = g_recordedEvents.empty() ? 0.0 : g_recordedEvents.back().timeOffsetMs / 1000.0;
-        }
         SetText(name_, name);
         SaveScriptFile(path);
         saveDurationSeconds_ = 0;
@@ -6883,6 +6768,7 @@ private:
             || hwnd == findImagePreviewBtn_
             || hwnd == findScreenshotBtn_ || hwnd == findLocalImageBtn_ || hwnd == findClearImageBtn_
             || hwnd == findSelectOffsetBtn_
+            || hwnd == ocrDepInstallBtn_
             || hwnd == ocrFullScreenBtn_ || hwnd == ocrSelectRegionBtn_ || hwnd == ocrTestBtn_
             || hwnd == ocrSelectOffsetBtn_
             || hwnd == ocrFindSelectRegionBtn_ || hwnd == ocrFindImagePreviewBtn_
@@ -6890,28 +6776,10 @@ private:
     }
 
     HWND HitGrayButton(int x, int y) const {
-        if (popupAction_.sel == 17) {
-            const HWND buttons[] = {
-                findFullScreenBtn_, findSelectRegionBtn_, findTestBtn_, findImagePreviewBtn_,
-                findScreenshotBtn_, findLocalImageBtn_, findClearImageBtn_,
-                findSelectOffsetBtn_
-            };
-            for (HWND btn : buttons) {
-                if (!btn || !IsWindowVisible(btn)) continue;
-                if (PtIn(WindowClientRect(btn), x, y)) return btn;
-            }
-            return nullptr;
-        }
-        if (popupAction_.sel == 18) {
-            const HWND buttons[] = {
-                ocrFullScreenBtn_, ocrSelectRegionBtn_, ocrTestBtn_, ocrSelectOffsetBtn_,
-                ocrFindSelectRegionBtn_, ocrFindImagePreviewBtn_, ocrFindScreenshotBtn_,
-                ocrFindLocalImageBtn_, ocrFindClearImageBtn_
-            };
-            for (HWND btn : buttons) {
-                if (!btn || !IsWindowVisible(btn)) continue;
-                if (PtIn(WindowClientRect(btn), x, y)) return btn;
-            }
+        if (page_ != Page::Editor) return nullptr;
+        for (HWND child = GetWindow(hwnd_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (!IsGrayButton(child) || !IsWindowVisible(child)) continue;
+            if (PtIn(WindowClientRect(child), x, y)) return child;
         }
         return nullptr;
     }
@@ -6975,6 +6843,7 @@ private:
         const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
         const bool hovered = dis->hwndItem == hoverGrayBtn_;
         const COLORREF fill = pressed ? kGrayButtonHover : (hovered ? kGrayButtonHover : kGrayButton);
+        const COLORREF border = hovered || pressed ? kMainGreen : kGrayButtonBorder;
         HBRUSH brush = CreateSolidBrush(fill);
         FillRect(hdc, &rc, brush);
         DeleteObject(brush);
@@ -7000,6 +6869,7 @@ private:
                     DeleteDC(mem);
                 }
             }
+            DrawBorderRect(hdc, rc, border);
             return;
         }
         wchar_t text[64]{};
@@ -7008,6 +6878,7 @@ private:
         SetTextColor(hdc, kGrayButtonText);
         SelectObject(hdc, editorFont_ ? editorFont_ : font_);
         DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawBorderRect(hdc, rc, border);
     }
 
     void DrawOwnerButton(DRAWITEMSTRUCT* dis) {
@@ -7368,6 +7239,7 @@ private:
     HWND ocrSelectOffsetBtn_ = nullptr;
     HWND ocrResultVarLabel_ = nullptr; HWND ocrUntilFound_ = nullptr; HWND ocrResultVar_ = nullptr; HWND ocrTestBtn_ = nullptr;
     HWND ocrRegionByImageCheck_ = nullptr;
+    HWND ocrDigitsOnlyCheck_ = nullptr;
     HWND ocrFindImageLabel_ = nullptr; HWND ocrFindSelectRegionBtn_ = nullptr; HWND ocrFindImagePreviewBtn_ = nullptr;
     HWND ocrFindScreenshotBtn_ = nullptr; HWND ocrFindLocalImageBtn_ = nullptr; HWND ocrFindClearImageBtn_ = nullptr;
     HWND ocrFindMatchThreshold_ = nullptr; HWND ocrFindScaleMin_ = nullptr; HWND ocrFindScaleMax_ = nullptr;

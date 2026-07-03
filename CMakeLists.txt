@@ -39,6 +39,8 @@ add_executable(QuickScriptTool WIN32
     src/match_overlay.cpp
     src/popup_combo.cpp
     src/recorder.cpp
+    src/recording_optimize_dialog.cpp
+    src/script_io.cpp
     src/screenshot_overlay.cpp
     src/utils.cpp
 )

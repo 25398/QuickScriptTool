@@ -62,6 +62,8 @@ std::wstring RunProgramDisplayName(int presetIndex, const std::wstring& customPa
 std::wstring ButtonText(MouseButtonType button) {
     if (button == MouseButtonType::Right) return L"右键";
     if (button == MouseButtonType::Middle) return L"中键";
+    if (button == MouseButtonType::X1) return L"X1键";
+    if (button == MouseButtonType::X2) return L"X2键";
     return L"左键";
 }
 
@@ -277,6 +279,8 @@ std::wstring JsonType(ActionType type) {
 std::wstring JsonButton(MouseButtonType button) {
     if (button == MouseButtonType::Right) return L"right";
     if (button == MouseButtonType::Middle) return L"middle";
+    if (button == MouseButtonType::X1) return L"x1";
+    if (button == MouseButtonType::X2) return L"x2";
     return L"left";
 }
 
@@ -314,7 +318,13 @@ void MouseButtonEvent(MouseButtonType button, bool down) {
         input.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
     else if (button == MouseButtonType::Middle)
         input.mi.dwFlags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
-    else
+    else if (button == MouseButtonType::X1) {
+        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+        input.mi.mouseData = XBUTTON1;
+    } else if (button == MouseButtonType::X2) {
+        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+        input.mi.mouseData = XBUTTON2;
+    } else
         input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
     SendInput(1, &input, sizeof(INPUT));
 }

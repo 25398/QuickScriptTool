@@ -56,6 +56,9 @@ bool ShouldIgnoreRecordedInput(UINT msg, WPARAM vkOrButton) {
     if (ignoreVk == VK_MBUTTON) {
         return msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP;
     }
+    if (ignoreVk == VK_XBUTTON1 || ignoreVk == VK_XBUTTON2) {
+        return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP;
+    }
 
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP) {
         if (static_cast<UINT>(vkOrButton) != ignoreVk) return false;
@@ -149,6 +152,27 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
             ev.msg = static_cast<UINT>(wp);
             ev.vkOrButton = VK_MBUTTON;
             ev.x = ms->pt.x; ev.y = ms->pt.y;
+            std::lock_guard<std::mutex> lock(g_recordMutex);
+            g_recordedEvents.push_back(ev);
+        } else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
+            UINT btn = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+            if (ShouldIgnoreRecordedInput(static_cast<UINT>(wp), btn)) {
+                return CallNextHookEx(nullptr, code, wp, lp);
+            }
+            RecordedEvent ev{};
+            ev.timeOffsetMs = now - startTick;
+            ev.msg = static_cast<UINT>(wp);
+            ev.vkOrButton = btn;
+            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            std::lock_guard<std::mutex> lock(g_recordMutex);
+            g_recordedEvents.push_back(ev);
+        } else if (wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL) {
+            RecordedEvent ev{};
+            ev.timeOffsetMs = now - startTick;
+            ev.msg = static_cast<UINT>(wp);
+            ev.vkOrButton = 0;
+            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            ev.wheelDelta = GET_WHEEL_DELTA_WPARAM(ms->mouseData);
             std::lock_guard<std::mutex> lock(g_recordMutex);
             g_recordedEvents.push_back(ev);
         }

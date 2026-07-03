@@ -142,7 +142,7 @@ bool IsTimerVarName(const std::wstring& name, const MacroVariableContext& ctx) {
     return ctx.timerStarts->find(name) != ctx.timerStarts->end();
 }
 
-std::wstring ResolveMacroOperandForLoopCount(const std::wstring& token, const MacroVariableContext& ctx) {
+std::wstring ResolveMacroOperandImpl(const std::wstring& token, const MacroVariableContext& ctx, bool forLoopCount) {
     std::wstring t = TrimToken(token);
     if (t.empty()) return L"";
 
@@ -169,18 +169,27 @@ std::wstring ResolveMacroOperandForLoopCount(const std::wstring& token, const Ma
     } else if (ctx.ocrVars) {
         const auto it = ctx.ocrVars->find(t);
         if (it != ctx.ocrVars->end()) {
-            return ResolveOcrVarNumericValue(it->second);
+            if (forLoopCount) return ResolveOcrVarNumericValue(it->second);
+            if (it->second.mode == OcrVarMode::Text) return it->second.text;
+            return std::to_wstring(it->second.found);
         }
     }
 
-    const std::wstring timerVal = ResolveTimerVarValue(t, ctx);
-    if (!timerVal.empty()) return timerVal;
+    if (forLoopCount) {
+        const std::wstring timerVal = ResolveTimerVarValue(t, ctx);
+        if (!timerVal.empty()) return timerVal;
+    }
 
     if (ctx.loopVars) {
         const auto it = ctx.loopVars->find(t);
         if (it != ctx.loopVars->end()) {
             return std::to_wstring(it->second);
         }
+    }
+
+    if (!forLoopCount) {
+        const std::wstring timerVal = ResolveTimerVarValue(t, ctx);
+        if (!timerVal.empty()) return timerVal;
     }
 
     double unused;
@@ -199,52 +208,7 @@ bool TryParseDouble(const std::wstring& text, double& out) {
 }
 
 std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableContext& ctx) {
-    std::wstring t = TrimToken(token);
-    if (t.empty()) return L"";
-
-    if (t.front() == L'{' && t.back() == L'}') {
-        return ResolveMacroVariables(t, ctx);
-    }
-
-    if (t == L"ctrl:CurLoops()") {
-        return std::to_wstring(ctx.curLoops);
-    }
-
-    const size_t dot = t.find(L'.');
-    if (dot != std::wstring::npos) {
-        const std::wstring varName = t.substr(0, dot);
-        const std::wstring prop = t.substr(dot + 1);
-        if (ctx.matchVars) {
-            const auto it = ctx.matchVars->find(varName);
-            if (it != ctx.matchVars->end()) {
-                return LookupMatchVarProperty(it->second, prop);
-            }
-        }
-        std::wstring ocrVal;
-        if (LookupOcrVar(ctx, varName, prop, ocrVal)) return ocrVal;
-    } else if (ctx.ocrVars) {
-        const auto it = ctx.ocrVars->find(t);
-        if (it != ctx.ocrVars->end()) {
-            if (it->second.mode == OcrVarMode::Text) return it->second.text;
-            return std::to_wstring(it->second.found);
-        }
-    }
-
-    if (ctx.loopVars) {
-        const auto it = ctx.loopVars->find(t);
-        if (it != ctx.loopVars->end()) {
-            return std::to_wstring(it->second);
-        }
-    }
-
-    const std::wstring timerVal = ResolveTimerVarValue(t, ctx);
-    if (!timerVal.empty()) return timerVal;
-
-    // Plain numeric literal: return as-is rather than mangling via {…} resolution
-    double unused;
-    if (TryParseDouble(t, unused)) return t;
-
-    return ResolveMacroVariables(L"{" + t + L"}", ctx);
+    return ResolveMacroOperandImpl(token, ctx, false);
 }
 
 namespace {
@@ -338,7 +302,7 @@ bool TryResolveIntOperand(const std::wstring& token, const MacroVariableContext&
 
 bool TryResolveIntOperandForLoopCount(const std::wstring& token, const MacroVariableContext& ctx, int& out) {
     double num = 0.0;
-    if (!TryParseDouble(ResolveMacroOperandForLoopCount(token, ctx), num)) return false;
+    if (!TryParseDouble(ResolveMacroOperandImpl(token, ctx, true), num)) return false;
     out = static_cast<int>(num);
     return true;
 }
@@ -424,36 +388,7 @@ std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariable
         if (expr == L"ctrl:CurLoops()") {
             replacement = std::to_wstring(ctx.curLoops);
         } else {
-            const size_t dot = expr.find(L'.');
-            if (dot != std::wstring::npos) {
-                const std::wstring varName = expr.substr(0, dot);
-                const std::wstring prop = expr.substr(dot + 1);
-                if (ctx.matchVars) {
-                    const auto it = ctx.matchVars->find(varName);
-                    if (it != ctx.matchVars->end()) {
-                        replacement = LookupMatchVarProperty(it->second, prop);
-                    }
-                }
-                if (replacement.empty()) {
-                    LookupOcrVar(ctx, varName, prop, replacement);
-                }
-            } else if (ctx.ocrVars) {
-                const auto it = ctx.ocrVars->find(expr);
-                if (it != ctx.ocrVars->end()) {
-                    replacement = it->second.mode == OcrVarMode::Text
-                        ? it->second.text
-                        : std::to_wstring(it->second.found);
-                }
-            }
-            if (replacement.empty() && ctx.loopVars) {
-                const auto it = ctx.loopVars->find(expr);
-                if (it != ctx.loopVars->end()) {
-                    replacement = std::to_wstring(it->second);
-                }
-            }
-            if (replacement.empty()) {
-                replacement = ResolveTimerVarValue(expr, ctx);
-            }
+            replacement = ResolveMacroOperand(expr, ctx);
         }
 
         result.erase(pos, end - pos + 1);

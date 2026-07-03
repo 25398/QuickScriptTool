@@ -45,7 +45,7 @@ enum class ActionType {
     CustomText
 };
 
-enum class MouseButtonType { Left, Right, Middle };
+enum class MouseButtonType { Left, Right, Middle, X1, X2 };
 
 // ── 脚本动作数据结构 ──────────────────────────────────────────────
 // 每个字段对应某种动作类型的参数，未使用的字段保持默认值
@@ -108,6 +108,7 @@ struct ScriptAction {
     std::wstring matchVarName = L"matchRet";  // 匹配结果变量名
     // ── 文字识别相关 ──
     bool ocrRegionByImage = false;           // 获取文字：根据找图结果选取相对 OCR 区域
+    bool ocrDigitsOnly = false;              // 纯数字识别（PaddleOCR 数字模式，失败时回退通用识别）
     int ocrResultMode = 0;                   // 0=获取文字, 1=文字查找
     std::wstring ocrSearchText;              // 文字查找目标（可含变量）
     int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到, 2=保存到变量
