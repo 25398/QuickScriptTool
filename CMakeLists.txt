@@ -40,6 +40,14 @@ add_executable(QuickScriptTool WIN32
     src/popup_combo.cpp
     src/recorder.cpp
     src/recording_optimize_dialog.cpp
+    src/app_settings_store.cpp
+    src/app_branding.cpp
+    src/settings_dialog.cpp
+    src/scheduled_task_types.cpp
+    src/scheduled_task_store.cpp
+    src/scheduled_task_scheduler.cpp
+    src/scheduled_task_datetime_picker.cpp
+    src/scheduled_task_dialog.cpp
     src/script_io.cpp
     src/screenshot_overlay.cpp
     src/utils.cpp
@@ -64,23 +72,41 @@ target_link_libraries(QuickScriptTool PRIVATE
     msimg32
     ole32
     oleaut32
+    urlmon
 )
 
 if(MSVC)
     target_compile_options(QuickScriptTool PRIVATE /W4 /permissive- /utf-8)
 endif()
 
-# Copy OpenCV runtime DLL next to the executable
+# Copy OpenCV runtime DLL next to the executable (Debug/Release matched per config)
 if(WIN32)
-    file(GLOB OPENCV_RUNTIME_DLLS
-        "${OpenCV_DIR}/x64/vc*/bin/opencv_world*.dll"
-        "${OpenCV_DIR}/bin/opencv_world*.dll")
-    foreach(OPENCV_DLL IN LISTS OPENCV_RUNTIME_DLLS)
-        add_custom_command(TARGET QuickScriptTool POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${OPENCV_DLL}"
-                "$<TARGET_FILE_DIR:QuickScriptTool>"
-            COMMENT "Copying OpenCV runtime DLL")
+    set(_opencv_bin_dirs "")
+    foreach(_subdir IN ITEMS "x64/vc16/bin" "x64/vc17/bin" "x64/vc18/bin" "x64/vc15/bin" "bin")
+        if(EXISTS "${OpenCV_DIR}/${_subdir}")
+            list(APPEND _opencv_bin_dirs "${OpenCV_DIR}/${_subdir}")
+        endif()
+    endforeach()
+    foreach(_bin_dir IN LISTS _opencv_bin_dirs)
+        file(GLOB _opencv_dbg "${_bin_dir}/opencv_world*d.dll")
+        file(GLOB _opencv_rel "${_bin_dir}/opencv_world[0-9]*.dll")
+        list(FILTER _opencv_rel EXCLUDE REGEX "d\\.dll$")
+        if(_opencv_dbg)
+            add_custom_command(TARGET QuickScriptTool POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_opencv_dbg}"
+                    "$<TARGET_FILE_DIR:QuickScriptTool>"
+                COMMENT "Copying OpenCV debug runtime DLL"
+                CONFIGURATIONS Debug)
+        endif()
+        if(_opencv_rel)
+            add_custom_command(TARGET QuickScriptTool POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_opencv_rel}"
+                    "$<TARGET_FILE_DIR:QuickScriptTool>"
+                COMMENT "Copying OpenCV release runtime DLL"
+                CONFIGURATIONS Release RelWithDebInfo MinSizeRel)
+        endif()
     endforeach()
     add_custom_command(TARGET QuickScriptTool POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/tools"

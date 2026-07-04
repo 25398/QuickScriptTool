@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,15 @@ ImageMatchResult FindTemplateInFrozenScreen(
     HBITMAP templateBmp, double thresholdPercent, double scale,
     int* outTemplateW = nullptr, int* outTemplateH = nullptr,
     double scaleMax = 0.0);
+
+// 将找图结果规范为「保存到变量」语义：未找到或匹配度未超过阈值时全部归零
+inline ImageMatchResult NormalizeMatchVarResult(ImageMatchResult match, double thresholdPercent) {
+    const double threshold = std::clamp(thresholdPercent, 1.0, 100.0);
+    if (!match.found || match.score <= threshold) {
+        return ImageMatchResult{};
+    }
+    return match;
+}
 
 // ── 辅助功能 ──────────────────────────────────────────────────
 void SendMouseWheel(int steps, bool vertical, bool horizontal, bool positive);

@@ -237,7 +237,7 @@ void OcrInstallDialog::Paint() {
     RECT descTextRc{descBox.left + 14, descBox.top + 12, descBox.right - 14, descBox.bottom - 12};
     const wchar_t* desc =
         L"此插件支持中文（简/繁）、英文等多种语言文字识别，识别速度快、准确度高。"
-        L"首次安装需联网下载依赖包，请耐心等待。";
+        L"首次安装将自动安装 Python 3.12 并下载 OCR 依赖，请保持联网并耐心等待。";
     DrawTextW(hdc, desc, -1, &descTextRc, DT_LEFT | DT_WORDBREAK);
 
     SelectObject(hdc, bodyFont_);

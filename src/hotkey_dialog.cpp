@@ -1,5 +1,6 @@
 // ── 热键捕获对话框实现 ──────────────────────────────────────
 #include "hotkey_dialog.h"
+#include "drawing.h"
 #include <windowsx.h>
 
 HotkeyCapture::HotkeyCapture() = default;

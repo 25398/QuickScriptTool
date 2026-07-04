@@ -42,6 +42,12 @@ void AddFindImageVarItems(const std::wstring& varName, std::vector<QuickInputVar
 }
 
 std::wstring LookupMatchVarProperty(const ImageMatchResult& match, const std::wstring& prop) {
+    if (!match.found) {
+        if (prop == L"matchData" || prop == L"x" || prop == L"y" || prop == L"x1" || prop == L"y1") {
+            return L"0";
+        }
+        return L"";
+    }
     if (prop == L"matchData") return std::to_wstring(static_cast<int>(match.score));
     if (prop == L"x") return std::to_wstring(match.topLeftX);
     if (prop == L"y") return std::to_wstring(match.topLeftY);
@@ -97,6 +103,10 @@ std::wstring LookupOcrVarValue(const OcrVarResult& ocr, const std::wstring& prop
         return prop.empty() ? ocr.text : L"";
     }
     if (prop.empty()) return std::to_wstring(ocr.found);
+    if (!ocr.found) {
+        if (prop == L"x" || prop == L"y" || prop == L"x1" || prop == L"y1") return L"0";
+        return L"";
+    }
     if (prop == L"x") return std::to_wstring(ocr.topLeftX);
     if (prop == L"y") return std::to_wstring(ocr.topLeftY);
     if (prop == L"x1") return std::to_wstring(ocr.bottomRightX);

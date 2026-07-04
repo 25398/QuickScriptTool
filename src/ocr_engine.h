@@ -29,7 +29,7 @@ std::wstring OcrPythonPath();
 // 检测 OCR 运行环境（verifyImport=true 时会尝试 import paddleocr，较慢）
 OcrEnvStatus CheckOcrEnvironment(bool verifyImport = false);
 
-// 一键安装/修复 OCR 依赖（创建 venv 并 pip install），messageOut 为结果说明
+// 一键安装/修复 OCR 依赖（自动安装 Python 3.12、创建 venv 并 pip install），messageOut 为结果说明
 using OcrInstallProgressFn = std::function<void(int percent, const std::wstring& status)>;
 bool RunOcrInstall(std::wstring& messageOut, OcrInstallProgressFn onProgress = nullptr);
 

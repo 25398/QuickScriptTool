@@ -27,6 +27,8 @@
 
 #include "action_tree.h"
 #include "action_utils.h"
+#include "app_settings.h"
+#include "app_settings_store.h"
 #include "config.h"
 #include "controls.h"
 #include "drawing.h"
@@ -41,6 +43,10 @@
 #include "process_utils.h"
 #include "recorder.h"
 #include "recording_optimize_dialog.h"
+#include "scheduled_task_dialog.h"
+#include "scheduled_task_scheduler.h"
+#include "scheduled_task_ui.h"
+#include "settings_dialog.h"
 #include "match_overlay.h"
 #include "ocr_overlay.h"
 #include "screenshot_overlay.h"
@@ -147,7 +153,7 @@ private:
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
     enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kOcrDigitsOnly, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName };
-    enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
+    enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, Settings, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
     struct EditorControlLayout { HWND hwnd = nullptr; RECT base{}; };
@@ -229,6 +235,7 @@ private:
         case WM_TIMER:
             if (wp == kHoverTimerId) { UpdateHoverFromCursor(); return 0; }
             if (wp == kQuickInputTipTimerId) { OnQuickInputTipTimer(); return 0; }
+            if (wp == kScheduledTaskTimerId) { scheduledTasks_.Tick(); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_HOTKEY: OnHotkey(static_cast<int>(wp)); return 0;
         case WM_GLOBAL_HOTKEY_DETECTED: OnHotkey(HOTKEY_GLOBAL_ID); return 0;
@@ -238,7 +245,15 @@ private:
         case WM_CTLCOLORSTATIC:
             return OnCtlColor(reinterpret_cast<HDC>(wp));
         case WM_CTLCOLOREDIT: return OnEditColor(reinterpret_cast<HDC>(wp));
-        case WM_CLOSE: if (recording_) StopRecording(); StopRun(); DestroyWindow(hwnd_); return 0;
+        case WM_CLOSE:
+            if (recording_) StopRecording();
+            StopRun();
+            if (page_ == Page::Home && appSettings_.other.closeToTray && !clicking_ && !recording_ && !running_) {
+                HideToTray();
+                return 0;
+            }
+            DestroyWindow(hwnd_);
+            return 0;
         case WM_DESTROY: Cleanup(); PostQuitMessage(0); return 0;
         case WM_QUERYENDSESSION: if (recording_) StopRecording(); return TRUE;
         case WM_ENDSESSION: if (recording_) StopRecordingCleanup(); return 0;
@@ -278,12 +293,17 @@ private:
         InitHotkeyShortcutPresets();
         LoadScripts();
         LoadRecordings();
+        LoadAppSettings(appSettings_);
+        ApplyDebugWindowSetting();
         CleanOrphanImages();  // 启动时清理孤立图片
         CreateEditorDropPopup();
         CreateEditorTipPopup();
         ShowHome();
         RegisterAllHotkeys();
         InstallGlobalHotkeyHooks();
+        scheduledTasks_.Reload();
+        scheduledTasks_.SetRunCallback([this](const std::wstring& path) { RunActionsFromPath(path); });
+        SetTimer(hwnd_, kScheduledTaskTimerId, 1000, nullptr);
     }
 
     // ── Editor control creation ────────────────────────────────────
@@ -460,8 +480,8 @@ private:
         AddGroup(findImageOffsetControls_, findOffsetY_ = MakeFieldEdit(hwnd_, L"0", kFindOffsetY, kFindYEditX, kFindOffsetRowY, kFindEditW, 22));
         AddGroup(findImageOffsetControls_, findSelectOffsetBtn_ = MakeGrayButton(hwnd_, L"选择偏移点击位置", kFindSelectOffset, kFindSelectOffsetLeft, kFindSelectOffsetY, kFindSelectOffsetW, kFindBtnH));
         AddGroup(findImageOffsetControls_, findUntilFound_ = MakeCheckBox(hwnd_, L"直到找到为止", kFindUntilFound, kFindContentLeft, kFindUntilFoundY, 140, 22));
-        AddGroup(findImageVarControls_, MakeLabel(hwnd_, L"匹配度保存到", -1, kFindContentLeft, kFindOffsetRowY, 100, 22));
-        AddGroup(findImageVarControls_, findMatchVar_ = MakeFieldEdit(hwnd_, L"matchRet", kFindMatchVar, kFindContentLeft + 91, kFindOffsetRowY, 80, 22));
+        AddGroup(findImageVarControls_, MakeLabel(hwnd_, L"匹配度保存到", -1, kFindContentLeft, kFindOffsetRowY, kFindMatchVarLabelW, 22));
+        AddGroup(findImageVarControls_, findMatchVar_ = MakeFieldEdit(hwnd_, L"matchRet", kFindMatchVar, kFindMatchVarEditX, kFindOffsetRowY, kFindMatchVarEditW, 22));
         SizeFindFullScreenButton();
         ApplyFindImageFullScreen();
 
@@ -1572,7 +1592,6 @@ private:
             y += fieldH + rowGap;
         }
 
-        const bool showSelectOffset = searchMode && !saveVar && !OcrSearchTextContainsVariable();
         if (searchMode) {
             const int compactRowH = std::max(fieldH, OcrScale(kOcrCompactBtnH));
             const int testX = kOcrPanelRight - kOcrTestBtnW;
@@ -1580,19 +1599,8 @@ private:
                 MoveOcrAt(ocrUntilFound_, kFindContentLeft, y + (compactRowH - fieldH) / 2, 140, 22);
             }
             if (ocrSelectOffsetBtn_) {
-                if (showSelectOffset) {
-                    const int offsetX = kFindContentLeft + 148;
-                    const int offsetW = testX - kOcrTestToOffsetGap - offsetX;
-                    if (offsetW >= 80) {
-                        ShowWindow(ocrSelectOffsetBtn_, SW_SHOW);
-                        MoveOcrAt(ocrSelectOffsetBtn_, offsetX, y + (compactRowH - OcrScale(kFindBtnH)) / 2,
-                            offsetW, kOcrCompactBtnH);
-                    } else {
-                        ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
-                    }
-                } else {
-                    ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
-                }
+                // 紧凑行：直到找到(140px) + 测试按钮(56px) 占满内容区，无空间显示偏移按钮
+                ShowWindow(ocrSelectOffsetBtn_, SW_HIDE);
             }
             MoveOcrAt(ocrTestBtn_, testX, y + (compactRowH - OcrScale(kOcrCompactBtnH)) / 2, kOcrTestBtnW, kOcrCompactBtnH);
             y += compactRowH + rowGap;
@@ -2151,7 +2159,7 @@ private:
             action.findImageFollowUp = std::clamp(popupFindFollowUp_.sel, 0, 2);
             action.offsetX = ToInt(findOffsetX_);
             action.offsetY = ToInt(findOffsetY_);
-            action.findUntilFound = Checked(findUntilFound_);
+            action.findUntilFound = action.findImageFollowUp == 2 ? false : Checked(findUntilFound_);
             action.matchVarName = Trim(GetText(findMatchVar_));
             if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
         }
@@ -3548,12 +3556,11 @@ private:
         if (i < 0 || i >= static_cast<int>(scripts_.size())) return RECT{};
         RECT r = HomeCardRect(i);
         const int left = r.left + 14;
-        const int rightLimit = r.right - 168;
+        const int rightLimit = r.right - 100;
         const int hotW = TextWidth(ScriptHotkeyText(scripts_[static_cast<size_t>(i)]), hotFont_);
-        const int nameW = TextWidth(scripts_[static_cast<size_t>(i)].name, font_);
+        const int nameW = TextWidth(scripts_[static_cast<size_t>(i)].name, homeFont_);
         const int hotLeft = std::min(left + nameW + 10, rightLimit - hotW);
-        const int hotRight = std::min(hotLeft + hotW, rightLimit);
-        return RECT{hotLeft, r.top + 17, hotRight, r.top + 48};
+        return RECT{hotLeft, r.top + 17, std::min(hotLeft + hotW, rightLimit), r.top + 48};
     }
     RECT ImportRect() const { return RECT{60, 149, 166, 182}; }
     RECT ExportRect() const { return RECT{180, 149, 286, 182}; }
@@ -3588,6 +3595,7 @@ private:
     RECT RunHintRect() const { return CreateRect(); }
     RECT CloseRect() const { RECT rc{}; GetClientRect(hwnd_, &rc); return RECT{rc.right - kCloseBtnW, 0, rc.right, kTitleH}; }
     RECT MinimizeRect() const { RECT close = CloseRect(); return RECT{close.left - kTitleBtnW, 0, close.left, kTitleH}; }
+    RECT SettingsRect() const { RECT min = MinimizeRect(); return RECT{min.left - kTitleBtnW, 0, min.left, kTitleH}; }
     RECT LoadButtonRect() const { return WindowClientRect(loadBtn_); }
     RECT ClearButtonRect() const { return WindowClientRect(clearBtn_); }
     RECT BatchExitButtonRect() const { return WindowClientRect(batchExitBtn_); }
@@ -3612,6 +3620,7 @@ private:
     }
     bool HitClose(int x, int y) const { return PtIn(CloseRect(), x, y); }
     bool HitMinimize(int x, int y) const { return PtIn(MinimizeRect(), x, y); }
+    bool HitSettings(int x, int y) const { return PtIn(SettingsRect(), x, y); }
     RECT ActionListRect() const {
         RECT rc{};
         GetClientRect(hwnd_, &rc);
@@ -4064,8 +4073,9 @@ private:
     }
 
     void InvalidateHoverButton(HoverButton btn) {
-        if (btn == HoverButton::Close || btn == HoverButton::Minimize) {
-            RECT rc = btn == HoverButton::Close ? CloseRect() : MinimizeRect();
+        if (btn == HoverButton::Close || btn == HoverButton::Minimize || btn == HoverButton::Settings) {
+            RECT rc = btn == HoverButton::Close ? CloseRect()
+                : (btn == HoverButton::Minimize ? MinimizeRect() : SettingsRect());
             InvalidateRect(hwnd_, &rc, FALSE);
             return;
         }
@@ -4156,6 +4166,7 @@ private:
         }
         if (HitClose(x, y)) return HoverButton::Close;
         if (HitMinimize(x, y)) return HoverButton::Minimize;
+        if (page_ == Page::Home && HitSettings(x, y)) return HoverButton::Settings;
         if (page_ == Page::Home) {
             if (PtIn(ClickerTabRect(), x, y) || PtIn(RecorderTabRect(), x, y) || PtIn(MacroTabRect(), x, y) || PtIn(ScriptCustomTabRect(), x, y)) return HoverButton::HomeCard;
             if (activeHomeTab_ == quickscript::MainTab::Clicker) {
@@ -4248,6 +4259,7 @@ private:
     void ClickButton(HoverButton button, int x, int y) {
         if (button == HoverButton::Close) { if (page_ == Page::Editor) ShowHome(); else SendMessageW(hwnd_, WM_CLOSE, 0, 0); return; }
         if (button == HoverButton::Minimize) { ShowWindow(hwnd_, SW_MINIMIZE); return; }
+        if (button == HoverButton::Settings && page_ == Page::Home) { ShowSettingsDialog(); return; }
         if (button == HoverButton::Import) { ImportScript(); return; }
         if (button == HoverButton::Export) { ExportSelectedScript(); return; }
         if (button == HoverButton::Create) { ShowEditorFor(-1, true); return; }
@@ -4288,6 +4300,7 @@ private:
         if (deleteConfirmVisible_) { OnDeleteConfirmClick(x, y); return; }
         if (HitClose(x, y)) { if (page_ == Page::Editor) ShowHome(); else SendMessageW(hwnd_, WM_CLOSE, 0, 0); return; }
         if (HitMinimize(x, y)) { ShowWindow(hwnd_, SW_MINIMIZE); return; }
+        if (HitSettings(x, y) && page_ == Page::Home) { ShowSettingsDialog(); return; }
         if (y <= kTitleH) { ReleaseCapture(); SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(x, y)); return; }
         if (page_ == Page::Home && activeHomeTab_ == quickscript::MainTab::Macro && MaxHomeScroll() > 0 && PtIn(HomeScrollThumbRect(), x, y)) {
             RECT thumb = HomeScrollThumbRect();
@@ -4775,7 +4788,7 @@ private:
     void OnRecorderHomeClick(int x, int y) {
         if (PtIn(ImportRect(), x, y)) { ImportScript(); return; }
         if (PtIn(ExportRect(), x, y)) { ExportSelectedRecording(); return; }
-        if (PtIn(TimerRect(), x, y)) { MessageBoxW(hwnd_, L"定时录制功能暂未开放。", L"录制", MB_OK | MB_ICONINFORMATION); return; }
+        if (PtIn(TimerRect(), x, y)) { ShowScheduledTaskDialog(); return; }
         if (PtIn(RecorderWindowModeRect(), x, y)) {
             recorderSettings_.captureScope = recorderSettings_.captureScope == quickscript::RecordCaptureScope::Window
                 ? quickscript::RecordCaptureScope::Global : quickscript::RecordCaptureScope::Window;
@@ -4888,7 +4901,7 @@ private:
     void OnMacroHomeClick(int x, int y) {
         if (PtIn(ImportRect(), x, y)) { ImportScript(); return; }
         if (PtIn(ExportRect(), x, y)) { ExportSelectedScript(); return; }
-        if (PtIn(TimerRect(), x, y)) { MessageBoxW(hwnd_, L"定时功能暂未开放。", L"提示", MB_OK | MB_ICONINFORMATION); return; }
+        if (PtIn(TimerRect(), x, y)) { ShowScheduledTaskDialog(); return; }
         if (selectedScript_ >= 0 && PtIn(CommonHotRect(), x, y)) { CaptureGlobalHotkey(); return; }
         if (selectedScript_ < 0 && PtIn(CreateWordRect(), x, y)) { ShowEditorFor(-1, true); return; }
         if (MaxHomeScroll() > 0 && PtIn(HomeScrollTrackRect(), x, y)) {
@@ -5107,6 +5120,34 @@ private:
         RunCurrentActions();
     }
 
+    void ShowScheduledTaskDialog() {
+        ScheduledTaskDialog dlg;
+        dlg.Show(hwnd_, scheduledTasks_);
+        if (IsWindow(hwnd_)) {
+            SetForegroundWindow(hwnd_);
+        }
+        StDiscardSpuriousInputAfterModal(hwnd_);
+    }
+
+    void ShowSettingsDialog() {
+        SettingsDialog dlg;
+        if (dlg.Show(hwnd_, appSettings_)) {
+            SaveAppSettings(appSettings_);
+            ApplyDebugWindowSetting();
+        }
+        if (IsWindow(hwnd_)) {
+            SetForegroundWindow(hwnd_);
+        }
+        StDiscardSpuriousInputAfterModal(hwnd_);
+    }
+
+    void RunActionsFromPath(const std::wstring& path) {
+        if (running_ || path.empty()) return;
+        const auto actions = ParseActionsFromFile(path);
+        if (actions.empty()) return;
+        StartActionsWorker(actions, path);
+    }
+
     int RandomInt(int maxValue) { if (maxValue <= 0) return 0; std::uniform_int_distribution<int> dist(-maxValue, maxValue); return dist(rng_); }
     double RandomDelay(double maxValue) { if (maxValue <= 0) return 0; std::uniform_real_distribution<double> dist(0.0, maxValue); return dist(rng_); }
     void SleepInterruptible(double seconds) { const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int>(seconds * 1000.0)); while (!stopFlag_ && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
@@ -5166,10 +5207,20 @@ private:
     void RunCurrentActions() {
         if (running_) return;
         SyncFormIntoActionsBeforeRun();
+        StartActionsWorker(actions_, currentPath_);
+    }
+
+    void StartActionsWorker(const std::vector<ScriptAction>& actions, const std::wstring& selfPath) {
+        if (running_) return;
         running_ = true; stopFlag_ = false; wasVisibleBeforeRun_ = IsWindowVisible(hwnd_) == TRUE; wasMinimizedBeforeRun_ = IsIconic(hwnd_) == TRUE;
-        CloseEditorPopup(); CancelQuickInputTip(); AddTray(); ShowWindow(hwnd_, SW_HIDE);
-        const auto actions = actions_;
-        const std::wstring selfPath = currentPath_;
+        CloseEditorPopup(); CancelQuickInputTip();
+        if (appSettings_.other.playSoundOnStart) MessageBeep(MB_OK);
+        if (appSettings_.other.autoHideMainWindow) {
+            AddTray();
+            ShowWindow(hwnd_, SW_HIDE);
+        }
+        UpdateStatusTip();
+        if (appSettings_.playback.enableDebugOutputWindow) ShowDebugWindow();
         worker_ = std::thread([this, actions, selfPath]() {
             bool usesOcr = ScriptUsesTextRecognition(actions);
             workerUsesOcrVars_ = usesOcr;
@@ -5219,6 +5270,13 @@ private:
             };
 
             auto executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx](const ScriptAction& a) {
+                if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                    if (a.type == ActionType::RunBlock || a.type == ActionType::RunMacro
+                        || a.type == ActionType::FindImage || a.type == ActionType::TextRecognition
+                        || a.type == ActionType::MousePlayback || a.type == ActionType::StopMacro) {
+                        AppendDebugLog(ActionName(a));
+                    }
+                }
                 if (a.type == ActionType::MoveMouse) {
                     int x = a.x;
                     int y = a.y;
@@ -5295,11 +5353,12 @@ private:
                         return output.matches.front();
                     };
                     do {
-                        const ImageMatchResult match = runFind();
+                        const ImageMatchResult rawMatch = runFind();
+                        const ImageMatchResult match = NormalizeMatchVarResult(rawMatch, a.matchThreshold);
                         if (a.findImageFollowUp == 2) {
-                            matchVars_[a.matchVarName] = match;
-                            if (match.found) break;
-                            if (!a.findUntilFound) break;
+                            const std::wstring varName = a.matchVarName.empty() ? L"matchRet" : a.matchVarName;
+                            matchVars_[varName] = match;
+                            break;
                         } else if (match.found) {
                             const int tx = match.x + a.offsetX;
                             const int ty = match.y + a.offsetY;
@@ -5580,6 +5639,14 @@ private:
                 loopVars_.clear();
                 timerStarts_.clear();
                 runRange(0, actions.size());
+                const auto& ps = appSettings_.playback;
+                if (ps.enablePlaybackCount && ps.playbackCount > 0 && curLoops_ >= ps.playbackCount) break;
+                if (stopFlag_) break;
+                if (ps.enablePlaybackInterval) {
+                    const double span = std::max(0.0, ps.playbackIntervalMaxSeconds - ps.playbackIntervalMinSeconds);
+                    const double wait = ps.playbackIntervalMinSeconds + RandomDelay(span);
+                    SleepInterruptible(wait);
+                }
             }
             // Final release (for clean state regardless of stop path)
             if (heldKeyVk != 0) {
@@ -5618,10 +5685,58 @@ private:
         }
         if (running_) UnmarkSimulatedInput();
     }
-    void OnRunDone() { running_ = false; if (worker_.joinable()) worker_.join(); RemoveTray(); if (wasVisibleBeforeRun_) ShowWindow(hwnd_, wasMinimizedBeforeRun_ ? SW_MINIMIZE : SW_SHOW); }
-    void AddTray() { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON; nid.uCallbackMessage = WM_TRAY; nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wcscpy_s(nid.szTip, L"鼠大侠-鼠标宏运行中"); Shell_NotifyIconW(NIM_ADD, &nid); }
-    void RemoveTray() { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); }
-    void RestoreFromTray() { ShowWindow(hwnd_, SW_SHOW); SetForegroundWindow(hwnd_); }
+    void OnRunDone() {
+        running_ = false;
+        if (worker_.joinable()) worker_.join();
+        RemoveTray();
+        HideStatusTip();
+        if (appSettings_.other.autoHideMainWindow && wasVisibleBeforeRun_) {
+            ShowWindow(hwnd_, wasMinimizedBeforeRun_ ? SW_MINIMIZE : SW_SHOW);
+        }
+    }
+    void AddTray() {
+        NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
+        nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON; nid.uCallbackMessage = WM_TRAY;
+        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        if (clicking_) wcscpy_s(nid.szTip, L"鼠大侠-连点运行中");
+        else if (recording_) wcscpy_s(nid.szTip, L"鼠大侠-录制中");
+        else wcscpy_s(nid.szTip, L"鼠大侠-鼠标宏运行中");
+        if (trayActive_) Shell_NotifyIconW(NIM_MODIFY, &nid);
+        else { Shell_NotifyIconW(NIM_ADD, &nid); trayActive_ = true; }
+    }
+    void RemoveTray() {
+        if (!trayActive_) return;
+        if (hiddenToTray_) {
+            NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
+            nid.uFlags = NIF_TIP; nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+            wcscpy_s(nid.szTip, L"鼠大侠");
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+            return;
+        }
+        NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        trayActive_ = false;
+    }
+    void RestoreFromTray() {
+        if (hiddenToTray_) {
+            hiddenToTray_ = false;
+            NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            trayActive_ = false;
+        }
+        ShowWindow(hwnd_, SW_SHOW);
+        SetForegroundWindow(hwnd_);
+    }
+    void HideToTray() {
+        hiddenToTray_ = true;
+        NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
+        nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON; nid.uCallbackMessage = WM_TRAY;
+        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        wcscpy_s(nid.szTip, L"鼠大侠");
+        Shell_NotifyIconW(NIM_ADD, &nid);
+        trayActive_ = true;
+        ShowWindow(hwnd_, SW_HIDE);
+    }
 
     // ── Recording ────────────────────────────────────────────────────
     void ToggleRecording() {
@@ -5649,8 +5764,12 @@ private:
         recording_ = true;
         recordingWasVisible_ = IsWindowVisible(hwnd_) == TRUE;
         CloseEditorPopup(); CancelQuickInputTip();
-        AddTray();
-        ShowWindow(hwnd_, SW_HIDE);
+        if (appSettings_.other.playSoundOnStart) MessageBeep(MB_OK);
+        if (appSettings_.other.autoHideMainWindow) {
+            AddTray();
+            ShowWindow(hwnd_, SW_HIDE);
+        }
+        UpdateStatusTip();
     }
 
     void StopRecording() {
@@ -5659,7 +5778,8 @@ private:
         SetRecordingIgnoreHotkey(0, 0, false);
         UninstallRecordingHooks();
         RemoveTray();
-        if (recordingWasVisible_) ShowWindow(hwnd_, SW_SHOW);
+        HideStatusTip();
+        if (appSettings_.other.autoHideMainWindow && recordingWasVisible_) ShowWindow(hwnd_, SW_SHOW);
         ConvertRecordedToActions();
         if (!actions_.empty()) SaveRecording();
     }
@@ -5822,12 +5942,17 @@ private:
     void StartClicking() {
         if (clicking_) return;
         clicking_ = true;
-        AddTray();
-        ShowWindow(hwnd_, SW_HIDE);
+        clickCountDone_ = 0;
+        if (appSettings_.other.playSoundOnStart) MessageBeep(MB_OK);
+        if (appSettings_.other.autoHideMainWindow) {
+            AddTray();
+            ShowWindow(hwnd_, SW_HIDE);
+        }
+        UpdateStatusTip();
         clickerThread_ = std::thread([this]() {
+            const auto& cs = appSettings_.click;
             while (clicking_ && !stopFlag_) {
-                // Determine the click interval
-                double interval = 0.1; // default
+                double interval = 0.1;
                 switch (clickerSettings_.intervalMode) {
                 case quickscript::ClickIntervalMode::Custom:
                     interval = std::max(0.001, clickerSettings_.customIntervalSeconds);
@@ -5839,8 +5964,23 @@ private:
                     interval = 0.01;
                     break;
                 }
+                if (cs.enableRandomInterval) interval += RandomDelay(cs.randomIntervalMaxSeconds);
 
-                // Send mouse click
+                int clickX = 0, clickY = 0;
+                if (cs.enableFixedCoordinates) {
+                    clickX = cs.fixedX;
+                    clickY = cs.fixedY;
+                } else {
+                    POINT pt{}; GetCursorPos(&pt);
+                    clickX = pt.x;
+                    clickY = pt.y;
+                }
+                if (cs.enableCoordinateJitter) {
+                    clickX += RandomInt(cs.jitterX);
+                    clickY += RandomInt(cs.jitterY);
+                }
+                SetCursorPos(clickX, clickY);
+
                 DWORD downFlag, upFlag;
                 if (clickerSettings_.button == quickscript::MouseButtonChoice::Left) {
                     downFlag = MOUSEEVENTF_LEFTDOWN; upFlag = MOUSEEVENTF_LEFTUP;
@@ -5850,14 +5990,28 @@ private:
                     downFlag = MOUSEEVENTF_MIDDLEDOWN; upFlag = MOUSEEVENTF_MIDDLEUP;
                 }
 
-                INPUT inputs[2]{};
-                inputs[0].type = INPUT_MOUSE;
-                inputs[0].mi.dwFlags = downFlag;
-                inputs[1].type = INPUT_MOUSE;
-                inputs[1].mi.dwFlags = upFlag;
-                SendInput(2, inputs, sizeof(INPUT));
+                INPUT downInput{};
+                downInput.type = INPUT_MOUSE;
+                downInput.mi.dwFlags = downFlag;
+                SendInput(1, &downInput, sizeof(INPUT));
 
-                // Sleep with stop check (polling)
+                if (cs.enablePressReleaseInterval) {
+                    SleepInterruptible(cs.pressReleaseIntervalSeconds);
+                }
+
+                if (clicking_ && !stopFlag_) {
+                    INPUT upInput{};
+                    upInput.type = INPUT_MOUSE;
+                    upInput.mi.dwFlags = upFlag;
+                    SendInput(1, &upInput, sizeof(INPUT));
+                }
+
+                ++clickCountDone_;
+                if (cs.enableClickCountLimit && cs.clickCountLimit > 0 && clickCountDone_ >= cs.clickCountLimit) {
+                    PostMessageW(hwnd_, WM_HOTKEY, HOTKEY_GLOBAL_ID, 0);
+                    break;
+                }
+
                 const auto end = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(static_cast<int>(interval * 1000.0));
                 while (clicking_ && !stopFlag_ && std::chrono::steady_clock::now() < end) {
@@ -5873,7 +6027,10 @@ private:
             clickerThread_.join();
         }
         RemoveTray();
-        ShowWindow(hwnd_, SW_SHOW);
+        HideStatusTip();
+        if (appSettings_.other.autoHideMainWindow) {
+            ShowWindow(hwnd_, SW_SHOW);
+        }
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
@@ -6205,12 +6362,23 @@ private:
     }
 
     void DrawTitleButtons(HDC hdc) {
-        RECT minimize = MinimizeRect();
         RECT close = CloseRect();
-        if (hoverButton_ == HoverButton::Minimize) FillAlphaRect(hdc, minimize, RGB(0, 0, 0), kCloseHoverAlpha);
+        if (page_ == Page::Home) {
+            RECT settings = SettingsRect();
+            RECT minimize = MinimizeRect();
+            if (hoverButton_ == HoverButton::Settings) FillAlphaRect(hdc, settings, RGB(0, 0, 0), kCloseHoverAlpha);
+            if (hoverButton_ == HoverButton::Minimize) FillAlphaRect(hdc, minimize, RGB(0, 0, 0), kCloseHoverAlpha);
+            SelectObject(hdc, closeFont_);
+            DrawTextIn(hdc, L"⚙", settings, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextIn(hdc, L"−", minimize, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            RECT minimize = MinimizeRect();
+            if (hoverButton_ == HoverButton::Minimize) FillAlphaRect(hdc, minimize, RGB(0, 0, 0), kCloseHoverAlpha);
+            SelectObject(hdc, closeFont_);
+            DrawTextIn(hdc, L"−", minimize, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
         if (hoverButton_ == HoverButton::Close) FillAlphaRect(hdc, close, RGB(0, 0, 0), kCloseHoverAlpha);
         SelectObject(hdc, closeFont_);
-        DrawTextIn(hdc, L"−", minimize, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         DrawTextIn(hdc, L"×", close, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
@@ -7113,7 +7281,7 @@ private:
             HBRUSH b = CreateSolidBrush(cardColor); FillRect(hdc, &r, b); DeleteObject(b);
             RECT hotRc = ScriptHotkeyRect(i);
             SelectObject(hdc, homeFont_);
-            DrawTextIn(hdc, scripts_[static_cast<size_t>(i)].name, RECT{r.left + 14, r.top + 17, std::max(r.left + 14, hotRc.left - 10), r.top + 48}, kWhite);
+            DrawTextIn(hdc, scripts_[static_cast<size_t>(i)].name, RECT{r.left + 14, r.top + 17, r.right - 100, r.top + 48}, kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             SelectObject(hdc, hotFont_);
             DrawTextIn(hdc, ScriptHotkeyText(scripts_[static_cast<size_t>(i)]), hotRc, kWhite);
             SelectObject(hdc, homeFont_);
@@ -7204,7 +7372,56 @@ private:
 
     LRESULT OnCtlColor(HDC hdc) { SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, kText); return reinterpret_cast<LRESULT>(whiteBrush_); }
     LRESULT OnEditColor(HDC hdc) { SetBkMode(hdc, OPAQUE); SetTextColor(hdc, kText); SetBkColor(hdc, kWhite); return reinterpret_cast<LRESULT>(whiteBrush_); }
-    void Cleanup() { if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CancelQuickInputTip(); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); RemoveTray(); UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(lineGreenBrush_); }
+
+    void AppendDebugLog(const std::wstring& text) {
+        if (!appSettings_.playback.autoOutputKeyFunctionDebug || !debugEdit_) return;
+        std::wstring line = text + L"\r\n";
+        const int len = GetWindowTextLengthW(debugEdit_);
+        SendMessageW(debugEdit_, EM_SETSEL, len, len);
+        SendMessageW(debugEdit_, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(line.c_str()));
+    }
+
+    void ShowDebugWindow() {
+        if (debugWindow_) { ShowWindow(debugWindow_, SW_SHOW); return; }
+        debugWindow_ = CreateWindowExW(WS_EX_TOOLWINDOW, L"EDIT", L"",
+            WS_POPUP | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            100, 100, 480, 280, hwnd_, nullptr, GetModuleHandleW(nullptr), nullptr);
+        debugEdit_ = debugWindow_;
+        SendMessageW(debugEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        SetWindowTextW(debugWindow_, L"宏调试信息输出窗口\r\n");
+        ShowWindow(debugWindow_, SW_SHOW);
+    }
+
+    void HideDebugWindow() {
+        if (debugWindow_) ShowWindow(debugWindow_, SW_HIDE);
+    }
+
+    void ApplyDebugWindowSetting() {
+        if (appSettings_.playback.enableDebugOutputWindow) ShowDebugWindow();
+        else HideDebugWindow();
+    }
+
+    void UpdateStatusTip() {
+        if (appSettings_.other.hideBottomRightTip) { HideStatusTip(); return; }
+        const wchar_t* text = clicking_ ? L"连点中..." : (recording_ ? L"录制中..." : (running_ ? L"回放中..." : L""));
+        if (!text[0]) { HideStatusTip(); return; }
+        if (!statusTipWindow_) {
+            statusTipWindow_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                L"STATIC", text, WS_POPUP | SS_CENTER | SS_CENTERIMAGE,
+                0, 0, 160, 36, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(statusTipWindow_, WM_SETFONT, reinterpret_cast<WPARAM>(homeFont_), TRUE);
+        }
+        SetWindowTextW(statusTipWindow_, text);
+        const int sw = GetSystemMetrics(SM_CXSCREEN);
+        const int sh = GetSystemMetrics(SM_CYSCREEN);
+        SetWindowPos(statusTipWindow_, HWND_TOPMOST, sw - 180, sh - 80, 160, 36, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    }
+
+    void HideStatusTip() {
+        if (statusTipWindow_) ShowWindow(statusTipWindow_, SW_HIDE);
+    }
+
+    void Cleanup() { if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } if (debugWindow_) { DestroyWindow(debugWindow_); debugWindow_ = nullptr; debugEdit_ = nullptr; } if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() { if (recording_) { g_recording = false; recording_ = false; UninstallRecordingHooks(); } }
 
@@ -7277,6 +7494,13 @@ private:
     UINT formKeyVk_ = '7', formKeyPressVk_ = '7';
     quickscript::ClickerSettings clickerSettings_{};
     quickscript::RecorderSettings recorderSettings_{};
+    quickscript::AppSettings appSettings_{};
+    bool trayActive_ = false;
+    bool hiddenToTray_ = false;
+    int clickCountDone_ = 0;
+    HWND debugWindow_ = nullptr;
+    HWND debugEdit_ = nullptr;
+    HWND statusTipWindow_ = nullptr;
     PopupCombo popupMode_, popupAction_, popupMouseBtn_, popupClickBtn_, popupLoopType_, popupRunBlock_, popupHotkeyShortcut_, popupQuickInputVar_, popupRunMacro_, popupMousePlayback_, popupScrollDir_, popupFindFollowUp_, popupOcrResultMode_, popupOcrFollowUp_, popupOcrSearchVar_, popupIfVar_, popupIfOperator_, popupIfConnector_, popupRunProgram_;
     std::vector<QuickInputVarItem> quickInputVarItems_;
     std::vector<std::wstring> runMacroPaths_, mousePlaybackPaths_;
@@ -7300,6 +7524,7 @@ private:
     std::atomic<int> simulatingInputDepth_{0};
     DWORD lastHotkeyTick_ = 0;
     std::atomic_bool running_{false}, stopFlag_{false}; std::thread worker_; std::mt19937 rng_{std::random_device{}()};
+    ScheduledTaskScheduler scheduledTasks_;
     // Recording
     std::atomic_bool recording_{false};
     bool recordingWasVisible_ = true;

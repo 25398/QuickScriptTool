@@ -3,6 +3,8 @@
 #include "image_match.h"
 #include "utils.h"
 
+#include <urlmon.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -13,6 +15,8 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#pragma comment(lib, "urlmon.lib")
 
 namespace {
 
@@ -37,10 +41,141 @@ bool EnsureDirectory(const std::wstring& path) {
         || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+constexpr wchar_t kOcrVenvPythonExe[] = L"C:\\paddle_env\\venv\\Scripts\\python.exe";
+constexpr wchar_t kOcrBasePythonExe[] = L"C:\\paddle_env\\python312\\python.exe";
+constexpr wchar_t kOcrBasePythonDir[] = L"C:\\paddle_env\\python312";
+constexpr wchar_t kOcrPythonInstallerName[] = L"python-3.12.10-amd64.exe";
+constexpr wchar_t kOcrPythonInstallerUrl[] =
+    L"https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe";
+
+bool FileExists(const std::wstring& path) {
+    return !path.empty()
+        && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 std::wstring DetectPythonExecutable() {
-    const wchar_t* path = L"C:\\paddle_env\\venv\\Scripts\\python.exe";
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return path;
-    return path;
+    if (FileExists(kOcrVenvPythonExe)) return kOcrVenvPythonExe;
+    return kOcrVenvPythonExe;
+}
+
+bool RunProcessWait(const std::wstring& commandLine, DWORD& exitCode, bool showWindow = false) {
+    exitCode = 1;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = showWindow ? SW_SHOWDEFAULT : SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdLine(commandLine.begin(), commandLine.end());
+    cmdLine.push_back(L'\0');
+
+    const DWORD creationFlags = showWindow ? 0 : CREATE_NO_WINDOW;
+    const BOOL ok = CreateProcessW(
+        nullptr, cmdLine.data(), nullptr, nullptr, FALSE,
+        creationFlags, nullptr, nullptr, &si, &pi);
+    if (!ok) return false;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+bool DownloadFileUrl(const std::wstring& url, const std::wstring& destPath) {
+    DeleteFileW(destPath.c_str());
+    const HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), destPath.c_str(), 0, nullptr);
+    return SUCCEEDED(hr) && FileExists(destPath);
+}
+
+bool CopyDirectoryTree(const std::wstring& srcDir, const std::wstring& destDir) {
+    if (!FileExists(srcDir)) return false;
+    EnsureDirectory(destDir);
+    const std::wstring cmd = L"robocopy " + QuoteArg(srcDir) + L" " + QuoteArg(destDir)
+        + L" /E /NFL /NDL /NJH /NJS /NC /NS /NP";
+    DWORD exitCode = 8;
+    if (!RunProcessWait(cmd, exitCode)) return false;
+    return exitCode < 8;
+}
+
+bool InstallPython312FromInstaller(const std::wstring& installerPath, std::wstring& errorOut) {
+    errorOut.clear();
+    if (!FileExists(installerPath)) {
+        errorOut = L"找不到 Python 安装程序";
+        return false;
+    }
+
+    const std::wstring cmd = QuoteArg(installerPath)
+        + L" /passive InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0 Include_doc=0"
+        + L" TargetDir=" + QuoteArg(kOcrBasePythonDir);
+    DWORD exitCode = 1;
+    if (!RunProcessWait(cmd, exitCode, true) || exitCode != 0) {
+        errorOut = L"Python 3.12 安装程序执行失败";
+        return false;
+    }
+    if (!FileExists(kOcrBasePythonExe)) {
+        errorOut = L"Python 3.12 安装完成但未找到 python.exe";
+        return false;
+    }
+    return true;
+}
+
+bool EnsurePython312Base(std::wstring& errorOut, const OcrInstallProgressFn& onProgress) {
+    errorOut.clear();
+    if (FileExists(kOcrBasePythonExe)) return true;
+
+    auto report = [&](int percent, const wchar_t* status) {
+        if (onProgress) onProgress(percent, status);
+    };
+
+    const std::wstring bundledPortable = AppDir() + L"\\tools\\python312";
+    if (FileExists(bundledPortable + L"\\python.exe")) {
+        report(10, L"正在部署内置 Python 3.12...");
+        if (CopyDirectoryTree(bundledPortable, kOcrBasePythonDir)
+            && FileExists(kOcrBasePythonExe)) {
+            return true;
+        }
+    }
+
+    std::wstring installerPath;
+    const std::wstring bundledInstaller = AppDir() + L"\\tools\\" + kOcrPythonInstallerName;
+    if (FileExists(bundledInstaller)) {
+        installerPath = bundledInstaller;
+        report(10, L"正在安装内置 Python 3.12...");
+    } else {
+        report(10, L"正在下载 Python 3.12...");
+        installerPath = L"C:\\paddle_env\\" + std::wstring(kOcrPythonInstallerName);
+        if (!DownloadFileUrl(kOcrPythonInstallerUrl, installerPath)) {
+            errorOut = L"无法下载 Python 3.12，请检查网络连接后重试。";
+            return false;
+        }
+        report(18, L"正在安装 Python 3.12...");
+    }
+
+    return InstallPython312FromInstaller(installerPath, errorOut);
+}
+
+bool CreateOcrVirtualEnv(std::wstring& errorOut, const OcrInstallProgressFn& onProgress) {
+    errorOut.clear();
+    if (FileExists(kOcrVenvPythonExe)) return true;
+
+    auto report = [&](int percent, const wchar_t* status) {
+        if (onProgress) onProgress(percent, status);
+    };
+
+    if (!EnsurePython312Base(errorOut, onProgress)) return false;
+
+    report(22, L"正在创建 Python 虚拟环境...");
+    const std::wstring venvCmd = QuoteArg(kOcrBasePythonExe)
+        + L" -m venv " + QuoteArg(L"C:\\paddle_env\\venv");
+    DWORD venvExit = 1;
+    if (!RunProcessWait(venvCmd, venvExit) || venvExit != 0
+        || !FileExists(kOcrVenvPythonExe)) {
+        errorOut = L"无法创建 Python 虚拟环境，请重试或联系技术支持。";
+        return false;
+    }
+    return true;
 }
 
 std::wstring TempOcrImagePath() {
@@ -377,27 +512,8 @@ bool RunOcrInstallImpl(std::wstring& messageOut, const OcrInstallProgressFn& onP
     EnsureDirectory(L"C:\\paddle_env");
     EnsureDirectory(L"C:\\paddle_env\\models");
 
-    const std::wstring pythonExe = DetectPythonExecutable();
-    if (GetFileAttributesW(pythonExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        report(15, L"正在创建 Python 虚拟环境...");
-        const wchar_t* venvCmds[] = {
-            L"py -3.12 -m venv C:\\paddle_env\\venv",
-            L"py -3 -m venv C:\\paddle_env\\venv",
-            L"python -m venv C:\\paddle_env\\venv",
-        };
-        bool venvOk = false;
-        for (const wchar_t* cmd : venvCmds) {
-            std::string out;
-            DWORD exitCode = 1;
-            if (RunProcessCaptureStdout(cmd, out, exitCode) && exitCode == 0) {
-                venvOk = true;
-                break;
-            }
-        }
-        if (!venvOk || GetFileAttributesW(pythonExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            messageOut = L"无法创建 Python 虚拟环境。\n请确认已安装 Python 3.12（可从 Microsoft Store 或 python.org 安装），然后重试。";
-            return false;
-        }
+    if (!CreateOcrVirtualEnv(messageOut, onProgress)) {
+        return false;
     }
 
     const std::wstring reqPath = AppDir() + L"\\tools\\requirements-ocr.txt";
@@ -646,7 +762,7 @@ OcrEngineOutput RunOcrOnImagePathOneShot(const std::wstring& imagePath, bool dig
 }  // namespace
 
 std::wstring OcrPythonPath() {
-    return L"C:\\paddle_env\\venv\\Scripts\\python.exe";
+    return kOcrVenvPythonExe;
 }
 
 OcrEnvStatus CheckOcrEnvironment(bool verifyImport) {

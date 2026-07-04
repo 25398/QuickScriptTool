@@ -142,6 +142,9 @@ constexpr int kFindFollowRowY = kFindScaleY + 22 + kFindVGap;
 constexpr int kFindOffsetRowY = kFindFollowRowY + kFindBtnH + kFindVGap;
 constexpr int kFindSelectOffsetY = kFindOffsetRowY + 22 + kFindVGap;
 constexpr int kFindUntilFoundY = kFindSelectOffsetY + kFindBtnH + kFindVGap;
+constexpr int kFindMatchVarLabelW = 108;
+constexpr int kFindMatchVarEditX = kFindContentLeft + kFindMatchVarLabelW + 1;
+constexpr int kFindMatchVarEditW = 80;
 
 // ── 文字识别面板布局（运行时由 RefreshOcrSubPanel 自 dep 行起堆叠排列）──
 constexpr int kOcrDepToRegionGap = 4;
@@ -208,4 +211,5 @@ constexpr int HOTKEY_SCRIPT_BASE = 800;
 constexpr BYTE kUiFontQuality = CLEARTYPE_NATURAL_QUALITY;
 constexpr UINT kHoverTimerId = 9001;
 constexpr UINT kQuickInputTipTimerId = 9002;
+constexpr UINT kScheduledTaskTimerId = 9003;
 constexpr int kQuickInputTipDelayMs = 500;
