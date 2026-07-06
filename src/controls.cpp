@@ -1,5 +1,6 @@
 // ── 窗口控件工厂函数实现 ────────────────────────────────────
 #include "controls.h"
+#include "modern_edit.h"
 
 HINSTANCE GetThisModule() {
     return GetModuleHandleW(nullptr);
@@ -9,6 +10,15 @@ HWND MakeLabel(HWND parent, const wchar_t* text, int id,
                int x, int y, int w, int h) {
     return CreateWindowExW(0, L"STATIC", text,
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        x, y, w, h, parent,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+        GetThisModule(), nullptr);
+}
+
+HWND MakeComboLabel(HWND parent, const wchar_t* text, int id,
+                    int x, int y, int w, int h) {
+    return CreateWindowExW(0, L"STATIC", text,
+        WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY,
         x, y, w, h, parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         GetThisModule(), nullptr);
@@ -33,29 +43,17 @@ HWND MakeHint(HWND parent, const wchar_t* text,
 
 HWND MakeEdit(HWND parent, const wchar_t* text, int id,
               int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"EDIT", text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-        x, y, w, h, parent,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-        GetThisModule(), nullptr);
+    return MakeModernSingleLineEdit(parent, text, id, x, y, w, h);
 }
 
 HWND MakeFieldEdit(HWND parent, const wchar_t* text, int id,
                    int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"EDIT", text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        x, y, w, h, parent,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-        GetThisModule(), nullptr);
+    return MakeModernSingleLineEdit(parent, text, id, x, y, w, h);
 }
 
 HWND MakeMultilineEdit(HWND parent, const wchar_t* text, int id,
                        int x, int y, int w, int h) {
-    return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN,
-        x, y, w, h, parent,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-        GetThisModule(), nullptr);
+    return MakeModernMultiLineEdit(parent, text, id, x, y, w, h, true);
 }
 
 HWND MakeButton(HWND parent, const wchar_t* text, int id,
@@ -87,7 +85,7 @@ HWND MakeGrayButton(HWND parent, const wchar_t* text, int id,
 
 HWND MakeCaptureField(HWND parent, const wchar_t* text, int id,
                       int x, int y, int w, int h) {
-    return CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", text,
+    return CreateWindowExW(0, L"STATIC", text,
         WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
         x, y, w, h, parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),

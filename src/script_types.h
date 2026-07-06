@@ -42,7 +42,11 @@ enum class ActionType {
     OpenWebpage,
     OpenFile,
     TimerRecordTime,
-    CustomText
+    GetCursorPos,      // 获取当前光标位置
+    CustomText,
+    AiTextAnalysis,    // AI文字分析
+    AiImageAnalysis,   // AI图片分析
+    AiActionExecute    // AI动作执行
 };
 
 enum class MouseButtonType { Left, Right, Middle, X1, X2 };
@@ -114,6 +118,27 @@ struct ScriptAction {
     int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到, 2=保存到变量
     std::wstring conditionExpr;               // 条件表达式 (If 动作)
     bool matchFileNameOnly = false;           // 关闭程序时仅匹配文件名
+    // ── AI 动作通用 ──
+    std::wstring aiPrompt;              // 用户 prompt（支持 {变量}）
+    std::wstring aiOutputVarName;       // 输出变量名
+    int aiOutputType = 0;              // 0=文本, 1=整数
+    std::wstring aiModelName;           // 选用的模型名（对应 savedModels）
+    int aiContextMode = 0;             // 0=无上下文, 1=宏上下文, 2=循环上下文, 3=指令块上下文
+    int aiTimeoutSec = 30;            // API超时秒数
+    // ── AI图片分析专用 ──
+    double aiImageScale = 0.5;         // 截屏缩放比例（0.1-1.0），大图还会自动限边
+    bool aiRegionByImage = false;       // 根据找图锚点确定 AI 分析区域
+    std::wstring aiTargetImagePath;     // 锚定找图用的图片（aiRegionByImage=1 时）
+    int aiSearchRegion = 0;           // 搜索区域：0=全屏,1=约左上,2=约右上,3=约左下,4=约右下,5=约中央,6=自定义
+    int aiSearchX1 = 0;               // 自定义搜索区域 X1
+    int aiSearchY1 = 0;               // 自定义搜索区域 Y1
+    int aiSearchX2 = 0;               // 自定义搜索区域 X2
+    int aiSearchY2 = 0;               // 自定义搜索区域 Y2
+    // ── AI动作执行专用 ──
+    bool aiWithImage = false;          // 是否附带截图调用 API
+    int aiMaxSteps = 10;               // 最大执行步骤数（-1=不限制）
+    std::wstring aiFallbackValue;        // API失败降级值
+    bool aiConfirmExecute = false;       // AI动作执行：确认后执行
 };
 
 // ── 容器动作判断辅助函数 ────────────────────────────────────────

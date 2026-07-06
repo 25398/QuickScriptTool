@@ -3,6 +3,9 @@
 // app_settings.h — 应用全局设置结构体
 // ──────────────────────────────────────────────────────────────────
 
+#include <string>
+#include <vector>
+
 namespace quickscript {
 
 struct ClickTabSettings {
@@ -37,10 +40,29 @@ struct OtherTabSettings {
     bool closeToTray = true;
 };
 
+struct AiModelProfile {
+    std::wstring apiUrl = L"https://api.openai.com/v1/chat/completions";
+    std::wstring apiKey;
+    std::wstring modelName = L"gpt-4o";
+    double temperature = 0.3;
+    int maxTokens = 4096;
+};
+
+struct AiApiSettings {
+    bool enabled = false;
+    std::wstring apiUrl = L"https://api.openai.com/v1/chat/completions";
+    std::wstring apiKey;
+    std::wstring modelName = L"gpt-4o";
+    double temperature = 0.3;
+    int maxTokens = 4096;
+    std::vector<AiModelProfile> savedModels;
+};
+
 struct AppSettings {
     ClickTabSettings click{};
     PlaybackTabSettings playback{};
     OtherTabSettings other{};
+    AiApiSettings ai{};
 };
 
 inline AppSettings DefaultAppSettings() {

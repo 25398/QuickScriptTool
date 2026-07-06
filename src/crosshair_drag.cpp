@@ -70,6 +70,7 @@ void CrosshairDragController::End() {
 bool CrosshairDragController::HandleMessage(UINT msg, WPARAM wp, LPARAM lp,
     CoordinateHandler onCoordinate, ProgramPathHandler onProgramPath) {
     if (!active_) return false;
+    (void)lp;
 
     switch (msg) {
     case WM_SETCURSOR:

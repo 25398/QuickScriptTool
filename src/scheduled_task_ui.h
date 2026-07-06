@@ -113,14 +113,30 @@ inline bool StPtIn(const RECT& rc, int x, int y) {
     return x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom;
 }
 
+inline bool StIsImeUiWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    wchar_t cls[64]{};
+    if (!GetClassNameW(hwnd, cls, 64)) return false;
+    if (wcsncmp(cls, L"IME", 3) == 0) return true;
+    if (wcscmp(cls, L"MSCTFIME UI") == 0) return true;
+    if (wcsstr(cls, L"CANDIDATE") != nullptr) return true;
+    return false;
+}
+
 /// 模态对话框消息泵：白名单模式，仅分发属于本对话框及其弹出层的消息
 inline bool StModalMessageForDialog(const MSG& msg, HWND dialogHwnd,
-    HWND popupA = nullptr, HWND popupB = nullptr) {
+    HWND popupA = nullptr, HWND popupB = nullptr, HWND disabledOwner = nullptr) {
     if (msg.message == WM_QUIT) return true;
     if (!msg.hwnd) return true;
+    if (disabledOwner && (msg.hwnd == disabledOwner || IsChild(disabledOwner, msg.hwnd)))
+        return false;
     if (msg.hwnd == dialogHwnd || IsChild(dialogHwnd, msg.hwnd)) return true;
     if (popupA && (msg.hwnd == popupA || IsChild(popupA, msg.hwnd))) return true;
     if (popupB && (msg.hwnd == popupB || IsChild(popupB, msg.hwnd))) return true;
+    // IME 候选/组字窗不是 dialog 子窗口，须放行（参考 wxWidgets/Chromium 模态泵做法）
+    if (msg.message >= WM_IME_SETCONTEXT && msg.message <= WM_IME_KEYUP) return true;
+    if (StIsImeUiWindow(msg.hwnd)) return true;
+    if (GetWindowThreadProcessId(msg.hwnd, nullptr) == GetCurrentThreadId()) return true;
     return false;
 }
 

@@ -345,12 +345,18 @@ std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& j
     for (const auto& block : blocks) {
         const auto type = ExtractString(block, L"type");
         const auto imgPath = ExtractString(block, L"imagePath");
-        if (imgPath.empty()) continue;
-        if (type == L"findImage") {
-            paths.insert(ResolveImagePath(imgPath));
-        } else if (type == L"textRecognition"
-            && ExtractNumber(block, L"ocrRegionByImage", 0) != 0) {
-            paths.insert(ResolveImagePath(imgPath));
+        if (!imgPath.empty()) {
+            if (type == L"findImage") {
+                paths.insert(ResolveImagePath(imgPath));
+            } else if (type == L"textRecognition"
+                && ExtractNumber(block, L"ocrRegionByImage", 0) != 0) {
+                paths.insert(ResolveImagePath(imgPath));
+            }
+        }
+        const auto aiTargetImagePath = ExtractString(block, L"aiTargetImagePath");
+        if (!aiTargetImagePath.empty()
+            && (type == L"aiImageAnalysis" || type == L"aiActionExecute")) {
+            paths.insert(ResolveImagePath(aiTargetImagePath));
         }
     }
     return paths;

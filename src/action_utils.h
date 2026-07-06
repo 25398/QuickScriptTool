@@ -37,6 +37,9 @@ bool IsValidBlockName(const std::wstring& name);
 /// 脚本是否包含文字识别动作（用于运行期按需启用 OCR 变量上下文）
 bool ScriptUsesTextRecognition(const std::vector<ScriptAction>& actions);
 
+/// 脚本是否包含 AI 动作
+bool ScriptUsesAiAction(const std::vector<ScriptAction>& actions);
+
 // ── 键盘/鼠标模拟函数 ─────────────────────────────────────────────
 
 /// 通过扫描码发送键盘按键事件（比虚拟键码更可靠）

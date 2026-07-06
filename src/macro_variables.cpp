@@ -39,11 +39,39 @@ void AddFindImageVarItems(const std::wstring& varName, std::vector<QuickInputVar
         L"找图返回的右下角Y",
         varName + L".y1"
     });
+    items.push_back({
+        varName + L".cx",
+        L"{" + varName + L".cx}",
+        L"找图返回的中心X",
+        varName + L".cx"
+    });
+    items.push_back({
+        varName + L".cy",
+        L"{" + varName + L".cy}",
+        L"找图返回的中心Y",
+        varName + L".cy"
+    });
+}
+
+void AddCursorPosVarItems(const std::wstring& varName, std::vector<QuickInputVarItem>& items) {
+    items.push_back({
+        varName + L".x",
+        L"{" + varName + L".x}",
+        L"光标横坐标",
+        varName + L".x"
+    });
+    items.push_back({
+        varName + L".y",
+        L"{" + varName + L".y}",
+        L"光标纵坐标",
+        varName + L".y"
+    });
 }
 
 std::wstring LookupMatchVarProperty(const ImageMatchResult& match, const std::wstring& prop) {
     if (!match.found) {
-        if (prop == L"matchData" || prop == L"x" || prop == L"y" || prop == L"x1" || prop == L"y1") {
+        if (prop == L"matchData" || prop == L"x" || prop == L"y" || prop == L"x1" || prop == L"y1"
+            || prop == L"cx" || prop == L"cy") {
             return L"0";
         }
         return L"";
@@ -53,6 +81,8 @@ std::wstring LookupMatchVarProperty(const ImageMatchResult& match, const std::ws
     if (prop == L"y") return std::to_wstring(match.topLeftY);
     if (prop == L"x1") return std::to_wstring(match.bottomRightX);
     if (prop == L"y1") return std::to_wstring(match.bottomRightY);
+    if (prop == L"cx") return std::to_wstring((match.topLeftX + match.bottomRightX) / 2);
+    if (prop == L"cy") return std::to_wstring((match.topLeftY + match.bottomRightY) / 2);
     return L"";
 }
 
@@ -182,6 +212,15 @@ std::wstring ResolveMacroOperandImpl(const std::wstring& token, const MacroVaria
             if (forLoopCount) return ResolveOcrVarNumericValue(it->second);
             if (it->second.mode == OcrVarMode::Text) return it->second.text;
             return std::to_wstring(it->second.found);
+        }
+    }
+
+    if (ctx.aiVars) {
+        const auto it = ctx.aiVars->find(t);
+        if (it != ctx.aiVars->end()) {
+            double num = 0.0;
+            if (TryParseDouble(it->second, num)) return std::to_wstring(static_cast<int>(num));
+            return it->second;
         }
     }
 
@@ -348,6 +387,11 @@ std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptA
         AddFindImageVarItems(a.matchVarName, items);
     }
     for (const auto& a : actions) {
+        if (a.type != ActionType::GetCursorPos || a.matchVarName.empty()) continue;
+        if (!seen.insert(a.matchVarName).second) continue;
+        AddCursorPosVarItems(a.matchVarName, items);
+    }
+    for (const auto& a : actions) {
         if (a.type != ActionType::TextRecognition || a.matchVarName.empty()) continue;
         if (!seen.insert(a.matchVarName).second) continue;
         if (a.ocrResultMode == 1) AddOcrSearchVarItems(a.matchVarName, items);
@@ -371,6 +415,16 @@ std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptA
             L"{" + a.loopVarName + L"}",
             L"计时器变量:" + a.loopVarName,
             a.loopVarName
+        });
+    }
+    for (const auto& a : actions) {
+        if ((a.type != ActionType::AiTextAnalysis && a.type != ActionType::AiImageAnalysis) || a.aiOutputVarName.empty()) continue;
+        if (!seen.insert(a.aiOutputVarName).second) continue;
+        items.push_back({
+            a.aiOutputVarName,
+            L"{" + a.aiOutputVarName + L"}",
+            L"AI输出变量:" + a.aiOutputVarName,
+            a.aiOutputVarName
         });
     }
     items.push_back({

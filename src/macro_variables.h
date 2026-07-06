@@ -27,6 +27,7 @@ struct QuickInputVarItem {
 struct MacroVariableContext {
     const std::unordered_map<std::wstring, ImageMatchResult>* matchVars = nullptr;  // 找图结果变量
     const std::unordered_map<std::wstring, OcrVarResult>* ocrVars = nullptr;      // 文字识别变量
+    const std::unordered_map<std::wstring, std::wstring>* aiVars = nullptr;       // AI输出变量
     const std::unordered_map<std::wstring, int>* loopVars = nullptr;                // 循环计数变量
     const std::unordered_map<std::wstring, std::chrono::steady_clock::time_point>* timerStarts = nullptr;  // 计时器变量起始时刻
     int curLoops = 0;  // 当前外层循环累计次数

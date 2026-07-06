@@ -260,10 +260,16 @@ bool OcrOverlay::PickAnchorCenter(int& centerX, int& centerY) const {
         centerY = (found->y1 + found->y2) / 2;
         return true;
     }
-    const OcrTextLine line = NearestLineToPoint(cursorX_, cursorY_);
-    if (line.text.empty() && line.x2 <= line.x1) return false;
-    centerX = (line.x1 + line.x2) / 2;
-    centerY = (line.y1 + line.y2) / 2;
+    int minX = lines_.front().x1, minY = lines_.front().y1;
+    int maxX = lines_.front().x2, maxY = lines_.front().y2;
+    for (const auto& line : lines_) {
+        minX = std::min(minX, line.x1);
+        minY = std::min(minY, line.y1);
+        maxX = std::max(maxX, line.x2);
+        maxY = std::max(maxY, line.y2);
+    }
+    centerX = (minX + maxX) / 2;
+    centerY = (minY + maxY) / 2;
     return true;
 }
 

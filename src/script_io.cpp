@@ -38,6 +38,10 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     else if (type == L"openWebpage") a.type = ActionType::OpenWebpage;
     else if (type == L"openFile") a.type = ActionType::OpenFile;
     else if (type == L"timerRecordTime") a.type = ActionType::TimerRecordTime;
+    else if (type == L"getCursorPos") a.type = ActionType::GetCursorPos;
+    else if (type == L"aiTextAnalysis") a.type = ActionType::AiTextAnalysis;
+    else if (type == L"aiImageAnalysis") a.type = ActionType::AiImageAnalysis;
+    else if (type == L"aiActionExecute") a.type = ActionType::AiActionExecute;
     else a.type = ActionType::CustomText;
     a.customText = ExtractString(block, L"text");
     a.remark = ExtractString(block, L"remark");
@@ -110,6 +114,26 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.ocrFollowUp = static_cast<int>(ExtractNumber(block, L"ocrFollowUp", 0));
     a.conditionExpr = ExtractString(block, L"conditionExpr");
     a.matchFileNameOnly = ExtractNumber(block, L"matchFileNameOnly", 0) != 0;
+    // ── AI 动作字段 ──
+    a.aiPrompt = ExtractString(block, L"aiPrompt");
+    a.aiOutputVarName = ExtractString(block, L"aiOutputVarName");
+    a.aiOutputType = static_cast<int>(ExtractNumber(block, L"aiOutputType", 0));
+    a.aiModelName = ExtractString(block, L"aiModelName");
+    a.aiContextMode = static_cast<int>(ExtractNumber(block, L"aiContextMode", 0));
+    a.aiTimeoutSec = static_cast<int>(ExtractNumber(block, L"aiTimeoutSec", 30));
+    a.aiImageScale = ExtractNumber(block, L"aiImageScale", 0.5);
+    a.aiRegionByImage = ExtractNumber(block, L"aiRegionByImage", 0) != 0;
+    a.aiTargetImagePath = ExtractString(block, L"aiTargetImagePath");
+    if (!a.aiTargetImagePath.empty()) a.aiTargetImagePath = ResolveImagePath(a.aiTargetImagePath);
+    a.aiSearchRegion = static_cast<int>(ExtractNumber(block, L"aiSearchRegion", 0));
+    a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
+    a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
+    a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
+    a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+    a.aiMaxSteps = static_cast<int>(ExtractNumber(block, L"aiMaxSteps", 10));
+    a.aiWithImage = ExtractNumber(block, L"aiWithImage", 1) != 0;
+    a.aiFallbackValue = ExtractString(block, L"aiFallbackValue");
+    a.aiConfirmExecute = ExtractNumber(block, L"aiConfirmExecute", 0) != 0;
     return a;
 }
 
@@ -184,8 +208,39 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"ocrSearchText\": \"" << EscapeJson(a.ocrSearchText) << L"\",\n";
     file << L"      \"ocrFollowUp\": " << a.ocrFollowUp << L",\n";
     file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\",\n";
-    file << L"      \"matchFileNameOnly\": " << (a.matchFileNameOnly ? 1 : 0) << L"\n";
+    file << L"      \"matchFileNameOnly\": " << (a.matchFileNameOnly ? 1 : 0) << L",\n";
+    // ── AI 动作字段 ──
+    file << L"      \"aiPrompt\": \"" << EscapeJson(a.aiPrompt) << L"\",\n";
+    file << L"      \"aiOutputVarName\": \"" << EscapeJson(a.aiOutputVarName) << L"\",\n";
+    file << L"      \"aiOutputType\": " << a.aiOutputType << L",\n";
+    file << L"      \"aiModelName\": \"" << EscapeJson(a.aiModelName) << L"\",\n";
+    file << L"      \"aiContextMode\": " << a.aiContextMode << L",\n";
+    file << L"      \"aiTimeoutSec\": " << a.aiTimeoutSec << L",\n";
+    file << L"      \"aiImageScale\": " << a.aiImageScale << L",\n";
+    file << L"      \"aiRegionByImage\": " << (a.aiRegionByImage ? 1 : 0) << L",\n";
+    const std::wstring savedAiImagePath = [&]() -> std::wstring {
+        if (!a.aiTargetImagePath.empty()) {
+            return ImagePathForJson(EnsureImageInLibrary(a.aiTargetImagePath));
+        }
+        return a.aiTargetImagePath;
+    }();
+    file << L"      \"aiTargetImagePath\": \"" << EscapeJson(savedAiImagePath) << L"\",\n";
+    file << L"      \"aiSearchRegion\": " << a.aiSearchRegion << L",\n";
+    file << L"      \"aiSearchX1\": " << a.aiSearchX1 << L",\n";
+    file << L"      \"aiSearchY1\": " << a.aiSearchY1 << L",\n";
+    file << L"      \"aiSearchX2\": " << a.aiSearchX2 << L",\n";
+    file << L"      \"aiSearchY2\": " << a.aiSearchY2 << L",\n";
+    file << L"      \"aiMaxSteps\": " << a.aiMaxSteps << L",\n";
+    file << L"      \"aiWithImage\": " << (a.aiWithImage ? 1 : 0) << L",\n";
+    file << L"      \"aiFallbackValue\": \"" << EscapeJson(a.aiFallbackValue) << L"\",\n";
+    file << L"      \"aiConfirmExecute\": " << (a.aiConfirmExecute ? 1 : 0) << L"\n";
     file << L"    }" << (last ? L"\n" : L",\n");
+}
+
+std::wstring ScriptActionToJsonString(const ScriptAction& a) {
+    std::wstringstream file;
+    WriteActionJson(file, a, true);
+    return file.str();
 }
 
 ScriptFileData LoadScriptFileData(const std::wstring& path) {

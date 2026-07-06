@@ -1,8 +1,10 @@
 #include "scheduled_task_dialog.h"
 
 #include "drawing.h"
+#include "modern_edit.h"
 #include "scheduled_task_datetime_picker.h"
 #include "scheduled_task_ui.h"
+#include "taskbar_window.h"
 #include "utils.h"
 
 #include <windowsx.h>
@@ -64,9 +66,11 @@ void ScheduledTaskDialog::Show(HWND owner, ScheduledTaskScheduler& scheduler) {
     const int x = ownerRc.left + ((ownerRc.right - ownerRc.left) - kListW) / 2;
     const int y = ownerRc.top + ((ownerRc.bottom - ownerRc.top) - kDialogH) / 2;
 
-    hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW, cls, L"", WS_POPUP | WS_CLIPCHILDREN,
+    hwnd_ = CreateWindowExW(0, cls, L"", WS_POPUP | WS_CLIPCHILDREN | WS_MINIMIZEBOX,
         x, y, kListW, kDialogH, nullptr, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return;
+
+    ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-定时任务");
 
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(hwnd_);
@@ -139,10 +143,7 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         createFont_ = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
-        nameEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
-            0, 0, 100, 24, hwnd_, reinterpret_cast<HMENU>(100),
-            GetModuleHandleW(nullptr), nullptr);
+        nameEdit_ = MakeModernSingleLineEdit(hwnd_, L"", 100, 0, 0, 100, 24);
         SendMessageW(nameEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(createFont_), TRUE);
         ShowWindow(nameEdit_, SW_HIDE);
 

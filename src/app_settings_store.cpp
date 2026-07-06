@@ -87,6 +87,53 @@ void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& o
     out.closeToTray = ParseBoolField(obj, L"closeToTray", out.closeToTray);
 }
 
+void LoadAiApiSettings(const std::wstring& obj, quickscript::AiApiSettings& out) {
+    out.enabled = ParseBoolField(obj, L"enabled", out.enabled);
+    out.apiUrl = ExtractString(obj, L"apiUrl");
+    if (out.apiUrl.empty()) out.apiUrl = L"https://api.openai.com/v1/chat/completions";
+    out.apiKey = ExtractString(obj, L"apiKey");
+    out.modelName = ExtractString(obj, L"modelName");
+    if (out.modelName.empty()) out.modelName = L"gpt-4o";
+    out.temperature = ParseDoubleField(obj, L"temperature", out.temperature);
+    out.maxTokens = ParseIntField(obj, L"maxTokens", out.maxTokens);
+    out.savedModels.clear();
+    const auto arrPos = obj.find(L"\"savedModels\"");
+    if (arrPos == std::wstring::npos) return;
+    const auto bracket = obj.find(L'[', arrPos);
+    if (bracket == std::wstring::npos) return;
+    size_t pos = bracket + 1;
+    while (pos < obj.size()) {
+        while (pos < obj.size() && (obj[pos] == L' ' || obj[pos] == L'\n'
+            || obj[pos] == L'\r' || obj[pos] == L'\t' || obj[pos] == L',')) {
+            ++pos;
+        }
+        if (pos >= obj.size() || obj[pos] == L']') break;
+        if (obj[pos] != L'{') { ++pos; continue; }
+        int depth = 0;
+        const size_t start = pos;
+        for (; pos < obj.size(); ++pos) {
+            if (obj[pos] == L'{') ++depth;
+            else if (obj[pos] == L'}') {
+                --depth;
+                if (depth == 0) {
+                    const std::wstring block = obj.substr(start, pos - start + 1);
+                    quickscript::AiModelProfile profile{};
+                    profile.apiUrl = ExtractString(block, L"apiUrl");
+                    if (profile.apiUrl.empty()) profile.apiUrl = L"https://api.openai.com/v1/chat/completions";
+                    profile.apiKey = ExtractString(block, L"apiKey");
+                    profile.modelName = ExtractString(block, L"modelName");
+                    if (profile.modelName.empty()) continue;
+                    profile.temperature = ParseDoubleField(block, L"temperature", profile.temperature);
+                    profile.maxTokens = ParseIntField(block, L"maxTokens", profile.maxTokens);
+                    out.savedModels.push_back(std::move(profile));
+                    ++pos;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 void WriteClickSettings(std::wofstream& file, const quickscript::ClickTabSettings& s) {
     file << L"    \"enableRandomInterval\": " << (s.enableRandomInterval ? L"true" : L"false") << L",\n";
     file << L"    \"randomIntervalMaxSeconds\": " << s.randomIntervalMaxSeconds << L",\n";
@@ -119,6 +166,29 @@ void WriteOtherSettings(std::wofstream& file, const quickscript::OtherTabSetting
     file << L"    \"closeToTray\": " << (s.closeToTray ? L"true" : L"false") << L"\n";
 }
 
+void WriteAiApiSettings(std::wofstream& file, const quickscript::AiApiSettings& s) {
+    file << L"    \"enabled\": " << (s.enabled ? L"true" : L"false") << L",\n";
+    file << L"    \"apiUrl\": \"" << EscapeJson(s.apiUrl) << L"\",\n";
+    file << L"    \"apiKey\": \"" << EscapeJson(s.apiKey) << L"\",\n";
+    file << L"    \"modelName\": \"" << EscapeJson(s.modelName) << L"\",\n";
+    file << L"    \"temperature\": " << s.temperature << L",\n";
+    file << L"    \"maxTokens\": " << s.maxTokens << L",\n";
+    file << L"    \"savedModels\": [\n";
+    for (size_t i = 0; i < s.savedModels.size(); ++i) {
+        const auto& m = s.savedModels[i];
+        file << L"      {\n";
+        file << L"        \"apiUrl\": \"" << EscapeJson(m.apiUrl) << L"\",\n";
+        file << L"        \"apiKey\": \"" << EscapeJson(m.apiKey) << L"\",\n";
+        file << L"        \"modelName\": \"" << EscapeJson(m.modelName) << L"\",\n";
+        file << L"        \"temperature\": " << m.temperature << L",\n";
+        file << L"        \"maxTokens\": " << m.maxTokens << L"\n";
+        file << L"      }";
+        if (i + 1 < s.savedModels.size()) file << L",";
+        file << L"\n";
+    }
+    file << L"    ]\n";
+}
+
 }  // namespace
 
 std::wstring AppSettingsFilePath() {
@@ -140,6 +210,8 @@ bool LoadAppSettings(quickscript::AppSettings& out) {
     if (!clickObj.empty()) LoadClickSettings(clickObj, out.click);
     if (!playbackObj.empty()) LoadPlaybackSettings(playbackObj, out.playback);
     if (!otherObj.empty()) LoadOtherSettings(otherObj, out.other);
+    const std::wstring aiObj = ExtractObject(content, L"ai");
+    if (!aiObj.empty()) LoadAiApiSettings(aiObj, out.ai);
     return true;
 }
 
@@ -156,7 +228,13 @@ bool SaveAppSettings(const quickscript::AppSettings& settings) {
     file << L"  },\n";
     file << L"  \"other\": {\n";
     WriteOtherSettings(file, settings.other);
+    file << L"  },\n";
+    file << L"  \"ai\": {\n";
+    WriteAiApiSettings(file, settings.ai);
     file << L"  }\n";
     file << L"}\n";
-    return file.good();
+    file.flush();
+    if (!file.good()) return false;
+    file.close();
+    return true;
 }

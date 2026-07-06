@@ -2,7 +2,9 @@
 
 #include "action_utils.h"
 #include "drawing.h"
+#include "modern_edit.h"
 #include "script_io.h"
+#include "taskbar_window.h"
 
 #include <windowsx.h>
 
@@ -90,6 +92,8 @@ RecordingOptimizeDialog::Result RecordingOptimizeDialog::Show(HWND owner, const 
         owner, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return {};
 
+    ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-录制优化");
+
     const std::wstring defaultName = L"优化-" + (fileData.scriptName.empty() ? recording.name : fileData.scriptName);
     SetWindowTextW(nameEdit_, defaultName.c_str());
     EnableWindow(owner, FALSE);
@@ -143,23 +147,15 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         closeFont_ = CreateFontW(38, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        nameEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            NameEditRect().left, NameEditRect().top,
-            NameEditRect().right - NameEditRect().left,
-            NameEditRect().bottom - NameEditRect().top,
-            hwnd_, reinterpret_cast<HMENU>(100), GetModuleHandleW(nullptr), nullptr);
+        const RECT nameRc = NameEditRect();
+        nameEdit_ = MakeModernSingleLineEdit(hwnd_, L"", 100,
+            nameRc.left, nameRc.top,
+            nameRc.right - nameRc.left, nameRc.bottom - nameRc.top);
         SendMessageW(nameEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
         CenterEditTextVertically(nameEdit_);
-        valueEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.1",
-            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER,
-            0, 0, kEditW, kEditH, hwnd_, reinterpret_cast<HMENU>(101), GetModuleHandleW(nullptr), nullptr);
-        thresholdEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1.0",
-            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER,
-            0, 0, kEditW, kEditH, hwnd_, reinterpret_cast<HMENU>(102), GetModuleHandleW(nullptr), nullptr);
-        mergeWaitEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.1",
-            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER,
-            0, 0, kEditW, kEditH, hwnd_, reinterpret_cast<HMENU>(103), GetModuleHandleW(nullptr), nullptr);
+        valueEdit_ = MakeModernSingleLineEdit(hwnd_, L"0.1", 101, 0, 0, kEditW, kEditH, ES_CENTER);
+        thresholdEdit_ = MakeModernSingleLineEdit(hwnd_, L"1.0", 102, 0, 0, kEditW, kEditH, ES_CENTER);
+        mergeWaitEdit_ = MakeModernSingleLineEdit(hwnd_, L"0.1", 103, 0, 0, kEditW, kEditH, ES_CENTER);
         SendMessageW(valueEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
         SendMessageW(thresholdEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
         SendMessageW(mergeWaitEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
@@ -1248,6 +1244,9 @@ void RecordingOptimizeDialog::PaintRightPanel(HDC hdc) {
         DrawTextW(hdc, L"压缩阈值", -1, &thLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         DrawGreenButton(hdc, applyBtn, L"开始压缩", hoverApply_);
     }
+    DrawEditControlBorder(hdc, hwnd_, valueEdit_);
+    DrawEditControlBorder(hdc, hwnd_, thresholdEdit_);
+    DrawEditControlBorder(hdc, hwnd_, mergeWaitEdit_);
 }
 
 void RecordingOptimizeDialog::Paint() {

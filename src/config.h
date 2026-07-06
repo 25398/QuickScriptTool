@@ -93,99 +93,92 @@ constexpr COLORREF kGrayButtonHover = RGB(220, 220, 220);
 constexpr COLORREF kGrayButtonBorder = RGB(173, 173, 173);
 constexpr COLORREF kGrayButtonText = RGB(51, 51, 51);
 
-// ── 找图面板布局（1024×768 设计稿，统一按宽比缩放以保持 120×120 等比例）────
-constexpr int kFindZoneLeft = 780;
-constexpr int kFindZoneRight = kEditorBaseWidth - 10;
-constexpr int kFindPanelRightMargin = 10;
+// ── 找图/文字识别面板公共尺寸（1024×768 设计稿，统一按宽比缩放）────
 constexpr int kFindBtnW = 90;
 constexpr int kFindBtnH = 30;
 constexpr int kFindImageSize = 120;
-constexpr int kFindContentGap = 8;
+constexpr int kFindImageSideBtnH = 26;
+constexpr int kFindImageSideBtnGap = 4;
 constexpr int kFindVGap = 8;
-constexpr int kFindBlockW = kFindImageSize + kFindContentGap + kFindBtnW;
-constexpr int kFindContentLeft = kFindZoneLeft + (kFindZoneRight - kFindZoneLeft - kFindBlockW) / 2;
-constexpr int kFindActionBtnX = kFindContentLeft + kFindImageSize + kFindContentGap;
-constexpr int kFindPanelRight = kFindZoneRight;
+constexpr int kFindContentLeft = 785;           // 1200x1080 下对应 x=920
+constexpr int kFindActionBtnX = 913;            // kFindContentLeft + kFindImageSize + 8
 constexpr int kFindRegionLabelW = 64;
 constexpr int kFindFollowLabelW = 64;
 constexpr int kFindFollowComboW = 145;
-constexpr int kFindSelectOffsetW = 155;
-constexpr int kFindActionBtnRight = kFindActionBtnX + kFindBtnW;
+constexpr int kFindActionBtnRight = 1003;       // kFindActionBtnX + kFindBtnW
 constexpr int kFindEditW = 48;
 constexpr int kFindRegionLabelGap = 8;
 constexpr int kFindRegionBtnGap = 6;
-constexpr int kFindSelectRegionX = kFindActionBtnX;
+constexpr int kFindSelectRegionX = 913;         // kFindActionBtnX
 constexpr int kFindCoordLabelW = 22;
 constexpr int kFindOffsetLabelW = 30;
 constexpr int kFindCoordLabelEditGap = 4;
 constexpr int kFindCoordPairGap = 10;
-constexpr int kFindYEditRight = kFindActionBtnRight;
-constexpr int kFindYEditX = kFindYEditRight - kFindEditW;
-constexpr int kFindYLabelX = kFindYEditX - kFindCoordLabelEditGap - kFindCoordLabelW;
-constexpr int kFindXEditX = kFindYLabelX - kFindCoordPairGap - kFindEditW;
-constexpr int kFindXLabelX = kFindXEditX - kFindCoordLabelEditGap - kFindCoordLabelW;
-constexpr int kFindOffsetYLabelX = kFindYEditX - kFindCoordLabelEditGap - kFindOffsetLabelW;
-constexpr int kFindOffsetXEditX = kFindOffsetYLabelX - kFindCoordPairGap - kFindEditW;
-constexpr int kFindOffsetXLabelX = kFindOffsetXEditX - kFindCoordLabelEditGap - kFindOffsetLabelW;
-constexpr int kFindSelectOffsetLeft = kFindOffsetXLabelX;
-constexpr int kFindPanelLeft = kFindContentLeft;
-constexpr int kOcrDepRowY = 118 + kEditorLabelAboveComboH + kEditorLabelGap + kEditorActionComboH + kEditorLabelGap;
-constexpr int kFindRegionRowY = 180;
-constexpr int kFindCoordRow1Y = kFindRegionRowY + kFindBtnH + kFindVGap;
-constexpr int kFindCoordRow2Y = kFindCoordRow1Y + 22 + kFindVGap;
+constexpr int kFindYEditX = 955;                // kFindActionBtnRight - kFindEditW
+constexpr int kFindYLabelX = 929;               // kFindYEditX - kFindCoordLabelEditGap - kFindCoordLabelW
+constexpr int kFindXEditX = 871;                // kFindYLabelX - kFindCoordPairGap - kFindEditW
+constexpr int kFindXLabelX = 845;               // kFindXEditX - kFindCoordLabelEditGap - kFindCoordLabelW
+constexpr int kFindOffsetYLabelX = 921;         // kFindYEditX - kFindCoordLabelEditGap - kFindOffsetLabelW
+constexpr int kFindOffsetXEditX = 863;          // kFindOffsetYLabelX - kFindCoordPairGap - kFindEditW
+constexpr int kFindOffsetXLabelX = 829;         // kFindOffsetXEditX - kFindCoordLabelEditGap - kFindOffsetLabelW
+constexpr int kFindRegionRowY = 174;            // 与其他动作参数首行对齐
 constexpr int kFindBtnStackGap = 8;
-constexpr int kFindImageLabelY = kFindCoordRow2Y + 22 + kFindVGap;
-constexpr int kFindImageRowY = kFindImageLabelY + kFindBtnH + kFindVGap;
-constexpr int kFindMatchY = kFindImageRowY + kFindImageSize + 12;
-constexpr int kFindScaleY = kFindMatchY + 22 + kFindVGap;
-constexpr int kFindFollowRowY = kFindScaleY + 22 + kFindVGap;
-constexpr int kFindOffsetRowY = kFindFollowRowY + kFindBtnH + kFindVGap;
-constexpr int kFindSelectOffsetY = kFindOffsetRowY + 22 + kFindVGap;
-constexpr int kFindUntilFoundY = kFindSelectOffsetY + kFindBtnH + kFindVGap;
+constexpr int kFindBlockW = 218;               // kFindImageSize + kFindContentGap + kFindBtnW
+constexpr int kFindContentGap = 8;
+constexpr int kFindSelectOffsetW = 155;
+constexpr int kFindSelectOffsetLeft = 829;     // kFindOffsetXLabelX
+constexpr int kFindSelectOffsetY = 552;
+constexpr int kFindUntilFoundY = 578;
 constexpr int kFindMatchVarLabelW = 108;
-constexpr int kFindMatchVarEditX = kFindContentLeft + kFindMatchVarLabelW + 1;
+constexpr int kFindMatchVarEditX = 897;       // kFindContentLeft + kFindMatchVarLabelW + 4
 constexpr int kFindMatchVarEditW = 80;
+constexpr int kFindImageLabelY = 278;
+constexpr int kFindImageRowY = 316;
+constexpr int kFindMatchY = 448;
+constexpr int kFindScaleY = 478;
+constexpr int kFindFollowRowY = 508;
+constexpr int kFindOffsetRowY = 546;
 
-// ── 文字识别面板布局（运行时由 RefreshOcrSubPanel 自 dep 行起堆叠排列）──
+// ── 文字识别面板公共尺寸 ──
 constexpr int kOcrDepToRegionGap = 4;
-constexpr int kOcrRegionRowY = kOcrDepRowY + kFindBtnH + kOcrDepToRegionGap;
-constexpr int kOcrCoordRow1Y = kOcrRegionRowY + kFindBtnH + kFindVGap;
-constexpr int kOcrCoordRow2Y = kOcrCoordRow1Y + 22 + kFindVGap;
-constexpr int kOcrResultModeY = kOcrCoordRow2Y + 22 + kFindVGap;
-constexpr int kOcrResultVarEditW = kFindBlockW - 91;
-constexpr int kOcrSearchLabelY = kOcrResultModeY + kFindBtnH + kFindVGap;
-constexpr int kOcrSearchEditY = kOcrSearchLabelY + 22 + 4;
-constexpr int kOcrSearchVarY = kOcrSearchEditY + 28 + kFindVGap;
-constexpr int kOcrFollowRowY = kOcrSearchVarY + 28 + kFindVGap;
-constexpr int kOcrFollowRowYCompact = kOcrResultModeY + kFindBtnH + kFindVGap;
-constexpr int kOcrOffsetRowY = kOcrFollowRowY + kFindBtnH + kFindVGap;
-constexpr int kOcrOffsetRowYCompact = kOcrFollowRowYCompact + kFindBtnH + kFindVGap;
-constexpr int kOcrResultVarY = kOcrOffsetRowY + 22 + kFindVGap;
-constexpr int kOcrResultVarYCompact = kOcrOffsetRowYCompact + 22 + kFindVGap;
-constexpr int kOcrUntilFoundY = kOcrResultVarY + 22 + kFindVGap;
-constexpr int kOcrTestBtnY = kOcrUntilFoundY + 22 + kFindVGap;
-constexpr int kOcrTestBtnYCompact = kOcrResultVarYCompact + 22 + kFindVGap;
-// 文字查找：测试与「选择偏移位置」同一行，偏移按钮在测试右侧留空，右缘对齐内容块
-constexpr int kOcrTestToOffsetGap = 12;
-constexpr int kOcrTestRowOffsetBtnX = kFindContentLeft + kFindBtnW + kOcrTestToOffsetGap;
-constexpr int kOcrTestRowOffsetBtnW = kFindContentLeft + kFindBlockW - kOcrTestRowOffsetBtnX;
+constexpr int kOcrDepRowY = 174;                // 与其他动作参数首行对齐
+constexpr int kOcrToggleRowY = 208;             // 174 + kFindBtnH + kOcrDepToRegionGap
+constexpr int kOcrRegionRowY = 238;             // 208 + 22 + kFindVGap（复选框行下方）
+constexpr int kOcrResultVarEditW = 127;         // 218 - 91
 constexpr int kOcrRegionByImageW = 140;
-constexpr int kOcrDigitsOnlyX = kFindContentLeft + kOcrRegionByImageW + 4;
+constexpr int kOcrDigitsOnlyX = 929;            // kFindContentLeft + kOcrRegionByImageW + 4
 constexpr int kOcrDigitsOnlyW = 64;
 constexpr int kOcrSearchVarLabelW = 36;
 constexpr int kOcrVarComboGap = 4;
 constexpr int kOcrVarInsertGap = 6;
-constexpr int kOcrPanelRight = kFindContentLeft + kFindBlockW;
-constexpr int kOcrSearchEditX = kFindContentLeft + kOcrSearchVarLabelW + kOcrVarComboGap;
-constexpr int kOcrSearchEditW = kOcrPanelRight - kOcrSearchEditX;
+constexpr int kOcrPanelRight = 1003;            // kFindContentLeft + 218
+constexpr int kOcrSearchEditX = 825;            // kFindContentLeft + kOcrSearchVarLabelW + kOcrVarComboGap
+constexpr int kOcrSearchEditW = 178;            // kOcrPanelRight - kOcrSearchEditX
 constexpr int kOcrCompactBtnH = 26;
 constexpr int kOcrTestBtnW = 56;
 constexpr int kOcrInsertBtnW = 44;
+constexpr int kOcrSearchLabelY = 347;
+constexpr int kOcrFollowRowY = 445;
+constexpr int kOcrOffsetRowY = 483;
+constexpr int kOcrResultVarY = 513;
 
 constexpr int kEditorRemarkY = 516;
 constexpr int kEditorAddY = 552;
-constexpr int kEditorFooterGap = 32;
-constexpr int kEditorParamHintH = 40;
+
+// 参数面板滚动区（设计稿 1024×768；1200×1080 下约为 left=920 top=225 right=1175 bottom=980）
+constexpr int kParamScrollLeftDesign = 785;
+constexpr int kParamScrollTopDesign = 160;
+constexpr int kParamScrollRightDesign = 1003;
+constexpr int kParamScrollBottomDesign = 697;
+constexpr int kParamScrollEditorRightMarginDesign = 6;
+constexpr int kParamScrollBarGapDesign = 7;
+// 参数区输入框：扣除滚动条列与左右绿边绘制余量（设计稿像素）
+constexpr int kParamFieldInsetDesign = 2;
+constexpr int kParamScrollContentRightDesign =
+    kParamScrollRightDesign - kParamScrollBarGapDesign - kEditorScrollW;
+constexpr int kParamPanelLeftDesign = kParamScrollLeftDesign + kParamFieldInsetDesign;
+constexpr int kParamFieldWidth =
+    kParamScrollContentRightDesign - kParamPanelLeftDesign - kParamFieldInsetDesign;
 
 // ── 控件尺寸 ──────────────────────────────────────────────────────
 constexpr int kComboArrowW = 24;
@@ -205,6 +198,10 @@ constexpr UINT WM_RUN_DONE = WM_APP + 11;
 constexpr UINT WM_TRAY = WM_APP + 12;
 constexpr UINT WM_FIND_TEST_DONE = WM_APP + 13;
 constexpr UINT WM_GLOBAL_HOTKEY_DETECTED = WM_APP + 14;
+constexpr UINT WM_OPEN_AGENT_DIALOG = WM_APP + 15;
+constexpr UINT WM_AGENT_SCRIPT_LIBRARY_CHANGED = WM_APP + 20;
+constexpr UINT WM_EDITOR_PARAM_CHROME = WM_APP + 21;
+constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
 constexpr int HOTKEY_COMMON_ID = 701;
 constexpr int HOTKEY_GLOBAL_ID = 702;
 constexpr int HOTKEY_SCRIPT_BASE = 800;

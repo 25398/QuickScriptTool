@@ -31,6 +31,7 @@ add_executable(QuickScriptTool WIN32
     src/image_match.cpp
     src/image_match_engines.cpp
     src/macro_variables.cpp
+    src/macro_debug_window.cpp
     src/ocr_engine.cpp
     src/ocr_install_dialog.cpp
     src/ocr_overlay.cpp
@@ -38,19 +39,37 @@ add_executable(QuickScriptTool WIN32
     src/crosshair_drag.cpp
     src/match_overlay.cpp
     src/popup_combo.cpp
+    src/panel_popup_combo.cpp
     src/recorder.cpp
     src/recording_optimize_dialog.cpp
     src/app_settings_store.cpp
     src/app_branding.cpp
     src/settings_dialog.cpp
+    src/modern_edit.cpp
+    src/agent_attachment.cpp
+    src/ai_action_service.cpp
+    src/ai_action_runtime.cpp
+    src/ai_action_router.cpp
+    src/tray_menu.cpp
     src/scheduled_task_types.cpp
     src/scheduled_task_store.cpp
     src/scheduled_task_scheduler.cpp
     src/scheduled_task_datetime_picker.cpp
     src/scheduled_task_dialog.cpp
     src/script_io.cpp
+    src/script_action_builder.cpp
+    src/agent_ui_notify.cpp
+    src/agent_script_ops.cpp
     src/screenshot_overlay.cpp
     src/utils.cpp
+    src/agent_core.cpp
+    src/agent_reference.cpp
+    src/agent_system_prompt.cpp
+    src/agent_dialog.cpp
+    src/agent_tools.cpp
+    src/agent_ai_actions.cpp
+    src/macro_execute_tools.cpp
+    src/ui_component.cpp
 )
 
 target_compile_definitions(QuickScriptTool PRIVATE UNICODE _UNICODE NOMINMAX)
@@ -60,6 +79,7 @@ target_include_directories(QuickScriptTool PRIVATE
     ${OpenCV_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/DuiLib_Ultimate
     ${CMAKE_CURRENT_SOURCE_DIR}/DuiLib_Ultimate/DuiLib
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party
 )
 
 target_link_libraries(QuickScriptTool PRIVATE
@@ -69,10 +89,12 @@ target_link_libraries(QuickScriptTool PRIVATE
     comdlg32
     shell32
     comctl32
+    imm32
     msimg32
     ole32
     oleaut32
     urlmon
+    winhttp
 )
 
 if(MSVC)

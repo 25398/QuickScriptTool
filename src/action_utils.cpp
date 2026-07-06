@@ -227,6 +227,26 @@ std::wstring ActionName(const ScriptAction& action) {
     case ActionType::TimerRecordTime:
         return L"计时器记录时间["
             + (action.loopVarName.empty() ? L"未命名" : action.loopVarName) + L"]";
+    case ActionType::AiTextAnalysis: {
+        std::wstring preview = action.aiPrompt;
+        for (wchar_t& ch : preview) { if (ch == L'\r' || ch == L'\n') ch = L' '; }
+        if (preview.size() > 30) preview = preview.substr(0, 30) + L"...";
+        return L"AI文字分析: " + preview + L" → 变量[" + action.aiOutputVarName + L"]";
+    }
+    case ActionType::AiImageAnalysis: {
+        std::wstring preview = action.aiPrompt;
+        for (wchar_t& ch : preview) { if (ch == L'\r' || ch == L'\n') ch = L' '; }
+        if (preview.size() > 30) preview = preview.substr(0, 30) + L"...";
+        return L"AI图片分析: " + preview + L" → 变量[" + action.aiOutputVarName + L"]";
+    }
+    case ActionType::AiActionExecute: {
+        std::wstring preview = action.aiPrompt;
+        for (wchar_t& ch : preview) { if (ch == L'\r' || ch == L'\n') ch = L' '; }
+        if (preview.size() > 30) preview = preview.substr(0, 30) + L"...";
+        return L"AI动作执行: " + preview + L"...";
+    }
+    case ActionType::GetCursorPos:
+        return L"获取当前光标位置→[" + (action.matchVarName.empty() ? L"未命名" : action.matchVarName) + L"]";
     case ActionType::CustomText:
         return action.customText;
     }
@@ -236,6 +256,15 @@ std::wstring ActionName(const ScriptAction& action) {
 bool ScriptUsesTextRecognition(const std::vector<ScriptAction>& actions) {
     for (const auto& a : actions) {
         if (a.type == ActionType::TextRecognition) return true;
+    }
+    return false;
+}
+
+bool ScriptUsesAiAction(const std::vector<ScriptAction>& actions) {
+    for (const auto& a : actions) {
+        if (a.type == ActionType::AiTextAnalysis
+            || a.type == ActionType::AiImageAnalysis
+            || a.type == ActionType::AiActionExecute) return true;
     }
     return false;
 }
@@ -271,7 +300,11 @@ std::wstring JsonType(ActionType type) {
     case ActionType::OpenWebpage:    return L"openWebpage";
     case ActionType::OpenFile:       return L"openFile";
     case ActionType::TimerRecordTime: return L"timerRecordTime";
+    case ActionType::GetCursorPos:    return L"getCursorPos";
     case ActionType::CustomText:     return L"customText";
+    case ActionType::AiTextAnalysis:  return L"aiTextAnalysis";
+    case ActionType::AiImageAnalysis: return L"aiImageAnalysis";
+    case ActionType::AiActionExecute: return L"aiActionExecute";
     }
     return L"customText";
 }

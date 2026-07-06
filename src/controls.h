@@ -13,6 +13,10 @@ HINSTANCE GetThisModule();
 HWND MakeLabel(HWND parent, const wchar_t* text, int id,
                int x, int y, int w, int h);
 
+/// 创建自绘下拉显示标签控件
+HWND MakeComboLabel(HWND parent, const wchar_t* text, int id,
+                    int x, int y, int w, int h);
+
 /// 创建左对齐文本标签（顶部对齐，用于编辑器参数区标题）
 HWND MakeEditorLabel(HWND parent, const wchar_t* text, int id,
                      int x, int y, int w, int h);

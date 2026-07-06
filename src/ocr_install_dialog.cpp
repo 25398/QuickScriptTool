@@ -3,6 +3,7 @@
 #include "config.h"
 #include "drawing.h"
 #include "ocr_engine.h"
+#include "taskbar_window.h"
 
 #include <windowsx.h>
 
@@ -59,6 +60,8 @@ bool OcrInstallDialog::Show(HWND owner, bool repairMode) {
         x, y, kDialogW, kDialogH,
         owner, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
+
+    ApplyTaskbarWindowStyle(hwnd_, repairMode ? L"文字识别插件修复" : L"文字识别插件安装");
 
     EnableWindow(owner, FALSE);
     ShowWindow(hwnd_, SW_SHOW);

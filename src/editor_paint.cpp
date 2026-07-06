@@ -1,6 +1,8 @@
 // ── 编辑器绘制函数 ────────────────────────────────────────
 #include "main_window.h"
 #include "drawing.h"
+#include "scheduled_task_ui.h"
+#include "modern_edit.h"
 
 // --------------------------------------------------
     void MainWindow::PaintActionListLocal(HDC hdc, int width, int height) {
@@ -110,30 +112,96 @@
     }
 
 // --------------------------------------------------
-    void MainWindow::PaintClickerIntervalPopup(HDC hdc) {
-        if (!clickerIntervalOpen_) return;
-        RECT popup = ClickerIntervalPopupRect();
-        FillRectColor(hdc, popup, kWhite);
-        DrawBorderRect(hdc, popup, kComboPopupBorderGray);
+    void MainWindow::DrawClickerPopupMenuItem(HDC hdc, const RECT& row, const wchar_t* title,
+        const wchar_t* desc, bool checked, bool hovered) {
+        const int rowH = row.bottom - row.top;
+        COLORREF bg = checked ? RGB(232, 245, 238)
+            : (hovered ? kComboMenuHoverBlue : kWhite);
+        FillRectColor(hdc, row, bg);
 
-        const quickscript::ClickIntervalMode modes[3] = {
-            quickscript::ClickIntervalMode::Custom,
-            quickscript::ClickIntervalMode::Efficient,
-            quickscript::ClickIntervalMode::Extreme
-        };
-        const wchar_t* descs[3] = {
-            L"手动输入间隔时间",
-            L"间隔0.1秒(每秒10次)",
-            L"间隔0.01秒(每秒100次)"
-        };
-        for (int i = 0; i < 3; ++i) {
-            RECT row = ClickerIntervalOptionRect(i);
-            const bool checked = clickerSettings_.intervalMode == modes[i];
-            FillRectColor(hdc, row, checked ? RGB(232, 245, 238) : kWhite);
-            RECT box{row.left + 20, row.top + 19, row.left + 38, row.top + 37};
-            DrawListCheckbox(hdc, box, checked);
-            DrawTextIn(hdc, ClickIntervalTitle(modes[i]), RECT{row.left + 78, row.top + 12, row.right - 20, row.top + 39}, RGB(50, 50, 50));
-            DrawTextIn(hdc, descs[i], RECT{row.left + 78, row.top + 41, row.right - 20, row.bottom - 8}, RGB(145, 145, 145));
+        static constexpr int kPopupCheckboxSize = 22;
+        const int boxTop = row.top + (rowH - kPopupCheckboxSize) / 2;
+        RECT box{row.left + 11, boxTop, row.left + 11 + kPopupCheckboxSize, boxTop + kPopupCheckboxSize};
+        StDrawCheckbox(hdc, box, checked);
+
+        SelectObject(hdc, homeFont_);
+        const int textLeft = box.right + 10;
+        const int titleH = 24;
+        const int descH = 22;
+        const int textGap = 8;
+        const int blockH = titleH + textGap + descH;
+        const int blockTop = row.top + (rowH - blockH) / 2;
+        const COLORREF titleColor = checked ? RGB(30, 30, 30) : (hovered ? kText : RGB(30, 30, 30));
+        DrawTextIn(hdc, title, RECT{textLeft, blockTop, row.right - 10, blockTop + titleH},
+            titleColor, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, desc, RECT{textLeft, blockTop + titleH + textGap, row.right - 10, blockTop + blockH},
+            RGB(145, 150, 155), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    void MainWindow::PaintClickerDropPopupContent(HDC hdc, HWND popupHwnd) {
+        if (clickerDropPopupKind_ < 0) return;
+        RECT client{};
+        GetClientRect(popupHwnd, &client);
+        FillRectColor(hdc, client, kWhite);
+        DrawBorderRect(hdc, client, kComboPopupBorderGray);
+
+        const int itemCount = ClickerPopupItemCount();
+        const int visible = ClickerPopupVisibleCount();
+        const int scrollMax = std::max(0, itemCount - visible);
+        clickerPopupScroll_ = std::clamp(clickerPopupScroll_, 0, scrollMax);
+        const int contentRight = client.right - 1 - (scrollMax > 0 ? 12 : 0);
+
+        if (clickerDropPopupKind_ == 0) {
+            const quickscript::ClickIntervalMode modes[3] = {
+                quickscript::ClickIntervalMode::Custom,
+                quickscript::ClickIntervalMode::Efficient,
+                quickscript::ClickIntervalMode::Extreme
+            };
+            const wchar_t* descs[3] = {
+                L"手动输入间隔时间",
+                L"间隔0.1秒(每秒10次)",
+                L"间隔0.01秒(每秒100次)"
+            };
+            for (int vis = 0; vis < visible; ++vis) {
+                const int i = vis + clickerPopupScroll_;
+                if (i >= itemCount) break;
+                RECT row{client.left + 1, client.top + 1 + vis * kClickerDropdownItemH,
+                    contentRight, client.top + 1 + (vis + 1) * kClickerDropdownItemH};
+                const bool checked = clickerSettings_.intervalMode == modes[i];
+                const bool hovered = !checked && clickerPopupHover_ == i;
+                DrawClickerPopupMenuItem(hdc, row, ClickIntervalTitle(modes[i]).c_str(), descs[i], checked, hovered);
+            }
+        } else {
+            static const HotkeyMenuItem kItems[] = {
+                {kHotCustom, L"自定义", L"将您指定的按键设为启停热键"},
+                {kHotF8, L"F8", L"将F8设为启停热键"},
+                {kHotF10, L"F10", L"将F10设为启停热键"},
+                {kHotLeft, L"鼠标左键", L"将长按左键设为启停热键"},
+                {kHotMiddle, L"鼠标中键", L"将点击中键设为启停热键"},
+                {kHotRight, L"鼠标右键", L"将点击右键设为启停热键"},
+                {kHotX1, L"鼠标侧键1", L"一般为鼠标左侧后部的键"},
+                {kHotX2, L"鼠标侧键2", L"一般为鼠标左侧前部的键"},
+                {kHotSpace, L"空格键", L"将空格键设为启停热键"},
+            };
+            for (int vis = 0; vis < visible; ++vis) {
+                const int i = vis + clickerPopupScroll_;
+                if (i >= itemCount) break;
+                RECT row{client.left + 1, client.top + 1 + vis * kClickerDropdownItemH,
+                    contentRight, client.top + 1 + (vis + 1) * kClickerDropdownItemH};
+                const bool checked = IsHotkeyMenuChecked(kItems[i].id);
+                const bool hovered = !checked && clickerPopupHover_ == i;
+                DrawClickerPopupMenuItem(hdc, row, kItems[i].title, kItems[i].desc, checked, hovered);
+            }
+        }
+
+        if (scrollMax > 0) {
+            RECT track{client.right - 10, client.top + 1, client.right - 1, client.bottom - 1};
+            FillRectColor(hdc, track, kComboScrollTrackGray);
+            const int trackH = track.bottom - track.top;
+            const int thumbH = std::max(18, trackH * visible / itemCount);
+            const int thumbTop = track.top + (trackH - thumbH) * clickerPopupScroll_ / scrollMax;
+            RECT thumb{track.left, thumbTop, track.right, thumbTop + thumbH};
+            FillRectColor(hdc, thumb, kComboScrollThumbGray);
         }
     }
 
@@ -142,7 +210,8 @@
         const COLORREF borderColor = dropped ? kMainGreen : kComboBorderGray;
         FillRectColor(hdc, rc, kWhite);
         const int arrowW = 26;
-        DrawTextIn(hdc, GetText(label).empty() ? L" " : GetText(label), RECT{rc.left + 10, rc.top, rc.right - arrowW, rc.bottom}, kText);
+        const std::wstring comboText = EditorComboDisplayText(label);
+        DrawTextIn(hdc, comboText.empty() ? L" " : comboText, RECT{rc.left + 10, rc.top, rc.right - arrowW, rc.bottom}, kText);
         const int arrowCenterX = rc.right - arrowW / 2;
         const int arrowCenterY = rc.top + (rc.bottom - rc.top) / 2;
         POINT arrow[3] = {
@@ -261,19 +330,116 @@
     }
 
 // --------------------------------------------------
-    void MainWindow::PaintEditor(HDC hdc) {
+    void MainWindow::PaintEditorListHeaderChrome(HDC hdc) {
+        const auto sx = [](int x) { return MulDiv(x, kEditorWidth, kEditorBaseWidth); };
+
+        // 动作列表上边框横线（右缘 776 为设计稿列表宽度，不延伸到右侧参数面板）
+        constexpr int kListHeaderLineRight = 776;
+        const int listLeft = sx(kListX);
+        const int listRight = sx(kListHeaderLineRight);
+        const int headerLineY = kListY;
+
         HPEN pen = CreatePen(PS_SOLID, 1, kLineGreen);
-        auto oldPen = SelectObject(hdc, pen);
-        MoveToEx(hdc, kListX, kListY + 3, nullptr);
-        LineTo(hdc, kListX + kListW, kListY + 3);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        MoveToEx(hdc, listLeft, headerLineY, nullptr);
+        LineTo(hdc, listRight, headerLineY);
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
-        for (HWND child = GetWindow(hwnd_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
-            if (!IsWindowVisible(child) || child == listRemarkEdit_) continue;
-            wchar_t cls[16]{};
-            GetClassNameW(child, cls, 16);
-            if (wcscmp(cls, L"Edit") == 0) DrawEditorFieldBorder(hdc, child);
+    }
+
+    void MainWindow::PaintEditorParamChrome(HDC hdc, HWND hdcWindow) {
+        if (!hdcWindow) hdcWindow = hwnd_;
+        const bool vpDc = (hdcWindow == paramViewport_);
+        auto controlOnThisDc = [&](HWND h) {
+            if (!h) return false;
+            return IsParamViewportChild(h) ? vpDc : !vpDc;
+        };
+        auto mapRect = [&](const RECT& rc) { return MapRectFromMain(hdcWindow, rc); };
+
+        RECT contentVp = mapRect(ParamScrollContentRect());
+        HRGN paramClip = CreateRectRgnIndirect(&contentVp);
+        HRGN oldClip = CreateRectRgn(0, 0, 0, 0);
+        const int hadClip = GetClipRgn(hdc, oldClip);
+        SelectClipRgn(hdc, paramClip);
+
+        SelectObject(hdc, editorFont_);
+        auto drawComboIfActive = [&](HWND h, int popupId) {
+            if (!controlOnThisDc(h) || !IsWindowVisible(h) || !IsParamComboVisible(popupId)) return;
+            RECT rc = mapRect(WindowClientRect(h));
+            if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+            if (!ParamRectIntersectsContent(WindowClientRect(h))) return;
+            DrawEditorCombo(hdc, h, rc, editorPopupOpen_ == popupId);
+        };
+        drawComboIfActive(mousePressButton_, 2);
+        drawComboIfActive(clickButton_, 3);
+        drawComboIfActive(loopTypeCombo_, 4);
+        drawComboIfActive(runBlockCombo_, 5);
+        drawComboIfActive(hotkeyShortcutCombo_, 6);
+        if (HWND varCombo = ActiveVarComboHwnd()) drawComboIfActive(varCombo, 7);
+        drawComboIfActive(runMacroCombo_, 8);
+        drawComboIfActive(mousePlaybackCombo_, 9);
+        drawComboIfActive(scrollDirectionCombo_, 10);
+        drawComboIfActive(findFollowUpCombo_, 11);
+        drawComboIfActive(ifVarCombo_, 12);
+        drawComboIfActive(ifOperatorCombo_, 13);
+        drawComboIfActive(ifConnectorCombo_, 14);
+        drawComboIfActive(runProgramCombo_, 15);
+        drawComboIfActive(ocrResultModeCombo_, 16);
+        drawComboIfActive(ocrFollowUpCombo_, 17);
+        drawComboIfActive(ocrSearchVarCombo_, 18);
+        drawComboIfActive(aiModelCombo_, 19);
+        drawComboIfActive(aiContextModeCombo_, 20);
+        drawComboIfActive(aiOutputTypeCombo_, 21);
+
+        auto drawEditBorder = [&](HWND h) {
+            if (!controlOnThisDc(h) || !IsWindowVisible(h)) return;
+            if (h == listRemarkEdit_) return;
+            RECT rc = WindowClientRect(h);
+            if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+            RECT outer = rc;
+            InflateRect(&outer, 1, 1);
+            if (!ParamRectIntersectsContent(outer)) return;
+            DrawEditorFieldBorder(hdc, h, hdcWindow);
+        };
+        const int sel = popupAction_.sel;
+        for (const auto& [idx, result] : paramLayoutResults_) {
+            if (idx != sel && !IsSubPanelIdxVisible(sel, idx)) continue;
+            for (const auto& p : result.placements) {
+                if (!p.hwnd || !IsWindowVisible(p.hwnd)) continue;
+                if (p.type == UIComponentType::Edit
+                    || p.type == UIComponentType::FieldEdit
+                    || p.type == UIComponentType::MultilineEdit
+                    || p.type == UIComponentType::CaptureField) {
+                    drawEditBorder(p.hwnd);
+                }
+            }
         }
+        if (remark_ && IsWindowVisible(remark_)) drawEditBorder(remark_);
+
+        for (const auto& [idx, result] : paramLayoutResults_) {
+            if (idx != sel && !IsSubPanelIdxVisible(sel, idx)) continue;
+            for (const auto& p : result.placements) {
+                if (!controlOnThisDc(p.hwnd) || !p.hwnd || !IsWindowVisible(p.hwnd)) continue;
+                if (p.type != UIComponentType::CheckBox) continue;
+                RECT rc = mapRect(WindowClientRect(p.hwnd));
+                if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
+                if (!ParamRectIntersectsContent(WindowClientRect(p.hwnd))) continue;
+                const int cbSize = 18;
+                const int cbTop = rc.top + (rc.bottom - rc.top - cbSize) / 2;
+                RECT cbRc{rc.left, cbTop, rc.left + cbSize, cbTop + cbSize};
+                FillRectColor(hdc, cbRc, kWhite);
+                StDrawCheckbox(hdc, cbRc, Checked(p.hwnd));
+            }
+        }
+
+        SelectClipRgn(hdc, hadClip == 1 ? oldClip : nullptr);
+        DeleteObject(paramClip);
+        DeleteObject(oldClip);
+    }
+
+    void MainWindow::PaintEditor(HDC hdc) {
+        PaintParamScrollScrollbar(hdc);
+
         SelectObject(hdc, editorFont_);
         const RECT modeRc = WindowClientRect(mode_);
         const RECT actionRc = WindowClientRect(actionCombo_);
@@ -281,33 +447,42 @@
         DrawEditorCombo(hdc, mode_, modeRc, editorPopupOpen_ == 0);
         DrawTextIn(hdc, L"请选择要添加的宏", RECT{actionRc.left, actionRc.top - 28, actionRc.right, actionRc.top - 4}, kText);
         DrawEditorCombo(hdc, actionCombo_, actionRc, editorPopupOpen_ == 1);
-        if (IsParamComboVisible(2)) DrawEditorCombo(hdc, mousePressButton_, WindowClientRect(mousePressButton_), editorPopupOpen_ == 2);
-        if (IsParamComboVisible(3)) DrawEditorCombo(hdc, clickButton_, WindowClientRect(clickButton_), editorPopupOpen_ == 3);
-        if (IsParamComboVisible(4)) DrawEditorCombo(hdc, loopTypeCombo_, WindowClientRect(loopTypeCombo_), editorPopupOpen_ == 4);
-        if (IsParamComboVisible(5)) DrawEditorCombo(hdc, runBlockCombo_, WindowClientRect(runBlockCombo_), editorPopupOpen_ == 5);
-        if (IsParamComboVisible(6)) DrawEditorCombo(hdc, hotkeyShortcutCombo_, WindowClientRect(hotkeyShortcutCombo_), editorPopupOpen_ == 6);
-        if (IsParamComboVisible(7)) DrawEditorCombo(hdc, quickInputVarCombo_, WindowClientRect(quickInputVarCombo_), editorPopupOpen_ == 7);
-        if (IsParamComboVisible(8)) DrawEditorCombo(hdc, runMacroCombo_, WindowClientRect(runMacroCombo_), editorPopupOpen_ == 8);
-        if (IsParamComboVisible(9)) DrawEditorCombo(hdc, mousePlaybackCombo_, WindowClientRect(mousePlaybackCombo_), editorPopupOpen_ == 9);
-        if (IsParamComboVisible(10)) DrawEditorCombo(hdc, scrollDirectionCombo_, WindowClientRect(scrollDirectionCombo_), editorPopupOpen_ == 10);
-        if (IsParamComboVisible(11)) DrawEditorCombo(hdc, findFollowUpCombo_, WindowClientRect(findFollowUpCombo_), editorPopupOpen_ == 11);
-        if (IsParamComboVisible(12)) DrawEditorCombo(hdc, ifVarCombo_, WindowClientRect(ifVarCombo_), editorPopupOpen_ == 12);
-        if (IsParamComboVisible(13)) DrawEditorCombo(hdc, ifOperatorCombo_, WindowClientRect(ifOperatorCombo_), editorPopupOpen_ == 13);
-        if (IsParamComboVisible(14)) DrawEditorCombo(hdc, ifConnectorCombo_, WindowClientRect(ifConnectorCombo_), editorPopupOpen_ == 14);
-        if (IsParamComboVisible(15)) DrawEditorCombo(hdc, runProgramCombo_, WindowClientRect(runProgramCombo_), editorPopupOpen_ == 15);
-        if (IsParamComboVisible(16)) DrawEditorCombo(hdc, ocrResultModeCombo_, WindowClientRect(ocrResultModeCombo_), editorPopupOpen_ == 16);
-        if (IsParamComboVisible(17)) DrawEditorCombo(hdc, ocrFollowUpCombo_, WindowClientRect(ocrFollowUpCombo_), editorPopupOpen_ == 17);
-        if (IsParamComboVisible(18)) DrawEditorCombo(hdc, ocrSearchVarCombo_, WindowClientRect(ocrSearchVarCombo_), editorPopupOpen_ == 18);
+        if (name_ && IsWindowVisible(name_)) {
+            DrawEditOuterBorder(hdc, hwnd_, name_, kComboBorderGray);
+        }
         PaintActionList(hdc);
+        PaintEditorListHeaderChrome(hdc);
         PaintDragMarker(hdc);
     }
 
 // --------------------------------------------------
-    void MainWindow::DrawEditorFieldBorder(HDC hdc, HWND ctrl) {
+    void MainWindow::PaintParamScrollScrollbar(HDC hdc) {
+        if (MaxParamScroll() <= 0) return;
+        RECT track = ParamScrollTrackRect();
+        if (track.bottom <= track.top) return;
+        FillRectColor(hdc, track, kScrollTrackGray);
+        RECT thumb = ParamScrollThumbRect();
+        FillRectColor(hdc, thumb, kScrollThumbGray);
+    }
+
+// --------------------------------------------------
+    void MainWindow::DrawEditorFieldBorder(HDC hdc, HWND ctrl, HWND hdcWindow) {
         if (!ctrl || !IsWindowVisible(ctrl)) return;
-        RECT rc = WindowClientRect(ctrl);
-        if (ctrl != name_) InflateRect(&rc, 1, 1);
-        DrawBorderRect(hdc, rc, kLineGreen);
+        if (!hdcWindow) hdcWindow = hwnd_;
+        RECT rc = MapRectFromMain(hdcWindow, WindowClientRect(ctrl));
+        InflateRect(&rc, 1, 1);
+        if (ctrl == name_) {
+            DrawBorderRect(hdc, rc, kComboBorderGray);
+            return;
+        }
+        // 仅画边框，不填充内部——父 DC 填充会盖住 EDIT 子控件文字
+        RECT content = MapRectFromMain(hdcWindow, ParamScrollContentRect());
+        RECT visible{};
+        if (!IntersectRect(&visible, &rc, &content)) return;
+        const int saved = SaveDC(hdc);
+        IntersectClipRect(hdc, content.left, content.top, content.right, content.bottom);
+        DrawBorderRect(hdc, visible, kComboBorderGray);
+        RestoreDC(hdc, saved);
     }
 
 // --------------------------------------------------

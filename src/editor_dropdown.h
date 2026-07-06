@@ -5,5 +5,7 @@
 
 LRESULT CALLBACK EditorDropPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 LRESULT CALLBACK EditorTipPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+LRESULT CALLBACK ClickerDropPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void RegisterEditorDropPopupClass();
 void RegisterEditorTipPopupClass();
+void RegisterClickerDropPopupClass();

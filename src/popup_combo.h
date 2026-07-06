@@ -27,3 +27,7 @@ HWND MakeCombo(HWND parent, int id, int x, int y, int w, int h);
 
 // 配置组合框下拉特性的辅助函数
 void ConfigureComboDropdown(HWND combo, int visibleRows);
+
+// 组合框 owner-draw 绘制与测量（供设置/Agent 等对话框复用）
+void DrawComboOwnerItem(DRAWITEMSTRUCT* dis, HFONT font);
+void MeasureComboOwnerItem(MEASUREITEMSTRUCT* mis);

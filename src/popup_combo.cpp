@@ -103,3 +103,44 @@ void ConfigureComboDropdown(HWND combo, int visibleRows) {
     SendMessageW(combo, CB_SETDROPPEDWIDTH, static_cast<WPARAM>(std::max(0L, rc.right - rc.left)), 0);
     StyleComboDropdownList(combo);
 }
+
+void MeasureComboOwnerItem(MEASUREITEMSTRUCT* mis) {
+    if (!mis || mis->CtlType != ODT_COMBOBOX) return;
+    mis->itemHeight = kComboItemH;
+}
+
+void DrawComboOwnerItem(DRAWITEMSTRUCT* dis, HFONT font) {
+    if (!dis || dis->CtlType != ODT_COMBOBOX || dis->itemID == static_cast<UINT>(-1)) return;
+    const bool inList = (dis->itemState & ODS_COMBOBOXEDIT) == 0;
+    const int curSel = static_cast<int>(SendMessageW(dis->hwndItem, CB_GETCURSEL, 0, 0));
+    const bool isCurSel = inList && static_cast<int>(dis->itemID) == curSel;
+    bool highlighted = false;
+    if (inList && !isCurSel) {
+        COMBOBOXINFO cbi{sizeof(cbi)};
+        if (GetComboBoxInfo(dis->hwndItem, &cbi) && cbi.hwndList) {
+            auto it = g_comboListHover.find(cbi.hwndList);
+            highlighted = (it != g_comboListHover.end() && it->second == static_cast<int>(dis->itemID));
+        }
+    }
+    COLORREF bg = kWhite;
+    COLORREF fg = inList ? kText : kMainGreen;
+    if (isCurSel) {
+        bg = kComboMenuSelectBlue;
+        fg = kComboMenuSelectText;
+    } else if (highlighted) {
+        bg = kComboMenuHoverBlue;
+        fg = kText;
+    }
+    RECT rc = dis->rcItem;
+    HBRUSH brush = CreateSolidBrush(bg);
+    FillRect(dis->hDC, &rc, brush);
+    DeleteObject(brush);
+    wchar_t text[256]{};
+    SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(text));
+    SelectObject(dis->hDC, font);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, fg);
+    RECT textRc{rc.left + 8, rc.top, rc.right - 8, rc.bottom};
+    DrawTextW(dis->hDC, text, -1, &textRc,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}

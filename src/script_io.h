@@ -20,5 +20,6 @@ struct ScriptFileData {
 
 ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo);
 void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last);
+std::wstring ScriptActionToJsonString(const ScriptAction& a);
 ScriptFileData LoadScriptFileData(const std::wstring& path);
 bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data);
