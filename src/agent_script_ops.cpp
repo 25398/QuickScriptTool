@@ -1,11 +1,13 @@
 #include "agent_script_ops.h"
 
+#include "action_tree.h"
 #include "agent_ui_notify.h"
 #include "agent_ai_actions.h"
 #include "script_action_builder.h"
 #include "script_io.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -28,6 +30,14 @@ std::wstring DirFromHint(const std::wstring& dirHint) {
 }
 
 struct FindResult { std::wstring path; bool found = false; };
+
+size_t StripCustomTextActions(std::vector<ScriptAction>& actions) {
+    const size_t before = actions.size();
+    actions.erase(std::remove_if(actions.begin(), actions.end(),
+        [](const ScriptAction& a) { return a.type == ActionType::CustomText; }),
+        actions.end());
+    return before - actions.size();
+}
 
 FindResult FindScriptFile(const std::wstring& fileName, const std::wstring& dirHint) {
     if (!IsSafeFileName(fileName))
@@ -257,9 +267,14 @@ bool BuildActionsFromJson(const std::vector<json>& actionParams,
             error = L"第 " + std::to_wstring(i + 1) + L" 个动作：" + built.error;
             return false;
         }
-        if (built.action.originalNo <= 0)
-            built.action.originalNo = static_cast<int>(i + 1);
         out.push_back(std::move(built.action));
+    }
+    EnsureStopMacroOnActions(out);
+    NormalizeScriptActionList(out);
+    if (const std::wstring endLoopErr = ValidateEndLoopPlacements(out); !endLoopErr.empty()) {
+        error = endLoopErr;
+        out.clear();
+        return false;
     }
     return true;
 }
@@ -272,42 +287,47 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
     if (!ValidateJsonFileName(fileName, err)) return FailMsg(L"[错误] " + err);
     if (content.empty()) return FailMsg(L"[错误] 缺少 content 参数。");
 
-    const std::wstring scriptName = ExtractString(content, L"scriptName");
-    if (scriptName.empty()) return FailMsg(L"[错误] 内容缺少 scriptName 字段。");
+    ScriptFileData data = ParseScriptContent(content);
+    if (data.scriptName.empty()) return FailMsg(L"[错误] 内容缺少 scriptName 字段。");
+    if (data.actions.empty()) return FailMsg(L"[错误] 内容中没有找到动作（actions 数组为空）。");
 
-    if (ExtractJsonActionBlocks(content).empty())
-        return FailMsg(L"[错误] 内容中没有找到动作（actions 数组为空）。");
+    const size_t stripped = StripCustomTextActions(data.actions);
+    if (data.actions.empty())
+        return FailMsg(L"[错误] 动作均为无效的 customText/未知类型，已拒绝保存。请用 buildScriptActions 生成。");
+    const bool addedStopMacro = EnsureStopMacroOnActions(data.actions);
+    NormalizeScriptActionList(data.actions);
 
     EnsureScriptsDir();
     const std::wstring targetDir = (dirHint == L"recordings") ? RecordingsDir() : ScriptsDir();
     const std::wstring fullPath = targetDir + L"\\" + fileName;
 
-    std::ofstream out(fullPath, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) return FailMsg(L"[错误] 无法写入文件：" + fileName);
+    if (!SaveScriptFileData(fullPath, data))
+        return FailMsg(L"[错误] 写入文件失败：" + fileName);
 
-    out.write("\xEF\xBB\xBF", 3);
-    const std::string utf8 = ToUtf8(content);
-    out.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
-    out.close();
-    if (!out.good()) return FailMsg(L"[错误] 写入文件失败：" + fileName);
-
-    const ScriptFileData verify = LoadScriptFileData(fullPath);
+    ScriptFileData verify = LoadScriptFileData(fullPath);
     if (verify.actions.empty()) return FailMsg(L"[错误] 写入后验证失败。");
 
-    ScriptFileData normalized = verify;
     bool modelFilled = false;
-    for (auto& a : normalized.actions) {
+    for (auto& a : verify.actions) {
         const std::wstring before = a.aiModelName;
         EnsureAiModelOnAction(a);
         if (a.aiModelName != before) modelFilled = true;
     }
-    if (modelFilled && !SaveScriptFileData(fullPath, normalized))
-        return FailMsg(L"[错误] 补全 AI 模型后保存失败：" + fileName);
+    if (modelFilled) {
+        NormalizeScriptActionList(verify.actions);
+        if (!SaveScriptFileData(fullPath, verify))
+            return FailMsg(L"[错误] 补全 AI 模型后保存失败：" + fileName);
+    }
 
     const std::wstring dirLabel = (dirHint == L"recordings") ? L"录制" : L"脚本";
-    return OkMsg(L"✓ " + dirLabel + L"已保存：" + fileName + L"\n"
+    std::wstring msg = L"✓ " + dirLabel + L"已保存：" + fileName + L"\n"
         L"  名称: " + verify.scriptName + L"\n"
-        L"  动作数: " + std::to_wstring(verify.actions.size()));
+        L"  动作数: " + std::to_wstring(verify.actions.size());
+    if (stripped > 0)
+        msg += L"\n  [提示] 已移除 " + std::to_wstring(stripped) + L" 个无效 customText 动作（说明应写 remark）";
+    if (addedStopMacro)
+        msg += L"\n  [提示] 已自动追加 stopMacro（结束宏运行）";
+    return OkMsg(msg);
 }
 
 AgentScriptOpResult AgentCreateMacroScript(const std::wstring& fileName,

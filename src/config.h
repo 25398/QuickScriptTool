@@ -76,6 +76,9 @@ constexpr COLORREF kComboMenuSelectText = RGB(255, 255, 255);
 constexpr int kEditorPopupItemH = 32;
 constexpr int kEditorPopupMaxHeight = 450;
 constexpr int kEditorPopupMaxVisible = 10;
+/// 主界面窗口外扩透明阴影（贴窗口一侧最深，向外渐浅）
+constexpr int kWindowEdgeShadowSize = 4;
+constexpr int kWindowEdgeShadowMaxAlpha = 48;
 // 编辑界面下拉框基准尺寸（1024×768 设计稿，缩放后在 1200×1080 下约为 150×30 / 240×30）
 constexpr int kEditorModeComboW = 128;
 constexpr int kEditorModeComboH = 21;
@@ -201,6 +204,8 @@ constexpr UINT WM_GLOBAL_HOTKEY_DETECTED = WM_APP + 14;
 constexpr UINT WM_OPEN_AGENT_DIALOG = WM_APP + 15;
 constexpr UINT WM_AGENT_SCRIPT_LIBRARY_CHANGED = WM_APP + 20;
 constexpr UINT WM_EDITOR_PARAM_CHROME = WM_APP + 21;
+constexpr UINT WM_APP_PROMPT = WM_APP + 22;
+constexpr UINT WM_OCR_SUBPANEL_REFRESH = WM_APP + 23;
 constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
 constexpr int HOTKEY_COMMON_ID = 701;
 constexpr int HOTKEY_GLOBAL_ID = 702;

@@ -11,7 +11,7 @@
 #include <string>
 
 // ── 脚本动作类型枚举 ──────────────────────────────────────────────
-// 共 27 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
+// 共 28 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
 enum class ActionType {
     MoveMouse,
     Wait,
@@ -37,6 +37,7 @@ enum class ActionType {
     LockScreenshot,
     UnlockScreenshot,
     StopMacro,
+    Goto,
     RunProgram,
     CloseProgram,
     OpenWebpage,
@@ -108,7 +109,8 @@ struct ScriptAction {
     int findImageFollowUp = 0;              // 0=点击, 1=移动, 2=保存变量
     int offsetX = 0;                         // 点击偏移 X
     int offsetY = 0;                         // 点击偏移 Y
-    bool findUntilFound = false;             // 是否循环查找直到找到
+    bool findUntilFound = false;             // OCR 文字查找：是否循环直到找到
+    std::wstring findTimeExpr = L"0";        // 找图时限（秒，可小数；0=只找一次；-1=直到找到；支持变量名）
     std::wstring matchVarName = L"matchRet";  // 匹配结果变量名
     // ── 文字识别相关 ──
     bool ocrRegionByImage = false;           // 获取文字：根据找图结果选取相对 OCR 区域
@@ -117,6 +119,7 @@ struct ScriptAction {
     std::wstring ocrSearchText;              // 文字查找目标（可含变量）
     int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到, 2=保存到变量
     std::wstring conditionExpr;               // 条件表达式 (If 动作)
+    std::wstring gotoStepExpr;                // 跳转目标序号（支持变量表达式）
     bool matchFileNameOnly = false;           // 关闭程序时仅匹配文件名
     // ── AI 动作通用 ──
     std::wstring aiPrompt;              // 用户 prompt（支持 {变量}）

@@ -207,6 +207,11 @@ std::wstring ActionName(const ScriptAction& action) {
         return L"解锁截屏";
     case ActionType::StopMacro:
         return L"结束宏运行";
+    case ActionType::Goto: {
+        std::wstring target = action.gotoStepExpr;
+        if (target.empty()) target = L"未填写";
+        return L"跳转到第[" + target + L"]步";
+    }
     case ActionType::RunProgram:
         return L"打开程序[" + RunProgramDisplayName(action.shortcutPreset, action.targetPath) + L"]";
     case ActionType::CloseProgram: {
@@ -253,6 +258,115 @@ std::wstring ActionName(const ScriptAction& action) {
     return L"未知动作";
 }
 
+std::wstring ActionTypeBriefLabel(ActionType type) {
+    switch (type) {
+    case ActionType::MoveMouse: return L"移动鼠标到";
+    case ActionType::Wait: return L"等待";
+    case ActionType::MouseClick: return L"鼠标点击";
+    case ActionType::MouseDown: return L"鼠标按下";
+    case ActionType::MouseUp: return L"鼠标松开";
+    case ActionType::MousePlayback: return L"鼠标回放";
+    case ActionType::RunMacro: return L"运行鼠标宏";
+    case ActionType::KeyClick: return L"按键点击";
+    case ActionType::KeyDown: return L"键盘按下";
+    case ActionType::KeyUp: return L"键盘松开";
+    case ActionType::HotkeyShortcut: return L"快捷按键";
+    case ActionType::QuickInput: return L"快捷输入";
+    case ActionType::ScrollWheel: return L"滚动滚轮";
+    case ActionType::Loop: return L"循环";
+    case ActionType::EndLoop: return L"跳出循环";
+    case ActionType::DefineBlock: return L"定义宏指令块";
+    case ActionType::RunBlock: return L"运行宏指令块";
+    case ActionType::FindImage: return L"找图(返回最匹配的)";
+    case ActionType::TextRecognition: return L"文字识别";
+    case ActionType::If: return L"条件-如果";
+    case ActionType::Else: return L"条件-否则";
+    case ActionType::LockScreenshot: return L"锁定截屏";
+    case ActionType::UnlockScreenshot: return L"解锁截屏";
+    case ActionType::StopMacro: return L"结束宏运行";
+    case ActionType::Goto: return L"跳转";
+    case ActionType::RunProgram: return L"运行程序";
+    case ActionType::CloseProgram: return L"关闭程序";
+    case ActionType::OpenWebpage: return L"打开网页";
+    case ActionType::OpenFile: return L"打开文件";
+    case ActionType::TimerRecordTime: return L"计时器记录时间";
+    case ActionType::GetCursorPos: return L"获取当前光标位置";
+    case ActionType::AiTextAnalysis: return L"AI文字分析";
+    case ActionType::AiImageAnalysis: return L"AI图片分析";
+    case ActionType::AiActionExecute: return L"AI动作执行";
+    case ActionType::CustomText: return L"自定义文本";
+    }
+    return L"未知动作";
+}
+
+std::wstring JsonTypeBriefLabel(const std::wstring& jsonType) {
+    static const struct { const wchar_t* json; ActionType type; } kMap[] = {
+        {L"moveMouse", ActionType::MoveMouse}, {L"wait", ActionType::Wait},
+        {L"mouseClick", ActionType::MouseClick}, {L"mouseDown", ActionType::MouseDown},
+        {L"mouseUp", ActionType::MouseUp}, {L"mousePlayback", ActionType::MousePlayback},
+        {L"runMacro", ActionType::RunMacro}, {L"keyClick", ActionType::KeyClick},
+        {L"keyDown", ActionType::KeyDown}, {L"keyUp", ActionType::KeyUp},
+        {L"hotkeyShortcut", ActionType::HotkeyShortcut}, {L"quickInput", ActionType::QuickInput},
+        {L"scrollWheel", ActionType::ScrollWheel}, {L"loop", ActionType::Loop},
+        {L"endLoop", ActionType::EndLoop}, {L"defineBlock", ActionType::DefineBlock},
+        {L"runBlock", ActionType::RunBlock}, {L"findImage", ActionType::FindImage},
+        {L"textRecognition", ActionType::TextRecognition}, {L"if", ActionType::If},
+        {L"else", ActionType::Else}, {L"lockScreenshot", ActionType::LockScreenshot},
+        {L"unlockScreenshot", ActionType::UnlockScreenshot}, {L"stopMacro", ActionType::StopMacro},
+        {L"goto", ActionType::Goto}, {L"runProgram", ActionType::RunProgram},
+        {L"closeProgram", ActionType::CloseProgram}, {L"openWebpage", ActionType::OpenWebpage},
+        {L"openFile", ActionType::OpenFile}, {L"timerRecordTime", ActionType::TimerRecordTime},
+        {L"getCursorPos", ActionType::GetCursorPos}, {L"customText", ActionType::CustomText},
+        {L"aiTextAnalysis", ActionType::AiTextAnalysis},
+        {L"aiImageAnalysis", ActionType::AiImageAnalysis},
+        {L"aiActionExecute", ActionType::AiActionExecute},
+    };
+    for (const auto& item : kMap) {
+        if (jsonType == item.json) return ActionTypeBriefLabel(item.type);
+    }
+    return jsonType;
+}
+
+std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions) {
+    if (actions.empty()) return L"";
+    std::wstring out =
+        L"【动作一览 — 对用户说明时必须用下列名称（与编辑器动作列一致），禁止说英文 type】\n";
+    for (size_t i = 0; i < actions.size(); ++i) {
+        const int no = actions[i].originalNo > 0
+            ? actions[i].originalNo : static_cast<int>(i + 1);
+        out += L"第" + std::to_wstring(no) + L"步 " + ActionName(actions[i]);
+        if (actions[i].indent > 0)
+            out += L"（缩进" + std::to_wstring(actions[i].indent) + L"）";
+        if (!actions[i].remark.empty())
+            out += L" 备注:" + actions[i].remark;
+        out += L"\n";
+    }
+    return out;
+}
+
+std::wstring ActionTypeReplyCatalog() {
+    return LR"(【动作 type 对用户的中文说法 — 与编辑器一致，禁止在回复中出现英文 type】
+wait→等待  moveMouse→移动鼠标到  mouseClick→鼠标点击  mouseDown→鼠标按下  mouseUp→鼠标松开
+mousePlayback→鼠标回放  runMacro→运行鼠标宏  keyClick→按键点击  keyDown→键盘按下  keyUp→键盘松开
+hotkeyShortcut→快捷按键  quickInput→快捷输入  scrollWheel→滚动滚轮
+loop→循环  endLoop→跳出循环  defineBlock→定义宏指令块  runBlock→运行宏指令块
+if→条件-如果  else→条件-否则  goto→跳转  stopMacro→结束宏运行
+findImage→找图  textRecognition→文字识别  lockScreenshot→锁定截屏  unlockScreenshot→解锁截屏
+runProgram→运行程序  closeProgram→关闭程序  openWebpage→打开网页  openFile→打开文件
+timerRecordTime→计时器记录时间  getCursorPos→获取当前光标位置
+aiTextAnalysis→AI文字分析  aiImageAnalysis→AI图片分析  aiActionExecute→AI动作执行
+说明某一步时优先写完整动作名（如「第8步 跳转到第[10]步」），不要写「动作8 goto」。)";
+}
+
+size_t FindActionIndexByNo(const std::vector<ScriptAction>& actions, int targetNo) {
+    for (size_t i = 0; i < actions.size(); ++i) {
+        const int no = actions[i].originalNo > 0
+            ? actions[i].originalNo : static_cast<int>(i + 1);
+        if (no == targetNo) return i;
+    }
+    return actions.size();
+}
+
 bool ScriptUsesTextRecognition(const std::vector<ScriptAction>& actions) {
     for (const auto& a : actions) {
         if (a.type == ActionType::TextRecognition) return true;
@@ -295,6 +409,7 @@ std::wstring JsonType(ActionType type) {
     case ActionType::LockScreenshot: return L"lockScreenshot";
     case ActionType::UnlockScreenshot: return L"unlockScreenshot";
     case ActionType::StopMacro:      return L"stopMacro";
+    case ActionType::Goto:           return L"goto";
     case ActionType::RunProgram:     return L"runProgram";
     case ActionType::CloseProgram:   return L"closeProgram";
     case ActionType::OpenWebpage:    return L"openWebpage";

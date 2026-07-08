@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include "config.h"
+#include "drawing.h"
 #include "utils.h"
 
 class HotkeyCapture {
@@ -63,4 +64,5 @@ private:
     bool hoverCancel_ = false;
     bool hoverReset_ = false;
     bool hoverDelete_ = false;
+    WindowOuterShadow outerShadow_;
 };

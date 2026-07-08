@@ -40,6 +40,7 @@
 #include "modern_edit.h"
 #include "main_features.h"
 #include "popup_combo.h"
+#include "prompt_modal.h"
 #include "crosshair_drag.h"
 #include "ocr_install_dialog.h"
 #include "ocr_engine.h"
@@ -60,14 +61,15 @@
 #include "script_action_builder.h"
 #include "utils.h"
 #include "agent_dialog.h"
+#include "agent_conversation_store.h"
 #include "agent_ui_notify.h"
 #include "ai_action_service.h"
 #include "agent_ai_actions.h"
 #include "ai_action_runtime.h"
 #include "ui_component.h"
 #include "editor_param_layout.h"
-
-extern HINSTANCE g_instance;
+#include "find_image_ui_debug.h"
+#include "taskbar_window.h"
 
 // ── Global-hotkey low-level hook (fallback when RegisterHotKey is unavailable) ──
 inline HHOOK ghHotkeyKbHook = nullptr;
@@ -137,18 +139,22 @@ inline LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
 class MainWindow {
 public:
     bool Create() {
-        WNDCLASSW wc{};
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = &MainWindow::WndProc;
         wc.hInstance = g_instance;
         wc.lpszClassName = L"QuickScriptToolWindow";
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hIcon = LoadAppIcon();
+        wc.hIconSm = LoadAppIconSmall();
         wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-        RegisterClassW(&wc);
+        RegisterClassExW(&wc);
         int screenW = GetSystemMetrics(SM_CXSCREEN);
         int screenH = GetSystemMetrics(SM_CYSCREEN);
         int x = (screenW - kHomeWidth) / 2;
         int y = (screenH - kHomeHeight) / 2;
         hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"鼠大侠-鼠标宏", WS_POPUP | WS_MINIMIZEBOX, x, y, kHomeWidth, kHomeHeight, nullptr, nullptr, g_instance, this);
+        if (hwnd_) ApplyWindowIcons(hwnd_);
         return hwnd_ != nullptr;
     }
 
@@ -228,6 +234,7 @@ private:
             }
             if (EditorDropPopupVisible()) SyncEditorDropPopup();
             if (quickInputTipShown_ != QuickInputTipKind::None) SyncQuickInputTipPopup();
+            promptModal_.OnOwnerResize();
             return DefWindowProcW(hwnd_, msg, wp, lp);
         }
         case WM_SHOWWINDOW:
@@ -239,6 +246,7 @@ private:
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_SIZE:
             if (wp == SIZE_MINIMIZED) CloseClickerDropPopup();
+            promptModal_.OnOwnerResize();
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
@@ -270,6 +278,20 @@ private:
         case WM_AGENT_SCRIPT_LIBRARY_CHANGED: RefreshScriptLibraryUi(); return 0;
         case WM_EDITOR_PARAM_CHROME:
             if (page_ == Page::Editor) RepaintParamPanelChrome();
+            return 0;
+        case WM_OCR_SUBPANEL_REFRESH:
+            ocrSubPanelRefreshPosted_ = false;
+            if (page_ == Page::Editor && popupAction_.sel == 18)
+                RefreshOcrSubPanel();
+            UnlockParamViewportRedraw();
+            return 0;
+        case WM_APP_PROMPT:
+            if (!promptPendingMessage_.empty()) {
+                CloseEditorPopup();
+                CloseClickerDropPopup();
+                promptModal_.ShowInfo(promptPendingMessage_);
+                promptPendingMessage_.clear();
+            }
             return 0;
         case WM_TRAY: return OnTrayMessage(lp);
         case WM_CTLCOLORSTATIC:
@@ -325,6 +347,7 @@ private:
         InitHotkeyShortcutPresets();
         LoadScripts();
         LoadRecordings();
+        LoadAgentConversations();
         LoadAppSettings(appSettings_);
         ApplyDebugWindowSetting();
         CleanOrphanImages();  // 启动时清理孤立图片
@@ -338,6 +361,10 @@ private:
         scheduledTasks_.SetRunCallback([this](const std::wstring& path) { RunActionsFromPath(path); });
         SetTimer(hwnd_, kScheduledTaskTimerId, 1000, nullptr);
         SetAgentUiNotifyHwnd(hwnd_);
+        promptModal_.Bind(hwnd_, font_, [this] {
+            if (page_ == Page::Editor) ApplyParamLayerMasks();
+        });
+        outerShadow_.Attach(hwnd_);
     }
 
     // ── Editor control creation ────────────────────────────────────
@@ -375,11 +402,11 @@ private:
         popupAction_.items = {
             L"移动鼠标到", L"等待", L"鼠标点击", L"鼠标回放", L"运行鼠标宏",
             L"鼠标按下", L"鼠标松开", L"滚动滚轮", L"按键点击", L"键盘按下", L"键盘松开",
-            L"快捷按键", L"快捷输入", L"循环", L"结束循环", L"定义宏指令块", L"运行宏指令块",
+            L"快捷按键", L"快捷输入", L"循环", L"跳出循环", L"定义宏指令块", L"运行宏指令块",
             L"找图(返回最匹配的)", L"文字识别", L"条件-如果", L"条件-否则",
             L"锁定截屏", L"解锁截屏", L"结束宏运行", L"运行程序", L"关闭程序",
             L"打开网页", L"打开文件", L"计时器记录时间",
-            L"AI文字分析", L"AI图片分析", L"AI动作执行", L"获取当前光标位置"
+            L"AI文字分析", L"AI图片分析", L"AI动作执行", L"获取当前光标位置", L"跳转"
         };
         popupAction_.sel = 0;
         paramViewport_ = CreateWindowExW(0, L"STATIC", L"",
@@ -407,8 +434,12 @@ private:
     void MoveParamAware(HWND h, int x, int y, int w, int hgt, BOOL repaint = FALSE) const {
         if (!h) return;
         if (paramViewport_ && GetParent(h) == paramViewport_) {
+            InvalidateParamControlInViewport(h);
             const RECT vp = ParamViewportRect();
             MoveWindow(h, x - vp.left, y - vp.top, w, hgt, repaint);
+            if (IsGrayButton(h)) {
+                RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+            }
         } else {
             MoveWindow(h, x, y, w, hgt, repaint);
         }
@@ -417,6 +448,7 @@ private:
     void SetParamPosAware(HWND h, int x, int y, int w, int hgt, UINT flags) const {
         if (!h) return;
         if (paramViewport_ && GetParent(h) == paramViewport_) {
+            InvalidateParamControlInViewport(h);
             const RECT vp = ParamViewportRect();
             SetWindowPos(h, nullptr, x - vp.left, y - vp.top, w, hgt, flags);
         } else {
@@ -426,14 +458,25 @@ private:
 
     void AttachToParamViewport(HWND h) const {
         if (!h || !paramViewport_ || h == paramViewport_) return;
-        if (GetParent(h) == paramViewport_) return;
         RECT rc = WindowClientRect(h);
-        SetParent(h, paramViewport_);
+        if (GetParent(h) != paramViewport_) {
+            SetParent(h, paramViewport_);
+            const RECT vp = ParamViewportRect();
+            MoveWindow(h, rc.left - vp.left, rc.top - vp.top, rc.right - rc.left, rc.bottom - rc.top, FALSE);
+        }
         SetWindowSubclass(h, EditorChildSubclassProc, 1, reinterpret_cast<DWORD_PTR>(const_cast<MainWindow*>(this)));
-        const RECT vp = ParamViewportRect();
-        MoveWindow(h, rc.left - vp.left, rc.top - vp.top, rc.right - rc.left, rc.bottom - rc.top, FALSE);
         auto* self = const_cast<MainWindow*>(this);
+        if (IsMarkedParamCheckbox(h)) {
+            LONG style = GetWindowLongW(h, GWL_STYLE);
+            if ((style & BS_TYPEMASK) != BS_OWNERDRAW) {
+                SetWindowLongW(h, GWL_STYLE, (style & ~BS_TYPEMASK) | BS_OWNERDRAW | BS_AUTOCHECKBOX);
+            }
+        }
         if (self->IsGrayButton(h)) {
+            LONG style = GetWindowLongW(h, GWL_STYLE);
+            if (style & WS_TABSTOP) {
+                SetWindowLongW(h, GWL_STYLE, style & ~WS_TABSTOP);
+            }
             RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
         }
     }
@@ -445,6 +488,7 @@ private:
         auto result = BuildLayout(hwnd_, layout);
         for (const auto& p : result.placements) {
             if (p.hwnd) {
+                if (p.type == UIComponentType::CheckBox) MarkParamCheckbox(p.hwnd);
                 AttachToParamViewport(p.hwnd);
                 group.push_back(p.hwnd);
                 editorControls_.push_back(p.hwnd);
@@ -478,11 +522,36 @@ private:
         return nullptr;
     }
 
+    void RestoreEditorControlLayout(HWND hwnd) {
+        if (!hwnd) return;
+        const RECT scaled = ScaledEditorLayoutRect(hwnd);
+        MoveParamAware(hwnd, scaled.left, scaled.top, scaled.right - scaled.left, scaled.bottom - scaled.top, FALSE);
+        SetWindowRgn(hwnd, nullptr, TRUE);
+    }
+
+    void RestoreEditorGroupLayout(const std::vector<HWND>& group) {
+        std::unordered_set<HWND> groupSet(group.begin(), group.end());
+        for (const auto& item : editorLayouts_) {
+            if (!groupSet.count(item.hwnd)) continue;
+            RestoreEditorControlLayout(item.hwnd);
+        }
+    }
+
     // 显示/隐藏指定 action index 的布局
     void ShowParamLayout(int idx, bool visible) {
         auto it = paramLayoutResults_.find(idx);
-        if (it != paramLayoutResults_.end()) {
-            ShowLayoutGroup(it->second, visible);
+        if (it == paramLayoutResults_.end()) return;
+        if (!visible) {
+            for (const auto& p : it->second.placements) {
+                if (p.hwnd) ParkParamControl(p.hwnd);
+            }
+            return;
+        }
+        for (const auto& p : it->second.placements) {
+            if (!p.hwnd) continue;
+            if (!UsesRuntimeParamLayout(p.hwnd)) RestoreEditorControlLayout(p.hwnd);
+            ShowWindow(p.hwnd, SW_SHOW);
+            SetWindowRgn(p.hwnd, nullptr, TRUE);
         }
     }
 
@@ -531,6 +600,15 @@ private:
         // ── 0. 移动鼠标到 ──
         {
             auto r = BuildAndStoreLayout(MoveMouse(), moveControls_, 0);
+            moveHintLabel_ = FindLayoutTextControl(r, L"移动到(左上角为0,0)");
+            moveXLabel_ = FindLayoutTextControl(r, L"X:", 0);
+            moveYLabel_ = FindLayoutTextControl(r, L"Y:", 0);
+            moveRandomXLabel_ = FindLayoutTextControl(r, L"±随机:", 0);
+            moveRandomYLabel_ = FindLayoutTextControl(r, L"±随机:", 1);
+            moveVarXLabel_ = FindLayoutTextControl(r, L"X:", 1);
+            moveVarYLabel_ = FindLayoutTextControl(r, L"Y:", 1);
+            moveHintFooter_ = FindLayoutTextControl(
+                r, L"*提示:可使用来自找图、找色，获取颜色，文字识别保存到变量中的值");
             moveX_ = r.HwndForId(EID_MoveX); moveY_ = r.HwndForId(EID_MoveY);
             moveRandomX_ = r.HwndForId(EID_MoveRandomX); moveRandomY_ = r.HwndForId(EID_MoveRandomY);
             crosshairBtn_ = r.HwndForId(EID_Crosshair); moveFromVar_ = r.HwndForId(EID_MoveFromVar);
@@ -689,7 +767,7 @@ private:
 
             auto r2 = BuildAndStoreLayout(FindImageOffset(), findImageOffsetControls_, 170);
             findOffsetX_ = r2.HwndForId(EID_FindOffsetX); findOffsetY_ = r2.HwndForId(EID_FindOffsetY);
-            findSelectOffsetBtn_ = r2.HwndForId(EID_FindSelectOffset); findUntilFound_ = r2.HwndForId(EID_FindUntilFound);
+            findSelectOffsetBtn_ = r2.HwndForId(EID_FindSelectOffset);
 
             auto r3 = BuildAndStoreLayout(FindImageVar(), findImageVarControls_, 171);
             findMatchVar_ = r3.HwndForId(EID_FindMatchVar);
@@ -705,6 +783,13 @@ private:
                 }
                 return nullptr;
             };
+            findImageHeaderLabel_ = findLabel(r, L"要查找的图");
+            findX1Label_ = findLabel(r, L"X1");
+            findY1Label_ = findLabel(r, L"Y1");
+            findX2Label_ = findLabel(r, L"X2");
+            findY2Label_ = findLabel(r, L"Y2");
+            findTimeLabel_ = findLabel(r2, L"时间");
+            findTimeEdit_ = r2.HwndForId(EID_FindTime);
             findFollowUpLabel_ = findLabel(r, L"后续操作");
             findOffsetXLabel_ = findLabel(r2, L"X偏");
             findOffsetYLabel_ = findLabel(r2, L"Y偏");
@@ -845,9 +930,15 @@ private:
             cursorPosVarName_ = r.HwndForId(EID_CursorPosVarName);
         }
 
+        // ── 33. 跳转 ──
+        {
+            auto r = BuildAndStoreLayout(Goto(), gotoControls_, 33);
+            gotoStepEdit_ = r.HwndForId(EID_GotoStepExpr);
+        }
+
         // ── AI 公共部分 ──
         popupAiModel_.items = {}; popupAiModel_.sel = -1;
-        popupAiContextMode_.items = {L"无上下文", L"宏上下文", L"循环上下文", L"指令块上下文"}; popupAiContextMode_.sel = 0;
+        popupAiContextMode_.items = {L"无上下文", L"宏上下文", L"循环上下文", L"指令块上下文"}; popupAiContextMode_.sel = 1;
         popupAiOutputType_.items = {L"文本", L"整数"}; popupAiOutputType_.sel = 0;
 
         // ── 29. AI文字分析 ──
@@ -944,9 +1035,35 @@ private:
     }
 
     void ShowGroup(const std::vector<HWND>& controls, bool visible) { for (HWND h : controls) ShowWindow(h, visible ? SW_SHOW : SW_HIDE); }
+
+    bool IsParamViewportDescendant(HWND h) const {
+        if (!h || !paramViewport_) return false;
+        if (h == paramViewport_) return true;
+        return IsParamViewportChild(h);
+    }
+
+    void ParkAllParamPanelControls() const {
+        if (!paramViewport_) return;
+        for (HWND child = GetWindow(paramViewport_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            ParkParamControl(child);
+        }
+    }
+
     void ShowEditorControls(bool visible) {
-        if (!visible) CloseEditorPopup();
-        for (HWND h : editorControls_) ShowWindow(h, visible ? SW_SHOW : SW_HIDE);
+        if (!visible) {
+            CloseEditorPopup();
+            ParkAllParamPanelControls();
+            for (HWND h : editorControls_) {
+                if (h) ShowWindow(h, SW_HIDE);
+            }
+            ApplyParamLayerMasks();
+            return;
+        }
+        for (HWND h : editorControls_) {
+            if (!h || IsParamViewportDescendant(h)) continue;
+            ShowWindow(h, SW_SHOW);
+        }
+        if (paramViewport_) ShowWindow(paramViewport_, SW_SHOW);
         ApplyParamLayerMasks();
     }
 
@@ -964,11 +1081,7 @@ private:
 
     void ApplyParamLayerMasks() {
         if (!hwnd_) return;
-        if (paramViewport_) {
-            const RECT vp = ParamViewportRect();
-            SetWindowPos(paramViewport_, HWND_TOP, vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top,
-                SWP_NOACTIVATE | (page_ == Page::Editor ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-        }
+        UpdateParamViewportGeometry();
         for (HWND h : {paramTopMask_, paramBottomMask_, paramRightMask_}) {
             if (h) ShowWindow(h, SW_HIDE);
         }
@@ -987,11 +1100,34 @@ private:
         }
     }
 
+    void UpdateParamViewportGeometry() {
+        if (!paramViewport_) return;
+        const RECT visible = ParamScrollContentRect();
+        const int w = visible.right - visible.left;
+        const int h = visible.bottom - visible.top;
+        if (w <= 0 || h <= 0) return;
+        SetWindowPos(paramViewport_, HWND_TOP, visible.left, visible.top, w, h,
+            SWP_NOACTIVATE | (page_ == Page::Editor ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+        SetWindowRgn(paramViewport_, nullptr, TRUE);
+    }
+
     bool IsParamScrollManagedHwnd(HWND hwnd) const {
         for (const auto& entry : paramScrollLayout_) {
             if (entry.hwnd == hwnd) return true;
         }
         return false;
+    }
+
+    RECT EditorComboClientRect(HWND combo) const {
+        if (!combo) return RECT{};
+        if (IsParamScrollManagedHwnd(combo)) {
+            for (const auto& entry : paramScrollLayout_) {
+                if (entry.hwnd != combo) continue;
+                const int y = entry.baseY - paramScrollY_;
+                return RECT{entry.baseX, y, entry.baseX + entry.baseW, y + entry.baseH};
+            }
+        }
+        return WindowClientRect(combo);
     }
 
     RECT PaintExcludeRectForChild(HWND hwnd) const {
@@ -1006,14 +1142,33 @@ private:
     }
 
     bool IsParamPanelCheckbox(HWND hwnd) const {
-        if (!hwnd || page_ != Page::Editor) return false;
-        wchar_t cls[16]{};
-        GetClassNameW(hwnd, cls, 16);
-        if (lstrcmpW(cls, L"BUTTON") != 0) return false;
-        if ((GetWindowLongW(hwnd, GWL_STYLE) & BS_AUTOCHECKBOX) == 0) return false;
-        if (IsGrayButton(hwnd) || IsFooterControl(hwnd)) return false;
-        RECT rc = WindowClientRect(hwnd);
-        return ParamRectIntersectsContent(rc);
+        return hwnd && page_ == Page::Editor && IsParamViewportChild(hwnd)
+            && IsMarkedParamCheckbox(hwnd);
+    }
+
+    void PaintParamPanelCheckbox(HWND hwnd, HDC hdc, const RECT* itemRc = nullptr) const {
+        if (!hwnd || !hdc) return;
+        RECT rc{};
+        if (itemRc) rc = *itemRc;
+        else GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, whiteBrush_);
+        wchar_t text[128]{};
+        GetWindowTextW(hwnd, text, 128);
+        HGDIOBJ oldFont = SelectObject(hdc, editorFont_ ? editorFont_ : font_);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, kText);
+        constexpr int kCbSize = 18;
+        const int cbTop = rc.top + (rc.bottom - rc.top - kCbSize) / 2;
+        RECT cbRc{rc.left, cbTop, rc.left + kCbSize, cbTop + kCbSize};
+        DrawCheckbox(hdc, cbRc, Checked(hwnd));
+        RECT textRc{rc.left + kCbSize + 4, rc.top, rc.right, rc.bottom};
+        DrawTextW(hdc, text, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (oldFont) SelectObject(hdc, oldFont);
+    }
+
+    void DrawParamPanelCheckboxItem(DRAWITEMSTRUCT* dis) const {
+        if (!dis) return;
+        PaintParamPanelCheckbox(dis->hwndItem, dis->hDC, &dis->rcItem);
     }
 
     bool IsFindImageParamEdit(HWND hwnd) const {
@@ -1090,6 +1245,7 @@ private:
         case 27: append(openFileControls_); break;
         case 28: append(timerRecordControls_); break;
         case 32: append(getCursorPosControls_); break;
+        case 33: append(gotoControls_); break;
         case 29: append(aiCommonControls_); append(aiTextControls_); break;
         case 30: append(aiCommonControls_); append(aiImageControls_);
             if (aiRegionByImageCheck_ && Checked(aiRegionByImageCheck_)) append(aiFindRegionControls_);
@@ -1266,6 +1422,34 @@ private:
             InvalidateRect(paramViewport_, nullptr, FALSE);
     }
 
+    void InvalidateParamControlInViewport(HWND h) const {
+        if (!h || !paramViewport_) return;
+        RECT rc = WindowClientRect(h);
+        const RECT vp = ParamViewportRect();
+        RECT vr{
+            rc.left - vp.left, rc.top - vp.top,
+            rc.right - vp.left, rc.bottom - vp.top
+        };
+        InvalidateRect(paramViewport_, &vr, TRUE);
+    }
+
+    void LockParamViewportRedraw() const {
+        if (paramViewport_) SendMessageW(paramViewport_, WM_SETREDRAW, FALSE, 0);
+    }
+
+    void UnlockParamViewportRedraw() const {
+        if (!paramViewport_) return;
+        SendMessageW(paramViewport_, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(paramViewport_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+
+    void RequestOcrSubPanelRefresh() {
+        if (!hwnd_ || ocrSubPanelRefreshPosted_) return;
+        ocrSubPanelRefreshPosted_ = true;
+        LockParamViewportRedraw();
+        PostMessageW(hwnd_, WM_OCR_SUBPANEL_REFRESH, 0, 0);
+    }
+
     void HideInactiveParamControls() {
         const int sel = popupAction_.sel;
         const bool aiFindImage = (sel == 30 && aiRegionByImageCheck_ && Checked(aiRegionByImageCheck_))
@@ -1273,11 +1457,7 @@ private:
                 && aiRegionByImageCheck2_ && Checked(aiRegionByImageCheck2_));
         auto stashGroup = [&](const std::vector<HWND>& group, bool active) {
             if (active) return;
-            for (HWND h : group) {
-                if (!h) continue;
-                ShowWindow(h, SW_HIDE);
-                SetWindowRgn(h, nullptr, TRUE);
-            }
+            ParkParamGroup(group);
         };
         stashGroup(moveControls_, sel == 0);
         stashGroup(waitControls_, sel == 1);
@@ -1317,6 +1497,7 @@ private:
         stashGroup(openFileControls_, sel == 27);
         stashGroup(timerRecordControls_, sel == 28);
         stashGroup(getCursorPosControls_, sel == 32);
+        stashGroup(gotoControls_, sel == 33);
         stashGroup(aiCommonControls_, sel == 29 || sel == 30 || sel == 31);
         stashGroup(aiTextControls_, sel == 29);
         stashGroup(aiImageControls_, sel == 30);
@@ -1343,6 +1524,10 @@ private:
                 if (!h) continue;
                 if (std::find(out.begin(), out.end(), h) == out.end()) out.push_back(h);
             }
+        };
+        auto appendHwnd = [&](HWND h) {
+            if (!h) return;
+            if (std::find(out.begin(), out.end(), h) == out.end()) out.push_back(h);
         };
         switch (sel) {
         case 0: appendGroup(moveControls_); break;
@@ -1374,6 +1559,16 @@ private:
             if (popupOcrResultMode_.sel == 1) appendGroup(ocrSearchControls_);
             if (popupOcrFollowUp_.sel == 2) appendGroup(ocrFollowVarControls_);
             else appendGroup(ocrFollowOffsetControls_);
+            appendHwnd(ocrResultModeLabel_);
+            appendHwnd(ocrFollowUpLabel_);
+            appendHwnd(ocrSearchLabel_);
+            appendHwnd(ocrSearchVarLabel_);
+            appendHwnd(ocrX1Label_);
+            appendHwnd(ocrY1Label_);
+            appendHwnd(ocrX2Label_);
+            appendHwnd(ocrY2Label_);
+            appendHwnd(ocrRegionLabel_);
+            appendHwnd(ocrFindImageLabel_);
             break;
         case 19: appendGroup(ifControls_); break;
         case 20: appendGroup(elseControls_); break;
@@ -1389,6 +1584,7 @@ private:
         case 27: appendGroup(openFileControls_); break;
         case 28: appendGroup(timerRecordControls_); break;
         case 32: appendGroup(getCursorPosControls_); break;
+        case 33: appendGroup(gotoControls_); break;
         case 29: appendGroup(aiCommonControls_); appendGroup(aiTextControls_); break;
         case 30:
             appendGroup(aiCommonControls_);
@@ -1424,54 +1620,118 @@ private:
         }
     }
 
-    void ApplyEditorFooterLayout() {
-        if (page_ != Page::Editor) return;
+    struct RemarkFieldMetrics {
+        int panelLeft = 0;
+        int labelW = 0;
+        int fieldH = 0;
+        int editX = 0;
+        int editW = 0;
+    };
 
+    RemarkFieldMetrics ComputeRemarkFieldMetrics() const {
         const int panelLeft = ParamPanelLeft();
         const int maxRight = ParamFieldMaxRight();
         const int labelW = MulDiv(44, kEditorWidth, kEditorBaseWidth);
-        const int remarkH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
+        const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
+        const int labelGap = MulDiv(4, kEditorWidth, kEditorBaseWidth);
+        const int editX = panelLeft + labelW + labelGap;
+        const int editW = std::max(40, maxRight - editX);
+        return RemarkFieldMetrics{panelLeft, labelW, fieldH, editX, editW};
+    }
+
+    void LayoutRemarkStyleFieldRow(HWND label, HWND edit, int y, const RemarkFieldMetrics& m) const {
+        if (label) {
+            MoveParamAware(label, m.panelLeft, y, m.labelW, m.fieldH, FALSE);
+            ShowWindow(label, SW_SHOW);
+        }
+        if (edit) {
+            MoveParamAware(edit, m.editX, y, m.editW, m.fieldH, FALSE);
+            ShowWindow(edit, SW_SHOW);
+        }
+    }
+
+    int MeasureParamScrollContentBottom(const std::vector<HWND>& controls) const {
+        int bottom = ParamPanelContentTopY();
+        for (HWND h : controls) {
+            if (!h || IsFooterControl(h)) continue;
+            if (IsIntentionallyHiddenParamControl(h)) continue;
+            if (!IsControlShown(h) && !IsEditorParamComboHwnd(h)) continue;
+            const RECT rc = WindowClientRect(h);
+            if (rc.top < ParamPanelContentTopY() - 64) continue;
+            bottom = std::max(bottom, static_cast<int>(rc.bottom));
+        }
+        return bottom;
+    }
+
+    void ApplyEditorFooterLayout(int contentBottom = -1) {
+        if (page_ != Page::Editor) return;
+
+        const RemarkFieldMetrics remarkMetrics = ComputeRemarkFieldMetrics();
+        const int panelLeft = remarkMetrics.panelLeft;
+        const int maxRight = ParamFieldMaxRight();
+        const int labelW = remarkMetrics.labelW;
+        const int remarkH = remarkMetrics.fieldH;
         const int btnH = MulDiv(30, kEditorHeight, kEditorBaseHeight);
         const int btnW = MulDiv(76, kEditorWidth, kEditorBaseWidth);
-        const int gap = MulDiv(12, kEditorHeight, kEditorBaseHeight);
+        const int gap = MulDiv(18, kEditorHeight, kEditorBaseHeight);
         const int panelTop = ParamPanelContentTopY();
         const int minRemarkY = MulDiv(kEditorRemarkY, kEditorHeight, kEditorBaseHeight);
-        const int measuredBottom = paramControlsBottom_ > panelTop ? paramControlsBottom_ + gap : 0;
-        const int remarkY = measuredBottom > 0 ? measuredBottom : minRemarkY;
+        const bool dynamicFooter = UsesDynamicParamPanel();
+        if (contentBottom < 0) {
+            std::vector<HWND> controls;
+            CollectParamScrollControls(controls);
+            contentBottom = MeasureParamScrollContentBottom(controls);
+        }
+        if (dynamicFooter && paramLayoutBottomHint_ > panelTop) {
+            contentBottom = std::max(contentBottom, paramLayoutBottomHint_);
+        }
+        if (dynamicFooter && contentBottom < panelTop) return;
+        const int measuredBottom = contentBottom > panelTop ? contentBottom + gap : 0;
+        int remarkY;
+        if (dynamicFooter) {
+            remarkY = contentBottom + gap;
+        } else {
+            remarkY = measuredBottom > 0 ? measuredBottom : minRemarkY;
+        }
         const int addY = remarkY + remarkH + gap;
         const int btnGap = MulDiv(10, kEditorWidth, kEditorBaseWidth);
-        const int addX = maxRight - btnW;
-        const int modifyX = addX - btnGap - btnW;
+        int addX = maxRight - btnW;
+        int modifyX = addX - btnGap - btnW;
+        if (modifyX < panelLeft) {
+            modifyX = panelLeft;
+            addX = std::min(maxRight - btnW, modifyX + btnGap + btnW);
+        }
         const int labelX = panelLeft;
-        const int remarkX = labelX + labelW + MulDiv(4, kEditorWidth, kEditorBaseWidth);
-        const int remarkW = std::max(40, maxRight - remarkX);
+        const int remarkX = remarkMetrics.editX;
+        const int remarkW = remarkMetrics.editW;
 
-        auto moveMaybeViewport = [&](HWND h, int x, int y, int w, int hgt) {
+        auto moveFooter = [&](HWND h, int x, int y, int w, int hgt) {
             if (!h) return;
-            if (paramViewport_ && GetParent(h) == paramViewport_) {
-                MoveWindow(h, x - ParamScrollContentLeft(), y - ParamPanelContentTopY(), w, hgt, FALSE);
-            } else {
-                MoveWindow(h, x, y, w, hgt, FALSE);
-            }
+            EnsureParamViewportParent(h);
+            SetParamPosAware(h, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
         };
 
         if (remarkLabel_) {
             ShowWindow(remarkLabel_, SW_SHOW);
-            moveMaybeViewport(remarkLabel_, labelX, remarkY, labelW, remarkH);
+            moveFooter(remarkLabel_, labelX, remarkY, labelW, remarkH);
         }
         if (remark_) {
             ShowWindow(remark_, SW_SHOW);
-            moveMaybeViewport(remark_, remarkX, remarkY, remarkW, remarkH);
+            moveFooter(remark_, remarkX, remarkY, remarkW, remarkH);
         }
         if (modifyBtn_) {
             const bool selected = !batchEditMode_ && selectedIndex_ >= 0
                 && selectedIndex_ < static_cast<int>(actions_.size());
             ShowWindow(modifyBtn_, selected ? SW_SHOW : SW_HIDE);
-            if (selected) moveMaybeViewport(modifyBtn_, modifyX, addY, btnW, btnH);
+            if (selected) moveFooter(modifyBtn_, modifyX, addY, btnW, btnH);
         }
         if (addBtn_) {
             ShowWindow(addBtn_, SW_SHOW);
-            moveMaybeViewport(addBtn_, addX, addY, btnW, btnH);
+            moveFooter(addBtn_, addX, addY, btnW, btnH);
+        }
+        for (HWND h : {remarkLabel_, remark_, modifyBtn_, addBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
 
@@ -1496,8 +1756,9 @@ private:
         if (!paramViewport_ || page_ != Page::Editor) return;
         for (HWND child = GetWindow(paramViewport_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
             if (!IsGrayButton(child) || !IsWindowVisible(child)) continue;
-            RedrawWindow(child, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+            RedrawWindow(child, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
         }
+        UpdateHoverFromCursor();
     }
 
     void ClearParamScrollTrack(HDC hdc) const {
@@ -1510,7 +1771,8 @@ private:
     // 否则 RevealParamControlsForCapture 会把控件恢复到静态坐标。
     void RefreshDynamicParamLayout() {
         const int sel = popupAction_.sel;
-        if (sel == 17) RefreshFindImageSubPanel();
+        if (sel == 0) RefreshMoveParamPanel();
+        else if (sel == 17) RefreshFindImageSubPanel();
         else if (sel == 18) {
             RefreshOcrDepStatus();
             RefreshOcrSubPanel();
@@ -1526,14 +1788,70 @@ private:
         else ClearParamScrollTrack(mainDc);
         ReleaseDC(hwnd_, mainDc);
         if (paramViewport_) {
-            RedrawWindow(paramViewport_, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+            RedrawWindow(paramViewport_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOCHILDREN);
+            RefreshGrayButtonsInParamViewport();
         }
     }
 
     void ClearParamViewportSurface() {
         if (!paramViewport_ || page_ != Page::Editor) return;
         InvalidateRect(paramViewport_, nullptr, TRUE);
+    }
+
+    void RefreshParamViewportChildren() const {
+        if (!paramViewport_ || page_ != Page::Editor) return;
+        for (HWND child = GetWindow(paramViewport_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (!IsWindowVisible(child)) continue;
+            RedrawWindow(child, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
+        }
+    }
+
+    void FillParamViewportGaps(HDC hdc, HWND viewport, const RECT& rcPaint) const {
+        if (!hdc || !viewport) return;
+        HRGN fillRgn = CreateRectRgnIndirect(&rcPaint);
+        for (HWND child = GetWindow(viewport, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (!IsWindowVisible(child)) continue;
+            if (IsEditorParamComboHwnd(child)) continue;
+            RECT cr = MapRectFromMain(viewport, WindowClientRect(child));
+            // 自绘灰按钮边框画在 client 边缘；背景填充须留余量，否则父 DC 白底会盖住上边框。
+            if (IsGrayButton(child)) InflateRect(&cr, 1, 1);
+            RECT inter{};
+            if (!IntersectRect(&inter, &cr, &rcPaint)) continue;
+            HRGN childRgn = CreateRectRgnIndirect(&inter);
+            CombineRgn(fillRgn, fillRgn, childRgn, RGN_DIFF);
+            DeleteObject(childRgn);
+        }
+        SelectClipRgn(hdc, fillRgn);
+        FillRect(hdc, &rcPaint, whiteBrush_);
+        SelectClipRgn(hdc, nullptr);
+        DeleteObject(fillRgn);
+    }
+
+    void PostLayoutParamPanelRedraw() {
+        if (!paramViewport_ || page_ != Page::Editor) return;
+        RefreshGrayButtonsInParamViewport();
+        for (HWND child = GetWindow(paramViewport_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (!IsWindowVisible(child)) continue;
+            if (IsEditorParamComboHwnd(child)) continue;
+            RedrawWindow(child, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        }
+    }
+
+    void RaiseAiFindImageHeaderControls() const {
+        for (HWND h : {aiFindImageLabel_, aiFindSelectRegionBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+        }
+    }
+
+    void RaiseOcrFindImageHeaderControls() const {
+        for (HWND h : {ocrFindImageLabel_, ocrFindSelectRegionBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+        }
     }
 
     void RefreshEditorChildWindows(const RECT* updateRect) {
@@ -1559,14 +1877,52 @@ private:
         }
     }
 
-    void SyncParamScrollLayout() {
-        CaptureParamScrollBaseLayout();
-        paramScrollY_ = std::clamp(paramScrollY_, 0, MaxParamScroll());
+    void EnsureParamFooterVisible() {
+        if (page_ != Page::Editor) return;
+        const int maxScroll = MaxParamScroll();
+        if (maxScroll <= 0) return;
+        int footerBottom = ParamPanelContentTopY();
+        for (HWND h : {remarkLabel_, remark_, modifyBtn_, addBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            footerBottom = std::max(footerBottom, static_cast<int>(WindowClientRect(h).bottom));
+        }
+        const int vpBottom = ParamScrollViewportBottomY();
+        if (footerBottom <= vpBottom) return;
+        paramScrollY_ = std::min(maxScroll, footerBottom - vpBottom + MulDiv(8, kEditorHeight, kEditorBaseHeight));
         ApplyParamScrollOffset(false);
-        RepaintParamPanelChrome();
     }
 
-    void ConfigureCombo(HWND, int) {}
+    void RestoreStaticParamLayoutsForSel(int sel) {
+        auto restoreIdx = [&](int idx) {
+            auto it = paramLayoutResults_.find(idx);
+            if (it == paramLayoutResults_.end()) return;
+            for (const auto& p : it->second.placements) {
+                if (!p.hwnd || UsesRuntimeParamLayout(p.hwnd)) continue;
+                RestoreEditorControlLayout(p.hwnd);
+            }
+        };
+        if (sel >= 0 && sel <= 32 && sel != 29) restoreIdx(sel);
+        if (sel == 5 || sel == 6) { restoreIdx(5); restoreIdx(6); }
+        if (sel == 9 || sel == 10) { restoreIdx(9); restoreIdx(10); }
+        if (sel == 29 || sel == 30 || sel == 31) restoreIdx(29);
+        if (sel == 24) restoreIdx(240);
+    }
+
+    bool UsesDynamicParamPanel(int sel = -1) const {
+        if (sel < 0) sel = popupAction_.sel;
+        return sel == 0 || sel == 17 || sel == 18 || sel == 29 || sel == 30 || sel == 31;
+    }
+
+    void SyncParamScrollLayout(int layoutBottomHint = -1) {
+        if (layoutBottomHint >= 0) paramLayoutBottomHint_ = layoutBottomHint;
+        CaptureParamScrollBaseLayout(layoutBottomHint);
+        paramScrollY_ = std::clamp(paramScrollY_, 0, MaxParamScroll());
+        ApplyParamScrollOffset(false);
+        UpdateParamViewportGeometry();
+        RepaintParamPanelChrome();
+        PostLayoutParamPanelRedraw();
+    }
+
     void ConfigureEditorCombos() {}
 
     void CaptureEditorControlLayout() {
@@ -1587,6 +1943,11 @@ private:
         return contains(findImageControls_) || contains(findImageOffsetControls_) || contains(findImageVarControls_);
     }
 
+    bool IsMoveHwnd(HWND hwnd) const {
+        for (HWND h : moveControls_) if (h == hwnd) return true;
+        return false;
+    }
+
     bool IsOcrDepHwnd(HWND hwnd) const {
         return hwnd == ocrDepStatusLabel_ || hwnd == ocrDepInstallBtn_;
     }
@@ -1602,15 +1963,47 @@ private:
             || contains(ocrFindRegionToggleControls_) || contains(ocrFindRegionControls_);
     }
 
-    bool IsAiDynamicHwnd(HWND hwnd) const {
+    bool IsAiLayoutHwnd(HWND hwnd) const {
         const int sel = popupAction_.sel;
-        if (sel != 30 && sel != 31) return false;
+        if (sel != 29 && sel != 30 && sel != 31) return false;
         auto contains = [hwnd](const std::vector<HWND>& group) {
             for (HWND h : group) if (h == hwnd) return true;
             return false;
         };
-        return contains(aiImageControls_) || contains(aiActionControls_)
-            || contains(aiFindRegionControls_);
+        return contains(aiCommonControls_) || contains(aiImageControls_)
+            || contains(aiActionControls_) || contains(aiFindRegionControls_);
+    }
+
+    bool IsAiDynamicHwnd(HWND hwnd) const {
+        return IsAiLayoutHwnd(hwnd);
+    }
+
+    bool UsesRuntimeParamLayout(HWND hwnd) const {
+        if (popupAction_.sel == 0 && IsMoveHwnd(hwnd)) return true;
+        if (IsOcrDepHwnd(hwnd) && popupAction_.sel == 18) return true;
+        if (IsOcrHwnd(hwnd)) return true;
+        if (IsAiLayoutHwnd(hwnd)) return true;
+        if (popupAction_.sel == 17 && IsFindImageHwnd(hwnd)) return true;
+        return false;
+    }
+
+    RECT ScaledEditorLayoutRect(HWND hwnd) const {
+        for (const auto& item : editorLayouts_) {
+            if (item.hwnd != hwnd) continue;
+            const int x = MulDiv(item.base.left, kEditorWidth, kEditorBaseWidth);
+            const int y = MulDiv(item.base.top, kEditorHeight, kEditorBaseHeight);
+            const int w = std::max(1, MulDiv(item.base.right - item.base.left, kEditorWidth, kEditorBaseWidth));
+            int h = std::max(1, MulDiv(item.base.bottom - item.base.top, kEditorHeight, kEditorBaseHeight));
+            if (IsEditorListHeaderLabelBase(item.base)) h = std::max(1, kListY - y - 2);
+            return RECT{x, y, x + w, y + h};
+        }
+        return WindowClientRect(hwnd);
+    }
+
+    void SyncParamControlScrollPosition(HWND hwnd) const {
+        if (!hwnd || UsesRuntimeParamLayout(hwnd)) return;
+        const RECT scaled = ScaledEditorLayoutRect(hwnd);
+        MoveParamAware(hwnd, scaled.left, scaled.top, scaled.right - scaled.left, scaled.bottom - scaled.top, FALSE);
     }
 
     bool IsEditorListHeaderLabelBase(const RECT& base) const {
@@ -1645,55 +2038,55 @@ private:
     }
 
     void LayoutFindImageSideStack(
-        int previewTop, const FindImageSideButtonLayout& layout,
-        HWND screenshot, HWND local, HWND clear) const {
-        auto place = [&](HWND h, int index) {
-            if (!h) return;
-            MoveParamAware(h, layout.actionX, layout.SideBtnY(previewTop, index),
-                layout.btnW, layout.compactBtnH, FALSE);
-        };
-        place(screenshot, 0);
-        place(local, 1);
-        place(clear, 2);
-    }
-
-    void PlaceFindImageCompactButton(HWND btn, int y) const {
-        if (!btn) return;
-        const FindImageSideButtonLayout layout = ComputeFindImageSideButtonLayout();
-        MoveParamAware(btn, layout.actionX, y, layout.btnW, layout.compactBtnH, FALSE);
+        int previewTop, HWND screenshot, HWND local, HWND clear) const {
+        LayoutOcrFindImageSideStack(previewTop, screenshot, local, clear);
     }
 
     int LayoutFindImageMatchScaleRows(int y) const {
         const int left = MulDiv(kFindContentLeft, kEditorWidth, kEditorBaseWidth);
         const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
         const int rowGap = MulDiv(kFindVGap, kEditorHeight, kEditorBaseHeight);
-        MoveParamAware(findMatchThreshold_, left + MulDiv(91, kEditorWidth, kEditorBaseWidth), y,
-            MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+        auto show = [](HWND h) { if (h) ShowWindow(h, SW_SHOW); };
+        if (findMatchThreshold_) {
+            MoveParamAware(findMatchThreshold_, left + MulDiv(91, kEditorWidth, kEditorBaseWidth), y,
+                MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+            show(findMatchThreshold_);
+        }
         for (HWND h : findImageControls_) {
             if (!h) continue;
             wchar_t buf[16]{};
             GetWindowTextW(h, buf, 16);
             if (wcscmp(buf, L"匹配度大于") == 0) {
                 MoveParamAware(h, left, y, MulDiv(90, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+                show(h);
             } else if (wcscmp(buf, L"%") == 0) {
                 MoveParamAware(h, left + MulDiv(135, kEditorWidth, kEditorBaseWidth), y,
                     MulDiv(24, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+                show(h);
             }
         }
         y += fieldH + rowGap;
-        MoveParamAware(findScaleMin_, left + MulDiv(65, kEditorWidth, kEditorBaseWidth), y,
-            MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
-        MoveParamAware(findScaleMax_, left + MulDiv(151, kEditorWidth, kEditorBaseWidth), y,
-            MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+        if (findScaleMin_) {
+            MoveParamAware(findScaleMin_, left + MulDiv(65, kEditorWidth, kEditorBaseWidth), y,
+                MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+            show(findScaleMin_);
+        }
+        if (findScaleMax_) {
+            MoveParamAware(findScaleMax_, left + MulDiv(151, kEditorWidth, kEditorBaseWidth), y,
+                MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+            show(findScaleMax_);
+        }
         for (HWND h : findImageControls_) {
             if (!h) continue;
             wchar_t buf[16]{};
             GetWindowTextW(h, buf, 16);
             if (wcscmp(buf, L"最小缩放") == 0) {
                 MoveParamAware(h, left, y, MulDiv(64, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+                show(h);
             } else if (wcscmp(buf, L"最大") == 0) {
                 MoveParamAware(h, left + MulDiv(110, kEditorWidth, kEditorBaseWidth), y,
                     MulDiv(40, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+                show(h);
             }
         }
         return y + fieldH + rowGap;
@@ -1719,26 +2112,27 @@ private:
         if (findOffsetYLabel_) ShowWindow(findOffsetYLabel_, SW_SHOW);
         if (findMatchVarLabel_) ShowWindow(findMatchVarLabel_, SW_HIDE);
         y = LayoutParamCoordPairRow(y, findOffsetXLabel_, findOffsetX_, findOffsetYLabel_, findOffsetY_, kFindOffsetLabelW);
-        const int left = MulDiv(kFindContentLeft, kEditorWidth, kEditorBaseWidth);
-        const int btnH = MulDiv(kFindBtnH, kEditorHeight, kEditorBaseHeight);
         const int rowGap = MulDiv(kFindVGap, kEditorHeight, kEditorBaseHeight);
-        const int offsetW = MulDiv(kFindSelectOffsetW, kEditorWidth, kEditorBaseWidth);
-        const int selectLeft = MulDiv(kFindSelectOffsetLeft - kFindContentLeft, kEditorWidth, kEditorBaseWidth);
+        const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
         if (findSelectOffsetBtn_) {
-            MoveParamAware(findSelectOffsetBtn_, left + selectLeft, y, offsetW, btnH, FALSE);
+            MoveOcrAt(findSelectOffsetBtn_, kFindSelectOffsetLeft, y, kFindSelectOffsetW, kFindImageSideBtnH);
             ShowWindow(findSelectOffsetBtn_, SW_SHOW);
         }
-        y += btnH + rowGap;
-        const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
-        if (findUntilFound_) MoveParamAware(findUntilFound_, left, y, MulDiv(140, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+        y += OcrScaleY(kFindImageSideBtnH) + rowGap;
+        LayoutFindImageTimeRow(y);
         return y + fieldH + rowGap;
+    }
+
+    void LayoutFindImageTimeRow(int y) const {
+        LayoutRemarkStyleFieldRow(findTimeLabel_, findTimeEdit_, y, ComputeRemarkFieldMetrics());
     }
 
     int LayoutFindImageVarBlock(int y) const {
         if (findOffsetXLabel_) ShowWindow(findOffsetXLabel_, SW_HIDE);
         if (findOffsetYLabel_) ShowWindow(findOffsetYLabel_, SW_HIDE);
         if (findSelectOffsetBtn_) ShowWindow(findSelectOffsetBtn_, SW_HIDE);
-        if (findUntilFound_) ShowWindow(findUntilFound_, SW_HIDE);
+        if (findTimeLabel_) ShowWindow(findTimeLabel_, SW_HIDE);
+        if (findTimeEdit_) ShowWindow(findTimeEdit_, SW_HIDE);
         const int left = MulDiv(kFindContentLeft, kEditorWidth, kEditorBaseWidth);
         const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
         const int rowGap = MulDiv(kFindVGap, kEditorHeight, kEditorBaseHeight);
@@ -1758,7 +2152,7 @@ private:
         const FindImageSideButtonLayout layout = ComputeFindImageSideButtonLayout();
         const int previewX = MulDiv(kFindContentLeft, kEditorWidth, kEditorBaseWidth);
         MoveParamAware(findImagePreviewBtn_, previewX, previewY, kFindImageSize, kFindImageSize, FALSE);
-        LayoutFindImageSideStack(previewY, layout, findScreenshotBtn_, findLocalImageBtn_, findClearImageBtn_);
+        LayoutOcrFindImageSideStack(previewY, findScreenshotBtn_, findLocalImageBtn_, findClearImageBtn_);
         return previewY + kFindImageSize + layout.sideGap;
     }
 
@@ -1773,19 +2167,16 @@ private:
     void ApplyEditorControlScale() {
         for (const auto& item : editorLayouts_) {
             if (item.hwnd == paramViewport_) {
-                const RECT vp = ParamViewportRect();
-                MoveWindow(paramViewport_, vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top, FALSE);
+                UpdateParamViewportGeometry();
                 continue;
             }
             if (IsFooterControl(item.hwnd)) continue;
             if (IsFindImageHwnd(item.hwnd)) {
-                const int x = MulDiv(item.base.left, kEditorWidth, kEditorBaseWidth);
-                const int y = MulDiv(item.base.top, kEditorHeight, kEditorBaseHeight);
-                const int w = std::max(1, MulDiv(item.base.right - item.base.left, kEditorWidth, kEditorBaseWidth));
-                const int h = std::max(1, MulDiv(item.base.bottom - item.base.top, kEditorHeight, kEditorBaseHeight));
-                MoveParamAware(item.hwnd, x, y, w, h, FALSE);
-            } else if (IsOcrHwnd(item.hwnd) || IsAiDynamicHwnd(item.hwnd)) {
-                // OCR 内容区 / AI 控件由 RefreshOcrSubPanel / RefreshAiSubPanel 统一堆叠布局
+                // 找图控件由 RefreshFindImageSubPanel 统一堆叠布局
+            } else if (IsMoveHwnd(item.hwnd)) {
+                // 移动鼠标控件由 RefreshMoveParamPanel 统一堆叠布局
+            } else if (IsOcrDepHwnd(item.hwnd) || IsOcrHwnd(item.hwnd) || IsAiLayoutHwnd(item.hwnd)) {
+                // OCR / AI 动态区由 Refresh*SubPanel 统一堆叠布局
             } else {
                 const int x = MulDiv(item.base.left, kEditorWidth, kEditorBaseWidth);
                 const int y = MulDiv(item.base.top, kEditorHeight, kEditorBaseHeight);
@@ -1794,6 +2185,9 @@ private:
                 if (IsEditorListHeaderLabelBase(item.base)) h = std::max(1, kListY - y - 2);
                 MoveParamAware(item.hwnd, x, y, w, h, FALSE);
             }
+        }
+        if (page_ == Page::Editor && popupAction_.sel == 0) {
+            RefreshMoveParamPanel();
         }
         if (page_ == Page::Editor && popupAction_.sel == 17) {
             RefreshFindImageSubPanel();
@@ -1890,10 +2284,10 @@ private:
         InvalidateRect(hwnd_, nullptr, TRUE);
         ShowWindow(hwnd_, SW_SHOW);
         ApplyParamLayerMasks();
-        CaptureParamScrollBaseLayout();
-        ApplyParamScrollOffset(false);
         RepaintParamPanelChrome();
         UpdateWindow(hwnd_);
+        FiDbgInit(hwnd_);
+        FiDbgSetMainWnd(hwnd_);
     }
 
     // ── Action form ↔ UI binding ───────────────────────────────────
@@ -1909,9 +2303,11 @@ private:
     void RefreshParamPanel() {
         const int sel = popupAction_.sel;
         if (sel != 12) CancelQuickInputTip();
+        if (!UsesDynamicParamPanel(sel)) paramLayoutBottomHint_ = -1;
 
         // 先隐藏所有 Combo 标签，再由 ShowParamLayout 显示正确的
         HideEditorComboHwnds();
+        HideInactiveParamControls();
 
         // ── 主面板切换 (基于布局索引) ──
         for (int i = 0; i <= 31; ++i) {
@@ -1921,6 +2317,10 @@ private:
         ShowParamLayout(29, sel == 29 || sel == 30 || sel == 31);
         ShowParamLayout(300, sel == 30);
         ShowParamLayout(310, sel == 31);
+        ShowParamLayout(32, sel == 32);
+        ShowParamLayout(33, sel == 33);
+
+        if (sel == 0) RefreshMoveParamPanel();
 
         // ── 共享布局 (sel 5/6 共用; 9/10 共用) ──
         ShowParamLayout(5, sel == 5 || sel == 6);
@@ -1939,9 +2339,6 @@ private:
 
         // ── 文字识别子面板 (位置 180-186) ──
         ShowParamLayout(180, sel == 18);
-        ShowParamLayout(181, sel == 18);
-        ShowParamLayout(18, sel == 18);
-        ShowParamLayout(183, sel == 18);
         if (sel == 18) {
             SetPopupSel(popupOcrResultMode_, ocrResultModeCombo_,
                 std::clamp(popupOcrResultMode_.sel, 0, static_cast<int>(popupOcrResultMode_.items.size()) - 1));
@@ -1991,7 +2388,17 @@ private:
         UpdateMoveVarControls();
         UpdateLoopVarControls();
         paramScrollY_ = 0;
-        ApplyParamScroll();
+        if (UsesDynamicParamPanel(sel)) {
+            ApplyParamScrollOffset(true);
+            UpdateParamViewportGeometry();
+            if (MaxParamScroll() <= 0 && hwnd_) {
+                HDC dc = GetDC(hwnd_);
+                ClearParamScrollTrack(dc);
+                ReleaseDC(hwnd_, dc);
+            }
+        } else {
+            ApplyParamScroll();
+        }
         if (hwnd_) {
             RECT listRc = ActionListRect();
             InvalidateRect(hwnd_, &listRc, TRUE);
@@ -2046,24 +2453,67 @@ private:
         InvalidateParamScrollChrome();
     }
 
-    void CaptureParamScrollBaseLayout() {
+    void CaptureParamScrollBaseLayout(int layoutBottomHint = -1) {
+        if (UsesDynamicParamPanel()) {
+            RevealParamControlsForCapture();
+            if (paramViewport_) UpdateWindow(paramViewport_);
+        }
+
+        std::unordered_map<HWND, ParamScrollLayoutEntry> prevLayout;
+        for (const auto& entry : paramScrollLayout_) {
+            if (entry.hwnd) prevLayout[entry.hwnd] = entry;
+        }
+
         paramScrollLayout_.clear();
         paramControlsBottom_ = ParamPanelContentTopY();
         paramContentBottom_ = ParamPanelContentTopY();
         std::vector<HWND> controls;
         CollectParamScrollControls(controls);
+        const bool dynamicPanel = UsesDynamicParamPanel();
+        if (dynamicPanel && paramScrollY_ != 0) {
+            for (const auto& [hwnd, entry] : prevLayout) {
+                if (!hwnd) continue;
+                SetParamPosAware(hwnd, entry.baseX, entry.baseY, entry.baseW, entry.baseH,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+        }
         for (HWND h : controls) {
             if (!h) continue;
-            if (!IsControlShown(h) && !IsEditorParamComboHwnd(h)) continue;
-            RECT rc = WindowClientRect(h);
+            if (IsIntentionallyHiddenParamControl(h)) continue;
+            if (!dynamicPanel) {
+                if (!IsControlShown(h) && !IsEditorParamComboHwnd(h)) continue;
+            } else if (!IsEditorParamComboHwnd(h)) {
+                const RECT probe = WindowClientRect(h);
+                if (probe.top < -1000) continue;
+            }
             if (IsFooterControl(h)) continue;
+            EnsureParamViewportParent(h);
+            if (!dynamicPanel) SyncParamControlScrollPosition(h);
+            RECT rc = WindowClientRect(h);
+            if (dynamicPanel && paramScrollY_ != 0) {
+                OffsetRect(&rc, 0, paramScrollY_);
+            }
+            if (auto it = prevLayout.find(h); it != prevLayout.end()) {
+                const auto& old = it->second;
+                const int oldW = old.baseW;
+                const int oldH = old.baseH;
+                const int newW = rc.right - rc.left;
+                const int newH = rc.bottom - rc.top;
+                if (old.baseX != rc.left || old.baseY != rc.top || oldW != newW || oldH != newH) {
+                    const RECT vp = ParamViewportRect();
+                    RECT oldVp{
+                        old.baseX - vp.left, old.baseY - vp.top,
+                        old.baseX + oldW - vp.left, old.baseY + oldH - vp.top
+                    };
+                    if (paramViewport_) InvalidateRect(paramViewport_, &oldVp, TRUE);
+                }
+            }
             const int maxRight = ParamFieldMaxRight();
             if (rc.left < maxRight && rc.right > maxRight) {
                 SetParamPosAware(h, rc.left, rc.top, maxRight - rc.left, rc.bottom - rc.top,
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
                 rc.right = maxRight;
             }
-            EnsureParamViewportParent(h);
             paramScrollLayout_.push_back(ParamScrollLayoutEntry{
                 h, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
             });
@@ -2071,10 +2521,17 @@ private:
             paramContentBottom_ = std::max(paramContentBottom_, static_cast<int>(rc.bottom));
         }
 
-        ApplyEditorFooterLayout();
+        int footerAnchor = paramControlsBottom_;
+        if (layoutBottomHint >= 0) {
+            footerAnchor = std::max(footerAnchor, layoutBottomHint);
+        } else if (UsesDynamicParamPanel() && paramLayoutBottomHint_ >= 0) {
+            footerAnchor = std::max(footerAnchor, paramLayoutBottomHint_);
+        }
+        ApplyEditorFooterLayout(footerAnchor);
 
         for (HWND h : {remarkLabel_, remark_, modifyBtn_, addBtn_}) {
-            if (!h || !IsControlShown(h)) continue;
+            if (!h) continue;
+            EnsureParamViewportParent(h);
             RECT rc = WindowClientRect(h);
             const int maxRight = ParamFieldMaxRight();
             if (rc.left < maxRight && rc.right > maxRight) {
@@ -2082,11 +2539,21 @@ private:
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
                 rc.right = maxRight;
             }
-            EnsureParamViewportParent(h);
             paramScrollLayout_.push_back(ParamScrollLayoutEntry{
                 h, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
             });
             paramContentBottom_ = std::max(paramContentBottom_, static_cast<int>(rc.bottom));
+        }
+
+        UpdateParamViewportGeometry();
+
+        if (footerAnchor >= ParamPanelContentTopY()) {
+            const int gap = MulDiv(18, kEditorHeight, kEditorBaseHeight);
+            const int remarkH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
+            const int btnGap = MulDiv(18, kEditorHeight, kEditorBaseHeight);
+            const int btnH = MulDiv(30, kEditorHeight, kEditorBaseHeight);
+            const int estimatedBottom = footerAnchor + gap + remarkH + btnGap + btnH;
+            paramContentBottom_ = std::max(paramContentBottom_, estimatedBottom);
         }
     }
 
@@ -2116,6 +2583,19 @@ private:
                 return true;
             }
         }
+        if (sel == 18) {
+            const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+            if (regionByImage) {
+                if (h == ocrRegionLabel_ || h == ocrFullScreenBtn_ || h == ocrSelectRegionBtn_) {
+                    return true;
+                }
+            } else {
+                for (HWND hide : ocrFindRegionControls_) {
+                    if (h == hide) return true;
+                }
+                if (h == ocrFindSelectRegionBtn_ || h == ocrFindImageLabel_) return true;
+            }
+        }
         return false;
     }
 
@@ -2129,25 +2609,65 @@ private:
         }
     }
 
-    void ApplyParamScrollOffset(bool repaintChrome = true, bool eraseViewport = true, bool hideOffscreen = true) {
+    void ApplyParamScrollOffset(bool repaintChrome = true, bool eraseViewport = true, bool hideOffscreen = true, bool postLayoutRedraw = true) {
         const RECT contentVp = ParamScrollContentRect();
-        // 滚动/重排前先擦掉 viewport 底色，避免 SWP_NOCOPYBITS 移位后在原位置留下 GDI 残留
-        if (eraseViewport && paramViewport_ && page_ == Page::Editor && !paramScrollLayout_.empty()) {
-            RedrawWindow(paramViewport_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ERASENOW | RDW_NOCHILDREN);
+        const bool effectiveHideOffscreen = hideOffscreen && paramScrollY_ > 0;
+        // 记录移位前可见控件区域，SWP_NOCOPYBITS 不会自动擦掉旧位置
+        std::vector<RECT> staleVpRects;
+        if (paramViewport_ && page_ == Page::Editor) {
+            const RECT vp = ParamViewportRect();
+            for (const auto& entry : paramScrollLayout_) {
+                if (!entry.hwnd || IsIntentionallyHiddenParamControl(entry.hwnd)) continue;
+                const bool pinFooter = IsFooterControl(entry.hwnd) && !UsesDynamicParamPanel();
+                const int scrollY = pinFooter ? entry.baseY : entry.baseY - paramScrollY_;
+                const RECT mainRc{entry.baseX, scrollY, entry.baseX + entry.baseW, scrollY + entry.baseH};
+                RECT visible{};
+                if (!IntersectRect(&visible, &mainRc, &contentVp)) continue;
+                staleVpRects.push_back(RECT{
+                    mainRc.left - vp.left, mainRc.top - vp.top,
+                    mainRc.right - vp.left, mainRc.bottom - vp.top
+                });
+            }
         }
-        HDWP hdwp = paramScrollLayout_.empty()
-            ? nullptr
-            : BeginDeferWindowPos(static_cast<UINT>(paramScrollLayout_.size()));
+        // 滚动/重排前仅标记旧区域待重绘；不要用 RDW_NOCHILDREN 擦全屏，否则白底会盖住子控件
+        if (eraseViewport && paramViewport_ && page_ == Page::Editor) {
+            for (const RECT& r : staleVpRects)
+                InvalidateRect(paramViewport_, &r, TRUE);
+        }
+        const bool dynamicPanelScroll = UsesDynamicParamPanel();
+        HDWP hdwp = (!dynamicPanelScroll && !paramScrollLayout_.empty())
+            ? BeginDeferWindowPos(static_cast<UINT>(paramScrollLayout_.size()))
+            : nullptr;
         for (const auto& entry : paramScrollLayout_) {
             if (!entry.hwnd) continue;
-            EnsureParamViewportParent(entry.hwnd);
-            const int y = entry.baseY - paramScrollY_;
-            const RECT ctrl{entry.baseX, y, entry.baseX + entry.baseW, y + entry.baseH};
-            RECT visible{};
-            if (hideOffscreen && !IntersectRect(&visible, &ctrl, &contentVp)) {
+            if (IsIntentionallyHiddenParamControl(entry.hwnd)) {
                 ShowWindow(entry.hwnd, SW_HIDE);
                 SetWindowRgn(entry.hwnd, nullptr, TRUE);
-                if (hdwp) {
+                if (dynamicPanelScroll) {
+                    SetParamPosAware(entry.hwnd, -5000, -5000, entry.baseW, entry.baseH,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                } else if (hdwp) {
+                    hdwp = DeferWindowPos(hdwp, entry.hwnd, nullptr, -5000, -5000, entry.baseW, entry.baseH,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                } else {
+                    SetParamPosAware(entry.hwnd, -5000, -5000, entry.baseW, entry.baseH,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                }
+                continue;
+            }
+            EnsureParamViewportParent(entry.hwnd);
+            const bool pinFooter = IsFooterControl(entry.hwnd) && !dynamicPanelScroll;
+            const int y = pinFooter ? entry.baseY : entry.baseY - paramScrollY_;
+            const RECT ctrl{entry.baseX, y, entry.baseX + entry.baseW, y + entry.baseH};
+            RECT visible{};
+            if (effectiveHideOffscreen && !IsFooterControl(entry.hwnd)
+                && !IntersectRect(&visible, &ctrl, &contentVp)) {
+                ShowWindow(entry.hwnd, SW_HIDE);
+                SetWindowRgn(entry.hwnd, nullptr, TRUE);
+                if (dynamicPanelScroll) {
+                    SetParamPosAware(entry.hwnd, -5000, -5000, entry.baseW, entry.baseH,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                } else if (hdwp) {
                     hdwp = DeferWindowPos(hdwp, entry.hwnd, nullptr, -5000, -5000, entry.baseW, entry.baseH,
                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
                 } else {
@@ -2160,32 +2680,65 @@ private:
             const RECT vp = ParamViewportRect();
             const int targetX = GetParent(entry.hwnd) == paramViewport_ ? entry.baseX - vp.left : entry.baseX;
             const int targetY = GetParent(entry.hwnd) == paramViewport_ ? y - vp.top : y;
-            if (hdwp) {
+            if (dynamicPanelScroll) {
+                SetParamPosAware(entry.hwnd, entry.baseX, y, entry.baseW, entry.baseH,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            } else if (hdwp) {
                 hdwp = DeferWindowPos(hdwp, entry.hwnd, nullptr, targetX, targetY, entry.baseW, entry.baseH,
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
             } else {
                 SetWindowPos(entry.hwnd, nullptr, targetX, targetY, entry.baseW, entry.baseH,
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
             }
-            ShowWindow(entry.hwnd, SW_SHOWNA);
+            if (IsEditorParamComboHwnd(entry.hwnd)) {
+                ShowWindow(entry.hwnd, SW_HIDE);
+            } else {
+                ShowWindow(entry.hwnd, SW_SHOWNA);
+            }
         }
         if (hdwp) EndDeferWindowPos(hdwp);
+        for (HWND h : {remarkLabel_, remark_, modifyBtn_, addBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if (paramViewport_ && page_ == Page::Editor) {
+            for (const RECT& r : staleVpRects)
+                InvalidateRect(paramViewport_, &r, TRUE);
+            if (!postLayoutRedraw) {
+                for (const auto& entry : paramScrollLayout_) {
+                    if (!entry.hwnd || IsIntentionallyHiddenParamControl(entry.hwnd)) continue;
+                    const bool pinFooter = IsFooterControl(entry.hwnd) && !UsesDynamicParamPanel();
+                    const int y = pinFooter ? entry.baseY : entry.baseY - paramScrollY_;
+                    const RECT ctrl{entry.baseX, y, entry.baseX + entry.baseW, y + entry.baseH};
+                    RECT visible{};
+                    if (!IntersectRect(&visible, &ctrl, &contentVp)) continue;
+                    InvalidateParamControlInViewport(entry.hwnd);
+                }
+            }
+        }
         ApplyParamLayerMasks();
         if (editorPopupOpen_ >= 0) SyncEditorDropPopup();
         if (quickInputTipShown_ != QuickInputTipKind::None) SyncQuickInputTipPopup();
         if (repaintChrome) RepaintParamPanelChrome();
+        if (postLayoutRedraw) PostLayoutParamPanelRedraw();
     }
 
     void RestoreParamPanelLayout() {
+        std::vector<HWND> active;
+        CollectParamScrollControls(active);
+        std::unordered_set<HWND> activeSet(active.begin(), active.end());
         for (const auto& item : editorLayouts_) {
             if (item.hwnd == paramViewport_) {
-                const RECT vp = ParamViewportRect();
-                MoveWindow(paramViewport_, vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top, FALSE);
+                UpdateParamViewportGeometry();
                 continue;
             }
             if (IsFooterControl(item.hwnd)) continue;
+            if (IsOcrDepHwnd(item.hwnd)) continue;
             if (IsOcrHwnd(item.hwnd)) continue;
-            if (IsAiDynamicHwnd(item.hwnd)) continue;
+            if (IsFindImageHwnd(item.hwnd)) continue;
+            if (IsMoveHwnd(item.hwnd)) continue;
+            if (IsAiLayoutHwnd(item.hwnd)) continue;
+            if (!activeSet.count(item.hwnd)) continue;
             const int x = MulDiv(item.base.left, kEditorWidth, kEditorBaseWidth);
             const int y = MulDiv(item.base.top, kEditorHeight, kEditorBaseHeight);
             const int w = std::max(1, MulDiv(item.base.right - item.base.left, kEditorWidth, kEditorBaseWidth));
@@ -2197,16 +2750,20 @@ private:
 
     void RebuildParamPanelLayout() {
         ClearParamScrollClipping();
+        paramScrollY_ = 0;
         HideInactiveParamControls();
         RestoreParamPanelLayout();
-        RevealParamControlsForCapture();
         RefreshDynamicParamLayout();
         SyncSharedVarComboVisibility();
-        CaptureParamScrollBaseLayout();
-        paramScrollY_ = std::clamp(paramScrollY_, 0, MaxParamScroll());
-        ApplyParamScrollOffset(false);
+        if (!UsesDynamicParamPanel()) {
+            RevealParamControlsForCapture();
+            CaptureParamScrollBaseLayout();
+            paramScrollY_ = std::clamp(paramScrollY_, 0, MaxParamScroll());
+            ApplyParamScrollOffset(false);
+        }
         ApplyParamLayerMasks();
         RepaintParamPanelChrome();
+        PostLayoutParamPanelRedraw();
     }
 
     void RestoreEditorAfterScreenOverlay() {
@@ -2221,7 +2778,11 @@ private:
             UpdateWindow(hwnd_);
             return;
         }
-        RebuildParamPanelLayout();
+        paramScrollY_ = 0;
+        paramLayoutBottomHint_ = -1;
+        RefreshDynamicParamLayout();
+        RepaintParamPanelChrome();
+        PostLayoutParamPanelRedraw();
         InvalidateRect(hwnd_, nullptr, TRUE);
         if (paramViewport_) InvalidateRect(paramViewport_, nullptr, TRUE);
         RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
@@ -2243,7 +2804,20 @@ private:
     }
 
     void ApplyParamScroll() {
-        RebuildParamPanelLayout();
+        ClearParamScrollClipping();
+        const int sel = popupAction_.sel;
+        if (!UsesDynamicParamPanel(sel)) {
+            RestoreStaticParamLayoutsForSel(sel);
+        }
+        CaptureParamScrollBaseLayout();
+        paramScrollY_ = std::clamp(paramScrollY_, 0, MaxParamScroll());
+        ApplyParamScrollOffset(true);
+        UpdateParamViewportGeometry();
+        if (MaxParamScroll() <= 0 && hwnd_) {
+            HDC dc = GetDC(hwnd_);
+            ClearParamScrollTrack(dc);
+            ReleaseDC(hwnd_, dc);
+        }
     }
 
     void ScrollParamPanel(int deltaY) {
@@ -2251,7 +2825,16 @@ private:
         if (maxScroll <= 0) return;
         const int oldScroll = paramScrollY_;
         paramScrollY_ = std::clamp(paramScrollY_ + deltaY, 0, maxScroll);
-        if (oldScroll != paramScrollY_) ApplyParamScrollOffset(true);
+        if (oldScroll != paramScrollY_) {
+            ApplyParamScrollOffset(true, true, true, true);
+            if (hwnd_) {
+                HDC mainDc = GetDC(hwnd_);
+                if (mainDc) {
+                    PaintParamScrollScrollbar(mainDc);
+                    ReleaseDC(hwnd_, mainDc);
+                }
+            }
+        }
     }
 
     int MaxParamScroll() const {
@@ -2280,20 +2863,234 @@ private:
         }
     }
 
+    void LayoutFindImageRegionButtons(int y) {
+        if (!findRegionLabel_ || !findFullScreenBtn_ || !findSelectRegionBtn_) return;
+        const int left = ParamPanelLeft();
+        const int maxRight = ParamFieldMaxRight();
+        const int btnGap = MulDiv(kFindRegionBtnGap, kEditorWidth, kEditorBaseWidth);
+        const int labelGap = MulDiv(kFindRegionLabelGap, kEditorWidth, kEditorBaseWidth);
+        const int selectW = kFindBtnW;
+        HDC hdc = GetDC(hwnd_);
+        HFONT old = static_cast<HFONT>(SelectObject(hdc, editorFont_ ? editorFont_ : font_));
+        wchar_t labelBuf[32]{};
+        GetWindowTextW(findRegionLabel_, labelBuf, 32);
+        SIZE labelSz{}, fullSz{};
+        GetTextExtentPoint32W(hdc, labelBuf, static_cast<int>(wcslen(labelBuf)), &labelSz);
+        GetTextExtentPoint32W(hdc, L"全图", 2, &fullSz);
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd_, hdc);
+        const int labelW = std::max(MulDiv(kFindRegionLabelW, kEditorWidth, kEditorBaseWidth),
+            static_cast<int>(labelSz.cx) + 4);
+        const int fullWWant = std::max(44, static_cast<int>(fullSz.cx) + MulDiv(18, kEditorWidth, kEditorBaseWidth));
+        const int selectWScaled = MulDiv(selectW, kEditorWidth, kEditorBaseWidth);
+        const int availW = maxRight - left;
+        const int fullWMax = std::max(44, availW - labelW - labelGap - btnGap - selectWScaled);
+        const int fullW = std::max(44, std::min(fullWMax, fullWWant));
+        const int totalW = labelW + labelGap + fullW + btnGap + selectWScaled;
+        const int startX = left + std::max(0, (availW - totalW) / 2);
+        const int labelXDesign = MulDiv(startX, kEditorBaseWidth, kEditorWidth);
+        const int fullXDesign = MulDiv(startX + labelW + labelGap, kEditorBaseWidth, kEditorWidth);
+        const int selectXDesign = MulDiv(startX + labelW + labelGap + fullW + btnGap, kEditorBaseWidth, kEditorWidth);
+        const int fullWDesign = MulDiv(fullW, kEditorBaseWidth, kEditorWidth);
+        MoveOcrAt(findRegionLabel_, labelXDesign, y, MulDiv(labelW, kEditorBaseWidth, kEditorWidth), kFindBtnH);
+        MoveOcrAt(findFullScreenBtn_, fullXDesign, y, fullWDesign, kFindBtnH);
+        MoveOcrAt(findSelectRegionBtn_, selectXDesign, y, selectW, kFindBtnH);
+        ShowWindow(findRegionLabel_, SW_SHOW);
+        ShowWindow(findFullScreenBtn_, SW_SHOW);
+        ShowWindow(findSelectRegionBtn_, SW_SHOW);
+    }
+
+    void RaiseFindImageRegionButtons() const {
+        for (HWND h : {findRegionLabel_, findFullScreenBtn_, findSelectRegionBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+        }
+    }
+
+    void RaiseOcrRegionButtons() const {
+        for (HWND h : {ocrRegionLabel_, ocrFullScreenBtn_, ocrSelectRegionBtn_}) {
+            if (!h || !IsWindowVisible(h)) continue;
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+        }
+    }
+
+    // 参数区复选框切换会触发 viewport 白底填充；邻近灰按钮须立即重绘，否则上边框被盖住。
+    void RefreshOcrNeighborGrayButtons() {
+        if (popupAction_.sel != 18) return;
+        if (ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_))
+            RaiseOcrFindImageHeaderControls();
+        else
+            RaiseOcrRegionButtons();
+        RefreshGrayButtonsInParamViewport();
+    }
+
+    int LayoutFindImageHeaderRow(int y) const {
+        const FindImageSideButtonLayout layout = ComputeFindImageSideButtonLayout();
+        const int rowH = layout.compactBtnH;
+        const int left = MulDiv(kFindContentLeft, kEditorWidth, kEditorBaseWidth);
+        if (findImageHeaderLabel_) {
+            MoveParamAware(findImageHeaderLabel_, left, y, MulDiv(90, kEditorWidth, kEditorBaseWidth), rowH, FALSE);
+            ShowWindow(findImageHeaderLabel_, SW_SHOW);
+        }
+        PlaceOcrFindImageCompactButton(findTestBtn_, y);
+        if (findTestBtn_) ShowWindow(findTestBtn_, SW_SHOW);
+        return y + rowH + layout.sideGap;
+    }
+
+    void RefreshMoveParamPanel() {
+        const int left = ParamPanelLeft();
+        const int maxRight = ParamFieldMaxRight();
+        const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
+        const int hintH = MulDiv(25, kEditorHeight, kEditorBaseHeight);
+        const int gap1 = MulDiv(1, kEditorWidth, kEditorBaseWidth);
+        const int gap5 = MulDiv(5, kEditorWidth, kEditorBaseWidth);
+        const int gap7 = MulDiv(7, kEditorHeight, kEditorBaseHeight);
+        const int gap8 = MulDiv(8, kEditorHeight, kEditorBaseHeight);
+        const int gap9 = MulDiv(9, kEditorHeight, kEditorBaseHeight);
+        const int gap10 = MulDiv(10, kEditorHeight, kEditorBaseHeight);
+        const int gap15 = MulDiv(15, kEditorHeight, kEditorBaseHeight);
+        const int btnH = MulDiv(32, kEditorHeight, kEditorBaseHeight);
+
+        int y = MulDiv(180, kEditorHeight, kEditorBaseHeight);
+
+        if (moveHintLabel_) {
+            MoveParamAware(moveHintLabel_, left, y,
+                std::min(MulDiv(190, kEditorWidth, kEditorBaseWidth), maxRight - left), hintH, FALSE);
+            ShowWindow(moveHintLabel_, SW_SHOW);
+        }
+        y += hintH + gap9;
+
+        auto layoutCoordRandomRow = [&](HWND xLabel, HWND xEdit, HWND rndLabel, HWND rndEdit) {
+            int x = left;
+            auto mv = [&](HWND h, int wDesign) {
+                if (!h) return;
+                const int w = MulDiv(wDesign, kEditorWidth, kEditorBaseWidth);
+                MoveParamAware(h, x, y, w, fieldH, FALSE);
+                ShowWindow(h, SW_SHOW);
+                x += w;
+            };
+            mv(xLabel, 25);
+            x += gap1;
+            mv(xEdit, 87);
+            x += gap1;
+            mv(rndLabel, 50);
+            x += gap5;
+            mv(rndEdit, 25);
+        };
+
+        layoutCoordRandomRow(moveXLabel_, moveX_, moveRandomXLabel_, moveRandomX_);
+        y += fieldH + gap15;
+
+        layoutCoordRandomRow(moveYLabel_, moveY_, moveRandomYLabel_, moveRandomY_);
+        y += fieldH + gap10;
+
+        if (crosshairBtn_) {
+            MoveParamAware(crosshairBtn_, left, y, MulDiv(186, kEditorWidth, kEditorBaseWidth), btnH, FALSE);
+            ShowWindow(crosshairBtn_, SW_SHOW);
+        }
+        y += btnH + gap7;
+
+        if (moveFromVar_) {
+            MoveParamAware(moveFromVar_, left, y, MulDiv(180, kEditorWidth, kEditorBaseWidth), hintH, FALSE);
+            ShowWindow(moveFromVar_, SW_SHOW);
+        }
+        y += hintH + gap7;
+
+        auto layoutVarRow = [&](HWND xLabel, HWND xEdit) {
+            int x = left;
+            auto mv = [&](HWND h, int wDesign) {
+                if (!h) return;
+                const int w = MulDiv(wDesign, kEditorWidth, kEditorBaseWidth);
+                MoveParamAware(h, x, y, w, fieldH, FALSE);
+                ShowWindow(h, SW_SHOW);
+                x += w;
+            };
+            mv(xLabel, 25);
+            x += gap1;
+            mv(xEdit, 168);
+        };
+
+        layoutVarRow(moveVarXLabel_, moveVarX_);
+        y += fieldH + gap15;
+
+        layoutVarRow(moveVarYLabel_, moveVarY_);
+        y += fieldH + gap8;
+
+        if (moveHintFooter_) {
+            const int hintFooterH = MulDiv(56, kEditorHeight, kEditorBaseHeight);
+            MoveParamAware(moveHintFooter_, left, y, std::max(1, maxRight - left), hintFooterH, FALSE);
+            ShowWindow(moveHintFooter_, SW_SHOW);
+            y += hintFooterH;
+        }
+
+        SyncParamScrollLayout(y);
+    }
+
     void RefreshFindImageSubPanel() {
         const bool saveVar = popupFindFollowUp_.sel == 2;
-        ShowParamLayout(170, !saveVar);
-        ShowParamLayout(171, saveVar);
-        const int rowY = MulDiv(kFindRegionRowY, kEditorHeight, kEditorBaseHeight);
-        LayoutParamRegionButtons(findRegionLabel_, findFullScreenBtn_, findSelectRegionBtn_, rowY);
-        int y = LayoutFindImagePreviewBlock();
+        if (saveVar) {
+            ParkParamGroup(findImageOffsetControls_);
+            for (HWND h : findImageVarControls_) {
+                if (h) ShowWindow(h, SW_SHOW);
+            }
+        } else {
+            ParkParamGroup(findImageVarControls_);
+            for (HWND h : findImageOffsetControls_) {
+                if (h) ShowWindow(h, SW_SHOW);
+            }
+        }
+        HideFindImageFloatingControls();
+        const int rowGap = MulDiv(kFindVGap, kEditorHeight, kEditorBaseHeight);
+        const int btnH = MulDiv(kFindBtnH, kEditorHeight, kEditorBaseHeight);
+        int y = MulDiv(kFindRegionRowY, kEditorHeight, kEditorBaseHeight);
+        LayoutFindImageRegionButtons(y);
+        RaiseFindImageRegionButtons();
+        y += btnH + rowGap;
+        y = LayoutParamCoordRows(
+            y,
+            findX1Label_, findX1_, findY1Label_, findY1_,
+            findX2Label_, findX2_, findY2Label_, findY2_);
+        y = LayoutFindImageHeaderRow(y);
+        y = LayoutFindImagePreviewBlockAt(y);
+        if (findImagePreviewBtn_) {
+            SetWindowPos(findImagePreviewBtn_, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        y = LayoutFindImageMatchScaleRows(y);
         y = LayoutFindImageFollowUpRow(y);
-        if (saveVar) LayoutFindImageVarBlock(y);
-        else LayoutFindImageOffsetBlock(y);
+        if (saveVar) y = LayoutFindImageVarBlock(y);
+        else y = LayoutFindImageOffsetBlock(y);
         ShowFindImageSideControls(
             findImagePreviewBtn_, findScreenshotBtn_, findLocalImageBtn_, findClearImageBtn_);
         RefreshGrayButtonsInParamViewport();
-        SyncParamScrollLayout();
+        SyncParamScrollLayout(y);
+        FiDbgLog(L"FIND_PANEL_REFRESH", L"layout snapshot");
+        FiDbgLogGrayButtonLayout(L"FIND/screenshot", findScreenshotBtn_);
+        FiDbgLogGrayButtonLayout(L"FIND/local", findLocalImageBtn_);
+        FiDbgLogGrayButtonLayout(L"FIND/clear", findClearImageBtn_);
+        FiDbgLogGrayButtonLayout(L"FIND/test", findTestBtn_);
+        FiDbgLogGrayButtonLayout(L"OCR/screenshot", ocrFindScreenshotBtn_);
+        FiDbgLogGrayButtonLayout(L"OCR/local", ocrFindLocalImageBtn_);
+        FiDbgLogGrayButtonLayout(L"OCR/clear", ocrFindClearImageBtn_);
+    }
+
+    const wchar_t* GrayButtonDebugName(HWND hwnd) const {
+        if (!hwnd) return L"(null)";
+        if (hwnd == findFullScreenBtn_) return L"findFullScreen";
+        if (hwnd == findSelectRegionBtn_) return L"findSelectRegion";
+        if (hwnd == findTestBtn_) return L"findTest";
+        if (hwnd == findImagePreviewBtn_) return L"findImagePreview";
+        if (hwnd == findScreenshotBtn_) return L"findScreenshot";
+        if (hwnd == findLocalImageBtn_) return L"findLocalImage";
+        if (hwnd == findClearImageBtn_) return L"findClearImage";
+        if (hwnd == findSelectOffsetBtn_) return L"findSelectOffset";
+        if (hwnd == ocrFindScreenshotBtn_) return L"ocrFindScreenshot";
+        if (hwnd == ocrFindLocalImageBtn_) return L"ocrFindLocalImage";
+        if (hwnd == ocrFindClearImageBtn_) return L"ocrFindClearImage";
+        if (hwnd == ocrFindSelectRegionBtn_) return L"ocrFindSelectRegion";
+        return L"grayOther";
     }
 
     void SizeFindFullScreenButton() {
@@ -2390,7 +3187,12 @@ private:
     void FinishGrayButtonClick(HWND ctrl) {
         if (!ctrl || !IsGrayButton(ctrl)) return;
         SendMessageW(ctrl, BM_SETSTATE, FALSE, 0);
+        if (GetFocus() == ctrl) {
+            HWND parent = GetParent(ctrl);
+            if (parent) SetFocus(parent);
+        }
         InvalidateGrayButton(ctrl);
+        UpdateHoverFromCursor();
     }
 
     void LayoutAiFindImageSideStack(int previewTop, HWND screenshot, HWND local, HWND clear) const {
@@ -2604,11 +3406,11 @@ private:
         };
         for (const auto& hit : hits) {
             if (!hit.hwnd || !IsParamComboVisible(hit.id)) continue;
-            if (PtIn(WindowClientRect(hit.hwnd), x, y)) return hit.id;
+            if (PtIn(EditorComboClientRect(hit.hwnd), x, y)) return hit.id;
         }
         if (IsParamComboVisible(7)) {
             if (HWND varCombo = ActiveVarComboHwnd()) {
-                if (PtIn(WindowClientRect(varCombo), x, y)) return 7;
+                if (PtIn(EditorComboClientRect(varCombo), x, y)) return 7;
             }
         }
         return -1;
@@ -2900,12 +3702,17 @@ private:
     }
 
     int LayoutAiFindRegionBlock(int y) {
+        HideAiFindRegionFloatingControls();
         const FindImageSideButtonLayout layout = ComputeFindImageSideButtonLayout();
         const int fieldH = OcrScale(22);
         const int rowGap = OcrScale(kFindVGap);
 
         MoveAiRegionAt(aiFindImagePreviewBtn_, kFindContentLeft, y, kFindImageSize, kFindImageSize);
         LayoutAiFindImageSideStack(y, aiFindScreenshotBtn_, aiFindLocalImageBtn_, aiFindClearImageBtn_);
+        if (aiFindImagePreviewBtn_) {
+            SetWindowPos(aiFindImagePreviewBtn_, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         ShowFindImageSideControls(
             aiFindImagePreviewBtn_, aiFindScreenshotBtn_, aiFindLocalImageBtn_, aiFindClearImageBtn_);
         y += kFindImageSize + layout.sideGap;
@@ -2937,93 +3744,102 @@ private:
         return y + fieldH + rowGap;
     }
 
-    void LayoutAiPromptHeader(bool actionExecuteMode) {
-        if (!aiPromptLabel_) return;
+    int LayoutAiCommonStack(int y, int sel) {
         const int left = ParamPanelLeft();
         const int fullW = ParamFieldMaxWidth();
-        const int labelH = MulDiv(kEditorLabelAboveComboH, kEditorHeight, kEditorBaseHeight);
-        const int checkW = AiScaleX(52);
-        const int sideGap = AiScaleX(8);
-        const int top = static_cast<int>(WindowClientRect(aiPromptLabel_).top);
-        if (actionExecuteMode) {
+        const int rowGap = MulDiv(8, kEditorHeight, kEditorBaseHeight);
+        const int labelGap = MulDiv(6, kEditorHeight, kEditorBaseHeight);
+        const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
+        const int comboH = MulDiv(21, kEditorHeight, kEditorBaseHeight);
+        const int btnH = MulDiv(28, kEditorHeight, kEditorBaseHeight);
+        const int textFieldH = MulDiv(EditorParamLayout::kPanelTextFieldH, kEditorHeight, kEditorBaseHeight);
+        const int hintH = MulDiv(28, kEditorHeight, kEditorBaseHeight);
+        const int blockGap = MulDiv(12, kEditorHeight, kEditorBaseHeight);
+        const bool actionExecute = sel == 31;
+
+        const int promptLabelH = MulDiv(kEditorLabelAboveComboH, kEditorHeight, kEditorBaseHeight);
+        if (actionExecute && aiWithImageCheck_) {
+            const int checkW = AiScaleX(52);
+            const int sideGap = AiScaleX(8);
             const int labelW = std::max(AiScaleX(80), fullW - checkW - sideGap);
-            MoveParamAware(aiPromptLabel_, left, top, labelW, labelH, FALSE);
-            if (aiWithImageCheck_) {
-                MoveParamAware(aiWithImageCheck_, left + labelW + sideGap, top, checkW, AiScaleY(25), FALSE);
-                ShowWindow(aiWithImageCheck_, SW_SHOW);
-            }
+            MoveAiAtVisible(aiPromptLabel_, left, y, labelW, promptLabelH);
+            MoveAiAtVisible(aiWithImageCheck_, left + labelW + sideGap, y, checkW, AiScaleY(25));
         } else {
-            MoveParamAware(aiPromptLabel_, left, top, fullW, labelH, FALSE);
+            if (aiWithImageCheck_) ParkParamControl(aiWithImageCheck_);
+            MoveAiAtVisible(aiPromptLabel_, left, y, fullW, promptLabelH);
         }
+        y += promptLabelH + labelGap;
+
+        MoveAiAtVisible(aiPromptEdit_, left, y, fullW, textFieldH);
+        y += textFieldH + rowGap;
+
+        if (actionExecute) {
+            MoveAiAtVisible(aiMaxStepsLabel_, left, y, fullW, fieldH);
+            y += fieldH + labelGap;
+            MoveAiAtVisible(aiMaxStepsEdit_, left, y, fullW, fieldH);
+            y += fieldH + MulDiv(4, kEditorHeight, kEditorBaseHeight);
+            MoveAiAtVisible(aiMaxStepsHint_, left, y, fullW, hintH);
+            y += hintH + rowGap;
+        } else {
+            for (HWND h : {aiMaxStepsLabel_, aiMaxStepsEdit_, aiMaxStepsHint_}) ParkParamControl(h);
+        }
+
+        MoveAiAtVisible(aiVarLabel_, left, y, fullW, fieldH);
+        y += fieldH + labelGap;
+        MoveAiAtVisible(aiVarCombo_, left, y, fullW, comboH);
+        y += comboH + rowGap;
+        MoveAiAtVisible(aiInsertVarBtn_, left, y, fullW, btnH);
+        y += btnH + blockGap;
+
+        MoveAiAtVisible(aiModelLabel_, left, y, fullW, fieldH);
+        y += fieldH + labelGap;
+        MoveAiAtVisible(aiModelCombo_, left, y, fullW, comboH);
+        y += comboH + rowGap;
+
+        MoveAiAtVisible(aiContextLabel_, left, y, fullW, fieldH);
+        y += fieldH + labelGap;
+        MoveAiAtVisible(aiContextModeCombo_, left, y, fullW, comboH);
+        y += comboH + rowGap;
+
+        MoveAiAtVisible(aiTimeoutLabel_, left, y, fullW, fieldH);
+        y += fieldH + labelGap;
+        MoveAiAtVisible(aiTimeoutEdit_, left, y, fullW, fieldH);
+        y += fieldH + rowGap;
+
+        MoveAiAtVisible(aiFallbackLabel_, left, y, fullW, fieldH);
+        y += fieldH + labelGap;
+        MoveAiAtVisible(aiFallbackEdit_, left, y, fullW, fieldH);
+        y += fieldH + rowGap;
+
+        if (!actionExecute) {
+            MoveAiAtVisible(aiOutputVarLabel_, left, y, fullW, fieldH);
+            y += fieldH + labelGap;
+            MoveAiAtVisible(aiOutputVarEdit_, left, y, fullW, fieldH);
+            y += fieldH + rowGap;
+            MoveAiAtVisible(aiOutputTypeLabel_, left, y, fullW, fieldH);
+            y += fieldH + labelGap;
+            MoveAiAtVisible(aiOutputTypeCombo_, left, y, fullW, comboH);
+            y += comboH;
+        } else {
+            for (HWND h : {aiOutputVarLabel_, aiOutputVarEdit_, aiOutputTypeLabel_, aiOutputTypeCombo_}) {
+                if (h) ParkParamControl(h);
+            }
+        }
+        return y;
     }
 
-    void ParkAiActionOnlyCommonFields() {
-        for (HWND h : {aiWithImageCheck_, aiMaxStepsLabel_, aiMaxStepsEdit_, aiMaxStepsHint_}) {
-            if (h) ParkParamControl(h);
-        }
-    }
+    int LayoutAiImageFields(int y) {
+        const int left = ParamPanelLeft();
+        const int fullW = ParamFieldMaxWidth();
+        const int rowGap = MulDiv(8, kEditorHeight, kEditorBaseHeight);
+        const int labelGap = MulDiv(6, kEditorHeight, kEditorBaseHeight);
+        const int fieldH = MulDiv(22, kEditorHeight, kEditorBaseHeight);
 
-    void EnsureAiCommonEditsVisible() {
-        for (HWND h : {aiPromptEdit_, aiFallbackEdit_, aiOutputVarEdit_, aiImageScaleEdit_}) {
-            if (!h || IsIntentionallyHiddenParamControl(h)) continue;
-            ShowWindow(h, SW_SHOW);
-            SetWindowRgn(h, nullptr, TRUE);
-        }
-    }
-
-    void CompactAiCommonBelowPrompt() {
-        if (!aiVarLabel_ || !aiPromptEdit_) return;
-        if (!IsWindowVisible(aiPromptEdit_)) return;
-        const RECT promptRc = WindowClientRect(aiPromptEdit_);
-        if (promptRc.bottom <= promptRc.top) return;
-        const int targetTop = static_cast<int>(WindowClientRect(aiPromptEdit_).bottom)
-            + MulDiv(8, kEditorHeight, kEditorBaseHeight);
-        const int currentTop = static_cast<int>(WindowClientRect(aiVarLabel_).top);
-        const int delta = targetTop - currentTop;
-        if (delta == 0) return;
-        const HWND shiftOrder[] = {
-            aiVarLabel_, aiVarCombo_, aiInsertVarBtn_, aiModelLabel_, aiModelCombo_,
-            aiContextLabel_, aiContextModeCombo_, aiTimeoutLabel_, aiTimeoutEdit_,
-            aiFallbackLabel_, aiFallbackEdit_, aiOutputVarLabel_, aiOutputVarEdit_,
-            aiOutputTypeLabel_, aiOutputTypeCombo_
-        };
-        for (HWND h : shiftOrder) {
-            if (!h) continue;
-            RECT rc = WindowClientRect(h);
-            MoveParamAware(h, rc.left, rc.top + delta, rc.right - rc.left, rc.bottom - rc.top, FALSE);
-            ShowWindow(h, SW_SHOW);
-        }
-    }
-
-    int AiCommonBlockBottomY() const {
-        int bottom = ParamPanelContentTopY();
-        for (HWND h : aiCommonControls_) {
-            if (!h || !IsWindowVisible(h)) continue;
-            if (IsIntentionallyHiddenParamControl(h)) continue;
-            bottom = std::max(bottom, static_cast<int>(WindowClientRect(h).bottom));
-        }
-        return bottom;
-    }
-
-    void StackParamGroupBelow(const std::vector<HWND>& group, int anchorBottom, int gap) {
-        int minTop = INT_MAX;
-        for (HWND h : group) {
-            if (!h || IsIntentionallyHiddenParamControl(h)) continue;
-            RECT rc = WindowClientRect(h);
-            if (rc.top < -1000) continue;
-            minTop = std::min(minTop, static_cast<int>(rc.top));
-        }
-        if (minTop == INT_MAX) return;
-        const int delta = anchorBottom + gap - minTop;
-        if (delta == 0) return;
-        for (HWND h : group) {
-            if (!h || IsIntentionallyHiddenParamControl(h)) continue;
-            RECT rc = WindowClientRect(h);
-            if (rc.top < -1000) continue;
-            MoveParamAware(h, rc.left, rc.top + delta, rc.right - rc.left, rc.bottom - rc.top, FALSE);
-            ShowWindow(h, SW_SHOW);
-            SetWindowRgn(h, nullptr, TRUE);
-        }
+        MoveAiAtVisible(aiImageScaleLabel_, left, y, fullW, fieldH);
+        y += fieldH + labelGap;
+        MoveAiAtVisible(aiImageScaleEdit_, left, y, fullW, fieldH);
+        y += fieldH + rowGap;
+        return y;
     }
 
     int LayoutAiRegionSection(
@@ -3040,7 +3856,7 @@ private:
         const int fieldH = OcrScale(22);
 
         if (regionByImageCheck) {
-            MoveParamAware(regionByImageCheck, ParamPanelLeft(), y, MulDiv(kOcrRegionByImageW, kEditorWidth, kEditorBaseWidth), fieldH, FALSE);
+            MoveParamAware(regionByImageCheck, ParamPanelLeft(), y, ParamFieldMaxWidth(), fieldH, FALSE);
             ShowWindow(regionByImageCheck, SW_SHOW);
             y += fieldH + rowGap;
         }
@@ -3049,7 +3865,7 @@ private:
             ParkParamControl(regionLabel);
             ParkParamControl(fullBtn);
             ParkParamControl(selectBtn);
-            ShowParamLayout(320, true);
+            HideAiFindRegionFloatingControls();
 
             const FindImageSideButtonLayout sideLayout = ComputeFindImageSideButtonLayout();
             const int headerRowY = y;
@@ -3063,6 +3879,7 @@ private:
                 PlaceAiFindImageCompactButton(aiFindSelectRegionBtn_, headerRowY);
                 ShowWindow(aiFindSelectRegionBtn_, SW_SHOW);
             }
+            RaiseAiFindImageHeaderControls();
             y += sideLayout.compactBtnH + sideLayout.sideGap;
             y = LayoutAiFindRegionBlock(y);
         } else {
@@ -3105,46 +3922,28 @@ private:
             : (withImage && aiRegionByImageCheck2_ && Checked(aiRegionByImageCheck2_));
 
         HideAiFindRegionControls();
-        const int rowGap = MulDiv(12, kEditorHeight, kEditorBaseHeight);
-        EnsureAiCommonEditsVisible();
-        LayoutAiPromptHeader(actionExecuteMode);
+        ParkParamGroup(aiImageControls_);
+        ParkParamGroup(aiActionControls_);
 
-        if (sel == 29) {
-            ParkParamGroup(aiImageControls_);
-            ParkParamGroup(aiActionControls_);
-            ParkAiActionOnlyCommonFields();
-            CompactAiCommonBelowPrompt();
-            SyncParamScrollLayout();
-            return;
-        }
+        const int sectionGap = MulDiv(12, kEditorHeight, kEditorBaseHeight);
+        const int rowGap = MulDiv(8, kEditorHeight, kEditorBaseHeight);
+        int y = ParamPanelContentTopY();
+        y = LayoutAiCommonStack(y, sel);
 
         if (imageMode) {
-            ParkParamGroup(aiActionControls_);
-            ParkAiActionOnlyCommonFields();
-            CompactAiCommonBelowPrompt();
-            if (aiRegionByImageCheck_) ShowWindow(aiRegionByImageCheck_, SW_SHOW);
-            if (aiRegionByImageCheck2_) ShowWindow(aiRegionByImageCheck2_, SW_HIDE);
-            StackParamGroupBelow(aiImageControls_, AiCommonBlockBottomY(), rowGap);
-            int y = aiRegionByImageCheck_
-                ? static_cast<int>(WindowClientRect(aiRegionByImageCheck_).top)
-                : AiCommonBlockBottomY() + rowGap;
-            LayoutAiRegionSection(
+            y += sectionGap;
+            y = LayoutAiImageFields(y);
+            y = LayoutAiRegionSection(
                 regionByImage,
                 aiRegionByImageCheck_,
                 aiRegionLabel_, aiFullScreenBtn_, aiSelectRegionBtn_,
                 aiCoordX1Label_, aiSearchX1Edit_, aiCoordY1Label_, aiSearchY1Edit_,
                 aiCoordX2Label_, aiSearchX2Edit_, aiCoordY2Label_, aiSearchY2Edit_,
                 y);
-        } else {
-            ParkParamGroup(aiImageControls_);
-            if (aiRegionByImageCheck2_) ShowWindow(aiRegionByImageCheck2_, SW_SHOW);
-            if (aiRegionByImageCheck_) ShowWindow(aiRegionByImageCheck_, SW_HIDE);
-            StackParamGroupBelow(aiActionControls_, AiCommonBlockBottomY(), rowGap);
+        } else if (actionExecuteMode) {
+            y += sectionGap;
             if (withImage) {
-                int y = aiRegionByImageCheck2_
-                    ? static_cast<int>(WindowClientRect(aiRegionByImageCheck2_).top)
-                    : AiCommonBlockBottomY() + rowGap;
-                LayoutAiRegionSection(
+                y = LayoutAiRegionSection(
                     regionByImage,
                     aiRegionByImageCheck2_,
                     aiActionRegionLabel_, aiFullScreenBtn2_, aiSelectRegionBtn2_,
@@ -3153,16 +3952,17 @@ private:
                     y);
             } else {
                 HideAiActionExecuteRegionControls();
-                for (HWND h : {
-                    aiRegionByImageCheck2_, aiActionRegionLabel_, aiFullScreenBtn2_, aiSelectRegionBtn2_,
-                    aiActCoordX1Label_, aiSearchX1Edit2_, aiActCoordY1Label_, aiSearchY1Edit2_,
-                    aiActCoordX2Label_, aiSearchX2Edit2_, aiActCoordY2Label_, aiSearchY2Edit2_}) {
-                    if (h) ParkParamControl(h);
-                }
+            }
+            if (aiConfirmExecute_) {
+                y += rowGap;
+                MoveAiAtVisible(aiConfirmExecute_, ParamPanelLeft(), y, AiScaleX(200), AiScaleY(25));
+                y += AiScaleY(25);
             }
         }
+
         if (regionByImage && (imageMode || withImage)) RefreshGrayButtonsInParamViewport();
-        SyncParamScrollLayout();
+        paramScrollY_ = 0;
+        SyncParamScrollLayout(y);
     }
 
     void InsertOcrSearchVariable() {
@@ -3201,34 +4001,129 @@ private:
     }
 
     int LayoutOcrFindRegionBlock(int y) {
+        HideOcrFindImageFloatingControls();
         const FindImageSideButtonLayout layout = ComputeFindImageSideButtonLayout();
         const int fieldH = OcrScaleY(22);
         const int rowGap = OcrScaleY(kFindVGap);
-        if (ocrFindImageLabel_) ShowWindow(ocrFindImageLabel_, SW_HIDE);
+        auto show = [](HWND h) {
+            if (!h) return;
+            ShowWindow(h, SW_SHOW);
+            SetWindowRgn(h, nullptr, TRUE);
+        };
+        for (HWND h : {ocrFindImagePreviewBtn_, ocrFindScreenshotBtn_, ocrFindLocalImageBtn_, ocrFindClearImageBtn_}) {
+            if (h && IsWindowVisible(h)) InvalidateParamControlInViewport(h);
+        }
         MoveOcrAt(ocrFindImagePreviewBtn_, kFindContentLeft, y, kFindImageSize, kFindImageSize);
+        show(ocrFindImagePreviewBtn_);
         LayoutOcrFindImageSideStack(y, ocrFindScreenshotBtn_, ocrFindLocalImageBtn_, ocrFindClearImageBtn_);
+        show(ocrFindScreenshotBtn_);
+        show(ocrFindLocalImageBtn_);
+        show(ocrFindClearImageBtn_);
         y += kFindImageSize + layout.sideGap;
 
         MoveOcrAt(ocrFindMatchThreshold_, kFindContentLeft + 91, y, 40, 22);
+        show(ocrFindMatchThreshold_);
         for (HWND h : ocrFindRegionControls_) {
             if (!h) continue;
             wchar_t buf[16]{};
             GetWindowTextW(h, buf, 16);
-            if (wcscmp(buf, L"匹配度大于") == 0) MoveOcrAt(h, kFindContentLeft, y, 90, 22);
-            else if (wcscmp(buf, L"%") == 0) MoveOcrAt(h, kFindContentLeft + 135, y, 24, 22);
+            if (wcscmp(buf, L"匹配度大于") == 0) {
+                MoveOcrAt(h, kFindContentLeft, y, 90, 22);
+                show(h);
+            } else if (wcscmp(buf, L"%") == 0) {
+                MoveOcrAt(h, kFindContentLeft + 135, y, 24, 22);
+                show(h);
+            }
         }
         y += fieldH + rowGap;
 
         MoveOcrAt(ocrFindScaleMin_, kFindContentLeft + 65, y, 40, 22);
         MoveOcrAt(ocrFindScaleMax_, kFindContentLeft + 151, y, 40, 22);
+        show(ocrFindScaleMin_);
+        show(ocrFindScaleMax_);
         for (HWND h : ocrFindRegionControls_) {
             if (!h) continue;
             wchar_t buf[16]{};
             GetWindowTextW(h, buf, 16);
-            if (wcscmp(buf, L"最小缩放") == 0) MoveOcrAt(h, kFindContentLeft, y, 64, 22);
-            else if (wcscmp(buf, L"最大") == 0) MoveOcrAt(h, kFindContentLeft + 110, y, 40, 22);
+            if (wcscmp(buf, L"最小缩放") == 0) {
+                MoveOcrAt(h, kFindContentLeft, y, 64, 22);
+                show(h);
+            } else if (wcscmp(buf, L"最大") == 0) {
+                MoveOcrAt(h, kFindContentLeft + 110, y, 40, 22);
+                show(h);
+            }
         }
         return y + fieldH + rowGap;
+    }
+
+    void HideOcrDynamicRegionControls() const {
+        for (HWND h : {ocrRegionLabel_, ocrFullScreenBtn_, ocrSelectRegionBtn_,
+                       ocrFindSelectRegionBtn_, ocrFindImageLabel_}) {
+            if (!h) continue;
+            if (IsWindowVisible(h)) InvalidateParamControlInViewport(h);
+            ShowWindow(h, SW_HIDE);
+        }
+        for (HWND h : ocrFindRegionControls_) {
+            if (!h) continue;
+            if (IsWindowVisible(h)) InvalidateParamControlInViewport(h);
+            ShowWindow(h, SW_HIDE);
+        }
+    }
+
+    void HideFindImageFloatingControls() const {
+        for (HWND h : {findTestBtn_, findImagePreviewBtn_, findScreenshotBtn_,
+                       findLocalImageBtn_, findClearImageBtn_}) {
+            if (!h) continue;
+            if (IsWindowVisible(h)) InvalidateParamControlInViewport(h);
+            ShowWindow(h, SW_HIDE);
+        }
+    }
+
+    void HideAiFindRegionFloatingControls() const {
+        for (HWND h : {aiFindImagePreviewBtn_, aiFindScreenshotBtn_,
+                       aiFindLocalImageBtn_, aiFindClearImageBtn_}) {
+            if (!h) continue;
+            if (IsWindowVisible(h)) InvalidateParamControlInViewport(h);
+            ShowWindow(h, SW_HIDE);
+        }
+    }
+
+    void HideOcrFindImageFloatingControls() const {
+        for (HWND h : {ocrFindImagePreviewBtn_, ocrFindScreenshotBtn_,
+                       ocrFindLocalImageBtn_, ocrFindClearImageBtn_}) {
+            if (!h) continue;
+            if (IsWindowVisible(h)) InvalidateParamControlInViewport(h);
+            ShowWindow(h, SW_HIDE);
+        }
+    }
+
+    int LayoutOcrFindImageHeaderRow(int y) {
+        const FindImageSideButtonLayout sideLayout = ComputeFindImageSideButtonLayout();
+        const int headerRowY = y;
+        const int headerLabelH = OcrScale(kFindBtnH);
+        if (ocrFindImageLabel_) {
+            MoveOcrAt(ocrFindImageLabel_, kFindContentLeft,
+                headerRowY + std::max(0, (sideLayout.compactBtnH - headerLabelH) / 2),
+                90, kFindBtnH);
+            ShowWindow(ocrFindImageLabel_, SW_SHOW);
+            SetWindowPos(ocrFindImageLabel_, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        PlaceOcrFindImageCompactButton(ocrFindSelectRegionBtn_, headerRowY);
+        if (ocrFindSelectRegionBtn_) {
+            ShowWindow(ocrFindSelectRegionBtn_, SW_SHOW);
+            SetWindowPos(ocrFindSelectRegionBtn_, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        return y + sideLayout.compactBtnH + sideLayout.sideGap;
+    }
+
+    int LayoutOcrRegionModeRow(int y) {
+        SizeOcrRegionButtonsAt(y);
+        if (ocrRegionLabel_) ShowWindow(ocrRegionLabel_, SW_SHOW);
+        if (ocrFullScreenBtn_) ShowWindow(ocrFullScreenBtn_, SW_SHOW);
+        if (ocrSelectRegionBtn_) ShowWindow(ocrSelectRegionBtn_, SW_SHOW);
+        return y + OcrScaleY(kFindBtnH) + OcrScaleY(kFindVGap);
     }
 
     bool OcrSearchTextContainsVariable() const {
@@ -3241,21 +4136,33 @@ private:
     }
 
     void RefreshOcrSubPanel() {
+        HideOcrDynamicRegionControls();
         const bool searchMode = popupOcrResultMode_.sel == 1;
         const bool saveVar = popupOcrFollowUp_.sel == 2;
         const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
-        ShowParamLayout(18, true);
-        ShowParamLayout(183, true);
-        ShowParamLayout(182, searchMode);
-        ShowParamLayout(184, !saveVar);
-        ShowParamLayout(185, saveVar);
-        ShowParamLayout(181, true);
-        ShowParamLayout(186, regionByImage);
-        if (!regionByImage) {
-            for (HWND h : ocrFindRegionControls_) {
-                if (h) ShowWindow(h, SW_HIDE);
+        if (searchMode) {
+            for (HWND h : ocrSearchControls_) {
+                if (h) ShowWindow(h, SW_SHOW);
+            }
+        } else {
+            ParkParamGroup(ocrSearchControls_);
+        }
+        if (saveVar) {
+            ParkParamGroup(ocrFollowOffsetControls_);
+            for (HWND h : ocrFollowVarControls_) {
+                if (h) ShowWindow(h, SW_SHOW);
+            }
+        } else {
+            ParkParamGroup(ocrFollowVarControls_);
+            for (HWND h : ocrFollowOffsetControls_) {
+                if (h) ShowWindow(h, SW_SHOW);
             }
         }
+        // 布局 186 仅用于创建控件；显示/定位由下方动态堆叠负责，避免静态坐标与复选框行重叠
+        ShowParamLayout(186, false);
+        // ShowParamLayout(18) 会把识别区域/找图控件短暂显示在静态坐标，须再次隐藏后再动态堆叠
+        HideOcrDynamicRegionControls();
+        if (ocrTestBtn_) ShowWindow(ocrTestBtn_, SW_HIDE);
         if (editorPopupOpen_ == 18) CloseEditorPopup();
         if (ocrUntilFound_) ShowWindow(ocrUntilFound_, searchMode ? SW_SHOW : SW_HIDE);
 
@@ -3265,37 +4172,32 @@ private:
 
         int y = OcrContentStartY();
         if (ocrRegionByImageCheck_) {
-            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, kOcrRegionByImageW, 22);
+            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, kFindBlockW, fieldH);
             ShowWindow(ocrRegionByImageCheck_, SW_SHOW);
+            y += fieldH + rowGap;
+        }
+        if (ocrDigitsOnlyCheck_) {
+            MoveOcrAt(ocrDigitsOnlyCheck_, kFindContentLeft, y, kFindBlockW, fieldH);
+            ShowWindow(ocrDigitsOnlyCheck_, SW_SHOW);
             y += fieldH + rowGap;
         }
 
         if (regionByImage) {
-            const FindImageSideButtonLayout sideLayout = ComputeFindImageSideButtonLayout();
-            const int comboRowY = y;
-            if (ocrDigitsOnlyCheck_) {
-                MoveOcrAt(ocrDigitsOnlyCheck_, kFindContentLeft,
-                    comboRowY + std::max(0, (sideLayout.compactBtnH - fieldH) / 2), kOcrDigitsOnlyW, 22);
-                ShowWindow(ocrDigitsOnlyCheck_, SW_SHOW);
-            }
-            if (ocrRegionLabel_) ShowWindow(ocrRegionLabel_, SW_HIDE);
-            if (ocrFullScreenBtn_) ShowWindow(ocrFullScreenBtn_, SW_HIDE);
-            if (ocrSelectRegionBtn_) ShowWindow(ocrSelectRegionBtn_, SW_HIDE);
-            PlaceOcrFindImageCompactButton(ocrFindSelectRegionBtn_, comboRowY);
-            if (ocrFindSelectRegionBtn_) ShowWindow(ocrFindSelectRegionBtn_, SW_SHOW);
-            y += sideLayout.compactBtnH + sideLayout.sideGap;
+            y += rowGap;
+            y = LayoutOcrFindImageHeaderRow(y);
             y = LayoutOcrFindRegionBlock(y);
+            if (ocrFindImagePreviewBtn_) {
+                SetWindowPos(ocrFindImagePreviewBtn_, HWND_BOTTOM, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
             ShowFindImageSideControls(
                 ocrFindImagePreviewBtn_, ocrFindScreenshotBtn_, ocrFindLocalImageBtn_, ocrFindClearImageBtn_);
+            RaiseOcrFindImageHeaderControls();
+            RefreshGrayButtonsInParamViewport();
         } else {
-            if (ocrDigitsOnlyCheck_) {
-                MoveOcrAt(ocrDigitsOnlyCheck_, kFindContentLeft, y, kOcrDigitsOnlyW, 22);
-                ShowWindow(ocrDigitsOnlyCheck_, SW_SHOW);
-                y += fieldH + rowGap;
-            }
-            if (ocrFindSelectRegionBtn_) ShowWindow(ocrFindSelectRegionBtn_, SW_HIDE);
-            SizeOcrRegionButtonsAt(y);
-            y += btnH + rowGap;
+            y = LayoutOcrRegionModeRow(y);
+            RaiseOcrRegionButtons();
+            RefreshGrayButtonsInParamViewport();
         }
 
         y = LayoutParamCoordRows(
@@ -3363,7 +4265,9 @@ private:
             MoveOcrAt(ocrTestBtn_, kFindContentLeft, y, kFindBtnW, kFindBtnH);
             y += btnH + rowGap;
         }
-        if (regionByImage) RefreshGrayButtonsInParamViewport();
+        if (regionByImage && paramViewport_) InvalidateRect(paramViewport_, nullptr, TRUE);
+        paramScrollY_ = 0;
+        SyncParamScrollLayout(y);
     }
 
     void InvalidateOcrEditorPanel() {
@@ -3504,7 +4408,7 @@ private:
         if (regionByImage && ocrFindImagePath_.empty()) {
             ocrTestRunning_ = false;
             if (ocrTestBtn_) EnableWindow(ocrTestBtn_, TRUE);
-            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"测试文字识别", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"请先设置要查找的图片。");
             return;
         }
 
@@ -3516,7 +4420,7 @@ private:
                 RestoreEditorAfterScreenCapture();
                 ocrTestRunning_ = false;
                 if (ocrTestBtn_) EnableWindow(ocrTestBtn_, TRUE);
-                MessageBoxW(hwnd_, L"未找到参考图片，无法测试识别。", L"测试文字识别", MB_OK | MB_ICONINFORMATION);
+                ShowPromptInfo(L"未找到参考图片，无法测试识别。");
                 return;
             }
         } else if (ocrFullScreen_) {
@@ -3634,13 +4538,13 @@ private:
         return false;
     }
 
-    bool ValidateDefineBlockName(const std::wstring& name, int excludeIndex = -1) const {
+    bool ValidateDefineBlockName(const std::wstring& name, int excludeIndex = -1) {
         if (!IsValidBlockName(name)) {
-            MessageBoxW(hwnd_, L"块名称只能以字母开始，后面只能包含字母和数字。", L"定义宏指令块", MB_OK | MB_ICONWARNING);
+            ShowPromptInfo(L"块名称只能以字母开始，后面只能包含字母和数字。");
             return false;
         }
         if (IsBlockNameDuplicate(name, excludeIndex)) {
-            MessageBoxW(hwnd_, L"块名称不能重复。", L"定义宏指令块", MB_OK | MB_ICONWARNING);
+            ShowPromptInfo(L"块名称不能重复。");
             return false;
         }
         return true;
@@ -3694,6 +4598,7 @@ private:
         case ActionType::AiImageAnalysis: return 30;
         case ActionType::AiActionExecute: return 31;
         case ActionType::GetCursorPos: return 32;
+        case ActionType::Goto: return 33;
         default: return 14;
         }
     }
@@ -3704,7 +4609,7 @@ private:
             || idx == 13 || idx == 14 || idx == 15 || idx == 16 || idx == 17 || idx == 18 || idx == 19
             || idx == 20 || idx == 21 || idx == 22 || idx == 23 || idx == 24
             || idx == 25 || idx == 26 || idx == 27 || idx == 28
-            || idx == 29 || idx == 30 || idx == 31 || idx == 32;
+            || idx == 29 || idx == 30 || idx == 31 || idx == 32 || idx == 33;
     }
 
     void UpdateEditMode() {
@@ -3728,9 +4633,57 @@ private:
         else if (batchSelected_.size() > actions_.size()) batchSelected_.resize(actions_.size());
     }
 
+    RECT ToolbarAreaRect() const {
+        RECT rc{};
+        bool has = false;
+        for (HWND h : {loadBtn_, clearBtn_, batchExitBtn_, batchSelectAllBtn_, batchDeselectBtn_,
+                       batchDeleteBtn_, batchCopyBtn_, labelBatchCount_, labelList_}) {
+            if (!h) continue;
+            const RECT hr = WindowClientRect(h);
+            if (hr.right <= hr.left || hr.bottom <= hr.top) continue;
+            if (!has) {
+                rc = hr;
+                has = true;
+            } else {
+                rc.left = std::min(rc.left, hr.left);
+                rc.top = std::min(rc.top, hr.top);
+                rc.right = std::max(rc.right, hr.right);
+                rc.bottom = std::max(rc.bottom, hr.bottom);
+            }
+        }
+        if (!has) {
+            return RECT{
+                0,
+                MulDiv(90, kEditorHeight, kEditorBaseHeight),
+                MulDiv(780, kEditorWidth, kEditorBaseWidth),
+                MulDiv(132, kEditorHeight, kEditorBaseHeight)
+            };
+        }
+        InflateRect(&rc, 4, 4);
+        return rc;
+    }
+
     void InvalidateToolbarArea() {
-        RECT rc{0, 90, 780, 132};
-        InvalidateRect(hwnd_, &rc, FALSE);
+        if (!hwnd_) return;
+        const RECT toolbarRc = ToolbarAreaRect();
+        InvalidateRect(hwnd_, &toolbarRc, TRUE);
+    }
+
+    void RedrawEditorSurface() {
+        if (!hwnd_ || page_ != Page::Editor) return;
+        InvalidateToolbarArea();
+        const RECT listRc = ActionListRect();
+        InvalidateRect(hwnd_, &listRc, TRUE);
+        RefreshActionListLayer();
+        if (UsesDynamicParamPanel()) {
+            RefreshDynamicParamLayout();
+        } else {
+            ApplyEditorFooterLayout();
+            SyncParamScrollLayout();
+        }
+        RepaintParamPanelChrome();
+        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        UpdateWindow(hwnd_);
     }
 
     void UpdateBatchToolbar() {
@@ -3747,8 +4700,10 @@ private:
         const bool hasSelection = BatchSelectedCount() > 0;
         EnableWindow(batchDeleteBtn_, hasSelection ? TRUE : FALSE);
         EnableWindow(batchCopyBtn_, hasSelection ? TRUE : FALSE);
-        if (batchDeleteBtn_) InvalidateRect(batchDeleteBtn_, nullptr, FALSE);
-        if (batchCopyBtn_) InvalidateRect(batchCopyBtn_, nullptr, FALSE);
+        for (HWND h : {loadBtn_, clearBtn_, batchExitBtn_, batchSelectAllBtn_, batchDeselectBtn_,
+                       batchDeleteBtn_, batchCopyBtn_, labelBatchCount_}) {
+            if (h) RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
         InvalidateToolbarArea();
     }
 
@@ -3761,6 +4716,7 @@ private:
         batchSelected_.assign(actions_.size(), false);
         UpdateBatchToolbar();
         UpdateEditMode();
+        RedrawEditorSurface();
     }
 
     void ExitBatchEditMode() {
@@ -3769,6 +4725,7 @@ private:
         batchSelected_.clear();
         UpdateBatchToolbar();
         UpdateEditMode();
+        RedrawEditorSurface();
     }
 
     void ToggleBatchSelection(int index) {
@@ -3827,8 +4784,50 @@ private:
         OnActionsChanged();
     }
 
-    bool Checked(HWND h) const { return SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; }
-    void SetChecked(HWND h, bool checked) { SendMessageW(h, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0); }
+    bool Checked(HWND h) const {
+        if (IsMarkedParamCheckbox(h)) return IsParamCheckboxChecked(h);
+        return SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+    void SetChecked(HWND h, bool checked) {
+        if (IsMarkedParamCheckbox(h)) {
+            SetParamCheckboxChecked(h, checked);
+            return;
+        }
+        SendMessageW(h, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
+    void RedrawParamCheckbox(HWND hwnd) const {
+        if (!hwnd) return;
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+    }
+
+    void OnParamCheckboxClicked(HWND ctrl) {
+        if (!ctrl) return;
+        const int id = GetDlgCtrlID(ctrl);
+        if (id == kOcrRegionByImage) {
+            if (popupAction_.sel == 18) RequestOcrSubPanelRefresh();
+            else RebuildParamPanelLayout();
+            return;
+        }
+        if (id == kAiRegionByImage || id == kAiRegionByImage2 || id == kAiWithImage) {
+            RebuildParamPanelLayout();
+        } else if (id == kMoveFromVar || id == kLoopFromVar) {
+            UpdateMoveVarControls();
+            UpdateLoopVarControls();
+        }
+    }
+
+    void ToggleParamCheckbox(HWND ctrl) {
+        if (!ctrl) return;
+        const int id = GetDlgCtrlID(ctrl);
+        const bool lockVp = (id == EditorParamLayout::EID_OcrDigitsOnly && paramViewport_);
+        if (lockVp) LockParamViewportRedraw();
+        if (id == EditorParamLayout::EID_OcrDigitsOnly) RefreshOcrNeighborGrayButtons();
+        SetChecked(ctrl, !Checked(ctrl));
+        if (!IsMarkedParamCheckbox(ctrl)) RedrawParamCheckbox(ctrl);
+        if (lockVp) UnlockParamViewportRedraw();
+        OnParamCheckboxClicked(ctrl);
+    }
 
     void ReadModifierHolds(ScriptAction& action, HWND lWin, HWND rWin, HWND lCtrl, HWND rCtrl, HWND lAlt, HWND rAlt, HWND lShift, HWND rShift) {
         action.holdLeftWin = Checked(lWin); action.holdRightWin = Checked(rWin);
@@ -3928,7 +4927,8 @@ private:
             action.findImageFollowUp = std::clamp(popupFindFollowUp_.sel, 0, 2);
             action.offsetX = ToInt(findOffsetX_);
             action.offsetY = ToInt(findOffsetY_);
-            action.findUntilFound = action.findImageFollowUp == 2 ? false : Checked(findUntilFound_);
+            action.findTimeExpr = action.findImageFollowUp == 2 ? L"0" : GetText(findTimeEdit_);
+            if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
             action.matchVarName = Trim(GetText(findMatchVar_));
             if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
         }
@@ -4002,6 +5002,10 @@ private:
         else if (sel == 32) {
             action.type = ActionType::GetCursorPos;
             action.matchVarName = Trim(GetText(cursorPosVarName_));
+        }
+        else if (sel == 33) {
+            action.type = ActionType::Goto;
+            action.gotoStepExpr = Trim(GetText(gotoStepEdit_));
         }
         else if (sel == 29) {
             action.type = ActionType::AiTextAnalysis;
@@ -4163,7 +5167,7 @@ private:
             SetPopupSel(popupFindFollowUp_, findFollowUpCombo_, std::clamp(action.findImageFollowUp, 0, 2));
             SetText(findOffsetX_, std::to_wstring(action.offsetX));
             SetText(findOffsetY_, std::to_wstring(action.offsetY));
-            SetChecked(findUntilFound_, action.findUntilFound);
+            SetText(findTimeEdit_, action.findTimeExpr.empty() ? L"0" : action.findTimeExpr);
             SetText(findMatchVar_, action.matchVarName.empty() ? L"matchRet" : action.matchVarName);
             UpdateFindImagePreview();
         }
@@ -4245,6 +5249,10 @@ private:
         else if (action.type == ActionType::GetCursorPos) {
             SetPopupSel(popupAction_, actionCombo_, 32);
             SetText(cursorPosVarName_, action.matchVarName);
+        }
+        else if (action.type == ActionType::Goto) {
+            SetPopupSel(popupAction_, actionCombo_, 33);
+            SetText(gotoStepEdit_, action.gotoStepExpr);
         }
         else if (action.type == ActionType::AiTextAnalysis) {
             SetPopupSel(popupAction_, actionCombo_, 29);
@@ -4531,7 +5539,7 @@ private:
     void BeginOcrFindRegionSelect() {
         if (!ocrRegionByImageCheck_ || !Checked(ocrRegionByImageCheck_)) return;
         if (!HasFindImageTemplate(ocrFindImagePath_)) {
-            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"选取区域", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"请先设置要查找的图片。");
             return;
         }
         int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
@@ -4637,7 +5645,7 @@ private:
         if (searchMode) {
             if (OcrSearchTextContainsVariable()) return;
             if (Trim(GetText(ocrSearchEdit_)).empty()) {
-                MessageBoxW(hwnd_, L"请先输入要在结果中查找的文字。", L"选择偏移", MB_OK | MB_ICONINFORMATION);
+                ShowPromptInfo(L"请先输入要在结果中查找的文字。");
                 return;
             }
         }
@@ -4650,7 +5658,7 @@ private:
 
         const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
         if (regionByImage && ocrFindImagePath_.empty()) {
-            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"选择偏移", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"请先设置要查找的图片。");
             return;
         }
 
@@ -4660,7 +5668,7 @@ private:
         if (regionByImage) {
             if (!ResolveOcrAbsRegionFromFindImage(sx1, sy1, sx2, sy2, sx1, sy1, sx2, sy2)) {
                 RestoreEditorAfterScreenCapture();
-                MessageBoxW(hwnd_, L"未找到参考图片，无法选择偏移位置。", L"选择偏移", MB_OK | MB_ICONINFORMATION);
+                ShowPromptInfo(L"未找到参考图片，无法选择偏移位置。");
                 return;
             }
         } else if (ocrFullScreen_) {
@@ -4696,7 +5704,7 @@ private:
 
     void BeginFindOffsetSelect() {
         if (findImagePath_.empty()) {
-            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"选择偏移", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"请先设置要查找的图片。");
             return;
         }
         int sx1 = ToInt(findX1_), sy1 = ToInt(findY1_), sx2 = ToInt(findX2_), sy2 = ToInt(findY2_);
@@ -4777,7 +5785,7 @@ private:
                 && aiRegionByImageCheck2_ && Checked(aiRegionByImageCheck2_));
         if (!regionByImage) return;
         if (!HasFindImageTemplate(aiFindImagePath_)) {
-            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"选取区域", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"请先设置要查找的图片。");
             return;
         }
         int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
@@ -4920,11 +5928,20 @@ private:
     }
 
     void TestFindImage() {
-        if (findImagePath_.empty()) {
-            MessageBoxW(hwnd_, L"请先设置要查找的图片。", L"测试找图", MB_OK | MB_ICONINFORMATION);
+        if (findTestRunning_.exchange(true)) return;
+        auto finishTest = [&]() {
+            findTestRunning_ = false;
+            if (findTestBtn_) {
+                EnableWindow(findTestBtn_, TRUE);
+                FinishGrayButtonClick(findTestBtn_);
+            }
+        };
+        // 无图时在此直接返回，不调用 MatchOverlay / 屏幕冻结
+        if (!HasFindImageTemplate(findImagePath_)) {
+            finishTest();
+            QueuePromptInfo(L"请先设置要查找的图片。");
             return;
         }
-        if (findTestRunning_.exchange(true)) return;
         if (findTestBtn_) EnableWindow(findTestBtn_, FALSE);
 
         if (!matchOverlay_) matchOverlay_ = std::make_unique<MatchOverlay>();
@@ -4945,9 +5962,7 @@ private:
                             MatchOverlayMode::Test);
 
         RestoreEditorAfterScreenOverlay();
-
-        findTestRunning_ = false;
-        if (findTestBtn_) EnableWindow(findTestBtn_, TRUE);
+        finishTest();
     }
 
     void OnFindTestDone(int /*found*/, int /*lParam*/) {
@@ -4963,7 +5978,9 @@ private:
             HWND btn = nullptr;
             int notifyCode = 0;
             ~GrayButtonClickReset() {
-                if (self && btn && notifyCode == BN_CLICKED && self->IsGrayButton(btn)) {
+                // WM_LBUTTONUP 已在子类过程中复位；此处仅兜底键盘触发的 BN_CLICKED
+                if (self && btn && notifyCode == BN_CLICKED && self->IsGrayButton(btn)
+                    && GetFocus() == btn) {
                     self->FinishGrayButtonClick(btn);
                 }
             }
@@ -5009,14 +6026,20 @@ private:
         if (id == kFindLocalImage) { LoadFindImageFromFile(); return; }
         if (id == kFindImagePreview) { LoadFindImageFromFile(); return; }
         if (id == kFindClearImage) { ClearFindImage(); return; }
-        if (id == kFindTest) { TestFindImage(); return; }
+        if (id == kFindTest) {
+            FiDbgLogFmt(L"ON_COMMAND_FIND_TEST",
+                L"ctrl=%p parent=%p chain=%s",
+                ctrl, ctrl ? GetParent(ctrl) : nullptr,
+                FiDbgWindowChain(ctrl).c_str());
+            TestFindImage();
+            return;
+        }
         if (id == kFindSelectOffset) { BeginFindOffsetSelect(); return; }
         if (id == kOcrFullScreen) { ApplyOcrFullScreen(); return; }
         if (id == kOcrSelectRegion) { BeginOcrRegionSelect(); return; }
         if (id == kOcrSelectOffset) { BeginOcrOffsetSelect(); return; }
         if (id == kOcrTest) { TestOcr(); return; }
         if (id == kOcrInstallDep) { ShowOcrInstallDialog(); return; }
-        if (id == kOcrRegionByImage && code == BN_CLICKED) { RebuildParamPanelLayout(); return; }
         if (id == kOcrFindSelectRegion) { BeginOcrFindRegionSelect(); return; }
         if (id == kOcrFindScreenshot) { BeginOcrFindScreenshot(); return; }
         if (id == kOcrFindLocalImage) { LoadOcrFindImageFromFile(); return; }
@@ -5025,19 +6048,11 @@ private:
         if (id == kAiInsertVar) { InsertAiPromptVariable(); return; }
         if (id == kAiSelectRegion) { BeginAiRegionSelect(); return; }
         if (id == kAiFullScreen) { ApplyAiFullScreen(); return; }
-        if (id == kAiRegionByImage && code == BN_CLICKED) { RebuildParamPanelLayout(); return; }
-        if (id == kAiRegionByImage2 && code == BN_CLICKED) { RebuildParamPanelLayout(); return; }
-        if (id == kAiWithImage && code == BN_CLICKED) { RebuildParamPanelLayout(); return; }
         if (id == kAiFindSelectRegion) { BeginAiFindRegionSelect(); return; }
         if (id == kAiTargetScreenshot) { BeginAiFindScreenshot(); return; }
         if (id == kAiTargetLocal) { LoadAiFindImageFromFile(); return; }
         if (id == kAiTargetPreview) { LoadAiFindImageFromFile(); return; }
         if (id == kAiTargetClear) { ClearAiFindImage(); return; }
-        if ((id == kMoveFromVar || id == kLoopFromVar) && code == BN_CLICKED) {
-            UpdateMoveVarControls();
-            UpdateLoopVarControls();
-            return;
-        }
         if (id == kListRemarkEdit && code == EN_KILLFOCUS) { CommitInlineRemark(); return; }
         if (id == kModify) { ModifySelected(); return; }
         if (id == kAdd) { ShowAddMenu(); return; }
@@ -5051,6 +6066,10 @@ private:
         action.originalNo = NextNo();
         if (indentOverride >= 0) action.indent = indentOverride;
         pos = std::min(pos, actions_.size());
+        if (action.type == ActionType::EndLoop && !HasLoopParentAt(actions_, pos, action.indent)) {
+            ShowPromptInfo(kEndLoopNeedsLoopParentMsg);
+            return;
+        }
         actions_.insert(actions_.begin() + static_cast<std::ptrdiff_t>(pos), action);
         selectedIndex_ = static_cast<int>(pos);
         {
@@ -5168,6 +6187,11 @@ private:
         if (selectedIndex_ < 0 || selectedIndex_ >= static_cast<int>(actions_.size())) return;
         ScriptAction action = ActionFromForm();
         if (action.type == ActionType::DefineBlock && !ValidateDefineBlockName(action.blockName, selectedIndex_)) return;
+        if (action.type == ActionType::EndLoop
+            && !HasLoopParentAt(actions_, static_cast<size_t>(selectedIndex_), actions_[static_cast<size_t>(selectedIndex_)].indent)) {
+            ShowPromptInfo(kEndLoopNeedsLoopParentMsg);
+            return;
+        }
         action.originalNo = actions_[static_cast<size_t>(selectedIndex_)].originalNo;
         action.indent = actions_[static_cast<size_t>(selectedIndex_)].indent;
         actions_[static_cast<size_t>(selectedIndex_)] = action;
@@ -5271,7 +6295,7 @@ private:
         const bool writeOk = out.good();
         out.close();
         if (!writeOk) {
-            MessageBoxW(hwnd_, L"保存失败：无法写入文件，请检查磁盘空间和权限。", L"保存", MB_OK | MB_ICONERROR);
+            ShowPromptInfo(L"保存失败：无法写入文件，请检查磁盘空间和权限。");
         } else {
             newImagePaths_.clear();
             CleanOrphanImages();
@@ -5302,6 +6326,7 @@ private:
         SetText(name_, ExtractString(content, L"scriptName"));
         currentRecordTime_ = ExtractString(content, L"recordTime");
         actions_ = ParseActionsFromContent(content);
+        NormalizeScriptActionList(actions_);
         collapsedContainers_.clear();
         RefreshRunBlockCombo();
         OnActionsChanged();
@@ -5406,7 +6431,7 @@ private:
         const auto content = ReadAll(path);
         std::wstring name = ExtractString(content, L"scriptName");
         if (name.empty()) {
-            MessageBoxW(hwnd_, L"导入失败：文件格式不正确，未找到脚本名称。", L"导入", MB_OK | MB_ICONWARNING);
+            ShowPromptInfo(L"导入失败：文件格式不正确，未找到脚本名称。");
             return;
         }
         EnsureScriptsDir();
@@ -5417,7 +6442,7 @@ private:
             target = baseDir + L"\\" + SafeScriptFileName(name) + L"-" + std::to_wstring(suffix++) + L".json";
         }
         if (!WriteImportedJson(target, content)) {
-            MessageBoxW(hwnd_, L"导入失败：无法写入目标目录。", L"导入", MB_OK | MB_ICONERROR);
+            ShowPromptInfo(L"导入失败：无法写入目标目录。");
             return;
         }
         FinishImport(toRecordings);
@@ -5427,13 +6452,13 @@ private:
         // 先读取 ZIP 中的 JSON 内容
         std::string jsonUtf8 = ReadTextFromZip(zipPath, "script.json");
         if (jsonUtf8.empty()) {
-            MessageBoxW(hwnd_, L"导入失败：ZIP 文件中未找到 script.json。", L"导入", MB_OK | MB_ICONWARNING);
+            ShowPromptInfo(L"导入失败：ZIP 文件中未找到 script.json。");
             return;
         }
         const std::wstring content = FromUtf8(jsonUtf8);
         std::wstring name = ExtractString(content, L"scriptName");
         if (name.empty()) {
-            MessageBoxW(hwnd_, L"导入失败：文件格式不正确，未找到脚本名称。", L"导入", MB_OK | MB_ICONWARNING);
+            ShowPromptInfo(L"导入失败：文件格式不正确，未找到脚本名称。");
             return;
         }
 
@@ -5443,7 +6468,7 @@ private:
         const std::wstring extractDir = std::wstring(tempDir) + L"qs_import_" + std::to_wstring(GetTickCount());
         int extracted = ExtractZipFile(zipPath, extractDir);
         if (extracted < 0) {
-            MessageBoxW(hwnd_, L"导入失败：无法解压 ZIP 文件。", L"导入", MB_OK | MB_ICONWARNING);
+            ShowPromptInfo(L"导入失败：无法解压 ZIP 文件。");
             return;
         }
 
@@ -5533,7 +6558,7 @@ private:
             target = baseDir + L"\\" + SafeScriptFileName(name) + L"-" + std::to_wstring(suffix++) + L".json";
         }
         if (!WriteImportedJson(target, modifiedContent)) {
-            MessageBoxW(hwnd_, L"导入失败：无法写入目标目录。", L"导入", MB_OK | MB_ICONERROR);
+            ShowPromptInfo(L"导入失败：无法写入目标目录。");
             return;
         }
         FinishImport(toRecordings);
@@ -5541,7 +6566,7 @@ private:
 
     void ExportSelectedScript() {
         if (selectedScript_ < 0 || selectedScript_ >= static_cast<int>(scripts_.size())) {
-            MessageBoxW(hwnd_, L"请选择要导出的宏", L"导出", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"请选择要导出的宏");
             return;
         }
         const auto& script = scripts_[static_cast<size_t>(selectedScript_)];
@@ -5561,9 +6586,9 @@ private:
         if (chosenPath.empty()) return;
         const auto path = EnsureJsonExtension(chosenPath);
         if (!CopyFileW(script.path.c_str(), path.c_str(), FALSE)) {
-            MessageBoxW(hwnd_, L"导出失败：无法写入目标文件。", L"导出", MB_OK | MB_ICONERROR);
+            ShowPromptInfo(L"导出失败：无法写入目标文件。");
         } else {
-            MessageBoxW(hwnd_, L"导出成功！", L"导出", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"导出成功！");
         }
     }
 
@@ -5601,14 +6626,14 @@ private:
         const auto zipResult = CreateZipFile(zipPath, files, script.path);
         if (zipResult.success) {
             if (zipResult.skippedFiles.empty()) {
-                MessageBoxW(hwnd_, L"导出成功！图片已一同打包。", L"导出", MB_OK | MB_ICONINFORMATION);
+                ShowPromptInfo(L"导出成功！图片已一同打包。");
             } else {
                 const std::wstring msg = L"导出成功，但有 " + std::to_wstring(zipResult.skippedFiles.size())
                     + L" 张图片未找到已跳过。\n\n对方导入后需要重新截图或选择本地图片。";
-                MessageBoxW(hwnd_, msg.c_str(), L"导出", MB_OK | MB_ICONWARNING);
+                ShowPromptInfo(msg.c_str());
             }
         } else {
-            MessageBoxW(hwnd_, L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。", L"导出", MB_OK | MB_ICONERROR);
+            ShowPromptInfo(L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。");
         }
     }
 
@@ -5643,7 +6668,19 @@ private:
     int HomeListHeight() const { RECT r = HomeListRect(); return r.bottom - r.top; }
     int HomeContentHeight() const { return static_cast<int>(scripts_.size()) * kHomeCardStep - kHomeCardGap; }
     int MaxHomeScroll() const { return std::max(0, HomeContentHeight() - HomeListHeight()); }
+    int AgentConvContentHeight() const { return static_cast<int>(agentConversations_.size()) * kHomeCardStep - kHomeCardGap; }
+    int MaxAgentConvScroll() const { return std::max(0, AgentConvContentHeight() - HomeListHeight()); }
+    int ActiveHomeContentHeight() const {
+        if (activeHomeTab_ == quickscript::MainTab::ScriptCustom)
+            return std::max(AgentConvContentHeight(), 1);
+        return std::max(HomeContentHeight(), 1);
+    }
+    int ActiveHomeListMaxScroll() const {
+        if (activeHomeTab_ == quickscript::MainTab::ScriptCustom) return MaxAgentConvScroll();
+        return MaxHomeScroll();
+    }
     void ClampHomeScroll() { homeScrollOffset_ = std::clamp(homeScrollOffset_, 0, MaxHomeScroll()); }
+    void ClampAgentConvScroll() { homeScrollOffset_ = std::clamp(homeScrollOffset_, 0, MaxAgentConvScroll()); }
     RECT HomeCardRect(int i) const { const int y = kHomeListY + i * kHomeCardStep - homeScrollOffset_; return RECT{kHomeCardX, y, kHomeCardX + kHomeCardW, y + kHomeCardH}; }
     int RecordingContentHeight() const { return static_cast<int>(recordings_.size()) * kHomeCardStep - kHomeCardGap; }
     int MaxRecordingScroll() const { return std::max(0, RecordingContentHeight() - HomeListHeight()); }
@@ -5669,10 +6706,10 @@ private:
     RECT HomeScrollTrackRect() const { RECT list = HomeListRect(); return RECT{list.right + 5, list.top, list.right + 5 + kHomeScrollW, list.bottom}; }
     RECT HomeScrollThumbRect() const {
         RECT track = HomeScrollTrackRect();
-        const int maxScroll = MaxHomeScroll();
+        const int maxScroll = ActiveHomeListMaxScroll();
         if (maxScroll <= 0) return RECT{track.left, track.top, track.right, track.bottom};
         const int trackH = track.bottom - track.top;
-        const int contentH = std::max(HomeContentHeight(), 1);
+        const int contentH = ActiveHomeContentHeight();
         const int thumbH = std::max(46, trackH * HomeListHeight() / contentH);
         const int range = std::max(1, trackH - thumbH);
         const int top = track.top + range * homeScrollOffset_ / maxScroll;
@@ -5695,9 +6732,55 @@ private:
     RECT ExportRect() const { return RECT{180, 149, 286, 182}; }
     RECT TimerRect() const { return RECT{300, 149, 406, 182}; }
     RECT HelpRect() const { return RECT{576, 149, 686, 182}; }
-    RECT DeleteDialogRect() const { RECT rc{}; GetClientRect(hwnd_, &rc); const int w = 450, h = 252; const int x = (rc.right - w) / 2; const int y = (rc.bottom - h) / 2; return RECT{x, y, x + w, y + h}; }
-    RECT DeleteOkRect() const { RECT d = DeleteDialogRect(); return RECT{d.left + 32, d.top + 138, d.left + 216, d.top + 208}; }
-    RECT DeleteCancelRect() const { RECT d = DeleteDialogRect(); return RECT{d.left + 236, d.top + 138, d.right - 32, d.top + 208}; }
+    RECT HomeFooterRect() const { return RECT{36, 468, 700, 492}; }
+    RECT ScriptCustomHeaderRect() const { return RECT{36, 125, 684, 182}; }
+    RECT AgentConvChatRect(int i) const {
+        RECT r = HomeCardRect(i);
+        return RECT{r.right - 96, r.top + 14, r.right - 24, r.top + 45};
+    }
+    RECT AgentConvDeleteRect(int i) const {
+        RECT r = HomeCardRect(i);
+        return RECT{r.right - 96, r.top + 58, r.right - 24, r.top + 88};
+    }
+
+    void LoadAgentConversations() {
+        agentConversations_.clear();
+        LoadAgentConversationList(agentConversations_);
+        ClampAgentConvScroll();
+    }
+
+    void OnAgentConversationClosed(AgentConversationSavePayload&& payload) {
+        if (payload.shouldSave) SaveAgentConversation(payload);
+        LoadAgentConversations();
+        if (IsWindow(hwnd_)) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void ConfirmDeleteAgentConversation(int index) {
+        if (index < 0 || index >= static_cast<int>(agentConversations_.size())) return;
+        pendingDeleteAgentConv_ = index;
+        const std::wstring name = agentConversations_[static_cast<size_t>(index)].name;
+        promptModal_.ShowConfirm(L"您确定要删除对话 \"" + name + L"\"\n吗？", [this](bool ok) {
+            if (ok && pendingDeleteAgentConv_ >= 0
+                && pendingDeleteAgentConv_ < static_cast<int>(agentConversations_.size())) {
+                DeleteAgentConversation(agentConversations_[static_cast<size_t>(pendingDeleteAgentConv_)].id);
+                LoadAgentConversations();
+                InvalidateRect(hwnd_, nullptr, TRUE);
+            }
+            pendingDeleteAgentConv_ = -1;
+            StDiscardSpuriousInputAfterModal(hwnd_);
+        });
+    }
+
+    void QueuePromptInfo(std::wstring message) {
+        promptPendingMessage_ = std::move(message);
+        PostMessageW(hwnd_, WM_APP_PROMPT, 0, 0);
+    }
+
+    void ShowPromptInfo(const std::wstring& message) {
+        CloseEditorPopup();
+        CloseClickerDropPopup();
+        promptModal_.ShowInfo(message);
+    }
     int TextWidth(const std::wstring& text, HFONT font) const {
         if (!hwnd_ || !font) return static_cast<int>(text.size()) * 18;
         HDC hdc = GetDC(hwnd_);
@@ -5944,15 +7027,13 @@ private:
             case WM_ERASEBKGND: {
                 RECT rc{};
                 GetClientRect(hwnd, &rc);
-                FillRect(reinterpret_cast<HDC>(wp), &rc, self->whiteBrush_);
+                self->FillParamViewportGaps(reinterpret_cast<HDC>(wp), hwnd, rc);
                 return 1;
             }
             case WM_PAINT: {
                 PAINTSTRUCT ps{};
                 HDC hdc = BeginPaint(hwnd, &ps);
-                RECT full{};
-                GetClientRect(hwnd, &full);
-                FillRect(hdc, &full, self->whiteBrush_);
+                self->FillParamViewportGaps(hdc, hwnd, ps.rcPaint);
                 self->PaintEditorParamChrome(hdc, hwnd);
                 EndPaint(hwnd, &ps);
                 return 0;
@@ -5960,8 +7041,73 @@ private:
             case WM_MOUSEWHEEL:
                 self->OnWheel(GET_WHEEL_DELTA_WPARAM(wp));
                 return 0;
+            case WM_MOUSEMOVE: {
+                POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                ClientToScreen(hwnd, &pt);
+                ScreenToClient(self->hwnd_, &pt);
+                self->OnMouseMove(pt.x, pt.y);
+                return 0;
+            }
+            case WM_MOUSELEAVE: {
+                POINT pt{};
+                GetCursorPos(&pt);
+                ScreenToClient(self->hwnd_, &pt);
+                self->OnMouseMove(pt.x, pt.y);
+                return 0;
+            }
             default:
                 break;
+            }
+        }
+        if (self && self->IsParamPanelCheckbox(hwnd)) {
+            switch (msg) {
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PRINTCLIENT:
+                self->PaintParamPanelCheckbox(hwnd, reinterpret_cast<HDC>(wp));
+                return 0;
+            case WM_PAINT:
+                return DefSubclassProc(hwnd, msg, wp, lp);
+            case WM_LBUTTONDOWN:
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+                return 0;
+            case WM_LBUTTONDBLCLK:
+                return 0;
+            case WM_LBUTTONUP:
+                if (GetCapture() == hwnd) ReleaseCapture();
+                self->ToggleParamCheckbox(hwnd);
+                return 0;
+            case WM_KEYDOWN:
+                if (wp == VK_SPACE) {
+                    self->ToggleParamCheckbox(hwnd);
+                    return 0;
+                }
+                break;
+            case WM_NCDESTROY:
+                RemovePropW(hwnd, kParamCheckboxProp);
+                RemovePropW(hwnd, kParamCheckboxCheckedProp);
+                break;
+            default:
+                break;
+            }
+        }
+        if (self && self->IsGrayButton(hwnd)) {
+            if (msg == WM_LBUTTONDOWN) {
+                FiDbgOnGrayClick(hwnd);
+            }
+            if (msg == WM_LBUTTONUP) {
+                FiDbgLogFmt(L"GRAY_LBUTTONUP", L"btn=%p name=%s",
+                    hwnd, self->GrayButtonDebugName(hwnd));
+                LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+                self->EditorChildMessage(hwnd, msg, wp, lp);
+                self->FinishGrayButtonClick(hwnd);
+                return r;
+            }
+            if (msg == WM_CAPTURECHANGED && reinterpret_cast<HWND>(lp) != hwnd) {
+                LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+                self->FinishGrayButtonClick(hwnd);
+                return r;
             }
         }
         wchar_t clsName[32]{};
@@ -5981,28 +7127,6 @@ private:
             }
             if (self->EditorComboPopupIdForHwnd(hwnd) >= 0) {
                 return msg == WM_ERASEBKGND ? 1 : 0;
-            }
-            if (self->IsParamPanelCheckbox(hwnd)) {
-                if (msg == WM_ERASEBKGND) return 1;
-                PAINTSTRUCT ps{};
-                HDC hdc = BeginPaint(hwnd, &ps);
-                RECT rc{};
-                GetClientRect(hwnd, &rc);
-                FillRect(hdc, &rc, self->whiteBrush_);
-                wchar_t text[128]{};
-                GetWindowTextW(hwnd, text, 128);
-                SelectObject(hdc, self->editorFont_ ? self->editorFont_ : self->font_);
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, kText);
-                constexpr int kCbSize = 18;
-                const int cbTop = rc.top + (rc.bottom - rc.top - kCbSize) / 2;
-                RECT cbRc{rc.left, cbTop, rc.left + kCbSize, cbTop + kCbSize};
-                FillRectColor(hdc, cbRc, kWhite);
-                StDrawCheckbox(hdc, cbRc, self->Checked(hwnd));
-                RECT textRc{rc.left + kCbSize + 4, rc.top, rc.right, rc.bottom};
-                DrawTextW(hdc, text, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                EndPaint(hwnd, &ps);
-                return 0;
             }
         }
         if (self && msg == WM_ERASEBKGND && self->IsGrayButton(hwnd)) {
@@ -6214,19 +7338,6 @@ private:
         ReleaseDC(hwnd_, wndDc);
     }
 
-    void DrawListCheckbox(HDC hdc, RECT rc, bool checked) {
-        HPEN boxPen = CreatePen(PS_SOLID, 1, checked ? kMainGreen : RGB(190, 190, 190));
-        HBRUSH boxBrush = CreateSolidBrush(checked ? kMainGreen : kWhite);
-        HGDIOBJ oldPen = SelectObject(hdc, boxPen);
-        HGDIOBJ oldBrush = SelectObject(hdc, boxBrush);
-        RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 3, 3);
-        SelectObject(hdc, oldPen);
-        SelectObject(hdc, oldBrush);
-        DeleteObject(boxPen);
-        DeleteObject(boxBrush);
-        if (checked) DrawTextIn(hdc, L"✓", rc, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-
     void DrawExpandTriangle(HDC hdc, RECT rc, bool expanded, COLORREF color) {
         POINT pts[3]{};
         const int cx = (rc.left + rc.right) / 2;
@@ -6285,6 +7396,22 @@ private:
         InvalidateRectClipped(RecordingCardRect(index));
     }
 
+    void InvalidateAgentConvCard(int index) {
+        if (index < 0 || index >= static_cast<int>(agentConversations_.size())) return;
+        InvalidateRectClipped(HomeCardRect(index));
+    }
+
+    int HitAgentConvCard(int x, int y) const {
+        if (activeHomeTab_ != quickscript::MainTab::ScriptCustom) return -1;
+        RECT list = HomeListRect();
+        if (!PtIn(list, x, y)) return -1;
+        for (int i = 0; i < static_cast<int>(agentConversations_.size()); ++i) {
+            RECT r = HomeCardRect(i);
+            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return i;
+        }
+        return -1;
+    }
+
     int HitRecordingCard(int x, int y) const {
         if (activeHomeTab_ != quickscript::MainTab::Recorder) return -1;
         RECT list = HomeListRect();
@@ -6335,10 +7462,7 @@ private:
 
     // ── Mouse input ────────────────────────────────────────────────
     void OnMouseMove(int x, int y) {
-        if (deleteConfirmVisible_) {
-            SetCursor(LoadCursorW(nullptr, (PtIn(DeleteOkRect(), x, y) || PtIn(DeleteCancelRect(), x, y)) ? IDC_HAND : IDC_ARROW));
-            return;
-        }
+        if (promptModal_.visible()) return;
         if (page_ == Page::Editor && editorPopupOpen_ >= 0) {
             if (EditorDropPopupVisible()) return;
         }
@@ -6358,7 +7482,7 @@ private:
         if (paramScrollbarDragging_) {
             UpdateParamScrollFromThumb(y - paramScrollbarDragOffset_);
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
-            ApplyParamScrollOffset(false, false);
+            ApplyParamScrollOffset(true, false);
             InvalidateRectClipped(ParamScrollTrackRect());
             return;
         }
@@ -6373,8 +7497,10 @@ private:
         if (page_ == Page::Home) {
             const int oldCard = homeHover_;
             const int oldRecording = recordingHover_;
+            const int oldAgentConv = agentConvHover_;
             homeHover_ = HitHomeCard(x, y);
             recordingHover_ = HitRecordingCard(x, y);
+            agentConvHover_ = HitAgentConvCard(x, y);
             if (oldCard != homeHover_) {
                 InvalidateHomeCard(oldCard);
                 InvalidateHomeCard(homeHover_);
@@ -6382,6 +7508,10 @@ private:
             if (oldRecording != recordingHover_) {
                 InvalidateRecordingCard(oldRecording);
                 InvalidateRecordingCard(recordingHover_);
+            }
+            if (oldAgentConv != agentConvHover_) {
+                InvalidateAgentConvCard(oldAgentConv);
+                InvalidateAgentConvCard(agentConvHover_);
             }
             if (oldButton != hoverButton_) {
                 InvalidateHoverButton(oldButton);
@@ -6414,10 +7544,6 @@ private:
     }
 
     HoverButton HitButton(int x, int y) const {
-        if (deleteConfirmVisible_) {
-            if (PtIn(DeleteOkRect(), x, y) || PtIn(DeleteCancelRect(), x, y)) return HoverButton::HomeDelete;
-            return HoverButton::None;
-        }
         if (HitClose(x, y)) return HoverButton::Close;
         if (HitMinimize(x, y)) return HoverButton::Minimize;
         if (page_ == Page::Home && HitSettings(x, y)) return HoverButton::Settings;
@@ -6455,7 +7581,16 @@ private:
                 return HoverButton::None;
             }
             if (activeHomeTab_ == quickscript::MainTab::ScriptCustom) {
-                if (PtIn(CreateRect(), x, y)) return HoverButton::HomeCard;
+                if (PtIn(CreateRect(), x, y)) return HoverButton::Create;
+                if (ActiveHomeListMaxScroll() > 0 && PtIn(HomeScrollTrackRect(), x, y)) return HoverButton::HomeScroll;
+                for (int i = 0; i < static_cast<int>(agentConversations_.size()); ++i) {
+                    RECT r = HomeCardRect(i);
+                    RECT list = HomeListRect();
+                    if (r.bottom < list.top || r.top > list.bottom) continue;
+                    if (PtIn(AgentConvChatRect(i), x, y)) return HoverButton::HomeEdit;
+                    if (PtIn(AgentConvDeleteRect(i), x, y)) return HoverButton::HomeDelete;
+                    if (PtIn(r, x, y)) return HoverButton::HomeCard;
+                }
                 return HoverButton::None;
             }
             if (PtIn(ImportRect(), x, y)) return HoverButton::Import;
@@ -6554,12 +7689,13 @@ private:
     }
 
     void OnMouseDown(int x, int y) {
-        if (deleteConfirmVisible_) { OnDeleteConfirmClick(x, y); return; }
+        if (promptModal_.visible()) return;
         if (HitClose(x, y)) { if (page_ == Page::Editor) ShowHome(); else SendMessageW(hwnd_, WM_CLOSE, 0, 0); return; }
         if (HitMinimize(x, y)) { ShowWindow(hwnd_, SW_MINIMIZE); return; }
         if (HitSettings(x, y) && page_ == Page::Home) { ShowSettingsDialog(); return; }
         if (y <= kTitleH) { ReleaseCapture(); SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(x, y)); return; }
-        if (page_ == Page::Home && activeHomeTab_ == quickscript::MainTab::Macro && MaxHomeScroll() > 0 && PtIn(HomeScrollThumbRect(), x, y)) {
+        if (page_ == Page::Home && (activeHomeTab_ == quickscript::MainTab::Macro || activeHomeTab_ == quickscript::MainTab::ScriptCustom)
+            && ActiveHomeListMaxScroll() > 0 && PtIn(HomeScrollThumbRect(), x, y)) {
             RECT thumb = HomeScrollThumbRect();
             homeScrollbarDragging_ = true;
             homeScrollbarDragOffset_ = y - thumb.top;
@@ -6620,6 +7756,7 @@ private:
     }
 
     void OnMouseUp(int, int) {
+        if (promptModal_.visible()) return;
         if (homeScrollbarDragging_) {
             homeScrollbarDragging_ = false;
             ReleaseCapture();
@@ -6659,8 +7796,12 @@ private:
         CloseClickerDropPopup();
         CloseEditorPopup();
         hoverButton_ = HoverButton::None;
+        homeHover_ = -1;
+        recordingHover_ = -1;
+        agentConvHover_ = -1;
         if (tab == quickscript::MainTab::Recorder) ClampRecordingScroll();
-        if (tab == quickscript::MainTab::Macro) ClampHomeScroll();
+        if (tab == quickscript::MainTab::Macro) { homeScrollOffset_ = 0; ClampHomeScroll(); }
+        if (tab == quickscript::MainTab::ScriptCustom) { homeScrollOffset_ = 0; ClampAgentConvScroll(); }
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
@@ -7381,10 +8522,10 @@ private:
                 } else {
                     const std::wstring msg = L"录制已导出，但有 " + std::to_wstring(zipResult.skippedFiles.size())
                         + L" 张图片未找到已跳过。\n\n可在\"鼠标宏\"中导入此文件，导入后需重新设置图片。";
-                    MessageBoxW(hwnd_, msg.c_str(), L"导出", MB_OK | MB_ICONWARNING);
+                    ShowPromptInfo(msg.c_str());
                 }
             } else {
-                MessageBoxW(hwnd_, L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。", L"导出", MB_OK | MB_ICONERROR);
+                ShowPromptInfo(L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。");
             }
         } else {
             // 纯 JSON 导出
@@ -7443,12 +8584,33 @@ private:
         if (activeHomeTab_ == quickscript::MainTab::Clicker) { OnClickerHomeClick(x, y); return; }
         if (activeHomeTab_ == quickscript::MainTab::Recorder) { OnRecorderHomeClick(x, y); return; }
         if (activeHomeTab_ == quickscript::MainTab::ScriptCustom) {
-            if (PtIn(CreateRect(), x, y)) {
-                PostMessageW(hwnd_, WM_OPEN_AGENT_DIALOG, 0, 0);
-            }
+            OnScriptCustomHomeClick(x, y);
             return;
         }
         OnMacroHomeClick(x, y);
+    }
+
+    void OnScriptCustomHomeClick(int x, int y) {
+        if (PtIn(CreateRect(), x, y)) {
+            OpenAgentDialog(-1);
+            return;
+        }
+        if (ActiveHomeListMaxScroll() > 0 && PtIn(HomeScrollTrackRect(), x, y)) {
+            RECT thumb = HomeScrollThumbRect();
+            homeScrollbarDragging_ = true;
+            homeScrollbarDragOffset_ = (thumb.bottom - thumb.top) / 2;
+            UpdateHomeScrollFromThumb(y - homeScrollbarDragOffset_);
+            SetCapture(hwnd_);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        for (int i = 0; i < static_cast<int>(agentConversations_.size()); ++i) {
+            RECT r = HomeCardRect(i);
+            RECT list = HomeListRect();
+            if (r.bottom < list.top || r.top > list.bottom) continue;
+            if (PtIn(AgentConvChatRect(i), x, y)) { OpenAgentDialog(i); return; }
+            if (PtIn(AgentConvDeleteRect(i), x, y)) { ConfirmDeleteAgentConversation(i); return; }
+        }
     }
 
     void CaptureScriptHotkey(int index) {
@@ -7472,14 +8634,17 @@ private:
     void ConfirmDelete(int index) {
         if (index < 0 || index >= static_cast<int>(scripts_.size())) return;
         pendingDeleteIndex_ = index;
-        deleteConfirmVisible_ = true;
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        const std::wstring name = scripts_[static_cast<size_t>(index)].name;
+        promptModal_.ShowConfirm(L"您确定要删除宏 \"" + name + L"\"\n吗？", [this](bool ok) {
+            if (ok) ExecutePendingDelete();
+            else pendingDeleteIndex_ = -1;
+            StDiscardSpuriousInputAfterModal(hwnd_);
+        });
     }
 
     void ExecutePendingDelete() {
         if (pendingDeleteIndex_ >= 0 && pendingDeleteIndex_ < static_cast<int>(scripts_.size())) {
             const auto scriptPath = scripts_[static_cast<size_t>(pendingDeleteIndex_)].path;
-            // 删除脚本引用的孤立图片（不被其他脚本引用才删）
             DeleteUnreferencedImagesOfScript(scriptPath);
             DeleteFileW(scriptPath.c_str());
             selectedScript_ = -1;
@@ -7488,17 +8653,7 @@ private:
             ClampHomeScroll();
             RegisterAllHotkeys();
         }
-        deleteConfirmVisible_ = false;
         InvalidateRect(hwnd_, nullptr, TRUE);
-    }
-
-    void OnDeleteConfirmClick(int x, int y) {
-        if (PtIn(DeleteOkRect(), x, y)) { ExecutePendingDelete(); return; }
-        if (PtIn(DeleteCancelRect(), x, y)) {
-            deleteConfirmVisible_ = false;
-            pendingDeleteIndex_ = -1;
-            InvalidateRect(hwnd_, nullptr, FALSE);
-        }
     }
 
     void ShowHotkeyMenuAt(RECT anchor) {
@@ -7640,15 +8795,33 @@ private:
         StDiscardSpuriousInputAfterModal(hwnd_);
     }
 
-    void OpenAgentDialog() {
+    void OpenAgentDialog(int restoreIndex = -1) {
         agentDialogs_.erase(
             std::remove_if(agentDialogs_.begin(), agentDialogs_.end(),
                 [](const std::unique_ptr<AgentDialog>& d) { return !d || !d->IsAlive(); }),
             agentDialogs_.end());
 
         LoadAppSettings(appSettings_);
+
+        AgentDialog::RestoreData restore;
+        const AgentDialog::RestoreData* restorePtr = nullptr;
+        if (restoreIndex >= 0 && restoreIndex < static_cast<int>(agentConversations_.size())) {
+            AgentConversationRecord rec;
+            if (LoadAgentConversationRecord(agentConversations_[static_cast<size_t>(restoreIndex)].id, rec)) {
+                restore.id = rec.meta.id;
+                restore.name = rec.meta.name;
+                restore.createdTime = rec.meta.createdTime;
+                restore.messages = std::move(rec.messages);
+                restore.chatDisplay = std::move(rec.chatDisplay);
+                restorePtr = &restore;
+            }
+        }
+
         auto dlg = std::make_unique<AgentDialog>();
-        if (!dlg->Show(hwnd_, appSettings_.ai)) return;
+        if (!dlg->Show(hwnd_, appSettings_.ai, restorePtr,
+            [this](AgentConversationSavePayload&& payload) {
+                OnAgentConversationClosed(std::move(payload));
+            })) return;
         agentDialogs_.push_back(std::move(dlg));
     }
 
@@ -7738,6 +8911,10 @@ private:
         if (ComboSelForType(existing.type) != popupAction_.sel) return;
         ScriptAction action = ActionFromForm();
         if (action.type == ActionType::DefineBlock && !IsValidBlockName(action.blockName)) return;
+        if (action.type == ActionType::EndLoop
+            && !HasLoopParentAt(actions_, static_cast<size_t>(selectedIndex_), existing.indent)) {
+            return;
+        }
         action.originalNo = existing.originalNo;
         action.indent = existing.indent;
         actions_[static_cast<size_t>(selectedIndex_)] = action;
@@ -7796,8 +8973,12 @@ private:
                 return static_cast<size_t>(ContainerBodyEnd(*activeActions, static_cast<int>(containerIndex)));
             };
 
-            std::function<bool(size_t, size_t)> runRange;
-            std::function<void(const std::wstring&)> runBlockByName;
+            enum class RunRangeResult { Normal, BreakLoop, GotoPending };
+            std::optional<size_t> pendingGoto;
+            std::optional<size_t> loopEntryGotoTarget;
+            bool pendingBreakLoop = false;
+            std::function<RunRangeResult(size_t, size_t)> runRange;
+            std::function<RunRangeResult(const std::wstring&)> runBlockByName;
             std::unordered_set<std::wstring> blockCallStack;
 
             auto makeVarCtx = [&]() {
@@ -7812,6 +8993,7 @@ private:
             };
 
             AiSessionStore aiSessions;
+            int aiLoopDepth = 0;
             AiStepBudgetState aiRootBudget{};
             AiStepFrame* aiCurFrame = nullptr;
             const ScriptAction* aiInheritParent = nullptr;
@@ -7821,7 +9003,8 @@ private:
 
             runAiActionExecute = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &runRange, &runningScriptPath,
                 &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx,
-                &executeOne, &runAiActionExecute, &aiSessions, &aiRootBudget, &aiCurFrame, &aiInheritParent](
+                &executeOne, &runAiActionExecute, &aiSessions, &aiLoopDepth, &aiRootBudget, &aiCurFrame, &aiInheritParent,
+                &pendingBreakLoop](
                 const ScriptAction& action, const ScriptAction* inheritFrom) {
                 if (stopFlag_) return;
                 ScriptAction eff = inheritFrom ? InheritAiActionFields(action, *inheritFrom) : action;
@@ -7839,9 +9022,14 @@ private:
                 AiStepFrame* prevFrame = aiCurFrame;
                 aiCurFrame = &childFrame;
 
-                if (!inheritFrom && eff.aiContextMode == 0) {
-                    aiSessions.ephemeralSession.reset();
-                }
+                auto propagateAiHistory = [&](AgentCore* core, const ScriptAction& action, size_t histBefore,
+                    const std::wstring& sysPrompt, bool withTools, int maxTokens, int timeoutMs) {
+                    if (core && action.aiContextMode != 0) {
+                        aiSessions.PropagateHistoryAfterCall(
+                            action.aiContextMode, aiLoopDepth, core, histBefore,
+                            action, sysPrompt, appSettings_, timeoutMs, withTools, maxTokens);
+                    }
+                };
 
                 auto resolveAiRegion = [&](int& x1, int& y1, int& x2, int& y2) -> bool {
                     if (eff.aiRegionByImage && !eff.aiTargetImagePath.empty()) {
@@ -7972,6 +9160,12 @@ private:
                                 continue;
                             }
                             ScriptAction stepAction = InheritAiActionFields(built.action, eff);
+                            if (stepAction.type == ActionType::EndLoop) {
+                                if (aiLoopDepth <= 0) {
+                                    AppendAiDebugLog(L"  跳过结束循环：" + std::wstring(kEndLoopNeedsLoopParentMsg));
+                                    continue;
+                                }
+                            }
                             AppendAiDebugLog(L"  执行 " + ActionName(stepAction)
                                 + L" (步" + std::to_wstring(stepCount + 1) + L")");
                             if (stepAction.type == ActionType::AiActionExecute) {
@@ -7979,6 +9173,7 @@ private:
                             } else {
                                 executeOne(stepAction);
                             }
+                            if (pendingBreakLoop) break;
                             ++stepCount;
                         }
                         AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：完成，共执行 "
@@ -8004,14 +9199,23 @@ private:
                             eff.aiTimeoutSec, false) * 1000;
                         AgentCore* corePtr = nullptr;
                         std::unique_ptr<AgentCore> ownedCore = PrepareAiActionExecuteCore(
-                            &aiSessions, prepAction, route, 0, 0, appSettings_, timeoutMs, corePtr);
+                            &aiSessions, prepAction, aiLoopDepth, route, 0, 0, appSettings_, timeoutMs, corePtr);
                         AgentCore* core = corePtr ? corePtr : ownedCore.get();
                         if (!core) {
                             AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：无法创建 AI 客户端");
                         } else {
-                            handleAiActionApiResult(ExecuteAiActionExecute(
+                            const size_t histBefore = core->GetHistory().size();
+                            AiActionResult ar = ExecuteAiActionExecute(
                                 core, resolvedPrompt, "", 0, 0, eff.aiContextMode,
-                                stopFlag_, eff.aiTimeoutSec, logFn, &aiHttpAbort_, nullptr));
+                                stopFlag_, eff.aiTimeoutSec, logFn, &aiHttpAbort_, nullptr);
+                            if (ar.ok) {
+                                propagateAiHistory(core, prepAction, histBefore,
+                                    BuildAiActionExecuteTextSystemPrompt(),
+                                    route == AiActionRouteKind::ToolExecute
+                                        || route == AiActionRouteKind::MultiTurnTools,
+                                    1024, timeoutMs);
+                            }
+                            handleAiActionApiResult(ar);
                         }
                     } catch (...) {
                         AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：执行异常");
@@ -8063,16 +9267,33 @@ private:
                                     capMap.apiHeight = apiH;
                                     AgentCore* corePtr = nullptr;
                                     std::unique_ptr<AgentCore> ownedCore = PrepareAiActionExecuteCore(
-                                        &aiSessions, prepAction, route, apiW, apiH,
+                                        &aiSessions, prepAction, aiLoopDepth, route, apiW, apiH,
                                         appSettings_, timeoutMs, corePtr);
                                     AgentCore* core = corePtr ? corePtr : ownedCore.get();
                                     if (!core) {
                                         AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：无法创建 AI 客户端");
                                     } else {
-                                        handleAiActionApiResult(ExecuteAiActionExecute(
+                                        const size_t histBefore = core->GetHistory().size();
+                                        AiActionResult ar = ExecuteAiActionExecute(
                                             core, resolvedPrompt, screenshotB64,
                                             apiW, apiH, eff.aiContextMode,
-                                            stopFlag_, eff.aiTimeoutSec, logFn, &aiHttpAbort_, &capMap));
+                                            stopFlag_, eff.aiTimeoutSec, logFn, &aiHttpAbort_, &capMap);
+                                        if (ar.ok) {
+                                            std::wstring sysPrompt;
+                                            if (route == AiActionRouteKind::VisionQuery
+                                                || route == AiActionRouteKind::CompositeClick) {
+                                                sysPrompt = BuildAiActionVisionQuerySystemPrompt(apiW, apiH);
+                                            } else if (route == AiActionRouteKind::MultiTurnTools) {
+                                                sysPrompt = BuildAiActionHybridSystemPrompt(apiW, apiH);
+                                            } else {
+                                                sysPrompt = BuildAiActionExecuteSystemPrompt(apiW, apiH);
+                                            }
+                                            propagateAiHistory(core, prepAction, histBefore, sysPrompt,
+                                                route == AiActionRouteKind::ToolExecute
+                                                    || route == AiActionRouteKind::MultiTurnTools,
+                                                1024, timeoutMs);
+                                        }
+                                        handleAiActionApiResult(ar);
                                     }
                                 } catch (...) {
                                     AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：执行异常");
@@ -8083,12 +9304,9 @@ private:
                 }
 
                 aiCurFrame = prevFrame;
-                if (!inheritFrom && eff.aiContextMode == 0) {
-                    aiSessions.ephemeralSession.reset();
-                }
             };
 
-            executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx, &executeOne, &runAiActionExecute](const ScriptAction& a) {
+            executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx, &executeOne, &runAiActionExecute, &aiSessions, &aiLoopDepth, &pendingBreakLoop](const ScriptAction& a) {
                 if (appSettings_.playback.autoOutputKeyFunctionDebug
                     && a.type != ActionType::MoveMouse
                     && a.type != ActionType::FindImage
@@ -8186,6 +9404,9 @@ private:
                         return output.matches.front();
                     };
                     ImageMatchResult lastRawMatch{};
+                    const double findTimeSec = ResolveFindImageTimeSec(a.findTimeExpr, makeVarCtx());
+                    const bool loopUntilFound = findTimeSec < 0.0;
+                    const auto findStart = std::chrono::steady_clock::now();
                     do {
                         const ImageMatchResult rawMatch = runFind();
                         lastRawMatch = rawMatch;
@@ -8208,8 +9429,11 @@ private:
                                 SetCursorPos(tx, ty);
                             }
                             break;
-                        } else if (!a.findUntilFound) {
-                            break;
+                        } else if (!loopUntilFound) {
+                            if (findTimeSec <= 0.0) break;
+                            const double elapsed = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - findStart).count();
+                            if (elapsed >= findTimeSec) break;
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     } while (!stopFlag_);
@@ -8374,6 +9598,9 @@ private:
                 else if (a.type == ActionType::StopMacro) {
                     stopFlag_ = true;
                 }
+                else if (a.type == ActionType::EndLoop) {
+                    if (aiLoopDepth > 0) pendingBreakLoop = true;
+                }
                 else if (a.type == ActionType::RunProgram) {
                     const std::wstring path = ResolveRunProgramPath(a.shortcutPreset, a.targetPath);
                     if (!path.empty()) LaunchProgram(path, a.inputText);
@@ -8437,7 +9664,8 @@ private:
                     const std::wstring modelLabel = EffectiveAiModelName(a);
                     AppendAiDebugLog(L"AI文字分析 [" + modelLabel + L"]：发送 prompt…");
                     try {
-                        const AiActionResult ar = RunAiTextAnalysisForAction(a, resolvedPrompt);
+                        const AiActionResult ar = RunAiTextAnalysisForAction(
+                            a, resolvedPrompt, &aiSessions, aiLoopDepth);
                         if (ar.ok) {
                             StoreAiOutputVar(outputVarName, a.aiOutputType, ar.textResult, fallback);
                             AppendAiDebugLog(L"AI文字分析 [" + modelLabel + L"]：完成 → "
@@ -8543,7 +9771,7 @@ private:
                                     + L" 字节(base64)，调用 API…");
                                 try {
                                     const AiActionResult ar = RunAiImageAnalysisForAction(
-                                        a, resolvedPrompt, encoded.base64);
+                                        a, resolvedPrompt, encoded.base64, &aiSessions, aiLoopDepth);
                                     if (ar.ok) {
                                         StoreAiOutputVar(outputVarName, a.aiOutputType, ar.textResult, fallback);
                                         AppendAiDebugLog(L"AI图片分析 [" + modelLabel + L"]：完成 → "
@@ -8566,8 +9794,8 @@ private:
                 }
             };
 
-            runBlockByName = [&](const std::wstring& name) {
-                if (stopFlag_ || name.empty()) return;
+            runBlockByName = [&](const std::wstring& name) -> RunRangeResult {
+                if (stopFlag_ || name.empty()) return RunRangeResult::Normal;
                 aiSessions.ClearBlock();
                 std::unordered_map<std::wstring, size_t> blockDefs;
                 for (size_t i = 0; i < activeActions->size(); ++i) {
@@ -8576,16 +9804,46 @@ private:
                     }
                 }
                 const auto it = blockDefs.find(name);
-                if (it == blockDefs.end()) return;
-                if (blockCallStack.count(name)) return;
+                if (it == blockDefs.end()) return RunRangeResult::Normal;
+                if (blockCallStack.count(name)) return RunRangeResult::Normal;
                 blockCallStack.insert(name);
-                runRange(it->second + 1, containerBodyEnd(it->second));
+                const RunRangeResult result = runRange(it->second + 1, containerBodyEnd(it->second));
                 blockCallStack.erase(name);
+                return result;
             };
-            runRange = [&](size_t start, size_t end) -> bool {
+            runRange = [&](size_t start, size_t end) -> RunRangeResult {
+                auto isDirectLoopBodyRange = [&](size_t loopIdx) {
+                    return start == loopIdx + 1 && end == containerBodyEnd(loopIdx);
+                };
+                auto resolveGotoCursor = [&](size_t targetIdx, size_t& outCursor) {
+                    const int outerLoop = OutermostEnclosingLoop(*activeActions, targetIdx);
+                    if (outerLoop < 0) {
+                        outCursor = targetIdx;
+                        return;
+                    }
+                    if (isDirectLoopBodyRange(static_cast<size_t>(outerLoop))) {
+                        outCursor = targetIdx;
+                        return;
+                    }
+                    loopEntryGotoTarget = targetIdx;
+                    outCursor = static_cast<size_t>(outerLoop);
+                };
+                auto consumePendingGoto = [&](size_t scopeStart, size_t scopeEnd, size_t& cursor) -> RunRangeResult {
+                    if (!pendingGoto) return RunRangeResult::Normal;
+                    const size_t targetIdx = *pendingGoto;
+                    pendingGoto.reset();
+                    resolveGotoCursor(targetIdx, cursor);
+                    if (cursor < scopeStart || cursor >= scopeEnd) return RunRangeResult::GotoPending;
+                    return RunRangeResult::Normal;
+                };
                 for (size_t i = start; i < end && !stopFlag_; ) {
+                    if (pendingGoto) {
+                        const RunRangeResult gotoResult = consumePendingGoto(start, end, i);
+                        if (gotoResult == RunRangeResult::GotoPending) return RunRangeResult::GotoPending;
+                        continue;
+                    }
                     const auto& a = (*activeActions)[i];
-                    if (a.type == ActionType::EndLoop) return true;
+                    if (a.type == ActionType::EndLoop) return RunRangeResult::BreakLoop;
                     if (SkipsInMainFlow(a.type)) {
                         i = containerBodyEnd(i);
                         continue;
@@ -8595,19 +9853,40 @@ private:
                             AppendDebugLog(FormatGenericActionDebug(a));
                         }
                         const size_t bodyEnd = containerBodyEnd(i);
+                        const int thisLoopDepth = aiLoopDepth;
+                        ++aiLoopDepth;
+                        aiSessions.EnsureLoopDepth(aiLoopDepth);
                         int iter = 1;
                         bool broke = false;
                         const auto loopStartTime = std::chrono::steady_clock::now();
                         while (!stopFlag_ && !broke) {
-                            aiSessions.ClearLoop();
+                            aiSessions.ClearLoopAt(thisLoopDepth);
                             if (!a.loopVarName.empty()) loopVars_[a.loopVarName] = iter;
                             MacroVariableContext ctx = makeVarCtx();
                             const int maxLoop = ResolveLoopMaxCount(a, ctx, loopStartTime);
                             if (!(maxLoop < 0 || iter <= maxLoop)) break;
-                            broke = runRange(i + 1, bodyEnd);
+                            size_t runFrom = i + 1;
+                            if (iter == 1 && loopEntryGotoTarget) {
+                                const size_t entryTarget = *loopEntryGotoTarget;
+                                if (entryTarget > i && entryTarget < bodyEnd) {
+                                    if (EnclosingChildLoopInBody(*activeActions, i, entryTarget) < 0) {
+                                        runFrom = entryTarget;
+                                        loopEntryGotoTarget.reset();
+                                    }
+                                }
+                            }
+                            const RunRangeResult bodyResult = runRange(runFrom, bodyEnd);
+                            if (bodyResult == RunRangeResult::BreakLoop) broke = true;
+                            else if (bodyResult == RunRangeResult::GotoPending) broke = true;
                             ++iter;
                         }
+                        --aiLoopDepth;
                         if (!a.loopVarName.empty()) loopVars_.erase(a.loopVarName);
+                        if (pendingGoto) {
+                            const RunRangeResult gotoResult = consumePendingGoto(start, end, i);
+                            if (gotoResult == RunRangeResult::GotoPending) return RunRangeResult::GotoPending;
+                            continue;
+                        }
                         i = bodyEnd;
                     } else if (a.type == ActionType::If) {
                         if (appSettings_.playback.autoOutputKeyFunctionDebug) {
@@ -8626,15 +9905,22 @@ private:
                                 break;
                             }
                         }
+                        RunRangeResult branchResult = RunRangeResult::Normal;
                         if (cond) {
-                            if (elseIdx >= 0) runRange(i + 1, static_cast<size_t>(elseIdx));
-                            else runRange(i + 1, trueEnd);
+                            branchResult = elseIdx >= 0
+                                ? runRange(i + 1, static_cast<size_t>(elseIdx))
+                                : runRange(i + 1, trueEnd);
                             i = elseIdx >= 0 ? containerBodyEnd(static_cast<size_t>(elseIdx)) : trueEnd;
                         } else if (elseIdx >= 0) {
-                            runRange(static_cast<size_t>(elseIdx) + 1, containerBodyEnd(static_cast<size_t>(elseIdx)));
+                            branchResult = runRange(static_cast<size_t>(elseIdx) + 1, containerBodyEnd(static_cast<size_t>(elseIdx)));
                             i = containerBodyEnd(static_cast<size_t>(elseIdx));
                         } else {
                             i = trueEnd;
+                        }
+                        if (branchResult == RunRangeResult::GotoPending || pendingGoto) {
+                            const RunRangeResult gotoResult = consumePendingGoto(start, end, i);
+                            if (gotoResult == RunRangeResult::GotoPending) return RunRangeResult::GotoPending;
+                            continue;
                         }
                     } else if (a.type == ActionType::Else) {
                         i = containerBodyEnd(i);
@@ -8642,14 +9928,41 @@ private:
                         if (appSettings_.playback.autoOutputKeyFunctionDebug) {
                             AppendDebugLog(FormatGenericActionDebug(a));
                         }
-                        runBlockByName(a.blockName);
+                        const RunRangeResult blockResult = runBlockByName(a.blockName);
+                        if (blockResult == RunRangeResult::GotoPending || pendingGoto) {
+                            const RunRangeResult gotoResult = consumePendingGoto(start, end, i);
+                            if (gotoResult == RunRangeResult::GotoPending) return RunRangeResult::GotoPending;
+                            continue;
+                        }
+                        ++i;
+                    } else if (a.type == ActionType::Goto) {
+                        if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                            AppendDebugLog(FormatGenericActionDebug(a));
+                        }
+                        MacroVariableContext ctx = makeVarCtx();
+                        int targetNo = 0;
+                        if (TryResolveGotoStepNo(a.gotoStepExpr, ctx, targetNo)) {
+                            const size_t targetIdx = FindActionIndexByNo(*activeActions, targetNo);
+                            if (targetIdx < activeActions->size()) {
+                                if (targetIdx < start || targetIdx >= end) {
+                                    pendingGoto = targetIdx;
+                                    return RunRangeResult::GotoPending;
+                                }
+                                resolveGotoCursor(targetIdx, i);
+                                continue;
+                            }
+                        }
                         ++i;
                     } else {
                         executeOne(a);
+                        if (pendingBreakLoop) {
+                            pendingBreakLoop = false;
+                            return RunRangeResult::BreakLoop;
+                        }
                         ++i;
                     }
                 }
-                return false;
+                return RunRangeResult::Normal;
             };
             while (!stopFlag_) {
                 ++curLoops_;
@@ -8664,6 +9977,8 @@ private:
                 loopVars_.clear();
                 timerStarts_.clear();
                 aiVars_.clear();
+                pendingGoto.reset();
+                loopEntryGotoTarget.reset();
                 runRange(0, actions.size());
                 const auto& ps = appSettings_.playback;
                 if (ps.enablePlaybackCount && ps.playbackCount > 0 && curLoops_ >= ps.playbackCount) break;
@@ -8726,7 +10041,7 @@ private:
     void AddTray() {
         NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON; nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        nid.hIcon = LoadAppIconSmall();
         if (clicking_) wcscpy_s(nid.szTip, L"鼠大侠-连点运行中");
         else if (recording_) wcscpy_s(nid.szTip, L"鼠大侠-录制中");
         else wcscpy_s(nid.szTip, L"鼠大侠-鼠标宏运行中");
@@ -8737,7 +10052,7 @@ private:
         if (!trayActive_) return;
         if (hiddenToTray_) {
             NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
-            nid.uFlags = NIF_TIP; nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+            nid.uFlags = NIF_TIP; nid.hIcon = LoadAppIconSmall();
             wcscpy_s(nid.szTip, L"鼠大侠");
             Shell_NotifyIconW(NIM_MODIFY, &nid);
             return;
@@ -8760,7 +10075,7 @@ private:
         hiddenToTray_ = true;
         NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON; nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        nid.hIcon = LoadAppIconSmall();
         wcscpy_s(nid.szTip, L"鼠大侠");
         Shell_NotifyIconW(NIM_ADD, &nid);
         trayActive_ = true;
@@ -9256,12 +10571,24 @@ private:
         }
         std::vector<ScriptAction> block(actions_.begin() + dragIndex_, actions_.begin() + dragEnd);
         const int indentDelta = dragTargetIndent_ - block.front().indent;
-        actions_.erase(actions_.begin() + dragIndex_, actions_.begin() + dragEnd);
+        for (auto& action : block) action.indent = std::max(0, action.indent + indentDelta);
         int insertIndex = dragTargetIndex_;
         if (insertIndex > dragIndex_) insertIndex -= count;
         insertIndex = std::clamp(insertIndex, 0, static_cast<int>(actions_.size()));
+        {
+            std::vector<ScriptAction> trial = actions_;
+            trial.erase(trial.begin() + dragIndex_, trial.begin() + dragEnd);
+            trial.insert(trial.begin() + insertIndex, block.begin(), block.end());
+            if (const std::wstring endLoopErr = ValidateEndLoopPlacements(trial); !endLoopErr.empty()) {
+                ShowPromptInfo(kEndLoopNeedsLoopParentMsg);
+                dragIndex_ = -1;
+                dragMoved_ = false;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+        }
+        actions_.erase(actions_.begin() + dragIndex_, actions_.begin() + dragEnd);
         collapsedContainers_ = RemapCollapsedAfterMove(collapsedContainers_, dragIndex_, dragEnd, insertIndex, count);
-        for (auto& action : block) action.indent = std::max(0, action.indent + indentDelta);
         actions_.insert(actions_.begin() + insertIndex, block.begin(), block.end());
         selectedIndex_ = insertIndex;
         RenumberActions();
@@ -9275,7 +10602,7 @@ private:
     void UpdateHomeScrollFromThumb(int thumbTop) {
         RECT track = HomeScrollTrackRect();
         RECT thumb = HomeScrollThumbRect();
-        const int maxScroll = MaxHomeScroll();
+        const int maxScroll = ActiveHomeListMaxScroll();
         const int trackHeight = static_cast<int>(track.bottom - track.top);
         const int thumbHeight = static_cast<int>(thumb.bottom - thumb.top);
         const int range = std::max(1, trackHeight - thumbHeight);
@@ -9284,7 +10611,7 @@ private:
     }
 
     void OnWheel(int delta) {
-        if (deleteConfirmVisible_) return;
+        if (promptModal_.visible()) return;
         if (page_ == Page::Editor && editorPopupOpen_ >= 0 && !EditorDropPopupVisible()) {
             PopupCombo* pc = GetEditorPopup();
             if (pc && pc->open && !pc->items.empty()) {
@@ -9300,9 +10627,11 @@ private:
             return;
         }
         if (page_ == Page::Home) {
-            if (activeHomeTab_ != quickscript::MainTab::Macro) return;
-            homeScrollOffset_ = std::clamp(homeScrollOffset_ + (delta < 0 ? kHomeCardStep : -kHomeCardStep), 0, MaxHomeScroll());
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            if (activeHomeTab_ == quickscript::MainTab::Macro || activeHomeTab_ == quickscript::MainTab::ScriptCustom) {
+                const int maxScroll = ActiveHomeListMaxScroll();
+                homeScrollOffset_ = std::clamp(homeScrollOffset_ + (delta < 0 ? kHomeCardStep : -kHomeCardStep), 0, maxScroll);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             return;
         }
         if (page_ != Page::Editor) return;
@@ -9354,10 +10683,7 @@ private:
             LineTo(hdc, x + 18, y + 20);
             LineTo(hdc, x + 18, y + 15);
         } else {
-            Ellipse(hdc, x + 1, y + 1, x + 21, y + 21);
-            MoveToEx(hdc, x + 11, y + 5, nullptr);
-            LineTo(hdc, x + 11, y + 11);
-            LineTo(hdc, x + 16, y + 11);
+            DrawClockGlyph(hdc, x + 11, y + 11, 18, kWhite, 2);
         }
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
@@ -9383,30 +10709,20 @@ private:
         GradientFill(hdc, vertex, 2, &gr, 1, vertical ? GRADIENT_FILL_RECT_V : GRADIENT_FILL_RECT_H);
     }
 
-    void DrawHomeLogo(HDC hdc) {
-        HPEN pen = CreatePen(PS_SOLID, 2, kWhite);
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        Ellipse(hdc, 11, 10, 28, 28);
-        MoveToEx(hdc, 19, 7, nullptr);
-        LineTo(hdc, 19, 15);
-        MoveToEx(hdc, 12, 7, nullptr);
-        LineTo(hdc, 26, 7);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
-    }
-
     void DrawNavIcon(HDC hdc, RECT rc, int iconType) {
         const int cx = rc.left + 29;
-        const int cy = rc.top + 35;
+        const int cy = rc.top + (rc.bottom - rc.top) / 2;
         HPEN pen = CreatePen(PS_SOLID, 2, kWhite);
         HBRUSH brush = CreateSolidBrush(kWhite);
         HGDIOBJ oldPen = SelectObject(hdc, pen);
         HGDIOBJ oldBrush = SelectObject(hdc, brush);
         if (iconType == 0) {
-            POINT arrow[3] = {{cx - 7, cy - 12}, {cx - 7, cy + 13}, {cx + 10, cy + 3}};
-            Polygon(hdc, arrow, 3);
-            MoveToEx(hdc, cx + 2, cy + 5, nullptr);
-            LineTo(hdc, cx + 9, cy + 15);
+            SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            SelectObject(hdc, oldPen);
+            DeleteObject(brush);
+            DeleteObject(pen);
+            DrawPointerCursorGlyph(hdc, cx, cy, 20, kWhite);
+            return;
         } else if (iconType == 1) {
             SelectObject(hdc, GetStockObject(NULL_BRUSH));
             RoundRect(hdc, cx - 10, cy - 10, cx + 10, cy + 10, 5, 5);
@@ -9419,10 +10735,10 @@ private:
             SelectObject(hdc, GetStockObject(NULL_BRUSH));
             RoundRect(hdc, cx - 13, cy - 10, cx + 13, cy + 10, 5, 5);
             MoveToEx(hdc, cx - 5, cy - 4, nullptr);
-            LineTo(hdc, cx - 10, cy);
+            LineTo(hdc, cx - 8, cy);
             LineTo(hdc, cx - 5, cy + 4);
             MoveToEx(hdc, cx + 5, cy - 4, nullptr);
-            LineTo(hdc, cx + 10, cy);
+            LineTo(hdc, cx + 7, cy);
             LineTo(hdc, cx + 5, cy + 4);
         }
         SelectObject(hdc, oldBrush);
@@ -9453,9 +10769,8 @@ private:
     }
 
     void DrawHomeShell(HDC hdc) {
-        DrawHomeLogo(hdc);
         SelectObject(hdc, homeTabFont_);
-        DrawTextIn(hdc, L"鼠大侠", RECT{33, 0, 120, kTitleH}, kWhite);
+        DrawTextIn(hdc, L"鼠大侠", RECT{14, 0, 120, kTitleH}, kWhite);
         DrawNavTab(hdc, ClickerTabRect(), quickscript::MainTab::Clicker, L"鼠标连点", 0);
         DrawNavTab(hdc, RecorderTabRect(), quickscript::MainTab::Recorder, L"鼠标录制", 1);
         DrawNavTab(hdc, MacroTabRect(), quickscript::MainTab::Macro, L"鼠标宏", 2);
@@ -9570,30 +10885,30 @@ private:
         switch (editorPopupOpen_) {
         case 0: return WindowClientRect(mode_);
         case 1: return WindowClientRect(actionCombo_);
-        case 2: return WindowClientRect(mousePressButton_);
-        case 3: return WindowClientRect(clickButton_);
-        case 4: return WindowClientRect(loopTypeCombo_);
-        case 5: return WindowClientRect(runBlockCombo_);
-        case 6: return WindowClientRect(hotkeyShortcutCombo_);
+        case 2: return EditorComboClientRect(mousePressButton_);
+        case 3: return EditorComboClientRect(clickButton_);
+        case 4: return EditorComboClientRect(loopTypeCombo_);
+        case 5: return EditorComboClientRect(runBlockCombo_);
+        case 6: return EditorComboClientRect(hotkeyShortcutCombo_);
         case 7: {
             HWND combo = ActiveVarComboHwnd();
-            return combo ? WindowClientRect(combo) : RECT{};
+            return combo ? EditorComboClientRect(combo) : RECT{};
         }
-        case 8: return WindowClientRect(runMacroCombo_);
-        case 9: return WindowClientRect(mousePlaybackCombo_);
-        case 10: return WindowClientRect(scrollDirectionCombo_);
-        case 11: return WindowClientRect(findFollowUpCombo_);
-        case 12: return WindowClientRect(ifVarCombo_);
-        case 13: return WindowClientRect(ifOperatorCombo_);
-        case 14: return WindowClientRect(ifConnectorCombo_);
-        case 15: return WindowClientRect(runProgramCombo_);
-        case 16: return WindowClientRect(ocrResultModeCombo_);
-        case 17: return WindowClientRect(ocrFollowUpCombo_);
-        case 18: return WindowClientRect(ocrSearchVarCombo_);
-        case 19: return WindowClientRect(aiModelCombo_);
-        case 20: return WindowClientRect(aiContextModeCombo_);
-        case 21: return WindowClientRect(aiOutputTypeCombo_);
-        case 22: return WindowClientRect(aiSearchRegionCombo_);
+        case 8: return EditorComboClientRect(runMacroCombo_);
+        case 9: return EditorComboClientRect(mousePlaybackCombo_);
+        case 10: return EditorComboClientRect(scrollDirectionCombo_);
+        case 11: return EditorComboClientRect(findFollowUpCombo_);
+        case 12: return EditorComboClientRect(ifVarCombo_);
+        case 13: return EditorComboClientRect(ifOperatorCombo_);
+        case 14: return EditorComboClientRect(ifConnectorCombo_);
+        case 15: return EditorComboClientRect(runProgramCombo_);
+        case 16: return EditorComboClientRect(ocrResultModeCombo_);
+        case 17: return EditorComboClientRect(ocrFollowUpCombo_);
+        case 18: return EditorComboClientRect(ocrSearchVarCombo_);
+        case 19: return EditorComboClientRect(aiModelCombo_);
+        case 20: return EditorComboClientRect(aiContextModeCombo_);
+        case 21: return EditorComboClientRect(aiOutputTypeCombo_);
+        case 22: return EditorComboClientRect(aiSearchRegionCombo_);
         default: return RECT{};
         }
     }
@@ -9627,7 +10942,7 @@ private:
         default: return RECT{};
         }
         if (!combo) return RECT{};
-        RECT rc = WindowClientRect(combo);
+        RECT rc = EditorComboClientRect(combo);
         if (popupId == 0) rc.left = std::max<LONG>(0, rc.left - 52);
         else if (popupId == 1) rc.top = std::max<LONG>(0, rc.top - 28);
         InflateRect(&rc, 3, 3);
@@ -9637,7 +10952,45 @@ private:
     void InvalidateEditorComboArea(int popupId) {
         if (popupId < 0) return;
         const RECT rc = EditorComboInvalidateRect(popupId);
-        if (rc.right > rc.left && rc.bottom > rc.top) InvalidateRect(hwnd_, &rc, FALSE);
+        if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+        HWND combo = nullptr;
+        switch (popupId) {
+        case 0: combo = mode_; break;
+        case 1: combo = actionCombo_; break;
+        case 2: combo = mousePressButton_; break;
+        case 3: combo = clickButton_; break;
+        case 4: combo = loopTypeCombo_; break;
+        case 5: combo = runBlockCombo_; break;
+        case 6: combo = hotkeyShortcutCombo_; break;
+        case 7: combo = ActiveVarComboHwnd(); break;
+        case 8: combo = runMacroCombo_; break;
+        case 9: combo = mousePlaybackCombo_; break;
+        case 10: combo = scrollDirectionCombo_; break;
+        case 11: combo = findFollowUpCombo_; break;
+        case 12: combo = ifVarCombo_; break;
+        case 13: combo = ifOperatorCombo_; break;
+        case 14: combo = ifConnectorCombo_; break;
+        case 15: combo = runProgramCombo_; break;
+        case 16: combo = ocrResultModeCombo_; break;
+        case 17: combo = ocrFollowUpCombo_; break;
+        case 18: combo = ocrSearchVarCombo_; break;
+        case 19: combo = aiModelCombo_; break;
+        case 20: combo = aiContextModeCombo_; break;
+        case 21: combo = aiOutputTypeCombo_; break;
+        case 22: combo = aiSearchRegionCombo_; break;
+        default: break;
+        }
+        if (combo && IsParamViewportChild(combo) && paramViewport_) {
+            const RECT vp = ParamViewportRect();
+            RECT inv{
+                rc.left - vp.left, rc.top - vp.top,
+                rc.right - vp.left, rc.bottom - vp.top
+            };
+            InvalidateRect(paramViewport_, &inv, FALSE);
+            RepaintParamPanelChrome();
+        } else {
+            InvalidateRect(hwnd_, &rc, FALSE);
+        }
     }
 
     void InvalidateEditorParamPanel() {
@@ -9864,7 +11217,7 @@ private:
         if (!pc) return;
         if (idx < 0 || idx >= static_cast<int>(pc->items.size())) { CloseEditorPopup(); return; }
         if (editorPopupOpen_ == 1 && !IsImplementedActionPopup(idx)) {
-            MessageBoxW(hwnd_, L"该动作类型暂未实现。", L"提示", MB_OK | MB_ICONINFORMATION);
+            ShowPromptInfo(L"该动作类型暂未实现。");
             CloseEditorPopup();
             return;
         }
@@ -10008,16 +11361,7 @@ private:
         DeleteObject(bg);
 
         RECT box{rc.left + 11, rc.top + 12, rc.left + 23, rc.top + 24};
-        HPEN boxPen = CreatePen(PS_SOLID, 1, checked ? kMainGreen : RGB(190, 190, 190));
-        HBRUSH boxBrush = CreateSolidBrush(checked ? kMainGreen : RGB(255, 255, 255));
-        HGDIOBJ oldPen = SelectObject(dis->hDC, boxPen);
-        HGDIOBJ oldBrush = SelectObject(dis->hDC, boxBrush);
-        RoundRect(dis->hDC, box.left, box.top, box.right, box.bottom, 3, 3);
-        SelectObject(dis->hDC, oldPen);
-        SelectObject(dis->hDC, oldBrush);
-        DeleteObject(boxPen);
-        DeleteObject(boxBrush);
-        if (checked) DrawTextIn(dis->hDC, L"✓", box, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawCheckbox(dis->hDC, box, checked);
 
         SelectObject(dis->hDC, font_);
         DrawTextIn(dis->hDC, item->title, RECT{rc.left + 46, rc.top + 3, rc.right - 10, rc.top + 22}, RGB(30, 30, 30));
@@ -10037,6 +11381,7 @@ private:
             return;
         }
         if (IsGrayButton(dis->hwndItem)) { DrawGrayButton(dis); return; }
+        if (IsParamPanelCheckbox(dis->hwndItem)) { DrawParamPanelCheckboxItem(dis); return; }
         DrawOwnerButton(dis);
     }
 
@@ -10063,20 +11408,20 @@ private:
             if (PtIn(WindowClientRect(child), x, y)) return child;
             return nullptr;
         };
-        for (HWND child = GetWindow(hwnd_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
-            if (HWND hit = testChild(child)) return hit;
-        }
-        if (paramViewport_) {
-            for (HWND child = GetWindow(paramViewport_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
-                if (HWND hit = testChild(child)) return hit;
+        auto scanParent = [&](HWND parent) -> HWND {
+            if (!parent) return nullptr;
+            for (HWND child = GetWindow(parent, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+                if (HWND h = testChild(child)) return h;
             }
-        }
-        return nullptr;
+            return nullptr;
+        };
+        if (HWND vpHit = scanParent(paramViewport_)) return vpHit;
+        return scanParent(hwnd_);
     }
 
     void InvalidateGrayButton(HWND btn) {
         if (!btn) return;
-        InvalidateRect(btn, nullptr, FALSE);
+        RedrawWindow(btn, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
     }
 
     void UpdateGrayButtonHover(int x, int y) {
@@ -10086,6 +11431,7 @@ private:
         hoverGrayBtn_ = hit;
         pendingHoverGrayOld_ = old;
         pendingHoverGrayNew_ = hit;
+        FiDbgOnGrayHoverChanged(old, hit);
     }
 
     void FlushGrayButtonHover() {
@@ -10128,6 +11474,7 @@ private:
 
     void DrawGrayButton(DRAWITEMSTRUCT* dis) {
         if (!dis) return;
+        FiDbgBumpGrayDraw(dis->hwndItem, dis->itemState, hoverGrayBtn_, false);
         HDC hdc = dis->hDC;
         RECT rc = dis->rcItem;
         const bool hovered = dis->hwndItem == hoverGrayBtn_;
@@ -10214,7 +11561,6 @@ private:
         SelectObject(hdc, font_);
         if (page_ == Page::Home) {
             PaintHome(hdc);
-            if (deleteConfirmVisible_) PaintDeleteConfirm(hdc);
         } else {
             PaintEditor(hdc);
         }
@@ -10236,7 +11582,7 @@ private:
         DeleteDC(hdc);
         DeleteObject(green); DeleteObject(white); DeleteObject(panel);
         EndPaint(hwnd_, &ps);
-        if (page_ == Page::Editor) {
+        if (page_ == Page::Editor && !promptModal_.visible()) {
             RepaintParamPanelChrome();
             HDC chromeDc = GetDC(hwnd_);
             PaintEditorListHeaderChrome(chromeDc);
@@ -10385,28 +11731,53 @@ private:
         else actionText = L"键开始 录制";
         DrawTextIn(hdc, actionText, RECT{keyBox.right + 10, hint.top, hint.right - 160, hint.bottom}, recording_ ? RGB(180, 40, 40) : RGB(60, 60, 60), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, homeFont_);
-        DrawTextIn(hdc, L"前往修改全局启停热键   在录制列表，您也可以为您的录制设置单独的热键", RECT{36, 468, 700, 492}, RGB(210, 245, 215));
+        DrawTextIn(hdc, L"前往修改全局启停热键   在录制列表，您也可以为您的录制设置单独的热键", HomeFooterRect(), RGB(210, 245, 215));
     }
 
     void PaintScriptCustomHome(HDC hdc) {
-        // 标题
+        const RECT header = ScriptCustomHeaderRect();
         SelectObject(hdc, bigFont_);
-        DrawTextIn(hdc, L"AI 脚本助手", RECT{0, 170, kHomeWidth, 210}, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"AI 脚本助手", RECT{header.left, header.top, header.right, header.top + 30},
+            kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, homeFont_);
-        DrawTextIn(hdc, L"通过自然语言描述需求，AI 将自动生成或修改自动化脚本。", RECT{0, 218, kHomeWidth, 248}, RGB(210, 245, 215), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"通过自然语言描述需求，AI 将自动生成或修改自动化脚本。",
+            RECT{header.left, header.top + 30, header.right, header.bottom},
+            RGB(210, 245, 215), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        // AI 入口按钮（黄底黑字，与鼠标宏主界面一致）
-        RECT hint = CreateRect();
+        int saved = SaveDC(hdc);
+        RECT list = HomeListRect();
+        IntersectClipRect(hdc, list.left, list.top, list.right, list.bottom);
+        for (int i = 0; i < static_cast<int>(agentConversations_.size()); ++i) {
+            RECT r = HomeCardRect(i);
+            if (r.bottom < list.top || r.top > list.bottom) continue;
+            const COLORREF cardColor = i == agentConvHover_ ? kCardHoverGreen : kCardGreen;
+            HBRUSH b = CreateSolidBrush(cardColor);
+            FillRect(hdc, &r, b);
+            DeleteObject(b);
+            const auto& conv = agentConversations_[static_cast<size_t>(i)];
+            SelectObject(hdc, homeFont_);
+            DrawTextIn(hdc, conv.name, RECT{r.left + 14, r.top + 17, r.right - 100, r.top + 48},
+                kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawTextIn(hdc, L"对话时间: " + conv.createdTime,
+                RECT{r.left + 14, r.top + 58, r.left + 350, r.top + 88}, RGB(220, 245, 225));
+            DrawTextIn(hdc, L"对话轮数: " + std::to_wstring(conv.roundCount),
+                RECT{r.left + 344, r.top + 58, r.left + 510, r.top + 88}, RGB(220, 245, 225));
+            DrawTextIn(hdc, L"对话", AgentConvChatRect(i), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextIn(hdc, L"删除", AgentConvDeleteRect(i), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        RestoreDC(hdc, saved);
+        if (MaxAgentConvScroll() > 0) PaintHomeScrollbar(hdc);
+
         HBRUSH y = CreateSolidBrush(kCreateYellow);
+        RECT hint = CreateRect();
         FillRect(hdc, &hint, y);
         DeleteObject(y);
-
         SelectObject(hdc, bigFont_);
         DrawTextIn(hdc, L"开始 AI 对话", RECT{hint.left, hint.top + 21, hint.right, hint.bottom - 21},
             RGB(60, 60, 60), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        // 底部提示
         SelectObject(hdc, homeFont_);
-        DrawTextIn(hdc, L"点击上方按钮启动 AI 脚本助手，支持列表/读取/写入脚本", RECT{0, hint.bottom + 16, kHomeWidth, hint.bottom + 44}, RGB(210, 245, 215), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"点击上方按钮启动 AI 脚本助手，支持列表/读取/写入脚本",
+            HomeFooterRect(), RGB(210, 245, 215), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
     void PaintMacroHome(HDC hdc) {
@@ -10455,11 +11826,11 @@ private:
             RECT createWord = CreateWordRect(); HBRUSH o = CreateSolidBrush(kOrange); FillRect(hdc, &createWord, o); DeleteObject(o); DrawTextIn(hdc, L"创建", createWord, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             DrawTextIn(hdc, L"鼠标宏", RECT{cr.left + 348, cr.top, cr.left + 455, cr.bottom}, RGB(60, 60, 60), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        SelectObject(hdc, homeFont_); DrawTextIn(hdc, L"前往修改全局启停热键   在宏列表中，您也可以为您的宏设置单独热键", RECT{36, 468, 700, 492}, RGB(210, 245, 215));
+        SelectObject(hdc, homeFont_); DrawTextIn(hdc, L"前往修改全局启停热键   在宏列表中，您也可以为您的宏设置单独热键", HomeFooterRect(), RGB(210, 245, 215));
     }
 
     void PaintHomeScrollbar(HDC hdc) {
-        if (MaxHomeScroll() <= 0) return;
+        if (ActiveHomeListMaxScroll() <= 0) return;
         RECT track = HomeScrollTrackRect();
         HBRUSH trackBrush = CreateSolidBrush(RGB(52, 143, 84));
         HGDIOBJ oldBrush = SelectObject(hdc, trackBrush);
@@ -10476,27 +11847,6 @@ private:
         SelectObject(hdc, oldPen);
         DeleteObject(thumbBrush);
         DeleteObject(nullPen);
-    }
-
-    void PaintDeleteConfirm(HDC hdc) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        FillAlphaRect(hdc, rc, RGB(0, 0, 0), 145);
-        RECT d = DeleteDialogRect();
-        FillRectColor(hdc, d, RGB(18, 18, 18));
-        DrawBorderRoundRect(hdc, d, RGB(70, 70, 70), 6);
-
-        std::wstring name = pendingDeleteIndex_ >= 0 && pendingDeleteIndex_ < static_cast<int>(scripts_.size()) ? scripts_[static_cast<size_t>(pendingDeleteIndex_)].name : L"";
-        SelectObject(hdc, titleFont_);
-        DrawTextIn(hdc, L"您确定要删除宏 \"" + name + L"\"\n吗？", RECT{d.left + 32, d.top + 34, d.right - 32, d.top + 106}, RGB(255, 226, 110), DT_LEFT | DT_TOP | DT_WORDBREAK);
-
-        RECT ok = DeleteOkRect();
-        RECT cancel = DeleteCancelRect();
-        FillRectColor(hdc, ok, RGB(255, 188, 75));
-        DrawBorderRect(hdc, cancel, RGB(255, 205, 95));
-        SelectObject(hdc, font_);
-        DrawTextIn(hdc, L"确定", ok, RGB(70, 45, 10), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        DrawTextIn(hdc, L"取消", cancel, RGB(255, 226, 110), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     // ── Editor screen painting ─────────────────────────────────────
@@ -10574,7 +11924,11 @@ private:
         return ResolveActionAiModelName(a, appSettings_.ai);
     }
 
-    AiActionResult RunAiTextAnalysisForAction(const ScriptAction& a, const std::wstring& resolvedPrompt) {
+    AiActionResult RunAiTextAnalysisForAction(
+        const ScriptAction& a,
+        const std::wstring& resolvedPrompt,
+        AiSessionStore* sessions = nullptr,
+        int loopDepth = 0) {
         AiActionResult result;
         result.errorMessage = L"AI 未启用或未配置模型";
         const std::wstring modelName = EffectiveAiModelName(a);
@@ -10583,24 +11937,37 @@ private:
         const int timeoutMs = std::max(5000, a.aiTimeoutSec > 0 ? a.aiTimeoutSec * 1000 : 30000);
         static const wchar_t* kAiTextSystemPrompt =
             L"文本分析助手。只输出用户要求的结果，不要解释或 Markdown，尽量简短。";
-        auto core = CreateAiActionCore(
-            modelName, appSettings_.ai.savedModels,
-            appSettings_.ai.apiUrl, appSettings_.ai.apiKey, kAiTextSystemPrompt,
-            timeoutMs, -1.0, 512);
+
+        ScriptAction prepAction = a;
+        prepAction.aiModelName = modelName;
+        AgentCore* corePtr = nullptr;
+        std::unique_ptr<AgentCore> ownedCore = PrepareAiAnalysisCore(
+            sessions, prepAction, loopDepth, kAiTextSystemPrompt, appSettings_, timeoutMs, 512, corePtr);
+        AgentCore* core = corePtr ? corePtr : ownedCore.get();
         if (!core) {
             result.errorMessage = L"无法创建 AI 客户端";
             return result;
         }
 
+        const size_t histBefore = core->GetHistory().size();
         AiMacroLogFn logFn = [this](const std::wstring& line) { AppendAiDebugLog(line); };
-        return ExecuteAiTextAnalysis(
-            core.get(), resolvedPrompt, a.aiOutputType, stopFlag_, a.aiTimeoutSec, logFn, &aiHttpAbort_);
+        result = ExecuteAiTextAnalysis(
+            core, resolvedPrompt, a.aiOutputType, stopFlag_, a.aiTimeoutSec,
+            logFn, &aiHttpAbort_, a.aiContextMode);
+        if (result.ok && sessions) {
+            sessions->PropagateHistoryAfterCall(
+                a.aiContextMode, loopDepth, core, histBefore,
+                prepAction, kAiTextSystemPrompt, appSettings_, timeoutMs, false, 512);
+        }
+        return result;
     }
 
     AiActionResult RunAiImageAnalysisForAction(
         const ScriptAction& a,
         const std::wstring& resolvedPrompt,
-        const std::string& screenshotBase64) {
+        const std::string& screenshotBase64,
+        AiSessionStore* sessions = nullptr,
+        int loopDepth = 0) {
         AiActionResult result;
         result.errorMessage = L"AI 未启用或未配置模型";
         const std::wstring modelName = EffectiveAiModelName(a);
@@ -10613,19 +11980,29 @@ private:
         const int timeoutMs = ResolveAiImageAnalysisTimeoutSec(a.aiTimeoutSec, resolvedPrompt.size()) * 1000;
         static const wchar_t* kAiImageSystemPrompt =
             L"截图分析助手。只输出用户要求的结果，不要解释或 Markdown，尽量简短。";
-        auto core = CreateAiActionCore(
-            modelName, appSettings_.ai.savedModels,
-            appSettings_.ai.apiUrl, appSettings_.ai.apiKey, kAiImageSystemPrompt,
-            timeoutMs, -1.0, 1024);
+
+        ScriptAction prepAction = a;
+        prepAction.aiModelName = modelName;
+        AgentCore* corePtr = nullptr;
+        std::unique_ptr<AgentCore> ownedCore = PrepareAiAnalysisCore(
+            sessions, prepAction, loopDepth, kAiImageSystemPrompt, appSettings_, timeoutMs, 1024, corePtr);
+        AgentCore* core = corePtr ? corePtr : ownedCore.get();
         if (!core) {
             result.errorMessage = L"无法创建 AI 客户端";
             return result;
         }
 
+        const size_t histBefore = core->GetHistory().size();
         AiMacroLogFn logFn = [this](const std::wstring& line) { AppendAiDebugLog(line); };
-        return ExecuteAiImageAnalysis(
-            core.get(), resolvedPrompt, screenshotBase64, a.aiOutputType,
-            stopFlag_, a.aiTimeoutSec, logFn, &aiHttpAbort_);
+        result = ExecuteAiImageAnalysis(
+            core, resolvedPrompt, screenshotBase64, a.aiOutputType,
+            stopFlag_, a.aiTimeoutSec, logFn, &aiHttpAbort_, a.aiContextMode);
+        if (result.ok && sessions) {
+            sessions->PropagateHistoryAfterCall(
+                a.aiContextMode, loopDepth, core, histBefore,
+                prepAction, kAiImageSystemPrompt, appSettings_, timeoutMs, false, 1024);
+        }
+        return result;
     }
 
     AiActionResult RunAiActionExecuteForAction(
@@ -10635,6 +12012,7 @@ private:
         int captureWidth,
         int captureHeight,
         AiSessionStore* sessions = nullptr,
+        int loopDepth = 0,
         const AiCaptureMapping* captureMapping = nullptr) {
         AiActionResult result;
         result.errorMessage = L"AI 未启用或未配置模型";
@@ -10650,7 +12028,7 @@ private:
         prepAction.aiModelName = modelName;
         AgentCore* corePtr = nullptr;
         std::unique_ptr<AgentCore> ownedCore = PrepareAiActionExecuteCore(
-            sessions, prepAction, route, captureWidth, captureHeight,
+            sessions, prepAction, loopDepth, route, captureWidth, captureHeight,
             appSettings_, timeoutMs, corePtr);
         AgentCore* core = corePtr ? corePtr : ownedCore.get();
         if (!core) {
@@ -10658,10 +12036,29 @@ private:
             return result;
         }
 
+        const size_t histBefore = core->GetHistory().size();
         AiMacroLogFn logFn = [this](const std::wstring& line) { AppendAiDebugLog(line); };
-        return ExecuteAiActionExecute(
+        result = ExecuteAiActionExecute(
             core, resolvedPrompt, screenshotBase64, captureWidth, captureHeight, a.aiContextMode,
             stopFlag_, a.aiTimeoutSec, logFn, &aiHttpAbort_, captureMapping);
+        if (result.ok && sessions) {
+            std::wstring sysPrompt;
+            if (route == AiActionRouteKind::VisionQuery || route == AiActionRouteKind::CompositeClick) {
+                sysPrompt = BuildAiActionVisionQuerySystemPrompt(captureWidth, captureHeight);
+            } else if (route == AiActionRouteKind::MultiTurnTools) {
+                sysPrompt = BuildAiActionHybridSystemPrompt(captureWidth, captureHeight);
+            } else if (withImage) {
+                sysPrompt = BuildAiActionExecuteSystemPrompt(captureWidth, captureHeight);
+            } else {
+                sysPrompt = BuildAiActionExecuteTextSystemPrompt();
+            }
+            const bool useTools = route == AiActionRouteKind::ToolExecute
+                || route == AiActionRouteKind::MultiTurnTools;
+            sessions->PropagateHistoryAfterCall(
+                a.aiContextMode, loopDepth, core, histBefore,
+                prepAction, sysPrompt, appSettings_, timeoutMs, useTools, 1024);
+        }
+        return result;
     }
 
     void OnDebugWindowClosedByUser() {
@@ -10709,7 +12106,7 @@ private:
         if (statusTipWindow_) ShowWindow(statusTipWindow_, SW_HIDE);
     }
 
-    void Cleanup() { if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } macroDebugWindow_.Destroy(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
+    void Cleanup() { outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } macroDebugWindow_.Destroy(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); stopFlag_ = true; if (worker_.joinable()) worker_.join(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() { if (recording_) { g_recording = false; recording_ = false; UninstallRecordingHooks(); } }
 
@@ -10719,7 +12116,10 @@ private:
     HWND cancelBtn_ = nullptr; HWND saveBtn_ = nullptr; HWND crosshairBtn_ = nullptr; HWND paramViewport_ = nullptr; HWND paramTopMask_ = nullptr; HWND paramBottomMask_ = nullptr; HWND paramRightMask_ = nullptr;
     HWND runProgramCombo_ = nullptr; HWND runProgramPath_ = nullptr; HWND runProgramBrowseBtn_ = nullptr; HWND runProgramOrLabel_ = nullptr; HWND runProgramCrosshairBtn_ = nullptr; HWND runProgramArgs_ = nullptr;
     HWND closeProgramPath_ = nullptr; HWND closeProgramBrowseBtn_ = nullptr; HWND closeProgramOrLabel_ = nullptr; HWND closeProgramCrosshairBtn_ = nullptr; HWND closeProgramMatchFileName_ = nullptr;
-    HWND openWebpageUrl_ = nullptr; HWND openFilePath_ = nullptr; HWND openFileBrowseBtn_ = nullptr; HWND timerVarName_ = nullptr; HWND cursorPosVarName_ = nullptr;
+    HWND openWebpageUrl_ = nullptr; HWND openFilePath_ = nullptr; HWND openFileBrowseBtn_ = nullptr; HWND timerVarName_ = nullptr; HWND cursorPosVarName_ = nullptr; HWND gotoStepEdit_ = nullptr;
+    HWND moveHintLabel_ = nullptr; HWND moveXLabel_ = nullptr; HWND moveYLabel_ = nullptr;
+    HWND moveRandomXLabel_ = nullptr; HWND moveRandomYLabel_ = nullptr;
+    HWND moveVarXLabel_ = nullptr; HWND moveVarYLabel_ = nullptr; HWND moveHintFooter_ = nullptr;
     HWND moveX_ = nullptr; HWND moveY_ = nullptr; HWND moveRandomX_ = nullptr; HWND moveRandomY_ = nullptr; HWND moveFromVar_ = nullptr; HWND moveVarX_ = nullptr; HWND moveVarY_ = nullptr; HWND waitDuration_ = nullptr; HWND waitRandom_ = nullptr; HWND clickButton_ = nullptr; HWND clickCount_ = nullptr; HWND clickWait_ = nullptr; HWND clickRandom_ = nullptr;
     HWND keyEdit_ = nullptr; HWND keyPressEdit_ = nullptr; HWND keyCount_ = nullptr; HWND keyWait_ = nullptr; HWND keyRandom_ = nullptr; HWND loopTypeCombo_ = nullptr; HWND loopCount_ = nullptr; HWND loopFromVar_ = nullptr; HWND loopVarExpr_ = nullptr; HWND loopVarName_ = nullptr; HWND defineBlockName_ = nullptr; HWND runBlockCombo_ = nullptr; HWND remarkLabel_ = nullptr; HWND remark_ = nullptr; HWND listRemarkEdit_ = nullptr;
     HWND clickLWin_ = nullptr; HWND clickRWin_ = nullptr; HWND clickLCtrl_ = nullptr; HWND clickRCtrl_ = nullptr; HWND clickLAlt_ = nullptr; HWND clickRAlt_ = nullptr; HWND clickLShift_ = nullptr; HWND clickRShift_ = nullptr;
@@ -10730,11 +12130,13 @@ private:
     HWND runMacroCombo_ = nullptr; HWND mousePlaybackCombo_ = nullptr; HWND mousePlaybackCount_ = nullptr; HWND mousePlaybackWait_ = nullptr; HWND mousePlaybackRandom_ = nullptr;
     HWND scrollVertical_ = nullptr; HWND scrollHorizontal_ = nullptr; HWND scrollSteps_ = nullptr; HWND scrollDirectionCombo_ = nullptr; HWND scrollCount_ = nullptr; HWND scrollWait_ = nullptr; HWND scrollRandom_ = nullptr;
     HWND findRegionLabel_ = nullptr; HWND findFullScreenBtn_ = nullptr; HWND findSelectRegionBtn_ = nullptr;
+    HWND findImageHeaderLabel_ = nullptr;
+    HWND findX1Label_ = nullptr; HWND findY1Label_ = nullptr; HWND findX2Label_ = nullptr; HWND findY2Label_ = nullptr;
     HWND findX1_ = nullptr; HWND findY1_ = nullptr; HWND findX2_ = nullptr; HWND findY2_ = nullptr;
     HWND findFollowUpLabel_ = nullptr; HWND findFollowUpCombo_ = nullptr;
     HWND findOffsetXLabel_ = nullptr; HWND findOffsetYLabel_ = nullptr; HWND findMatchVarLabel_ = nullptr;
     HWND findTestBtn_ = nullptr; HWND findImagePreviewBtn_ = nullptr; HWND findScreenshotBtn_ = nullptr; HWND findLocalImageBtn_ = nullptr; HWND findClearImageBtn_ = nullptr;
-    HWND findMatchThreshold_ = nullptr; HWND findScaleMin_ = nullptr; HWND findScaleMax_ = nullptr; HWND findOffsetX_ = nullptr; HWND findOffsetY_ = nullptr; HWND findSelectOffsetBtn_ = nullptr; HWND findUntilFound_ = nullptr; HWND findMatchVar_ = nullptr;
+    HWND findMatchThreshold_ = nullptr; HWND findScaleMin_ = nullptr; HWND findScaleMax_ = nullptr; HWND findOffsetX_ = nullptr; HWND findOffsetY_ = nullptr; HWND findSelectOffsetBtn_ = nullptr; HWND findTimeLabel_ = nullptr; HWND findTimeEdit_ = nullptr; HWND findMatchVar_ = nullptr;
     HWND ocrDepStatusLabel_ = nullptr; HWND ocrDepInstallBtn_ = nullptr;
     HWND ocrRegionLabel_ = nullptr; HWND ocrFullScreenBtn_ = nullptr; HWND ocrSelectRegionBtn_ = nullptr;
     HWND ocrX1_ = nullptr; HWND ocrY1_ = nullptr; HWND ocrX2_ = nullptr; HWND ocrY2_ = nullptr;
@@ -10794,7 +12196,7 @@ private:
     HWND aiSearchRegionCombo_ = nullptr;
     HWND quickInputEdit_ = nullptr; HWND quickInputVarCombo_ = nullptr; HWND quickInputInsertBtn_ = nullptr; HWND quickInputCharInterval_ = nullptr; HWND quickInputCount_ = nullptr; HWND quickInputWait_ = nullptr; HWND quickInputRandom_ = nullptr;
     HWND ifVarCombo_ = nullptr; HWND ifOperatorCombo_ = nullptr; HWND ifValueEdit_ = nullptr; HWND ifConnectorCombo_ = nullptr; HWND ifAddConditionBtn_ = nullptr; HWND ifConditionList_ = nullptr;
-    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ocrDepControls_, ocrFindRegionToggleControls_, ocrControls_, ocrFindRegionControls_, ocrSearchControls_, ocrFollowControls_, ocrFollowOffsetControls_, ocrFollowVarControls_, ifControls_, elseControls_, lockScreenshotControls_, unlockScreenshotControls_, stopMacroControls_, runProgramControls_, runProgramFileControls_, closeProgramControls_, openWebpageControls_, openFileControls_, timerRecordControls_, getCursorPosControls_, aiCommonControls_, aiTextControls_, aiImageControls_, aiActionControls_, aiFindRegionControls_;
+    std::vector<HWND> editorControls_, moveControls_, waitControls_, mousePressControls_, clickControls_, mousePlaybackControls_, runMacroControls_, keyPressControls_, keyControls_, hotkeyShortcutControls_, quickInputControls_, loopControls_, endLoopControls_, defineBlockControls_, runBlockControls_, scrollWheelControls_, findImageControls_, findImageOffsetControls_, findImageVarControls_, ocrDepControls_, ocrFindRegionToggleControls_, ocrControls_, ocrFindRegionControls_, ocrSearchControls_, ocrFollowControls_, ocrFollowOffsetControls_, ocrFollowVarControls_, ifControls_, elseControls_, lockScreenshotControls_, unlockScreenshotControls_, stopMacroControls_, runProgramControls_, runProgramFileControls_, closeProgramControls_, openWebpageControls_, openFileControls_, timerRecordControls_, getCursorPosControls_, gotoControls_, aiCommonControls_, aiTextControls_, aiImageControls_, aiActionControls_, aiFindRegionControls_;
 
     // ── 新布局系统: 参数面板布局结果缓存 (索引 = popupAction_.sel) ──
     std::unordered_map<int, UILayoutResult> paramLayoutResults_;
@@ -10802,16 +12204,19 @@ private:
     std::vector<ParamScrollLayoutEntry> paramScrollLayout_;
     int paramContentBottom_ = 0;
     int paramControlsBottom_ = 0;
+    int paramLayoutBottomHint_ = -1;
     std::vector<HotkeyMenuItem> hotkeyMenuItems_;
-    std::vector<ScriptMeta> scripts_; std::vector<ScriptMeta> recordings_; std::vector<ScriptAction> actions_;
+    std::vector<ScriptMeta> scripts_; std::vector<ScriptMeta> recordings_;
+    std::vector<AgentConversationMeta> agentConversations_;
+    std::vector<ScriptAction> actions_;
     std::set<int> collapsedContainers_;
     Page page_ = Page::Home; quickscript::MainTab activeHomeTab_ = quickscript::MainTab::Clicker; Hotkey globalHotkey_{0, VK_F8, L"F8", true};
     RECT homeRectBeforeEditor_{};
-    int selectedScript_ = -1, selectedRecording_ = -1, currentScriptIndex_ = -1, homeHover_ = -1, recordingHover_ = -1, hoverIndex_ = -1, selectedIndex_ = -1, editingRemarkIndex_ = -1, copySource_ = -1, dragIndex_ = -1, dragTargetIndex_ = -1, dragTargetIndent_ = 0, dragStartX_ = 0, dragStartY_ = 0, scrollOffset_ = 0, homeScrollOffset_ = 0, homeScrollbarDragOffset_ = 0, editorScrollbarDragOffset_ = 0, pendingDeleteIndex_ = -1, paramScrollY_ = 0, paramScrollbarDragOffset_ = 0;
+    int selectedScript_ = -1, selectedRecording_ = -1, currentScriptIndex_ = -1, homeHover_ = -1, recordingHover_ = -1, agentConvHover_ = -1, hoverIndex_ = -1, selectedIndex_ = -1, editingRemarkIndex_ = -1, copySource_ = -1, dragIndex_ = -1, dragTargetIndex_ = -1, dragTargetIndent_ = 0, dragStartX_ = 0, dragStartY_ = 0, scrollOffset_ = 0, homeScrollOffset_ = 0, homeScrollbarDragOffset_ = 0, editorScrollbarDragOffset_ = 0, pendingDeleteIndex_ = -1, pendingDeleteAgentConv_ = -1, paramScrollY_ = 0, paramScrollbarDragOffset_ = 0;
     HoverButton hoverButton_ = HoverButton::None;
     HWND hoverGrayBtn_ = nullptr;
     HWND pendingHoverGrayOld_ = nullptr, pendingHoverGrayNew_ = nullptr;
-    bool dragging_ = false, dragMoved_ = false, dragTargetNested_ = false, homeScrollbarDragging_ = false, editorScrollbarDragging_ = false, paramScrollbarDragging_ = false, trackingMouse_ = false, deleteConfirmVisible_ = false, hasHomeRectBeforeEditor_ = false, wasVisibleBeforeRun_ = true, wasMinimizedBeforeRun_ = false, loadingForm_ = false, batchEditMode_ = false, findImageFullScreen_ = true, ocrFullScreen_ = true, aiFullScreen_ = true;
+    bool dragging_ = false, dragMoved_ = false, dragTargetNested_ = false, homeScrollbarDragging_ = false, editorScrollbarDragging_ = false, paramScrollbarDragging_ = false, trackingMouse_ = false, hasHomeRectBeforeEditor_ = false, wasVisibleBeforeRun_ = true, wasMinimizedBeforeRun_ = false, loadingForm_ = false, batchEditMode_ = false, findImageFullScreen_ = true, ocrFullScreen_ = true, aiFullScreen_ = true;
     int clickerDropPopupKind_ = -1;
     int clickerPopupHover_ = -1;
     int clickerPopupScroll_ = 0;
@@ -10819,6 +12224,7 @@ private:
     CrosshairDragController crosshairDrag_;
     HWND hoverCrosshairBtn_ = nullptr;
     int editorPopupOpen_ = -1;
+    bool ocrSubPanelRefreshPosted_ = false;
     int editorPopupHover_ = -1;
     int editorPopupScroll_ = 0;
     HWND editorDropPopup_ = nullptr;
@@ -10852,6 +12258,9 @@ private:
     std::unordered_set<std::wstring> newImagePaths_;      // 编辑期间新增的图片路径，用于取消时清理
     std::atomic<bool> findTestRunning_{false};
     std::atomic<bool> ocrTestRunning_{false};
+    PromptModal promptModal_;
+    WindowOuterShadow outerShadow_;
+    std::wstring promptPendingMessage_;
     bool workerUsesOcrVars_ = false;
     HBITMAP findImagePreviewBitmap_ = nullptr;
     HBITMAP ocrFindImagePreviewBitmap_ = nullptr;

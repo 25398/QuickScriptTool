@@ -5,24 +5,38 @@
 
 #include <windows.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 #include <atomic>
 
 #include "agent_attachment.h"
+#include "agent_conversation_store.h"
 #include "agent_core.h"
 #include "agent_system_prompt.h"
 #include "app_settings.h"
 #include "config.h"
+#include "drawing.h"
 #include "panel_popup_combo.h"
 
 class AgentDialog {
 public:
+    struct RestoreData {
+        std::wstring id;
+        std::wstring name;
+        std::wstring createdTime;
+        std::vector<ChatMessage> messages;
+        std::wstring chatDisplay;
+    };
+
+    using CloseCallback = std::function<void(AgentConversationSavePayload&&)>;
+
     AgentDialog();
     ~AgentDialog();
 
-    bool Show(HWND owner, const quickscript::AiApiSettings& aiSettings);
+    bool Show(HWND owner, const quickscript::AiApiSettings& aiSettings,
+        const RestoreData* restore = nullptr, CloseCallback onClose = nullptr);
     bool IsAlive() const { return hwnd_ != nullptr && IsWindow(hwnd_); }
     bool IsVisible() const { return IsAlive() && IsWindowVisible(hwnd_); }
 
@@ -37,6 +51,7 @@ private:
     void Init();
     void Paint();
     void Cleanup();
+    void TryExportConversation();
     void PositionControls();
     void UpdateInputHeight();
     void SetWelcomeMessage();
@@ -48,6 +63,7 @@ private:
     std::wstring BuildUserDisplayText(const std::wstring& text) const;
 
     void SendUserMessage();
+    void CancelRequest();
     std::wstring ThinkingStatusText() const;
     RECT ThinkingStatusRect() const;
     void OnAssistantResponse(const std::wstring& text);
@@ -166,6 +182,8 @@ private:
 
     std::shared_ptr<AgentCore> agent_;
     std::shared_ptr<std::atomic<bool>> aliveFlag_;
+    std::shared_ptr<std::atomic<bool>> cancelRequested_;
+    AiHttpAbortSlot httpAbort_;
     quickscript::AiApiSettings aiSettings_;
     std::vector<quickscript::AiModelProfile> savedModels_;
     int selectedProfileIndex_ = -1;
@@ -204,4 +222,11 @@ private:
     int inputScrollbarDragOffset_ = 0;
 
     std::wstring currentAssistantMsg_;
+    WindowOuterShadow outerShadow_;
+
+    CloseCallback onClose_;
+    RestoreData restoreData_;
+    std::wstring conversationId_;
+    std::wstring conversationName_;
+    std::wstring createdTime_;
 };

@@ -83,7 +83,7 @@ std::unique_ptr<AgentCore> CreateAiActionExecuteCore(
     int recvTimeoutMs = 120000,
     double temperatureOverride = -1.0);
 
-// 执行 AI 文字分析
+// 执行 AI 文字分析（contextMode=0 时清空历史；≠0 时复用会话保留上下文）
 AiActionResult ExecuteAiTextAnalysis(
     AgentCore* core,
     const std::wstring& resolvedPrompt,
@@ -91,7 +91,8 @@ AiActionResult ExecuteAiTextAnalysis(
     const std::atomic_bool& stopFlag,
     int timeoutSec,
     AiMacroLogFn logFn = nullptr,
-    AiHttpAbortSlot* httpAbort = nullptr);
+    AiHttpAbortSlot* httpAbort = nullptr,
+    int contextMode = 0);
 
 // 执行 AI 图片分析
 AiActionResult ExecuteAiImageAnalysis(
@@ -102,7 +103,8 @@ AiActionResult ExecuteAiImageAnalysis(
     const std::atomic_bool& stopFlag,
     int timeoutSec,
     AiMacroLogFn logFn = nullptr,
-    AiHttpAbortSlot* httpAbort = nullptr);
+    AiHttpAbortSlot* httpAbort = nullptr,
+    int contextMode = 0);
 
 // 构建 AI 动作执行的 system prompt（带截图）
 std::wstring BuildAiActionExecuteSystemPrompt(

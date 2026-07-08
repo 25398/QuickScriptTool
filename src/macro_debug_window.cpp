@@ -189,6 +189,7 @@ void MacroDebugWindow::Create(HFONT bodyFont, HFONT titleFont, HFONT closeFont,
         ApplyModernEditBehavior(edit_, true);
     }
     ApplyTopmost();
+    outerShadow_.Attach(hwnd_);
 }
 
 void MacroDebugWindow::Show() {

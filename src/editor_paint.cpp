@@ -30,7 +30,7 @@
             COLORREF fg = (!batchEditMode_ && i == selectedIndex_) ? kWhite : kText;
             const int textLeft = ActionTextLeftLocal(a.indent, a.type, batchEditMode_, pad);
             DrawTextIn(hdc, std::to_wstring(a.originalNo > 0 ? a.originalNo : i + 1), RECT{pad + kColNoInList, r.top, pad + kColActionInList - 4, r.bottom}, (!batchEditMode_ && i == selectedIndex_) ? kWhite : kIndexGreen);
-            if (batchEditMode_) DrawListCheckbox(hdc, LocalCheckboxRect(i, y), batchChecked);
+            if (batchEditMode_) DrawCheckbox(hdc, LocalCheckboxRect(i, y), batchChecked);
             if (IsExpandableContainer(a.type)) {
                 const int expandLeft = ExpandToggleLeftLocal(a.indent, batchEditMode_, pad);
                 RECT expandRc{expandLeft, r.top + 8, expandLeft + kExpandToggleWidth, r.bottom - 8};
@@ -364,10 +364,12 @@
 
         SelectObject(hdc, editorFont_);
         auto drawComboIfActive = [&](HWND h, int popupId) {
-            if (!controlOnThisDc(h) || !IsWindowVisible(h) || !IsParamComboVisible(popupId)) return;
-            RECT rc = mapRect(WindowClientRect(h));
+            if (!controlOnThisDc(h) || !IsParamComboVisible(popupId)) return;
+            const RECT clientRc = EditorComboClientRect(h);
+            if (clientRc.right <= clientRc.left || clientRc.bottom <= clientRc.top) return;
+            if (!ParamRectIntersectsContent(clientRc)) return;
+            RECT rc = mapRect(clientRc);
             if (rc.right <= rc.left || rc.bottom <= rc.top) return;
-            if (!ParamRectIntersectsContent(WindowClientRect(h))) return;
             DrawEditorCombo(hdc, h, rc, editorPopupOpen_ == popupId);
         };
         drawComboIfActive(mousePressButton_, 2);
@@ -415,22 +417,6 @@
             }
         }
         if (remark_ && IsWindowVisible(remark_)) drawEditBorder(remark_);
-
-        for (const auto& [idx, result] : paramLayoutResults_) {
-            if (idx != sel && !IsSubPanelIdxVisible(sel, idx)) continue;
-            for (const auto& p : result.placements) {
-                if (!controlOnThisDc(p.hwnd) || !p.hwnd || !IsWindowVisible(p.hwnd)) continue;
-                if (p.type != UIComponentType::CheckBox) continue;
-                RECT rc = mapRect(WindowClientRect(p.hwnd));
-                if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
-                if (!ParamRectIntersectsContent(WindowClientRect(p.hwnd))) continue;
-                const int cbSize = 18;
-                const int cbTop = rc.top + (rc.bottom - rc.top - cbSize) / 2;
-                RECT cbRc{rc.left, cbTop, rc.left + cbSize, cbTop + cbSize};
-                FillRectColor(hdc, cbRc, kWhite);
-                StDrawCheckbox(hdc, cbRc, Checked(p.hwnd));
-            }
-        }
 
         SelectClipRgn(hdc, hadClip == 1 ? oldClip : nullptr);
         DeleteObject(paramClip);

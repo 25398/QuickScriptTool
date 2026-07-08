@@ -618,7 +618,9 @@ AiActionResult ExecuteAiTextAnalysis(
 
     AiMacroLogFn logFn,
 
-    AiHttpAbortSlot* httpAbort) {
+    AiHttpAbortSlot* httpAbort,
+
+    int contextMode) {
 
     AiActionResult result;
 
@@ -638,6 +640,8 @@ AiActionResult ExecuteAiTextAnalysis(
 
     }
 
+    if (contextMode == 0) core->ClearHistory();
+
 
 
     ChatMessage msg;
@@ -651,6 +655,7 @@ AiActionResult ExecuteAiTextAnalysis(
     AgentSendCallbacks cb = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
     cb.preferNonStream = true;
     if (core) core->SetRecvTimeoutMs(ResolveAiActionExecuteTimeoutSec(timeoutSec, false) * 1000);
+    if (logFn) logFn(L"  [诊断] 上下文模式: " + std::to_wstring(contextMode));
 
     try {
 
@@ -714,7 +719,9 @@ AiActionResult ExecuteAiImageAnalysis(
 
     AiMacroLogFn logFn,
 
-    AiHttpAbortSlot* httpAbort) {
+    AiHttpAbortSlot* httpAbort,
+
+    int contextMode) {
 
     AiActionResult result;
 
@@ -733,6 +740,8 @@ AiActionResult ExecuteAiImageAnalysis(
         return result;
 
     }
+
+    if (contextMode == 0) core->ClearHistory();
 
 
 
@@ -769,6 +778,7 @@ AiActionResult ExecuteAiImageAnalysis(
     cb.preferNonStream = false;
 
     if (logFn) {
+        logFn(L"  [诊断] 上下文模式: " + std::to_wstring(contextMode));
         logFn(L"  超时上限 " + std::to_wstring(effectiveSec) + L"s，流式接收回复…");
         if (resolvedPrompt.size() > 400)
             logFn(L"  prompt 较长（" + std::to_wstring(resolvedPrompt.size())

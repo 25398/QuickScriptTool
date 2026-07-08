@@ -9,9 +9,11 @@
 #include <vector>
 
 #include "config.h"
+#include "drawing.h"
 #include "scheduled_task_datetime_picker.h"
 #include "scheduled_task_scheduler.h"
 #include "scheduled_task_types.h"
+#include "prompt_modal.h"
 
 class ScheduledTaskDialog {
 public:
@@ -147,4 +149,6 @@ private:
     bool hoverFileCombo_ = false;
     bool hoverTimeCombo_ = false;
     std::wstring timePreview_;
+    PromptModal promptModal_;
+    WindowOuterShadow outerShadow_;
 };

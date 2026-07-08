@@ -45,10 +45,16 @@ std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableC
 // 尝试将 token 解析为整数操作数
 bool TryResolveIntOperand(const std::wstring& token, const MacroVariableContext& ctx, int& out);
 
+// 解析找图时限（秒）：负数=直到找到；0=只找一次；正数=最大搜索秒数；非数字视为 0
+double ResolveFindImageTimeSec(const std::wstring& expr, const MacroVariableContext& ctx);
+
 // 获取循环动作的最大执行次数 (从 loopVarExpr 或 loopCount 解析)
 // loopStartTime: 传入循环进入时刻，用于计时器变量作循环次数时扣除循环体内耗时
 int ResolveLoopMaxCount(const ScriptAction& action, const MacroVariableContext& ctx,
     std::optional<std::chrono::steady_clock::time_point> loopStartTime = std::nullopt);
+
+// 解析跳转目标序号（支持变量名或 {变量} 表达式）
+bool TryResolveGotoStepNo(const std::wstring& expr, const MacroVariableContext& ctx, int& out);
 
 // 解码快捷输入文本中的转义字符 (如 \\n → 换行)
 std::wstring DecodeQuickInputEscapes(const std::wstring& text);

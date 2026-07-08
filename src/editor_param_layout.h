@@ -14,7 +14,8 @@ namespace EditorParamLayout {
 constexpr int kPanelLeft = kFindContentLeft;   // 785，找图等同宽区块仍用此值
 constexpr int kParamPanelLeft = kParamPanelLeftDesign;
 constexpr int kPanelWidth = kParamFieldWidth;
-constexpr int kPanelTextFieldH = 64;  // 与「打开网页」输入框一致的全宽文本框高度
+constexpr int kPanelTextFieldH = 64;  // 多行/长文本输入框（如提示词、URL）
+constexpr int kPanelSingleFieldH = 22; // 单行短内容输入框（与超时等字段一致）
 
 // ── 控件 ID ──
 constexpr int EID_MoveX                   = 1015;
@@ -113,7 +114,7 @@ constexpr int EID_FindFollowUp            = 1110;
 constexpr int EID_FindOffsetX             = 1111;
 constexpr int EID_FindOffsetY             = 1112;
 constexpr int EID_FindSelectOffset        = 1113;
-constexpr int EID_FindUntilFound          = 1114;
+constexpr int EID_FindTime                = 1114;
 constexpr int EID_FindMatchVar            = 1115;
 constexpr int EID_OcrFullScreen           = 1116;
 constexpr int EID_OcrSelectRegion         = 1117;
@@ -194,6 +195,7 @@ constexpr int EID_AiMaxSteps              = 1189;
 constexpr int EID_AiMaxStepsHint          = 1192;
 constexpr int EID_AiConfirm               = 1191;
 constexpr int EID_CursorPosVarName        = 1193;
+constexpr int EID_GotoStepExpr            = 1194;
 
 // 辅助: Indent 将第一个组件推到指定 x (相对于 panel left), Gap 为精确像素间距
 inline UIComponent Indent(int x) { return UIComponent::Spacer(x - kParamPanelLeft, 0); }
@@ -651,13 +653,13 @@ inline UILayout Loop() {
             UIComponent::CheckBox(L"来自变量表达式", EID_LoopFromVar, 180, 25),
         }, 0, 0, 7)                                // y=340
         .AddRow({
-            UIComponent::MultilineEdit(L"", EID_LoopVarExpr, kParamFieldWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"", EID_LoopVarExpr, kParamFieldWidth, kPanelSingleFieldH),
         }, 0, 0, 16)                               // y=378
         .AddRow({
             UIComponent::Label(L"循环变量命名", -1, 120, 25),
         }, 0, 0, 1)                                // y=404
         .AddRow({
-            UIComponent::MultilineEdit(L"", EID_LoopVarName, kParamFieldWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"", EID_LoopVarName, kParamFieldWidth, kPanelSingleFieldH),
         }, 0, 0, 6)                                // y=432
         .AddRow({
             UIComponent::Hint(L"*提示:可用于标识当前循环次数，或作为数据索引", kParamFieldWidth, 40),
@@ -683,7 +685,7 @@ inline UILayout DefineBlock() {
             UIComponent::EditorLabel(L"定义的宏指令块名称:", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::MultilineEdit(L"block1", EID_DefineBlockName, kPanelWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"block1", EID_DefineBlockName, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::Hint(
@@ -813,7 +815,9 @@ inline UILayout FindImageOffset() {
             UIComponent::GrayButton(L"选择偏移点击位置", EID_FindSelectOffset, kFindSelectOffsetW, kFindBtnH),
         }, 0, 0, kFindVGap)
         .AddRow({
-            UIComponent::CheckBox(L"直到找到为止", EID_FindUntilFound, 140, 22),
+            UIComponent::Label(L"时间", -1, 44, 22),
+            Gap(4),
+            UIComponent::FieldEdit(L"0", EID_FindTime, kFindBlockW - 48, 22),
         }, 0, 0, kFindVGap);
 }
 
@@ -840,9 +844,10 @@ inline UILayout OcrDepStatus() {
 inline UILayout OcrFindRegionToggle() {
     return UILayout(kFindContentLeft, kOcrToggleRowY, kFindBlockW)
         .AddRow({
-            UIComponent::CheckBox(L"根据图片选取区域", EID_OcrRegionByImage, kOcrRegionByImageW, 22),
-            Gap(4),
-            UIComponent::CheckBox(L"纯数字", EID_OcrDigitsOnly, kOcrDigitsOnlyW, 22),
+            UIComponent::CheckBox(L"根据图片选取区域", EID_OcrRegionByImage, kFindBlockW, 22),
+        }, 0, 0, kFindVGap)
+        .AddRow({
+            UIComponent::CheckBox(L"纯数字", EID_OcrDigitsOnly, kFindBlockW, 22),
         });
 }
 
@@ -1051,6 +1056,22 @@ inline UILayout StopMacro() {
         });
 }
 
+inline UILayout Goto() {
+    return UILayout(kParamPanelLeft, 174, kPanelWidth)
+        .AddRow({
+            UIComponent::EditorLabel(L"跳转到动作序号", -1, kPanelWidth, 22),
+        }, 0, 0, 8)
+        .AddRow({
+            UIComponent::FieldEdit(L"", EID_GotoStepExpr, kParamFieldWidth, kPanelSingleFieldH),
+        }, 0, 0, 8)
+        .AddRow({
+            UIComponent::Hint(
+                L"*提示:填写目标动作的序号（列表左侧序号），支持变量名或 {变量} 表达式\r\n"
+                L"跳入循环体内=该循环第1次迭代并从目标动作执行；循环内互跳保持同次迭代",
+                kParamFieldWidth, 64),
+        });
+}
+
 // ══════════════════════════════════════════════════════════════════
 // 30. 打开程序
 // ══════════════════════════════════════════════════════════════════
@@ -1237,13 +1258,13 @@ inline UILayout AiCommon() {
             UIComponent::EditorLabel(L"降级值(失败时使用)", -1, kPanelWidth, 22),
         }, 0, 0, 6)
         .AddRow({
-            UIComponent::MultilineEdit(L"", EID_AiFallback, kPanelWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"", EID_AiFallback, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::EditorLabel(L"输出变量名", -1, kPanelWidth, 22),
         }, 0, 0, 6)
         .AddRow({
-            UIComponent::MultilineEdit(L"aiResult", EID_AiOutputVar, kPanelWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"aiResult", EID_AiOutputVar, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::EditorLabel(L"输出类型", -1, kPanelWidth, 22),
@@ -1259,10 +1280,10 @@ inline UILayout AiImage() {
             UIComponent::EditorLabel(L"截屏缩放(0.1-1.0)", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::MultilineEdit(L"1.0", EID_AiImageScale, kPanelWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"1.0", EID_AiImageScale, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage, 140, 25),
+            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage, kPanelWidth, 25),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::Label(L"识别区域", -1, 60, 22),
@@ -1294,7 +1315,7 @@ inline UILayout AiImage() {
 inline UILayout AiAction() {
     return UILayout(kParamPanelLeft, 174, kPanelWidth)
         .AddRow({
-            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage2, 140, 25),
+            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage2, kPanelWidth, 25),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::Label(L"识别区域", -1, 60, 22),

@@ -21,6 +21,81 @@ inline int ContainerBodyEnd(const std::vector<ScriptAction>& actions, int contai
     return i;
 }
 
+// 判断 index 是否位于 loop 动作的主体范围内（不含 loop 头自身）
+inline bool IsLoopBodyIndex(const std::vector<ScriptAction>& actions, size_t loopIdx, size_t index) {
+    if (loopIdx >= actions.size()) return false;
+    const int bodyEnd = ContainerBodyEnd(actions, static_cast<int>(loopIdx));
+    return index > loopIdx && index < static_cast<size_t>(bodyEnd);
+}
+
+// 返回包含 index 的最外层 loop 头索引；不在任何循环体内则返回 -1
+inline int OutermostEnclosingLoop(const std::vector<ScriptAction>& actions, size_t index) {
+    int found = -1;
+    for (int i = 0; i < static_cast<int>(actions.size()); ++i) {
+        if (actions[static_cast<size_t>(i)].type != ActionType::Loop) continue;
+        if (IsLoopBodyIndex(actions, static_cast<size_t>(i), index)) found = i;
+    }
+    return found;
+}
+
+// 查找 index 处动作（indent 为 actionIndent）的直接父节点索引；无父节点返回 -1
+inline int FindDirectParentIndex(const std::vector<ScriptAction>& actions, size_t index, int actionIndent) {
+    if (actionIndent <= 0) return -1;
+    for (int i = static_cast<int>(index) - 1; i >= 0; --i) {
+        if (actions[static_cast<size_t>(i)].indent < actionIndent)
+            return i;
+    }
+    return -1;
+}
+
+// 结束循环必须挂在循环容器下（indent = loop.indent + 1）
+inline bool HasLoopParentAt(const std::vector<ScriptAction>& actions, size_t index, int actionIndent) {
+    const int parentIdx = FindDirectParentIndex(actions, index, actionIndent);
+    if (parentIdx < 0) return false;
+    return actions[static_cast<size_t>(parentIdx)].type == ActionType::Loop;
+}
+
+inline constexpr const wchar_t* kEndLoopNeedsLoopParentMsg = L"请将循环作为父节点";
+
+// 校验动作列表中所有 endLoop 是否均有循环父节点；通过返回空字符串
+inline std::wstring ValidateEndLoopPlacements(const std::vector<ScriptAction>& actions) {
+    for (size_t i = 0; i < actions.size(); ++i) {
+        if (actions[i].type != ActionType::EndLoop) continue;
+        if (!HasLoopParentAt(actions, i, actions[i].indent)) {
+            return std::wstring(L"第 ") + std::to_wstring(i + 1) + L" 个动作（结束循环）："
+                + kEndLoopNeedsLoopParentMsg;
+        }
+    }
+    return L"";
+}
+
+// 返回包含 index 的最内层 loop 头索引
+inline int InnermostEnclosingLoop(const std::vector<ScriptAction>& actions, size_t index) {
+    int found = -1;
+    size_t smallestSpan = static_cast<size_t>(-1);
+    for (int i = 0; i < static_cast<int>(actions.size()); ++i) {
+        if (actions[static_cast<size_t>(i)].type != ActionType::Loop) continue;
+        if (!IsLoopBodyIndex(actions, static_cast<size_t>(i), index)) continue;
+        const size_t span = static_cast<size_t>(ContainerBodyEnd(actions, i) - i);
+        if (span < smallestSpan) {
+            smallestSpan = span;
+            found = i;
+        }
+    }
+    return found;
+}
+
+// 在 parentLoop 体内查找直接包含 index 的子 loop
+inline int EnclosingChildLoopInBody(const std::vector<ScriptAction>& actions, size_t parentLoopIdx, size_t index) {
+    if (!IsLoopBodyIndex(actions, parentLoopIdx, index)) return -1;
+    const size_t bodyEnd = static_cast<size_t>(ContainerBodyEnd(actions, static_cast<int>(parentLoopIdx)));
+    for (size_t j = parentLoopIdx + 1; j < bodyEnd; ++j) {
+        if (actions[j].type != ActionType::Loop) continue;
+        if (IsLoopBodyIndex(actions, j, index)) return static_cast<int>(j);
+    }
+    return -1;
+}
+
 // 获取动作子树的结束位置 (包含容器中所有子节点)
 inline int SubtreeEnd(const std::vector<ScriptAction>& actions, int index) {
     if (index < 0 || index >= static_cast<int>(actions.size())) return index + 1;

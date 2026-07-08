@@ -62,6 +62,7 @@ bool OcrInstallDialog::Show(HWND owner, bool repairMode) {
     if (!hwnd_) return false;
 
     ApplyTaskbarWindowStyle(hwnd_, repairMode ? L"文字识别插件修复" : L"文字识别插件安装");
+    outerShadow_.Attach(hwnd_);
 
     EnableWindow(owner, FALSE);
     ShowWindow(hwnd_, SW_SHOW);

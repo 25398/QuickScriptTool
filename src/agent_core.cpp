@@ -140,6 +140,21 @@ bool IsTransientHttpReceiveError(DWORD err) {
         || err == 12119; // ERROR_WINHTTP_INVALID_OPERATION
 }
 
+// 思考模型首 token / 长输出可能远超默认 120s，按 max_tokens 放大等待上限
+int ComputeEffectiveRecvTimeoutMs(int recvTimeoutMs, int maxTokens) {
+    const int floorMs = 180000;  // 至少 3 分钟
+    const int scaledMs = maxTokens > 0 ? maxTokens * 25 : 0;
+    return std::max(recvTimeoutMs, std::max(floorMs, scaledMs));
+}
+
+// 各兼容 API 普遍可接受的 max_tokens 上限（DeepSeek 为 393216）
+int ClampApiMaxTokens(int value) {
+    constexpr int kMin = 1;
+    constexpr int kMax = 393216;
+    if (value < kMin) return 4096;
+    return std::min(value, kMax);
+}
+
 bool ReceiveResponseWithPolling(HINTERNET hRequest, const std::atomic_bool* cancelFlag,
                                 int maxWaitMs, std::wstring* errorOut,
                                 StatusCallback onStatus = nullptr) {
@@ -267,6 +282,16 @@ void AgentCore::ClearHistory() {
     }
 }
 
+void AgentCore::SetFullHistory(std::vector<ChatMessage> messages) {
+    messages_ = std::move(messages);
+}
+
+void AgentCore::ImportHistoryFrom(const AgentCore& other, size_t startIndex) {
+    const auto& src = other.messages_;
+    if (startIndex >= src.size()) return;
+    messages_.insert(messages_.end(), src.begin() + static_cast<std::ptrdiff_t>(startIndex), src.end());
+}
+
 void AgentCore::UpdateConfig(const AgentConfig& config, const std::wstring& systemPrompt) {
     config_ = config;
     if (!messages_.empty() && messages_[0].role == L"system") {
@@ -292,7 +317,7 @@ json AgentCore::BuildRequest() {
     json req;
     req["model"] = ToUtf8(config_.model);
     req["temperature"] = config_.temperature;
-    req["max_tokens"] = config_.maxTokens;
+    req["max_tokens"] = ClampApiMaxTokens(config_.maxTokens);
 
     size_t lastUserIdx = messages_.size();
     for (size_t i = messages_.size(); i > 0; --i) {
@@ -415,6 +440,7 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
     }
 
     const std::string body = requestBody.dump();
+    const int effectiveTimeoutMs = ComputeEffectiveRecvTimeoutMs(config_.recvTimeoutMs, config_.maxTokens);
     if (onStatus) {
         onStatus(L"请求体 " + std::to_wstring((body.size() + 1023) / 1024)
             + L" KB，上传中…");
@@ -432,7 +458,7 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
 
     DWORD connectTimeout = 30000;
     DWORD sendTimeout = body.size() > 300000 ? 180000u : 120000u;
-    DWORD recvTimeout = static_cast<DWORD>(std::max(5000, config_.recvTimeoutMs));
+    DWORD recvTimeout = static_cast<DWORD>(std::max(5000, effectiveTimeoutMs));
     WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &connectTimeout, sizeof(connectTimeout));
     WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT, &sendTimeout, sizeof(sendTimeout));
     WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &recvTimeout, sizeof(recvTimeout));
@@ -481,7 +507,7 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
     WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &pollTimeoutMs, sizeof(pollTimeoutMs));
 
     const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds(std::max(30000, config_.recvTimeoutMs));
+        + std::chrono::milliseconds(std::max(30000, effectiveTimeoutMs));
     const auto waitStart = std::chrono::steady_clock::now();
     int lastReportSec = 0;
     DWORD lastErr = 0;
@@ -504,7 +530,7 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
             return fail(L"已取消");
         if (std::chrono::steady_clock::now() >= deadline)
             return fail(L"等待服务器响应超时（已超过 "
-                + std::to_wstring(std::max(30000, config_.recvTimeoutMs)) + L"ms，"
+                + std::to_wstring(std::max(30000, effectiveTimeoutMs)) + L"ms，"
                 + WinHttpErrorText(lastErr) + L" code=" + std::to_wstring(lastErr) + L"）");
     }
 
@@ -559,8 +585,10 @@ struct StreamAccumState {
     std::string content;
     std::vector<json> toolCallParts;
     std::string lineBuffer;
+    std::string finishReason;
     bool done = false;
     bool hasToolCalls = false;
+    bool contentDeltaSent = false;
 };
 
 bool StreamToolCallArgsComplete(const json& fn) {
@@ -584,6 +612,19 @@ bool HasUsableStreamToolCalls(const StreamAccumState& state) {
         if (!StreamToolCallArgsComplete(fn)) return false;
     }
     return true;
+}
+
+void MaybeMarkStreamDone(StreamAccumState& state) {
+    if (state.finishReason == "tool_calls") {
+        if (HasUsableStreamToolCalls(state)) state.done = true;
+        return;
+    }
+    if (state.finishReason == "stop" || state.finishReason == "length")
+        state.done = true;
+}
+
+bool HasMeaningfulStreamPayload(const StreamAccumState& state) {
+    return !state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state);
 }
 
 bool ShouldFinalizeStream(const StreamAccumState& state, bool expectTools) {
@@ -663,8 +704,8 @@ bool ProcessStreamSseLine(const std::string& line, StreamAccumState& state,
         return true;
     const json& choice = chunk["choices"][0];
     if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
-        const std::string fr = choice["finish_reason"].get<std::string>();
-        if (fr == "stop" || fr == "tool_calls" || fr == "length") state.done = true;
+        state.finishReason = choice["finish_reason"].get<std::string>();
+        MaybeMarkStreamDone(state);
     }
     const json& delta = choice.value("delta", json::object());
     auto appendReasoning = [&](const json& obj, const char* key) {
@@ -683,13 +724,16 @@ bool ProcessStreamSseLine(const std::string& line, StreamAccumState& state,
         const std::string piece = delta["content"].get<std::string>();
         if (!piece.empty()) {
             state.content += piece;
-            if (callbacks.onContentDelta)
+            if (callbacks.onContentDelta) {
+                state.contentDeltaSent = true;
                 callbacks.onContentDelta(FromUtf8(piece));
+            }
         }
     }
     if (delta.contains("tool_calls")) {
         state.hasToolCalls = true;
         MergeStreamToolCallDelta(state.toolCallParts, delta["tool_calls"]);
+        if (state.finishReason == "tool_calls") MaybeMarkStreamDone(state);
     }
     if (choice.contains("message") && choice["message"].is_object()) {
         const json& msg = choice["message"];
@@ -699,15 +743,18 @@ bool ProcessStreamSseLine(const std::string& line, StreamAccumState& state,
         appendReasoning(msg, "thought");
         if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
             state.hasToolCalls = true;
-            state.done = true;
             for (const json& tc : msg["tool_calls"]) state.toolCallParts.push_back(tc);
+            if (state.finishReason.empty()) state.finishReason = "tool_calls";
+            MaybeMarkStreamDone(state);
         }
         if (msg.contains("content") && msg["content"].is_string()) {
             const std::string piece = msg["content"].get<std::string>();
             if (!piece.empty()) {
                 state.content += piece;
-                if (callbacks.onContentDelta)
+                if (callbacks.onContentDelta) {
+                    state.contentDeltaSent = true;
                     callbacks.onContentDelta(FromUtf8(piece));
+                }
             }
         }
     }
@@ -739,6 +786,9 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     json requestBody = requestBodyIn;
     requestBody["stream"] = true;
 
+    const int effectiveTimeoutMs = ComputeEffectiveRecvTimeoutMs(config_.recvTimeoutMs, config_.maxTokens);
+    constexpr int kStreamIdleTimeoutMs = 90000;  // 已收到数据后，90s 无新字节视为断流
+
     const std::wstring url = NormalizeChatCompletionsUrl(Trim(config_.apiUrl));
     const ParsedUrl parsed = ParseUrl(url);
     if (parsed.host.empty() || !HostLooksValid(parsed.host))
@@ -756,7 +806,7 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
 
     DWORD connectTimeout = 30000;
     DWORD sendTimeout = body.size() > 300000 ? 180000u : 120000u;
-    DWORD recvTimeout = static_cast<DWORD>(std::max(5000, config_.recvTimeoutMs));
+    DWORD recvTimeout = static_cast<DWORD>(std::max(5000, effectiveTimeoutMs));
     WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &connectTimeout, sizeof(connectTimeout));
     WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT, &sendTimeout, sizeof(sendTimeout));
     WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &recvTimeout, sizeof(recvTimeout));
@@ -790,7 +840,7 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
 
     std::wstring recvErr;
-    if (!ReceiveResponseWithPolling(hRequest, callbacks.cancelFlag, config_.recvTimeoutMs,
+    if (!ReceiveResponseWithPolling(hRequest, callbacks.cancelFlag, effectiveTimeoutMs,
             &recvErr, callbacks.onStatus))
         return fail(recvErr.empty() ? L"接收响应失败" : recvErr);
 
@@ -809,8 +859,10 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     const bool expectTools = !tools_.empty();
     DWORD bytesAvailable = 0;
     const auto streamDeadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds(std::max(5000, config_.recvTimeoutMs));
+        + std::chrono::milliseconds(effectiveTimeoutMs);
     const auto streamStart = std::chrono::steady_clock::now();
+    auto lastByteTime = streamStart;
+    bool receivedAnyByte = false;
     int lastBeatSec = 0;
     while (!state.done) {
         if (callbacks.cancelFlag && callbacks.cancelFlag->load())
@@ -825,19 +877,29 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
             return fail(L"读取流失败：" + WinHttpErrorText(err)
                 + L" (code=" + std::to_wstring(err) + L")");
         }
+        const auto now = std::chrono::steady_clock::now();
         if (bytesAvailable == 0) {
             if (ShouldFinalizeStream(state, expectTools)) break;
             if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
-            if (std::chrono::steady_clock::now() >= streamDeadline) {
-                if (!state.reasoning.empty() || !state.content.empty()) {
+            if (receivedAnyByte && HasMeaningfulStreamPayload(state)
+                && now - lastByteTime >= std::chrono::milliseconds(kStreamIdleTimeoutMs)) {
+                if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
+                    state.done = true;
+                    break;
+                }
+                return fail(L"流式连接空闲超时（"
+                    + std::to_wstring(kStreamIdleTimeoutMs) + L" ms 无新数据）");
+            }
+            if (now >= streamDeadline) {
+                if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
                     state.done = true;
                     break;
                 }
                 return fail(L"流式接收超时（已超过 "
-                    + std::to_wstring(config_.recvTimeoutMs) + L" ms）");
+                    + std::to_wstring(effectiveTimeoutMs) + L" ms）");
             }
             const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - streamStart).count());
+                now - streamStart).count());
             if (callbacks.onStatus && waitedSec >= lastBeatSec + 3) {
                 lastBeatSec = waitedSec;
                 std::wstring beat = L"流式等待 " + std::to_wstring(waitedSec) + L"s";
@@ -850,6 +912,8 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
             Sleep(50);
             continue;
         }
+        receivedAnyByte = true;
+        lastByteTime = now;
         std::vector<char> buffer(bytesAvailable);
         DWORD bytesRead = 0;
         if (!WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead) || bytesRead == 0) {
@@ -861,10 +925,14 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     if (!state.lineBuffer.empty())
         ProcessStreamSseLine(state.lineBuffer, state, callbacks);
 
+    if (!state.done && HasUsableStreamToolCalls(state))
+        state.done = true;
+
     if (AssembleStreamMessage(state, expectTools, result.message)) {
         result.ok = true;
+        result.finishReason = state.finishReason;
         const bool hasTools = state.hasToolCalls || !state.toolCallParts.empty();
-        if (!hasTools && !state.content.empty() && callbacks.onContentDelta)
+        if (!hasTools && !state.content.empty() && callbacks.onContentDelta && !state.contentDeltaSent)
             callbacks.onContentDelta(FromUtf8(state.content));
         return result;
     }
@@ -923,18 +991,34 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
         activeHttpAbort_ = callbacks.httpAbort;
         json requestBody = BuildRequest();
         if (callbacks.onStatus)
-            callbacks.onStatus(loop == 0 ? L"Connecting..." : L"继续处理…");
+            callbacks.onStatus(loop == 0 ? L"正在连接…" : L"继续处理…");
 
         const bool useStream = !callbacks.preferNonStream;
+        const bool expectTools = !tools_.empty();
         StreamApiResult streamed;
         ChatMessage assistantMsg;
         bool parsed = false;
+        std::string finishReason;
+
+        auto needsNonStreamRetry = [&](const StreamApiResult& s, const ChatMessage& msg) {
+            if (!useStream || !s.ok || !expectTools || !msg.tool_calls.empty()) return false;
+            if (s.finishReason == "length") return true;
+            // 流式只收到思考、未产出正文/工具时，改用完整响应重试
+            if (msg.content.empty() && !msg.reasoning_content.empty()) return true;
+            return false;
+        };
 
         if (useStream) {
             streamed = CallApiStream(requestBody, callbacks);
             if (streamed.ok) {
                 assistantMsg = streamed.message;
+                finishReason = streamed.finishReason;
                 parsed = true;
+                if (needsNonStreamRetry(streamed, assistantMsg)) {
+                    parsed = false;
+                    if (callbacks.onStatus)
+                        callbacks.onStatus(L"流式响应不完整，改用完整响应重试…");
+                }
             }
         }
 
@@ -976,7 +1060,10 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
             if (!resp.contains("choices") || !resp["choices"].is_array() || resp["choices"].empty())
                 return L"[错误] API 响应格式异常：缺少 choices。";
 
-            const json& message = resp["choices"][0].value("message", json::object());
+            const json& choice = resp["choices"][0];
+            const json& message = choice.value("message", json::object());
+            if (choice.contains("finish_reason") && !choice["finish_reason"].is_null())
+                finishReason = choice["finish_reason"].get<std::string>();
             assistantMsg.role = L"assistant";
             FillAssistantFromApiMessage(assistantMsg, message);
             parsed = true;
@@ -1036,6 +1123,13 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
 
         if (callbacks.onChunk && !callbacks.onContentDelta)
             callbacks.onChunk(finalContent);
+
+        if (expectTools && finishReason == "length" && !hasToolCalls) {
+            return L"[提示] 模型输出因 max_tokens（当前 "
+                + std::to_wstring(config_.maxTokens)
+                + L"）被截断，未完成脚本生成。请在「设置 → AI助手」中增大 max_tokens，"
+                L"或换用非思考型模型后重试。\n\n" + finalContent;
+        }
 
         return finalContent;
     }

@@ -125,6 +125,12 @@ public:
     // 清空对话历史（保留 system prompt）
     void ClearHistory();
 
+    /// 用完整历史替换当前消息（用于恢复已保存对话）
+    void SetFullHistory(std::vector<ChatMessage> messages);
+
+    /// 从 other 追加非 system 消息（startIndex 起，通常传 1 或追加起点）
+    void ImportHistoryFrom(const AgentCore& other, size_t startIndex = 1);
+
     // 更新 API 配置与 system prompt（切换模型时使用）
     void UpdateConfig(const AgentConfig& config, const std::wstring& systemPrompt);
 
@@ -143,6 +149,7 @@ private:
         ChatMessage message;
         bool ok = false;
         std::wstring error;
+        std::string finishReason;
     };
 
     std::wstring CallApi(const json& requestBody, std::wstring* errorOut = nullptr,

@@ -20,6 +20,7 @@ endif()
 find_package(OpenCV REQUIRED)
 
 add_executable(QuickScriptTool WIN32
+    resources/QuickScriptTool.rc
     src/main.cpp
     src/action_utils.cpp
     src/clicker.cpp
@@ -37,8 +38,10 @@ add_executable(QuickScriptTool WIN32
     src/ocr_overlay.cpp
     src/process_utils.cpp
     src/crosshair_drag.cpp
+    src/find_image_ui_debug.cpp
     src/match_overlay.cpp
     src/popup_combo.cpp
+    src/prompt_modal.cpp
     src/panel_popup_combo.cpp
     src/recorder.cpp
     src/recording_optimize_dialog.cpp
@@ -66,6 +69,7 @@ add_executable(QuickScriptTool WIN32
     src/agent_reference.cpp
     src/agent_system_prompt.cpp
     src/agent_dialog.cpp
+    src/agent_conversation_store.cpp
     src/agent_tools.cpp
     src/agent_ai_actions.cpp
     src/macro_execute_tools.cpp
@@ -75,6 +79,7 @@ add_executable(QuickScriptTool WIN32
 target_compile_definitions(QuickScriptTool PRIVATE UNICODE _UNICODE NOMINMAX)
 
 target_include_directories(QuickScriptTool PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${OpenCV_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/DuiLib_Ultimate
@@ -91,6 +96,7 @@ target_link_libraries(QuickScriptTool PRIVATE
     comctl32
     imm32
     msimg32
+    uxtheme
     ole32
     oleaut32
     urlmon

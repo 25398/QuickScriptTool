@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "config.h"
+#include "drawing.h"
 #include "image_match.h"
 #include "macro_variables.h"
 #include "script_types.h"
@@ -73,6 +74,7 @@ private:
     std::function<void()> onClosed_;
     std::mutex logMutex_;
     std::vector<std::wstring> pendingLogs_;
+    WindowOuterShadow outerShadow_;
 };
 
 // ── 调试信息格式化 ────────────────────────────────────────────────

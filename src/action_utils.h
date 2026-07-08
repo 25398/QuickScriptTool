@@ -22,8 +22,23 @@ std::wstring HoldText(const ScriptAction& action);
 /// 生成重复动作描述文本
 std::wstring RepeatInfo(const ScriptAction& action);
 
+/// 根据动作序号（originalNo）查找动作在列表中的索引；未找到返回 actions.size()
+size_t FindActionIndexByNo(const std::vector<ScriptAction>& actions, int targetNo);
+
 /// 根据动作类型和参数生成可读的动作描述名称
 std::wstring ActionName(const ScriptAction& action);
+
+/// 编辑器动作类型的简短中文名（无参数，对用户说明时用）
+std::wstring ActionTypeBriefLabel(ActionType type);
+
+/// JSON type 字段 → 编辑器中文动作名
+std::wstring JsonTypeBriefLabel(const std::wstring& jsonType);
+
+/// 脚本动作列表的可读大纲（供 AI 回复用户时引用）
+std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions);
+
+/// 动作 type 英文标识 → 中文说法对照表（注入 AI 提示）
+std::wstring ActionTypeReplyCatalog();
 
 /// 将动作类型转换为 JSON 类型标识字符串
 std::wstring JsonType(ActionType type);

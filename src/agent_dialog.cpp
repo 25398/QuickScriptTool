@@ -8,6 +8,7 @@
 #include <imm.h>
 
 #include "agent_attachment.h"
+#include "agent_conversation_store.h"
 #include "agent_core.h"
 #include "agent_reference.h"
 #include "agent_tools.h"
@@ -92,7 +93,8 @@ AgentDialog::~AgentDialog() {
 }
 
 // ── Show（非模态，可多个实例）──────────────────────────────────────
-bool AgentDialog::Show(HWND owner, const quickscript::AiApiSettings& aiSettings) {
+bool AgentDialog::Show(HWND owner, const quickscript::AiApiSettings& aiSettings,
+    const RestoreData* restore, CloseCallback onClose) {
     if (IsAlive()) {
         SetForegroundWindow(hwnd_);
         return true;
@@ -118,6 +120,19 @@ bool AgentDialog::Show(HWND owner, const quickscript::AiApiSettings& aiSettings)
     chatView_ = nullptr;
     currentAssistantMsg_.clear();
     AgentReleaseAttachmentBitmaps(attachments_);
+    onClose_ = std::move(onClose);
+    restoreData_ = {};
+    conversationId_.clear();
+    conversationName_.clear();
+    createdTime_.clear();
+    if (restore) {
+        restoreData_ = *restore;
+        conversationId_ = restore->id;
+        conversationName_ = restore->name;
+        createdTime_ = restore->createdTime;
+        if (conversationName_.empty() && !restore->messages.empty())
+            conversationName_ = SummarizeConversationName(restore->messages);
+    }
 
     static bool registered = false;
     const wchar_t* cls = L"QuickScriptAgentDialog";
@@ -273,8 +288,9 @@ LRESULT AgentDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             modelCombo_.Toggle(ModelComboRect());
             return 0;
         }
-        if (HitSend(x, y) && !thinking_) {
-            SendUserMessage();
+        if (HitSend(x, y)) {
+            if (thinking_) CancelRequest();
+            else SendUserMessage();
             return 0;
         }
         if (inputScrollVisible_ && HitInputScrollThumb(x, y)) {
@@ -558,6 +574,19 @@ void AgentDialog::Init() {
     aliveFlag_ = std::make_shared<std::atomic<bool>>(true);
     PositionControls();
     SetWelcomeMessage();
+    if (!restoreData_.messages.empty() && agent_) {
+        agent_->SetFullHistory(restoreData_.messages);
+        if (chatView_ && !restoreData_.chatDisplay.empty()) {
+            SetWindowTextW(chatView_, restoreData_.chatDisplay.c_str());
+            CHARFORMAT2W cf{};
+            cf.cbSize = sizeof(cf);
+            cf.dwMask = CFM_COLOR;
+            cf.crTextColor = kText;
+            SendMessageW(chatView_, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
+        }
+        conversationStarted_ = true;
+    }
+    outerShadow_.Attach(hwnd_);
 }
 
 void AgentDialog::ApplySelectedModelProfile() {
@@ -594,6 +623,10 @@ void AgentDialog::RebuildAgentCore() {
     cfg.model = aiSettings_.modelName;
     cfg.temperature = aiSettings_.temperature;
     cfg.maxTokens = aiSettings_.maxTokens;
+    if (cfg.maxTokens > 393216) cfg.maxTokens = 393216;
+    if (cfg.maxTokens < 1) cfg.maxTokens = 4096;
+    const int scaledTimeout = cfg.maxTokens > 0 ? cfg.maxTokens * 25 : 0;
+    cfg.recvTimeoutMs = std::max({120000, 180000, scaledTimeout});
     const std::wstring systemPrompt = BuildAgentSystemPrompt(cfg.model, cfg.apiUrl);
     const std::vector<AgentTool> tools = BuildDefaultAgentTools();
 
@@ -856,7 +889,8 @@ void AgentDialog::Paint() {
         modelCombo_.DrawField(mem, ModelComboRect(), hoverModelCombo_);
 
     const RECT sendRc = SendBtnRect();
-    StDrawGreenButton(mem, font_, sendRc, L"发送", hoverSend_ && !thinking_, !thinking_);
+  const wchar_t* sendLabel = thinking_ ? L"取消" : L"发送";
+  StDrawGreenButton(mem, font_, sendRc, sendLabel, hoverSend_, true);
 
     if (thinking_) {
         SelectObject(mem, chatFont_);
@@ -875,8 +909,32 @@ void AgentDialog::Paint() {
 }
 
 // ── Cleanup ───────────────────────────────────────────────────────
+void AgentDialog::TryExportConversation() {
+    if (!onClose_) return;
+    AgentConversationSavePayload payload;
+    if (agent_) {
+        const auto& hist = agent_->GetHistory();
+        payload.roundCount = CountConversationRounds(hist);
+        payload.shouldSave = payload.roundCount > 0;
+        if (payload.shouldSave) {
+            payload.messages = hist;
+            payload.id = conversationId_.empty() ? TimestampName() : conversationId_;
+            payload.createdTime = createdTime_.empty() ? NowText() : createdTime_;
+            payload.name = conversationName_.empty()
+                ? SummarizeConversationName(hist) : conversationName_;
+            if (chatView_) payload.chatDisplay = GetText(chatView_);
+        }
+    }
+    onClose_(std::move(payload));
+}
+
 void AgentDialog::Cleanup() {
+    TryExportConversation();
+    onClose_ = nullptr;
     if (aliveFlag_) *aliveFlag_ = false;
+    if (cancelRequested_) cancelRequested_->store(true);
+    httpAbort_.Abort();
+    if (agent_) agent_->AbortActiveHttp();
     KillTimer(hwnd_, kThinkingTimerId);
     AgentReleaseAttachmentBitmaps(attachments_);
     inputEdit_ = nullptr;
@@ -1109,7 +1167,6 @@ void AgentDialog::EndThinkingBlock() {
     statusLinePending_ = false;
     thinkingStatusStart_ = -1;
     thinkingStatusEnd_ = -1;
-    lastStatusText_.clear();
 }
 
 void AgentDialog::BeginAssistantStream() {
@@ -1166,8 +1223,10 @@ void AgentDialog::ShowThinking(bool show) {
         thinkingBlinkPhase_ = 0;
         if (IsAlive())
             SetTimer(hwnd_, kThinkingTimerId, kThinkingTimerMs, nullptr);
-    } else if (IsAlive()) {
-        KillTimer(hwnd_, kThinkingTimerId);
+    } else {
+        lastStatusText_.clear();
+        if (IsAlive())
+            KillTimer(hwnd_, kThinkingTimerId);
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
     if (inputEdit_) EnableWindow(inputEdit_, show ? FALSE : TRUE);
@@ -1176,6 +1235,8 @@ void AgentDialog::ShowThinking(bool show) {
 std::wstring AgentDialog::ThinkingStatusText() const {
     static const wchar_t* kDots[] = { L"", L".", L"..", L"..." };
     const int phase = thinkingBlinkPhase_ % 4;
+    if (!lastStatusText_.empty())
+        return lastStatusText_ + kDots[phase];
     return std::wstring(L"正在思考") + kDots[phase];
 }
 
@@ -1368,6 +1429,9 @@ void AgentDialog::SendUserMessage() {
     }
 
     ClearWelcomeIfNeeded();
+    if (createdTime_.empty()) createdTime_ = NowText();
+    if (conversationName_.empty())
+        conversationName_ = DeriveConversationTitleFromPrompt(text);
     const std::wstring displayText = BuildUserDisplayText(text);
     AddMessage(L"user", displayText);
 
@@ -1392,13 +1456,20 @@ void AgentDialog::SendUserMessage() {
 
     ShowThinking(true);
     BeginThinkingBlock();
+    cancelRequested_ = std::make_shared<std::atomic<bool>>(false);
+    httpAbort_.Clear();
+    lastStatusText_.clear();
 
     auto agentPtr = agent_;        // shared_ptr — 线程持有引用
     auto alive = aliveFlag_;       // shared_ptr — 线程持有引用
+    auto cancelFlag = cancelRequested_;
+    AiHttpAbortSlot* httpAbort = &httpAbort_;
     HWND hwnd = hwnd_;
 
-    std::thread([agentPtr, alive, hwnd, userMsg]() {
+    std::thread([agentPtr, alive, cancelFlag, httpAbort, hwnd, userMsg]() {
         AgentSendCallbacks callbacks;
+        callbacks.cancelFlag = cancelFlag.get();
+        callbacks.httpAbort = httpAbort;
         callbacks.onStatus = [hwnd, alive](const std::wstring& status) {
             if (status.empty() || !*alive) return;
             auto* p = new std::wstring(status);
@@ -1448,11 +1519,27 @@ void AgentDialog::SendUserMessage() {
     }).detach();
 }
 
+void AgentDialog::CancelRequest() {
+    if (!thinking_) return;
+    if (cancelRequested_) cancelRequested_->store(true);
+    httpAbort_.Abort();
+    if (agent_) agent_->AbortActiveHttp();
+    lastStatusText_ = L"正在取消";
+    const RECT thinkRc = ThinkingStatusRect();
+    InvalidateRect(hwnd_, &thinkRc, FALSE);
+}
+
 // ── 回调处理 ──────────────────────────────────────────────────────
 void AgentDialog::OnStatus(const std::wstring& status) {
-    if (!thinkingBlockOpen_ || status.empty()) return;
-    if (statusLinePending_ && status == lastStatusText_)
-        return;
+    if (status.empty() || !thinking_) return;
+    if (status == lastStatusText_) return;
+
+    lastStatusText_ = status;
+    const RECT thinkRc = ThinkingStatusRect();
+    InvalidateRect(hwnd_, &thinkRc, FALSE);
+
+    if (!thinkingBlockOpen_) return;
+
     const std::wstring line = status + L"\n";
     if (statusLinePending_ && thinkingStatusStart_ >= 0 && thinkingStatusEnd_ > thinkingStatusStart_) {
         SendMessageW(chatView_, EM_SETSEL, thinkingStatusStart_, thinkingStatusEnd_);
@@ -1462,17 +1549,14 @@ void AgentDialog::OnStatus(const std::wstring& status) {
         cf.crTextColor = kHint;
         SendMessageW(chatView_, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
         SendMessageW(chatView_, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(line.c_str()));
-        thinkingStatusEnd_ = GetWindowTextLengthW(chatView_);
-        lastStatusText_ = status;
+        thinkingStatusEnd_ = thinkingStatusStart_ + static_cast<int>(line.size());
         ScrollToBottom();
         return;
     }
-    thinkingHasContent_ = true;
     statusLinePending_ = true;
-    lastStatusText_ = status;
     thinkingStatusStart_ = GetWindowTextLengthW(chatView_);
     AppendStyledText(line, kHint);
-    thinkingStatusEnd_ = GetWindowTextLengthW(chatView_);
+    thinkingStatusEnd_ = thinkingStatusStart_ + static_cast<int>(line.size());
 }
 
 void AgentDialog::OnReasoning(const std::wstring& reasoning) {
@@ -1501,8 +1585,16 @@ void AgentDialog::OnAssistantResponse(const std::wstring& text) {
 }
 
 void AgentDialog::OnToolCall(const std::wstring& name, const std::wstring& /*args*/) {
-    if (!thinkingBlockOpen_) return;
-    AppendThinkingLine(L"· " + ToolSkillLabel(name));
+    const std::wstring label = ToolSkillLabel(name);
+    if (thinkingBlockOpen_) {
+        AppendThinkingLine(L"· " + label);
+        return;
+    }
+    if (thinking_) {
+        lastStatusText_ = L"调用工具: " + label;
+        const RECT thinkRc = ThinkingStatusRect();
+        InvalidateRect(hwnd_, &thinkRc, FALSE);
+    }
 }
 
 void AgentDialog::OnError(const std::wstring& error) {

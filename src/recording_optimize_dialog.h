@@ -9,8 +9,10 @@
 #include <vector>
 
 #include "config.h"
+#include "drawing.h"
 #include "script_types.h"
 #include "utils.h"
+#include "prompt_modal.h"
 
 /// 录制优化对话框 — 批量删除、等待调整、移动合并/压缩
 class RecordingOptimizeDialog {
@@ -81,7 +83,6 @@ private:
     void PaintDropPopupContent(HDC hdc);
     void DrawGreenButton(HDC hdc, const RECT& rc, const wchar_t* text, bool hover, bool enabled = true);
     void DrawOutlineButton(HDC hdc, const RECT& rc, const wchar_t* text, bool hover);
-    void DrawCheckbox(HDC hdc, const RECT& rc, bool checked);
     void DrawRadio(HDC hdc, const RECT& rc, bool checked);
     void DrawPanelCombo(HDC hdc, const RECT& rc, const wchar_t* text, bool open);
 
@@ -270,4 +271,6 @@ private:
     bool hoverQuickSelect_ = false;
     bool draggingScroll_ = false;
     int scrollDragOffset_ = 0;
+    PromptModal promptModal_;
+    WindowOuterShadow outerShadow_;
 };

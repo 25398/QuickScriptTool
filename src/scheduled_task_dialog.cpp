@@ -71,6 +71,7 @@ void ScheduledTaskDialog::Show(HWND owner, ScheduledTaskScheduler& scheduler) {
     if (!hwnd_) return;
 
     ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-定时任务");
+    outerShadow_.Attach(hwnd_);
 
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(hwnd_);
@@ -166,6 +167,7 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         ShowWindow(dropPopup_, SW_HIDE);
 
         timePicker_.Attach(hwnd_);
+        promptModal_.Bind(hwnd_, listFont_);
         return 0;
     }
     // ── Edit control background ───────────────────────────────
@@ -198,6 +200,7 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     // ── Size (create view popup management) ───────────────────
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED && view_ == View::Create) CloseAllPopups();
+        promptModal_.OnOwnerResize();
         return DefWindowProcW(hwnd_, msg, wp, lp);
     // ── Move / position changed (create view popups) ──────────
     case WM_MOVE:
@@ -222,6 +225,7 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     // ── Mouse wheel (list view scroll) ────────────────────────
     case WM_MOUSEWHEEL:
+        if (promptModal_.visible()) return 0;
         if (view_ == View::List) {
             const auto& tasks = scheduler_->Tasks();
             const RECT table = TableRect();
@@ -235,6 +239,7 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
+        if (promptModal_.visible()) return 0;
         if (view_ == View::List) {
             const bool hc = StPtIn(CloseRect(), x, y);
             const bool hCreate = StPtIn(CreateBtnRect(), x, y);
@@ -273,6 +278,7 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
+        if (promptModal_.visible()) return 0;
         if (view_ == View::List) {
             if (StPtIn(CloseRect(), x, y)) {
                 PostMessageW(hwnd_, WM_CLOSE, 0, 0);
@@ -1059,7 +1065,8 @@ bool ScheduledTaskDialog::ValidateAndCollect() {
 }
 
 void ScheduledTaskDialog::ShowAlert(const wchar_t* msg) {
-    MessageBoxW(hwnd_, msg, L"定时任务", MB_OK | MB_ICONINFORMATION);
+    CloseAllPopups();
+    promptModal_.ShowInfo(msg ? msg : L"");
 }
 
 bool ScheduledTaskDialog::HitClose(int x, int y) const {

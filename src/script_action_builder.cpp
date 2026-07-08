@@ -1,5 +1,6 @@
 #include "script_action_builder.h"
 
+#include "action_tree.h"
 #include "action_utils.h"
 #include "agent_ai_actions.h"
 #include "ai_action_router.h"
@@ -86,6 +87,7 @@ bool ParseActionType(const std::wstring& type, ActionType& out) {
         {L"lockScreenshot", ActionType::LockScreenshot},
         {L"unlockScreenshot", ActionType::UnlockScreenshot},
         {L"stopMacro", ActionType::StopMacro},
+        {L"goto", ActionType::Goto},
         {L"runProgram", ActionType::RunProgram},
         {L"closeProgram", ActionType::CloseProgram},
         {L"openWebpage", ActionType::OpenWebpage},
@@ -182,7 +184,7 @@ void ApplyAiCommonFields(ScriptAction& action, const json& p) {
     }
     action.aiOutputType = std::clamp(JsonInt(p, "aiOutputType", 0), 0, 1);
     action.aiModelName = JsonWString(p, "aiModelName");
-    action.aiContextMode = std::clamp(JsonInt(p, "aiContextMode", 0), 0, 3);
+    action.aiContextMode = std::clamp(JsonInt(p, "aiContextMode", 1), 0, 3);
     action.aiTimeoutSec = std::max(5, JsonInt(p, "aiTimeoutSec", 30));
     action.aiFallbackValue = Trim(JsonWString(p, "aiFallbackValue"));
     action.aiImageScale = std::clamp(JsonDouble(p, "aiImageScale", 0.5), 0.1, 1.0);
@@ -212,11 +214,21 @@ bool ValidateVarName(const std::wstring& name, const wchar_t* label, std::wstrin
 }
 
 void ApplyCommonFields(ScriptAction& action, const json& p) {
-    action.customText = JsonWString(p, "text");
-    if (action.customText.empty()) action.customText = JsonWString(p, "customText");
     action.remark = JsonWString(p, "remark");
-    action.originalNo = std::max(1, JsonInt(p, "no", 1));
     action.indent = std::max(0, JsonInt(p, "indent", 0));
+    if (action.type == ActionType::CustomText) {
+        action.customText = JsonWString(p, "text");
+        if (action.customText.empty()) action.customText = JsonWString(p, "customText");
+    }
+}
+
+void SanitizeScriptActionDisplay(ScriptAction& action) {
+    if (action.type == ActionType::CustomText) return;
+    if (action.type == ActionType::EndLoop) {
+        action.customText = L"跳出循环";
+        return;
+    }
+    action.customText.clear();
 }
 
 ScriptActionBuildResult Fail(const std::wstring& msg) {
@@ -348,9 +360,10 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         action.matchVarName = Trim(JsonWString(p, "matchVarName", L"matchRet"));
         if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
         if (action.findImageFollowUp == 2) {
-            action.findUntilFound = false;
+            action.findTimeExpr = L"0";
         } else {
-            action.findUntilFound = JsonBool(p, "findUntilFound");
+            action.findTimeExpr = JsonWString(p, "findTimeExpr", L"0");
+            if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
         }
         break;
     }
@@ -430,6 +443,12 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
     case ActionType::StopMacro:
         break;
 
+    case ActionType::Goto:
+        action.gotoStepExpr = Trim(JsonWString(p, "gotoStepExpr"));
+        if (action.gotoStepExpr.empty())
+            action.gotoStepExpr = Trim(JsonWString(p, "targetStep"));
+        break;
+
     case ActionType::AiTextAnalysis:
     case ActionType::AiImageAnalysis:
         ApplyAiCommonFields(action, p);
@@ -457,6 +476,8 @@ ScriptActionBuildResult BuildScriptActionFromJson(const json& params) {
     ActionType type{};
     if (!ParseActionType(typeStr, type))
         return Fail(L"未知动作类型：" + typeStr);
+    if (type == ActionType::CustomText)
+        return Fail(L"禁止使用 customText。说明写 remark；须用 wait、goto、mouseClick、stopMacro 等可执行动作。");
 
     auto result = BuildTypedAction(type, params);
     if (!result.ok) return result;
@@ -516,20 +537,33 @@ std::wstring BuildScriptActionsJsonArray(const std::vector<json>& actionParams,
         return L"";
     }
 
-    std::wstring out = L"[\n";
+    std::vector<ScriptAction> built;
+    built.reserve(actionParams.size());
     for (size_t i = 0; i < actionParams.size(); ++i) {
-        auto built = BuildScriptActionFromJson(actionParams[i]);
-        if (!built.ok) {
-            error = L"第 " + std::to_wstring(i + 1) + L" 个动作构建失败：" + built.error;
+        auto result = BuildScriptActionFromJson(actionParams[i]);
+        if (!result.ok) {
+            error = L"第 " + std::to_wstring(i + 1) + L" 个动作构建失败：" + result.error;
             return L"";
         }
-        if (built.action.originalNo <= 0)
-            built.action.originalNo = static_cast<int>(i + 1);
-        out += ScriptActionToJsonString(built.action);
-        if (i + 1 < actionParams.size()) out += L",";
+        SanitizeScriptActionDisplay(result.action);
+        built.push_back(std::move(result.action));
+    }
+    const bool addedStopMacro = EnsureStopMacroOnActions(built);
+    NormalizeScriptActionList(built);
+    if (const std::wstring endLoopErr = ValidateEndLoopPlacements(built); !endLoopErr.empty()) {
+        error = endLoopErr;
+        return L"";
+    }
+
+    std::wstring out = L"[\n";
+    for (size_t i = 0; i < built.size(); ++i) {
+        out += ScriptActionToJsonString(built[i]);
+        if (i + 1 < built.size()) out += L",";
         out += L"\n";
     }
     out += L"]";
+    if (addedStopMacro)
+        out += L"\n[提示] 已自动在末尾追加 stopMacro（结束宏运行），避免脚本无限重复执行。";
     return out;
 }
 
@@ -538,10 +572,9 @@ std::wstring ScriptActionBuilderSchema() {
 
 通用字段（每个动作可选）：
   type      动作类型（必填）
-  no        序号，默认按数组顺序 1,2,3…
   indent    缩进层级，默认 0；if/loop 子动作 = 父级+1
-  remark    备注
-  text      自定义显示名
+  remark    备注（步骤说明、待确认提示写这里，禁止用 text 改动作名）
+  no / text 由工具自动分配，不要手写
 
 followUp 语义别名（findImage / textRecognition）：
   "click"=点击(0)  "move"=移动(1)  "saveVar"=保存变量(2)
@@ -560,16 +593,17 @@ scrollWheel:    scrollVertical, scrollHorizontal, scrollDirection(0|1|"up"|"down
 
 ── 流程 ──
 loop:           loopCount(-1=无限), loopFromVar, loopVarExpr, loopVarName
-endLoop:        （无额外字段，自动生成「跳出循环」）
+endLoop:        （无额外字段，自动生成「跳出循环」；indent 必须为 loop 子节点，即 loop.indent+1）
 defineBlock:    blockName
 runBlock:       blockName
 if:             conditionExpr
 else:           （无额外字段）
+goto:           gotoStepExpr（目标序号；跳入循环体=第1次迭代从目标执行，循环内互跳保持同次迭代）
 
 ── 识别 ──
 findImage:      imagePath, matchThreshold, searchFullScreen, searchX1~Y2,
                 followUp/saveVar→findImageFollowUp=2, matchVarName,
-                offsetX/Y, findUntilFound, imageScaleMin/Max
+                offsetX/Y, findTimeExpr, imageScaleMin/Max
                 变量: {name}.x/.y 左上角, {name}.cx/.cy 中心点, {name}.x1/.y1 右下角
 textRecognition: ocrResultMode(0文字/1查找), ocrFollowUp/followUp,
                 matchVarName, ocrSearchText, ocrRegionByImage, ocrDigitsOnly,
@@ -583,7 +617,8 @@ openFile:       targetPath
 timerRecordTime: loopVarName 或 timerVarName
 runMacro:       blockName, targetPath
 mousePlayback:  blockName, targetPath, clickCount, duration
-lockScreenshot / unlockScreenshot / stopMacro / customText
+lockScreenshot / unlockScreenshot / stopMacro
+  ★ 禁止 customText（说明写 remark，勿伪造动作名）
 
 ── AI ──
 getCursorPos:   matchVarName（默认 cursor；引用 {name}.x / {name}.y 为屏幕坐标）
@@ -596,7 +631,8 @@ aiActionExecute: aiPrompt(必填任务描述), aiModelName, aiWithImage(1=带截
                  aiMaxSteps(默认10,-1=不限), aiTimeoutSec, aiConfirmExecute(1=执行前确认),
                  aiContextMode, aiFallbackValue
 
-aiContextMode：0=每次独立请求；1=宏级共享上下文；2=循环级；3=块级。
+aiContextMode：0=每次独立请求；1=宏级（可见全部下级对话）；2=循环级（可见嵌套子循环对话）；3=块级。
+层级规则：循环上下文按嵌套深度分槽；子循环每轮结束后合并到父循环；宏上下文自动同步所有非「无上下文」对话。
 aiModelName 留空时使用软件「设置→AI助手」中的默认模型。
 后续 quickInput / if 等可引用 {aiResult}、{aiImgResult} 等输出变量。
 
@@ -606,10 +642,10 @@ modifiers 示例: ["ctrl","shift"] 或 holdLeftCtrl 等 0/1
 
 std::wstring ScriptActionCatalog() {
     return LR"(【宏动作目录 — 参数细节用 lookupMacroAction 查询】
-通用可选字段：type(必填), remark, no, indent, text
+通用可选字段：type(必填), remark, indent（no/text 由工具自动生成）
 鼠标: moveMouse, mouseClick, mouseDown, mouseUp, scrollWheel
 键盘: keyClick, keyDown, keyUp, hotkeyShortcut, quickInput
-流程: loop, endLoop, if, else, defineBlock, runBlock, stopMacro
+流程: loop, endLoop, if, else, defineBlock, runBlock, stopMacro, goto
 识别: findImage(找图点击), textRecognition(OCR)
 系统: runProgram, closeProgram, openWebpage, openFile, lockScreenshot, unlockScreenshot
 其它: runMacro, mousePlayback, timerRecordTime, getCursorPos, customText
@@ -661,7 +697,7 @@ std::wstring SchemaTypeDetail(const std::wstring& typeName) {
         pos = lineEnd + 1;
     }
     if (!found) return L"";
-    out << L"\n通用可选: remark, no, indent, text\n";
+    out << L"\n通用可选: remark, indent（序号与显示名由工具自动生成）\n";
     out << L"followUp: click|move|saveVar（findImage/textRecognition 适用）\n";
     return out.str();
 }
@@ -705,7 +741,7 @@ std::wstring LookupMacroActionSchema(const std::wstring& typeOrSection) {
     static const wchar_t* kTypes[] = {
         L"wait", L"moveMouse", L"mouseClick", L"mouseDown", L"mouseUp",
         L"keyClick", L"keyDown", L"keyUp", L"hotkeyShortcut", L"quickInput", L"scrollWheel",
-        L"loop", L"endLoop", L"defineBlock", L"runBlock", L"if", L"else",
+        L"loop", L"endLoop", L"defineBlock", L"runBlock", L"if", L"else", L"goto",
         L"findImage", L"textRecognition",
         L"lockScreenshot", L"unlockScreenshot", L"stopMacro", L"customText",
         L"runProgram", L"closeProgram", L"openWebpage", L"openFile",
@@ -724,4 +760,44 @@ std::wstring LookupMacroActionSchema(const std::wstring& typeOrSection) {
         L"type 示例: keyClick, findImage, wait\n"
         L"section 示例: mouse, keyboard, flow, findImage, ocr, system, ai, all\n\n"
         + ScriptActionCatalog();
+}
+
+void NormalizeScriptActionList(std::vector<ScriptAction>& actions) {
+    for (size_t i = 0; i < actions.size(); ++i) {
+        actions[i].originalNo = static_cast<int>(i + 1);
+        if (actions[i].type == ActionType::CustomText) continue;
+        if (actions[i].type == ActionType::EndLoop) {
+            actions[i].customText = L"跳出循环";
+            continue;
+        }
+        actions[i].customText.clear();
+    }
+}
+
+namespace {
+
+bool HasStopMacro(const std::vector<ScriptAction>& actions) {
+    for (const auto& a : actions) {
+        if (a.type == ActionType::StopMacro) return true;
+    }
+    return false;
+}
+
+bool HasTopLevelInfiniteLoop(const std::vector<ScriptAction>& actions) {
+    for (const auto& a : actions) {
+        if (a.indent == 0 && a.type == ActionType::Loop && a.loopCount < 0 && !a.loopFromVar)
+            return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool EnsureStopMacroOnActions(std::vector<ScriptAction>& actions) {
+    if (actions.empty() || HasStopMacro(actions) || HasTopLevelInfiniteLoop(actions))
+        return false;
+    ScriptAction stop{};
+    stop.type = ActionType::StopMacro;
+    actions.push_back(stop);
+    return true;
 }

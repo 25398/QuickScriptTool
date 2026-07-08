@@ -240,6 +240,7 @@ quickscript::AiModelProfile SettingsDialog::ReadAiProfileFromControls() const {
     profile.modelName = GetText(editModelName_);
     profile.temperature = ToDouble(editTemperature_, 0.3);
     profile.maxTokens = ToInt(editMaxTokens_, 4096);
+    profile.maxTokens = std::clamp(profile.maxTokens, 1, 393216);
     return profile;
 }
 
@@ -278,11 +279,11 @@ void SettingsDialog::AddCurrentAiProfile() {
     SyncSettingsFromControls();
     const auto profile = ReadAiProfileFromControls();
     if (Trim(profile.modelName).empty()) {
-        MessageBoxW(hwnd_, L"请先填写模型名称。", L"添加模型", MB_OK | MB_ICONINFORMATION);
+        ShowPromptAlert(L"请先填写模型名称。");
         return;
     }
     if (Trim(profile.apiUrl).empty() || Trim(profile.apiKey).empty()) {
-        MessageBoxW(hwnd_, L"请先填写 API 地址和 API 密钥。", L"添加模型", MB_OK | MB_ICONINFORMATION);
+        ShowPromptAlert(L"请先填写 API 地址和 API 密钥。");
         return;
     }
     auto& models = working_.ai.savedModels;
@@ -304,7 +305,7 @@ void SettingsDialog::AddCurrentAiProfile() {
 void SettingsDialog::DeleteSelectedAiProfile() {
     const int sel = aiModelCombo_.SelectedIndex();
     if (sel < 0 || sel >= static_cast<int>(working_.ai.savedModels.size())) {
-        MessageBoxW(hwnd_, L"请先在模型列表中选择要删除的模型。", L"删除模型", MB_OK | MB_ICONINFORMATION);
+        ShowPromptAlert(L"请先在模型列表中选择要删除的模型。");
         return;
     }
     aiModelCombo_.Close();
@@ -433,6 +434,7 @@ bool SettingsDialog::Show(HWND owner, quickscript::AppSettings& settings) {
 
     g_activeSettingsDialogHwnd = hwnd_;
     ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-设置");
+    outerShadow_.Attach(hwnd_);
 
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(hwnd_);
@@ -559,6 +561,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         SyncControlsFromSettings();
         RefreshAiModelCombo();
         UpdateControlVisibility();
+        promptModal_.Bind(hwnd_, bodyFont_);
         return 0;
     }
     case WM_CTLCOLOREDIT: {
@@ -596,11 +599,12 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
+        if (promptModal_.visible()) return 0;
         if (HitClose(x, y)) { aiModelCombo_.Close(); done_ = true; DestroyWindow(hwnd_); return 0; }
         if (PtIn(RestoreLinkRect(), x, y)) { RestoreDefaults(); InvalidateRect(hwnd_, nullptr, FALSE); return 0; }
         if (PtIn(SaveBtnRect(), x, y)) { SaveAndClose(); return 0; }
         if (activeTab_ == Tab::About && PtIn(CheckUpgradeBtnRect(), x, y)) {
-            MessageBoxW(hwnd_, L"当前已是最新版本。", L"检查升级", MB_OK | MB_ICONINFORMATION);
+            ShowPromptAlert(L"当前已是最新版本。");
             return 0;
         }
         for (int t = 0; t < 5; ++t) {
@@ -677,6 +681,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
+        if (promptModal_.visible()) return 0;
         bool needRedraw = false;
         if (HitClose(x, y) != hoverClose_) { hoverClose_ = HitClose(x, y); needRedraw = true; }
         if (PtIn(RestoreLinkRect(), x, y) != hoverRestore_) { hoverRestore_ = PtIn(RestoreLinkRect(), x, y); needRedraw = true; }
@@ -796,6 +801,7 @@ void SettingsDialog::SyncSettingsFromControls() {
     working_.ai.modelName = GetText(editModelName_);
     working_.ai.temperature = ToDouble(editTemperature_, 0.3);
     working_.ai.maxTokens = ToInt(editMaxTokens_, 4096);
+    working_.ai.maxTokens = std::clamp(working_.ai.maxTokens, 1, 393216);
 }
 
 void SettingsDialog::UpdateControlVisibility() {
@@ -1124,4 +1130,9 @@ void SettingsDialog::Paint() {
     DeleteObject(bmp);
     DeleteDC(mem);
     EndPaint(hwnd_, &ps);
+}
+
+void SettingsDialog::ShowPromptAlert(const std::wstring& message) {
+    aiModelCombo_.Close();
+    promptModal_.ShowInfo(message);
 }

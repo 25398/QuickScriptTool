@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "scheduled_task_types.h"
+#include "drawing.h"
 
 class ScheduledDateTimePicker {
 public:
@@ -69,4 +70,5 @@ private:
     int hoverRow_ = -1;
     bool accepted_ = false;
     HFONT bodyFont_ = nullptr;
+    WindowOuterShadow outerShadow_;
 };

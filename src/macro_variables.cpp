@@ -260,6 +260,16 @@ std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableC
     return ResolveMacroOperandImpl(token, ctx, false);
 }
 
+double ResolveFindImageTimeSec(const std::wstring& expr, const MacroVariableContext& ctx) {
+    const std::wstring trimmed = TrimToken(expr);
+    if (trimmed.empty()) return 0.0;
+    double direct = 0.0;
+    if (TryParseDouble(trimmed, direct)) return direct;
+    const std::wstring resolved = ResolveMacroOperand(trimmed, ctx);
+    if (TryParseDouble(resolved, direct)) return direct;
+    return 0.0;
+}
+
 namespace {
 
 int CompareResolvedValues(const std::wstring& left, const std::wstring& right) {
@@ -374,6 +384,12 @@ int ResolveLoopMaxCount(const ScriptAction& action, const MacroVariableContext& 
         if (maxLoop < 0) maxLoop = 0;
     }
     return maxLoop;
+}
+
+bool TryResolveGotoStepNo(const std::wstring& expr, const MacroVariableContext& ctx, int& out) {
+    const std::wstring trimmed = TrimToken(expr);
+    if (trimmed.empty()) return false;
+    return TryResolveIntOperand(trimmed, ctx, out) && out > 0;
 }
 
 std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptAction>& actions) {

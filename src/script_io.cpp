@@ -33,6 +33,7 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     else if (type == L"lockScreenshot") a.type = ActionType::LockScreenshot;
     else if (type == L"unlockScreenshot") a.type = ActionType::UnlockScreenshot;
     else if (type == L"stopMacro") a.type = ActionType::StopMacro;
+    else if (type == L"goto") a.type = ActionType::Goto;
     else if (type == L"runProgram") a.type = ActionType::RunProgram;
     else if (type == L"closeProgram") a.type = ActionType::CloseProgram;
     else if (type == L"openWebpage") a.type = ActionType::OpenWebpage;
@@ -103,6 +104,8 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
     a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
     a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
+    a.findTimeExpr = ExtractString(block, L"findTimeExpr");
+    if (a.findTimeExpr.empty()) a.findTimeExpr = L"0";
     a.matchVarName = ExtractString(block, L"matchVarName");
     if (a.matchVarName.empty()) {
         a.matchVarName = a.type == ActionType::TextRecognition ? L"a" : L"matchRet";
@@ -113,13 +116,14 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.ocrSearchText = ExtractString(block, L"ocrSearchText");
     a.ocrFollowUp = static_cast<int>(ExtractNumber(block, L"ocrFollowUp", 0));
     a.conditionExpr = ExtractString(block, L"conditionExpr");
+    a.gotoStepExpr = ExtractString(block, L"gotoStepExpr");
     a.matchFileNameOnly = ExtractNumber(block, L"matchFileNameOnly", 0) != 0;
     // ── AI 动作字段 ──
     a.aiPrompt = ExtractString(block, L"aiPrompt");
     a.aiOutputVarName = ExtractString(block, L"aiOutputVarName");
     a.aiOutputType = static_cast<int>(ExtractNumber(block, L"aiOutputType", 0));
     a.aiModelName = ExtractString(block, L"aiModelName");
-    a.aiContextMode = static_cast<int>(ExtractNumber(block, L"aiContextMode", 0));
+    a.aiContextMode = static_cast<int>(ExtractNumber(block, L"aiContextMode", 1));
     a.aiTimeoutSec = static_cast<int>(ExtractNumber(block, L"aiTimeoutSec", 30));
     a.aiImageScale = ExtractNumber(block, L"aiImageScale", 0.5);
     a.aiRegionByImage = ExtractNumber(block, L"aiRegionByImage", 0) != 0;
@@ -201,6 +205,7 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"offsetX\": " << a.offsetX << L",\n";
     file << L"      \"offsetY\": " << a.offsetY << L",\n";
     file << L"      \"findUntilFound\": " << (a.findUntilFound ? 1 : 0) << L",\n";
+    file << L"      \"findTimeExpr\": \"" << EscapeJson(a.findTimeExpr) << L"\",\n";
     file << L"      \"matchVarName\": \"" << EscapeJson(a.matchVarName) << L"\",\n";
     file << L"      \"ocrResultMode\": " << a.ocrResultMode << L",\n";
     file << L"      \"ocrRegionByImage\": " << (a.ocrRegionByImage ? 1 : 0) << L",\n";
@@ -208,6 +213,7 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"ocrSearchText\": \"" << EscapeJson(a.ocrSearchText) << L"\",\n";
     file << L"      \"ocrFollowUp\": " << a.ocrFollowUp << L",\n";
     file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\",\n";
+    file << L"      \"gotoStepExpr\": \"" << EscapeJson(a.gotoStepExpr) << L"\",\n";
     file << L"      \"matchFileNameOnly\": " << (a.matchFileNameOnly ? 1 : 0) << L",\n";
     // ── AI 动作字段 ──
     file << L"      \"aiPrompt\": \"" << EscapeJson(a.aiPrompt) << L"\",\n";
@@ -247,6 +253,24 @@ ScriptFileData LoadScriptFileData(const std::wstring& path) {
     ScriptFileData data{};
     if (path.empty()) return data;
     const auto content = ReadAll(path);
+    data.scriptName = ExtractString(content, L"scriptName");
+    data.recordTime = ExtractString(content, L"recordTime");
+    data.durationSeconds = ExtractNumber(content, L"durationSeconds", 0);
+    data.hotkey.text = ExtractString(content, L"hotkeyText");
+    data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
+    data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+    data.hotkey.enabled = data.hotkey.vk != 0;
+    const auto blocks = ExtractJsonActionBlocks(content);
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        const auto type = ExtractString(blocks[i], L"type");
+        if (!type.empty()) data.actions.push_back(ParseScriptActionBlock(blocks[i], i));
+    }
+    return data;
+}
+
+ScriptFileData ParseScriptContent(const std::wstring& content) {
+    ScriptFileData data{};
+    if (content.empty()) return data;
     data.scriptName = ExtractString(content, L"scriptName");
     data.recordTime = ExtractString(content, L"recordTime");
     data.durationSeconds = ExtractNumber(content, L"durationSeconds", 0);

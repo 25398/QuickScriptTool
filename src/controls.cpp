@@ -2,6 +2,10 @@
 #include "controls.h"
 #include "modern_edit.h"
 
+#include <uxtheme.h>
+
+#pragma comment(lib, "uxtheme.lib")
+
 HINSTANCE GetThisModule() {
     return GetModuleHandleW(nullptr);
 }
@@ -77,7 +81,7 @@ HWND MakeGreenButton(HWND parent, const wchar_t* text, int id,
 HWND MakeGrayButton(HWND parent, const wchar_t* text, int id,
                     int x, int y, int w, int h) {
     return CreateWindowExW(0, L"BUTTON", text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         x, y, w, h, parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         GetThisModule(), nullptr);
@@ -92,13 +96,37 @@ HWND MakeCaptureField(HWND parent, const wchar_t* text, int id,
         GetThisModule(), nullptr);
 }
 
+void MarkParamCheckbox(HWND hwnd) {
+    if (hwnd) SetPropW(hwnd, kParamCheckboxProp, reinterpret_cast<HANDLE>(1));
+}
+
+bool IsMarkedParamCheckbox(HWND hwnd) {
+    return hwnd && GetPropW(hwnd, kParamCheckboxProp) != nullptr;
+}
+
+bool IsParamCheckboxChecked(HWND hwnd) {
+    return hwnd && GetPropW(hwnd, kParamCheckboxCheckedProp) != nullptr;
+}
+
+void SetParamCheckboxChecked(HWND hwnd, bool checked) {
+    if (!hwnd) return;
+    if (checked) SetPropW(hwnd, kParamCheckboxCheckedProp, reinterpret_cast<HANDLE>(1));
+    else RemovePropW(hwnd, kParamCheckboxCheckedProp);
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+}
+
 HWND MakeCheckBox(HWND parent, const wchar_t* text, int id,
                   int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"BUTTON", text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+    HWND hwnd = CreateWindowExW(0, L"BUTTON", text,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | BS_AUTOCHECKBOX,
         x, y, w, h, parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         GetThisModule(), nullptr);
+    if (hwnd) {
+        SetWindowTheme(hwnd, L"", L"");
+        MarkParamCheckbox(hwnd);
+    }
+    return hwnd;
 }
 
 void ApplyFont(HWND parent, HFONT font) {

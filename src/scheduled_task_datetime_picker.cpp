@@ -78,6 +78,7 @@ void ScheduledDateTimePicker::EnsureWindow() {
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
     }
+    if (hwnd_) outerShadow_.Attach(hwnd_);
     ShowWindow(hwnd_, SW_HIDE);
 }
 

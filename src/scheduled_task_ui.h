@@ -36,18 +36,7 @@ inline void StDrawRadio(HDC hdc, const RECT& rc, bool checked) {
 }
 
 inline void StDrawCheckbox(HDC hdc, const RECT& rc, bool checked) {
-    DrawBorderRect(hdc, rc, kComboBorderGray);
-    if (checked) {
-        const int w = rc.right - rc.left;
-        const int h = rc.bottom - rc.top;
-        HPEN pen = CreatePen(PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, 2, kMainGreen);
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        MoveToEx(hdc, rc.left + w / 5, rc.top + h / 2, nullptr);
-        LineTo(hdc, rc.left + 2 * w / 5, rc.bottom - h / 5);
-        LineTo(hdc, rc.right - w / 6, rc.top + h / 5);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
-    }
+    DrawCheckbox(hdc, rc, checked);
 }
 
 inline void StDrawPanelCombo(HDC hdc, HFONT font, const RECT& rc, const wchar_t* text, bool open) {

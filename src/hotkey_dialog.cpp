@@ -143,6 +143,7 @@ void HotkeyCapture::OnCreate() {
     };
     font_ = mkFont(22, FW_NORMAL);
     valueFont_ = mkFont(28, FW_NORMAL);
+    outerShadow_.Attach(hwnd_);
 }
 
 void HotkeyCapture::CleanupGdi() {

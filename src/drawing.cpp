@@ -2,9 +2,11 @@
 #include "drawing.h"
 
 #include <windowsx.h>
+#include <commctrl.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 void DrawCrosshairGlyph(HDC hdc, int cx, int cy, int size,
@@ -105,6 +107,9 @@ HCURSOR CreateCrosshairDragCursor(COLORREF crosshairColor) {
 
 namespace {
 
+constexpr UINT_PTR kWindowOuterShadowSubclassId = 0x5153;
+constexpr wchar_t kOuterShadowClass[] = L"QuickScriptOuterShadow";
+
 int DistToContentRect(int x, int y, int contentW, int contentH, int margin) {
     const int cx = x - margin;
     const int cy = y - margin;
@@ -118,6 +123,316 @@ int DistToContentRect(int x, int y, int contentW, int contentH, int margin) {
 }
 
 }  // namespace
+
+namespace {
+
+struct PointerCursorCache {
+    HBITMAP bmp = nullptr;
+    int size = 0;
+    int drawW = 0;
+    int drawH = 0;
+    int anchorX = 0;
+    int anchorY = 0;
+
+    void Clear() {
+        if (bmp) {
+            DeleteObject(bmp);
+            bmp = nullptr;
+        }
+        size = 0;
+        drawW = drawH = anchorX = anchorY = 0;
+    }
+};
+
+PointerCursorCache g_pointerCursor;
+
+bool EnsurePointerCursorBitmap(int size, COLORREF color) {
+    if (size <= 0) return false;
+    static COLORREF cachedColor = 0xFFFFFFFF;
+    if (g_pointerCursor.bmp && g_pointerCursor.size == size && cachedColor == color) return true;
+
+    g_pointerCursor.Clear();
+    cachedColor = color;
+
+    HCURSOR cur = LoadCursorW(nullptr, IDC_ARROW);
+    if (!cur) return false;
+
+    ICONINFO ii{};
+    if (!GetIconInfo(cur, &ii) || !ii.hbmMask) return false;
+
+    BITMAP bm{};
+    GetObject(ii.hbmMask, sizeof(bm), &bm);
+    const int srcW = bm.bmWidth;
+    const int srcH = bm.bmHeight / 2;
+    if (srcW <= 0 || srcH <= 0) {
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        DeleteObject(ii.hbmMask);
+        return false;
+    }
+
+    HDC screen = GetDC(nullptr);
+    HDC maskDc = CreateCompatibleDC(screen);
+    HGDIOBJ oldMaskBmp = SelectObject(maskDc, ii.hbmMask);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = srcW;
+    bmi.bmiHeader.biHeight = -srcH * 2;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    std::vector<BYTE> maskPx(static_cast<size_t>(srcW) * srcH * 2 * 4);
+    if (!GetDIBits(maskDc, ii.hbmMask, 0, srcH * 2, maskPx.data(), &bmi, DIB_RGB_COLORS)) {
+        SelectObject(maskDc, oldMaskBmp);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        DeleteObject(ii.hbmMask);
+        DeleteDC(maskDc);
+        ReleaseDC(nullptr, screen);
+        return false;
+    }
+
+    SelectObject(maskDc, oldMaskBmp);
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    DeleteObject(ii.hbmMask);
+    DeleteDC(maskDc);
+
+    const BYTE fr = GetRValue(color);
+    const BYTE fg = GetGValue(color);
+    const BYTE fb = GetBValue(color);
+
+    auto maskLum = [](const BYTE* px) {
+        return (px[2] * 299 + px[1] * 587 + px[0] * 114) / 1000;
+    };
+
+    int minX = srcW, minY = srcH, maxX = -1, maxY = -1;
+    std::vector<uint8_t> opaque(static_cast<size_t>(srcW) * srcH, 0);
+    for (int y = 0; y < srcH; ++y) {
+        for (int x = 0; x < srcW; ++x) {
+            const size_t andIdx = (static_cast<size_t>(y) * srcW + x) * 4;
+            if (maskLum(maskPx.data() + andIdx) >= 128) continue;
+            opaque[static_cast<size_t>(y) * srcW + x] = 1;
+            minX = std::min(minX, x);
+            minY = std::min(minY, y);
+            maxX = std::max(maxX, x);
+            maxY = std::max(maxY, y);
+        }
+    }
+
+    if (maxX < minX || maxY < minY) {
+        ReleaseDC(nullptr, screen);
+        return false;
+    }
+
+    const int cropW = maxX - minX + 1;
+    const int cropH = maxY - minY + 1;
+    const int margin = 1;
+    const int avail = std::max(1, size - margin * 2);
+    const double scale = std::min(static_cast<double>(avail) / cropW,
+        static_cast<double>(avail) / cropH);
+    const int drawW = std::max(1, static_cast<int>(cropW * scale + 0.5));
+    const int drawH = std::max(1, static_cast<int>(cropH * scale + 0.5));
+    const int dstX = (size - drawW) / 2;
+    const int dstY = (size - drawH) / 2;
+
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
+    void* outBits = nullptr;
+    HBITMAP outBmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &outBits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!outBmp || !outBits) return false;
+
+    auto* px = static_cast<uint32_t*>(outBits);
+    std::fill_n(px, static_cast<size_t>(size) * size, 0u);
+    const uint32_t fill = (static_cast<uint32_t>(0xFF) << 24)
+        | (static_cast<uint32_t>(fr) << 16)
+        | (static_cast<uint32_t>(fg) << 8)
+        | static_cast<uint32_t>(fb);
+
+    for (int dy = 0; dy < drawH; ++dy) {
+        const int sy = minY + static_cast<int>(dy / scale);
+        for (int dx = 0; dx < drawW; ++dx) {
+            const int sx = minX + static_cast<int>(dx / scale);
+            if (!opaque[static_cast<size_t>(sy) * srcW + sx]) continue;
+            px[(dstY + dy) * size + (dstX + dx)] = fill;
+        }
+    }
+
+    g_pointerCursor.bmp = outBmp;
+    g_pointerCursor.size = size;
+    g_pointerCursor.drawW = size;
+    g_pointerCursor.drawH = size;
+    g_pointerCursor.anchorX = 0;
+    g_pointerCursor.anchorY = 0;
+    return true;
+}
+
+}  // namespace
+
+void DrawPointerCursorGlyph(HDC hdc, int cx, int cy, int size, COLORREF color) {
+    if (!hdc || size <= 0) return;
+    if (!EnsurePointerCursorBitmap(size, color) || !g_pointerCursor.bmp) return;
+
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HGDIOBJ old = SelectObject(mem, g_pointerCursor.bmp);
+
+    const int w = g_pointerCursor.drawW > 0 ? g_pointerCursor.drawW : size;
+    const int h = g_pointerCursor.drawH > 0 ? g_pointerCursor.drawH : size;
+    const int x = cx - w / 2;
+    const int y = cy - h / 2 + 1;
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = 255;
+    bf.AlphaFormat = AC_SRC_ALPHA;
+    GdiAlphaBlend(hdc, x, y, w, h, mem,
+        g_pointerCursor.anchorX, g_pointerCursor.anchorY, w, h, bf);
+
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
+WindowOuterShadow::~WindowOuterShadow() {
+    Detach();
+    if (shadow_) {
+        DestroyWindow(shadow_);
+        shadow_ = nullptr;
+    }
+}
+
+bool WindowOuterShadow::EnsureShadowClass() {
+    static bool registered = false;
+    if (registered) return true;
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kOuterShadowClass;
+    registered = RegisterClassW(&wc) != 0;
+    return registered;
+}
+
+bool WindowOuterShadow::EnsureShadowWindow() {
+    if (shadow_ && IsWindow(shadow_)) return true;
+    if (!EnsureShadowClass()) return false;
+    shadow_ = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kOuterShadowClass, L"", WS_POPUP,
+        0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    return shadow_ != nullptr;
+}
+
+bool WindowOuterShadow::Render(int contentW, int contentH) {
+    if (!shadow_ || !owner_ || contentW <= 0 || contentH <= 0) return false;
+    const int m = kWindowEdgeShadowSize;
+    const int outerW = contentW + 2 * m;
+    const int outerH = contentH + 2 * m;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = outerW;
+    bmi.bmiHeader.biHeight = -outerH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* outerBits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    HBITMAP outerBmp = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &outerBits, nullptr, 0);
+    if (!outerBmp || !outerBits) {
+        ReleaseDC(nullptr, screenDc);
+        return false;
+    }
+
+    auto* px = static_cast<uint32_t*>(outerBits);
+    const int total = outerW * outerH;
+    for (int i = 0; i < total; ++i) px[i] = 0;
+
+    for (int y = 0; y < outerH; ++y) {
+        for (int x = 0; x < outerW; ++x) {
+            const int dist = DistToContentRect(x, y, contentW, contentH, m);
+            if (dist <= 0 || dist > m) continue;
+            const int alpha = (m - dist + 1) * kWindowEdgeShadowMaxAlpha / (m + 1);
+            px[y * outerW + x] = static_cast<uint32_t>(alpha) << 24;
+        }
+    }
+
+    HDC outerDc = CreateCompatibleDC(screenDc);
+    HGDIOBJ oldOuter = SelectObject(outerDc, outerBmp);
+
+    RECT wr{};
+    GetWindowRect(owner_, &wr);
+    POINT ptDst{wr.left - m, wr.top - m};
+    SIZE size{outerW, outerH};
+    POINT ptSrc{0, 0};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    const BOOL ok = UpdateLayeredWindow(shadow_, screenDc, &ptDst, &size, outerDc,
+        &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(outerDc, oldOuter);
+    ReleaseDC(nullptr, screenDc);
+    DeleteObject(outerBmp);
+    DeleteDC(outerDc);
+    return ok == TRUE;
+}
+
+void WindowOuterShadow::Sync() {
+    if (!owner_ || !IsWindow(owner_)) return;
+    if (!IsWindowVisible(owner_) || IsIconic(owner_)) {
+        if (shadow_) ShowWindow(shadow_, SW_HIDE);
+        return;
+    }
+    if (!EnsureShadowWindow()) return;
+
+    RECT wr{};
+    GetWindowRect(owner_, &wr);
+    const int cw = wr.right - wr.left;
+    const int ch = wr.bottom - wr.top;
+    if (cw <= 0 || ch <= 0) return;
+
+    const int m = kWindowEdgeShadowSize;
+    SetWindowPos(shadow_, owner_, wr.left - m, wr.top - m, cw + 2 * m, ch + 2 * m,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    Render(cw, ch);
+}
+
+LRESULT CALLBACK WindowOuterShadow::OwnerSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+    UINT_PTR /*id*/, DWORD_PTR refData) {
+    auto* self = reinterpret_cast<WindowOuterShadow*>(refData);
+    if (self) {
+        if (msg == WM_WINDOWPOSCHANGED || msg == WM_SIZE || msg == WM_SHOWWINDOW)
+            self->Sync();
+        if (msg == WM_DESTROY)
+            self->Detach();
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+bool WindowOuterShadow::Attach(HWND owner) {
+    if (!owner || !IsWindow(owner)) return false;
+    Detach();
+    owner_ = owner;
+    if (!EnsureShadowWindow()) {
+        owner_ = nullptr;
+        return false;
+    }
+    subclassed_ = SetWindowSubclass(owner_, OwnerSubclassProc, kWindowOuterShadowSubclassId,
+        reinterpret_cast<DWORD_PTR>(this)) != FALSE;
+    Sync();
+    return shadow_ != nullptr;
+}
+
+void WindowOuterShadow::Detach() {
+    if (owner_ && subclassed_) {
+        RemoveWindowSubclass(owner_, OwnerSubclassProc, kWindowOuterShadowSubclassId);
+        subclassed_ = false;
+    }
+    owner_ = nullptr;
+    if (shadow_) ShowWindow(shadow_, SW_HIDE);
+}
 
 void DrawPopupShadowMargin(HDC hdc, int contentW, int contentH) {
     if (!hdc || contentW <= 0 || contentH <= 0) return;

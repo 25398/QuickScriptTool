@@ -8,7 +8,9 @@
 #include "app_settings.h"
 #include "config.h"
 #include "crosshair_drag.h"
+#include "drawing.h"
 #include "panel_popup_combo.h"
+#include "prompt_modal.h"
 
 class SettingsDialog {
 public:
@@ -206,10 +208,14 @@ private:
     HWND editMaxTokens_ = nullptr;
 
     PanelPopupCombo aiModelCombo_;
+    PromptModal promptModal_;
+
+    void ShowPromptAlert(const std::wstring& message);
 
     CrosshairDragController crosshairDrag_{};
     HCURSOR crosshairDragCursor_ = nullptr;
     InlineLayout inlineLayout_{};
+    WindowOuterShadow outerShadow_;
 };
 
 /// 若设置对话框正在显示，从 settings 引用同步勾选状态并刷新界面

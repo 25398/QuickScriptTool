@@ -1,4 +1,5 @@
 #include "recording_optimize_dialog.h"
+#include "drawing.h"
 
 #include "action_utils.h"
 #include "drawing.h"
@@ -93,6 +94,7 @@ RecordingOptimizeDialog::Result RecordingOptimizeDialog::Show(HWND owner, const 
     if (!hwnd_) return {};
 
     ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-录制优化");
+    outerShadow_.Attach(hwnd_);
 
     const std::wstring defaultName = L"优化-" + (fileData.scriptName.empty() ? recording.name : fileData.scriptName);
     SetWindowTextW(nameEdit_, defaultName.c_str());
@@ -162,6 +164,7 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         CreateDropPopup();
         UpdatePanelControls();
         UpdateStats();
+        promptModal_.Bind(hwnd_, bodyFont_);
         return 0;
     }
     case WM_CTLCOLOREDIT: {
@@ -185,6 +188,7 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         Paint();
         return 0;
     case WM_MOUSEWHEEL:
+        if (promptModal_.visible()) return 0;
         if (!DropPopupVisible()) {
             scrollTop_ -= GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
             ClampScroll();
@@ -194,6 +198,7 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
+        if (promptModal_.visible()) return 0;
         SetHoverFlag(hoverClose_, HitCloseButton(x, y), CloseRect());
         SetHoverFlag(hoverCancel_, PtInRect(CancelBtnRect(), x, y), CancelBtnRect());
         SetHoverFlag(hoverSave_, PtInRect(SaveBtnRect(), x, y), SaveBtnRect());
@@ -215,6 +220,7 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
+        if (promptModal_.visible()) return 0;
         POINT pt{x, y};
         HWND child = ChildWindowFromPointEx(hwnd_, pt, CWP_SKIPINVISIBLE);
         if (child && child != hwnd_) return DefWindowProcW(hwnd_, msg, wp, lp);
@@ -1002,7 +1008,8 @@ void RecordingOptimizeDialog::ApplyMoveCompress() {
 }
 
 void RecordingOptimizeDialog::ShowAlert(const wchar_t* message) {
-    MessageBoxW(hwnd_, message, L"提示", MB_OK | MB_ICONINFORMATION);
+    CloseMenuPopup();
+    promptModal_.ShowInfo(message ? message : L"");
 }
 
 bool RecordingOptimizeDialog::SaveToNewRecording() {
@@ -1099,21 +1106,6 @@ void RecordingOptimizeDialog::DrawRadio(HDC hdc, const RECT& rc, bool checked) {
         SelectObject(hdc, oldBrush);
         SelectObject(hdc, oldPen);
         DeleteObject(dot);
-    }
-}
-
-void RecordingOptimizeDialog::DrawCheckbox(HDC hdc, const RECT& rc, bool checked) {
-    DrawBorderRect(hdc, rc, kComboBorderGray);
-    if (checked) {
-        const int w = rc.right - rc.left;
-        const int h = rc.bottom - rc.top;
-        HPEN pen = CreatePen(PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, 2, kMainGreen);
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        MoveToEx(hdc, rc.left + w / 5, rc.top + h / 2, nullptr);
-        LineTo(hdc, rc.left + 2 * w / 5, rc.bottom - h / 5);
-        LineTo(hdc, rc.right - w / 6, rc.top + h / 5);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
     }
 }
 

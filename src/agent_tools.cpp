@@ -6,6 +6,7 @@
 
 #include "agent_tools.h"
 
+#include "action_utils.h"
 #include "app_settings_store.h"
 #include "scheduled_task_store.h"
 #include "scheduled_task_types.h"
@@ -319,7 +320,7 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     ss << L"  鼠标移动: " << moveCount << L"\n";
     ss << L"  等待: " << waitCount << L" (合计 " << totalWait << L"秒)\n";
     ss << L"  鼠标点击: " << clickCount << L"\n";
-    ss << L"  按键: " << keyDownCount << L" down, " << keyUpCount << L" up, " << keyClickCount << L" click\n";
+    ss << L"  按键: 按下 " << keyDownCount << L" 次, 松开 " << keyUpCount << L" 次, 点击 " << keyClickCount << L" 次\n";
     ss << L"  识图: " << findImageCount << L"\n";
     ss << L"  循环: " << loopCount << L"\n";
     ss << L"  条件: " << ifCount << L"\n";
@@ -337,9 +338,11 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
             size_t keyStart = segStart > 0 ? segStart - 1 : 0;
             size_t keyEnd = endIdx < data.actions.size() ? endIdx : data.actions.size() - 1;
             std::wstring startLabel = (segStart == 0) ? L"开头"
-                : (L"#" + std::to_wstring(data.actions[keyStart].originalNo) + L" " + data.actions[keyStart].customText);
+                : (L"第" + std::to_wstring(data.actions[keyStart].originalNo) + L"步 "
+                    + ActionName(data.actions[keyStart]));
             std::wstring endLabel = (endIdx >= data.actions.size()) ? L"结尾"
-                : (L"#" + std::to_wstring(data.actions[keyEnd].originalNo) + L" " + data.actions[keyEnd].customText);
+                : (L"第" + std::to_wstring(data.actions[keyEnd].originalNo) + L"步 "
+                    + ActionName(data.actions[keyEnd]));
             ss << L"  " << segmentIdx << L". [" << startLabel << L" → " << endLabel << L"] — "
                << segMoves << L" 个移动, " << segWaits << L" 个等待\n";
         }
@@ -439,6 +442,11 @@ AgentTool MakeReadScriptTool() {
 
         std::wstring content = ReadAll(found.path);
         if (content.empty()) return L"[提示] 文件内容为空：" + p.fileName;
+
+        ScriptFileData data = LoadScriptFileData(found.path);
+        if (!data.actions.empty()) {
+            content += L"\n\n" + FormatScriptActionsOutline(data.actions);
+        }
         return content;
     };
 
@@ -474,6 +482,18 @@ std::wstring ExecuteBuildScriptActionsParams(const json& params, bool executionF
     std::wstring summary = L"✓ 已构建 " + std::to_wstring(items.size()) + L" 个动作。\n";
     summary += L"将下方 JSON 数组嵌入脚本的 actions 字段即可：\n\n";
     summary += jsonArray;
+
+    std::vector<ScriptAction> built;
+    built.reserve(items.size());
+    for (const auto& item : items) {
+        auto builtOne = BuildScriptActionFromJson(item);
+        if (builtOne.ok) built.push_back(std::move(builtOne.action));
+    }
+    if (!built.empty()) {
+        EnsureStopMacroOnActions(built);
+        NormalizeScriptActionList(built);
+        summary += L"\n\n" + FormatScriptActionsOutline(built);
+    }
     return summary;
 }
 
@@ -574,11 +594,14 @@ AgentTool MakeBuildScriptActionsTool() {
     tool.description =
         L"构建规范格式的脚本动作 JSON 数组，与用户在编辑器手动添加动作的逻辑完全一致。"
         L"创建或修改脚本时必须用此工具生成 actions，禁止手写动作 JSON 对象。"
+        L"步骤说明写 remark；禁止 customText 与 text/no 字段（工具自动分配序号与标准动作名）。"
+        L"非无限循环脚本末尾会自动追加 stopMacro（结束宏运行）。"
         L"传入 actions 数组，每项含 type 及该类型参数；返回可直接嵌入脚本的 JSON 数组文本。"
         L"支持全部编辑器动作（不含 AI 专用动作）。"
         L"AI 相关请用 buildGetCursorPosAction、buildAiTextAnalysisAction、"
         L"buildAiImageAnalysisAction、buildAiActionExecuteAction。"
-        L"找图/OCR 保存变量用 followUp:\"saveVar\"；等待用 type:wait,duration；按键用 keyClick/keyDown/keyUp。";
+        L"找图/OCR 保存变量用 followUp:\"saveVar\"；等待用 type:wait,duration；按键用 keyClick/keyDown/keyUp。"
+        L"endLoop 必须是 loop 的子节点（indent=loop.indent+1），否则构建失败。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -619,7 +642,8 @@ AgentTool MakeBuildScriptActionsTool() {
 AgentTool MakeWriteScriptTool() {
     AgentTool tool;
     tool.name = L"writeScript";
-    tool.description = L"将内容写入指定脚本或录制文件（覆盖已有内容）";
+    tool.description = L"将内容写入指定脚本或录制文件（覆盖已有内容）。"
+        L"内容会解析并规范化动作（序号 1..n、清除误写的 text 显示名），禁止绕过 buildScriptActions 手写动作对象。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -693,6 +717,7 @@ AgentTool MakeGetScriptStatsTool() {
 
         std::wstringstream ss;
         WriteScriptStats(data, ss);
+        ss << L"\n" << FormatScriptActionsOutline(data.actions);
         return ss.str();
     };
 
@@ -778,6 +803,7 @@ AgentTool MakeCreateMacroScriptTool() {
     tool.name = L"createMacroScript";
     tool.description =
         L"一步创建鼠标宏：构建动作并保存到 scripts 目录。"
+        L"禁止 customText；说明写 remark；末尾自动追加 stopMacro（除非顶层无限 loop）。"
         L"含 AI 动作时无需手写 aiModelName，保存时会自动从已添加模型中选取（图片分析优先识图模型）。"
         L"也可先用 buildAiTextAnalysisAction / buildAiImageAnalysisAction 等专用工具构建单个 AI 动作。";
 

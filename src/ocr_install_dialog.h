@@ -9,6 +9,7 @@
 #include <string>
 
 #include "config.h"
+#include "drawing.h"
 
 /// 文字识别插件安装对话框（450×500，模态，可拖动）
 class OcrInstallDialog {
@@ -58,4 +59,5 @@ private:
     std::wstring statusText_;
     std::wstring resultMessage_;
     std::atomic<bool> installRunning_{false};
+    WindowOuterShadow outerShadow_;
 };
