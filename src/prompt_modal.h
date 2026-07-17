@@ -22,12 +22,15 @@ struct PromptModalLayout {
     bool hasCancel = false;
 };
 
-PromptModalLayout ComputePromptModalLayout(const RECT& client, PromptModalMode mode);
+PromptModalLayout ComputePromptModalLayout(const RECT& client, PromptModalMode mode,
+                                           const std::wstring& message = L"",
+                                           HFONT font = nullptr);
 
 void PaintPromptModal(HDC hdc, const RECT& client, const std::wstring& message,
     PromptModalMode mode, bool hoverOk, bool hoverCancel, HFONT textFont);
 
-PromptModalButton PromptModalHitTest(int x, int y, const RECT& client, PromptModalMode mode);
+PromptModalButton PromptModalHitTest(int x, int y, const RECT& client, PromptModalMode mode,
+                                     const std::wstring& message = L"", HFONT font = nullptr);
 
 class PromptModal {
 public:
@@ -46,6 +49,7 @@ private:
     void SyncShield();
     void InvalidateButtonRegion();
     bool UpdateHover(int x, int y, const RECT& client);
+    void TrackMouseLeave();
     RECT ClientRect() const;
     RECT OwnerScreenRect() const;
     void RefreshOwnerAfterClose();
@@ -64,6 +68,11 @@ private:
     std::wstring message_;
     bool hoverOk_ = false;
     bool hoverCancel_ = false;
+    bool cursorOnButton_ = false;
+    bool trackingLeave_ = false;
+    // Ignore the mouse-up that still belongs to the click which opened this modal.
+    bool suppressClickUntilRelease_ = false;
+    PromptModalButton armedButton_ = PromptModalButton::None;
     std::function<void(bool)> onDone_;
     std::function<void()> afterClose_;
 };

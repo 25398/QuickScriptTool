@@ -25,6 +25,10 @@ constexpr int EID_MoveRandomY             = 1018;
 constexpr int EID_MoveFromVar             = 1019;
 constexpr int EID_MoveVarX                = 1020;
 constexpr int EID_MoveVarY                = 1021;
+constexpr int EID_MoveRelX                = 1196;
+constexpr int EID_MoveRelY                = 1197;
+constexpr int EID_MoveRelRandomX          = 1198;
+constexpr int EID_MoveRelRandomY          = 1199;
 constexpr int EID_ClickButton             = 1022;
 constexpr int EID_ClickCount              = 1023;
 constexpr int EID_ClickWait               = 1024;
@@ -186,16 +190,17 @@ constexpr int EID_AiTargetLocal           = 1181;
 constexpr int EID_AiTargetClear           = 1182;
 constexpr int EID_AiFullScreen            = 1183;
 constexpr int EID_AiSelectRegion          = 1184;
-constexpr int EID_AiSearchX1              = 1185;
-constexpr int EID_AiSearchY1              = 1186;
-constexpr int EID_AiSearchX2              = 1187;
-constexpr int EID_AiSearchY2              = 1188;
-constexpr int EID_AiWithImage             = 1190;
-constexpr int EID_AiMaxSteps              = 1189;
-constexpr int EID_AiMaxStepsHint          = 1192;
-constexpr int EID_AiConfirm               = 1191;
-constexpr int EID_CursorPosVarName        = 1193;
-constexpr int EID_GotoStepExpr            = 1194;
+constexpr int EID_AiSearchRegion          = 1185;
+constexpr int EID_AiSearchX1              = 1186;
+constexpr int EID_AiSearchY1              = 1187;
+constexpr int EID_AiSearchX2              = 1188;
+constexpr int EID_AiSearchY2              = 1189;
+constexpr int EID_AiMaxSteps              = 1190;
+constexpr int EID_AiWithImage             = 1191;
+constexpr int EID_AiConfirm               = 1192;
+constexpr int EID_AiMaxStepsHint          = 1193;
+constexpr int EID_CursorPosVarName        = 1194;
+constexpr int EID_GotoStepExpr            = 1195;
 
 // 辅助: Indent 将第一个组件推到指定 x (相对于 panel left), Gap 为精确像素间距
 inline UIComponent Indent(int x) { return UIComponent::Spacer(x - kParamPanelLeft, 0); }
@@ -245,6 +250,37 @@ inline UILayout MoveMouse() {
         }, 0, 0, 8)                               // 421 - (391+22) = 8
         .AddRow({
             UIComponent::Hint(L"*提示:可使用来自找图、找色，获取颜色，文字识别保存到变量中的值", kParamFieldWidth, 56),
+        });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 1b. 相对移动鼠标 (dx/dy)
+// ══════════════════════════════════════════════════════════════════
+inline UILayout MoveMouseRelative() {
+    return UILayout(kParamPanelLeft, 180, kPanelWidth)
+        .AddRow({
+            UIComponent::Label(L"相对位移(像素,可负)", -1, 190, 25),
+        }, 0, 0, 9)
+        .AddRow({
+            UIComponent::Label(L"dx:", -1, 30, 22),
+            Gap(1),
+            UIComponent::Edit(L"0", EID_MoveRelX, 87, 22),
+            Gap(1),
+            UIComponent::Label(L"±随机:", -1, 50, 22),
+            Gap(5),
+            UIComponent::Edit(L"0", EID_MoveRelRandomX, 25, 22),
+        }, 0, 0, 15)
+        .AddRow({
+            UIComponent::Label(L"dy:", -1, 30, 22),
+            Gap(1),
+            UIComponent::Edit(L"0", EID_MoveRelY, 87, 22),
+            Gap(1),
+            UIComponent::Label(L"±随机:", -1, 50, 22),
+            Gap(5),
+            UIComponent::Edit(L"0", EID_MoveRelRandomY, 25, 22),
+        }, 0, 0, 10)
+        .AddRow({
+            UIComponent::Hint(L"*提示:Raw 逐包录制；回放关加速+绝对时间轴+高优先级。请重新录制后验证", kParamFieldWidth, 56),
         });
 }
 
@@ -316,14 +352,14 @@ inline UILayout MouseClick() {
             UIComponent::Edit(L"0", EID_ClickCount, 54, 22),
         }, 0, 0, 15)                              // y=449, gap=449-(412+22)=15
         .AddRow({
-            UIComponent::Label(L"等待时间", -1, 75, 22),
+            UIComponent::Label(L"重复间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.010", EID_ClickWait, 54, 22),
             Gap(6),
             UIComponent::Label(L"秒", -1, 32, 25),
         }, 0, 0, 13)                              // y=487, gap=487-(449+max(22,25))=13
         .AddRow({
-            UIComponent::Label(L"随机时间", -1, 75, 22),
+            UIComponent::Label(L"随机间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.000", EID_ClickRandom, 54, 22),
             Gap(6),
@@ -384,14 +420,14 @@ inline UILayout MousePlayback() {
             UIComponent::Edit(L"0", EID_MousePlaybackCount, 54, 22),
         }, 0, 0, 15)
         .AddRow({
-            UIComponent::Label(L"等待时间", -1, 75, 22),
+            UIComponent::Label(L"重复间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.010", EID_MousePlaybackWait, 54, 22),
             Gap(6),
             UIComponent::Label(L"秒", -1, 32, 25),
         }, 0, 0, 12)
         .AddRow({
-            UIComponent::Label(L"随机时间", -1, 75, 22),
+            UIComponent::Label(L"随机间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.000", EID_MousePlaybackRandom, 54, 22),
             Gap(6),
@@ -442,14 +478,14 @@ inline UILayout ScrollWheel() {
             UIComponent::Edit(L"0", EID_ScrollCount, 54, 22),
         }, 0, 0, 15)                               // y=449
         .AddRow({
-            UIComponent::Label(L"等待时间", -1, 75, 22),
+            UIComponent::Label(L"重复间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.010", EID_ScrollWait, 54, 22),
             Gap(6),
             UIComponent::Label(L"秒", -1, 32, 25),
         }, 0, 0, 13)                               // y=487
         .AddRow({
-            UIComponent::Label(L"随机时间", -1, 75, 22),
+            UIComponent::Label(L"随机间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.000", EID_ScrollRandom, 54, 22),
             Gap(6),
@@ -497,14 +533,14 @@ inline UILayout KeyClick() {
             UIComponent::Edit(L"0", 0, 54, 22),
         }, 0, 0, 15)
         .AddRow({
-            UIComponent::Label(L"等待时间", -1, 75, 22),
+            UIComponent::Label(L"重复间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.010", 0, 54, 22),
             Gap(6),
             UIComponent::Label(L"秒", -1, 32, 25),
         }, 0, 0, 13)
         .AddRow({
-            UIComponent::Label(L"随机时间", -1, 75, 22),
+            UIComponent::Label(L"随机间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.000", 0, 54, 22),
             Gap(6),
@@ -565,14 +601,14 @@ inline UILayout HotkeyShortcut() {
             UIComponent::Edit(L"0", EID_HotkeyShortcutCount, 54, 22),
         }, 0, 0, 15)
         .AddRow({
-            UIComponent::Label(L"等待时间", -1, 75, 22),
+            UIComponent::Label(L"重复间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.010", EID_HotkeyShortcutWait, 54, 22),
             Gap(6),
             UIComponent::Label(L"秒", -1, 32, 25),
         }, 0, 0, 13)
         .AddRow({
-            UIComponent::Label(L"随机时间", -1, 75, 22),
+            UIComponent::Label(L"随机间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.000", EID_HotkeyShortcutRandom, 54, 22),
             Gap(6),
@@ -615,14 +651,14 @@ inline UILayout QuickInput() {
             UIComponent::Edit(L"0", EID_QuickInputCount, 54, 22),
         }, 0, 0, 10)                               // y=490
         .AddRow({
-            UIComponent::Label(L"等待时间", -1, 75, 22),
+            UIComponent::Label(L"重复间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.010", EID_QuickInputWait, 54, 22),
             Gap(6),
             UIComponent::Label(L"秒", -1, 32, 25),
         }, 0, 0, 7)                                // y=522
         .AddRow({
-            UIComponent::Label(L"随机时间", -1, 75, 22),
+            UIComponent::Label(L"随机间隔", -1, 75, 22),
             Gap(16),
             UIComponent::Edit(L"0.000", EID_QuickInputRandom, 54, 22),
             Gap(6),
@@ -672,7 +708,7 @@ inline UILayout Loop() {
 inline UILayout EndLoop() {
     return UILayout(kParamPanelLeft, 183, kPanelWidth)
         .AddRow({
-            UIComponent::Hint(L"*提示:仅可添加到循环子节点，用于提前结束循环", kParamFieldWidth, 48),
+            UIComponent::Hint(L"*提示:须放在循环内（含循环下的条件分支），用于提前结束循环", kParamFieldWidth, 48),
         });
 }
 

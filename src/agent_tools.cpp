@@ -13,9 +13,11 @@
 #include "agent_script_ops.h"
 #include "agent_reference.h"
 #include "agent_ai_actions.h"
+#include "agent_ui_notify.h"
 #include "script_action_builder.h"
 #include "script_io.h"
 #include "utils.h"
+#include "window_mode/window_mode_json.h"
 
 #include <fstream>
 #include <string>
@@ -119,7 +121,12 @@ void ListScriptsInDir(const std::wstring& dir, const std::wstring& label,
     for (const auto& [fname, data] : entries) {
         std::wstring name = data.scriptName.empty() ? fname : data.scriptName;
         int count = static_cast<int>(data.actions.size());
-        result << index << L". " << fname << L" — \"" << name << L"\" (" << count << L" 个动作)\n";
+        result << index << L". " << fname << L" — \"" << name << L"\" ("
+            << count << L" 个动作, " << windowmode::WindowModeConfigSummary(data.windowMode);
+        if (!data.windowMode.enabled && EffectiveBreakoutTimeSeconds(data) > 0) {
+            result << L", 脱离" << static_cast<int>(EffectiveBreakoutTimeSeconds(data)) << L"s";
+        }
+        result << L")\n";
         ++index;
     }
 }
@@ -127,7 +134,10 @@ void ListScriptsInDir(const std::wstring& dir, const std::wstring& label,
 // ── 录制优化辅助函数 ──────────────────────────────────────────────
 
 bool IsKeyOperation(ActionType type) {
-    return type != ActionType::MoveMouse && type != ActionType::Wait;
+    // 关键操作：键鼠点击/按下/滚轮/输入等；绝对/相对移动与等待是「间操作」
+    return type != ActionType::MoveMouse
+        && type != ActionType::MoveMouseRelative
+        && type != ActionType::Wait;
 }
 
 double ComputeMergedWait(const std::vector<double>& waits, const std::wstring& mode) {
@@ -312,6 +322,10 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     }
 
     ss << L"脚本统计: " << data.scriptName << L"\n";
+    ss << L"运行模式: " << windowmode::WindowModeConfigSummary(data.windowMode) << L"\n";
+    if (!data.windowMode.enabled) {
+        ss << L"脱离时间: " << EffectiveBreakoutTimeSeconds(data) << L" 秒\n";
+    }
     ss << L"总动作数: " << data.actions.size() << L"\n";
     ss << L"总等待时长: " << totalWait << L" 秒\n";
     ss << L"记录时间: " << data.recordTime << L"\n\n";
@@ -444,6 +458,18 @@ AgentTool MakeReadScriptTool() {
         if (content.empty()) return L"[提示] 文件内容为空：" + p.fileName;
 
         ScriptFileData data = LoadScriptFileData(found.path);
+        if (content.find(L"\"windowMode\"") == std::wstring::npos) {
+            content += L"\n\n[提示] 该文件缺少 windowMode 字段，运行时将按默认模式执行。"
+                L" 保存或 writeScript 后会自动补全。\n";
+        }
+        if (!data.windowMode.enabled && content.find(L"\"breakoutTimeSeconds\"") == std::wstring::npos) {
+            content += L"[提示] 未写 breakoutTimeSeconds，视为 0（脱离时间禁用）。\n";
+        }
+        content += L"\n[脚本模式] " + windowmode::WindowModeConfigSummary(data.windowMode) + L"\n";
+        if (!data.windowMode.enabled) {
+            content += L"[脱离时间] " + std::to_wstring(
+                static_cast<int>(EffectiveBreakoutTimeSeconds(data))) + L" 秒（0=禁用）\n";
+        }
         if (!data.actions.empty()) {
             content += L"\n\n" + FormatScriptActionsOutline(data.actions);
         }
@@ -599,8 +625,10 @@ AgentTool MakeBuildScriptActionsTool() {
         L"传入 actions 数组，每项含 type 及该类型参数；返回可直接嵌入脚本的 JSON 数组文本。"
         L"支持全部编辑器动作（不含 AI 专用动作）。"
         L"AI 相关请用 buildGetCursorPosAction、buildAiTextAnalysisAction、"
-        L"buildAiImageAnalysisAction、buildAiActionExecuteAction。"
+        L"buildAiImageAnalysisAction（尽量少用）；buildAiActionExecuteAction 仅当用户明确要求 AI 动作执行时使用。"
         L"找图/OCR 保存变量用 followUp:\"saveVar\"；等待用 type:wait,duration；按键用 keyClick/keyDown/keyUp。"
+        L"mouseClick/keyClick 等含 clickCount 的动作：duration 是两次重复之间的间隔，"
+        L"count=1 时不等待，也不在首前/末后插入等待。"
         L"endLoop 必须是 loop 的子节点（indent=loop.indent+1），否则构建失败。";
 
     tool.parameters_json = LR"({
@@ -643,7 +671,9 @@ AgentTool MakeWriteScriptTool() {
     AgentTool tool;
     tool.name = L"writeScript";
     tool.description = L"将内容写入指定脚本或录制文件（覆盖已有内容）。"
-        L"内容会解析并规范化动作（序号 1..n、清除误写的 text 显示名），禁止绕过 buildScriptActions 手写动作对象。";
+        L"内容会解析并规范化动作（序号 1..n、清除误写的 text 显示名），禁止绕过 buildScriptActions 手写动作对象。"
+        L"脚本宏必须包含 windowMode 字段（默认模式 enabled=0）；默认模式可含 breakoutTimeSeconds（0=禁用脱离）；"
+        L"键鼠录制始终强制默认模式且 breakoutTimeSeconds=0。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -805,13 +835,29 @@ AgentTool MakeCreateMacroScriptTool() {
         L"一步创建鼠标宏：构建动作并保存到 scripts 目录。"
         L"禁止 customText；说明写 remark；末尾自动追加 stopMacro（除非顶层无限 loop）。"
         L"含 AI 动作时无需手写 aiModelName，保存时会自动从已添加模型中选取（图片分析优先识图模型）。"
-        L"也可先用 buildAiTextAnalysisAction / buildAiImageAnalysisAction 等专用工具构建单个 AI 动作。";
+        L"默认效率优先：优先 findImage/OCR，少调用 AI 分析；aiActionExecute 仅用户明确要求时使用。"
+        L"准确度优先时 readAgentSkill section=scriptStrategy。"
+        L"需窗口/后台模式时传 scriptMode 或 windowMode（见 readScriptReference section=windowMode）。"
+        L"默认模式可传 breakoutTimeSeconds（秒，0=禁用；用户中途操作键鼠会暂停宏并在该秒数后恢复）。";
 
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
             "fileName": { "type": "string", "description": "文件名，如 mymacro.json" },
             "scriptName": { "type": "string", "description": "宏显示名称" },
+            "scriptMode": {
+                "type": "string",
+                "enum": ["default", "window", "backgroundWindow"],
+                "description": "脚本运行模式：default=默认, window=窗口模式, backgroundWindow=后台窗口模式"
+            },
+            "breakoutTimeSeconds": {
+                "type": "number",
+                "description": "脱离时间（秒，仅默认模式生效）。0 或未填=禁用；用户中途操作键鼠会暂停宏，等待该秒数后从当前步骤重试"
+            },
+            "windowMode": {
+                "type": "object",
+                "description": "完整 windowMode 配置（与脚本 JSON 头字段一致，优先级高于 scriptMode）"
+            },
             "actions": {
                 "type": "array",
                 "description": "动作参数数组，每项含 type 及字段（同 buildScriptActions）",
@@ -834,7 +880,7 @@ AgentTool MakeCreateMacroScriptTool() {
                 if (item.is_object()) items.push_back(item);
             }
         }
-        const auto result = AgentCreateMacroScript(fileName, scriptName, items);
+        const auto result = AgentCreateMacroScript(fileName, scriptName, items, params);
         return result.message;
     };
 
@@ -994,7 +1040,7 @@ AgentTool MakeCreateScheduledTaskTool() {
             },
             "targetFile": {
                 "type": "string",
-                "description": "目标文件名（如 myscript.json）。请先通过 listScripts 确认文件存在。"
+                "description": "目标文件名（如 myscript.json）。必须存在；请先用 listScripts 确认。"
             },
             "kind": {
                 "type": "string",
@@ -1006,22 +1052,22 @@ AgentTool MakeCreateScheduledTaskTool() {
                 "enum": ["custom", "daily", "weekly", "hourly"],
                 "description": "执行频率：custom=单次, daily=每天, weekly=每周, hourly=每小时。默认 custom"
             },
-            "year": { "type": "integer", "description": "年份（仅 custom 频率需要，如 2026）" },
-            "month": { "type": "integer", "description": "月份（仅 custom 频率需要，1-12）" },
-            "day": { "type": "integer", "description": "日（仅 custom 频率需要，1-31）" },
-            "hour": { "type": "integer", "description": "小时（0-23）。daily/weekly 也需要。默认 9" },
+            "year": { "type": "integer", "description": "年份（custom 必填，如 2026）" },
+            "month": { "type": "integer", "description": "月份（custom 必填，1-12）" },
+            "day": { "type": "integer", "description": "日（custom 必填，1-31）" },
+            "hour": { "type": "integer", "description": "小时（0-23）。daily/weekly/custom 需要。默认 9" },
             "minute": { "type": "integer", "description": "分钟（0-59）。默认 0" },
             "second": { "type": "integer", "description": "秒（0-59）。默认 0" },
             "weekDays": {
                 "type": "array", "items": { "type": "string" },
-                "description": "星期数组（仅 weekly 频率需要）：[\"Mon\",\"Tue\",\"Wed\",\"Thu\",\"Fri\",\"Sat\",\"Sun\"]"
+                "description": "星期数组（weekly 必填）：[\"Mon\",\"Tue\",\"Wed\",\"Thu\",\"Fri\",\"Sat\",\"Sun\"]"
             },
             "enabled": {
                 "type": "boolean",
                 "description": "是否启用，默认 true"
             }
         },
-        "required": ["name"]
+        "required": ["name", "targetFile"]
     })";
 
     tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
@@ -1033,25 +1079,20 @@ AgentTool MakeCreateScheduledTaskTool() {
         if (name.empty()) return L"[错误] 缺少 name 参数。";
 
         std::wstring targetFile = FromUtf8(params.value("targetFile", ""));
+        if (targetFile.empty()) return L"[错误] 缺少 targetFile 参数。";
         std::wstring kindStr = FromUtf8(params.value("kind", "macro"));
         std::wstring freqStr = FromUtf8(params.value("frequency", "custom"));
 
-        std::wstring filePath;
-        std::wstring displayName;
-        if (!targetFile.empty()) {
-            auto found = FindScriptFile(targetFile, L"");
-            if (!found.found)
-                return L"[错误] 目标文件不存在：" + targetFile + L"。请先用 listScripts 确认文件名。";
-            filePath = found.path;
-            displayName = targetFile;
-        }
+        auto found = FindScriptFile(targetFile, L"");
+        if (!found.found)
+            return L"[错误] 目标文件不存在：" + targetFile + L"。请先用 listScripts 确认文件名。";
 
         ScheduledTask task;
         task.id = GenerateScheduledTaskId();
         task.name = name;
         task.kind = (kindStr == L"recording") ? ScheduledTaskKind::Recording : ScheduledTaskKind::Macro;
-        task.filePath = filePath;
-        task.fileDisplayName = displayName;
+        task.filePath = found.path;
+        task.fileDisplayName = targetFile;
 
         if (freqStr == L"hourly") task.frequency = ScheduledFrequency::Hourly;
         else if (freqStr == L"daily") task.frequency = ScheduledFrequency::Daily;
@@ -1079,6 +1120,16 @@ AgentTool MakeCreateScheduledTaskTool() {
             }
         }
 
+        if (task.frequency == ScheduledFrequency::Weekly && task.time.weekDays == 0) {
+            return L"[错误] weekly 频率必须提供 weekDays（至少一个星期）。";
+        }
+        if (task.frequency == ScheduledFrequency::Custom) {
+            if (task.time.year < 1970 || task.time.month < 1 || task.time.month > 12
+                || task.time.day < 1 || task.time.day > 31) {
+                return L"[错误] custom 频率必须提供有效的 year/month/day。";
+            }
+        }
+
         task.status = params.value("enabled", true)
             ? ScheduledTaskStatus::Enabled : ScheduledTaskStatus::Disabled;
 
@@ -1089,6 +1140,7 @@ AgentTool MakeCreateScheduledTaskTool() {
 
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
+        NotifyAgentScriptLibraryChanged();
 
         std::wstringstream ss;
         ss << L"定时任务已创建：\n";
@@ -1097,7 +1149,7 @@ AgentTool MakeCreateScheduledTaskTool() {
         if (!task.filePath.empty()) ss << L"  目标: " << task.fileDisplayName << L"\n";
         ss << L"  执行时间: " << FormatScheduledRunTime(task) << L"\n";
         ss << L"  状态: " << ((task.status == ScheduledTaskStatus::Enabled) ? L"启用" : L"禁用") << L"\n\n";
-        ss << L"提示：任务将在下次定时检查时自动生效。";
+        ss << L"提示：任务已写入并通知主窗口重新加载，将在到期秒触发。";
         return ss.str();
     };
 
@@ -1182,14 +1234,27 @@ AgentTool MakeUpdateScheduledTaskTool() {
         }
         if (params.contains("targetFile")) {
             std::wstring newFile = FromUtf8(params["targetFile"].get<std::string>());
+            if (newFile.empty()) return L"[错误] targetFile 不能为空。";
             auto found = FindScriptFile(newFile, L"");
             if (!found.found) return L"[错误] 目标文件不存在：" + newFile;
             target->filePath = found.path;
             target->fileDisplayName = newFile;
         }
 
+        if (target->filePath.empty())
+            return L"[错误] 任务缺少有效目标文件；请传入 targetFile。";
+        if (target->frequency == ScheduledFrequency::Weekly && target->time.weekDays == 0)
+            return L"[错误] weekly 频率必须至少选择一个星期（weekDays）。";
+        if (target->frequency == ScheduledFrequency::Custom) {
+            if (target->time.year < 1970 || target->time.month < 1 || target->time.month > 12
+                || target->time.day < 1 || target->time.day > 31) {
+                return L"[错误] custom 频率需要有效的 year/month/day。";
+            }
+        }
+
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
+        NotifyAgentScriptLibraryChanged();
 
         return L"定时任务已更新：" + target->name + L"\n"
                L"  新的执行时间: " + FormatScheduledRunTime(*target);
@@ -1238,6 +1303,7 @@ AgentTool MakeDeleteScheduledTaskTool() {
 
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
+        NotifyAgentScriptLibraryChanged();
 
         return L"已删除定时任务：" + deletedName;
     };
@@ -1405,7 +1471,7 @@ AgentTool MakeListAiModelsTool() {
     tool.name = L"listAiModels";
     tool.description =
         L"列出用户在「设置→AI助手」中已添加的 AI 模型，并标注是否支持识图。"
-        L"添加 aiTextAnalysis / aiImageAnalysis / aiActionExecute 前可先调用此工具。";
+        L"添加 AI 动作前可先调用；常规脚本优先 findImage/OCR，不必先查模型。";
     tool.parameters_json = LR"({"type":"object","properties":{}})";
     tool.execute = [](const std::wstring&) -> std::wstring {
         return FormatAvailableAiModelsList(LoadAgentAppSettings().ai);
@@ -1444,8 +1510,8 @@ AgentTool MakeBuildAiTextAnalysisActionTool() {
     AgentTool tool;
     tool.name = L"buildAiTextAnalysisAction";
     tool.description =
-        L"构建「AI 文本分析」动作。aiPrompt 必填；aiModelName 可省略，工具会从已添加模型中自动选择。"
-        L"不确定可用模型时先 listAiModels。";
+        L"构建「AI 文本分析」动作。★优先级低★：优先 OCR(textRecognition)；"
+        L"仅当必须理解文字语义且 OCR 不够用时才调用。aiPrompt 必填；aiModelName 可省略。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
@@ -1481,8 +1547,9 @@ AgentTool MakeBuildAiImageAnalysisActionTool() {
     AgentTool tool;
     tool.name = L"buildAiImageAnalysisAction";
     tool.description =
-        L"构建「AI 图片分析」动作。aiPrompt 必填；自动从已添加模型中选择支持识图的模型（优先识图模型）。"
-        L"可指定截屏区域、缩放等参数。";
+        L"构建「AI 图片分析」动作。★优先级低★：优先 findImage；"
+        L"仅当必须理解画面且找图无法完成，或准确度模式兜底诊断界面状况时使用。"
+        L"aiPrompt 必填；自动选择识图模型。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
@@ -1525,8 +1592,8 @@ AgentTool MakeBuildAiActionExecuteActionTool() {
     AgentTool tool;
     tool.name = L"buildAiActionExecuteAction";
     tool.description =
-        L"构建「AI 动作执行」动作。aiPrompt 为任务描述；aiWithImage=1 时需识图模型，工具会自动选择。"
-        L"可设置最大步数、超时、执行前确认等。";
+        L"构建「AI 动作执行」动作。★极低优先级★：仅当用户明确要求「AI动作执行/让AI自动操作桌面」时使用；"
+        L"禁止用其替代 findImage+键鼠 常规动作链。aiPrompt 为任务描述；可设置最大步数、超时等。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {

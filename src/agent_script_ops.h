@@ -30,7 +30,8 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
 
 /// 用 buildScriptActions 逻辑创建鼠标宏（scripts 目录）
 AgentScriptOpResult AgentCreateMacroScript(const std::wstring& fileName,
-    const std::wstring& scriptName, const std::vector<nlohmann::json>& actions);
+    const std::wstring& scriptName, const std::vector<nlohmann::json>& actions,
+    const nlohmann::json& extraParams = {});
 
 /// 优化脚本或键鼠录制
 AgentScriptOpResult AgentOptimizeScriptFile(const AgentOptimizeOptions& options);

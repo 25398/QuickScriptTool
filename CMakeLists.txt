@@ -19,21 +19,85 @@ endif()
 
 find_package(OpenCV REQUIRED)
 
+set(WINDOW_MODE_CORE_SOURCES
+    src/window_mode/window_mode_types.cpp
+    src/window_mode/window_mode_log.cpp
+    src/window_mode/hidden_desktop.cpp
+    src/window_mode/macro_virtual_desktop.cpp
+    src/window_mode/virtual_desktop_accessor.cpp
+    src/window_mode/com_apartment.cpp
+    src/window_mode/window_target.cpp
+    src/window_mode/window_capture.cpp
+    src/window_mode/window_capture_wgc.cpp
+    src/window_mode/window_coords.cpp
+    src/window_mode/window_mode_session.cpp
+    src/window_mode/window_mode_executor.cpp
+    src/window_mode/background_window_input.cpp
+    src/window_mode/background_uia_input.cpp
+    src/window_mode/window_mode_permission.cpp
+)
+
+add_library(window_mode_core OBJECT ${WINDOW_MODE_CORE_SOURCES})
+target_compile_definitions(window_mode_core PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(window_mode_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(window_mode_core PUBLIC
+    ${OpenCV_LIBS}
+    user32
+    gdi32
+    dwmapi
+    shell32
+    shlwapi
+    ole32
+    oleaut32
+    UIAutomationCore
+    urlmon
+    d3d11
+    dxgi
+    windowsapp
+)
+if(MSVC)
+    target_compile_options(window_mode_core PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+set(SCRIPT_CORE_COMMON_SOURCES
+    src/action_utils.cpp
+    src/input/mouse_input_backend.cpp
+    src/coord_space.cpp
+    src/image_match.cpp
+    src/image_match_engines.cpp
+    src/ocr_engine.cpp
+    src/utils.cpp
+)
+
+add_library(script_core_common OBJECT ${SCRIPT_CORE_COMMON_SOURCES})
+target_compile_definitions(script_core_common PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(script_core_common PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS})
+if(MSVC)
+    target_compile_options(script_core_common PRIVATE /W4 /permissive- /utf-8)
+endif()
+
 add_executable(QuickScriptTool WIN32
     resources/QuickScriptTool.rc
     src/main.cpp
-    src/action_utils.cpp
     src/clicker.cpp
     src/controls.cpp
     src/drawing.cpp
+    src/render_device.cpp
+    src/render_context_gdi.cpp
+    src/render_context_d2d.cpp
+    src/render_font.cpp
     src/editor_paint.cpp
     src/editor_dropdown.cpp
     src/hotkey_dialog.cpp
-    src/image_match.cpp
-    src/image_match_engines.cpp
     src/macro_variables.cpp
     src/macro_debug_window.cpp
-    src/ocr_engine.cpp
     src/ocr_install_dialog.cpp
     src/ocr_overlay.cpp
     src/process_utils.cpp
@@ -44,9 +108,13 @@ add_executable(QuickScriptTool WIN32
     src/prompt_modal.cpp
     src/panel_popup_combo.cpp
     src/recorder.cpp
+    src/recorder_timeline.cpp
+    src/input_timeline_scheduler.cpp
     src/recording_optimize_dialog.cpp
     src/app_settings_store.cpp
     src/app_branding.cpp
+    src/app_theme.cpp
+    src/theme_custom_dialog.cpp
     src/settings_dialog.cpp
     src/modern_edit.cpp
     src/agent_attachment.cpp
@@ -54,6 +122,7 @@ add_executable(QuickScriptTool WIN32
     src/ai_action_runtime.cpp
     src/ai_action_router.cpp
     src/tray_menu.cpp
+    src/taskbar_iconic_preview.cpp
     src/scheduled_task_types.cpp
     src/scheduled_task_store.cpp
     src/scheduled_task_scheduler.cpp
@@ -64,7 +133,6 @@ add_executable(QuickScriptTool WIN32
     src/agent_ui_notify.cpp
     src/agent_script_ops.cpp
     src/screenshot_overlay.cpp
-    src/utils.cpp
     src/agent_core.cpp
     src/agent_reference.cpp
     src/agent_system_prompt.cpp
@@ -74,6 +142,10 @@ add_executable(QuickScriptTool WIN32
     src/agent_ai_actions.cpp
     src/macro_execute_tools.cpp
     src/ui_component.cpp
+    src/ui_scale.cpp
+    src/window_mode/window_mode_json.cpp
+    src/window_mode/window_mode_preview.cpp
+    src/window_mode/window_pick_dialog.cpp
 )
 
 target_compile_definitions(QuickScriptTool PRIVATE UNICODE _UNICODE NOMINMAX)
@@ -88,9 +160,14 @@ target_include_directories(QuickScriptTool PRIVATE
 )
 
 target_link_libraries(QuickScriptTool PRIVATE
+    window_mode_core
+    script_core_common
     ${OpenCV_LIBS}
     user32
     gdi32
+    dwmapi
+    d2d1
+    dwrite
     comdlg32
     shell32
     comctl32
@@ -99,13 +176,207 @@ target_link_libraries(QuickScriptTool PRIVATE
     uxtheme
     ole32
     oleaut32
+    propsys
+    UIAutomationCore
     urlmon
     winhttp
+    d3d11
+    dxgi
+    windowsapp
+    winmm
 )
 
 if(MSVC)
     target_compile_options(QuickScriptTool PRIVATE /W4 /permissive- /utf-8)
 endif()
+
+# ── Agent SelfTest harness helper ─────────────────────────────────
+# Usage: qst_add_selftest(Name sources... [LIBS lib1 lib2 ...])
+function(qst_add_selftest name)
+    cmake_parse_arguments(QST "" "" "LIBS" ${ARGN})
+    if(NOT QST_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "qst_add_selftest(${name}): no SOURCES")
+    endif()
+    add_executable(${name} ${QST_UNPARSED_ARGUMENTS})
+    target_compile_definitions(${name} PRIVATE UNICODE _UNICODE NOMINMAX)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    if(QST_LIBS)
+        target_link_libraries(${name} PRIVATE ${QST_LIBS})
+    endif()
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4 /permissive- /utf-8)
+        set_target_properties(${name} PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+    endif()
+endfunction()
+
+add_library(scheduled_task_core OBJECT
+    src/scheduled_task_types.cpp
+    src/scheduled_task_store.cpp
+    src/scheduled_task_scheduler.cpp
+    src/utils.cpp
+)
+target_compile_definitions(scheduled_task_core PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(scheduled_task_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(scheduled_task_core PUBLIC user32 shell32 shlwapi)
+if(MSVC)
+    target_compile_options(scheduled_task_core PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+add_library(macro_variables_core OBJECT
+    src/macro_variables.cpp
+)
+target_compile_definitions(macro_variables_core PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(macro_variables_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OpenCV_INCLUDE_DIRS}
+)
+if(MSVC)
+    target_compile_options(macro_variables_core PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+add_library(script_action_builder_core OBJECT
+    src/script_action_builder.cpp
+    src/agent_ai_actions.cpp
+    src/ai_action_router.cpp
+    src/app_settings_store.cpp
+    src/app_theme.cpp
+    src/script_io.cpp
+    src/window_mode/window_mode_json.cpp
+    src/window_mode/window_mode_types.cpp
+)
+target_compile_definitions(script_action_builder_core PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(script_action_builder_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(script_action_builder_core PUBLIC
+    script_core_common
+    ${OpenCV_LIBS}
+    user32 shell32 shlwapi
+)
+if(MSVC)
+    target_compile_options(script_action_builder_core PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+qst_add_selftest(WindowModeSelfTest
+    tools/window_mode_selftest.cpp
+    LIBS
+        window_mode_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
+)
+
+qst_add_selftest(ScheduledTaskSelfTest
+    tools/scheduled_task_selftest.cpp
+    LIBS scheduled_task_core user32 shell32 shlwapi
+)
+
+qst_add_selftest(MacroVariablesSelfTest
+    tools/macro_variables_selftest.cpp
+    LIBS macro_variables_core
+)
+
+qst_add_selftest(ScriptActionBuilderSelfTest
+    tools/script_action_builder_selftest.cpp
+    LIBS
+        script_action_builder_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi
+)
+
+add_library(app_settings_store_core OBJECT
+    src/app_settings_store.cpp
+    src/utils.cpp
+)
+target_compile_definitions(app_settings_store_core PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(app_settings_store_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(app_settings_store_core PUBLIC user32 shell32 shlwapi)
+if(MSVC)
+    target_compile_options(app_settings_store_core PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+qst_add_selftest(CoordSpaceSelfTest
+    tools/coord_space_selftest.cpp
+    LIBS
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi
+)
+
+qst_add_selftest(ScriptIoSelfTest
+    tools/script_io_selftest.cpp
+    LIBS
+        script_action_builder_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi
+)
+
+qst_add_selftest(ImageMatchSelfTest
+    tools/image_match_selftest.cpp
+    LIBS
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi
+)
+
+qst_add_selftest(AiActionRouterSelfTest
+    tools/ai_action_router_selftest.cpp
+    LIBS
+        script_action_builder_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi
+)
+
+qst_add_selftest(AppSettingsStoreSelfTest
+    tools/app_settings_store_selftest.cpp
+    LIBS
+        app_settings_store_core
+        user32 shell32 shlwapi
+)
+
+qst_add_selftest(ThemeUiSelfTest
+    tools/theme_ui_selftest.cpp
+    src/app_theme.cpp
+    src/ui_scale.cpp
+    LIBS
+        user32 gdi32 shell32
+)
+
+# 录制时间轴自检：不要链 script_core_common（含 SendInput/找图），否则易被 360 HEUR 误删。
+qst_add_selftest(RecorderSelfTest
+    tools/recorder_selftest.cpp
+    tools/recorder_selftest_support.cpp
+    src/recorder_timeline.cpp
+    src/input_timeline_scheduler.cpp
+    src/utils.cpp
+    resources/selftest_version.rc
+    LIBS user32 shell32 shlwapi winmm
+)
+# 输出名避开 Recorder*+SendInput 启发式指纹；CMake/技能里仍用目标名 RecorderSelfTest
+set_target_properties(RecorderSelfTest PROPERTIES OUTPUT_NAME QstRecorderLogicTest)
+
+qst_add_selftest(WindowModeDiag
+    tools/window_mode_diag.cpp
+    LIBS
+        window_mode_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
+)
 
 # Copy OpenCV runtime DLL next to the executable (Debug/Release matched per config)
 if(WIN32)
@@ -139,10 +410,30 @@ if(WIN32)
     add_custom_command(TARGET QuickScriptTool POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/tools"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/resources/breakout_pause.ico"
+            "$<TARGET_FILE_DIR:QuickScriptTool>/breakout_pause.ico"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/resources/tray_running.ico"
+            "$<TARGET_FILE_DIR:QuickScriptTool>/tray_running.ico"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/resources/app_icon.ico"
+            "$<TARGET_FILE_DIR:QuickScriptTool>/app_icon.ico"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/paddle_ocr_helper.py"
             "$<TARGET_FILE_DIR:QuickScriptTool>/tools/paddle_ocr_helper.py"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/requirements-ocr.txt"
             "$<TARGET_FILE_DIR:QuickScriptTool>/tools/requirements-ocr.txt"
-        COMMENT "Copying PaddleOCR helper script and requirements")
+        COMMENT "Copying PaddleOCR helper and icons")
+    foreach(_vda_dll IN ITEMS
+        "VirtualDesktopAccessor11.dll"
+        "VirtualDesktopAccessor10.dll")
+        if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/VirtualDesktopAccessor/${_vda_dll}")
+            add_custom_command(TARGET QuickScriptTool POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_SOURCE_DIR}/third_party/VirtualDesktopAccessor/${_vda_dll}"
+                    "$<TARGET_FILE_DIR:QuickScriptTool>/${_vda_dll}"
+                COMMENT "Copying VirtualDesktopAccessor ${_vda_dll}")
+        endif()
+    endforeach()
 endif()

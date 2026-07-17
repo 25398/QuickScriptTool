@@ -28,7 +28,7 @@ constexpr int kRemarkEditW = 138;
 constexpr int kRemarkEditH = 31;
 constexpr int kColNoInList = 38 - kListX;
 constexpr int kColActionInList = 110 - kListX;
-constexpr int kListY = 228;
+constexpr int kListY = 240;
 constexpr int kListW = 872;
 constexpr int kListH = 934;
 constexpr int kRowH = 48;
@@ -43,35 +43,20 @@ constexpr int kHomeCardStep = kHomeCardH + kHomeCardGap;
 constexpr int kHomeScrollW = 16;
 constexpr int kEditorScrollW = 12;
 
-// ── 品牌颜色 ──────────────────────────────────────────────────────
-constexpr COLORREF kMainGreen = RGB(64, 168, 99);
-constexpr COLORREF kDarkGreen = RGB(54, 141, 82);
-constexpr COLORREF kCardGreen = RGB(67, 161, 94);
-constexpr COLORREF kCardHoverGreen = RGB(58, 148, 87);
-constexpr COLORREF kButtonGreen = RGB(70, 185, 111);
-constexpr COLORREF kButtonGreenHover = RGB(54, 153, 88);
-constexpr COLORREF kSelectedYellow = RGB(255, 241, 122);
-constexpr COLORREF kCreateYellow = RGB(255, 244, 138);
-constexpr COLORREF kOrange = RGB(255, 154, 72);
+// ── 固定颜色（不随主题变化） ──────────────────────────────────────
 constexpr COLORREF kHoverGray = RGB(205, 205, 205);
 constexpr COLORREF kScrollTrackGray = RGB(245, 245, 245);
 constexpr COLORREF kScrollThumbGray = RGB(210, 210, 210);
 constexpr COLORREF kComboScrollTrackGray = RGB(238, 238, 238);
 constexpr COLORREF kComboScrollThumbGray = RGB(142, 142, 142);
 constexpr COLORREF kComboPopupBorderGray = RGB(154, 154, 154);
-constexpr COLORREF kLineGreen = RGB(197, 220, 205);
 constexpr COLORREF kText = RGB(28, 28, 28);
 constexpr COLORREF kHint = RGB(165, 165, 165);
-constexpr COLORREF kIndexGreen = RGB(75, 166, 103);
 constexpr COLORREF kWhite = RGB(255, 255, 255);
 constexpr COLORREF kCrosshairBlue = RGB(0, 120, 215);
 constexpr COLORREF kPanel = RGB(246, 246, 246);
-constexpr COLORREF kButtonDisabledGreen = RGB(190, 205, 194);
 constexpr COLORREF kButtonDisabledText = RGB(235, 235, 235);
-constexpr COLORREF kBatchSelectedRow = RGB(232, 245, 238);
 constexpr COLORREF kComboBorderGray = RGB(204, 204, 204);
-constexpr COLORREF kComboMenuHoverBlue = RGB(229, 243, 255);
-constexpr COLORREF kComboMenuSelectBlue = RGB(0, 102, 204);
 constexpr COLORREF kComboMenuSelectText = RGB(255, 255, 255);
 constexpr int kEditorPopupItemH = 32;
 constexpr int kEditorPopupMaxHeight = 450;
@@ -82,15 +67,48 @@ constexpr int kWindowEdgeShadowMaxAlpha = 48;
 // 编辑界面下拉框基准尺寸（1024×768 设计稿，缩放后在 1200×1080 下约为 150×30 / 240×30）
 constexpr int kEditorModeComboW = 128;
 constexpr int kEditorModeComboH = 21;
+constexpr int kEditorWmSelectMethodComboW = 250;
+constexpr int kEditorWmSpecifyBtnW = 92;
+// 编辑页顶部宏名称行 — 设计稿坐标（紧贴标题栏下方），布局时经 MulDiv 缩放
+constexpr int kEditorChromeIndent = 10;
+constexpr int kEditorMacroHeaderRowY = 40;
+constexpr int kEditorMacroHeaderRowH = 26;
+constexpr int kEditorMacroNameLabelX = 15 + kEditorChromeIndent;
+constexpr int kEditorMacroNameLabelW = 66;
+constexpr int kEditorMacroNameEditX = 83 + kEditorChromeIndent;
+constexpr int kEditorMacroNameEditW = 690;
+constexpr int kEditorListLabelX = 13 + kEditorChromeIndent;
+// 动作列表工具栏（批量编辑等）— 位于宏名称/窗口模式行下方
+constexpr int kEditorToolbarBtnY = 108;
+constexpr int kEditorToolbarBtnH = 31;
+constexpr int kEditorToolbarLabelY = 112;
+constexpr int kEditorListColumnHeaderY = 148;
+constexpr int kEditorActionComboY = 126;
+// 窗口模式顶部两行：左缘与宏名称输入对齐，右缘止于动作列表区域
+constexpr int kEditorWmContentRight = 776;
+constexpr int kEditorWmHeaderGap = 8;
+constexpr int kEditorWmNameEditW = 160;
+constexpr int kEditorWmModeComboW = 100;
+constexpr int kEditorWmModeLabelW = 40;
+constexpr int kEditorWmSelectMethodLabelW = 100;
+constexpr int kEditorWmRowGap = 8;
+// 默认模式脱离时间行 — 紧贴宏名称行下方，左缘与宏名称标签对齐
+constexpr int kEditorBreakoutRowY = kEditorMacroHeaderRowY + kEditorMacroHeaderRowH + kEditorWmRowGap;
+constexpr int kEditorBreakoutLabelX = kEditorMacroNameLabelX;
+constexpr int kEditorBreakoutLabelW = 68;
+constexpr int kEditorBreakoutEditX = kEditorMacroNameEditX;
+constexpr int kEditorBreakoutEditW = 80;
+constexpr int kEditorWmTargetBrowseW = 50;
+constexpr int kEditorWmTargetCrosshairW = 136;
+constexpr int kEditorWmTargetBtnGap = 6;
 constexpr int kEditorActionComboW = 205;
 constexpr int kEditorActionComboH = 21;
 constexpr int kEditorComboRight = 995;
 constexpr int kEditorPanelLeft = kEditorComboRight - kEditorActionComboW;
-constexpr int kEditorParamComboY = 204;
+constexpr int kEditorParamComboY = 212;
 constexpr int kEditorLabelGap = 8;
 constexpr int kEditorLabelAboveComboH = 22;
 constexpr int kEditorLabelAboveComboY = kEditorParamComboY - kEditorLabelGap - kEditorLabelAboveComboH;
-constexpr COLORREF kComboHoverGreen = RGB(232, 248, 239);
 constexpr COLORREF kGrayButton = RGB(240, 240, 240);
 constexpr COLORREF kGrayButtonHover = RGB(220, 220, 220);
 constexpr COLORREF kGrayButtonBorder = RGB(173, 173, 173);
@@ -170,7 +188,7 @@ constexpr int kEditorAddY = 552;
 
 // 参数面板滚动区（设计稿 1024×768；1200×1080 下约为 left=920 top=225 right=1175 bottom=980）
 constexpr int kParamScrollLeftDesign = 785;
-constexpr int kParamScrollTopDesign = 160;
+constexpr int kParamScrollTopDesign = 168;
 constexpr int kParamScrollRightDesign = 1003;
 constexpr int kParamScrollBottomDesign = 697;
 constexpr int kParamScrollEditorRightMarginDesign = 6;
@@ -206,7 +224,57 @@ constexpr UINT WM_AGENT_SCRIPT_LIBRARY_CHANGED = WM_APP + 20;
 constexpr UINT WM_EDITOR_PARAM_CHROME = WM_APP + 21;
 constexpr UINT WM_APP_PROMPT = WM_APP + 22;
 constexpr UINT WM_OCR_SUBPANEL_REFRESH = WM_APP + 23;
+constexpr UINT WM_WINDOW_MODE_TEST_DONE = WM_APP + 24;
+constexpr UINT WM_APP_UI_SCALE_SYNC = WM_APP + 25;
+constexpr UINT WM_APP_UI_LAYOUT_REFRESH = WM_APP + 26;
+constexpr UINT WM_APP_BREAKOUT_UI = WM_APP + 27;
+constexpr UINT WM_APP_RESTORE_INSTANCE = WM_APP + 28;
+constexpr UINT WM_APP_QUIT_APP = WM_APP + 29;
+constexpr UINT WM_APP_ENSURE_TRAY = WM_APP + 30;
+constexpr UINT WM_APP_EDITOR_FINISH_OPEN = WM_APP + 31;
+constexpr UINT WM_APP_HOME_REFRESH_LISTS = WM_APP + 32;
+constexpr UINT WM_APP_OPTIMIZE_LOAD = WM_APP + 33;
+constexpr UINT WM_APP_OPTIMIZE_LOADED = WM_APP + 34;
+constexpr UINT WM_APP_OPTIMIZE_PRERENDER = WM_APP + 35;
+constexpr UINT WM_APP_EDITOR_PARSE_MORE = WM_APP + 36;
 constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
+
+// ── 主题感知颜色（运行时随 CurrentTheme() 变化） ──────────────────
+#include "app_theme.h"
+#define kMainGreen (quickscript::CurrentTheme().mainColor)
+#define kDarkGreen (quickscript::CurrentTheme().darkColor)
+#define kCardGreen (quickscript::CurrentTheme().cardColor)
+#define kCardHoverGreen (quickscript::CurrentTheme().cardHoverColor)
+#define kButtonGreen (quickscript::CurrentTheme().buttonColor)
+#define kButtonGreenHover (quickscript::CurrentTheme().buttonHoverColor)
+#define kOrange (quickscript::CurrentTheme().accentColor)
+#define kLineGreen (quickscript::CurrentTheme().lineColor)
+#define kIndexGreen (quickscript::CurrentTheme().indexColor)
+#define kButtonDisabledGreen (quickscript::CurrentTheme().buttonDisabled)
+#define kBatchSelectedRow (quickscript::CurrentTheme().batchSelectedRow)
+#define kComboHoverGreen (quickscript::CurrentTheme().comboHover)
+#define kComboMenuHoverBlue (quickscript::CurrentTheme().comboMenuHover)
+#define kComboMenuSelectBlue (quickscript::CurrentTheme().comboMenuSelect)
+#define kTabGradientStart (quickscript::CurrentTheme().tabGradientStart)
+#define kTabGradientEnd (quickscript::CurrentTheme().tabGradientEnd)
+#define kNavStripGreen (quickscript::CurrentTheme().navStripColor)
+#define kTabActiveGreen (quickscript::CurrentTheme().tabActiveColor)
+#define kCloseHover (quickscript::CurrentTheme().closeHover)
+#define kCreateYellow (quickscript::CurrentTheme().bannerBg)
+#define kSelectedYellow (quickscript::CurrentTheme().selectedTagBg)
+#define kBannerTag (quickscript::CurrentTheme().bannerTag)
+#define kBannerText (quickscript::CurrentTheme().bannerText)
+#define kSecondaryText (quickscript::CurrentTheme().secondaryText)
+#define kFooterHint (quickscript::CurrentTheme().footerHint)
+#define kHomeScrollTrack (quickscript::CurrentTheme().scrollTrack)
+#define kHomeScrollThumb (quickscript::CurrentTheme().scrollThumb)
+#define kPromptDialogBg (quickscript::CurrentTheme().promptBg)
+#define kPromptDialogBorder (quickscript::CurrentTheme().promptBorder)
+#define kPromptText (quickscript::CurrentTheme().promptText)
+#define kPromptOkFill (quickscript::CurrentTheme().promptOkFill)
+#define kPromptOkHover (quickscript::CurrentTheme().promptOkHover)
+#define kPromptOkText (quickscript::CurrentTheme().promptOkText)
+#define kPromptCancelBorder (quickscript::CurrentTheme().promptCancelBorder)
 constexpr int HOTKEY_COMMON_ID = 701;
 constexpr int HOTKEY_GLOBAL_ID = 702;
 constexpr int HOTKEY_SCRIPT_BASE = 800;
@@ -214,4 +282,7 @@ constexpr BYTE kUiFontQuality = CLEARTYPE_NATURAL_QUALITY;
 constexpr UINT kHoverTimerId = 9001;
 constexpr UINT kQuickInputTipTimerId = 9002;
 constexpr UINT kScheduledTaskTimerId = 9003;
+constexpr UINT kDisplaySyncTimerId = 9005;
+constexpr UINT kWindowModePreviewTimerId = 9004;
+constexpr UINT kBreakoutReturnTimerId = 9006;
 constexpr int kQuickInputTipDelayMs = 500;

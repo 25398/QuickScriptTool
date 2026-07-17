@@ -3,6 +3,7 @@
 #include "action_utils.h"
 #include "drawing.h"
 #include "modern_edit.h"
+#include "render_context.h"
 #include "taskbar_window.h"
 
 #include <windowsx.h>
@@ -11,44 +12,6 @@
 #include <cmath>
 
 namespace {
-
-void DrawTextIn(HDC hdc, const std::wstring& text, RECT rc, COLORREF color,
-                UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS) {
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, color);
-    DrawTextW(hdc, text.c_str(), static_cast<int>(text.size()), &rc, format);
-}
-
-void FillAlphaRect(HDC hdc, RECT rc, COLORREF color, BYTE alpha) {
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = alpha;
-    bf.AlphaFormat = 0;
-    HDC mem = CreateCompatibleDC(hdc);
-    const int w = rc.right - rc.left;
-    const int h = rc.bottom - rc.top;
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp) {
-        DeleteDC(mem);
-        return;
-    }
-    HGDIOBJ old = SelectObject(mem, bmp);
-    HBRUSH brush = CreateSolidBrush(color);
-    RECT fill{0, 0, w, h};
-    FillRect(mem, &fill, brush);
-    DeleteObject(brush);
-    AlphaBlend(hdc, rc.left, rc.top, w, h, mem, 0, 0, w, h, bf);
-    SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
-}
 
 int FormatMatchPercent(double score) {
     return static_cast<int>(std::lround(std::clamp(score, 0.0, 100.0)));
@@ -93,7 +56,12 @@ std::wstring FormatMoveMouseDebug(const ScriptAction& action, int x, int y) {
     return BracketIndex(action) + L"移动鼠标到(" + std::to_wstring(x) + L"," + std::to_wstring(y) + L")";
 }
 
-std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchResult& rawMatch) {
+std::wstring FormatMoveMouseRelativeDebug(const ScriptAction& action, int dx, int dy) {
+    return BracketIndex(action) + L"相对移动鼠标(" + std::to_wstring(dx) + L"," + std::to_wstring(dy) + L")";
+}
+
+std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchResult& rawMatch,
+                                  bool hasTarget, int targetX, int targetY) {
     const std::wstring prefix = BracketIndex(action) + L"找图，";
     const int pct = FormatMatchPercent(rawMatch.score);
     const std::wstring varName = action.matchVarName.empty() ? L"matchRet" : action.matchVarName;
@@ -107,10 +75,12 @@ std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchRe
         return prefix + pctText + L"，未找到匹配";
     }
     const wchar_t* follow = FindImageFollowText(action.findImageFollowUp);
-    if (follow[0]) {
-        return prefix + pctText + L"，" + follow;
+    std::wstring line = prefix + pctText;
+    if (follow[0]) line += L"，" + std::wstring(follow);
+    if (hasTarget && (action.findImageFollowUp == 0 || action.findImageFollowUp == 1)) {
+        line += L"(" + std::to_wstring(targetX) + L"," + std::to_wstring(targetY) + L")";
     }
-    return prefix + pctText;
+    return line;
 }
 
 std::wstring FormatOcrDebug(const ScriptAction& action, const std::wstring& textContent,
@@ -175,14 +145,13 @@ void MacroDebugWindow::Create(HFONT bodyFont, HFONT titleFont, HFONT closeFont,
 
     ApplyTaskbarWindowStyle(hwnd_, L"宏调试信息输出窗口", true);
 
-    const RECT content = RECT{
-        kContentPad, kTitleH + kContentPad,
-        kWindowW - kContentPad, kWindowH - kContentPad};
+    // 不用 WS_EX_CLIENTEDGE：经典凹陷边在父窗口 BitBlt 时会闪；改为父窗口画 1px 灰边
+    const RECT frame = ContentFrameRect();
     edit_ = CreateWindowExW(
-        WS_EX_CLIENTEDGE, L"EDIT", L"",
+        0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        content.left, content.top,
-        content.right - content.left, content.bottom - content.top,
+        frame.left + 1, frame.top + 1,
+        (frame.right - frame.left) - 2, (frame.bottom - frame.top) - 2,
         hwnd_, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr);
     if (edit_ && bodyFont_) {
         SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
@@ -228,16 +197,21 @@ void MacroDebugWindow::AppendLog(const std::wstring& text) {
 
 void MacroDebugWindow::ClearLog() {
     if (!hwnd_) return;
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        pendingLogs_.clear();
+        ++clearEpoch_;
+    }
     PostMessageW(hwnd_, WM_DEBUG_CLEAR, 0, 0);
 }
 
 void MacroDebugWindow::ClearLogDirect() {
-    if (!edit_) return;
-    SetWindowTextW(edit_, L"");
     {
         std::lock_guard<std::mutex> lock(logMutex_);
         pendingLogs_.clear();
+        ++clearEpoch_;
     }
+    if (edit_) SetWindowTextW(edit_, L"");
 }
 
 void MacroDebugWindow::AppendLogDirect(const std::wstring& text) {
@@ -250,11 +224,19 @@ void MacroDebugWindow::AppendLogDirect(const std::wstring& text) {
 
 void MacroDebugWindow::FlushPendingLogs() {
     std::vector<std::wstring> batch;
+    unsigned epoch = 0;
     {
         std::lock_guard<std::mutex> lock(logMutex_);
         batch.swap(pendingLogs_);
+        epoch = clearEpoch_;
     }
-    for (const auto& line : batch) AppendLogDirect(line);
+    for (const auto& line : batch) {
+        {
+            std::lock_guard<std::mutex> lock(logMutex_);
+            if (clearEpoch_ != epoch) return;
+        }
+        AppendLogDirect(line);
+    }
 }
 
 void MacroDebugWindow::ApplyTopmost() {
@@ -265,19 +247,37 @@ void MacroDebugWindow::ApplyTopmost() {
 
 void MacroDebugWindow::PositionEdit() {
     if (!edit_) return;
-    RECT rc{};
-    GetClientRect(hwnd_, &rc);
-    const RECT content{
-        kContentPad, kTitleH + kContentPad,
-        rc.right - kContentPad, rc.bottom - kContentPad};
-    MoveWindow(edit_, content.left, content.top,
-        content.right - content.left, content.bottom - content.top, TRUE);
+    const RECT frame = ContentFrameRect();
+    const int w = std::max(1, static_cast<int>(frame.right - frame.left) - 2);
+    const int h = std::max(1, static_cast<int>(frame.bottom - frame.top) - 2);
+    MoveWindow(edit_, frame.left + 1, frame.top + 1, w, h, TRUE);
 }
 
 int MacroDebugWindow::ClientWidth() const {
     RECT rc{};
     if (hwnd_) GetClientRect(hwnd_, &rc);
     return rc.right > 0 ? rc.right : kWindowW;
+}
+
+RECT MacroDebugWindow::TitleBarRect() const {
+    return RECT{0, 0, ClientWidth(), kTitleH};
+}
+
+RECT MacroDebugWindow::ContentFrameRect() const {
+    RECT rc{};
+    if (hwnd_) GetClientRect(hwnd_, &rc);
+    else rc = RECT{0, 0, kWindowW, kWindowH};
+    return RECT{
+        kContentPad,
+        kTitleH + kContentPad,
+        rc.right - kContentPad,
+        rc.bottom - kContentPad};
+}
+
+void MacroDebugWindow::InvalidateTitleBar() {
+    if (!hwnd_) return;
+    RECT title = TitleBarRect();
+    InvalidateRect(hwnd_, &title, FALSE);
 }
 
 RECT MacroDebugWindow::CloseRect() const {
@@ -315,56 +315,55 @@ bool MacroDebugWindow::HitTitleBar(int x, int y) const {
 }
 
 void MacroDebugWindow::DrawPinIcon(HDC hdc, const RECT& rc, bool pinned) {
+    // 微信风格置顶图钉：平头顶 + 梯形针身 + 竖直针尖
     const int cx = (rc.left + rc.right) / 2;
-    const int cy = (rc.top + rc.bottom) / 2 + 1;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const COLORREF color = pinned ? kWhite : RGB(190, 220, 200);
+    const float stroke = pinned ? 2.0f : 1.6f;
+    IRenderContext& ctx = ResolveRenderContext(hdc);
+
+    const int topY = cy - 8;
+    const int bodyTop = cy - 5;
+    const int bodyBot = cy + 2;
+    const int tipY = cy + 10;
+    const int headHalf = 6;
+    const int bodyTopHalf = 4;
+    const int bodyBotHalf = 3;
+
+    ctx.DrawLine(cx - headHalf, topY, cx + headHalf, topY, color, stroke);
+    POINT body[4] = {
+        {cx - bodyTopHalf, bodyTop},
+        {cx + bodyTopHalf, bodyTop},
+        {cx + bodyBotHalf, bodyBot},
+        {cx - bodyBotHalf, bodyBot},
+    };
     if (pinned) {
-        HBRUSH headBrush = CreateSolidBrush(RGB(255, 255, 220));
-        HGDIOBJ oldBrush = SelectObject(hdc, headBrush);
-        HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        const int headR = 6;
-        Ellipse(hdc, cx - headR, cy - headR - 4, cx + headR, cy + headR - 4);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(headBrush);
-        HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-        oldPen = SelectObject(hdc, pen);
-        oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Ellipse(hdc, cx - headR, cy - headR - 4, cx + headR, cy + headR - 4);
-        MoveToEx(hdc, cx, cy + 1, nullptr);
-        LineTo(hdc, cx, cy + 10);
-        MoveToEx(hdc, cx - 5, cy + 10, nullptr);
-        LineTo(hdc, cx + 5, cy + 10);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
+        ctx.DrawPolygon(body, 4, color, true);
     } else {
-        HPEN pen = CreatePen(PS_SOLID, 2, RGB(190, 220, 200));
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        const int headR = 5;
-        Ellipse(hdc, cx - headR, cy - headR - 4, cx + headR, cy + headR - 4);
-        MoveToEx(hdc, cx, cy + 1, nullptr);
-        LineTo(hdc, cx, cy + 10);
-        MoveToEx(hdc, cx - 4, cy + 10, nullptr);
-        LineTo(hdc, cx + 4, cy + 10);
-        MoveToEx(hdc, rc.left + 8, rc.bottom - 8, nullptr);
-        LineTo(hdc, rc.right - 8, rc.top + 8);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
+        ctx.DrawLine(body[0].x, body[0].y, body[1].x, body[1].y, color, stroke);
+        ctx.DrawLine(body[1].x, body[1].y, body[2].x, body[2].y, color, stroke);
+        ctx.DrawLine(body[2].x, body[2].y, body[3].x, body[3].y, color, stroke);
+        ctx.DrawLine(body[3].x, body[3].y, body[0].x, body[0].y, color, stroke);
     }
+    ctx.DrawLine(cx, bodyBot, cx, tipY, color, stroke);
 }
 
 void MacroDebugWindow::DrawTitleButtons(HDC hdc) {
     if (pinned_) {
-        FillAlphaRect(hdc, PinRect(), RGB(255, 210, 80), 90);
+        ::FillAlphaRect(hdc, PinRect(), RGB(255, 210, 80), 90);
     }
-    if (hoverPin_) FillAlphaRect(hdc, PinRect(), RGB(0, 0, 0), kCloseHoverAlpha);
-    if (hoverMin_) FillAlphaRect(hdc, MinimizeRect(), RGB(0, 0, 0), kCloseHoverAlpha);
-    if (hoverClose_) FillAlphaRect(hdc, CloseRect(), RGB(0, 0, 0), kCloseHoverAlpha);
+    if (hoverPin_) ::FillAlphaRect(hdc, PinRect(), RGB(0, 0, 0), kCloseHoverAlpha);
+    if (hoverMin_) ::FillAlphaRect(hdc, MinimizeRect(), RGB(0, 0, 0), kCloseHoverAlpha);
+    if (hoverClose_) ::FillAlphaRect(hdc, CloseRect(), RGB(0, 0, 0), kCloseHoverAlpha);
     DrawPinIcon(hdc, PinRect(), pinned_);
+
+    // 用线段绘制最小化“-”，避免字体字形被渲染成竖线
+    const RECT minRc = MinimizeRect();
+    const int minCx = (minRc.left + minRc.right) / 2;
+    const int minCy = (minRc.top + minRc.bottom) / 2;
+    ResolveRenderContext(hdc).DrawLine(minCx - 7, minCy, minCx + 7, minCy, kWhite, 2.0f);
+
     SelectObject(hdc, closeFont_);
-    DrawTextIn(hdc, L"−", MinimizeRect(), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     DrawTextIn(hdc, L"×", CloseRect(), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -376,15 +375,31 @@ void MacroDebugWindow::Paint() {
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
     HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    RenderBatchScope batch(mem);
 
     FillRectColor(mem, rc, kBatchSelectedRow);
-    FillRectColor(mem, RECT{0, 0, rc.right, kTitleH}, kMainGreen);
+    FillRectColor(mem, TitleBarRect(), kMainGreen);
+    // 内容区底板 + 灰边（EDIT 内缩 1px）；边框画在父窗口上，避免 CLIENTEDGE 被盖住后闪
+    const RECT frame = ContentFrameRect();
+    if (frame.right > frame.left && frame.bottom > frame.top) {
+        FillRectColor(mem, frame, kWhite);
+        DrawBorderRect(mem, frame, kComboBorderGray);
+    }
     SelectObject(mem, titleFont_);
     DrawTextIn(mem, L"宏调试信息输出窗口",
         RECT{16, 0, rc.right - kTitleBtnW * 3, kTitleH}, kWhite,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawTitleButtons(mem);
 
+    batch.End();
+    // 禁止 BitBlt 盖住 EDIT：否则悬停标题按钮全窗重绘时，日志区会被薄荷绿盖住再重画，
+    // ClearType/边框会“突然变一下”，像字体跳变。
+    if (edit_ && IsWindowVisible(edit_)) {
+        RECT editRc{};
+        GetWindowRect(edit_, &editRc);
+        MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&editRc), 2);
+        ExcludeClipRect(hdc, editRc.left, editRc.top, editRc.right, editRc.bottom);
+    }
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -421,6 +436,13 @@ LRESULT MacroDebugWindow::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND:
         return 1;
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetBkColor(dc, kWhite);
+        SetTextColor(dc, kText);
+        return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    }
     case WM_SIZE:
         PositionEdit();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -438,7 +460,7 @@ LRESULT MacroDebugWindow::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             hoverPin_ = hoverPin;
             hoverMin_ = hoverMin;
             hoverClose_ = hoverClose;
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            InvalidateTitleBar();
         }
         if (hoverPin || hoverMin || hoverClose) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
@@ -461,7 +483,7 @@ LRESULT MacroDebugWindow::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (HitPin(x, y)) {
             pinned_ = !pinned_;
             ApplyTopmost();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            InvalidateTitleBar();
             return 0;
         }
         if (HitTitleBar(x, y)) {

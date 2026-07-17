@@ -1,15 +1,26 @@
 #include "script_io.h"
 
 #include "action_utils.h"
+#include "coord_space.h"
+#include "window_mode/window_mode_json.h"
 
 #include <fstream>
 #include <sstream>
 
-ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo) {
+bool IsRecordingScriptPath(const std::wstring& path) {
+    const std::wstring dir = RecordingsDir();
+    if (path.size() < dir.size()) return false;
+    if (_wcsnicmp(path.c_str(), dir.c_str(), dir.size()) != 0) return false;
+    return path.size() == dir.size() || path[dir.size()] == L'\\';
+}
+
+ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo,
+    bool coordsNormalized) {
     ScriptAction a{};
     const auto type = ExtractString(block, L"type");
     if (type.empty()) return a;
     if (type == L"moveMouse") a.type = ActionType::MoveMouse;
+    else if (type == L"moveMouseRelative") a.type = ActionType::MoveMouseRelative;
     else if (type == L"mouseDown") a.type = ActionType::MouseDown;
     else if (type == L"mouseUp") a.type = ActionType::MouseUp;
     else if (type == L"mouseClick") a.type = ActionType::MouseClick;
@@ -48,10 +59,57 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.remark = ExtractString(block, L"remark");
     a.originalNo = static_cast<int>(ExtractNumber(block, L"no", static_cast<double>(fallbackNo + 1)));
     a.indent = static_cast<int>(ExtractNumber(block, L"indent", 0));
-    a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
-    a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
-    a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
-    a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
+
+    if (a.type == ActionType::MoveMouseRelative) {
+        // 相对位移始终为整型像素 dx/dy，不参与屏幕归一化
+        a.coordsAreNormalized = false;
+        a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
+        a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
+        a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
+        a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
+        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
+        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
+        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
+        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
+        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
+        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
+        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+    } else if (coordsNormalized) {
+        // 从 JSON 读取归一化坐标（0.0–1.0 浮点数）
+        a.coordsAreNormalized = true;
+        a.nx = ExtractNumber(block, L"x", 0.0);
+        a.ny = ExtractNumber(block, L"y", 0.0);
+        a.nRandomX = ExtractNumber(block, L"randomX", 0.0);
+        a.nRandomY = ExtractNumber(block, L"randomY", 0.0);
+        a.nSearchX1 = ExtractNumber(block, L"searchX1", 0.0);
+        a.nSearchY1 = ExtractNumber(block, L"searchY1", 0.0);
+        a.nSearchX2 = ExtractNumber(block, L"searchX2", 0.0);
+        a.nSearchY2 = ExtractNumber(block, L"searchY2", 0.0);
+        a.nOffsetX = ExtractNumber(block, L"offsetX", 0.0);
+        a.nOffsetY = ExtractNumber(block, L"offsetY", 0.0);
+        a.nAiSearchX1 = ExtractNumber(block, L"aiSearchX1", 0.0);
+        a.nAiSearchY1 = ExtractNumber(block, L"aiSearchY1", 0.0);
+        a.nAiSearchX2 = ExtractNumber(block, L"aiSearchX2", 0.0);
+        a.nAiSearchY2 = ExtractNumber(block, L"aiSearchY2", 0.0);
+    } else {
+        a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
+        a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
+        a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
+        a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
+        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
+        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
+        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
+        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
+        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
+        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
+        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+    }
     a.moveFromVar = ExtractNumber(block, L"moveFromVar", 0) != 0;
     a.moveVarExprX = ExtractString(block, L"moveVarExprX");
     a.moveVarExprY = ExtractString(block, L"moveVarExprY");
@@ -75,7 +133,9 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.holdRightShift = ExtractNumber(block, L"holdRightShift", 0) != 0;
     a.clickCount = static_cast<int>(ExtractNumber(block, L"clickCount", 1));
     a.duration = ExtractNumber(block, L"duration", 0.1);
-    a.randomDuration = ExtractNumber(block, L"randomDuration", 0);
+    a.randomDuration = ExtractNumber(block, L"randomDuration", 0.0);
+    a.timingUs = static_cast<uint64_t>(std::max(0.0,
+        ExtractNumber(block, L"timingUs", 0.0)));
     a.loopCount = static_cast<int>(ExtractNumber(block, L"loopCount", -1));
     a.loopVarName = ExtractString(block, L"loopVarName");
     a.loopFromVar = ExtractNumber(block, L"loopFromVar", 0) != 0;
@@ -89,10 +149,12 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.scrollHorizontal = ExtractNumber(block, L"scrollHorizontal", 0) != 0;
     a.scrollSteps = static_cast<int>(ExtractNumber(block, L"scrollSteps", 1));
     a.scrollDirection = static_cast<int>(ExtractNumber(block, L"scrollDirection", 0));
-    a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
-    a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
-    a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
-    a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
+    if (!coordsNormalized) {
+        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
+        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
+        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
+        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
+    }
     a.searchFullScreen = ExtractNumber(block, L"searchFullScreen", 1) != 0;
     a.imagePath = ExtractString(block, L"imagePath");
     if (!a.imagePath.empty()) a.imagePath = ResolveImagePath(a.imagePath);
@@ -101,8 +163,10 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.imageScaleMin = ExtractNumber(block, L"imageScaleMin", a.imageScale);
     a.imageScaleMax = ExtractNumber(block, L"imageScaleMax", a.imageScale);
     a.findImageFollowUp = static_cast<int>(ExtractNumber(block, L"findImageFollowUp", 0));
-    a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
-    a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
+    if (!coordsNormalized) {
+        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
+        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
+    }
     a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
     a.findTimeExpr = ExtractString(block, L"findTimeExpr");
     if (a.findTimeExpr.empty()) a.findTimeExpr = L"0";
@@ -130,10 +194,12 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.aiTargetImagePath = ExtractString(block, L"aiTargetImagePath");
     if (!a.aiTargetImagePath.empty()) a.aiTargetImagePath = ResolveImagePath(a.aiTargetImagePath);
     a.aiSearchRegion = static_cast<int>(ExtractNumber(block, L"aiSearchRegion", 0));
-    a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
-    a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
-    a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
-    a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+    if (!coordsNormalized) {
+        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+    }
     a.aiMaxSteps = static_cast<int>(ExtractNumber(block, L"aiMaxSteps", 10));
     a.aiWithImage = ExtractNumber(block, L"aiWithImage", 1) != 0;
     a.aiFallbackValue = ExtractString(block, L"aiFallbackValue");
@@ -148,10 +214,18 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"remark\": \"" << EscapeJson(a.remark) << L"\",\n";
     file << L"      \"no\": " << a.originalNo << L",\n";
     file << L"      \"indent\": " << a.indent << L",\n";
-    file << L"      \"x\": " << a.x << L",\n";
-    file << L"      \"y\": " << a.y << L",\n";
-    file << L"      \"randomX\": " << a.randomX << L",\n";
-    file << L"      \"randomY\": " << a.randomY << L",\n";
+    if (a.type == ActionType::MoveMouseRelative || !a.coordsAreNormalized) {
+        file << L"      \"x\": " << a.x << L",\n";
+        file << L"      \"y\": " << a.y << L",\n";
+        file << L"      \"randomX\": " << a.randomX << L",\n";
+        file << L"      \"randomY\": " << a.randomY << L",\n";
+    } else {
+        // 写入归一化坐标（0.0–1.0 浮点数）
+        file << L"      \"x\": " << a.nx << L",\n";
+        file << L"      \"y\": " << a.ny << L",\n";
+        file << L"      \"randomX\": " << a.nRandomX << L",\n";
+        file << L"      \"randomY\": " << a.nRandomY << L",\n";
+    }
     file << L"      \"moveFromVar\": " << (a.moveFromVar ? 1 : 0) << L",\n";
     file << L"      \"moveVarExprX\": \"" << EscapeJson(a.moveVarExprX) << L"\",\n";
     file << L"      \"moveVarExprY\": \"" << EscapeJson(a.moveVarExprY) << L"\",\n";
@@ -169,6 +243,9 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"clickCount\": " << a.clickCount << L",\n";
     file << L"      \"duration\": " << a.duration << L",\n";
     file << L"      \"randomDuration\": " << a.randomDuration << L",\n";
+    if (a.timingUs > 0) {
+        file << L"      \"timingUs\": " << a.timingUs << L",\n";
+    }
     file << L"      \"loopCount\": " << a.loopCount << L",\n";
     file << L"      \"loopVarName\": \"" << EscapeJson(a.loopVarName) << L"\",\n";
     file << L"      \"loopFromVar\": " << (a.loopFromVar ? 1 : 0) << L",\n";
@@ -182,10 +259,17 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"scrollHorizontal\": " << (a.scrollHorizontal ? 1 : 0) << L",\n";
     file << L"      \"scrollSteps\": " << a.scrollSteps << L",\n";
     file << L"      \"scrollDirection\": " << a.scrollDirection << L",\n";
-    file << L"      \"searchX1\": " << a.searchX1 << L",\n";
-    file << L"      \"searchY1\": " << a.searchY1 << L",\n";
-    file << L"      \"searchX2\": " << a.searchX2 << L",\n";
-    file << L"      \"searchY2\": " << a.searchY2 << L",\n";
+    if (a.coordsAreNormalized) {
+        file << L"      \"searchX1\": " << a.nSearchX1 << L",\n";
+        file << L"      \"searchY1\": " << a.nSearchY1 << L",\n";
+        file << L"      \"searchX2\": " << a.nSearchX2 << L",\n";
+        file << L"      \"searchY2\": " << a.nSearchY2 << L",\n";
+    } else {
+        file << L"      \"searchX1\": " << a.searchX1 << L",\n";
+        file << L"      \"searchY1\": " << a.searchY1 << L",\n";
+        file << L"      \"searchX2\": " << a.searchX2 << L",\n";
+        file << L"      \"searchY2\": " << a.searchY2 << L",\n";
+    }
     file << L"      \"searchFullScreen\": " << (a.searchFullScreen ? 1 : 0) << L",\n";
     const std::wstring savedImagePath = [&]() -> std::wstring {
         if (a.type == ActionType::FindImage && !a.imagePath.empty()) {
@@ -202,8 +286,13 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"imageScaleMin\": " << a.imageScaleMin << L",\n";
     file << L"      \"imageScaleMax\": " << a.imageScaleMax << L",\n";
     file << L"      \"findImageFollowUp\": " << a.findImageFollowUp << L",\n";
-    file << L"      \"offsetX\": " << a.offsetX << L",\n";
-    file << L"      \"offsetY\": " << a.offsetY << L",\n";
+    if (a.coordsAreNormalized) {
+        file << L"      \"offsetX\": " << a.nOffsetX << L",\n";
+        file << L"      \"offsetY\": " << a.nOffsetY << L",\n";
+    } else {
+        file << L"      \"offsetX\": " << a.offsetX << L",\n";
+        file << L"      \"offsetY\": " << a.offsetY << L",\n";
+    }
     file << L"      \"findUntilFound\": " << (a.findUntilFound ? 1 : 0) << L",\n";
     file << L"      \"findTimeExpr\": \"" << EscapeJson(a.findTimeExpr) << L"\",\n";
     file << L"      \"matchVarName\": \"" << EscapeJson(a.matchVarName) << L"\",\n";
@@ -232,10 +321,17 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     }();
     file << L"      \"aiTargetImagePath\": \"" << EscapeJson(savedAiImagePath) << L"\",\n";
     file << L"      \"aiSearchRegion\": " << a.aiSearchRegion << L",\n";
-    file << L"      \"aiSearchX1\": " << a.aiSearchX1 << L",\n";
-    file << L"      \"aiSearchY1\": " << a.aiSearchY1 << L",\n";
-    file << L"      \"aiSearchX2\": " << a.aiSearchX2 << L",\n";
-    file << L"      \"aiSearchY2\": " << a.aiSearchY2 << L",\n";
+    if (a.coordsAreNormalized) {
+        file << L"      \"aiSearchX1\": " << a.nAiSearchX1 << L",\n";
+        file << L"      \"aiSearchY1\": " << a.nAiSearchY1 << L",\n";
+        file << L"      \"aiSearchX2\": " << a.nAiSearchX2 << L",\n";
+        file << L"      \"aiSearchY2\": " << a.nAiSearchY2 << L",\n";
+    } else {
+        file << L"      \"aiSearchX1\": " << a.aiSearchX1 << L",\n";
+        file << L"      \"aiSearchY1\": " << a.aiSearchY1 << L",\n";
+        file << L"      \"aiSearchX2\": " << a.aiSearchX2 << L",\n";
+        file << L"      \"aiSearchY2\": " << a.aiSearchY2 << L",\n";
+    }
     file << L"      \"aiMaxSteps\": " << a.aiMaxSteps << L",\n";
     file << L"      \"aiWithImage\": " << (a.aiWithImage ? 1 : 0) << L",\n";
     file << L"      \"aiFallbackValue\": \"" << EscapeJson(a.aiFallbackValue) << L"\",\n";
@@ -249,22 +345,89 @@ std::wstring ScriptActionToJsonString(const ScriptAction& a) {
     return file.str();
 }
 
-ScriptFileData LoadScriptFileData(const std::wstring& path) {
+namespace {
+
+bool ScriptNormValuesLookLikePixels(const std::vector<ScriptAction>& actions) {
+    for (const auto& a : actions) {
+        if (!a.coordsAreNormalized) continue;
+        if (a.nx > 1.5 || a.ny > 1.5 || a.nSearchX2 > 1.5 || a.nSearchY2 > 1.5
+            || a.nAiSearchX2 > 1.5 || a.nAiSearchY2 > 1.5) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDisplay) {
     ScriptFileData data{};
     if (path.empty()) return data;
     const auto content = ReadAll(path);
     data.scriptName = ExtractString(content, L"scriptName");
     data.recordTime = ExtractString(content, L"recordTime");
     data.durationSeconds = ExtractNumber(content, L"durationSeconds", 0);
+    data.recordingCaptureMode = static_cast<int>(
+        ExtractNumber(content, L"recordingCaptureMode", -1));
+    data.inputTimingVersion = std::max(0, static_cast<int>(
+        ExtractNumber(content, L"inputTimingVersion", 0)));
     data.hotkey.text = ExtractString(content, L"hotkeyText");
     data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
     data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
     data.hotkey.enabled = data.hotkey.vk != 0;
+    data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
+        ExtractNumber(content, L"breakoutTimeSeconds", 0));
+    data.windowMode = windowmode::ParseWindowModeJson(content);
+
+    // 解析 coordMeta
+    if (HasCoordMetaJson(content)) {
+        data.coordMeta = ParseCoordMetaJson(content);
+        data.coordsNormalized = true;
+    } else {
+        // 旧脚本：检查是否已是归一化格式（x/y 为 0.0–1.0 小数）
+        // 启发式：读取第一个 action 的 x 值，若为小数且 <= 1.0 则视为归一化
+        data.coordsNormalized = false;
+    }
+
+    // coordMeta 无效时回退为标准参考系
+    if (data.coordsNormalized
+        && (data.coordMeta.refWidth <= 0 || data.coordMeta.refHeight <= 0)) {
+        data.coordMeta = StandardScriptCoordMeta();
+    }
+
     const auto blocks = ExtractJsonActionBlocks(content);
     for (size_t i = 0; i < blocks.size(); ++i) {
         const auto type = ExtractString(blocks[i], L"type");
-        if (!type.empty()) data.actions.push_back(ParseScriptActionBlock(blocks[i], i));
+        if (!type.empty()) {
+            data.actions.push_back(
+                ParseScriptActionBlock(blocks[i], i, data.coordsNormalized));
+        }
     }
+
+    // coordMeta 存在但 actions 仍是像素值（早期/混合格式）→ 按 legacy 重解析
+    if (data.coordsNormalized && ScriptNormValuesLookLikePixels(data.actions)) {
+        data.actions.clear();
+        data.coordsNormalized = false;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            const auto type = ExtractString(blocks[i], L"type");
+            if (!type.empty()) {
+                data.actions.push_back(ParseScriptActionBlock(blocks[i], i, false));
+            }
+        }
+    }
+
+    // 旧脚本迁移：无 coordMeta 时，假设像素在标准 2560×1440 下，转为 n*
+    if (!data.coordsNormalized && !data.actions.empty()) {
+        data.coordMeta = StandardScriptCoordMeta();
+        MigrateLegacyScriptToNormalized(data.actions, data.coordMeta);
+        data.coordsNormalized = true;
+    }
+
+    // 编辑器显示：n* → 当前屏幕像素（运行副本由 PrepareScriptActionsForExecution 生成）
+    if (denormForDisplay && data.coordsNormalized && !data.actions.empty()) {
+        DenormalizeScriptToCurrentScreen(data.actions);
+    }
+
     return data;
 }
 
@@ -274,19 +437,68 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
     data.scriptName = ExtractString(content, L"scriptName");
     data.recordTime = ExtractString(content, L"recordTime");
     data.durationSeconds = ExtractNumber(content, L"durationSeconds", 0);
+    data.recordingCaptureMode = static_cast<int>(
+        ExtractNumber(content, L"recordingCaptureMode", -1));
+    data.inputTimingVersion = std::max(0, static_cast<int>(
+        ExtractNumber(content, L"inputTimingVersion", 0)));
     data.hotkey.text = ExtractString(content, L"hotkeyText");
     data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
     data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
     data.hotkey.enabled = data.hotkey.vk != 0;
+    data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
+        ExtractNumber(content, L"breakoutTimeSeconds", 0));
+    data.windowMode = windowmode::ParseWindowModeJson(content);
+
+    if (HasCoordMetaJson(content)) {
+        data.coordMeta = ParseCoordMetaJson(content);
+        data.coordsNormalized = true;
+    }
+
+    if (data.coordsNormalized
+        && (data.coordMeta.refWidth <= 0 || data.coordMeta.refHeight <= 0)) {
+        data.coordMeta = StandardScriptCoordMeta();
+    }
+
     const auto blocks = ExtractJsonActionBlocks(content);
     for (size_t i = 0; i < blocks.size(); ++i) {
         const auto type = ExtractString(blocks[i], L"type");
-        if (!type.empty()) data.actions.push_back(ParseScriptActionBlock(blocks[i], i));
+        if (!type.empty()) {
+            data.actions.push_back(
+                ParseScriptActionBlock(blocks[i], i, data.coordsNormalized));
+        }
     }
+
+    if (!data.coordsNormalized && !data.actions.empty()) {
+        data.coordMeta = StandardScriptCoordMeta();
+        MigrateLegacyScriptToNormalized(data.actions, data.coordMeta);
+        data.coordsNormalized = true;
+    }
+
+    if (data.coordsNormalized && !data.actions.empty()) {
+        DenormalizeScriptToCurrentScreen(data.actions);
+    }
+
     return data;
 }
 
 bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data) {
+    ScriptFileData normalized = data;
+    normalized.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(normalized.breakoutTimeSeconds);
+    if (IsRecordingScriptPath(path)) {
+        normalized.windowMode = windowmode::DefaultWindowModeConfig();
+        normalized.breakoutTimeSeconds = 0;
+    } else if (normalized.windowMode.enabled) {
+        normalized.breakoutTimeSeconds = 0;
+    }
+
+    // 像素→n* 用当前屏幕；JSON coordMeta 固定为标准 2560×1440
+    CoordMeta pixelMeta = CaptureCurrentCoordMeta(
+        normalized.windowMode.enabled ? &normalized.windowMode : nullptr);
+    const CoordMeta storeMeta = BuildScriptCoordMetaForSave(pixelMeta);
+
+    std::vector<ScriptAction> saveActions = normalized.actions;
+    SyncNormFieldsFromPixels(saveActions, pixelMeta);
+
     std::wstringstream file;
     std::ofstream out(path, std::ios::binary);
     if (!out) return false;
@@ -297,12 +509,33 @@ bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data) {
     if (data.durationSeconds > 0) {
         file << L"  \"durationSeconds\": " << data.durationSeconds << L",\n";
     }
+    if (normalized.recordingCaptureMode >= 0) {
+        file << L"  \"recordingCaptureMode\": "
+             << std::clamp(normalized.recordingCaptureMode, 0, 2) << L",\n";
+    }
+    if (normalized.inputTimingVersion > 0) {
+        file << L"  \"inputTimingVersion\": " << normalized.inputTimingVersion << L",\n";
+    }
     file << L"  \"hotkeyText\": \"" << EscapeJson(data.hotkey.text) << L"\",\n";
     file << L"  \"hotkeyVk\": " << data.hotkey.vk << L",\n";
     file << L"  \"hotkeyModifiers\": " << data.hotkey.modifiers << L",\n";
+    if (!IsRecordingScriptPath(path)) {
+        file << L"  \"breakoutTimeSeconds\": " << normalized.breakoutTimeSeconds << L",\n";
+    }
+
+    // 写入标准 coordMeta（2560×1440）
+    {
+        std::wstring coordMetaJson;
+        WriteCoordMetaJson(coordMetaJson, storeMeta, true);
+        file << coordMetaJson;
+    }
+
+    std::wstring wmJson;
+    windowmode::WriteWindowModeJson(wmJson, normalized.windowMode, true);
+    file << wmJson;
     file << L"  \"actions\": [\n";
-    for (size_t i = 0; i < data.actions.size(); ++i) {
-        WriteActionJson(file, data.actions[i], i + 1 == data.actions.size());
+    for (size_t i = 0; i < saveActions.size(); ++i) {
+        WriteActionJson(file, saveActions[i], i + 1 == saveActions.size());
     }
     file << L"  ]\n}\n";
     const auto bytes = ToUtf8(file.str());

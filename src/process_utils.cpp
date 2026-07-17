@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cwctype>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +49,101 @@ std::wstring QueryProcessPath(DWORD pid) {
     }
     CloseHandle(process);
     return path;
+}
+
+std::wstring QueryProcessCommandLine(DWORD pid) {
+    if (pid == 0) return L"";
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!process) return L"";
+
+    using NtQueryInformationProcessFn = LONG (WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcessFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (!NtQueryInformationProcess) {
+        CloseHandle(process);
+        return L"";
+    }
+
+    struct PROCESS_BASIC_INFORMATION {
+        PVOID Reserved1;
+        PVOID PebBaseAddress;
+        PVOID Reserved2[2];
+        ULONG_PTR UniqueProcessId;
+        PVOID Reserved3;
+    } pbi{};
+    ULONG retLen = 0;
+    if (NtQueryInformationProcess(process, 0 /*ProcessBasicInformation*/, &pbi, sizeof(pbi), &retLen) != 0
+        || !pbi.PebBaseAddress) {
+        CloseHandle(process);
+        return L"";
+    }
+
+    PVOID processParams = nullptr;
+#if defined(_WIN64)
+    const ULONG_PTR processParametersOffset = 0x20;
+#else
+    const ULONG_PTR processParametersOffset = 0x10;
+#endif
+    if (!ReadProcessMemory(process,
+            reinterpret_cast<BYTE*>(pbi.PebBaseAddress) + processParametersOffset,
+            &processParams, sizeof(processParams), nullptr) || !processParams) {
+        CloseHandle(process);
+        return L"";
+    }
+
+    struct UNICODE_STRING_REMOTE {
+        USHORT Length;
+        USHORT MaximumLength;
+        PVOID Buffer;
+    } cmd{};
+#if defined(_WIN64)
+    const ULONG_PTR commandLineOffset = 0x70;
+#else
+    const ULONG_PTR commandLineOffset = 0x40;
+#endif
+    if (!ReadProcessMemory(process,
+            reinterpret_cast<BYTE*>(processParams) + commandLineOffset,
+            &cmd, sizeof(cmd), nullptr) || !cmd.Buffer || cmd.Length == 0) {
+        CloseHandle(process);
+        return L"";
+    }
+
+    std::wstring result(cmd.Length / sizeof(wchar_t), L'\0');
+    if (!ReadProcessMemory(process, cmd.Buffer, result.data(), cmd.Length, nullptr)) {
+        CloseHandle(process);
+        return L"";
+    }
+    CloseHandle(process);
+    return result;
+}
+
+std::wstring ExtractExistingFileFromCommandLine(const std::wstring& cmdLine) {
+    if (cmdLine.empty()) return L"";
+    std::vector<std::wstring> tokens;
+    for (size_t i = 0; i < cmdLine.size();) {
+        while (i < cmdLine.size() && iswspace(cmdLine[i])) ++i;
+        if (i >= cmdLine.size()) break;
+        std::wstring tok;
+        if (cmdLine[i] == L'"') {
+            ++i;
+            while (i < cmdLine.size() && cmdLine[i] != L'"') tok.push_back(cmdLine[i++]);
+            if (i < cmdLine.size()) ++i;
+        } else {
+            while (i < cmdLine.size() && !iswspace(cmdLine[i])) tok.push_back(cmdLine[i++]);
+        }
+        if (!tok.empty()) tokens.push_back(tok);
+    }
+    // 跳过 argv0（进程本身），取后续存在的文件路径。
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        const std::wstring& t = tokens[i];
+        if (t.size() < 2) continue;
+        if ((t[1] == L':' || t.find(L'\\') != std::wstring::npos || t.find(L'/') != std::wstring::npos)
+            && GetFileAttributesW(t.c_str()) != INVALID_FILE_ATTRIBUTES
+            && (GetFileAttributesW(t.c_str()) & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            return t;
+        }
+    }
+    return L"";
 }
 
 HWND WindowFromScreenPoint(int x, int y) {
@@ -418,6 +514,61 @@ std::wstring GetProcessPathFromPoint(int x, int y) {
     return QueryProcessPath(pid);
 }
 
+WindowInfoFromPoint GetWindowInfoFromPoint(int x, int y) {
+    POINT pt{x, y};
+    HWND pointHwnd = WindowFromPoint(pt);
+    HWND rootHwnd = pointHwnd ? GetAncestor(pointHwnd, GA_ROOT) : nullptr;
+    if (!rootHwnd && pointHwnd) rootHwnd = pointHwnd;
+
+    WindowInfoFromPoint info{};
+    info.x = x;
+    info.y = y;
+    if (rootHwnd) {
+        wchar_t title[512]{};
+        GetWindowTextW(rootHwnd, title, 512);
+        info.windowTitle = title;
+        wchar_t cls[256]{};
+        GetClassNameW(rootHwnd, cls, 256);
+        info.windowClassName = cls;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(rootHwnd, &pid);
+        info.processPath = QueryProcessPath(pid);
+        info.documentPath = ExtractExistingFileFromCommandLine(QueryProcessCommandLine(pid));
+        // 标题里的文档名：完整路径校验存在；裸文件名也写入，供「指定窗口类」按脚本目录打开。
+        if (info.documentPath.empty() && info.windowTitle.size() > 2) {
+            std::wstring docTitle = info.windowTitle;
+            const auto dash = docTitle.find(L" - ");
+            if (dash != std::wstring::npos) docTitle = docTitle.substr(0, dash);
+            while (!docTitle.empty() && (docTitle.front() == L'*' || docTitle.front() == L' ')) {
+                docTitle.erase(docTitle.begin());
+            }
+            while (!docTitle.empty() && (docTitle.back() == L' ' || docTitle.back() == L'\t')) {
+                docTitle.pop_back();
+            }
+            const bool looksFull = (docTitle.size() >= 2 && docTitle[1] == L':')
+                || docTitle.find(L'\\') != std::wstring::npos
+                || docTitle.find(L'/') != std::wstring::npos;
+            if (looksFull) {
+                const DWORD attrs = GetFileAttributesW(docTitle.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES
+                    && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                    info.documentPath = docTitle;
+                }
+            } else if (docTitle.find(L'.') != std::wstring::npos
+                && docTitle != L"无标题"
+                && _wcsicmp(docTitle.c_str(), L"Untitled") != 0) {
+                info.documentPath = docTitle;
+            }
+        }
+    }
+    if (pointHwnd) {
+        wchar_t childCls[256]{};
+        GetClassNameW(pointHwnd, childCls, 256);
+        info.childWindowClassName = childCls;
+    }
+    return info;
+}
+
 bool LaunchProgram(const std::wstring& path, const std::wstring& args) {
     if (path.empty()) return false;
     SHELLEXECUTEINFOW info{};
@@ -473,4 +624,22 @@ bool CloseProgramsByTarget(const std::wstring& target, bool matchFileNameOnly) {
     }
 
     return closedAny;
+}
+
+int TerminateOtherInstancesOfCurrentExe() {
+    wchar_t exePath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return 0;
+    const std::wstring targetLower = ToLowerCopy(exePath);
+    const std::wstring targetFileLower = ToLowerCopy(FileNameFromPath(targetLower));
+    const std::wstring targetDirLower = ParentDirectoryLower(targetLower);
+    const DWORD selfPid = GetCurrentProcessId();
+
+    int terminated = 0;
+    for (DWORD pid : CollectMatchingPids(targetLower, targetFileLower, targetDirLower, false)) {
+        if (pid == selfPid || !IsProcessRunning(pid)) continue;
+        const std::wstring processName = ToLowerCopy(ProcessNameByPid(pid));
+        if (IsProtectedProcess(pid, processName)) continue;
+        if (TerminateUserProcess(pid)) ++terminated;
+    }
+    return terminated;
 }

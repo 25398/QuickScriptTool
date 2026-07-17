@@ -37,6 +37,12 @@ enum class RecordCaptureScope {
     Global   // 全局捕获
 };
 
+enum class RecorderInputMode {
+    Auto = 0,
+    DesktopAbsolute = 1,
+    FpsRelative = 2,
+};
+
 // ── 连点击设置 ───────────────────────────────────────────────────
 struct ClickerSettings {
     MouseButtonChoice button = MouseButtonChoice::Left;          // 点击按键
@@ -47,6 +53,7 @@ struct ClickerSettings {
 // ── 录制器设置 ───────────────────────────────────────────────────
 struct RecorderSettings {
     RecordCaptureScope captureScope = RecordCaptureScope::Window;  // 捕获范围
+    RecorderInputMode inputMode = RecorderInputMode::Auto;
 };
 
 // 连点击功能接口

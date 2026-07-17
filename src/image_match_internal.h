@@ -183,11 +183,40 @@ inline ImageMatchResult RefineAtLevel(
                       RawScoreToSimilarity(extreme, mode), 1.0);
 }
 
+inline double CandidateThresholdPercent(double thresholdPercent, bool crossResolution) {
+    if (!crossResolution) return thresholdPercent;
+    return std::max(30.0, thresholdPercent * 0.55);
+}
+
+/// 单尺度 NCC 峰值（不过滤阈值，供粗搜/诊断）
+inline double PeakNccPercentAtScale(const cv::Mat& srcGray, const cv::Mat& tplGray, double scale) {
+    if (srcGray.empty() || tplGray.empty()) return 0.0;
+    cv::Mat scaledTpl;
+    if (std::abs(scale - 1.0) > 0.001) {
+        cv::resize(tplGray, scaledTpl, cv::Size(), scale, scale, cv::INTER_AREA);
+    } else {
+        scaledTpl = tplGray;
+    }
+    if (scaledTpl.cols < 4 || scaledTpl.rows < 4 ||
+        scaledTpl.cols > srcGray.cols || scaledTpl.rows > srcGray.rows) {
+        return 0.0;
+    }
+    cv::Mat result;
+    cv::matchTemplate(srcGray, scaledTpl, result, cv::TM_CCOEFF_NORMED);
+    double maxVal = 0.0;
+    cv::minMaxLoc(result, nullptr, &maxVal, nullptr, nullptr);
+    return maxVal * 100.0;
+}
+
 inline std::vector<ImageMatchResult> MatchSingleScale(
     const cv::Mat& srcGray, const cv::Mat& tplGray, double scale,
-    const ImageMatchOptions& opt, cv::TemplateMatchModes mode) {
+    const ImageMatchOptions& opt, cv::TemplateMatchModes mode,
+    double* outPeakPercent = nullptr) {
     std::vector<ImageMatchResult> results;
     if (srcGray.empty() || tplGray.empty()) return results;
+
+    const double candidateThreshold =
+        CandidateThresholdPercent(opt.thresholdPercent, opt.crossResolutionMatch);
 
     cv::Mat scaledTpl;
     if (std::abs(scale - 1.0) > 0.001) {
@@ -204,10 +233,19 @@ inline std::vector<ImageMatchResult> MatchSingleScale(
         mode == cv::TM_SQDIFF || mode == cv::TM_SQDIFF_NORMED;
     const double threshold01 = SimilarityThreshold01(opt.thresholdPercent, mode);
 
-    const int levels = CalcPyramidLevels(tplW, tplH);
+    const int levels = opt.disablePyramid ? 0 : CalcPyramidLevels(tplW, tplH);
     if (levels <= 0) {
         cv::Mat result;
         cv::matchTemplate(srcGray, scaledTpl, result, mode);
+        double extreme = 0.0;
+        if (lowerIsBetter) {
+            cv::minMaxLoc(result, &extreme, nullptr, nullptr, nullptr);
+        } else {
+            cv::minMaxLoc(result, nullptr, &extreme, nullptr, nullptr);
+        }
+        if (outPeakPercent) {
+            *outPeakPercent = std::max(*outPeakPercent, RawScoreToSimilarity(extreme, mode));
+        }
         const double coarseThresh = lowerIsBetter
             ? std::min(0.7, threshold01 + 0.15)
             : std::max(0.3, threshold01 * 0.75);
@@ -216,7 +254,7 @@ inline std::vector<ImageMatchResult> MatchSingleScale(
         for (const auto& [pt, rawScore] : peaks) {
             auto m = MakeResult(pt, tplW, tplH, RawScoreToSimilarity(rawScore, mode), scale);
             m.scale = scale;
-            if (m.score >= opt.thresholdPercent) results.push_back(m);
+            if (m.score >= candidateThreshold) results.push_back(m);
         }
         return results;
     }
@@ -233,6 +271,17 @@ inline std::vector<ImageMatchResult> MatchSingleScale(
 
     cv::Mat topResult;
     cv::matchTemplate(srcPyr[top], tplPyr[top], topResult, mode);
+    {
+        double extreme = 0.0;
+        if (lowerIsBetter) {
+            cv::minMaxLoc(topResult, &extreme, nullptr, nullptr, nullptr);
+        } else {
+            cv::minMaxLoc(topResult, nullptr, &extreme, nullptr, nullptr);
+        }
+        if (outPeakPercent) {
+            *outPeakPercent = std::max(*outPeakPercent, RawScoreToSimilarity(extreme, mode));
+        }
+    }
     const int topTplW = tplPyr[top].cols;
     const int topTplH = tplPyr[top].rows;
     auto topPeaks = FindPeaks(topResult, coarseThresh, topTplW, topTplH,
@@ -277,7 +326,10 @@ inline std::vector<ImageMatchResult> MatchSingleScale(
             bestScore = rescore.score;
         }
 
-        if (bestScore < opt.thresholdPercent) continue;
+        if (outPeakPercent) {
+            *outPeakPercent = std::max(*outPeakPercent, bestScore);
+        }
+        if (bestScore < candidateThreshold) continue;
         auto m = MakeResult(loc, tplW, tplH, bestScore, scale);
         results.push_back(m);
     }

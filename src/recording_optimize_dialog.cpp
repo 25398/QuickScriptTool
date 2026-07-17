@@ -2,22 +2,47 @@
 #include "drawing.h"
 
 #include "action_utils.h"
+#include "coord_space.h"
 #include "drawing.h"
+#include "render_context.h"
 #include "modern_edit.h"
 #include "script_io.h"
+#include "scheduled_task_ui.h"
 #include "taskbar_window.h"
+#include "window_mode/window_mode_json.h"
 
 #include <windowsx.h>
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+
+namespace {
+int S(int v) { return UiLen(v); }
+
+// 输入框有焦点时滚轮默认进 Edit；转到父窗以便列表滚动
+WNDPROC g_optEditPrevProc = nullptr;
+LRESULT CALLBACK OptEditWheelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEWHEEL) {
+        HWND parent = GetParent(hwnd);
+        if (parent) return SendMessageW(parent, msg, wp, lp);
+    }
+    return CallWindowProcW(g_optEditPrevProc, hwnd, msg, wp, lp);
+}
+
+void HookOptEditWheel(HWND edit) {
+    if (!edit) return;
+    const WNDPROC prev = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&OptEditWheelProc)));
+    if (!g_optEditPrevProc) g_optEditPrevProc = prev;
+}
+} // namespace
 
 namespace {
 
 constexpr COLORREF kKeyboardRow = RGB(204, 229, 255);
 constexpr COLORREF kMouseRow = RGB(230, 255, 204);
 constexpr COLORREF kWaitAltRow = RGB(246, 246, 246);
-constexpr COLORREF kSearchHighlight = RGB(255, 241, 122);
 
 std::wstring SafeScriptFileName(std::wstring name) {
     if (Trim(name).empty()) name = TimestampName();
@@ -51,22 +76,29 @@ std::vector<std::wstring> FilterItemStrings() {
 
 }  // namespace
 
+HWND RecordingOptimizeDialog::s_activeHwnd_ = nullptr;
+
+HWND RecordingOptimizeDialog::ActiveHwnd() {
+    return (s_activeHwnd_ && IsWindow(s_activeHwnd_)) ? s_activeHwnd_ : nullptr;
+}
+
 RecordingOptimizeDialog::Result RecordingOptimizeDialog::Show(HWND owner, const ScriptMeta& recording) {
     owner_ = owner;
     done_ = false;
     saved_ = false;
     savedPath_.clear();
     sourcePath_ = recording.path;
-
-    ScriptFileData fileData = LoadScriptFileData(recording.path);
-    actions_ = std::move(fileData.actions);
-    hotkey_ = fileData.hotkey;
-    originalActionCount_ = static_cast<int>(actions_.size());
-    originalDuration_ = fileData.durationSeconds > 0
-        ? fileData.durationSeconds
-        : ComputeDuration(actions_);
-    currentDuration_ = originalDuration_;
-    selected_.assign(actions_.size(), false);
+    actions_.clear();
+    selected_.clear();
+    rowLabels_.clear();
+    actionBlocks_.clear();
+    actionParsed_.clear();
+    prerenderCursor_ = 0;
+    ++loadGeneration_;
+    hotkey_ = {};
+    originalActionCount_ = 0;
+    originalDuration_ = 0;
+    currentDuration_ = 0;
     anchorIndex_ = 0;
 
     static bool registered = false;
@@ -76,33 +108,69 @@ RecordingOptimizeDialog::Result RecordingOptimizeDialog::Show(HWND owner, const 
         wc.lpfnWndProc = &RecordingOptimizeDialog::WndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = clsName;
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        // 空光标：由 WM_SETCURSOR 按命中自绘按钮切换手型，避免类光标把 IDC_HAND 打回箭头
+        wc.hCursor = nullptr;
         wc.hbrBackground = nullptr;
         RegisterClassW(&wc);
         registered = true;
     }
 
+    UiScaleInitFromHwnd(owner);
     RECT ownerRc{};
     GetWindowRect(owner, &ownerRc);
-    const int x = ownerRc.left + ((ownerRc.right - ownerRc.left) - kDialogW) / 2;
-    const int y = ownerRc.top + ((ownerRc.bottom - ownerRc.top) - kDialogH) / 2;
+    const int dlgW = S(kDialogW);
+    const int dlgH = S(kDialogH);
+    const int x = ownerRc.left + ((ownerRc.right - ownerRc.left) - dlgW) / 2;
+    const int y = ownerRc.top + ((ownerRc.bottom - ownerRc.top) - dlgH) / 2;
 
+    // 非 owned：隐藏主窗时对话框不能跟着消失；关闭后恢复主窗（避免禁用 owned 弹窗导致主窗被最小化）
+    // 不用 WS_CLIPCHILDREN：父 DC 需绘制名称输入框边线（子 Edit 无边框）
     hwnd_ = CreateWindowExW(
-        0, clsName, L"", WS_POPUP | WS_CLIPCHILDREN,
-        x, y, kDialogW, kDialogH,
-        owner, nullptr, GetModuleHandleW(nullptr), this);
+        0, clsName, L"", WS_POPUP,
+        x, y, dlgW, dlgH,
+        nullptr, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return {};
 
+    s_activeHwnd_ = hwnd_;
+    // 类可能早已注册过旧 hCursor；每次创建后清掉，保证 hover 手型生效
+    SetClassLongPtrW(hwnd_, GCLP_HCURSOR, 0);
     ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-录制优化");
     outerShadow_.Attach(hwnd_);
 
-    const std::wstring defaultName = L"优化-" + (fileData.scriptName.empty() ? recording.name : fileData.scriptName);
-    SetWindowTextW(nameEdit_, defaultName.c_str());
-    EnableWindow(owner, FALSE);
+    // 用列表元数据先填时长，避免读盘前显示 0.000
+    actionsLoaded_ = false;
+    actionsLoading_ = !sourcePath_.empty();
+    pendingLoadName_ = recording.name;
+    originalDuration_ = recording.durationSeconds;
+    currentDuration_ = recording.durationSeconds;
+    originalActionCount_ = recording.actionCount;
+    if (nameEdit_) {
+        SetWindowTextW(nameEdit_, (L"优化-" + recording.name).c_str());
+        CenterEditTextVertically(nameEdit_);
+    }
+
+    // 不 cloak 主窗：对话框小于主窗，cloak 会在四周挖透明洞露出桌面/IDE。
+    BOOL disableTransitions = TRUE;
+    DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED, &disableTransitions, sizeof(disableTransitions));
+    // 对话框自身 cloak：揭开前读盘并画好首屏动作，用户不会看到空列表
+    SetWindowCloaked(hwnd_, true);
     ShowWindow(hwnd_, SW_SHOW);
-    SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    UpdateWindow(hwnd_);
+    SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOCOPYBITS);
+
+    if (!sourcePath_.empty()) {
+        // 只解析+渲染首屏可见行，再揭开；其余打开后分块解析/预渲染
+        BeginProgressiveLoad();
+    } else {
+        actionsLoading_ = false;
+    }
+
+    RedrawWindow(hwnd_, nullptr, nullptr,
+        RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    SetWindowCloaked(hwnd_, false);
     SetForegroundWindow(hwnd_);
+    disableTransitions = FALSE;
+    DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED, &disableTransitions, sizeof(disableTransitions));
+    if (actionsLoaded_) SchedulePrerender();
 
     MSG msg{};
     while (!done_ && GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -110,8 +178,21 @@ RecordingOptimizeDialog::Result RecordingOptimizeDialog::Show(HWND owner, const 
         DispatchMessageW(&msg);
     }
 
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
+    if (IsWindow(hwnd_)) {
+        if (s_activeHwnd_ == hwnd_) s_activeHwnd_ = nullptr;
+        ShowWindow(hwnd_, SW_HIDE);
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+    }
+    StDiscardSpuriousInputAfterModal(owner);
+
+    s_activeHwnd_ = nullptr;
+    if (IsWindow(owner)) {
+        RedrawWindow(owner, nullptr, nullptr,
+            RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        SetForegroundWindow(owner);
+    }
+    StDiscardSpuriousInputAfterModal(owner);
     Result result{};
     result.saved = saved_;
     result.savedPath = savedPath_;
@@ -134,33 +215,51 @@ LRESULT CALLBACK RecordingOptimizeDialog::WndProc(HWND hwnd, UINT msg, WPARAM wp
 LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        titleFont_ = CreateFontW(28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
-        bodyFont_ = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
-        smallFont_ = CreateFontW(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
-        btnFont_ = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
-        closeFont_ = CreateFontW(38, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        // 进程内复用字体，避免每次打开优化窗创建 5 个字体
+        static HFONT sTitle = nullptr, sBody = nullptr, sSmall = nullptr, sBtn = nullptr, sClose = nullptr;
+        if (!sTitle) {
+            sTitle = CreateFontW(UiFontHeight(28), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
+            sBody = CreateFontW(UiFontHeight(24), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
+            sSmall = CreateFontW(UiFontHeight(22), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
+            sBtn = CreateFontW(UiFontHeight(24), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei");
+            sClose = CreateFontW(UiFontHeight(38), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        }
+        titleFont_ = sTitle;
+        bodyFont_ = sBody;
+        smallFont_ = sSmall;
+        btnFont_ = sBtn;
+        closeFont_ = sClose;
         const RECT nameRc = NameEditRect();
         nameEdit_ = MakeModernSingleLineEdit(hwnd_, L"", 100,
             nameRc.left, nameRc.top,
             nameRc.right - nameRc.left, nameRc.bottom - nameRc.top);
-        SendMessageW(nameEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        // 内缩 1px 画边框；外框已在名称行内垂直居中，与左侧文案对齐
+        PositionEditInBorderFrame(nameEdit_, nameRc.left, nameRc.top,
+            nameRc.right - nameRc.left, nameRc.bottom - nameRc.top);
+        SendMessageW(nameEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), FALSE);
+        // 取消默认左右 margin 造成的视觉上偏，再按行高垂直居中
+        SendMessageW(nameEdit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 4));
         CenterEditTextVertically(nameEdit_);
-        valueEdit_ = MakeModernSingleLineEdit(hwnd_, L"0.1", 101, 0, 0, kEditW, kEditH, ES_CENTER);
-        thresholdEdit_ = MakeModernSingleLineEdit(hwnd_, L"1.0", 102, 0, 0, kEditW, kEditH, ES_CENTER);
-        mergeWaitEdit_ = MakeModernSingleLineEdit(hwnd_, L"0.1", 103, 0, 0, kEditW, kEditH, ES_CENTER);
-        SendMessageW(valueEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
-        SendMessageW(thresholdEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
-        SendMessageW(mergeWaitEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        valueEdit_ = MakeModernSingleLineEdit(hwnd_, L"0.1", 101, 0, 0, S(kEditW), S(kEditH), ES_CENTER);
+        thresholdEdit_ = MakeModernSingleLineEdit(hwnd_, L"1.0", 102, 0, 0, S(kEditW), S(kEditH), ES_CENTER);
+        mergeWaitEdit_ = MakeModernSingleLineEdit(hwnd_, L"0.1", 103, 0, 0, S(kEditW), S(kEditH), ES_CENTER);
+        SendMessageW(valueEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), FALSE);
+        SendMessageW(thresholdEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), FALSE);
+        SendMessageW(mergeWaitEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), FALSE);
+        HookOptEditWheel(nameEdit_);
+        HookOptEditWheel(valueEdit_);
+        HookOptEditWheel(thresholdEdit_);
+        HookOptEditWheel(mergeWaitEdit_);
         CreateDropPopup();
         UpdatePanelControls();
         UpdateStats();
@@ -187,18 +286,54 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT:
         Paint();
         return 0;
-    case WM_MOUSEWHEEL:
-        if (promptModal_.visible()) return 0;
-        if (!DropPopupVisible()) {
-            scrollTop_ -= GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-            ClampScroll();
-            InvalidateListArea();
-        }
+    case WM_APP_OPTIMIZE_LOAD:
+        LoadActionsFromDisk();
         return 0;
+    case WM_APP_OPTIMIZE_LOADED: {
+        auto* payload = reinterpret_cast<ScriptFileData*>(lp);
+        std::unique_ptr<ScriptFileData> guard(payload);
+        if (static_cast<int>(wp) != loadGeneration_ || actionsLoaded_) return 0;
+        if (payload) ApplyLoadedActions(std::move(*payload));
+        return 0;
+    }
+    case WM_APP_OPTIMIZE_PRERENDER:
+        if (static_cast<int>(wp) != loadGeneration_) return 0;
+        PrerenderMoreRowLabels();
+        return 0;
+    case WM_MOUSEWHEEL: {
+        if (promptModal_.visible()) return 0;
+        if (DropPopupVisible()) return 0;
+        // 光标在列表上才滚列表（右侧面板滚轮不误伤）
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd_, &pt);
+        if (!PtInRect(ListContentRect(), pt.x, pt.y)
+            && !PtInRect(RECT{S(kListLeft) + S(kListW) - S(kScrollBarW), S(kListTop),
+                S(kListLeft) + S(kListW), S(kFooterTop)}, pt.x, pt.y)) {
+            return 0;
+        }
+        const int steps = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+        scrollTop_ -= steps * 3;
+        ClampScroll();
+        EnsureRowLabels(scrollTop_, scrollTop_ + VisibleRowCount() + VisibleRowCount());
+        InvalidateListArea();
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        if (LOWORD(lp) != HTCLIENT) return DefWindowProcW(hwnd_, msg, wp, lp);
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd_, &pt);
+        const bool hand = !promptModal_.visible() && HitClickableControl(pt.x, pt.y);
+        SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+        return TRUE;
+    }
     case WM_MOUSEMOVE: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
         if (promptModal_.visible()) return 0;
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
+        TrackMouseEvent(&tme);
         SetHoverFlag(hoverClose_, HitCloseButton(x, y), CloseRect());
         SetHoverFlag(hoverCancel_, PtInRect(CancelBtnRect(), x, y), CancelBtnRect());
         SetHoverFlag(hoverSave_, PtInRect(SaveBtnRect(), x, y), SaveBtnRect());
@@ -207,12 +342,14 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         SetHoverFlag(hoverNextKey_, PtInRect(NextKeyBtnRect(), x, y), NextKeyBtnRect());
         SetHoverFlag(hoverKeySearch_, PtInRect(KeySearchBtnRect(), x, y), KeySearchBtnRect());
         SetHoverFlag(hoverQuickSelect_, PtInRect(QuickSelectBtnRect(), x, y), QuickSelectBtnRect());
+        SetCursor(LoadCursorW(nullptr, HitClickableControl(x, y) ? IDC_HAND : IDC_ARROW));
         if (draggingScroll_) {
-            const int thumbH = std::max(32, kListH * VisibleRowCount() / std::max(1, static_cast<int>(actions_.size())));
-            const int trackH = std::max(1, kListH - thumbH);
-            const int rel = std::clamp(y - scrollDragOffset_ - kListTop, 0, trackH);
+            const int thumbH = std::max(S(32), S(kListH) * VisibleRowCount() / std::max(1, static_cast<int>(actions_.size())));
+            const int trackH = std::max(1, S(kListH) - thumbH);
+            const int rel = std::clamp(y - scrollDragOffset_ - S(kListTop), 0, trackH);
             scrollTop_ = (rel * MaxScrollTop()) / trackH;
             ClampScroll();
+            EnsureRowLabels(scrollTop_, scrollTop_ + VisibleRowCount() + VisibleRowCount());
             InvalidateListArea();
         }
         return 0;
@@ -243,6 +380,7 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (PtInRect(SaveBtnRect(), x, y)) {
+            if (!actionsLoaded_) return 0;
             if (SaveToNewRecording()) {
                 saved_ = true;
                 done_ = true;
@@ -252,6 +390,7 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         const RECT applyBtn = ApplyBtnRect();
         if (PtInRect(applyBtn, x, y)) {
+            if (!actionsLoaded_) return 0;
             if (optimizeScheme_ == 0) ApplyBatchDelete();
             else if (optimizeScheme_ == 1) ApplyWaitAdjust();
             else if (optimizeScheme_ == 2) ApplyMoveMerge();
@@ -313,8 +452,8 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         if (optimizeScheme_ == 0) {
-            const RECT protectCheck{panel.left + kMargin, panel.top + kPanelContentTop,
-                panel.left + kMargin + kCheckboxSize, panel.top + kPanelContentTop + kCheckboxSize};
+            const RECT protectCheck{panel.left + S(kMargin), panel.top + S(kPanelContentTop),
+                panel.left + S(kMargin) + S(kCheckboxSize), panel.top + S(kPanelContentTop) + S(kCheckboxSize)};
             if (PtInRect(protectCheck, x, y)) {
                 protectKeyOps_ = !protectKeyOps_;
                 InvalidatePanelArea();
@@ -323,9 +462,9 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (optimizeScheme_ == 2) {
             for (int i = 0; i < 5; ++i) {
-                const int rowTop = panel.top + kPanelContentTop + 36 + i * kRadioRowH;
-                const RECT radio{panel.left + kMargin, rowTop + (kRadioRowH - kRadioSize) / 2,
-                    panel.left + kMargin + kRadioSize, rowTop + (kRadioRowH + kRadioSize) / 2};
+                const int rowTop = panel.top + S(kPanelContentTop) + S(36) + i * S(kRadioRowH);
+                const RECT radio{panel.left + S(kMargin), rowTop + (S(kRadioRowH) - S(kRadioSize)) / 2,
+                    panel.left + S(kMargin) + S(kRadioSize), rowTop + (S(kRadioRowH) + S(kRadioSize)) / 2};
                 if (PtInRect(radio, x, y)) {
                     mergeWaitMode_ = i;
                     UpdatePanelControls();
@@ -336,17 +475,22 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         const int row = HitListRow(x, y);
         if (row >= 0) {
-            if (PtInRect(CheckboxRect(row), x, y)) selected_[static_cast<size_t>(row)] = !selected_[static_cast<size_t>(row)];
-            else anchorIndex_ = row;
+            SetFocus(hwnd_);
+            // 整行点击切换勾选；手型光标仅在勾选框上（见 HitClickableControl）
+            selected_[static_cast<size_t>(row)] = !selected_[static_cast<size_t>(row)];
+            anchorIndex_ = row;
+            InvalidatePanelArea();
             InvalidateListArea();
             return 0;
         }
-        const RECT scrollTrack{kListLeft + kListW - kScrollBarW, kListTop, kListLeft + kListW, kFooterTop};
+        const int scrollW = S(kEditorScrollW);
+        const RECT scrollTrack{S(kListLeft) + S(kListW) - scrollW - S(4), S(kListTop),
+            S(kListLeft) + S(kListW) - S(2), S(kFooterTop)};
         if (MaxScrollTop() > 0 && PtInRect(scrollTrack, x, y)) {
             draggingScroll_ = true;
             SetCapture(hwnd_);
-            const int thumbH = std::max(20, kListH * VisibleRowCount() / std::max(1, static_cast<int>(actions_.size())));
-            const int thumbTop = kListTop + (std::max(1, kListH - thumbH) * scrollTop_) / std::max(1, MaxScrollTop());
+            const int thumbH = std::max(S(20), S(kListH) * VisibleRowCount() / std::max(1, static_cast<int>(actions_.size())));
+            const int thumbTop = S(kListTop) + (std::max(1, S(kListH) - thumbH) * scrollTop_) / std::max(1, MaxScrollTop());
             scrollDragOffset_ = y - thumbTop;
         }
         return 0;
@@ -367,8 +511,9 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(hwnd_, msg, wp, lp);
     case WM_ENTERSIZEMOVE:
-        CloseMenuPopup();
+        if (DropPopupVisible()) SyncDropPopup();
         return 0;
+    case WM_MOVE:
     case WM_WINDOWPOSCHANGED:
         if (DropPopupVisible()) SyncDropPopup();
         return DefWindowProcW(hwnd_, msg, wp, lp);
@@ -378,6 +523,8 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         done_ = true;
+        ++loadGeneration_;
+        actionsLoading_ = false;
         CleanupGdi();
         return 0;
     default:
@@ -390,11 +537,7 @@ void RecordingOptimizeDialog::CleanupGdi() {
         DestroyWindow(dropPopup_);
         dropPopup_ = nullptr;
     }
-    if (titleFont_) DeleteObject(titleFont_);
-    if (bodyFont_) DeleteObject(bodyFont_);
-    if (smallFont_) DeleteObject(smallFont_);
-    if (btnFont_) DeleteObject(btnFont_);
-    if (closeFont_) DeleteObject(closeFont_);
+    // 字体为进程内静态复用，不在此 DeleteObject
     titleFont_ = bodyFont_ = smallFont_ = btnFont_ = closeFont_ = nullptr;
 }
 
@@ -404,7 +547,34 @@ bool RecordingOptimizeDialog::PtInRect(const RECT& rc, int x, int y) const {
 
 bool RecordingOptimizeDialog::HitCloseButton(int x, int y) const { return PtInRect(CloseRect(), x, y); }
 bool RecordingOptimizeDialog::HitTitleBar(int x, int y) const {
-    return y >= 0 && y < kOptTitleH && x >= 0 && x < kDialogW - kCloseBtnW;
+    return y >= 0 && y < S(kOptTitleH) && x >= 0 && x < S(kDialogW) - S(kCloseBtnW);
+}
+bool RecordingOptimizeDialog::HitClickableControl(int x, int y) const {
+    if (HitCloseButton(x, y)) return true;
+    if (PtInRect(CancelBtnRect(), x, y) || PtInRect(SaveBtnRect(), x, y)) return true;
+    if (PtInRect(ApplyBtnRect(), x, y)) return true;
+    if (PtInRect(PrevKeyBtnRect(), x, y) || PtInRect(NextKeyBtnRect(), x, y)) return true;
+    if (PtInRect(KeySearchBtnRect(), x, y) || PtInRect(QuickSelectBtnRect(), x, y)) return true;
+    if (PtInRect(SchemeComboRect(), x, y)) return true;
+    if (optimizeScheme_ == 1 && PtInRect(WaitFilterComboRect(), x, y)) return true;
+    const RECT panel = RightPanelRect();
+    if (optimizeScheme_ == 0) {
+        // 仅勾选框本身；空白面板区不做手型
+        const RECT protectCheck{panel.left + S(kMargin), panel.top + S(kPanelContentTop),
+            panel.left + S(kMargin) + S(kCheckboxSize), panel.top + S(kPanelContentTop) + S(kCheckboxSize)};
+        if (PtInRect(protectCheck, x, y)) return true;
+    } else if (optimizeScheme_ == 2) {
+        for (int i = 0; i < 5; ++i) {
+            const int rowTop = panel.top + S(kPanelContentTop) + S(36) + i * S(kRadioRowH);
+            const RECT radio{panel.left + S(kMargin), rowTop + (S(kRadioRowH) - S(kRadioSize)) / 2,
+                panel.left + S(kMargin) + S(kRadioSize), rowTop + (S(kRadioRowH) + S(kRadioSize)) / 2};
+            if (PtInRect(radio, x, y)) return true;
+        }
+    }
+    // 列表：整行可点选，但手型仅勾选框
+    const int row = HitListRow(x, y);
+    if (row >= 0 && PtInRect(CheckboxRect(row), x, y)) return true;
+    return false;
 }
 
 int RecordingOptimizeDialog::MaxScrollTop() const {
@@ -417,32 +587,38 @@ void RecordingOptimizeDialog::ScrollToIndex(int index) {
     if (index < scrollTop_) scrollTop_ = index;
     else if (index >= scrollTop_ + VisibleRowCount()) scrollTop_ = index - VisibleRowCount() + 1;
     ClampScroll();
+    EnsureRowLabels(scrollTop_, scrollTop_ + VisibleRowCount() + VisibleRowCount());
 }
 
 int RecordingOptimizeDialog::HitListRow(int x, int y) const {
     const RECT list = ListContentRect();
-    if (!PtInRect(list, x, y) || x >= list.right - kScrollBarW) return -1;
-    const int row = scrollTop_ + (y - list.top) / kRowH;
+    if (!PtInRect(list, x, y) || x >= list.right - S(kScrollBarW)) return -1;
+    const int row = scrollTop_ + (y - list.top) / S(kRowH);
     return (row >= 0 && row < static_cast<int>(actions_.size())) ? row : -1;
 }
 
 RECT RecordingOptimizeDialog::RowRect(int index) const {
-    return RECT{kListLeft, kListTop + (index - scrollTop_) * kRowH,
-        kListLeft + kListW - kScrollBarW, kListTop + (index - scrollTop_ + 1) * kRowH};
+    return RECT{S(kListLeft), S(kListTop) + (index - scrollTop_) * S(kRowH),
+        S(kListLeft) + S(kListW) - S(kScrollBarW), S(kListTop) + (index - scrollTop_ + 1) * S(kRowH)};
 }
 
 RECT RecordingOptimizeDialog::CheckboxRect(int index) const {
     RECT row = RowRect(index);
-    return RECT{row.left + 52, row.top + (kRowH - kCheckboxSize) / 2,
-        row.left + 52 + kCheckboxSize, row.top + (kRowH + kCheckboxSize) / 2};
+    return RECT{row.left + S(52), row.top + (S(kRowH) - S(kCheckboxSize)) / 2,
+        row.left + S(52) + S(kCheckboxSize), row.top + (S(kRowH) + S(kCheckboxSize)) / 2};
 }
 
 bool RecordingOptimizeDialog::IsKeyOperation(const ScriptAction& action) const {
-    return action.type != ActionType::MoveMouse && action.type != ActionType::Wait;
+    // 关键操作：除绝对/相对移动与等待外都算（键鼠点击、滚轮、输入等）
+    return action.type != ActionType::MoveMouse
+        && action.type != ActionType::MoveMouseRelative
+        && action.type != ActionType::Wait;
 }
 
 bool RecordingOptimizeDialog::IsMoveOrWait(const ScriptAction& action) const {
-    return action.type == ActionType::MoveMouse || action.type == ActionType::Wait;
+    return action.type == ActionType::MoveMouse
+        || action.type == ActionType::MoveMouseRelative
+        || action.type == ActionType::Wait;
 }
 
 COLORREF RecordingOptimizeDialog::RowBackground(const ScriptAction& action) const {
@@ -450,7 +626,7 @@ COLORREF RecordingOptimizeDialog::RowBackground(const ScriptAction& action) cons
     case ActionType::KeyDown: case ActionType::KeyUp: case ActionType::KeyClick:
     case ActionType::HotkeyShortcut: case ActionType::QuickInput: return kKeyboardRow;
     case ActionType::MouseDown: case ActionType::MouseUp: case ActionType::MouseClick:
-    case ActionType::ScrollWheel: return kMouseRow;
+    case ActionType::ScrollWheel: case ActionType::MoveMouseRelative: return kMouseRow;
     default: return kWhite;
     }
 }
@@ -471,6 +647,8 @@ std::wstring RecordingOptimizeDialog::ActionDisplayText(const ScriptAction& acti
     }
     case ActionType::MoveMouse:
         return L"鼠标移动到位置(" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y) + L")";
+    case ActionType::MoveMouseRelative:
+        return L"相对移动鼠标(" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y) + L")";
     case ActionType::KeyDown: return L"键盘按下" + action.keyText;
     case ActionType::KeyUp: return L"键盘抬起" + action.keyText;
     case ActionType::MouseDown: return ButtonText(action.button) + L"按下";
@@ -487,11 +665,207 @@ double RecordingOptimizeDialog::ComputeDuration(const std::vector<ScriptAction>&
 }
 
 void RecordingOptimizeDialog::UpdateStats() {
-    currentDuration_ = ComputeDuration(actions_);
+    // 录制多为相对移动/按键，不一定含 Wait；不能只用 Wait 求和把时长刷成 0
+    if (actionsLoaded_) {
+        const double waitSum = ComputeDuration(actions_);
+        currentDuration_ = waitSum > 0.0 ? waitSum : originalDuration_;
+    }
     RECT stats = StatsRect();
     RECT header = ListHeaderTextRect();
     InvalidateRect(hwnd_, &stats, FALSE);
     InvalidateRect(hwnd_, &header, FALSE);
+}
+
+void RecordingOptimizeDialog::LoadActionsFromDisk() {
+    // 首屏已在 Show() 中 BeginProgressiveLoad；此消息仅作兼容补载
+    if (actionsLoaded_ || sourcePath_.empty()) {
+        actionsLoading_ = false;
+        return;
+    }
+    BeginProgressiveLoad();
+    if (actionsLoaded_) SchedulePrerender();
+}
+
+void RecordingOptimizeDialog::BeginProgressiveLoad() {
+    if (sourcePath_.empty()) {
+        actionsLoading_ = false;
+        return;
+    }
+    const std::wstring content = ReadAll(sourcePath_);
+    const std::wstring scriptName = ExtractString(content, L"scriptName");
+    const double fileDuration = ExtractNumber(content, L"durationSeconds", 0);
+    hotkey_.text = ExtractString(content, L"hotkeyText");
+    hotkey_.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
+    hotkey_.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+    hotkey_.enabled = hotkey_.vk != 0;
+
+    loadCoordsNormalized_ = HasCoordMetaJson(content);
+    if (loadCoordsNormalized_) {
+        loadCoordMeta_ = ParseCoordMetaJson(content);
+        if (loadCoordMeta_.refWidth <= 0 || loadCoordMeta_.refHeight <= 0)
+            loadCoordMeta_ = StandardScriptCoordMeta();
+    } else {
+        loadCoordMeta_ = StandardScriptCoordMeta();
+    }
+
+    actionBlocks_ = ExtractJsonActionBlocks(content);
+    const int n = static_cast<int>(actionBlocks_.size());
+    actions_.assign(static_cast<size_t>(n), ScriptAction{});
+    actionParsed_.assign(static_cast<size_t>(n), 0);
+    selected_.assign(static_cast<size_t>(n), false);
+    rowLabels_.assign(static_cast<size_t>(n), {});
+    originalActionCount_ = n;
+    scrollTop_ = 0;
+    prerenderCursor_ = 0;
+
+    if (fileDuration > 0.0) originalDuration_ = fileDuration;
+    currentDuration_ = originalDuration_;
+
+    const std::wstring defaultName = L"优化-"
+        + (scriptName.empty() ? pendingLoadName_ : scriptName);
+    if (nameEdit_) {
+        SetWindowTextW(nameEdit_, defaultName.c_str());
+        CenterEditTextVertically(nameEdit_);
+    }
+
+    // 只解析并渲染首屏；其余等打开后再分块
+    const int firstPage = VisibleRowCount();
+    EnsureActionsParsed(0, firstPage);
+    EnsureRowLabels(0, firstPage);
+    actionsLoaded_ = true;
+    actionsLoading_ = false;
+    UpdateStats();
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void RecordingOptimizeDialog::EnsureActionsParsed(int begin, int end) {
+    if (actions_.empty()) return;
+    begin = std::max(0, begin);
+    end = std::min(end, static_cast<int>(actions_.size()));
+    if (begin >= end) return;
+    if (actionParsed_.size() != actions_.size())
+        actionParsed_.assign(actions_.size(), 1); // 已无分块源时视为已解析
+
+    int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+    GetVirtualScreenBounds(vsX, vsY, vsW, vsH);
+    const CoordMeta denormMeta = StandardScriptCoordMeta();
+
+    for (int i = begin; i < end; ++i) {
+        if (actionParsed_[static_cast<size_t>(i)]) continue;
+        if (i >= static_cast<int>(actionBlocks_.size())) {
+            actionParsed_[static_cast<size_t>(i)] = 1;
+            continue;
+        }
+        const auto& block = actionBlocks_[static_cast<size_t>(i)];
+        if (ExtractString(block, L"type").empty()) {
+            actionParsed_[static_cast<size_t>(i)] = 1;
+            continue;
+        }
+        ScriptAction a = ParseScriptActionBlock(block, static_cast<size_t>(i), loadCoordsNormalized_);
+        if (!loadCoordsNormalized_) {
+            std::vector<ScriptAction> tmp{std::move(a)};
+            MigrateLegacyScriptToNormalized(tmp, StandardScriptCoordMeta());
+            a = std::move(tmp[0]);
+        }
+        DenormalizeActionCoords(a, denormMeta, vsW, vsH);
+        actions_[static_cast<size_t>(i)] = std::move(a);
+        actionParsed_[static_cast<size_t>(i)] = 1;
+    }
+}
+
+void RecordingOptimizeDialog::EnsureFullyParsed() {
+    EnsureActionsParsed(0, static_cast<int>(actions_.size()));
+    actionBlocks_.clear();
+}
+
+void RecordingOptimizeDialog::ApplyLoadedActions(ScriptFileData&& fileData) {
+    // 兼容旧全量加载路径
+    actions_ = std::move(fileData.actions);
+    actionBlocks_.clear();
+    actionParsed_.assign(actions_.size(), 1);
+    hotkey_ = fileData.hotkey;
+    originalActionCount_ = static_cast<int>(actions_.size());
+    if (fileData.durationSeconds > 0.0) {
+        originalDuration_ = fileData.durationSeconds;
+    } else {
+        const double waitSum = ComputeDuration(actions_);
+        if (waitSum > 0.0) originalDuration_ = waitSum;
+    }
+    const double waitSum = ComputeDuration(actions_);
+    currentDuration_ = waitSum > 0.0 ? waitSum : originalDuration_;
+    selected_.assign(actions_.size(), false);
+    rowLabels_.assign(actions_.size(), {});
+    scrollTop_ = 0;
+    prerenderCursor_ = 0;
+    const std::wstring defaultName = L"优化-"
+        + (fileData.scriptName.empty() ? pendingLoadName_ : fileData.scriptName);
+    if (nameEdit_) {
+        SetWindowTextW(nameEdit_, defaultName.c_str());
+        CenterEditTextVertically(nameEdit_);
+    }
+    actionsLoaded_ = true;
+    actionsLoading_ = false;
+    EnsureRowLabels(0, VisibleRowCount());
+    UpdateStats();
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void RecordingOptimizeDialog::EnsureRowLabels(int begin, int end) {
+    if (rowLabels_.size() != actions_.size())
+        rowLabels_.assign(actions_.size(), {});
+    begin = std::max(0, begin);
+    end = std::min(end, static_cast<int>(actions_.size()));
+    EnsureActionsParsed(begin, end);
+    for (int i = begin; i < end; ++i) {
+        if (rowLabels_[static_cast<size_t>(i)].empty())
+            rowLabels_[static_cast<size_t>(i)] = ActionDisplayText(actions_[static_cast<size_t>(i)]);
+    }
+}
+
+const std::wstring& RecordingOptimizeDialog::RowLabelAt(int index) {
+    if (index < 0 || index >= static_cast<int>(actions_.size())) {
+        static const std::wstring empty;
+        return empty;
+    }
+    EnsureActionsParsed(index, index + 1);
+    if (rowLabels_.size() != actions_.size())
+        rowLabels_.assign(actions_.size(), {});
+    auto& label = rowLabels_[static_cast<size_t>(index)];
+    if (label.empty())
+        label = ActionDisplayText(actions_[static_cast<size_t>(index)]);
+    return label;
+}
+
+void RecordingOptimizeDialog::SchedulePrerender() {
+    if (!hwnd_ || !actionsLoaded_) return;
+    PostMessageW(hwnd_, WM_APP_OPTIMIZE_PRERENDER, static_cast<WPARAM>(loadGeneration_), 0);
+}
+
+void RecordingOptimizeDialog::PrerenderMoreRowLabels() {
+    if (!actionsLoaded_ || actions_.empty()) return;
+    if (rowLabels_.size() != actions_.size())
+        rowLabels_.assign(actions_.size(), {});
+    constexpr int kChunk = 48;
+    const int n = static_cast<int>(actions_.size());
+    // 优先当前视口附近
+    const int viewEnd = std::min(n, scrollTop_ + VisibleRowCount() + VisibleRowCount());
+    EnsureRowLabels(scrollTop_, viewEnd);
+    int filled = 0;
+    while (prerenderCursor_ < n && filled < kChunk) {
+        if (!actionParsed_.empty()
+            && prerenderCursor_ < static_cast<int>(actionParsed_.size())
+            && !actionParsed_[static_cast<size_t>(prerenderCursor_)]) {
+            EnsureActionsParsed(prerenderCursor_, prerenderCursor_ + 1);
+        }
+        if (rowLabels_[static_cast<size_t>(prerenderCursor_)].empty()) {
+            rowLabels_[static_cast<size_t>(prerenderCursor_)] =
+                ActionDisplayText(actions_[static_cast<size_t>(prerenderCursor_)]);
+            ++filled;
+        }
+        ++prerenderCursor_;
+    }
+    if (prerenderCursor_ < n) SchedulePrerender();
+    else actionBlocks_.clear();
 }
 
 void RecordingOptimizeDialog::SyncSelectionSize() {
@@ -501,6 +875,12 @@ void RecordingOptimizeDialog::SyncSelectionSize() {
 
 void RecordingOptimizeDialog::ApplyActionChange() {
     SyncSelectionSize();
+    actionBlocks_.clear();
+    actionParsed_.assign(actions_.size(), 1);
+    rowLabels_.assign(actions_.size(), {});
+    prerenderCursor_ = 0;
+    EnsureRowLabels(scrollTop_, scrollTop_ + VisibleRowCount());
+    SchedulePrerender();
     UpdateStats();
     ClampScroll();
     InvalidateListArea();
@@ -529,14 +909,14 @@ bool RecordingOptimizeDialog::DropPopupVisible() const {
 
 int RecordingOptimizeDialog::PopupVisibleCount() const {
     if (popupItems_.empty()) return 0;
-    const int maxVisible = kEditorPopupMaxHeight / kPopupItemH;
+    const int maxVisible = S(kEditorPopupMaxHeight) / S(kPopupItemH);
     return std::min(maxVisible, static_cast<int>(popupItems_.size()));
 }
 
 int RecordingOptimizeDialog::HitPopupItemLocal(int /*x*/, int y) const {
     if (popupItems_.empty()) return -1;
     const int visible = PopupVisibleCount();
-    const int rel = (y - 1) / kPopupItemH;
+    const int rel = (y - 1) / S(kPopupItemH);
     if (rel < 0 || rel >= visible) return -1;
     const int idx = rel + popupScroll_;
     return idx < static_cast<int>(popupItems_.size()) ? idx : -1;
@@ -572,15 +952,32 @@ void RecordingOptimizeDialog::SyncDropPopup() {
     const int visible = PopupVisibleCount();
     const int scrollMax = std::max(0, static_cast<int>(popupItems_.size()) - visible);
     popupScroll_ = std::clamp(popupScroll_, 0, scrollMax);
-    int w = popupAnchor_.right - popupAnchor_.left;
-    if (openPopup_ == PopupKind::KeySearch || openPopup_ == PopupKind::QuickSelect) w += 80;
-    const int h = visible * kPopupItemH + 2;
+
+    // 用真实窗口 DC + 正文字体量最长项，避免菜单宽不足导致截断
+    int textMax = 0;
+    HDC hdc = GetDC(hwnd_ ? hwnd_ : dropPopup_);
+    HFONT font = bodyFont_ ? bodyFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+    for (const auto& item : popupItems_) {
+        SIZE sz{};
+        GetTextExtentPoint32W(hdc, item.c_str(), static_cast<int>(item.size()), &sz);
+        textMax = std::max(textMax, static_cast<int>(sz.cx));
+    }
+    SelectObject(hdc, oldFont);
+    ReleaseDC(hwnd_ ? hwnd_ : dropPopup_, hdc);
+    const int pad = S(10) + S(6) + S(8) + (scrollMax > 0 ? S(12) : 0);
+    int w = std::max(static_cast<int>(popupAnchor_.right - popupAnchor_.left), textMax + pad);
+    const int maxW = S(kDialogW) - S(kMargin) * 2;
+    w = std::min(w, maxW);
+
+    const int h = visible * S(kPopupItemH) + 2;
     POINT screenTop{popupAnchor_.left, popupAnchor_.bottom + 2};
     ClientToScreen(hwnd_, &screenTop);
     int x = static_cast<int>(screenTop.x);
     int y = static_cast<int>(screenTop.y);
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    if (x + w > work.right) x = std::max(static_cast<int>(work.left), static_cast<int>(work.right) - w);
     if (y + h > work.bottom) {
         POINT screenAnchor{popupAnchor_.left, popupAnchor_.top};
         ClientToScreen(hwnd_, &screenAnchor);
@@ -622,7 +1019,7 @@ void RecordingOptimizeDialog::InvalidatePopupRow(int idx) {
     if (!dropPopup_ || idx < 0) return;
     const int vis = idx - popupScroll_;
     if (vis < 0 || vis >= PopupVisibleCount()) return;
-    RECT row{1, 1 + vis * kPopupItemH, 0, 1 + (vis + 1) * kPopupItemH};
+    RECT row{1, 1 + vis * S(kPopupItemH), 0, 1 + (vis + 1) * S(kPopupItemH)};
     RECT client{};
     GetClientRect(dropPopup_, &client);
     row.right = client.right - 1;
@@ -636,24 +1033,24 @@ void RecordingOptimizeDialog::UpdatePanelControls() {
     ShowWindow(mergeWaitEdit_, SW_HIDE);
     if (optimizeScheme_ == 1) {
         const int adjustTop = WaitAdjustRowTop(panel);
-        MoveWindow(valueEdit_, panel.left + 88, adjustTop, kEditW, kEditH, TRUE);
+        MoveWindow(valueEdit_, panel.left + S(88), adjustTop, S(kEditW), S(kEditH), TRUE);
         ShowWindow(valueEdit_, SW_SHOW);
         SetWindowPos(valueEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         if (waitFilterOp_ != 0) {
             const int compareTop = WaitCompareEditTop(panel);
-            MoveWindow(thresholdEdit_, panel.left + kMargin, compareTop, kEditW, kEditH, TRUE);
+            MoveWindow(thresholdEdit_, panel.left + S(kMargin), compareTop, S(kEditW), S(kEditH), TRUE);
             ShowWindow(thresholdEdit_, SW_SHOW);
             SetWindowPos(thresholdEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         }
     } else if (optimizeScheme_ == 2) {
         if (mergeWaitMode_ == 4) {
-            MoveWindow(mergeWaitEdit_, panel.left + kMargin, panel.top + kMergeAdjustEditTop, kEditW, kEditH, TRUE);
+            MoveWindow(mergeWaitEdit_, panel.left + S(kMargin), panel.top + S(kMergeAdjustEditTop), S(kEditW), S(kEditH), TRUE);
             ShowWindow(mergeWaitEdit_, SW_SHOW);
             SetWindowPos(mergeWaitEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         }
     } else if (optimizeScheme_ == 3) {
-        MoveWindow(valueEdit_, panel.left + kMargin, panel.top + kCompressWaitEditTop, kEditW, kEditH, TRUE);
-        MoveWindow(thresholdEdit_, panel.left + kMargin, panel.top + kCompressThresholdEditTop, kEditW, kEditH, TRUE);
+        MoveWindow(valueEdit_, panel.left + S(kMargin), panel.top + S(kCompressWaitEditTop), S(kEditW), S(kEditH), TRUE);
+        MoveWindow(thresholdEdit_, panel.left + S(kMargin), panel.top + S(kCompressThresholdEditTop), S(kEditW), S(kEditH), TRUE);
         ShowWindow(valueEdit_, SW_SHOW);
         ShowWindow(thresholdEdit_, SW_SHOW);
         SetWindowPos(valueEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -662,21 +1059,7 @@ void RecordingOptimizeDialog::UpdatePanelControls() {
 }
 
 void RecordingOptimizeDialog::CenterEditTextVertically(HWND edit) {
-    if (!edit) return;
-    RECT rc{};
-    GetClientRect(edit, &rc);
-    const HFONT font = reinterpret_cast<HFONT>(SendMessageW(edit, WM_GETFONT, 0, 0));
-    HDC hdc = GetDC(edit);
-    HFONT oldFont = font ? reinterpret_cast<HFONT>(SelectObject(hdc, font)) : nullptr;
-    TEXTMETRICW tm{};
-    GetTextMetricsW(hdc, &tm);
-    if (oldFont) SelectObject(hdc, oldFont);
-    ReleaseDC(edit, hdc);
-    const int textH = tm.tmHeight;
-    const int pad = std::max(0, static_cast<int>((rc.bottom - rc.top - textH) / 2));
-    rc.top = pad;
-    rc.bottom = rc.top + textH + 2;
-    SendMessageW(edit, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&rc));
+    CenterModernSingleLineEditText(edit);
 }
 
 LRESULT CALLBACK RecordingOptimizeDialog::DropPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -772,7 +1155,7 @@ void RecordingOptimizeDialog::PaintDropPopupContent(HDC hdc) {
     for (int vis = 0; vis < visible; ++vis) {
         const int i = vis + popupScroll_;
         if (i >= static_cast<int>(popupItems_.size())) break;
-        RECT row{client.left + 1, client.top + 1 + vis * kPopupItemH, contentRight, client.top + 1 + (vis + 1) * kPopupItemH};
+        RECT row{client.left + 1, client.top + 1 + vis * S(kPopupItemH), contentRight, client.top + 1 + (vis + 1) * S(kPopupItemH)};
         const bool selected = i == selectedIdx;
         const bool hovered = !selected && popupHover_ == i;
         const COLORREF rowBg = selected ? kComboMenuSelectBlue : (hovered ? kComboMenuHoverBlue : kWhite);
@@ -780,7 +1163,7 @@ void RecordingOptimizeDialog::PaintDropPopupContent(HDC hdc) {
         SetTextColor(hdc, selected ? kComboMenuSelectText : kText);
         RECT textRc{row.left + 10, row.top, row.right - 6, row.bottom};
         DrawTextW(hdc, popupItems_[static_cast<size_t>(i)].c_str(), -1, &textRc,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
     if (scrollMax > 0) {
         RECT track{client.right - 10, client.top + 1, client.right - 1, client.bottom - 1};
@@ -812,6 +1195,15 @@ std::vector<int> RecordingOptimizeDialog::ContiguousSelectedRange() const {
     return indices;
 }
 
+bool RecordingOptimizeDialog::SelectionContainsRelativeMove() const {
+    const auto range = ContiguousSelectedRange();
+    for (int idx : range) {
+        if (actions_[static_cast<size_t>(idx)].type == ActionType::MoveMouseRelative)
+            return true;
+    }
+    return false;
+}
+
 bool RecordingOptimizeDialog::SelectionIsContiguousMoveWait() const {
     const auto range = ContiguousSelectedRange();
     if (range.empty()) return false;
@@ -821,12 +1213,18 @@ bool RecordingOptimizeDialog::SelectionIsContiguousMoveWait() const {
 
 int RecordingOptimizeDialog::FindKeyIndexFrom(int start, bool forward) const {
     if (actions_.empty()) return -1;
+    // const 方法里需要解析：通过 const_cast 调用非 const 解析（仅填充缓存）
+    auto* self = const_cast<RecordingOptimizeDialog*>(this);
     if (forward) {
-        for (int i = std::max(0, start); i < static_cast<int>(actions_.size()); ++i)
+        for (int i = std::max(0, start); i < static_cast<int>(actions_.size()); ++i) {
+            self->EnsureActionsParsed(i, i + 1);
             if (IsKeyOperation(actions_[static_cast<size_t>(i)])) return i;
+        }
     } else {
-        for (int i = std::min(static_cast<int>(actions_.size()) - 1, start); i >= 0; --i)
+        for (int i = std::min(static_cast<int>(actions_.size()) - 1, start); i >= 0; --i) {
+            self->EnsureActionsParsed(i, i + 1);
             if (IsKeyOperation(actions_[static_cast<size_t>(i)])) return i;
+        }
     }
     return -1;
 }
@@ -853,22 +1251,32 @@ void RecordingOptimizeDialog::FindKeyOperation(int mode) {
 
 void RecordingOptimizeDialog::QuickSelect(int mode) {
     if (actions_.empty()) return;
-    const int anchor = std::clamp(anchorIndex_, 0, static_cast<int>(actions_.size()) - 1);
+    // 优先用当前勾选项；若锚点未勾选则退到最后一个已选项
+    int anchor = std::clamp(anchorIndex_, 0, static_cast<int>(actions_.size()) - 1);
+    if (!selected_[static_cast<size_t>(anchor)]) {
+        const auto indices = SelectedIndices();
+        if (!indices.empty()) anchor = indices.back();
+    }
+    EnsureActionsParsed(anchor, anchor + 1);
     switch (mode) {
     case 0: for (int i = 0; i <= anchor; ++i) selected_[static_cast<size_t>(i)] = true; break;
     case 1: for (int i = anchor; i < static_cast<int>(actions_.size()); ++i) selected_[static_cast<size_t>(i)] = true; break;
     case 2: {
+        // 从当前到下一关键操作（含两端）：如 3→9 则选中 3..9
         int end = static_cast<int>(actions_.size()) - 1;
         for (int i = anchor + 1; i < static_cast<int>(actions_.size()); ++i) {
-            if (IsKeyOperation(actions_[static_cast<size_t>(i)])) { end = i - 1; break; }
+            EnsureActionsParsed(i, i + 1);
+            if (IsKeyOperation(actions_[static_cast<size_t>(i)])) { end = i; break; }
         }
         for (int i = anchor; i <= end; ++i) selected_[static_cast<size_t>(i)] = true;
         break;
     }
     case 3: {
+        // 从上一关键操作到当前（含两端）
         int start = 0;
         for (int i = anchor - 1; i >= 0; --i) {
-            if (IsKeyOperation(actions_[static_cast<size_t>(i)])) { start = i + 1; break; }
+            EnsureActionsParsed(i, i + 1);
+            if (IsKeyOperation(actions_[static_cast<size_t>(i)])) { start = i; break; }
         }
         for (int i = start; i <= anchor; ++i) selected_[static_cast<size_t>(i)] = true;
         break;
@@ -902,6 +1310,7 @@ bool RecordingOptimizeDialog::WaitMatchesFilter(double duration, double compareV
 
 void RecordingOptimizeDialog::ApplyBatchDelete() {
     if (SelectedCount() == 0) { ShowAlert(L"请先选择要删除的动作。"); return; }
+    EnsureFullyParsed();
     std::vector<ScriptAction> kept;
     kept.reserve(actions_.size());
     for (int i = 0; i < static_cast<int>(actions_.size()); ++i) {
@@ -914,6 +1323,7 @@ void RecordingOptimizeDialog::ApplyBatchDelete() {
 }
 
 void RecordingOptimizeDialog::ApplyWaitAdjust() {
+    EnsureFullyParsed();
     waitAdjustValue_ = ParseEditDouble(valueEdit_, waitAdjustValue_);
     const double compareVal = waitFilterOp_ == 0
         ? 0.0
@@ -931,6 +1341,11 @@ void RecordingOptimizeDialog::ApplyWaitAdjust() {
 }
 
 void RecordingOptimizeDialog::ApplyMoveMerge() {
+    EnsureFullyParsed();
+    if (SelectionContainsRelativeMove()) {
+        ShowAlert(L"相对移动轨迹受保护，不能对 FPS 相对位移使用绝对路径合并。");
+        return;
+    }
     if (!SelectionIsContiguousMoveWait()) {
         ShowAlert(L"鼠标移动合并时只能选择连续的移动和等待操作，其中不允许夹杂其他操作。");
         return;
@@ -967,6 +1382,11 @@ void RecordingOptimizeDialog::ApplyMoveMerge() {
 }
 
 void RecordingOptimizeDialog::ApplyMoveCompress() {
+    EnsureFullyParsed();
+    if (SelectionContainsRelativeMove()) {
+        ShowAlert(L"相对移动轨迹受保护，不能对 FPS 相对位移使用绝对路径压缩。");
+        return;
+    }
     if (!SelectionIsContiguousMoveWait()) {
         ShowAlert(L"鼠标移动压缩时只能选择连续的移动和等待操作，其中不允许夹杂其他操作。");
         return;
@@ -1013,6 +1433,7 @@ void RecordingOptimizeDialog::ShowAlert(const wchar_t* message) {
 }
 
 bool RecordingOptimizeDialog::SaveToNewRecording() {
+    EnsureFullyParsed();
     wchar_t nameBuf[256]{};
     GetWindowTextW(nameEdit_, nameBuf, 255);
     const std::wstring name = Trim(nameBuf);
@@ -1025,7 +1446,10 @@ bool RecordingOptimizeDialog::SaveToNewRecording() {
     data.scriptName = name;
     data.recordTime = NowText();
     data.durationSeconds = ComputeDuration(actions_);
+    if (data.durationSeconds <= 0.0) data.durationSeconds = currentDuration_;
     data.hotkey = hotkey_;
+    data.windowMode = windowmode::DefaultWindowModeConfig();
+    data.breakoutTimeSeconds = 0;
     data.actions = actions_;
     if (!SaveScriptFileData(path, data)) { ShowAlert(L"保存失败：无法写入文件，请检查磁盘空间和权限。"); return false; }
     savedPath_ = path;
@@ -1051,7 +1475,7 @@ void RecordingOptimizeDialog::DrawGreenButton(HDC hdc, const RECT& rc, const wch
 }
 
 void RecordingOptimizeDialog::DrawOutlineButton(HDC hdc, const RECT& rc, const wchar_t* text, bool hover) {
-    DrawBorderRoundRect(hdc, rc, hover ? kMainGreen : kComboBorderGray, 6);
+    DrawBorderRoundRect(hdc, rc, hover ? kMainGreen : kComboBorderGray, S(6));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, kMainGreen);
     SelectObject(hdc, btnFont_);
@@ -1119,7 +1543,7 @@ void RecordingOptimizeDialog::PaintList(HDC hdc) {
     HGDIOBJ oldPen = SelectObject(hdc, linePen);
     for (int i = scrollTop_; i < static_cast<int>(actions_.size()) && i < scrollTop_ + VisibleRowCount(); ++i) {
         RECT row = RowRect(i);
-        const COLORREF bg = i == keySearchHighlight_ ? kSearchHighlight : RowBackgroundAt(i);
+        const COLORREF bg = i == keySearchHighlight_ ? kSelectedYellow : RowBackgroundAt(i);
         HBRUSH rowBrush = CreateSolidBrush(bg);
         FillRect(hdc, &row, rowBrush);
         DeleteObject(rowBrush);
@@ -1133,16 +1557,18 @@ void RecordingOptimizeDialog::PaintList(HDC hdc) {
         DrawCheckbox(hdc, CheckboxRect(i), selected_[static_cast<size_t>(i)]);
         SetTextColor(hdc, kText);
         RECT textRc{row.left + 82, row.top, row.right - 6, row.bottom};
-        DrawTextW(hdc, ActionDisplayText(actions_[static_cast<size_t>(i)]).c_str(), -1, &textRc,
+        DrawTextW(hdc, RowLabelAt(i).c_str(), -1, &textRc,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     SelectObject(hdc, oldPen);
     DeleteObject(linePen);
     if (MaxScrollTop() > 0) {
-        const RECT track{kListLeft + kListW - kScrollBarW + 2, kListTop + 4,
-            kListLeft + kListW - 2, kFooterTop - 4};
+        // 与宏编辑动作列表一致：细灰轨 + 灰滑块（非主页绿圆角条）
+        const int scrollW = S(kEditorScrollW);
+        const RECT track{S(kListLeft) + S(kListW) - scrollW - S(4), S(kListTop) + S(2),
+            S(kListLeft) + S(kListW) - S(4), S(kFooterTop) - S(2)};
         FillRectColor(hdc, track, kScrollTrackGray);
-        const int thumbH = std::max(32, kListH * VisibleRowCount() / std::max(1, static_cast<int>(actions_.size())));
+        const int thumbH = std::max(S(32), S(kListH) * VisibleRowCount() / std::max(1, static_cast<int>(actions_.size())));
         const int trackHeight = static_cast<int>(track.bottom - track.top);
         const int trackH = std::max(1, trackHeight - thumbH);
         const int thumbTop = track.top + (trackH * scrollTop_) / std::max(1, MaxScrollTop());
@@ -1160,79 +1586,79 @@ void RecordingOptimizeDialog::PaintRightPanel(HDC hdc) {
     SetTextColor(hdc, kText);
     wchar_t selText[64]{};
     swprintf_s(selText, L"已选择%d个", SelectedCount());
-    RECT selRc{panel.left + kMargin, panel.top + kPanelSelectedTop,
-        panel.right - kMargin, panel.top + kPanelSelectedTop + 28};
+    RECT selRc{panel.left + S(kMargin), panel.top + S(kPanelSelectedTop),
+        panel.right - S(kMargin), panel.top + S(kPanelSelectedTop) + S(28)};
     DrawTextW(hdc, selText, -1, &selRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT schemeLabel{panel.left + kMargin, panel.top + kSchemeLabelTop,
-        panel.right - kMargin, panel.top + kSchemeLabelTop + 28};
+    RECT schemeLabel{panel.left + S(kMargin), panel.top + S(kSchemeLabelTop),
+        panel.right - S(kMargin), panel.top + S(kSchemeLabelTop) + S(28)};
     DrawTextW(hdc, L"优化方案", -1, &schemeLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     const RECT schemeRc = SchemeComboRect();
     DrawPanelCombo(hdc, schemeRc, kSchemeItems[optimizeScheme_],
         openPopup_ == PopupKind::OptimizeScheme);
     const RECT applyBtn = ApplyBtnRect();
     if (optimizeScheme_ == 0) {
-        RECT protectCheck{panel.left + kMargin, panel.top + kPanelContentTop,
-            panel.left + kMargin + kCheckboxSize, panel.top + kPanelContentTop + kCheckboxSize};
+        RECT protectCheck{panel.left + S(kMargin), panel.top + S(kPanelContentTop),
+            panel.left + S(kMargin) + S(kCheckboxSize), panel.top + S(kPanelContentTop) + S(kCheckboxSize)};
         DrawCheckbox(hdc, protectCheck, protectKeyOps_);
-        RECT protectText{panel.left + kMargin + kCheckboxSize + 8, panel.top + kPanelContentTop - 4,
-            panel.right - kMargin, panel.top + kPanelContentTop + 28};
+        RECT protectText{panel.left + S(kMargin) + S(kCheckboxSize) + S(8), panel.top + S(kPanelContentTop) - S(4),
+            panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(28)};
         DrawTextW(hdc, L"不删除关键操作", -1, &protectText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         DrawGreenButton(hdc, applyBtn, L"删除选择项", hoverApply_);
     } else if (optimizeScheme_ == 1) {
-        RECT waitLabel{panel.left + kMargin, panel.top + kPanelContentTop, panel.right - kMargin, panel.top + kPanelContentTop + 28};
+        RECT waitLabel{panel.left + S(kMargin), panel.top + S(kPanelContentTop), panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(28)};
         DrawTextW(hdc, L"等待时间(已选择的):", -1, &waitLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         const RECT filterRc = WaitFilterComboRect();
         DrawPanelCombo(hdc, filterRc, kFilterItems[waitFilterOp_],
             openPopup_ == PopupKind::WaitFilter);
         if (waitFilterOp_ != 0) {
             const int compareTop = WaitCompareEditTop(panel);
-            RECT secCompare{panel.left + kMargin + kEditW + 8, compareTop,
-                panel.left + kMargin + kEditW + 36, compareTop + kEditH};
+            RECT secCompare{panel.left + S(kMargin) + S(kEditW) + S(8), compareTop,
+                panel.left + S(kMargin) + S(kEditW) + S(36), compareTop + S(kEditH)};
             DrawTextW(hdc, L"秒", -1, &secCompare, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
         const int adjustTop = WaitAdjustRowTop(panel);
-        RECT adjustLabel{panel.left + kMargin, adjustTop, panel.left + 80, adjustTop + kEditH};
+        RECT adjustLabel{panel.left + S(kMargin), adjustTop, panel.left + S(80), adjustTop + S(kEditH)};
         DrawTextW(hdc, L"调整为", -1, &adjustLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        RECT secLabel{panel.left + 88 + kEditW + 8, adjustTop,
-            panel.left + 88 + kEditW + 36, adjustTop + kEditH};
+        RECT secLabel{panel.left + S(88) + S(kEditW) + S(8), adjustTop,
+            panel.left + S(88) + S(kEditW) + S(36), adjustTop + S(kEditH)};
         DrawTextW(hdc, L"秒", -1, &secLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         DrawGreenButton(hdc, applyBtn, L"调整选择", hoverApply_);
     } else if (optimizeScheme_ == 2) {
         static const wchar_t* kMergeModes[] = {
             L"等待时间累加", L"使用平均时间", L"使用已选的第一个", L"使用已选的最后一个", L"使用指定的时间"};
-        RECT mergeLabel{panel.left + kMargin, panel.top + kPanelContentTop, panel.right - kMargin, panel.top + kPanelContentTop + 28};
+        RECT mergeLabel{panel.left + S(kMargin), panel.top + S(kPanelContentTop), panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(28)};
         DrawTextW(hdc, L"合并后等待时间处理:", -1, &mergeLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         for (int i = 0; i < 5; ++i) {
-            const int rowTop = panel.top + kPanelContentTop + 36 + i * kRadioRowH;
-            RECT radio{panel.left + kMargin, rowTop + (kRadioRowH - kRadioSize) / 2,
-                panel.left + kMargin + kRadioSize, rowTop + (kRadioRowH + kRadioSize) / 2};
+            const int rowTop = panel.top + S(kPanelContentTop) + S(36) + i * S(kRadioRowH);
+            RECT radio{panel.left + S(kMargin), rowTop + (S(kRadioRowH) - S(kRadioSize)) / 2,
+                panel.left + S(kMargin) + S(kRadioSize), rowTop + (S(kRadioRowH) + S(kRadioSize)) / 2};
             DrawRadio(hdc, radio, mergeWaitMode_ == i);
-            RECT radioText{panel.left + kMargin + kRadioSize + 8, rowTop,
-                panel.right - kMargin, rowTop + kRadioRowH};
+            RECT radioText{panel.left + S(kMargin) + S(kRadioSize) + S(8), rowTop,
+                panel.right - S(kMargin), rowTop + S(kRadioRowH)};
             DrawTextW(hdc, kMergeModes[i], -1, &radioText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
         if (mergeWaitMode_ == 4) {
-            RECT adjustLabel{panel.left + kMargin, panel.top + kMergeAdjustLabelTop,
-                panel.right - kMargin, panel.top + kMergeAdjustLabelTop + 26};
+            RECT adjustLabel{panel.left + S(kMargin), panel.top + S(kMergeAdjustLabelTop),
+                panel.right - S(kMargin), panel.top + S(kMergeAdjustLabelTop) + S(26)};
             DrawTextW(hdc, L"调整等待时间为", -1, &adjustLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            RECT secLabel{panel.left + kMargin + kEditW + 8, panel.top + kMergeAdjustEditTop,
-                panel.left + kMargin + kEditW + 36, panel.top + kMergeAdjustEditTop + kEditH};
+            RECT secLabel{panel.left + S(kMargin) + S(kEditW) + S(8), panel.top + S(kMergeAdjustEditTop),
+                panel.left + S(kMargin) + S(kEditW) + S(36), panel.top + S(kMergeAdjustEditTop) + S(kEditH)};
             DrawTextW(hdc, L"秒", -1, &secLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
         SelectObject(hdc, smallFont_);
         SetTextColor(hdc, kHint);
-        RECT hint{panel.left + kMargin, panel.bottom - 108, panel.right - kMargin, panel.bottom - 72};
+        RECT hint{panel.left + S(kMargin), panel.bottom - S(108), panel.right - S(kMargin), panel.bottom - S(72)};
         DrawTextW(hdc, L"*本操作将合并已选择的等待移动操作为1个。并用选择的合并等待时间方式设置这个等待时间。", -1, &hint, DT_LEFT | DT_WORDBREAK);
         DrawGreenButton(hdc, applyBtn, L"开始合并", hoverApply_);
     } else {
-        RECT waitLabel{panel.left + kMargin, panel.top + kPanelContentTop,
-            panel.right - kMargin, panel.top + kPanelContentTop + 26};
+        RECT waitLabel{panel.left + S(kMargin), panel.top + S(kPanelContentTop),
+            panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(26)};
         DrawTextW(hdc, L"压缩后等待时间", -1, &waitLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        RECT sec1{panel.left + kMargin + kEditW + 8, panel.top + kCompressWaitEditTop,
-            panel.left + kMargin + kEditW + 36, panel.top + kCompressWaitEditTop + kEditH};
+        RECT sec1{panel.left + S(kMargin) + S(kEditW) + S(8), panel.top + S(kCompressWaitEditTop),
+            panel.left + S(kMargin) + S(kEditW) + S(36), panel.top + S(kCompressWaitEditTop) + S(kEditH)};
         DrawTextW(hdc, L"秒", -1, &sec1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        RECT thLabel{panel.left + kMargin, panel.top + kCompressThresholdLabelTop,
-            panel.right - kMargin, panel.top + kCompressThresholdLabelTop + 26};
+        RECT thLabel{panel.left + S(kMargin), panel.top + S(kCompressThresholdLabelTop),
+            panel.right - S(kMargin), panel.top + S(kCompressThresholdLabelTop) + S(26)};
         DrawTextW(hdc, L"压缩阈值", -1, &thLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         DrawGreenButton(hdc, applyBtn, L"开始压缩", hoverApply_);
     }
@@ -1251,42 +1677,44 @@ void RecordingOptimizeDialog::Paint() {
     HDC hdc = CreateCompatibleDC(windowDc);
     HBITMAP bmp = CreateCompatibleBitmap(windowDc, w, h);
     HGDIOBJ oldBmp = SelectObject(hdc, bmp);
+    RenderBatchScope batch(hdc);
     FillRectColor(hdc, client, kWhite);
-    RECT titleBar{0, 0, kDialogW, kOptTitleH};
+    RECT titleBar{0, 0, S(kDialogW), S(kOptTitleH)};
     FillRectColor(hdc, titleBar, kMainGreen);
     SelectObject(hdc, titleFont_);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, kWhite);
-    RECT titleRc{kMargin, 0, kDialogW - kCloseBtnW, kOptTitleH};
-    DrawTextW(hdc, L"鼠大侠-录制优化", -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    if (hoverClose_) FillRectColor(hdc, CloseRect(), RGB(90, 190, 125));
+    DrawTextIn(hdc, L"鼠大侠-录制优化", RECT{S(kMargin), 0, S(kDialogW) - S(kCloseBtnW), S(kOptTitleH)},
+        kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (hoverClose_) FillRectColor(hdc, CloseRect(), kCloseHover);
     SelectObject(hdc, closeFont_);
-    RECT closeRc = CloseRect();
-    DrawTextW(hdc, L"×", -1, &closeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"×", CloseRect(), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, bodyFont_);
-    SetTextColor(hdc, kText);
     const RECT nameLabel = NameLabelRect();
-    DrawTextW(hdc, L"录制名称:", -1, const_cast<RECT*>(&nameLabel), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"录制名称:", nameLabel, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    // nameEdit_ 已内缩 1px，边框画在 NameEditRect outer（不被 CLIPCHILDREN 裁掉）
     DrawBorderRect(hdc, NameEditRect(), kComboBorderGray);
     wchar_t stats[128]{};
     swprintf_s(stats, L"当前时长:%.3f  原时长:%.3f", currentDuration_, originalDuration_);
     const RECT statsRc = StatsRect();
-    DrawTextW(hdc, stats, -1, const_cast<RECT*>(&statsRc), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, stats, statsRc, kText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     wchar_t listHeader[128]{};
-    swprintf_s(listHeader, L"动作列表  当前动作数:%d  原动作数:%d",
-        static_cast<int>(actions_.size()), originalActionCount_);
-    const RECT headerRc = ListHeaderTextRect();
-    DrawTextW(hdc, listHeader, -1, const_cast<RECT*>(&headerRc), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (actionsLoading_ && !actionsLoaded_) {
+        swprintf_s(listHeader, L"动作列表  正在加载…");
+    } else {
+        swprintf_s(listHeader, L"动作列表  当前动作数:%d  原动作数:%d",
+            static_cast<int>(actions_.size()), originalActionCount_);
+    }
+    DrawTextIn(hdc, listHeader, ListHeaderTextRect(), kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawGreenButton(hdc, PrevKeyBtnRect(), L"<<", hoverPrevKey_);
     DrawGreenButton(hdc, NextKeyBtnRect(), L">>", hoverNextKey_);
     DrawGreenButton(hdc, KeySearchBtnRect(), L"关键操作查找", hoverKeySearch_);
     DrawGreenButton(hdc, QuickSelectBtnRect(), L"快速选择", hoverQuickSelect_);
     PaintList(hdc);
     PaintRightPanel(hdc);
-    RECT footer{0, kFooterTop, kDialogW, kDialogH};
+    RECT footer{0, S(kFooterTop), S(kDialogW), S(kDialogH)};
     FillRectColor(hdc, footer, kPanel);
     DrawOutlineButton(hdc, CancelBtnRect(), L"取消", hoverCancel_);
     DrawGreenButton(hdc, SaveBtnRect(), L"保存到新录制", hoverSave_);
+    batch.End();
     const int blitW = ps.rcPaint.right - ps.rcPaint.left;
     const int blitH = ps.rcPaint.bottom - ps.rcPaint.top;
     BitBlt(windowDc, ps.rcPaint.left, ps.rcPaint.top, blitW, blitH, hdc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);

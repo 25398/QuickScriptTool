@@ -244,7 +244,9 @@ std::wstring ResolveMacroOperandImpl(const std::wstring& token, const MacroVaria
     double unused;
     if (TryParseDouble(t, unused)) return t;
 
-    return ResolveMacroVariables(L"{" + t + L"}", ctx);
+    // Unknown identifier: do not re-wrap into {t} (ResolveMacroVariables → Operand
+    // would recurse forever and overflow the stack).
+    return L"";
 }
 
 }  // namespace

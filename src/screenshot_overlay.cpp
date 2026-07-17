@@ -4,6 +4,7 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "screenshot_overlay.h"
+#include "image_match.h"
 
 #include <algorithm>
 #include <cstring>
@@ -43,10 +44,8 @@ void ScreenshotOverlay::Show(std::function<void(RECT)> onConfirm) {
 
     CaptureVirtualScreen();
 
-    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    const int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int x = 0, y = 0, w = 0, h = 0;
+    GetVirtualScreenRect(x, y, w, h);
 
     hwnd_ = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -331,10 +330,7 @@ void ScreenshotOverlay::CaptureVirtualScreen() {
     if (screenBitmap_) { DeleteObject(screenBitmap_); screenBitmap_ = nullptr; }
     if (dimOverlay_) { DeleteObject(dimOverlay_); dimOverlay_ = nullptr; }
 
-    screenX_ = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    screenY_ = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    screenW_ = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    screenH_ = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    GetVirtualScreenRect(screenX_, screenY_, screenW_, screenH_);
 
     HDC screenDc = GetDC(nullptr);
     HDC memDc = CreateCompatibleDC(screenDc);

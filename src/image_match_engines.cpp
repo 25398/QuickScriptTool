@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <future>
+#include <utility>
 #include <vector>
 
 #include <opencv2/imgproc.hpp>
@@ -137,15 +138,167 @@ double ComputePatchColorSimilarity(const cv::Mat& srcBgr, const PatchVerifierCon
     return std::clamp(corr * 100.0, 0.0, 100.0);
 }
 
-std::vector<ImageMatchResult> RunEngineAllScales(
+std::vector<double> BuildUniformScales(double scaleMin, double scaleMax, double scaleStep) {
+    std::vector<double> scales;
+    if (scaleMax < scaleMin) std::swap(scaleMin, scaleMax);
+    scaleStep = std::max(0.01, scaleStep);
+    for (double s = scaleMin; s <= scaleMax + 1e-9; s += scaleStep) {
+        scales.push_back(s);
+    }
+    if (scales.empty()) {
+        scales.push_back(scaleMin);
+    } else if (std::abs(scales.back() - scaleMax) > 1e-4) {
+        scales.push_back(scaleMax);
+    }
+    return scales;
+}
+
+/// 跨分辨率粗尺度：约 5 个采样点（含端点与中点）
+std::vector<double> BuildCoarseScales(double scaleMin, double scaleMax) {
+    if (scaleMax < scaleMin) std::swap(scaleMin, scaleMax);
+    if (scaleMax - scaleMin < 0.035) {
+        return {0.5 * (scaleMin + scaleMax)};
+    }
+    constexpr int kSamples = 5;
+    std::vector<double> scales;
+    scales.reserve(kSamples);
+    for (int i = 0; i < kSamples; ++i) {
+        const double t = static_cast<double>(i) / (kSamples - 1);
+        scales.push_back(scaleMin + (scaleMax - scaleMin) * t);
+    }
+    return scales;
+}
+
+std::vector<double> BuildFineScalesAround(double center, double scaleMin, double scaleMax) {
+    const double lo = std::max(scaleMin, center * 0.96);
+    const double hi = std::min(scaleMax, center * 1.04);
+    return BuildUniformScales(lo, hi, 0.02);
+}
+
+std::vector<ImageMatchResult> RunEngineOnScales(
     const cv::Mat& srcGray, const cv::Mat& tplGray,
-    const ImageMatchOptions& opt, cv::TemplateMatchModes mode) {
+    const ImageMatchOptions& opt, cv::TemplateMatchModes mode,
+    const std::vector<double>& scales, double* outPeakPercent) {
     std::vector<ImageMatchResult> all;
-    for (double scale = opt.scaleMin; scale <= opt.scaleMax + 1e-9; scale += opt.scaleStep) {
-        auto batch = MatchSingleScale(srcGray, tplGray, scale, opt, mode);
+    for (double scale : scales) {
+        auto batch = MatchSingleScale(srcGray, tplGray, scale, opt, mode, outPeakPercent);
         all.insert(all.end(), batch.begin(), batch.end());
     }
     return GlobalNms(std::move(all), opt.maxOverlap, opt.maxMatches);
+}
+
+std::vector<ImageMatchResult> RunEngineAllScales(
+    const cv::Mat& srcGray, const cv::Mat& tplGray,
+    const ImageMatchOptions& opt, cv::TemplateMatchModes mode,
+    double* outPeakPercent = nullptr) {
+    return RunEngineOnScales(srcGray, tplGray, opt, mode,
+        BuildUniformScales(opt.scaleMin, opt.scaleMax, opt.scaleStep), outPeakPercent);
+}
+
+/// 跨分辨率：NCC 粗→细定位最佳尺度，其它引擎只在少量精尺度上跑
+struct CrossResScaleSearch {
+    std::vector<double> fineScales;
+    std::vector<ImageMatchResult> nccResults;
+    double bestPeakNcc = 0.0;
+    double bestScale = 1.0;
+};
+
+CrossResScaleSearch RunCrossResolutionNccSearch(
+    const cv::Mat& srcGray, const cv::Mat& tplGray, const ImageMatchOptions& opt) {
+    CrossResScaleSearch out;
+    out.bestScale = 0.5 * (opt.scaleMin + opt.scaleMax);
+
+    // 小模板/小尺度禁用金字塔，避免粗层 NCC 虚高而精修丢候选
+    ImageMatchOptions searchOpt = opt;
+    const double midScale = out.bestScale;
+    const int approxTpl = static_cast<int>(std::min(tplGray.cols, tplGray.rows) * midScale);
+    if (searchOpt.disablePyramid || midScale < 0.55 || approxTpl < 160) {
+        searchOpt.disablePyramid = true;
+    }
+
+    const auto coarse = BuildCoarseScales(opt.scaleMin, opt.scaleMax);
+    std::vector<ImageMatchResult> coarseAll;
+    for (double scale : coarse) {
+        double peak = 0.0;
+        auto batch = MatchSingleScale(srcGray, tplGray, scale, searchOpt, cv::TM_CCOEFF_NORMED, &peak);
+        if (peak > out.bestPeakNcc) {
+            out.bestPeakNcc = peak;
+            out.bestScale = scale;
+        }
+        for (const auto& r : batch) {
+            if (r.score > out.bestPeakNcc) {
+                out.bestPeakNcc = r.score;
+                out.bestScale = r.scale;
+            }
+            coarseAll.push_back(r);
+        }
+    }
+    coarseAll = GlobalNms(std::move(coarseAll), opt.maxOverlap, opt.maxMatches);
+    if (!coarseAll.empty()) {
+        const ImageMatchResult* best = &coarseAll.front();
+        for (const auto& r : coarseAll) {
+            if (r.score > best->score) best = &r;
+        }
+        out.bestScale = best->scale;
+        out.bestPeakNcc = std::max(out.bestPeakNcc, best->score);
+    }
+
+    if (out.bestPeakNcc < opt.thresholdPercent * 0.70) {
+        out.fineScales.clear();
+        out.nccResults = std::move(coarseAll);
+        return out;
+    }
+
+    out.fineScales = BuildFineScalesAround(out.bestScale, opt.scaleMin, opt.scaleMax);
+    double finePeak = out.bestPeakNcc;
+    out.nccResults = RunEngineOnScales(srcGray, tplGray, searchOpt, cv::TM_CCOEFF_NORMED,
+                                       out.fineScales, &finePeak);
+    out.bestPeakNcc = std::max(out.bestPeakNcc, finePeak);
+    if (!out.nccResults.empty()) {
+        const ImageMatchResult* best = &out.nccResults.front();
+        for (const auto& r : out.nccResults) {
+            if (r.score > best->score) best = &r;
+        }
+        out.bestScale = best->scale;
+        out.bestPeakNcc = std::max(out.bestPeakNcc, best->score);
+    } else if (!coarseAll.empty()) {
+        out.nccResults = std::move(coarseAll);
+    }
+
+    // 峰值过阈但金字塔路径未产出候选：全分辨率补一刀
+    if (out.nccResults.empty() && out.bestPeakNcc >= opt.thresholdPercent * 0.85) {
+        ImageMatchOptions flat = searchOpt;
+        flat.disablePyramid = true;
+        double peak = 0.0;
+        auto recovered = MatchSingleScale(srcGray, tplGray, out.bestScale, flat,
+                                          cv::TM_CCOEFF_NORMED, &peak);
+        out.bestPeakNcc = std::max(out.bestPeakNcc, peak);
+        if (recovered.empty() && peak >= opt.thresholdPercent) {
+            // MatchSingleScale 仍空时，直接取 minMaxLoc 峰位
+            cv::Mat scaledTpl;
+            cv::resize(tplGray, scaledTpl, cv::Size(), out.bestScale, out.bestScale, cv::INTER_AREA);
+            if (scaledTpl.cols >= 4 && scaledTpl.rows >= 4 &&
+                scaledTpl.cols <= srcGray.cols && scaledTpl.rows <= srcGray.rows) {
+                cv::Mat result;
+                cv::matchTemplate(srcGray, scaledTpl, result, cv::TM_CCOEFF_NORMED);
+                double maxVal = 0.0;
+                cv::Point maxLoc;
+                cv::minMaxLoc(result, nullptr, &maxVal, nullptr, &maxLoc);
+                const double score = maxVal * 100.0;
+                out.bestPeakNcc = std::max(out.bestPeakNcc, score);
+                if (score >= image_match_internal::CandidateThresholdPercent(
+                        opt.thresholdPercent, true)) {
+                    recovered.push_back(MakeResult(maxLoc, scaledTpl.cols, scaledTpl.rows,
+                                                   score, out.bestScale));
+                }
+            }
+        }
+        out.nccResults = std::move(recovered);
+        if (out.fineScales.empty()) {
+            out.fineScales.push_back(out.bestScale);
+        }
+    }
+    return out;
 }
 
 const ImageMatchResult* FindAgreeingMatch(
@@ -163,6 +316,49 @@ const ImageMatchResult* FindAgreeingMatch(
 double BestNccScore(const std::vector<ImageMatchResult>& nccResults) {
     double best = 0.0;
     for (const auto& r : nccResults) best = std::max(best, r.score);
+    return best;
+}
+
+/// 在尺度范围内扫全局 NCC 峰（共识失败时的兜底）
+ImageMatchResult RecoverGlobalNccPeak(
+    const cv::Mat& srcGray, const cv::Mat& tplGray, const ImageMatchOptions& opt) {
+    ImageMatchResult best{};
+    double bestScore = 0.0;
+    ImageMatchOptions flat = opt;
+    flat.disablePyramid = true;
+    const auto scales = BuildUniformScales(opt.scaleMin, opt.scaleMax, opt.scaleStep);
+    for (double scale : scales) {
+        double peak = 0.0;
+        auto batch = MatchSingleScale(srcGray, tplGray, scale, flat, cv::TM_CCOEFF_NORMED, &peak);
+        for (const auto& r : batch) {
+            if (r.score > bestScore) {
+                bestScore = r.score;
+                best = r;
+            }
+        }
+        if (peak <= bestScore) continue;
+
+        cv::Mat scaledTpl;
+        if (std::abs(scale - 1.0) > 0.001) {
+            cv::resize(tplGray, scaledTpl, cv::Size(), scale, scale, cv::INTER_AREA);
+        } else {
+            scaledTpl = tplGray;
+        }
+        if (scaledTpl.cols < 4 || scaledTpl.rows < 4 ||
+            scaledTpl.cols > srcGray.cols || scaledTpl.rows > srcGray.rows) {
+            continue;
+        }
+        cv::Mat result;
+        cv::matchTemplate(srcGray, scaledTpl, result, cv::TM_CCOEFF_NORMED);
+        double maxVal = 0.0;
+        cv::Point maxLoc;
+        cv::minMaxLoc(result, nullptr, &maxVal, nullptr, &maxLoc);
+        const double score = maxVal * 100.0;
+        if (score > bestScore) {
+            bestScore = score;
+            best = MakeResult(maxLoc, scaledTpl.cols, scaledTpl.rows, score, scale);
+        }
+    }
     return best;
 }
 
@@ -240,21 +436,56 @@ ImageMatchOutput MatchInGrayMatsMultiVerify(
     normalized.maxOverlap = std::clamp(normalized.maxOverlap, 0.0, 0.95);
 
     const int tolerancePx = AutoConsensusTolerancePx(tplGray.cols, tplGray.rows);
-    const PatchVerifierContext verifier = PatchVerifierContext::Build(tplGray, tplBgr);
     const double threshold = normalized.thresholdPercent;
 
-    std::vector<std::future<std::vector<ImageMatchResult>>> futures;
-    futures.reserve(std::size(kTemplateEngines));
-    for (const auto& spec : kTemplateEngines) {
-        futures.push_back(std::async(std::launch::async, [&srcGray, &tplGray, normalized, spec]() {
-            return RunEngineAllScales(srcGray, tplGray, normalized, spec.mode);
-        }));
-    }
+    std::vector<std::vector<ImageMatchResult>> engineResults(std::size(kTemplateEngines));
+    double trackedPeakNcc = 0.0;
 
-    std::vector<std::vector<ImageMatchResult>> engineResults;
-    engineResults.reserve(futures.size());
-    for (auto& fut : futures) {
-        engineResults.push_back(fut.get());
+    if (normalized.crossResolutionMatch &&
+        (normalized.scaleMax - normalized.scaleMin) > 0.04) {
+        // 跨分辨率：NCC 粗→细，峰值不足阈值则早停（避免 3 引擎 × 密尺度）
+        CrossResScaleSearch nccSearch =
+            RunCrossResolutionNccSearch(srcGray, tplGray, normalized);
+        trackedPeakNcc = nccSearch.bestPeakNcc;
+        engineResults[0] = std::move(nccSearch.nccResults);
+
+        const bool nccHopeful = trackedPeakNcc >= threshold * 0.85
+            || BestNccScore(engineResults[0]) >= image_match_internal::CandidateThresholdPercent(
+                   threshold, true);
+        if (nccHopeful && !nccSearch.fineScales.empty()) {
+            std::vector<std::future<std::vector<ImageMatchResult>>> futures;
+            futures.reserve(2);
+            for (size_t i = 1; i < std::size(kTemplateEngines); ++i) {
+                const auto mode = kTemplateEngines[i].mode;
+                const auto scales = nccSearch.fineScales;
+                futures.push_back(std::async(std::launch::async,
+                    [&srcGray, &tplGray, normalized, mode, scales]() {
+                        return RunEngineOnScales(srcGray, tplGray, normalized, mode,
+                                                 scales, nullptr);
+                    }));
+            }
+            for (size_t i = 0; i < futures.size(); ++i) {
+                engineResults[i + 1] = futures[i].get();
+            }
+        }
+    } else {
+        std::vector<std::future<std::pair<std::vector<ImageMatchResult>, double>>> futures;
+        futures.reserve(std::size(kTemplateEngines));
+        for (const auto& spec : kTemplateEngines) {
+            futures.push_back(std::async(std::launch::async,
+                [&srcGray, &tplGray, normalized, spec]() {
+                    double localPeak = 0.0;
+                    auto results = RunEngineAllScales(
+                        srcGray, tplGray, normalized, spec.mode,
+                        spec.mode == cv::TM_CCOEFF_NORMED ? &localPeak : nullptr);
+                    return std::make_pair(std::move(results), localPeak);
+                }));
+        }
+        for (size_t i = 0; i < futures.size(); ++i) {
+            auto batch = futures[i].get();
+            engineResults[i] = std::move(batch.first);
+            if (i == 0) trackedPeakNcc = batch.second;
+        }
     }
 
     if (engineResults.empty()) {
@@ -265,12 +496,16 @@ ImageMatchOutput MatchInGrayMatsMultiVerify(
     }
 
     bool anyCandidates = false;
+    int rawCandidateCount = 0;
     for (const auto& results : engineResults) {
+        rawCandidateCount += static_cast<int>(results.size());
         if (!results.empty()) {
             anyCandidates = true;
-            break;
         }
     }
+    out.debugRawCandidates = rawCandidateCount;
+    out.debugBestNccPercent = std::max(trackedPeakNcc, BestNccScore(engineResults[0]));
+
     if (!anyCandidates) {
         const auto t1 = std::chrono::steady_clock::now();
         out.elapsedMs = static_cast<int>(
@@ -278,58 +513,132 @@ ImageMatchOutput MatchInGrayMatsMultiVerify(
         return out;
     }
 
-    const double bestNccScore = BestNccScore(engineResults[0]);
+    const double bestNccScore = out.debugBestNccPercent;
+
+    auto scaledTemplateMats = [](const cv::Mat& gray, const cv::Mat& bgr, double scale,
+                                  cv::Mat& outGray, cv::Mat& outBgr) {
+        if (std::abs(scale - 1.0) < 0.001) {
+            outGray = gray;
+            outBgr = bgr;
+            return;
+        }
+        cv::resize(gray, outGray, cv::Size(), scale, scale, cv::INTER_AREA);
+        if (!bgr.empty()) {
+            cv::resize(bgr, outBgr, cv::Size(), scale, scale, cv::INTER_AREA);
+        } else {
+            outBgr.release();
+        }
+    };
 
     std::vector<ImageMatchResult> consensus;
     consensus.reserve(static_cast<size_t>(normalized.maxMatches));
 
-    auto tryAcceptSeed = [&](const ImageMatchResult& seed) {
+    auto tryAcceptSeed = [&](const ImageMatchResult& seed, bool requireAllEngines,
+                             bool relaxVerify) {
         std::vector<const ImageMatchResult*> perEngineBest(engineResults.size(), nullptr);
-        for (size_t e = 0; e < engineResults.size(); ++e) {
+        const size_t engineLimit = requireAllEngines ? engineResults.size() : 1;
+        for (size_t e = 0; e < engineLimit; ++e) {
             perEngineBest[e] =
                 FindAgreeingMatch(engineResults[e], seed.x, seed.y, tolerancePx);
             if (!perEngineBest[e]) return;
             if (perEngineBest[e]->score < threshold) return;
         }
 
+        const double verifyScale = seed.scale > 0.0 ? seed.scale : 1.0;
+        cv::Mat verifyGray;
+        cv::Mat verifyBgr;
+        scaledTemplateMats(tplGray, tplBgr, verifyScale, verifyGray, verifyBgr);
+        if (verifyGray.empty()) return;
+
+        const PatchVerifierContext scaledVerifier =
+            PatchVerifierContext::Build(verifyGray, verifyBgr);
+
         const double sadScore =
-            ComputePatchSadSimilarity(srcGray, tplGray, seed.topLeftX, seed.topLeftY);
-        if (sadScore < threshold) return;
+            ComputePatchSadSimilarity(srcGray, verifyGray, seed.topLeftX, seed.topLeftY);
+        const double sadNeed = relaxVerify ? (threshold * 0.55) : threshold;
+        if (sadScore < sadNeed) {
+            if (!relaxVerify) return;
+            // 跨分辨率时 SAD 与 NCC 尺度不完全一致，NCC 已过阈值则仍接受
+            if (seed.score < threshold) return;
+        }
 
-        const double edgeScore =
-            ComputePatchEdgeSimilarity(srcGray, verifier, seed.topLeftX, seed.topLeftY);
-        const double colorScore =
-            ComputePatchColorSimilarity(srcBgr, verifier, seed.topLeftX, seed.topLeftY);
+        if (!relaxVerify) {
+            const double edgeScore =
+                ComputePatchEdgeSimilarity(srcGray, scaledVerifier, seed.topLeftX, seed.topLeftY);
+            const double colorScore =
+                ComputePatchColorSimilarity(srcBgr, scaledVerifier, seed.topLeftX, seed.topLeftY);
 
-        const double nccScore = perEngineBest[0]->score;
-        const bool isTopNccPeak = (bestNccScore - nccScore) < 1.0;
-        const double edgeNeed = isTopNccPeak ? threshold : (threshold + kEdgeBoostPercent);
-        const double colorNeed = isTopNccPeak ? threshold : (threshold + kColorBoostPercent);
+            const double nccScore = perEngineBest[0]->score;
+            const bool isTopNccPeak = (bestNccScore - nccScore) < 1.0;
+            const double edgeNeed = isTopNccPeak ? threshold : (threshold + kEdgeBoostPercent);
+            const double colorNeed = isTopNccPeak ? threshold : (threshold + kColorBoostPercent);
 
-        if (edgeScore < edgeNeed) return;
-        if (verifier.hasColor && colorScore < colorNeed) return;
+            if (edgeScore < edgeNeed) return;
+            if (scaledVerifier.hasColor && colorScore < colorNeed) return;
+        }
 
         for (const auto& existing : consensus) {
             if (PositionsAgree(existing.x, existing.y, seed.x, seed.y, tolerancePx)) return;
         }
 
-        double scoreSum = sadScore + edgeScore;
-        if (verifier.hasColor) scoreSum += colorScore;
-        for (const auto* m : perEngineBest) scoreSum += m->score;
-        const int divisor = static_cast<int>(perEngineBest.size()) + 2 + (verifier.hasColor ? 1 : 0);
-        const double avgScore = scoreSum / static_cast<double>(divisor);
-
         ImageMatchResult merged = seed;
-        merged.score = avgScore;
+        if (relaxVerify) {
+            merged.score = std::max(seed.score, sadScore);
+        } else {
+            const double edgeScore =
+                ComputePatchEdgeSimilarity(srcGray, scaledVerifier, seed.topLeftX, seed.topLeftY);
+            const double colorScore =
+                ComputePatchColorSimilarity(srcBgr, scaledVerifier, seed.topLeftX, seed.topLeftY);
+            double scoreSum = sadScore + edgeScore;
+            if (scaledVerifier.hasColor) scoreSum += colorScore;
+            scoreSum += perEngineBest[0]->score;
+            if (requireAllEngines) {
+                for (size_t e = 1; e < perEngineBest.size(); ++e) {
+                    if (perEngineBest[e]) scoreSum += perEngineBest[e]->score;
+                }
+            }
+            const int divisor = (requireAllEngines ? static_cast<int>(perEngineBest.size()) : 1)
+                + 2 + (scaledVerifier.hasColor ? 1 : 0);
+            merged.score = scoreSum / static_cast<double>(divisor);
+        }
         consensus.push_back(merged);
     };
 
     for (const auto& results : engineResults) {
         for (const auto& seed : results) {
-            tryAcceptSeed(seed);
+            tryAcceptSeed(seed, true, false);
             if (static_cast<int>(consensus.size()) >= normalized.maxMatches) break;
         }
         if (static_cast<int>(consensus.size()) >= normalized.maxMatches) break;
+    }
+
+    if (consensus.empty() && !engineResults[0].empty()) {
+        ImageMatchResult bestNcc{};
+        for (const auto& r : engineResults[0]) {
+            if (r.score > bestNcc.score) bestNcc = r;
+        }
+        if (bestNcc.found && bestNcc.score >= threshold) {
+            tryAcceptSeed(bestNcc, false, true);
+            if (consensus.empty()) {
+                consensus.push_back(bestNcc);
+            }
+        }
+    }
+
+    // NCC 峰值接近阈值但三引擎共识失败：窄范围重扫 + 仅 NCC 放宽验收
+    if (consensus.empty()) {
+        const double acceptFloor = std::max(threshold * 0.97, threshold - 2.0);
+        if (trackedPeakNcc >= acceptFloor ||
+            (normalized.scaleMax - normalized.scaleMin) > 0.03) {
+            ImageMatchResult recovered = RecoverGlobalNccPeak(srcGray, tplGray, normalized);
+            out.debugBestNccPercent = std::max(out.debugBestNccPercent, recovered.score);
+            if (recovered.found && recovered.score >= acceptFloor) {
+                tryAcceptSeed(recovered, false, true);
+                if (consensus.empty()) {
+                    consensus.push_back(recovered);
+                }
+            }
+        }
     }
 
     consensus = GlobalNms(std::move(consensus), normalized.maxOverlap, normalized.maxMatches);

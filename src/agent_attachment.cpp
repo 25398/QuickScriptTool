@@ -183,20 +183,31 @@ bool BuildAttachmentFromImageMat(const cv::Mat& bgr, const std::wstring& fileNam
         return false;
     }
 
+    cv::Mat apiImage = bgr;
+    constexpr int kMaxLongEdge = 1280;
+    const int longEdge = std::max(apiImage.cols, apiImage.rows);
+    if (longEdge > kMaxLongEdge) {
+        const double scale = static_cast<double>(kMaxLongEdge) / longEdge;
+        cv::Mat resized;
+        cv::resize(apiImage, resized, cv::Size(), scale, scale, cv::INTER_AREA);
+        apiImage = resized;
+    }
+
     std::vector<uint8_t> encoded;
-    if (!cv::imencode(".png", bgr, encoded)) {
-        error = L"无法编码剪贴板图片。";
+    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 82};
+    if (!cv::imencode(".jpg", apiImage, encoded, params)) {
+        error = L"无法编码图片。";
         return false;
     }
 
     AgentPendingAttachment item;
     item.fileName = fileName;
     item.isImage = true;
-    item.mime = L"image/png";
+    item.mime = L"image/jpeg";
     item.base64 = Base64Encode(encoded);
     item.thumbnail = CreateBitmapFromMatBGR(bgr, 40);
     if (item.base64.empty()) {
-        error = L"无法读取剪贴板图片。";
+        error = L"无法读取图片。";
         AgentReleaseAttachmentBitmap(item);
         return false;
     }
@@ -265,11 +276,15 @@ bool AgentLoadAttachmentFromPath(const std::wstring& path, AgentPendingAttachmen
     item.mime = AgentMimeTypeForPath(path);
 
     if (item.isImage) {
-        item.base64 = AgentBase64EncodeFile(path);
-        if (item.base64.empty()) {
+        const cv::Mat bgr = DecodeImageFile(path);
+        if (bgr.empty()) {
             error = L"无法读取图片：" + item.fileName;
             return false;
         }
+        const std::wstring savedPath = item.path;
+        if (!BuildAttachmentFromImageMat(bgr, item.fileName, item, error))
+            return false;
+        item.path = savedPath;
         item.thumbnail = AgentCreateImageThumbnail(path, 40);
     } else {
         const auto bytes = ReadBinaryFile(path);

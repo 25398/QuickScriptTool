@@ -61,7 +61,7 @@ inline constexpr wchar_t kParamCheckboxCheckedProp[] = L"QuickScriptParamCheckOn
 void MarkParamCheckbox(HWND hwnd);
 bool IsMarkedParamCheckbox(HWND hwnd);
 bool IsParamCheckboxChecked(HWND hwnd);
-void SetParamCheckboxChecked(HWND hwnd, bool checked);
+void SetParamCheckboxChecked(HWND hwnd, bool checked, bool immediateRedraw = true);
 
 /// 创建复选框控件
 HWND MakeCheckBox(HWND parent, const wchar_t* text, int id,

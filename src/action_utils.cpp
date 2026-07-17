@@ -1,9 +1,18 @@
 // ── 脚本动作辅助函数实现 ────────────────────────────────────
 #include "action_utils.h"
+#include "input/mouse_input_backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
+
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
+#ifndef MOUSEEVENTF_MOVE_NOCOALESCE
+#define MOUSEEVENTF_MOVE_NOCOALESCE 0x2000
+#endif
 
 namespace {
 const RunProgramPreset kRunProgramPresets[] = {
@@ -83,7 +92,7 @@ std::wstring HoldText(const ScriptAction& action) {
 
 std::wstring RepeatInfo(const ScriptAction& action) {
     return L"[重复" + std::to_wstring(action.clickCount)
-        + L"次等待" + F3(action.duration)
+        + L"次间隔" + F3(action.duration)
         + L"+随机" + F3(action.randomDuration) + L"秒]";
 }
 
@@ -95,6 +104,9 @@ std::wstring ActionName(const ScriptAction& action) {
             return L"移动鼠标到(" + action.moveVarExprX + L"," + action.moveVarExprY + L")";
         }
         return L"移动鼠标到(" + std::to_wstring(action.x)
+            + L"," + std::to_wstring(action.y) + L")";
+    case ActionType::MoveMouseRelative:
+        return L"相对移动鼠标(" + std::to_wstring(action.x)
             + L"," + std::to_wstring(action.y) + L")";
     case ActionType::MouseDown: {
         const auto holds = HoldText(action);
@@ -261,6 +273,7 @@ std::wstring ActionName(const ScriptAction& action) {
 std::wstring ActionTypeBriefLabel(ActionType type) {
     switch (type) {
     case ActionType::MoveMouse: return L"移动鼠标到";
+    case ActionType::MoveMouseRelative: return L"相对移动鼠标";
     case ActionType::Wait: return L"等待";
     case ActionType::MouseClick: return L"鼠标点击";
     case ActionType::MouseDown: return L"鼠标按下";
@@ -301,7 +314,9 @@ std::wstring ActionTypeBriefLabel(ActionType type) {
 
 std::wstring JsonTypeBriefLabel(const std::wstring& jsonType) {
     static const struct { const wchar_t* json; ActionType type; } kMap[] = {
-        {L"moveMouse", ActionType::MoveMouse}, {L"wait", ActionType::Wait},
+        {L"moveMouse", ActionType::MoveMouse},
+        {L"moveMouseRelative", ActionType::MoveMouseRelative},
+        {L"wait", ActionType::Wait},
         {L"mouseClick", ActionType::MouseClick}, {L"mouseDown", ActionType::MouseDown},
         {L"mouseUp", ActionType::MouseUp}, {L"mousePlayback", ActionType::MousePlayback},
         {L"runMacro", ActionType::RunMacro}, {L"keyClick", ActionType::KeyClick},
@@ -346,7 +361,7 @@ std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions
 
 std::wstring ActionTypeReplyCatalog() {
     return LR"(【动作 type 对用户的中文说法 — 与编辑器一致，禁止在回复中出现英文 type】
-wait→等待  moveMouse→移动鼠标到  mouseClick→鼠标点击  mouseDown→鼠标按下  mouseUp→鼠标松开
+wait→等待  moveMouse→移动鼠标到  moveMouseRelative→相对移动鼠标  mouseClick→鼠标点击  mouseDown→鼠标按下  mouseUp→鼠标松开
 mousePlayback→鼠标回放  runMacro→运行鼠标宏  keyClick→按键点击  keyDown→键盘按下  keyUp→键盘松开
 hotkeyShortcut→快捷按键  quickInput→快捷输入  scrollWheel→滚动滚轮
 loop→循环  endLoop→跳出循环  defineBlock→定义宏指令块  runBlock→运行宏指令块
@@ -383,9 +398,58 @@ bool ScriptUsesAiAction(const std::vector<ScriptAction>& actions) {
     return false;
 }
 
+bool ScriptIsTimedInputSequence(const std::vector<ScriptAction>& actions) {
+    if (actions.empty()) return false;
+    for (const auto& a : actions) {
+        switch (a.type) {
+        case ActionType::MoveMouse:
+        case ActionType::MoveMouseRelative:
+        case ActionType::Wait:
+        case ActionType::MouseDown:
+        case ActionType::MouseUp:
+        case ActionType::MouseClick:
+        case ActionType::KeyDown:
+        case ActionType::KeyUp:
+        case ActionType::KeyClick:
+        case ActionType::HotkeyShortcut:
+        case ActionType::QuickInput:
+        case ActionType::ScrollWheel:
+        case ActionType::Loop:
+        case ActionType::EndLoop:
+        case ActionType::StopMacro:
+        case ActionType::Goto:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ActionUsesInterRepeatInterval(ActionType type) {
+    switch (type) {
+    case ActionType::MouseClick:
+    case ActionType::KeyClick:
+    case ActionType::HotkeyShortcut:
+    case ActionType::QuickInput:
+    case ActionType::ScrollWheel:
+    case ActionType::MousePlayback:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ShouldWaitAfterRepeat(const ScriptAction& action, int repeatIndex) {
+    return ActionUsesInterRepeatInterval(action.type)
+        && repeatIndex >= 0
+        && repeatIndex + 1 < action.clickCount;
+}
+
 std::wstring JsonType(ActionType type) {
     switch (type) {
     case ActionType::MoveMouse:   return L"moveMouse";
+    case ActionType::MoveMouseRelative: return L"moveMouseRelative";
     case ActionType::MouseDown:   return L"mouseDown";
     case ActionType::MouseUp:     return L"mouseUp";
     case ActionType::MouseClick:  return L"mouseClick";
@@ -443,43 +507,161 @@ bool IsValidBlockName(const std::wstring& name) {
 
 // ── 键盘/鼠标模拟函数 ─────────────────────────────────────────────
 
+namespace {
+
+/// 专用方向键/编辑区等须带 KEYEVENTF_EXTENDEDKEY。
+/// 否则 MapVirtualKey 常只给出与小键盘同码的 0x48 等，NumLock 开着时 ↑ 会打出「8」。
+bool IsExtendedVirtualKey(UINT vk) {
+    switch (vk) {
+    case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT:
+    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+    case VK_INSERT: case VK_DELETE:
+    case VK_DIVIDE:   // 小键盘 /
+    case VK_NUMLOCK:
+    case VK_RCONTROL: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN: case VK_APPS:
+    case VK_SNAPSHOT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+}  // namespace
+
 void SendKeyboardKey(UINT vk, bool down) {
     if (vk == 0) return;
     UINT scanEx = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
     if (scanEx == 0) scanEx = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-    if (scanEx == 0) return;
+    if (scanEx == 0 && !IsExtendedVirtualKey(vk)) return;
+
+    // 方向键等：强制按扩展扫描码处理（低 8 位 + EXTENDED 标志）
+    WORD scan = static_cast<WORD>(scanEx & 0xFF);
+    bool extended = ((scanEx & 0xFF00) == 0xE000) || ((scanEx & 0xFF00) == 0xE100)
+        || IsExtendedVirtualKey(vk);
+    if (scan == 0 && IsExtendedVirtualKey(vk)) {
+        // 个别环境 MAPVK 失败时仍给出常见扫描码，避免静默跳过
+        switch (vk) {
+        case VK_UP: scan = 0x48; break;
+        case VK_LEFT: scan = 0x4B; break;
+        case VK_RIGHT: scan = 0x4D; break;
+        case VK_DOWN: scan = 0x50; break;
+        case VK_INSERT: scan = 0x52; break;
+        case VK_DELETE: scan = 0x53; break;
+        case VK_HOME: scan = 0x47; break;
+        case VK_END: scan = 0x4F; break;
+        case VK_PRIOR: scan = 0x49; break;
+        case VK_NEXT: scan = 0x51; break;
+        default: break;
+        }
+    }
+    if (scan == 0) return;
+
     INPUT input{};
     input.type = INPUT_KEYBOARD;
-    input.ki.wScan = static_cast<WORD>(scanEx & 0xFF);
+    input.ki.wScan = scan;
     input.ki.dwFlags = KEYEVENTF_SCANCODE;
-    const UINT high = scanEx & 0xFF00;
-    if (high == 0xE000 || high == 0xE100)
-        input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    if (extended) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     if (!down) input.ki.dwFlags |= KEYEVENTF_KEYUP;
     SendInput(1, &input, sizeof(INPUT));
 }
 
 void MouseButtonEvent(MouseButtonType button, bool down) {
-    INPUT input{};
-    input.type = INPUT_MOUSE;
-    if (button == MouseButtonType::Right)
-        input.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-    else if (button == MouseButtonType::Middle)
-        input.mi.dwFlags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
-    else if (button == MouseButtonType::X1) {
-        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
-        input.mi.mouseData = XBUTTON1;
-    } else if (button == MouseButtonType::X2) {
-        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
-        input.mi.mouseData = XBUTTON2;
-    } else
-        input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-    SendInput(1, &input, sizeof(INPUT));
+    MouseInputRouter::Instance().Button(button, down);
 }
 
 void MouseClick(MouseButtonType button) {
     MouseButtonEvent(button, true);
     MouseButtonEvent(button, false);
+}
+
+void SendMouseMoveRelative(int dx, int dy) {
+    MouseInputRouter::Instance().MoveRelative(dx, dy);
+}
+
+MouseBallisticsGuard::MouseBallisticsGuard(bool enable) {
+    if (!enable) return;
+    active_ = true;
+    SystemParametersInfoW(SPI_GETMOUSE, 0, mouseParams_, 0);
+    SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &mouseSpeed_, 0);
+    // 阈值与增强精度全部清零；速度 10 = 1:1 mickey（贴合 Raw 录制计数值）
+    int flat[3] = { 0, 0, 0 };
+    SystemParametersInfoW(SPI_SETMOUSE, 0, flat, SPIF_SENDCHANGE);
+    int mid = 10;
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, &mid, SPIF_SENDCHANGE);
+    // 给系统一点时间让加速表生效；切勿再发零位移 SendInput（会灌进游戏导致视角微抖）。
+    Sleep(1);
+}
+
+MouseBallisticsGuard::~MouseBallisticsGuard() {
+    if (!active_) return;
+    SystemParametersInfoW(SPI_SETMOUSE, 0, mouseParams_, SPIF_SENDCHANGE);
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, &mouseSpeed_, SPIF_SENDCHANGE);
+}
+
+PlaybackProcessPriorityGuard::PlaybackProcessPriorityGuard(bool enable) {
+    if (!enable) return;
+    HANDLE proc = GetCurrentProcess();
+    prevClass_ = GetPriorityClass(proc);
+    if (SetPriorityClass(proc, HIGH_PRIORITY_CLASS)) active_ = true;
+}
+
+PlaybackProcessPriorityGuard::~PlaybackProcessPriorityGuard() {
+    if (active_) SetPriorityClass(GetCurrentProcess(), prevClass_);
+}
+
+PlaybackThreadAffinityGuard::PlaybackThreadAffinityGuard(bool enable) {
+    if (!enable) return;
+    thread_ = GetCurrentThread();
+    DWORD_PTR processMask = 0, systemMask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask)
+        || processMask == 0) {
+        return;
+    }
+    // 选 processMask 中编号最高的核，减少与 UI/游戏抢同一核的概率。
+    DWORD_PTR pin = 1;
+    while ((pin << 1) != 0 && ((pin << 1) & processMask) != 0) pin <<= 1;
+    if ((pin & processMask) == 0) pin = processMask & ~(processMask - 1);
+    prevMask_ = SetThreadAffinityMask(thread_, pin);
+    active_ = prevMask_ != 0;
+}
+
+PlaybackThreadAffinityGuard::~PlaybackThreadAffinityGuard() {
+    if (active_ && thread_) SetThreadAffinityMask(thread_, prevMask_);
+}
+
+MultimediaTimerGuard::MultimediaTimerGuard(bool enable) {
+    if (!enable) return;
+    if (timeBeginPeriod(1) == TIMERR_NOERROR) activePeriod_ = true;
+
+    using NtSetTimerResolutionFn = LONG (WINAPI*)(ULONG, BOOLEAN, ULONG*);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    auto ntSet = reinterpret_cast<NtSetTimerResolutionFn>(
+        GetProcAddress(ntdll, "NtSetTimerResolution"));
+    if (!ntSet) return;
+    ULONG current = 0;
+    // 请求 0.5ms（5000 × 100ns）；失败则忽略。
+    if (ntSet(5000, TRUE, &current) >= 0) {
+        prevNtRes_ = current;
+        activeNtRes_ = true;
+    }
+}
+
+MultimediaTimerGuard::~MultimediaTimerGuard() {
+    if (activeNtRes_) {
+        using NtSetTimerResolutionFn = LONG (WINAPI*)(ULONG, BOOLEAN, ULONG*);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll) {
+            auto ntSet = reinterpret_cast<NtSetTimerResolutionFn>(
+                GetProcAddress(ntdll, "NtSetTimerResolution"));
+            if (ntSet) {
+                ULONG ignored = 0;
+                ntSet(prevNtRes_ ? prevNtRes_ : 10000, FALSE, &ignored);
+            }
+        }
+    }
+    if (activePeriod_) timeEndPeriod(1);
 }
 
 namespace {
@@ -543,17 +725,22 @@ void SendUnicodeChar(wchar_t ch) {
     SendInput(2, inputs, sizeof(INPUT));
 }
 
-void SendQuickInputText(const std::wstring& text, double charInterval) {
-    auto delay = [charInterval]() {
-        if (charInterval <= 0) return;
+void SendQuickInputText(const std::wstring& text, double charInterval,
+    const std::atomic_bool* cancelFlag) {
+    auto cancelled = [cancelFlag]() {
+        return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
+    };
+    auto delay = [charInterval, &cancelled]() {
+        if (charInterval <= 0 || cancelled()) return;
         const auto end = std::chrono::steady_clock::now()
             + std::chrono::milliseconds(static_cast<int>(charInterval * 1000.0));
-        while (std::chrono::steady_clock::now() < end) {
+        while (!cancelled() && std::chrono::steady_clock::now() < end) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     };
 
     for (size_t i = 0; i < text.size(); ++i) {
+        if (cancelled()) return;
         const wchar_t ch = text[i];
         if (ch == L'\r') {
             if (i + 1 < text.size() && text[i + 1] == L'\n') ++i;

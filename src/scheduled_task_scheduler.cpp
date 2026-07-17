@@ -3,6 +3,7 @@
 #include "scheduled_task_store.h"
 
 #include <cstdio>
+#include <vector>
 
 void ScheduledTaskScheduler::SetRunCallback(RunCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -55,38 +56,44 @@ bool ScheduledTaskScheduler::Save() {
 
 std::wstring ScheduledTaskScheduler::FireKey(const ScheduledTask& task, const SYSTEMTIME& st) const {
     wchar_t buf[128]{};
-    swprintf_s(buf, L"%s-%04d%02d%02d%02d%02d%02d%03d",
-        task.id.c_str(), st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    // 秒级去重：与 TimeMatches（忽略毫秒）一致，避免同秒内重复开火。
+    swprintf_s(buf, L"%s-%04d%02d%02d%02d%02d%02d",
+        task.id.c_str(), st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     return buf;
 }
 
 void ScheduledTaskScheduler::Tick() {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    TickAt(now);
+}
+
+void ScheduledTaskScheduler::TickAt(const SYSTEMTIME& now) {
     RunCallback callback;
-    std::wstring pathToRun;
+    std::vector<std::wstring> pathsToRun;
     bool needSave = false;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (paused_ || !runCallback_) return;
 
-        SYSTEMTIME now{};
-        GetLocalTime(&now);
-
+        callback = runCallback_;
         for (auto& task : tasks_) {
             if (!ScheduledTaskShouldRun(task, now, globalDisabled_, paused_)) continue;
             const std::wstring key = FireKey(task, now);
             if (lastFireKey_[task.id] == key) continue;
             lastFireKey_[task.id] = key;
-            pathToRun = task.filePath;
-            callback = runCallback_;
+            if (!task.filePath.empty()) pathsToRun.push_back(task.filePath);
             if (task.frequency == ScheduledFrequency::Custom) {
                 task.customFired = true;
                 needSave = true;
             }
-            break;
         }
     }
 
     if (needSave) Save();
-    if (callback && !pathToRun.empty()) callback(pathToRun);
+    if (!callback) return;
+    for (const auto& path : pathsToRun) {
+        if (!path.empty()) callback(path);
+    }
 }

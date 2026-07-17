@@ -15,10 +15,37 @@
 #include "agent_system_prompt.h"
 #include "config.h"
 #include "drawing.h"
+#include "render_context.h"
 #include "modern_edit.h"
 #include "scheduled_task_ui.h"
 #include "taskbar_window.h"
 #include "utils.h"
+#include "ui_scale.h"
+
+#include <set>
+
+namespace {
+int AL(int v) { return UiLen(v); }
+
+// AI 助手多开级联：占用最小空闲槽位；关窗后释放，新窗优先补洞。
+std::set<int>& AgentCascadeUsedSlots() {
+    static std::set<int> used;
+    return used;
+}
+
+int AcquireAgentCascadeSlot() {
+    auto& used = AgentCascadeUsedSlots();
+    int slot = 0;
+    while (used.count(slot)) ++slot;
+    used.insert(slot);
+    return slot;
+}
+
+void ReleaseAgentCascadeSlot(int slot) {
+    if (slot < 0) return;
+    AgentCascadeUsedSlots().erase(slot);
+}
+}  // namespace
 
 #include <windowsx.h>
 #include <commctrl.h>
@@ -31,24 +58,6 @@
 #include <thread>
 
 namespace {
-
-void FillAlphaRect(HDC hdc, RECT rc, COLORREF color, BYTE alpha) {
-    const int w = rc.right - rc.left;
-    const int h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) return;
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-    HGDIOBJ oldBmp = SelectObject(mem, bmp);
-    RECT local{0, 0, w, h};
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(mem, &local, brush);
-    DeleteObject(brush);
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, 0};
-    GdiAlphaBlend(hdc, rc.left, rc.top, w, h, mem, 0, 0, w, h, bf);
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
-}
 
 std::wstring NowHHMM() {
     SYSTEMTIME st{};
@@ -151,18 +160,30 @@ bool AgentDialog::Show(HWND owner, const quickscript::AiApiSettings& aiSettings,
     if (owner_ && IsWindow(owner_))
         GetWindowRect(owner_, &ownerRc);
 
-    static int sCascade = 0;
-    const int cascade = (sCascade++ % 10) * 28;
+    // 相对主窗：槽位 0 与主窗完全重叠；第 2 个起才右下偏移，关窗后优先补最小空闲槽
+    cascadeSlot_ = AcquireAgentCascadeSlot();
+    const int cascade = cascadeSlot_ * UiLen(28);
     const int x = ownerRc.left + cascade;
     const int y = ownerRc.top + cascade;
 
+    // 缩放比例由主窗口维护；无 owner 时才从显示器初始化
+    if (!owner_ || !IsWindow(owner_))
+        UiScaleInitFromPrimaryMonitor();
+
     hwnd_ = CreateWindowExW(0, cls, L"",
         WS_POPUP | WS_CLIPCHILDREN,
-        x, y, kDialogW, kDialogH, nullptr, nullptr,
+        x, y, UiHomeWidth(), UiHomeHeight(), nullptr, nullptr,
         GetModuleHandleW(nullptr), this);
-    if (!hwnd_) return false;
+    if (!hwnd_) {
+        ReleaseAgentCascadeSlot(cascadeSlot_);
+        cascadeSlot_ = -1;
+        return false;
+    }
 
-    ApplyTaskbarWindowStyle(hwnd_, L"AI 脚本助手");
+    UiResizeHwndToHome(hwnd_);
+
+    ApplyTaskbarWindowStyle(hwnd_, L"AI 脚本助手", true);
+    if (initialized_) PositionControls();
 
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(hwnd_);
@@ -417,6 +438,16 @@ LRESULT AgentDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_DPICHANGED:
+        if (owner_ && IsWindow(owner_))
+            PostMessageW(owner_, WM_APP_UI_SCALE_SYNC, 0, 1);
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        if (owner_ && IsWindow(owner_))
+            PostMessageW(owner_, WM_APP_UI_SCALE_SYNC, 0, 1);
+        return 0;
+
     case WM_PAINT:
         Paint();
         return 0;
@@ -433,6 +464,8 @@ LRESULT AgentDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(hwnd_, kThinkingTimerId);
         Cleanup();
+        if (owner_ && IsWindow(owner_))
+            PostMessageW(owner_, WM_APP_UI_SCALE_SYNC, 0, 0);
         hwnd_ = nullptr;
         return 0;
 
@@ -507,19 +540,46 @@ LRESULT CALLBACK AgentDialog::ChatViewSubclassProc(HWND hwnd, UINT msg, WPARAM w
 }
 
 // ── Init ──────────────────────────────────────────────────────────
+void AgentDialog::RecreateFonts() {
+    if (font_) { DeleteObject(font_); font_ = nullptr; }
+    if (closeFont_) { DeleteObject(closeFont_); closeFont_ = nullptr; }
+    if (chatFont_) { DeleteObject(chatFont_); chatFont_ = nullptr; }
+    if (smallFont_) { DeleteObject(smallFont_); smallFont_ = nullptr; }
+    font_ = CreateFontW(UiFontHeight(24), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    closeFont_ = CreateFontW(UiFontHeight(36), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    chatFont_ = CreateFontW(UiFontHeight(22), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    smallFont_ = CreateFontW(UiFontHeight(20), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+}
+
+void AgentDialog::ResizeToUiHome() {
+    UiResizeWindowClient(hwnd_, UiHomeWidth(), UiHomeHeight(), true);
+}
+
+void AgentDialog::ApplyDpiLayout() {
+    if (!hwnd_) return;
+    RecreateFonts();
+    if (chatView_) SendMessageW(chatView_, WM_SETFONT, reinterpret_cast<WPARAM>(chatFont_), TRUE);
+    if (inputEdit_) SendMessageW(inputEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    if (initialized_) modelCombo_.Init(hwnd_, font_);
+    ResizeToUiHome();
+    if (initialized_) {
+        UpdateInputHeight();
+        PositionControls();
+    }
+    RedrawWindow(hwnd_, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
 void AgentDialog::Init() {
-    font_ = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    closeFont_ = CreateFontW(36, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    chatFont_ = CreateFontW(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    smallFont_ = CreateFontW(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    RecreateFonts();
 
     LoadLibraryW(L"Msftedit.dll");
     DragAcceptFiles(hwnd_, TRUE);
@@ -536,7 +596,7 @@ void AgentDialog::Init() {
     if (!chatView_) return;
 
     SendMessageW(chatView_, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
-    SendMessageW(chatView_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(kHorizPad, kHorizPad));
+    SendMessageW(chatView_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(AL(kHorizPad), AL(kHorizPad)));
     DragAcceptFiles(chatView_, TRUE);
     SetWindowSubclass(chatView_, ChatViewSubclassProc, 8803, reinterpret_cast<DWORD_PTR>(this));
 
@@ -587,6 +647,8 @@ void AgentDialog::Init() {
         conversationStarted_ = true;
     }
     outerShadow_.Attach(hwnd_);
+    ResizeToUiHome();
+    PositionControls();
 }
 
 void AgentDialog::ApplySelectedModelProfile() {
@@ -735,7 +797,7 @@ void AgentDialog::HandleInputMouseWheel(int delta) {
 int AgentDialog::VisibleInputLines() const {
     const RECT rc = InputRect();
     const int h = std::max(1, static_cast<int>(rc.bottom - rc.top));
-    return std::max(1, h / kInputLineH);
+    return std::max(1, h / AL(kInputLineH));
 }
 
 void AgentDialog::SetInputScrollPos(int pos) {
@@ -821,10 +883,10 @@ void AgentDialog::PositionControls() {
 }
 
 int AgentDialog::InputFrameHeight() const {
-    int h = kFrameInnerPad;
-    if (!attachments_.empty()) h += kAttachmentBarH + 4;
-    h += kInputPadV + inputLines_ * kInputLineH + kInputPadV;
-    h += std::max(kSendBtnH, kAttachBtnH) + kFrameInnerPad;
+    int h = AL(kFrameInnerPad);
+    if (!attachments_.empty()) h += AL(kAttachmentBarH) + 4;
+    h += AL(kInputPadV) + inputLines_ * AL(kInputLineH) + AL(kInputPadV);
+    h += std::max(AL(kSendBtnH), AL(kAttachBtnH)) + AL(kFrameInnerPad);
     return h;
 }
 
@@ -840,6 +902,7 @@ void AgentDialog::Paint() {
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
     HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    RenderBatchScope batch(mem);
 
     // 背景
     FillRectColor(mem, rc, kWhite);
@@ -847,17 +910,15 @@ void AgentDialog::Paint() {
     // 标题栏（与主界面一致，仅保留一行）
     const RECT closeRc = CloseRect();
     const RECT minRc = MinimizeRect();
-    FillRectColor(mem, RECT{0, 0, w, kTitleBarH}, kMainGreen);
+    FillRectColor(mem, RECT{0, 0, w, AL(kTitleBarH)}, kMainGreen);
     SelectObject(mem, font_);
-    SetBkMode(mem, TRANSPARENT);
-    SetTextColor(mem, kWhite);
-    RECT titleRc{kHorizPad + 20, 0, w - kCloseBtnW - kTitleBtnW, kTitleBarH};
-    DrawTextW(mem, L"AI 脚本助手", -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    if (hoverMinimize_) FillAlphaRect(mem, minRc, RGB(90, 190, 125), kCloseHoverAlpha);
-    if (hoverClose_) FillAlphaRect(mem, closeRc, RGB(90, 190, 125), kCloseHoverAlpha);
+    RECT titleRc{AL(kHorizPad) + 20, 0, w - AL(kCloseBtnW) - AL(kTitleBtnW), AL(kTitleBarH)};
+    DrawTextIn(mem, L"AI 脚本助手", titleRc, kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (hoverMinimize_) ::FillAlphaRect(mem, minRc, kCloseHover, kCloseHoverAlpha);
+    if (hoverClose_) ::FillAlphaRect(mem, closeRc, kCloseHover, kCloseHoverAlpha);
     SelectObject(mem, closeFont_);
-    DrawTextW(mem, L"−", -1, const_cast<RECT*>(&minRc), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    DrawTextW(mem, L"×", -1, const_cast<RECT*>(&closeRc), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(mem, L"−", minRc, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(mem, L"×", closeRc, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     // 输入区分割线与背景
     const RECT inputFrame = InputFrameRect();
@@ -881,9 +942,7 @@ void AgentDialog::Paint() {
     SelectObject(mem, oldPen);
     DeleteObject(attachPen);
     SelectObject(mem, font_);
-    SetBkMode(mem, TRANSPARENT);
-    SetTextColor(mem, kText);
-    DrawTextW(mem, L"+", -1, const_cast<RECT*>(&attachRc), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(mem, L"+", attachRc, kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     if (!savedModels_.empty())
         modelCombo_.DrawField(mem, ModelComboRect(), hoverModelCombo_);
@@ -894,13 +953,12 @@ void AgentDialog::Paint() {
 
     if (thinking_) {
         SelectObject(mem, chatFont_);
-        SetBkMode(mem, TRANSPARENT);
-        SetTextColor(mem, kMainGreen);
         const std::wstring label = ThinkingStatusText();
-        RECT thinkRc = ThinkingStatusRect();
-        DrawTextW(mem, label.c_str(), -1, &thinkRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(mem, label, ThinkingStatusRect(), kMainGreen,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
+    batch.End();
     BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -929,6 +987,10 @@ void AgentDialog::TryExportConversation() {
 }
 
 void AgentDialog::Cleanup() {
+    // 先销毁独立阴影窗口，避免会话保存或网络清理期间仍残留在桌面/任务栏。
+    outerShadow_.Detach();
+    ReleaseAgentCascadeSlot(cascadeSlot_);
+    cascadeSlot_ = -1;
     TryExportConversation();
     onClose_ = nullptr;
     if (aliveFlag_) *aliveFlag_ = false;
@@ -951,13 +1013,13 @@ void AgentDialog::Cleanup() {
 int AgentDialog::ClientW() const {
     RECT rc{}; GetClientRect(hwnd_, &rc);
     const int w = static_cast<int>(rc.right - rc.left);
-    return w > 0 ? w : kDialogW;
+    return w > 0 ? w : UiHomeWidth();
 }
 
 int AgentDialog::ClientH() const {
     RECT rc{}; GetClientRect(hwnd_, &rc);
     const int h = static_cast<int>(rc.bottom - rc.top);
-    return h > 0 ? h : kDialogH;
+    return h > 0 ? h : UiHomeHeight();
 }
 
 // ── Hit testing ───────────────────────────────────────────────────
@@ -974,7 +1036,7 @@ bool AgentDialog::HitMinimize(int x, int y) const {
 }
 
 bool AgentDialog::HitTitle(int x, int y) const {
-    return y >= 0 && y < kTitleBarH && x < MinimizeRect().left;
+    return y >= 0 && y < AL(kTitleBarH) && x < MinimizeRect().left;
 }
 
 bool AgentDialog::HitSend(int x, int y) const {
@@ -989,66 +1051,66 @@ bool AgentDialog::HitAttach(int x, int y) const {
 RECT AgentDialog::MessagesRect() const {
     const int clientW = ClientW();
     const int clientH = ClientH();
-    const int frameTop = clientH - kInputBottomPad - InputFrameHeight();
-    const int bottom = std::max(kTitleBarH + 8, frameTop - kInputGap);
-    return RECT{kHorizPad, kTitleBarH + 4, clientW - kHorizPad, bottom};
+    const int frameTop = clientH - AL(kInputBottomPad) - InputFrameHeight();
+    const int bottom = std::max(AL(kTitleBarH) + 8, frameTop - AL(kInputGap));
+    return RECT{AL(kHorizPad), AL(kTitleBarH) + 4, clientW - AL(kHorizPad), bottom};
 }
 
 RECT AgentDialog::InputFrameRect() const {
     const int clientW = ClientW();
     const int clientH = ClientH();
     const int h = InputFrameHeight();
-    return RECT{kHorizPad, clientH - kInputBottomPad - h, clientW - kHorizPad,
-        clientH - kInputBottomPad};
+    return RECT{AL(kHorizPad), clientH - AL(kInputBottomPad) - h, clientW - AL(kHorizPad),
+        clientH - AL(kInputBottomPad)};
 }
 
 RECT AgentDialog::AttachmentBarRect() const {
     const RECT frame = InputFrameRect();
     if (attachments_.empty()) return RECT{};
-    return RECT{frame.left + kFrameInnerPad, frame.top + kFrameInnerPad,
-        frame.right - kFrameInnerPad, frame.top + kFrameInnerPad + kAttachmentBarH};
+    return RECT{frame.left + AL(kFrameInnerPad), frame.top + AL(kFrameInnerPad),
+        frame.right - AL(kFrameInnerPad), frame.top + AL(kFrameInnerPad) + AL(kAttachmentBarH)};
 }
 
 RECT AgentDialog::AttachmentChipRect(int index) const {
     const RECT bar = AttachmentBarRect();
-    const int x = bar.left + index * (kAttachmentChipW + kAttachmentChipGap);
-    return RECT{x, bar.top + 4, x + kAttachmentChipW, bar.bottom - 4};
+    const int x = bar.left + index * (AL(kAttachmentChipW) + AL(kAttachmentChipGap));
+    return RECT{x, bar.top + 4, x + AL(kAttachmentChipW), bar.bottom - 4};
 }
 
 RECT AgentDialog::InputRect() const {
     const RECT frame = InputFrameRect();
-    int top = frame.top + kFrameInnerPad;
-    if (!attachments_.empty()) top += kAttachmentBarH + 4;
-    const int bottom = frame.bottom - kFrameInnerPad - std::max(kSendBtnH, kAttachBtnH) - 4;
-    const int left = frame.left + kFrameInnerPad;
-    int right = frame.right - kFrameInnerPad;
-    if (inputScrollVisible_) right -= kInputScrollW + 4;
+    int top = frame.top + AL(kFrameInnerPad);
+    if (!attachments_.empty()) top += AL(kAttachmentBarH) + 4;
+    const int bottom = frame.bottom - AL(kFrameInnerPad) - std::max(AL(kSendBtnH), AL(kAttachBtnH)) - 4;
+    const int left = frame.left + AL(kFrameInnerPad);
+    int right = frame.right - AL(kFrameInnerPad);
+    if (inputScrollVisible_) right -= AL(kInputScrollW) + 4;
     return RECT{left, top, right, bottom};
 }
 
 RECT AgentDialog::AttachBtnRect() const {
     const RECT frame = InputFrameRect();
-    const int top = frame.bottom - kFrameInnerPad - kAttachBtnH;
-    return RECT{frame.left + kFrameInnerPad, top,
-        frame.left + kFrameInnerPad + kAttachBtnW, top + kAttachBtnH};
+    const int top = frame.bottom - AL(kFrameInnerPad) - AL(kAttachBtnH);
+    return RECT{frame.left + AL(kFrameInnerPad), top,
+        frame.left + AL(kFrameInnerPad) + AL(kAttachBtnW), top + AL(kAttachBtnH)};
 }
 
 RECT AgentDialog::ModelComboRect() const {
     const RECT attach = AttachBtnRect();
-    return RECT{attach.right + kModelComboGap, attach.top,
-        attach.right + kModelComboGap + kModelComboW, attach.bottom};
+    return RECT{attach.right + AL(kModelComboGap), attach.top,
+        attach.right + AL(kModelComboGap) + AL(kModelComboW), attach.bottom};
 }
 
 RECT AgentDialog::SendBtnRect() const {
     const RECT frame = InputFrameRect();
-    const int top = frame.bottom - kFrameInnerPad - kSendBtnH;
-    return RECT{frame.right - kFrameInnerPad - kSendBtnW, top,
-        frame.right - kFrameInnerPad, top + kSendBtnH};
+    const int top = frame.bottom - AL(kFrameInnerPad) - AL(kSendBtnH);
+    return RECT{frame.right - AL(kFrameInnerPad) - AL(kSendBtnW), top,
+        frame.right - AL(kFrameInnerPad), top + AL(kSendBtnH)};
 }
 
 RECT AgentDialog::InputScrollTrackRect() const {
     const RECT input = InputRect();
-    return RECT{input.right + 2, input.top, input.right + 2 + kInputScrollW, input.bottom};
+    return RECT{input.right + 2, input.top, input.right + 2 + AL(kInputScrollW), input.bottom};
 }
 
 RECT AgentDialog::InputScrollThumbRect() const {
@@ -1075,12 +1137,12 @@ bool AgentDialog::HitInputScrollTrack(int x, int y) const {
 
 RECT AgentDialog::CloseRect() const {
     const int clientW = ClientW();
-    return RECT{clientW - kCloseBtnW, 0, clientW, kTitleBarH};
+    return RECT{clientW - AL(kCloseBtnW), 0, clientW, AL(kTitleBarH)};
 }
 
 RECT AgentDialog::MinimizeRect() const {
     const RECT close = CloseRect();
-    return RECT{close.left - kTitleBtnW, 0, close.left, kTitleBarH};
+    return RECT{close.left - AL(kTitleBtnW), 0, close.left, AL(kTitleBarH)};
 }
 
 // ── Chat view helpers ─────────────────────────────────────────────
@@ -1139,6 +1201,8 @@ void AgentDialog::BeginThinkingBlock() {
     statusLinePending_ = false;
     thinkingStatusStart_ = -1;
     thinkingStatusEnd_ = -1;
+    thinkingCharCount_ = 0;
+    lastReasoningStatusChars_ = 0;
     lastStatusText_.clear();
     AppendStyledText(L"[思考] " + NowHHMM() + L"\n", kHint);
 }
@@ -1146,14 +1210,12 @@ void AgentDialog::BeginThinkingBlock() {
 void AgentDialog::AppendThinkingLine(const std::wstring& line) {
     if (!thinkingBlockOpen_ || line.empty()) return;
     thinkingHasContent_ = true;
-    statusLinePending_ = false;
     AppendStyledText(line + L"\n", kHint);
 }
 
 void AgentDialog::AppendThinkingDelta(const std::wstring& delta) {
     if (!thinkingBlockOpen_ || delta.empty()) return;
     thinkingHasContent_ = true;
-    statusLinePending_ = false;
     AppendStyledText(delta, kHint);
 }
 
@@ -1242,7 +1304,7 @@ std::wstring AgentDialog::ThinkingStatusText() const {
 
 RECT AgentDialog::ThinkingStatusRect() const {
     const RECT frame = InputFrameRect();
-    return RECT{kHorizPad, frame.top - 34, ClientW() - kHorizPad, frame.top - 8};
+    return RECT{AL(kHorizPad), frame.top - 34, ClientW() - AL(kHorizPad), frame.top - 8};
 }
 
 std::wstring AgentDialog::BuildUserDisplayText(const std::wstring& text) const {
@@ -1537,26 +1599,6 @@ void AgentDialog::OnStatus(const std::wstring& status) {
     lastStatusText_ = status;
     const RECT thinkRc = ThinkingStatusRect();
     InvalidateRect(hwnd_, &thinkRc, FALSE);
-
-    if (!thinkingBlockOpen_) return;
-
-    const std::wstring line = status + L"\n";
-    if (statusLinePending_ && thinkingStatusStart_ >= 0 && thinkingStatusEnd_ > thinkingStatusStart_) {
-        SendMessageW(chatView_, EM_SETSEL, thinkingStatusStart_, thinkingStatusEnd_);
-        CHARFORMAT2W cf{};
-        cf.cbSize = sizeof(cf);
-        cf.dwMask = CFM_COLOR;
-        cf.crTextColor = kHint;
-        SendMessageW(chatView_, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
-        SendMessageW(chatView_, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(line.c_str()));
-        thinkingStatusEnd_ = thinkingStatusStart_ + static_cast<int>(line.size());
-        ScrollToBottom();
-        return;
-    }
-    statusLinePending_ = true;
-    thinkingStatusStart_ = GetWindowTextLengthW(chatView_);
-    AppendStyledText(line, kHint);
-    thinkingStatusEnd_ = thinkingStatusStart_ + static_cast<int>(line.size());
 }
 
 void AgentDialog::OnReasoning(const std::wstring& reasoning) {
@@ -1566,6 +1608,13 @@ void AgentDialog::OnReasoning(const std::wstring& reasoning) {
 
 void AgentDialog::OnReasoningDelta(const std::wstring& delta) {
     AppendThinkingDelta(delta);
+    if (!thinking_ || delta.empty()) return;
+    thinkingCharCount_ += static_cast<int>(delta.size());
+    if (thinkingCharCount_ - lastReasoningStatusChars_ < 80) return;
+    lastReasoningStatusChars_ = thinkingCharCount_;
+    lastStatusText_ = L"模型思考中（约 " + std::to_wstring(thinkingCharCount_) + L" 字）";
+    const RECT thinkRc = ThinkingStatusRect();
+    InvalidateRect(hwnd_, &thinkRc, FALSE);
 }
 
 void AgentDialog::OnContentDelta(const std::wstring& delta) {

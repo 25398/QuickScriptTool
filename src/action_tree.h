@@ -48,14 +48,20 @@ inline int FindDirectParentIndex(const std::vector<ScriptAction>& actions, size_
     return -1;
 }
 
-// 结束循环必须挂在循环容器下（indent = loop.indent + 1）
+// 结束循环必须位于某循环的子孙节点内（跳出时结束最近先祖循环）
 inline bool HasLoopParentAt(const std::vector<ScriptAction>& actions, size_t index, int actionIndent) {
-    const int parentIdx = FindDirectParentIndex(actions, index, actionIndent);
-    if (parentIdx < 0) return false;
-    return actions[static_cast<size_t>(parentIdx)].type == ActionType::Loop;
+    int targetLevel = actionIndent;
+    for (int i = static_cast<int>(index) - 1; i >= 0; --i) {
+        const ScriptAction& ancestor = actions[static_cast<size_t>(i)];
+        if (ancestor.indent < targetLevel) {
+            if (ancestor.type == ActionType::Loop) return true;
+            targetLevel = ancestor.indent;
+        }
+    }
+    return false;
 }
 
-inline constexpr const wchar_t* kEndLoopNeedsLoopParentMsg = L"请将循环作为父节点";
+inline constexpr const wchar_t* kEndLoopNeedsLoopParentMsg = L"请将结束循环放在循环内";
 
 // 校验动作列表中所有 endLoop 是否均有循环父节点；通过返回空字符串
 inline std::wstring ValidateEndLoopPlacements(const std::vector<ScriptAction>& actions) {

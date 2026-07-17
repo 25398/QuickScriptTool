@@ -20,7 +20,11 @@ bool ModernEditHandleShortcutMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 /// 选中编辑框全部文本
 void ModernEditSelectAll(HWND edit);
 
-/// 创建无边框单行编辑框（边框由父窗口绘制）
+/// 单行编辑框文字垂直居中（对齐外侧 SS_CENTERIMAGE / DT_VCENTER 标签）。
+/// 依赖 ES_MULTILINE 伪单行；密码框等不支持时为 no-op。
+void CenterModernSingleLineEditText(HWND edit);
+
+/// 创建无边框单行编辑框（边框由父窗口绘制；文字与同行标签垂直对齐）
 HWND MakeModernSingleLineEdit(HWND parent, const wchar_t* text, int id,
     int x, int y, int w, int h, DWORD extraStyle = 0);
 

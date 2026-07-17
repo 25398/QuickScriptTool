@@ -39,6 +39,8 @@ public:
         const RestoreData* restore = nullptr, CloseCallback onClose = nullptr);
     bool IsAlive() const { return hwnd_ != nullptr && IsWindow(hwnd_); }
     bool IsVisible() const { return IsAlive() && IsWindowVisible(hwnd_); }
+    HWND Hwnd() const { return hwnd_; }
+    void ApplyDpiLayout();
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -49,6 +51,8 @@ private:
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp);
 
     void Init();
+    void RecreateFonts();
+    void ResizeToUiHome();
     void Paint();
     void Cleanup();
     void TryExportConversation();
@@ -208,6 +212,8 @@ private:
     bool statusLinePending_ = false;
     int thinkingStatusStart_ = -1;
     int thinkingStatusEnd_ = -1;
+    int thinkingCharCount_ = 0;
+    int lastReasoningStatusChars_ = 0;
     std::wstring lastStatusText_;
     bool enterSendIssuedForKey_ = false;
     bool initialized_ = false;
@@ -220,6 +226,7 @@ private:
     int hoverAttachmentRemove_ = -1;
     bool inputScrollbarDragging_ = false;
     int inputScrollbarDragOffset_ = 0;
+    int cascadeSlot_ = -1;  // 级联偏移槽位；关闭后释放，新窗优先占用最小空闲槽
 
     std::wstring currentAssistantMsg_;
     WindowOuterShadow outerShadow_;

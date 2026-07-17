@@ -5,10 +5,10 @@
 
 #include <windows.h>
 
-#include <algorithm>
 #include <functional>
 
 #include "config.h"
+#include "render_context.h"
 
 /// 弹出窗口外扩阴影边距（阴影区域点击穿透）
 constexpr int kPopupShadowMargin = 10;
@@ -66,79 +66,45 @@ void DrawCrosshairGlyph(HDC hdc, int cx, int cy, int size,
     COLORREF lineColor, COLORREF fillColor, bool withFill,
     int stroke = 2);
 
+void DrawCrosshairGlyph(IRenderContext& ctx, int cx, int cy, int size,
+    COLORREF lineColor, COLORREF fillColor, bool withFill,
+    int stroke = 2);
+
 HCURSOR CreateCrosshairDragCursor(COLORREF crosshairColor);
 
 /// 简约线框时钟：12 点与 3 点指针 + 中心圆点（用于「定时」等功能入口）
-inline void DrawClockGlyph(HDC hdc, int cx, int cy, int size,
-    COLORREF color, int stroke = 2) {
-    if (!hdc || size <= 0) return;
-    HPEN pen = CreatePen(PS_SOLID, stroke, color);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    const int r = size / 2;
-    Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
-    const int handLen = std::max(4, (r * 5) / 9);
-    MoveToEx(hdc, cx, cy, nullptr);
-    LineTo(hdc, cx, cy - handLen);
-    MoveToEx(hdc, cx, cy, nullptr);
-    LineTo(hdc, cx + handLen, cy);
-    const int dotR = std::max(2, stroke);
-    HBRUSH dot = CreateSolidBrush(color);
-    SelectObject(hdc, dot);
-    Ellipse(hdc, cx - dotR, cy - dotR, cx + dotR + 1, cy + dotR + 1);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(dot);
-    DeleteObject(pen);
-}
+void DrawClockGlyph(HDC hdc, int cx, int cy, int size, COLORREF color, int stroke = 2);
 
 /// 标准箭头指针（取自系统 IDC_ARROW 轮廓，实心填充）
 void DrawPointerCursorGlyph(HDC hdc, int cx, int cy, int size, COLORREF color);
 
-inline void DrawBorderRect(HDC hdc, const RECT& rc, COLORREF color) {
-    HPEN pen = CreatePen(PS_SOLID, 1, color);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-}
+void DrawBorderRect(HDC hdc, const RECT& rc, COLORREF color);
+void FillRectColor(HDC hdc, const RECT& rc, COLORREF color);
+void FillGradientRect(HDC hdc, const RECT& rc, COLORREF start, COLORREF end, bool vertical);
+void FillAlphaRect(HDC hdc, const RECT& rc, COLORREF color, BYTE alpha);
+void FillRoundRectColor(HDC hdc, const RECT& rc, COLORREF color, int cornerRadius);
+void DrawFilledTriangle(HDC hdc, const POINT pts[3], COLORREF color);
+void DrawExpandTriangle(HDC hdc, const RECT& rc, bool expanded, COLORREF color);
+void DrawComboDownArrow(HDC hdc, int centerX, int centerY, COLORREF color = kMainGreen);
+void DrawTopActionGlyph(HDC hdc, const RECT& rc, int iconType);
+void DrawNavIcon(HDC hdc, const RECT& rc, int iconType, HFONT homeTabFont = nullptr);
+void DrawHomeRadio(HDC hdc, const RECT& rc, bool checked);
+void DrawRecorderEmptyIcon(HDC hdc);
+void DrawBorderRoundRect(HDC hdc, const RECT& rc, COLORREF color, int cornerRadius);
+void DrawCheckbox(HDC hdc, const RECT& rc, bool checked);
 
-inline void FillRectColor(HDC hdc, const RECT& rc, COLORREF color) {
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(hdc, &rc, brush);
-    DeleteObject(brush);
-}
+/// 单选圆钮：外圈描边 + 选中时内填绿点
+void DrawRadioButton(HDC hdc, const RECT& rc, bool checked);
 
-inline void DrawBorderRoundRect(HDC hdc, const RECT& rc, COLORREF color, int cornerRadius) {
-    HPEN pen = CreatePen(PS_SOLID, 1, color);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, cornerRadius, cornerRadius);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-}
+/// 应用品牌鼠标图标（图4造型；fillGreenCircle=true 时为绿底白线）
+void DrawAppTitleGlyph(HDC hdc, const RECT& circleBounds, COLORREF color, float stroke = 2.0f,
+    bool fillGreenCircle = false);
 
-/// 统一勾选框：选中为绿色底 + 白色 ✓，未选中为白底 + 灰边。
-inline void DrawCheckbox(HDC hdc, const RECT& rc, bool checked) {
-    const COLORREF border = checked ? kMainGreen : RGB(190, 190, 190);
-    const COLORREF fill = checked ? kMainGreen : kWhite;
-    HPEN boxPen = CreatePen(PS_SOLID, 1, border);
-    HBRUSH boxBrush = CreateSolidBrush(fill);
-    HGDIOBJ oldPen = SelectObject(hdc, boxPen);
-    HGDIOBJ oldBrush = SelectObject(hdc, boxBrush);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 3, 3);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(boxPen);
-    DeleteObject(boxBrush);
-    if (checked) {
-        const int oldBk = SetBkMode(hdc, TRANSPARENT);
-        const COLORREF oldColor = SetTextColor(hdc, kWhite);
-        DrawTextW(hdc, L"✓", -1, const_cast<RECT*>(&rc), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SetBkMode(hdc, oldBk);
-        SetTextColor(hdc, oldColor);
-    }
-}
+/// 六齿设置齿轮（描边：外圈齿廓 + 内圆）
+void DrawGearGlyph(HDC hdc, const RECT& rc, COLORREF color, COLORREF holeColor);
+
+/// 读取 HDC 当前字体绘制文本（Direct2D 批次模式下须先 SelectObject 字体）
+void DrawTextIn(HDC hdc, const std::wstring& text, RECT rc, COLORREF color,
+    UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+void DrawTextIn(HDC hdc, const wchar_t* text, RECT rc, COLORREF color,
+    UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);

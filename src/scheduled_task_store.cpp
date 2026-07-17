@@ -18,14 +18,31 @@ int ParseIntField(const std::wstring& src, const std::wstring& key, int fallback
 }
 
 bool ParseBoolField(const std::wstring& src, const std::wstring& key, bool fallback) {
+    // 只认 key 冒号后的下一个 JSON token（true/false），避免在窗口内误匹配其它字段字面量。
     const auto pos = src.find(L"\"" + key + L"\"");
     if (pos == std::wstring::npos) return fallback;
     const auto colon = src.find(L':', pos);
     if (colon == std::wstring::npos) return fallback;
-    const auto valPos = src.find(L"true", colon);
-    if (valPos != std::wstring::npos && valPos < colon + 12) return true;
-    const auto falsePos = src.find(L"false", colon);
-    if (falsePos != std::wstring::npos && falsePos < colon + 12) return false;
+    size_t i = colon + 1;
+    while (i < src.size() && (src[i] == L' ' || src[i] == L'\t' || src[i] == L'\r' || src[i] == L'\n')) {
+        ++i;
+    }
+    if (i + 4 <= src.size()
+        && src.compare(i, 4, L"true") == 0
+        && (i + 4 >= src.size()
+            || src[i + 4] == L',' || src[i + 4] == L'}' || src[i + 4] == L']'
+            || src[i + 4] == L' ' || src[i + 4] == L'\t'
+            || src[i + 4] == L'\r' || src[i + 4] == L'\n')) {
+        return true;
+    }
+    if (i + 5 <= src.size()
+        && src.compare(i, 5, L"false") == 0
+        && (i + 5 >= src.size()
+            || src[i + 5] == L',' || src[i + 5] == L'}' || src[i + 5] == L']'
+            || src[i + 5] == L' ' || src[i + 5] == L'\t'
+            || src[i + 5] == L'\r' || src[i + 5] == L'\n')) {
+        return false;
+    }
     return fallback;
 }
 
@@ -114,11 +131,11 @@ std::wstring ScheduledTasksFilePath() {
     return AppDir() + L"\\scheduled_tasks.json";
 }
 
-bool LoadScheduledTasks(std::vector<ScheduledTask>& out, bool* globalDisabled) {
+bool ParseScheduledTasksJson(const std::wstring& content,
+                             std::vector<ScheduledTask>& out,
+                             bool* globalDisabled) {
     out.clear();
     if (globalDisabled) *globalDisabled = false;
-    const std::wstring path = ScheduledTasksFilePath();
-    const std::wstring content = ReadAll(path);
     if (content.empty()) return true;
     if (globalDisabled) *globalDisabled = ParseBoolField(content, L"globalDisabled", false);
 
@@ -126,11 +143,16 @@ bool LoadScheduledTasks(std::vector<ScheduledTask>& out, bool* globalDisabled) {
     out.reserve(blocks.size());
     for (const auto& block : blocks) {
         ScheduledTask task = ParseTaskObject(block);
-        if (!task.filePath.empty() || !task.name.empty()) {
+        // 无目标路径的任务永远不会跑；丢弃以免脏数据进调度器。
+        if (!task.filePath.empty()) {
             out.push_back(std::move(task));
         }
     }
     return true;
+}
+
+bool LoadScheduledTasks(std::vector<ScheduledTask>& out, bool* globalDisabled) {
+    return ParseScheduledTasksJson(ReadAll(ScheduledTasksFilePath()), out, globalDisabled);
 }
 
 bool SaveScheduledTasks(const std::vector<ScheduledTask>& tasks, bool globalDisabled) {

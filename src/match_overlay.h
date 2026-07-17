@@ -32,6 +32,11 @@ public:
                       double thresholdPercent, double scaleMin, double scaleMax,
                       MatchOverlayMode mode);
 
+    ActionResult Show(const std::wstring& imagePath,
+                      int searchX1, int searchY1, int searchX2, int searchY2,
+                      const ImageMatchOptions& matchOptions,
+                      MatchOverlayMode mode);
+
     bool matchDone_ = false;
     ImageMatchResult matchResult_;
     std::vector<ImageMatchResult> matchResults_;
@@ -66,6 +71,8 @@ private:
     double thresholdPercent_ = 65.0;
     double scaleMin_ = 1.0;
     double scaleMax_ = 1.0;
+    bool useCustomMatchOptions_ = false;
+    ImageMatchOptions customMatchOptions_{};
     MatchOverlayMode mode_ = MatchOverlayMode::Test;
 
     bool cancelled_ = false;

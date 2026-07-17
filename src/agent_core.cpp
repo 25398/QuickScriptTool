@@ -313,7 +313,7 @@ void AgentCore::AbortActiveHttp() {
 }
 
 // ── 构建 API 请求 ─────────────────────────────────────────────────
-json AgentCore::BuildRequest() {
+json AgentCore::BuildRequest(bool stripLastUserImages) {
     json req;
     req["model"] = ToUtf8(config_.model);
     req["temperature"] = config_.temperature;
@@ -331,7 +331,8 @@ json AgentCore::BuildRequest() {
     json msgs = json::array();
     for (size_t mi = 0; mi < messages_.size(); ++mi) {
         const auto& m = messages_[mi];
-        const bool stripImages = m.role == L"user" && mi != lastUserIdx;
+        const bool stripImages = (m.role == L"user" && mi != lastUserIdx)
+            || (stripLastUserImages && m.role == L"user" && mi == lastUserIdx);
         json msg;
         msg["role"] = ToUtf8(m.role);
         if (!m.parts.empty()) {
@@ -341,7 +342,10 @@ json AgentCore::BuildRequest() {
                     parts.push_back({{"type", "text"}, {"text", ToUtf8(p.text)}});
                 } else if (p.type == L"image_url") {
                     if (stripImages) {
-                        parts.push_back({{"type", "text"}, {"text", "(历史截图已省略)"}});
+                        const char* hint = (stripLastUserImages && mi == lastUserIdx)
+                            ? "(截图已在上一轮流式请求中发送，请根据文字描述直接调用工具完成脚本，勿重复长篇思考)"
+                            : "(历史截图已省略)";
+                        parts.push_back({{"type", "text"}, {"text", hint}});
                     } else {
                         parts.push_back({
                             {"type", "image_url"},
@@ -787,7 +791,7 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     requestBody["stream"] = true;
 
     const int effectiveTimeoutMs = ComputeEffectiveRecvTimeoutMs(config_.recvTimeoutMs, config_.maxTokens);
-    constexpr int kStreamIdleTimeoutMs = 90000;  // 已收到数据后，90s 无新字节视为断流
+    constexpr int kStreamIdleTimeoutMs = 180000;  // 思考模型 chunk 间隔可达数分钟
 
     const std::wstring url = NormalizeChatCompletionsUrl(Trim(config_.apiUrl));
     const ParsedUrl parsed = ParseUrl(url);
@@ -795,6 +799,10 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
         return fail(L"API 地址格式无效，请检查是否包含完整的 https:// 地址。");
 
     const std::string body = requestBody.dump();
+    if (callbacks.onStatus) {
+        callbacks.onStatus(L"请求体 " + std::to_wstring((body.size() + 1023) / 1024)
+            + L" KB，上传中…");
+    }
 
     WinHttpHandle hSession = WinHttpOpen(
         L"QuickScriptTool/1.0",
@@ -914,6 +922,8 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
         }
         receivedAnyByte = true;
         lastByteTime = now;
+        if (callbacks.onStatus && lastBeatSec == 0)
+            callbacks.onStatus(L"已连接，接收流式响应…");
         std::vector<char> buffer(bytesAvailable);
         DWORD bytesRead = 0;
         if (!WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead) || bytesRead == 0) {
@@ -999,11 +1009,12 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
         ChatMessage assistantMsg;
         bool parsed = false;
         std::string finishReason;
+        bool nonStreamRetryStripImages = false;
 
         auto needsNonStreamRetry = [&](const StreamApiResult& s, const ChatMessage& msg) {
             if (!useStream || !s.ok || !expectTools || !msg.tool_calls.empty()) return false;
             if (s.finishReason == "length") return true;
-            // 流式只收到思考、未产出正文/工具时，改用完整响应重试
+            // 流式只收到思考、未产出正文/工具时，改用完整响应重试（省略已发送过的截图以加速）
             if (msg.content.empty() && !msg.reasoning_content.empty()) return true;
             return false;
         };
@@ -1016,8 +1027,9 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                 parsed = true;
                 if (needsNonStreamRetry(streamed, assistantMsg)) {
                     parsed = false;
+                    nonStreamRetryStripImages = true;
                     if (callbacks.onStatus)
-                        callbacks.onStatus(L"流式响应不完整，改用完整响应重试…");
+                        callbacks.onStatus(L"思考完成但未调用工具，改用完整响应重试（省略截图）…");
                 }
             }
         }
@@ -1030,11 +1042,11 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                     std::wstring hint = streamed.error;
                     if (hint.size() > 120) hint = hint.substr(0, 120) + L"...";
                     callbacks.onStatus(L"流式失败，改用完整响应（" + hint + L"）");
-                } else {
+                } else if (!nonStreamRetryStripImages) {
                     callbacks.onStatus(L"正在等待完整响应…");
                 }
             }
-            json apiBody = requestBody;
+            json apiBody = nonStreamRetryStripImages ? BuildRequest(true) : requestBody;
             apiBody["stream"] = false;
             std::wstring apiError;
             const std::wstring responseText = CallApi(

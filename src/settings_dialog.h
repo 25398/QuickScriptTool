@@ -1,12 +1,15 @@
 #pragma once
 // ──────────────────────────────────────────────────────────────────
-// settings_dialog.h — 应用设置对话框
+// settings_dialog.h — 应用设置对话框（非模态，可与主窗并存）
 // ──────────────────────────────────────────────────────────────────
 
 #include <windows.h>
 
+#include <functional>
+
 #include "app_settings.h"
 #include "config.h"
+#include "ui_scale.h"
 #include "crosshair_drag.h"
 #include "drawing.h"
 #include "panel_popup_combo.h"
@@ -14,7 +17,16 @@
 
 class SettingsDialog {
 public:
-    bool Show(HWND owner, quickscript::AppSettings& settings);
+    using SavedCallback = std::function<void()>;
+
+    SettingsDialog();
+    ~SettingsDialog();
+
+    /// 非模态打开；已打开则前置。成功创建窗口返回 true。
+    bool Show(HWND owner, quickscript::AppSettings& settings, SavedCallback onSaved = nullptr);
+    bool IsAlive() const { return hwnd_ != nullptr && IsWindow(hwnd_); }
+    HWND Hwnd() const { return hwnd_; }
+    static HWND ActiveHwnd();
 
 private:
     enum class Tab { Click, Playback, Other, AiApi, About };
@@ -23,6 +35,8 @@ private:
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp);
 
     void CleanupGdi();
+    void RecreateUiFonts();
+    void RelayoutForScaleChange();
     void Paint();
     void PaintClickTab(HDC hdc);
     void PaintPlaybackTab(HDC hdc);
@@ -31,10 +45,12 @@ private:
     void PaintAiApiTab(HDC hdc);
     void DrawSettingsTab(HDC hdc, const RECT& rc, Tab tab, const wchar_t* text);
     void DrawFooter(HDC hdc);
-    void FillGradientRect(HDC hdc, RECT rc, COLORREF start, COLORREF end, bool vertical);
     void PositionChildControls();
     void CenterEditTextVertically(HWND edit);
     int CenteredEditY(int rowTop, int rowHeight) const;
+
+    int ClientW() const;
+    int ClientH() const;
 
     void SyncControlsFromSettings();
     void SyncSettingsFromControls();
@@ -54,19 +70,23 @@ private:
     RECT CheckUpgradeBtnRect() const;
 
     // ── 点击设置页布局 ─────────────────────────────────────────────
-    int ClickTop() const { return kContentTop + kContentPad; }
+    int ClickTop() const { return UiLen(kContentTop) + UiLen(kContentPad); }
     int ClickRowY(int index) const;
     RECT ClickCheckboxRect(int index) const;
     bool HitClickCheckbox(int x, int y, int& outIndex) const;
 
     // ── 录制/宏回放设置页布局 ──────────────────────────────────────
-    int PlaybackTop() const { return kContentTop + kContentPad; }
+    int PlaybackTop() const { return UiLen(kContentTop) + UiLen(kContentPad); }
     int PlaybackRowY(int index) const;
     RECT PlaybackCheckboxRect(int index) const;
     bool HitPlaybackCheckbox(int x, int y, int& outIndex) const;
 
     // ── 其他设置页布局 ─────────────────────────────────────────────
     RECT OtherCheckboxRect(int index) const;
+    RECT OtherThemeLabelRect() const;
+    RECT OtherThemeComboRect() const;
+
+    void RefreshThemeCombo();
 
     // ── AI 助手页布局 ──────────────────────────────────────────────
     RECT AiCheckboxRect() const;
@@ -143,7 +163,11 @@ private:
     static constexpr int kAiAddModelBtnW = 96;
     static constexpr int kAiDeleteBtnW = 64;
     static constexpr int kAiModelComboW = 200;
+    static constexpr int kThemeComboW = 240;
+    static constexpr int kThemeLabelW = 100;
     static constexpr int kAiTopRowGap = 8;
+    static constexpr int kCrosshairBtnW = 420;
+    static constexpr int kCrosshairBtnH = 38;
 
     enum CtrlId {
         kEditRandomInterval = 2101,
@@ -166,8 +190,8 @@ private:
 
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
-    bool done_ = false;
     bool saved_ = false;
+    SavedCallback onSaved_;
 
     Tab activeTab_ = Tab::Click;
     quickscript::AppSettings working_{};
@@ -180,6 +204,7 @@ private:
     bool hoverAiAddModel_ = false;
     bool hoverAiDeleteModel_ = false;
     bool hoverAiModelCombo_ = false;
+    bool hoverThemeCombo_ = false;
     HWND hoverCrosshairBtn_ = nullptr;
 
     HFONT titleFont_ = nullptr;
@@ -208,6 +233,7 @@ private:
     HWND editMaxTokens_ = nullptr;
 
     PanelPopupCombo aiModelCombo_;
+    PanelPopupCombo themeCombo_;
     PromptModal promptModal_;
 
     void ShowPromptAlert(const std::wstring& message);
@@ -220,3 +246,5 @@ private:
 
 /// 若设置对话框正在显示，从 settings 引用同步勾选状态并刷新界面
 void NotifyActiveSettingsDialogSync();
+/// 若设置对话框正在显示，在全局缩放更新后重新布局
+void NotifyActiveSettingsDialogRelayout();

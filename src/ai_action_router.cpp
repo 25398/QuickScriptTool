@@ -21,7 +21,20 @@ bool HasAny(const std::wstring& p, std::initializer_list<const wchar_t*> keys) {
 }
 
 bool HasActionVerb(const std::wstring& p) {
-    return HasAny(p, {L"点击", L"双击", L"按", L"输入", L"按键", L"拖动", L"滚动", L"打开", L"关闭", L"运行"});
+    if (HasAny(p, {L"点击", L"双击", L"输入", L"按键", L"拖动", L"滚动", L"打开", L"关闭", L"运行",
+            L"按下"})) {
+        return true;
+    }
+    // 「按」单独算动词，但不能把「按钮」里的「按」算进去
+    size_t pos = 0;
+    while ((pos = p.find(L"按", pos)) != std::wstring::npos) {
+        if (pos + 1 < p.size() && p[pos + 1] == L'钮') {
+            pos += 2;
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -60,7 +73,18 @@ bool IsAiActionComplexCompositePrompt(const std::wstring& prompt) {
     int verbs = 0;
     if (p.find(L"点击") != std::wstring::npos || p.find(L"双击") != std::wstring::npos) ++verbs;
     if (p.find(L"输入") != std::wstring::npos) ++verbs;
-    if (p.find(L"按键") != std::wstring::npos || p.find(L"按") != std::wstring::npos) ++verbs;
+    if (p.find(L"按键") != std::wstring::npos || p.find(L"按下") != std::wstring::npos) ++verbs;
+    else {
+        size_t pos = 0;
+        while ((pos = p.find(L"按", pos)) != std::wstring::npos) {
+            if (pos + 1 < p.size() && p[pos + 1] == L'钮') {
+                pos += 2;
+                continue;
+            }
+            ++verbs;
+            break;
+        }
+    }
     if (p.find(L"打开") != std::wstring::npos) ++verbs;
     if (p.find(L"关闭") != std::wstring::npos) ++verbs;
     return verbs >= 2;

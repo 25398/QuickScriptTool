@@ -28,6 +28,8 @@ public:
     void Reload();
     bool Save();
     void Tick();
+    /// 自检 / 可注入时钟：按给定本地时间评估到期任务并触发回调。
+    void TickAt(const SYSTEMTIME& now);
 
 private:
     std::wstring FireKey(const ScheduledTask& task, const SYSTEMTIME& st) const;

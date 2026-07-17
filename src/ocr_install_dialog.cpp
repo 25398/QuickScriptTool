@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "drawing.h"
+#include "render_context.h"
 #include "ocr_engine.h"
 #include "taskbar_window.h"
 
@@ -198,7 +199,7 @@ void OcrInstallDialog::CleanupGdi() {
 void OcrInstallDialog::DrawCloseButton(HDC hdc) {
     RECT close = CloseRect();
     if (hoverClose_) {
-        FillRectColor(hdc, close, RGB(90, 190, 125));
+        FillRectColor(hdc, close, kCloseHover);
     }
     SelectObject(hdc, closeFont_);
     SetTextColor(hdc, RGB(255, 255, 255));
@@ -208,32 +209,29 @@ void OcrInstallDialog::DrawCloseButton(HDC hdc) {
 void OcrInstallDialog::Paint() {
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hwnd_, &ps);
+    RenderBatchScope batch(hdc);
     RECT client{};
     GetClientRect(hwnd_, &client);
     FillRectColor(hdc, client, kWhite);
 
     RECT title = TitleBarRect();
     FillRectColor(hdc, title, kMainGreen);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(255, 255, 255));
     HGDIOBJ oldFont = SelectObject(hdc, titleFont_);
-    DrawTextW(hdc, L"  鼠大侠-插件安装", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"  鼠大侠-插件安装", title, RGB(255, 255, 255),
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawCloseButton(hdc);
 
     SelectObject(hdc, bodyFont_);
-    SetTextColor(hdc, RGB(50, 50, 50));
-    RECT labelRc{28, 52, kDialogW - 28, 84};
-    DrawTextW(hdc, L"安装插件:", -1, &labelRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"安装插件:", RECT{28, 52, kDialogW - 28, 84}, RGB(50, 50, 50),
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(hdc, nameFont_);
-    SetTextColor(hdc, kMainGreen);
-    RECT nameRc{28, 88, kDialogW - 28, 126};
-    DrawTextW(hdc, L"文字识别(PaddleOCR)", -1, &nameRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"文字识别(PaddleOCR)", RECT{28, 88, kDialogW - 28, 126}, kMainGreen,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(hdc, bodyFont_);
-    SetTextColor(hdc, RGB(50, 50, 50));
-    RECT descLabelRc{28, 132, kDialogW - 28, 156};
-    DrawTextW(hdc, L"插件说明:", -1, &descLabelRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"插件说明:", RECT{28, 132, kDialogW - 28, 156}, RGB(50, 50, 50),
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     RECT descBox = DescBoxRect();
     FillRectColor(hdc, descBox, RGB(255, 255, 255));
@@ -242,12 +240,11 @@ void OcrInstallDialog::Paint() {
     const wchar_t* desc =
         L"此插件支持中文（简/繁）、英文等多种语言文字识别，识别速度快、准确度高。"
         L"首次安装将自动安装 Python 3.12 并下载 OCR 依赖，请保持联网并耐心等待。";
-    DrawTextW(hdc, desc, -1, &descTextRc, DT_LEFT | DT_WORDBREAK);
+    DrawTextIn(hdc, desc, descTextRc, RGB(50, 50, 50), DT_LEFT | DT_WORDBREAK);
 
     SelectObject(hdc, bodyFont_);
-    SetTextColor(hdc, RGB(80, 80, 80));
-    RECT statusRc{28, 296, kDialogW - 28, 346};
-    DrawTextW(hdc, statusText_.c_str(), -1, &statusRc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+    DrawTextIn(hdc, statusText_, RECT{28, 296, kDialogW - 28, 346}, RGB(80, 80, 80),
+        DT_CENTER | DT_VCENTER | DT_WORDBREAK);
 
     DrawProgressBar(hdc);
 
@@ -263,12 +260,13 @@ void OcrInstallDialog::Paint() {
         SelectObject(hdc, oldPen);
         SelectObject(hdc, oldBrush);
         DeleteObject(disabled);
-        SetTextColor(hdc, RGB(255, 255, 255));
         SelectObject(hdc, btnFont_);
-        DrawTextW(hdc, L"安装中...", -1, &installRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"安装中...", installRc, RGB(255, 255, 255),
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     SelectObject(hdc, oldFont);
+    batch.End();
     EndPaint(hwnd_, &ps);
 }
 

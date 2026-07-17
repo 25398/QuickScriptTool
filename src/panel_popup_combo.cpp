@@ -145,7 +145,7 @@ void PanelPopupCombo::SyncPopupPosition(const RECT& anchorClientRect) {
     POINT screenTop{anchorClientRect.left, anchorClientRect.bottom};
     ClientToScreen(owner_, &screenTop);
     SetWindowPos(popup_, HWND_TOPMOST, screenTop.x, screenTop.y, w, h,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
 }
 
 LRESULT CALLBACK PanelPopupCombo::PopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {

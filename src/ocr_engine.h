@@ -44,6 +44,10 @@ OcrEngineOutput RunOcrOnScreenRegion(
     HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0,
     bool digitsOnly = false);
 
+// 对已有位图执行 OCR（坐标偏移用于将识别框映射回屏幕坐标）
+OcrEngineOutput RunOcrOnBitmap(
+    HBITMAP bitmap, int coordOffsetX, int coordOffsetY, bool digitsOnly = false);
+
 // 拼接所有识别行为单个字符串
 std::wstring ConcatOcrLines(const OcrEngineOutput& output);
 

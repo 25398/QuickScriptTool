@@ -6,6 +6,7 @@
 #include "script_action_builder.h"
 #include "script_io.h"
 #include "utils.h"
+#include "window_mode/window_mode_json.h"
 
 #include <algorithm>
 #include <cmath>
@@ -92,6 +93,80 @@ AgentScriptOpResult OkMsg(const std::wstring& msg) {
     r.message = msg;
     NotifyAgentScriptLibraryChanged();
     return r;
+}
+
+bool ApplyAgentWindowModeParams(const json& params, windowmode::WindowModeScriptConfig& cfg) {
+    bool changed = false;
+    if (params.contains("scriptMode") && params["scriptMode"].is_string()) {
+        cfg = windowmode::DefaultWindowModeConfig();
+        const std::string mode = params["scriptMode"].get<std::string>();
+        if (mode == "window") {
+            cfg.enabled = true;
+            cfg.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+        } else if (mode == "backgroundWindow" || mode == "background") {
+            cfg.enabled = true;
+            cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+        }
+        changed = true;
+    }
+    if (params.contains("windowMode") && params["windowMode"].is_object()) {
+        const auto& wm = params["windowMode"];
+        cfg = windowmode::DefaultWindowModeConfig();
+        if (wm.contains("enabled")) cfg.enabled = wm.value("enabled", 0) != 0;
+        if (wm.contains("executionKind")) {
+            const std::string kind = wm.value("executionKind", "hiddenDesktop");
+            cfg.executionKind = kind == "backgroundWindow"
+                ? windowmode::WindowModeExecutionKind::BackgroundWindow
+                : windowmode::WindowModeExecutionKind::HiddenDesktop;
+        }
+        if (wm.contains("targetExePath")) cfg.targetExePath = FromUtf8(wm.value("targetExePath", ""));
+        if (wm.contains("targetWindowTitle")) cfg.targetWindowTitle = FromUtf8(wm.value("targetWindowTitle", ""));
+        if (wm.contains("coordSpace")) {
+            const std::string space = wm.value("coordSpace", "windowClient");
+            cfg.coordSpace = space == "screenAbsolute"
+                ? windowmode::WindowModeCoordinateSpace::ScreenAbsolute
+                : windowmode::WindowModeCoordinateSpace::WindowClient;
+        }
+        if (wm.contains("autoLaunchTarget")) cfg.autoLaunchTarget = wm.value("autoLaunchTarget", 0) != 0;
+        if (wm.contains("launchArgs")) cfg.launchArgs = FromUtf8(wm.value("launchArgs", ""));
+        if (wm.contains("selectMethod")) {
+            const std::string method = wm.value("selectMethod", "selectOnStartup");
+            if (method == "mousePositionOnStartup") {
+                cfg.selectMethod = windowmode::WindowSelectMethod::MousePositionOnStartup;
+            } else if (method == "useEditorWindowClass") {
+                cfg.selectMethod = windowmode::WindowSelectMethod::UseEditorWindowClass;
+            } else if (method == "noSelect") {
+                cfg.selectMethod = windowmode::WindowSelectMethod::NoSelect;
+            } else {
+                cfg.selectMethod = windowmode::WindowSelectMethod::SelectOnStartup;
+            }
+        }
+        if (wm.contains("windowName")) cfg.windowName = FromUtf8(wm.value("windowName", ""));
+        if (wm.contains("windowClassName")) cfg.windowClassName = FromUtf8(wm.value("windowClassName", ""));
+        if (wm.contains("childWindowClassName")) {
+            cfg.childWindowClassName = FromUtf8(wm.value("childWindowClassName", ""));
+        }
+        if (wm.contains("useTopLevelWindow")) cfg.useTopLevelWindow = wm.value("useTopLevelWindow", 1) != 0;
+        if (wm.contains("targetPickX")) cfg.targetPickX = wm.value("targetPickX", 0);
+        if (wm.contains("targetPickY")) cfg.targetPickY = wm.value("targetPickY", 0);
+        if (wm.contains("allowForegroundInputFallback")) {
+            cfg.allowForegroundInputFallback = wm.value("allowForegroundInputFallback", 0) != 0;
+        }
+        if (cfg.windowName.empty() && !cfg.targetWindowTitle.empty()) {
+            cfg.windowName = cfg.targetWindowTitle;
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+double ApplyAgentBreakoutTimeParams(const json& params, bool windowModeEnabled) {
+    if (windowModeEnabled) return 0.0;
+    if (params.contains("breakoutTimeSeconds")) {
+        const double raw = params.value("breakoutTimeSeconds", 0.0);
+        return NormalizeBreakoutTimeSeconds(raw);
+    }
+    return 0.0;
 }
 
 bool IsKeyOperation(ActionType type) {
@@ -290,6 +365,12 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
     ScriptFileData data = ParseScriptContent(content);
     if (data.scriptName.empty()) return FailMsg(L"[错误] 内容缺少 scriptName 字段。");
     if (data.actions.empty()) return FailMsg(L"[错误] 内容中没有找到动作（actions 数组为空）。");
+    if (dirHint == L"recordings") {
+        data.windowMode = windowmode::DefaultWindowModeConfig();
+        data.breakoutTimeSeconds = 0;
+    } else {
+        data.breakoutTimeSeconds = EffectiveBreakoutTimeSeconds(data);
+    }
 
     const size_t stripped = StripCustomTextActions(data.actions);
     if (data.actions.empty())
@@ -322,7 +403,12 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
     const std::wstring dirLabel = (dirHint == L"recordings") ? L"录制" : L"脚本";
     std::wstring msg = L"✓ " + dirLabel + L"已保存：" + fileName + L"\n"
         L"  名称: " + verify.scriptName + L"\n"
-        L"  动作数: " + std::to_wstring(verify.actions.size());
+        L"  模式: " + windowmode::WindowModeConfigSummary(verify.windowMode) + L"\n";
+    if (!verify.windowMode.enabled) {
+        msg += L"  脱离时间: " + std::to_wstring(
+            static_cast<int>(EffectiveBreakoutTimeSeconds(verify))) + L" 秒\n";
+    }
+    msg += L"  动作数: " + std::to_wstring(verify.actions.size());
     if (stripped > 0)
         msg += L"\n  [提示] 已移除 " + std::to_wstring(stripped) + L" 个无效 customText 动作（说明应写 remark）";
     if (addedStopMacro)
@@ -331,7 +417,8 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
 }
 
 AgentScriptOpResult AgentCreateMacroScript(const std::wstring& fileName,
-    const std::wstring& scriptName, const std::vector<json>& actions) {
+    const std::wstring& scriptName, const std::vector<json>& actions,
+    const json& extraParams) {
     std::wstring err;
     if (!ValidateJsonFileName(fileName, err)) return FailMsg(L"[错误] " + err);
     if (scriptName.empty()) return FailMsg(L"[错误] 缺少 scriptName 参数。");
@@ -345,6 +432,9 @@ AgentScriptOpResult AgentCreateMacroScript(const std::wstring& fileName,
     data.scriptName = scriptName;
     data.recordTime = NowText();
     data.actions = std::move(builtActions);
+    data.windowMode = windowmode::DefaultWindowModeConfig();
+    ApplyAgentWindowModeParams(extraParams, data.windowMode);
+    data.breakoutTimeSeconds = ApplyAgentBreakoutTimeParams(extraParams, data.windowMode.enabled);
     double totalWait = 0;
     for (const auto& a : data.actions)
         if (a.type == ActionType::Wait) totalWait += a.duration;
@@ -355,10 +445,15 @@ AgentScriptOpResult AgentCreateMacroScript(const std::wstring& fileName,
     if (!SaveScriptFileData(fullPath, data))
         return FailMsg(L"[错误] 保存鼠标宏失败：" + fileName);
 
-    return OkMsg(L"✓ 鼠标宏已创建：" + fileName + L"\n"
+    std::wstring msg = L"✓ 鼠标宏已创建：" + fileName + L"\n"
         L"  名称: " + data.scriptName + L"\n"
-        L"  动作数: " + std::to_wstring(data.actions.size()) + L"\n"
-        L"  路径: scripts\\" + fileName);
+        L"  模式: " + windowmode::WindowModeConfigSummary(data.windowMode) + L"\n";
+    if (!data.windowMode.enabled) {
+        msg += L"  脱离时间: " + std::to_wstring(static_cast<int>(data.breakoutTimeSeconds)) + L" 秒\n";
+    }
+    msg += L"  动作数: " + std::to_wstring(data.actions.size()) + L"\n"
+        L"  路径: scripts\\" + fileName;
+    return OkMsg(msg);
 }
 
 AgentScriptOpResult AgentOptimizeScriptFile(const AgentOptimizeOptions& options) {

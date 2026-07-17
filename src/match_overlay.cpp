@@ -36,10 +36,7 @@ void MatchOverlay::RegisterWindowClass() {
 }
 
 void MatchOverlay::CaptureScreen() {
-    screenX_ = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    screenY_ = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    screenW_ = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    screenH_ = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    GetVirtualScreenRect(screenX_, screenY_, screenW_, screenH_);
 
     HDC screenDc = GetDC(nullptr);
     HDC memDc = CreateCompatibleDC(screenDc);
@@ -63,12 +60,16 @@ void MatchOverlay::RunMatch() {
     }
 
     ImageMatchOptions opt;
-    opt.thresholdPercent = thresholdPercent_;
-    opt.scaleMin = scaleMin_;
-    opt.scaleMax = scaleMax_;
-    opt.scaleStep = 0.05;
-    opt.maxMatches = 20;
-    opt.maxOverlap = 0.5;
+    if (useCustomMatchOptions_) {
+        opt = customMatchOptions_;
+    } else {
+        opt.thresholdPercent = thresholdPercent_;
+        opt.scaleMin = scaleMin_;
+        opt.scaleMax = scaleMax_;
+        opt.scaleStep = 0.05;
+        opt.maxMatches = 20;
+        opt.maxOverlap = 0.5;
+    }
 
     ImageMatchOutput output = FindTemplateInFrozenScreenMulti(
         screenBitmap_, screenX_, screenY_,
@@ -89,13 +90,30 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     int searchX1, int searchY1, int searchX2, int searchY2,
     double thresholdPercent, double scaleMin, double scaleMax,
     MatchOverlayMode mode) {
+    ImageMatchOptions opt;
+    opt.thresholdPercent = thresholdPercent;
+    opt.scaleMin = scaleMin;
+    opt.scaleMax = scaleMax;
+    opt.scaleStep = 0.05;
+    opt.maxMatches = 20;
+    opt.maxOverlap = 0.5;
+    return Show(imagePath, searchX1, searchY1, searchX2, searchY2, opt, mode);
+}
+
+MatchOverlay::ActionResult MatchOverlay::Show(
+    const std::wstring& imagePath,
+    int searchX1, int searchY1, int searchX2, int searchY2,
+    const ImageMatchOptions& matchOptions,
+    MatchOverlayMode mode) {
 
     imagePath_ = imagePath;
     searchX1_ = searchX1; searchY1_ = searchY1;
     searchX2_ = searchX2; searchY2_ = searchY2;
-    thresholdPercent_ = thresholdPercent;
-    scaleMin_ = scaleMin;
-    scaleMax_ = scaleMax;
+    useCustomMatchOptions_ = true;
+    customMatchOptions_ = matchOptions;
+    thresholdPercent_ = matchOptions.thresholdPercent;
+    scaleMin_ = matchOptions.scaleMin;
+    scaleMax_ = matchOptions.scaleMax;
     mode_ = mode;
     matchDone_ = false;
     cancelled_ = true;

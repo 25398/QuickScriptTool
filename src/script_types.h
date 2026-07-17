@@ -14,6 +14,7 @@
 // 共 28 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
 enum class ActionType {
     MoveMouse,
+    MoveMouseRelative,  // 相对位移 dx/dy（FPS 视角等；非屏幕绝对坐标）
     Wait,
     MouseDown,
     MouseUp,
@@ -60,15 +61,15 @@ struct ScriptAction {
     std::wstring customText;                   // 自定义显示文本 (覆盖默认名称)
     int originalNo = 0;                       // 原始序号，序列化时保持
     int indent = 0;                           // 缩进层级 (0=顶层, >=1=子节点)
-    int x = 0;                                // 目标 X 坐标 (MoveMouse 等)
-    int y = 0;                                // 目标 Y 坐标
+    int x = 0;                                // 目标 X 坐标 (MoveMouse)；或相对 dx (MoveMouseRelative)
+    int y = 0;                                // 目标 Y 坐标；或相对 dy (MoveMouseRelative)
     int randomX = 0;                          // X 坐标随机偏移范围
     int randomY = 0;                          // Y 坐标随机偏移范围
     bool moveFromVar = false;                  // 是否从变量表达式解析移动坐标
     std::wstring moveVarExprX;                 // X 坐标变量表达式
     std::wstring moveVarExprY;                 // Y 坐标变量表达式
     MouseButtonType button = MouseButtonType::Left;  // 鼠标按键类型
-    int clickCount = 1;                       // 点击/循环次数
+    int clickCount = 1;                       // 重复执行次数（点击/回放/滚动等）
     UINT keyVk = '7';                         // 虚拟键码
     std::wstring keyText = L"7";               // 按键显示名
     // ── 修饰键按下状态 (左右分别控制) ──
@@ -80,8 +81,13 @@ struct ScriptAction {
     bool holdRightAlt = false;
     bool holdLeftShift = false;
     bool holdRightShift = false;
-    double duration = 0.1;                    // 基本等待/持续时长 (秒)
-    double randomDuration = 0.0;              // 最大随机时长 (秒)
+    // Wait: 等待秒数。mouseClick/keyClick/hotkeyShortcut/quickInput/scrollWheel/mousePlayback:
+    //   相邻两次重复之间的间隔（clickCount=1 时不生效；首前/末后不等待）
+    double duration = 0.1;
+    // Wait: 随机附加等待。上列重复类动作: 重复间隔上的随机附加秒数
+    double randomDuration = 0.0;
+    // 录制精密时间轴：前延迟微秒（优先于 duration 的浮点往返，减少漂移）
+    uint64_t timingUs = 0;
     int loopCount = -1;                       // 循环次数 (-1=无限循环)
     std::wstring loopVarName;                  // 循环变量名
     bool loopFromVar = false;                  // 是否从变量表达式解析循环次数
@@ -142,6 +148,15 @@ struct ScriptAction {
     int aiMaxSteps = 10;               // 最大执行步骤数（-1=不限制）
     std::wstring aiFallbackValue;        // API失败降级值
     bool aiConfirmExecute = false;       // AI动作执行：确认后执行
+    // ── 归一化坐标（方案 C：跨分辨率适配）─────────────────────
+    // 当 coordsAreNormalized=true 时，nx/ny/nSearchX1 等存储归一化 0.0–1.0 值
+    // 此时 x/y/searchX1 等 int 字段由 denormalize 填充为当前环境像素，供编辑器/执行器使用
+    bool coordsAreNormalized = false;
+    double nx = 0.0, ny = 0.0;
+    double nRandomX = 0.0, nRandomY = 0.0;
+    double nSearchX1 = 0.0, nSearchY1 = 0.0, nSearchX2 = 0.0, nSearchY2 = 0.0;
+    double nOffsetX = 0.0, nOffsetY = 0.0;
+    double nAiSearchX1 = 0.0, nAiSearchY1 = 0.0, nAiSearchX2 = 0.0, nAiSearchY2 = 0.0;
 };
 
 // ── 容器动作判断辅助函数 ────────────────────────────────────────

@@ -157,7 +157,7 @@ private:
                          AiHttpAbortSlot* httpAbort = nullptr,
                          StatusCallback onStatus = nullptr);
     StreamApiResult CallApiStream(const json& requestBody, const AgentSendCallbacks& callbacks);
-    json BuildRequest();
+    json BuildRequest(bool stripLastUserImages = false);
 
     AgentConfig config_;
     std::vector<ChatMessage> messages_;

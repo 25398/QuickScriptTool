@@ -1,6 +1,7 @@
 #include "ocr_overlay.h"
 
 #include "drawing.h"
+#include "image_match.h"
 #include "ocr_engine.h"
 
 #include <algorithm>
@@ -124,10 +125,7 @@ void OcrOverlay::RegisterWindowClass() {
 }
 
 void OcrOverlay::CaptureScreen() {
-    screenX_ = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    screenY_ = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    screenW_ = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    screenH_ = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    GetVirtualScreenRect(screenX_, screenY_, screenW_, screenH_);
 
     HDC screenDc = GetDC(nullptr);
     HDC memDc = CreateCompatibleDC(screenDc);

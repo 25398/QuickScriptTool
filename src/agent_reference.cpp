@@ -25,9 +25,33 @@ const wchar_t* kRefFormat = LR"(【脚本文件格式】
 
 顶层字段：
 
-  scriptName, recordTime, durationSeconds, hotkeyText, hotkeyVk, hotkeyModifiers, actions[]
+  scriptName, recordTime, durationSeconds, hotkeyText, hotkeyVk, hotkeyModifiers,
+  coordMeta, windowMode, breakoutTimeSeconds, actions[]
 
+录制文件还可包含：
+  recordingCaptureMode  -1/缺失=旧文件，0=自动，1=桌面绝对，2=FPS相对
+  inputTimingVersion    1=整数微秒绝对时间轴语义
 
+breakoutTimeSeconds（脱离时间，仅默认模式生效）：
+  数字，单位秒。0 或未填写视为禁用。
+  运行中若用户操作鼠标/键盘（非热键），宏会暂停并在该秒数后从当前步骤重试；
+  等待期间再有用户操作会重置计时。窗口模式/后台窗口模式忽略此字段。
+
+coordMeta（坐标元数据）：
+  顶层对象，记录录制/保存时的参考分辨率。AI 生成脚本时无需手写此字段，
+  调用 buildScriptActions 工具会自动设置。
+  {
+    "version": 1,
+    "space": "screenVirtual",
+    "refWidth": 2560,
+    "refHeight": 1440,
+    "refDpi": 96
+  }
+
+坐标系统：
+  所有坐标字段（x, y, searchX1–Y2, offsetX/Y, aiSearchX1–Y2 等）均为 0.0–1.0 归一化浮点数。
+  执行时自动按实际分辨率缩放，确保跨分辨率兼容。
+  像素坐标 = round(norm * 当前宽度/高度)。
 
 每个 action 对象包含公共字段 + 类型专用字段。软件保存时会写出全部字段；
 
@@ -262,6 +286,84 @@ ocrFollowUp（后续操作，与找图同理）：
 )";
 
 
+const wchar_t* kRefWindowMode = LR"(【脚本模式 windowMode — 脚本头字段】
+
+脚本 JSON 根对象与 actions 并列，保存/导入/导出/热键运行均读取此字段。
+编辑界面三种模式对应关系：
+
+  默认模式        windowMode.enabled = 0
+  窗口模式        enabled = 1, executionKind = "hiddenDesktop"
+  后台窗口模式    enabled = 1, executionKind = "backgroundWindow"
+
+createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow；
+或传完整 windowMode 对象（优先级更高）。
+默认模式可传 breakoutTimeSeconds（秒，0=禁用脱离）。
+
+键鼠录制（recordings）始终强制默认模式，忽略 windowMode，breakoutTimeSeconds 恒为 0。
+
+字段说明：
+
+  windowMode.enabled              0=默认模式，1=启用窗口类模式
+  windowMode.executionKind        hiddenDesktop | backgroundWindow
+  windowMode.targetExePath        目标程序路径、文档路径（.txt/.xlsx 等）或 URL（http/https）；窗口不存在时用于自动打开
+  windowMode.targetWindowTitle    目标窗口标题过滤
+  windowMode.windowName           窗口名称（与 targetWindowTitle 同步）
+  windowMode.windowClassName      窗口类名（后台模式常用）
+  windowMode.childWindowClassName 子窗口类名
+  windowMode.selectMethod         selectOnStartup | mousePositionOnStartup | useEditorWindowClass | noSelect
+  windowMode.targetPickX/Y        准星绑定坐标
+  windowMode.coordSpace           windowClient（默认）| screenAbsolute
+  windowMode.autoLaunchTarget     1=运行前自动启动目标程序
+  windowMode.launchArgs           启动参数
+  windowMode.allowForegroundInputFallback  后台输入失败时是否抢焦点（默认 0）
+
+示例（后台窗口模式）：
+
+  "windowMode": {
+    "enabled": 1,
+    "executionKind": "backgroundWindow",
+    "windowClassName": "Notepad",
+    "selectMethod": "useEditorWindowClass",
+    "coordSpace": "windowClient",
+    "autoLaunchTarget": 0,
+    "targetExePath": "",
+    "targetWindowTitle": "",
+    "windowName": "",
+    "childWindowClassName": "",
+    "useTopLevelWindow": 1,
+    "targetPickX": 0,
+    "targetPickY": 0,
+    "launchArgs": "",
+    "allowForegroundInputFallback": 0
+  }
+
+注意：
+  · 窗口模式在独立宏桌面执行，用户桌面光标/焦点不受影响
+  · 后台窗口模式在用户桌面操作已绑定窗口，不抢焦点
+  · 坐标 x/y、searchX1..Y2 在窗口模式下为客户区坐标
+  · writeScript / createMacroScript 创建脚本宏时必须写入 windowMode（可为 enabled=0）
+  · 默认模式脚本应写入 breakoutTimeSeconds（0 表示禁用）；未写视为 0
+
+【脱离时间 breakoutTimeSeconds — 仅默认模式】
+
+  breakoutTimeSeconds     非负数字，秒。0 或未填写=禁用。
+  仅 windowMode.enabled=0 时生效；窗口/后台模式保存时强制为 0。
+
+  行为：宏运行中用户操作鼠标/键盘（移动、点击、滚轮、按键，不含已注册热键）会立即暂停；
+  暂停满 breakoutTimeSeconds 秒后从当前动作重试（嵌套宏/指令块内精确到具体步骤）。
+  暂停等待期间再有用户操作会重置倒计时。
+
+  createMacroScript / writeScript：
+    · scriptMode=default 或未启用 windowMode 时可传 breakoutTimeSeconds
+    · 用户要求「允许手动打断后继续」「脱离时间」等场景时设置，常见 1–10 秒
+    · 不需要时写 0 或省略
+
+  示例（默认模式，3 秒脱离）：
+    "windowMode": { "enabled": 0, ... },
+    "breakoutTimeSeconds": 3
+
+)";
+
 
 const wchar_t* kRefMouseKeyboard = LR"(【鼠标动作】
 
@@ -277,15 +379,25 @@ moveMouse:
 
 
 
+moveMouseRelative:
+
+  x/dx, y/dy        相对位移像素（可负）；回放用 SendInput 相对移动，适合 FPS 视角
+
+  randomX, randomY  可选随机附加位移（非负）
+
+  录制: 仅当系统光标不可见或 ClipCursor 裁剪时，用 Raw Input 写入；可见光标仍用 moveMouse
+
+
+
 mouseClick / mouseDown / mouseUp:
 
   button            left(默认) / right / middle / x1 / x2
 
   clickCount        重复次数（mouseClick），默认 1
 
-  duration          每次间隔秒数，默认 0.1
+  duration          两次重复之间的间隔秒数（仅 clickCount>1 生效；执行前/后不等待），默认 0.1
 
-  randomDuration    随机附加等待，默认 0
+  randomDuration    间隔上的随机附加秒数，默认 0
 
   holdLeftCtrl 等   修饰键 0/1（mouseDown/Up/Click 可选）
 
@@ -301,8 +413,7 @@ scrollWheel:
 
   scrollSteps       步数，默认 1
 
-  clickCount/duration/randomDuration  重复与等待
-
+  clickCount/duration/randomDuration  重复与间隔（仅相邻两次之间等待）
 
 
 wait:
@@ -323,7 +434,7 @@ keyClick / keyDown / keyUp:
 
   holdLeftCtrl 等   修饰键组合
 
-  clickCount/duration/randomDuration  keyClick 专用
+  clickCount/duration/randomDuration  重复与间隔（仅相邻两次之间；count=1 不等待）
 
 
 
@@ -335,7 +446,7 @@ hotkeyShortcut:
 
     5=Alt+F4, 6=Win+D, 7=Win+R, 8=Ctrl+Alt+Delete
 
-  clickCount/duration/randomDuration
+  clickCount/duration/randomDuration  同上，间隔仅在两次重复之间
 
 
 
@@ -345,7 +456,7 @@ quickInput:
 
   charInterval      字符间隔秒数，默认 0.01
 
-  clickCount/duration/randomDuration
+  clickCount/duration/randomDuration  整段输入的重复间隔（非字间；字间用 charInterval）
 
 )";
 
@@ -396,6 +507,8 @@ runMacro / mousePlayback:
   blockName         目标脚本显示名
 
   targetPath        目标脚本路径
+
+  clickCount/duration/randomDuration  仅 mousePlayback：回放重复次数与两次回放之间的间隔
 
 
 
@@ -455,9 +568,25 @@ stopMacro（结束宏运行）：
 
 const wchar_t* kRefAi = LR"(【AI 动作 — 必读】
 
+★ 选用优先级（默认效率优先，非 AI 动作优先）：
+
+  1. findImage / textRecognition(OCR) / 常规键鼠 — 首选，能完成就不要用 AI
+
+  2. getCursorPos — 仅需当前光标坐标时
+
+  3. aiTextAnalysis — 必须理解文字语义且 OCR 不够用时（尽量少用）
+
+  4. aiImageAnalysis — 必须理解画面且 findImage 无法胜任时（尽量少用）；
+     准确度优先模式下可用于兜底分支诊断当前界面状况
+
+  5. aiActionExecute — ★权重极低★：除非用户明确要求「AI动作执行/让AI自动操作桌面」，
+     否则禁止调用 buildAiActionExecuteAction；禁止因任务复杂就用它整段生成脚本
+
+
+
 以下四种动作必须使用专用工具构建（禁止用 buildScriptActions 手写）：
   buildGetCursorPosAction / buildAiTextAnalysisAction /
-  buildAiImageAnalysisAction / buildAiActionExecuteAction
+  buildAiImageAnalysisAction / buildAiActionExecuteAction（最后一项见上条限制）
 可用 listAiModels 查看已添加模型；图片分析与带截图的执行会自动选择识图模型。
 
 
@@ -480,6 +609,8 @@ aiTextAnalysis — AI 文字分析
 
   aiModelName       模型名；专用工具会自动从已添加模型中选择（图片分析优先识图模型）
 
+  ★ 优先 OCR(textRecognition)；仅当 OCR 无法表达所需语义时才用本动作
+
 
 
 aiImageAnalysis — AI 图片分析
@@ -495,6 +626,8 @@ aiImageAnalysis — AI 图片分析
   aiTargetImagePath 锚定图片路径 images\xxx.bmp
 
   aiSearchX1/Y1/X2/Y2  截屏区域（不填且 aiRegionByImage=0 时全屏）
+
+  ★ 优先 findImage；准确度兜底时可用来判断界面处于哪种异常状态（见 readAgentSkill section=scriptStrategy）
 
 
 
@@ -514,15 +647,15 @@ aiActionExecute — AI 动作执行
 
   aiContextMode / aiTimeoutSec / aiFallbackValue
 
+  ★ 仅当用户明确要求时使用；常规点击/输入/找图必须用 findImage+键鼠 等动作链
 
 
-★ 典型流程 — 识图后 AI 分析再输入：
+
+★ 典型流程 — 识图后 AI 分析再输入（仅 OCR/找图无法完成时）：
 
   1. findImage(followUp=2, matchVarName="anchor")
 
-  2. aiImageAnalysis(aiPrompt="描述按钮文字", aiRegionByImage=1,
-
-     aiTargetImagePath=同 anchor 图, aiSearchX1~Y2=相对区域)
+  2. aiImageAnalysis(...)
 
   3. quickInput(inputText="{aiImgResult}")
 
@@ -530,13 +663,13 @@ aiActionExecute — AI 动作执行
 
 ★ 典型流程 — 纯文本 AI 结果写入变量后判断：
 
-  1. aiTextAnalysis(aiPrompt="…", aiOutputVarName="summary")
+  1. aiTextAnalysis(...)
 
   2. if(conditionExpr="summary >> 成功") → 子动作
 
 
 
-不确定字段时：readScriptReference(section=ai) 或各 buildAi* 工具的参数说明
+不确定字段时：readScriptReference(section=ai) 或 readAgentSkill(section=scriptStrategy)
 
 )";
 
@@ -690,9 +823,15 @@ const wchar_t* kRefPatterns = LR"(【复合模式速查】
 
 10. 录制优化：硬编码坐标改 findImage；加 wait；加 if 条件
 
-11. AI 分析/执行：需要模型返回文字时用 aiTextAnalysis；需要看图时用 aiImageAnalysis；
+11. AI 动作选用（默认效率优先）：
+    · 能用 findImage/OCR/键鼠完成的，禁止用 aiTextAnalysis / aiImageAnalysis
+    · aiActionExecute 仅用户明确要求「AI动作执行」时使用
+    · 准确度优先时 readAgentSkill section=scriptStrategy 查看兜底模式
 
-    需要 AI 自动操作桌面时用 aiActionExecute；获取坐标用 getCursorPos
+12. 准确度兜底 — 关键找图（用户要稳/要兜底时）：
+    timerRecordTime → findImage(findTimeExpr=30,followUp=2) →
+    if(计时变量<30 and matchData>0) 正常分支 else 兜底分支 →
+    兜底内 aiImageAnalysis 判状况 → 按变量选预案 → goto 跳回主流程起点
 
 )";
 
@@ -784,13 +923,31 @@ const wchar_t* kRefMistakes = LR"(【常见 AI 生成错误 — 务必避免】
 
    → 正确：endLoop 必须是 loop 的子节点（indent = loop.indent + 1），否则会异常结束宏运行
 
+
+
+16. ★ 用户未要求「AI动作执行」却使用 aiActionExecute
+
+   → 正确：用 findImage + 键鼠动作链；aiActionExecute 权重极低
+
+
+
+17. 能用 findImage / OCR 却用 aiImageAnalysis / aiTextAnalysis
+
+   → 正确：优先常规识别动作；AI 分析仅在语义理解必需或准确度兜底诊断时使用
+
+
+
+18. 准确度优先却未对关键找图做兜底
+
+   → 正确：timerRecordTime + findTimeExpr 限时找图 + if 分支 + 兜底后 goto 回主流程起点
+
 )";
 
 
 
 const wchar_t* kRefActions = LR"(【动作类型索引】
 
-基础：wait, moveMouse, mouseClick, mouseDown, mouseUp,
+基础：wait, moveMouse, moveMouseRelative, mouseClick, mouseDown, mouseUp,
 
       keyClick, keyDown, keyUp, quickInput, hotkeyShortcut,
 
@@ -836,7 +993,7 @@ std::wstring BuildFullReference() {
 
     return std::wstring(L"【脚本助手技术参考 — 完整版】\n")
 
-        + kRefFormat + kRefActions + kRefFindImage + kRefTextRecognition
+        + kRefFormat + kRefActions + kRefFindImage + kRefTextRecognition + kRefWindowMode
 
         + kRefMouseKeyboard + kRefFlow + kRefAi + kRefConditions + kRefVariables
 
@@ -874,6 +1031,14 @@ std::wstring AgentReferenceGet(const std::wstring& section) {
 
         return kRefTextRecognition;
 
+    if (key == L"windowMode" || key == L"windowmode" || key == L"窗口模式" || key == L"脚本模式")
+
+        return kRefWindowMode;
+
+    if (key == L"breakoutTime" || key == L"breakoutTimeSeconds" || key == L"脱离时间")
+
+        return kRefWindowMode;
+
     if (key == L"mouse" || key == L"keyboard" || key == L"鼠标" || key == L"键盘")
 
         return kRefMouseKeyboard;
@@ -904,7 +1069,7 @@ std::wstring AgentReferenceGet(const std::wstring& section) {
 
     return BuildFullReference()
 
-        + L"\n可用 section: all, format, actions, findImage, ocr, mouse, flow, ai,"
+        + L"\n可用 section: all, format, actions, findImage, ocr, windowMode, breakoutTime, mouse, flow, ai,"
 
         L" conditions, variables, patterns, mistakes";
 
@@ -920,7 +1085,7 @@ AgentTool MakeReadScriptReferenceTool() {
 
     tool.description =
 
-        L"读取脚本格式 Skill。section: format|findImage|ocr|flow|ai|conditions|variables|patterns|mistakes|all。"
+        L"读取脚本格式 Skill。section: format|findImage|ocr|windowMode|breakoutTime|flow|ai|conditions|variables|patterns|mistakes|all。"
         L"动作 JSON 用 buildScriptActions 或 buildAi* 工具生成，勿手写。"
         L"优化/定时任务/设置/回复风格用 readAgentSkill。";
 
@@ -934,7 +1099,7 @@ AgentTool MakeReadScriptReferenceTool() {
 
                 "type": "string",
 
-                "description": "all | format | actions | findImage | ocr | mouse | flow | ai | conditions | variables | patterns | mistakes"
+                "description": "all | format | actions | findImage | ocr | windowMode | breakoutTime | mouse | flow | ai | conditions | variables | patterns | mistakes"
 
             }
 
@@ -965,6 +1130,83 @@ AgentTool MakeReadScriptReferenceTool() {
     return tool;
 
 }
+
+const wchar_t* kSkillScriptStrategy = LR"(【脚本生成策略 — readAgentSkill section=scriptStrategy】
+
+用户未说明时默认「效率优先」。用户说「准确度优先/要稳/要可靠/要兜底」时切换为准确度模式。
+
+
+
+── 效率优先（默认）──
+
+· 动作链：findImage、OCR、wait、键鼠、if、goto，尽量不用 AI 文字/图片分析
+
+· 禁止 aiActionExecute，除非用户明确要求「AI动作执行/让AI自动操作」
+
+· 找图：followUp=2 存变量 + if(matchData>0) 即可，不必加计时器兜底
+
+· 验证步骤是否成功：用 findImage/OCR 再次识别，不用 AI 分析
+
+· 脚本头字段：createMacroScript 须写 windowMode（默认 enabled=0）；默认模式 breakoutTimeSeconds 未写视为 0
+  用户要求「手动操作后暂停再继续/脱离时间」时设 breakoutTimeSeconds（常见 1–10 秒）
+
+
+
+── 准确度优先 ──
+
+· 仍禁止 aiActionExecute（即使用户要稳，也用常规动作+兜底，不用 AI 代操作）
+
+· 可适度使用 aiImageAnalysis 在兜底分支诊断界面；aiTextAnalysis 仅在 OCR 不够时
+
+· 关键步骤（尤其找图）须考虑失败并写兜底，但兜底只做环境恢复，不重写整份业务逻辑
+
+
+
+★ 关键找图兜底模板（准确度模式，找图前必加计时器）：
+
+  假设主流程从第 MAIN 步开始（页面加载完成后的第一个业务动作序号）。
+
+  1. timerRecordTime(loopVarName="findTimer")     remark: 开始计时
+
+  2. findImage(findImageFollowUp=2, matchVarName="target",
+     findTimeExpr="30", imagePath=...)             remark: 限时30秒找图
+
+  3. if(conditionExpr="findTimer < 30 and target.matchData > 0", indent=0)
+
+  4.   → 正常后续动作（indent=1）
+
+  5. else (indent=0)
+
+  6.   → 兜底分支（indent=1）：
+
+       a. aiImageAnalysis(
+            aiPrompt="分析当前屏幕。仅回复一个数字，不要其它文字："
+                     "1=仍在加载请等待 2=弹窗遮挡需关闭 3=页面错误需刷新重进",
+            aiOutputVarName="fallbackPlan")
+
+       b. if(fallbackPlan == 1) → wait 5秒 等加载
+
+       c. else if(fallbackPlan == 2) → 找关闭按钮并点击
+
+       d. else if(fallbackPlan == 3) → 刷新/重新打开界面（按实际场景写具体动作）
+
+       e. goto(gotoStepExpr="MAIN")  ★兜底完成后跳回主流程起点，勿重复后面全部步骤
+
+  findTimeExpr 秒数与 findTimer 判断阈值一致（如均为 30）。
+
+  正常分支条件须同时检查 matchData>0，避免误匹配仍走正常逻辑。
+
+
+
+── 模式识别 ──
+
+· 「快点/效率/简单」→ 效率优先
+
+· 「稳/可靠/容错/兜底/别失败」→ 准确度优先，读本节并套用兜底模板
+
+· 「用AI执行/AI自动操作」→ 才允许 buildAiActionExecuteAction
+
+)";
 
 const wchar_t* kSkillReply = LR"(【回复风格 — readAgentSkill section=reply】
 
@@ -1006,15 +1248,16 @@ const wchar_t* kSkillScheduledTasks = LR"(【定时任务 — readAgentSkill sec
 流程：
 1. 确认目标脚本与时间
 2. 无脚本则先 createMacroScript，再创建任务
-3. 已有脚本则直接 createScheduledTask 指定 targetFile
+3. createScheduledTask 必须带 targetFile（真实存在的脚本/录制文件名）
 
 频率：
-  custom=单次（需年月日时分秒）
+  custom=单次（必填 year/month/day + 时分秒）
   daily=每天（时分）
-  weekly=每周（时分+星期，「每周天」=周日）
+  weekly=每周（时分 + weekDays，至少一个；「每周天」=周日）
   hourly=每小时（分）
 
 默认创建鼠标宏类型任务，除非用户明确说是录制。
+创建/更新/删除后主窗口会 Reload，无需用户再开一次定时对话框。
 )";
 
 const wchar_t* kSkillSettings = LR"(【应用设置 — readAgentSkill section=settings】
@@ -1037,12 +1280,14 @@ std::wstring AgentSkillGet(const std::wstring& section) {
     for (auto& c : key) c = static_cast<wchar_t>(std::towlower(c));
 
     if (key.empty() || key == L"all") {
-        return BuildReplySkillText() + L"\n\n" + kSkillOptimize + L"\n\n"
+        return BuildReplySkillText() + L"\n\n" + kSkillScriptStrategy + L"\n\n" + kSkillOptimize + L"\n\n"
             + kSkillScheduledTasks + L"\n\n" + kSkillSettings
-            + L"\n\n可用 section: all, reply, optimize, scheduledTasks, settings";
+            + L"\n\n可用 section: all, reply, scriptStrategy, optimize, scheduledTasks, settings";
     }
     if (key == L"reply" || key == L"style" || key == L"回复")
         return BuildReplySkillText();
+    if (key == L"scriptstrategy" || key == L"strategy" || key == L"脚本策略" || key == L"策略")
+        return kSkillScriptStrategy;
     if (key == L"optimize" || key == L"optimization" || key == L"优化")
         return kSkillOptimize;
     if (key == L"scheduledtasks" || key == L"scheduled" || key == L"tasks" || key == L"定时")
@@ -1058,14 +1303,15 @@ AgentTool MakeReadAgentSkillTool() {
     tool.name = L"readAgentSkill";
     tool.description =
         L"读取助手操作 Skill（非脚本格式）。"
-        L"section: reply|optimize|scheduledTasks|settings|all。"
-        L"涉及优化、定时任务、改设置、回复风格时先读对应 section。";
+        L"section: reply|scriptStrategy|optimize|scheduledTasks|settings|all。"
+        L"生成/修改脚本涉及 AI 动作选用、效率/准确度、兜底逻辑时先读 scriptStrategy；"
+        L"涉及优化、定时任务、改设置、回复风格时读对应 section。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
             "section": {
                 "type": "string",
-                "description": "reply | optimize | scheduledTasks | settings | all"
+                "description": "reply | scriptStrategy | optimize | scheduledTasks | settings | all"
             }
         },
         "required": []

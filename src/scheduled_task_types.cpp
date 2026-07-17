@@ -44,9 +44,9 @@ std::wstring FormatScheduledRunTime(const ScheduledTask& task) {
         return FormatTimeParts(t.hour, t.minute, t.second, t.millisecond, true, false, 0, 0, 0);
     default:
         {
-            wchar_t buf[128]{};
-            swprintf_s(buf, L"%02d-%02d %d时%d分%d秒%d毫秒",
-                t.month, t.day, t.hour, t.minute, t.second, t.millisecond);
+            wchar_t buf[160]{};
+            swprintf_s(buf, L"%04d-%02d-%02d %d时%d分%d秒%d毫秒",
+                t.year, t.month, t.day, t.hour, t.minute, t.second, t.millisecond);
             return buf;
         }
     }
@@ -79,6 +79,8 @@ int SystemTimeWeekDayBit(const SYSTEMTIME& st) {
 
 static bool TimeMatches(const ScheduledTaskTime& t, const SYSTEMTIME& now,
                         bool matchHour, bool matchDate) {
+    // 主窗口用 1s SetTimer 驱动 Tick：不能要求毫秒精确相等，否则几乎永不触发。
+    // 对齐到秒即可；同一秒内的去重由 ScheduledTaskScheduler::FireKey 负责。
     if (matchDate) {
         if (t.year != static_cast<int>(now.wYear)) return false;
         if (t.month != static_cast<int>(now.wMonth)) return false;
@@ -87,7 +89,6 @@ static bool TimeMatches(const ScheduledTaskTime& t, const SYSTEMTIME& now,
     if (matchHour && t.hour != static_cast<int>(now.wHour)) return false;
     if (t.minute != static_cast<int>(now.wMinute)) return false;
     if (t.second != static_cast<int>(now.wSecond)) return false;
-    if (t.millisecond != static_cast<int>(now.wMilliseconds)) return false;
     return true;
 }
 

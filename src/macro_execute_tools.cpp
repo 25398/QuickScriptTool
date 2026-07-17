@@ -51,7 +51,9 @@ AgentTool MakeLookupMacroActionTool() {
     tool.name = L"lookupMacroAction";
     tool.description =
         L"按需查阅宏动作参数字段。type 填动作名（如 keyClick、findImage）或 section"
-        L"（mouse|keyboard|flow|findImage|ocr|system|ai|all）。目录已在 system prompt 中。";
+        L"（mouse|keyboard|flow|findImage|ocr|system|ai|all）。"
+        L"含 clickCount 的类型：duration 为两次重复之间的间隔，count=1 不等待。"
+        L"目录已在 system prompt 中。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
@@ -79,6 +81,7 @@ AgentTool MakeSubmitMacroActionsToolLocal() {
     tool.name = L"submitMacroActions";
     tool.description =
         L"提交本批次要立刻执行的宏动作。actions 数组每项含 type 及参数。"
+        L"mouseClick/keyClick 等：duration 仅用于重复间隔（两次之间），单次不插入等待。"
         L"不确定字段时先 lookupMacroAction，禁止在文字回复中手写 JSON。";
     tool.parameters_json = LR"({
         "type": "object",

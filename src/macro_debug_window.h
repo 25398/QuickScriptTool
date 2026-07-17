@@ -43,6 +43,7 @@ private:
     void AppendLogDirect(const std::wstring& text);
     void ClearLogDirect();
     void CloseByUser();
+    void InvalidateTitleBar();
 
     void DrawTitleButtons(HDC hdc);
     void DrawPinIcon(HDC hdc, const RECT& rc, bool pinned);
@@ -50,6 +51,8 @@ private:
     RECT CloseRect() const;
     RECT MinimizeRect() const;
     RECT PinRect() const;
+    RECT TitleBarRect() const;
+    RECT ContentFrameRect() const;
     int ClientWidth() const;
     bool HitClose(int x, int y) const;
     bool HitMinimize(int x, int y) const;
@@ -74,6 +77,8 @@ private:
     std::function<void()> onClosed_;
     std::mutex logMutex_;
     std::vector<std::wstring> pendingLogs_;
+    /// Clear 与 Flush 竞态：epoch 变化则丢弃已 swap 出的 batch
+    unsigned clearEpoch_ = 0;
     WindowOuterShadow outerShadow_;
 };
 
@@ -87,7 +92,10 @@ std::wstring FormatGenericActionDebug(const ScriptAction& action);
 
 std::wstring FormatMoveMouseDebug(const ScriptAction& action, int x, int y);
 
-std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchResult& rawMatch);
+std::wstring FormatMoveMouseRelativeDebug(const ScriptAction& action, int dx, int dy);
+
+std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchResult& rawMatch,
+                                  bool hasTarget = false, int targetX = 0, int targetY = 0);
 
 std::wstring FormatOcrDebug(const ScriptAction& action, const std::wstring& textContent,
                             bool searchFound, const MacroVariableContext& ctx);

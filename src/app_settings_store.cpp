@@ -1,5 +1,6 @@
 #include "app_settings_store.h"
 
+#include "app_theme.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -85,6 +86,22 @@ void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& o
     out.playSoundOnStart = ParseBoolField(obj, L"playSoundOnStart", out.playSoundOnStart);
     out.hideBottomRightTip = ParseBoolField(obj, L"hideBottomRightTip", out.hideBottomRightTip);
     out.closeToTray = ParseBoolField(obj, L"closeToTray", out.closeToTray);
+    out.themeId = ParseIntField(obj, L"themeId", out.themeId);
+    out.themeId = std::clamp(out.themeId, 0, quickscript::kThemeCount - 1);
+    out.useCustomTheme = ParseBoolField(obj, L"useCustomTheme", out.useCustomTheme);
+    out.customMainColor = ParseIntField(obj, L"customMainColor", out.customMainColor);
+    out.customAccentColor = ParseIntField(obj, L"customAccentColor", out.customAccentColor);
+    out.customMainColor = std::clamp(out.customMainColor, 0, 0xFFFFFF);
+    out.customAccentColor = std::clamp(out.customAccentColor, 0, 0xFFFFFF);
+}
+
+void LoadWindowModeSettings(const std::wstring& obj, quickscript::WindowModeSettings& out) {
+    out.showPreviewThumbnail = ParseBoolField(obj, L"showPreviewThumbnail", out.showPreviewThumbnail);
+    out.previewRefreshMs = ParseIntField(obj, L"previewRefreshMs", out.previewRefreshMs);
+    out.blockRunWhenUnhealthy = ParseBoolField(obj, L"blockRunWhenUnhealthy", out.blockRunWhenUnhealthy);
+    out.allowForegroundInputFallback = ParseBoolField(obj, L"allowForegroundInputFallback",
+        out.allowForegroundInputFallback);
+    out.previewRefreshMs = std::clamp(out.previewRefreshMs, 200, 5000);
 }
 
 void LoadAiApiSettings(const std::wstring& obj, quickscript::AiApiSettings& out) {
@@ -134,6 +151,22 @@ void LoadAiApiSettings(const std::wstring& obj, quickscript::AiApiSettings& out)
     }
 }
 
+void LoadHomeState(const std::wstring& obj, quickscript::HomeState& out) {
+    out.activeTab = ParseIntField(obj, L"activeTab", out.activeTab);
+    out.clickerButton = ParseIntField(obj, L"clickerButton", out.clickerButton);
+    out.clickerIntervalMode = ParseIntField(obj, L"clickerIntervalMode", out.clickerIntervalMode);
+    out.clickerCustomInterval = ParseDoubleField(obj, L"clickerCustomInterval", out.clickerCustomInterval);
+    out.recorderCaptureScope = ParseIntField(obj, L"recorderCaptureScope", out.recorderCaptureScope);
+    out.recorderInputMode = std::clamp(
+        ParseIntField(obj, L"recorderInputMode", out.recorderInputMode), 0, 2);
+    out.selectedScriptPath = ExtractString(obj, L"selectedScriptPath");
+    out.selectedRecordingPath = ExtractString(obj, L"selectedRecordingPath");
+    out.clickerScrollOffset = ParseIntField(obj, L"clickerScrollOffset", out.clickerScrollOffset);
+    out.recorderScrollOffset = ParseIntField(obj, L"recorderScrollOffset", out.recorderScrollOffset);
+    out.macroScrollOffset = ParseIntField(obj, L"macroScrollOffset", out.macroScrollOffset);
+    out.scriptCustomScrollOffset = ParseIntField(obj, L"scriptCustomScrollOffset", out.scriptCustomScrollOffset);
+}
+
 void WriteClickSettings(std::wofstream& file, const quickscript::ClickTabSettings& s) {
     file << L"    \"enableRandomInterval\": " << (s.enableRandomInterval ? L"true" : L"false") << L",\n";
     file << L"    \"randomIntervalMaxSeconds\": " << s.randomIntervalMaxSeconds << L",\n";
@@ -163,7 +196,19 @@ void WriteOtherSettings(std::wofstream& file, const quickscript::OtherTabSetting
     file << L"    \"autoHideMainWindow\": " << (s.autoHideMainWindow ? L"true" : L"false") << L",\n";
     file << L"    \"playSoundOnStart\": " << (s.playSoundOnStart ? L"true" : L"false") << L",\n";
     file << L"    \"hideBottomRightTip\": " << (s.hideBottomRightTip ? L"true" : L"false") << L",\n";
-    file << L"    \"closeToTray\": " << (s.closeToTray ? L"true" : L"false") << L"\n";
+    file << L"    \"closeToTray\": " << (s.closeToTray ? L"true" : L"false") << L",\n";
+    file << L"    \"themeId\": " << s.themeId << L",\n";
+    file << L"    \"useCustomTheme\": " << (s.useCustomTheme ? L"true" : L"false") << L",\n";
+    file << L"    \"customMainColor\": " << s.customMainColor << L",\n";
+    file << L"    \"customAccentColor\": " << s.customAccentColor << L"\n";
+}
+
+void WriteWindowModeSettings(std::wofstream& file, const quickscript::WindowModeSettings& s) {
+    file << L"    \"showPreviewThumbnail\": " << (s.showPreviewThumbnail ? L"true" : L"false") << L",\n";
+    file << L"    \"previewRefreshMs\": " << s.previewRefreshMs << L",\n";
+    file << L"    \"blockRunWhenUnhealthy\": " << (s.blockRunWhenUnhealthy ? L"true" : L"false") << L",\n";
+    file << L"    \"allowForegroundInputFallback\": "
+        << (s.allowForegroundInputFallback ? L"true" : L"false") << L"\n";
 }
 
 void WriteAiApiSettings(std::wofstream& file, const quickscript::AiApiSettings& s) {
@@ -189,6 +234,21 @@ void WriteAiApiSettings(std::wofstream& file, const quickscript::AiApiSettings& 
     file << L"    ]\n";
 }
 
+void WriteHomeState(std::wofstream& file, const quickscript::HomeState& s) {
+    file << L"    \"activeTab\": " << s.activeTab << L",\n";
+    file << L"    \"clickerButton\": " << s.clickerButton << L",\n";
+    file << L"    \"clickerIntervalMode\": " << s.clickerIntervalMode << L",\n";
+    file << L"    \"clickerCustomInterval\": " << s.clickerCustomInterval << L",\n";
+    file << L"    \"recorderCaptureScope\": " << s.recorderCaptureScope << L",\n";
+    file << L"    \"recorderInputMode\": " << s.recorderInputMode << L",\n";
+    file << L"    \"selectedScriptPath\": \"" << EscapeJson(s.selectedScriptPath) << L"\",\n";
+    file << L"    \"selectedRecordingPath\": \"" << EscapeJson(s.selectedRecordingPath) << L"\",\n";
+    file << L"    \"clickerScrollOffset\": " << s.clickerScrollOffset << L",\n";
+    file << L"    \"recorderScrollOffset\": " << s.recorderScrollOffset << L",\n";
+    file << L"    \"macroScrollOffset\": " << s.macroScrollOffset << L",\n";
+    file << L"    \"scriptCustomScrollOffset\": " << s.scriptCustomScrollOffset << L"\n";
+}
+
 }  // namespace
 
 std::wstring AppSettingsFilePath() {
@@ -210,8 +270,12 @@ bool LoadAppSettings(quickscript::AppSettings& out) {
     if (!clickObj.empty()) LoadClickSettings(clickObj, out.click);
     if (!playbackObj.empty()) LoadPlaybackSettings(playbackObj, out.playback);
     if (!otherObj.empty()) LoadOtherSettings(otherObj, out.other);
+    const std::wstring wmObj = ExtractObject(content, L"windowMode");
+    if (!wmObj.empty()) LoadWindowModeSettings(wmObj, out.windowMode);
     const std::wstring aiObj = ExtractObject(content, L"ai");
     if (!aiObj.empty()) LoadAiApiSettings(aiObj, out.ai);
+    const std::wstring homeObj = ExtractObject(content, L"home");
+    if (!homeObj.empty()) LoadHomeState(homeObj, out.home);
     return true;
 }
 
@@ -229,8 +293,14 @@ bool SaveAppSettings(const quickscript::AppSettings& settings) {
     file << L"  \"other\": {\n";
     WriteOtherSettings(file, settings.other);
     file << L"  },\n";
+    file << L"  \"windowMode\": {\n";
+    WriteWindowModeSettings(file, settings.windowMode);
+    file << L"  },\n";
     file << L"  \"ai\": {\n";
     WriteAiApiSettings(file, settings.ai);
+    file << L"  },\n";
+    file << L"  \"home\": {\n";
+    WriteHomeState(file, settings.home);
     file << L"  }\n";
     file << L"}\n";
     file.flush();

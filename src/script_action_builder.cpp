@@ -64,6 +64,9 @@ bool ParseActionType(const std::wstring& type, ActionType& out) {
     static const struct { const wchar_t* name; ActionType t; } kMap[] = {
         {L"moveMouse", ActionType::MoveMouse},
         {L"mouseMove", ActionType::MoveMouse},
+        {L"moveMouseRelative", ActionType::MoveMouseRelative},
+        {L"mouseMoveRelative", ActionType::MoveMouseRelative},
+        {L"relativeMouseMove", ActionType::MoveMouseRelative},
         {L"wait", ActionType::Wait},
         {L"mouseClick", ActionType::MouseClick},
         {L"mouseDown", ActionType::MouseDown},
@@ -251,6 +254,15 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         action.y = JsonInt(p, "y");
         action.randomX = std::max(0, JsonInt(p, "randomX"));
         action.randomY = std::max(0, JsonInt(p, "randomY"));
+        break;
+
+    case ActionType::MoveMouseRelative:
+        // x/y = dx/dy 像素（可负），回放走 SendInput 相对移动
+        action.x = JsonInt(p, "x", JsonInt(p, "dx"));
+        action.y = JsonInt(p, "y", JsonInt(p, "dy"));
+        action.randomX = std::max(0, JsonInt(p, "randomX"));
+        action.randomY = std::max(0, JsonInt(p, "randomY"));
+        action.coordsAreNormalized = false;
         break;
 
     case ActionType::Wait:
@@ -581,14 +593,19 @@ followUp 语义别名（findImage / textRecognition）：
   也可写 findImageFollowUp / ocrFollowUp 整数 0/1/2
 
 ── 基础动作 ──
-wait:           duration, randomDuration
+wait:           duration, randomDuration（整段等待，与下面「重复间隔」不同）
 moveMouse:      x, y, randomX, randomY, moveFromVar, moveVarExprX, moveVarExprY
+moveMouseRelative: x/dx, y/dy（像素相对位移，可负；FPS 视角等）, randomX, randomY
+  说明: 键鼠录制仅在光标隐藏/ClipCursor 时由 Raw Input 自动写入；桌面勿用差值伪相对
+★ 重复间隔语义（mouseClick/keyClick/hotkeyShortcut/quickInput/scrollWheel/mousePlayback）：
+  clickCount=执行次数；duration/randomDuration=相邻两次之间的间隔；
+  count=1 时完全不等待；不在第一次之前、最后一次之后插入等待。
 mouseClick:     button(left/right/middle/x1/x2), clickCount, duration, randomDuration, modifiers/hold*
 mouseDown/Up:   button, modifiers/hold*
 keyClick:       keyText, keyVk, clickCount, duration, randomDuration, modifiers
 keyDown/Up:     keyText, keyVk, modifiers
 hotkeyShortcut: shortcutPreset(0~8), clickCount, duration, randomDuration
-quickInput:     inputText, charInterval, clickCount, duration, randomDuration
+quickInput:     inputText, charInterval(字间), clickCount, duration(整段重复间隔), randomDuration
 scrollWheel:    scrollVertical, scrollHorizontal, scrollDirection(0|1|"up"|"down"), scrollSteps, clickCount, duration
 
 ── 流程 ──
@@ -616,7 +633,7 @@ openWebpage:    targetPath(URL)
 openFile:       targetPath
 timerRecordTime: loopVarName 或 timerVarName
 runMacro:       blockName, targetPath
-mousePlayback:  blockName, targetPath, clickCount, duration
+mousePlayback:  blockName, targetPath, clickCount, duration(重复间隔，仅 count>1)
 lockScreenshot / unlockScreenshot / stopMacro
   ★ 禁止 customText（说明写 remark，勿伪造动作名）
 
@@ -624,12 +641,15 @@ lockScreenshot / unlockScreenshot / stopMacro
 getCursorPos:   matchVarName（默认 cursor；引用 {name}.x / {name}.y 为屏幕坐标）
 aiTextAnalysis:  aiPrompt(必填), aiOutputVarName(默认 aiResult), aiOutputType(0文本/1数字),
                  aiModelName, aiContextMode(0无/1宏/2循环/3块), aiTimeoutSec, aiFallbackValue
+                 ★优先级低：优先 OCR；效率模式尽量少用
 aiImageAnalysis: 同上 + aiImageScale(0.1~1), aiRegionByImage, aiTargetImagePath,
                  aiSearchX1~Y2（区域截屏；不填则全屏）
+                 ★优先级低：优先 findImage；准确度兜底诊断时可用
 aiActionExecute: aiPrompt(必填任务描述), aiModelName, aiWithImage(1=带截图),
                  aiRegionByImage, aiTargetImagePath, aiSearchX1~Y2,
                  aiMaxSteps(默认10,-1=不限), aiTimeoutSec, aiConfirmExecute(1=执行前确认),
                  aiContextMode, aiFallbackValue
+                 ★极低优先级：仅用户明确要求「AI动作执行」时使用
 
 aiContextMode：0=每次独立请求；1=宏级（可见全部下级对话）；2=循环级（可见嵌套子循环对话）；3=块级。
 层级规则：循环上下文按嵌套深度分槽；子循环每轮结束后合并到父循环；宏上下文自动同步所有非「无上下文」对话。
@@ -643,7 +663,7 @@ modifiers 示例: ["ctrl","shift"] 或 holdLeftCtrl 等 0/1
 std::wstring ScriptActionCatalog() {
     return LR"(【宏动作目录 — 参数细节用 lookupMacroAction 查询】
 通用可选字段：type(必填), remark, indent（no/text 由工具自动生成）
-鼠标: moveMouse, mouseClick, mouseDown, mouseUp, scrollWheel
+鼠标: moveMouse, moveMouseRelative, mouseClick, mouseDown, mouseUp, scrollWheel
 键盘: keyClick, keyDown, keyUp, hotkeyShortcut, quickInput
 流程: loop, endLoop, if, else, defineBlock, runBlock, stopMacro, goto
 识别: findImage(找图点击), textRecognition(OCR)
@@ -697,6 +717,12 @@ std::wstring SchemaTypeDetail(const std::wstring& typeName) {
         pos = lineEnd + 1;
     }
     if (!found) return L"";
+    if (typeName == L"mouseClick" || typeName == L"keyClick"
+        || typeName == L"hotkeyShortcut" || typeName == L"quickInput"
+        || typeName == L"scrollWheel" || typeName == L"mousePlayback") {
+        out << L"\n★ duration/randomDuration = 相邻两次 clickCount 重复之间的间隔；"
+            L"count=1 完全不等待；不在首前/末后插入等待（与 wait 不同）。\n";
+    }
     out << L"\n通用可选: remark, indent（序号与显示名由工具自动生成）\n";
     out << L"followUp: click|move|saveVar（findImage/textRecognition 适用）\n";
     return out.str();
@@ -739,7 +765,7 @@ std::wstring LookupMacroActionSchema(const std::wstring& typeOrSection) {
     }
 
     static const wchar_t* kTypes[] = {
-        L"wait", L"moveMouse", L"mouseClick", L"mouseDown", L"mouseUp",
+        L"wait", L"moveMouse", L"moveMouseRelative", L"mouseClick", L"mouseDown", L"mouseUp",
         L"keyClick", L"keyDown", L"keyUp", L"hotkeyShortcut", L"quickInput", L"scrollWheel",
         L"loop", L"endLoop", L"defineBlock", L"runBlock", L"if", L"else", L"goto",
         L"findImage", L"textRecognition",

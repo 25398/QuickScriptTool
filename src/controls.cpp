@@ -108,11 +108,15 @@ bool IsParamCheckboxChecked(HWND hwnd) {
     return hwnd && GetPropW(hwnd, kParamCheckboxCheckedProp) != nullptr;
 }
 
-void SetParamCheckboxChecked(HWND hwnd, bool checked) {
+void SetParamCheckboxChecked(HWND hwnd, bool checked, bool immediateRedraw) {
     if (!hwnd) return;
     if (checked) SetPropW(hwnd, kParamCheckboxCheckedProp, reinterpret_cast<HANDLE>(1));
     else RemovePropW(hwnd, kParamCheckboxCheckedProp);
-    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+    if (immediateRedraw) {
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME);
+    } else {
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
 }
 
 HWND MakeCheckBox(HWND parent, const wchar_t* text, int id,

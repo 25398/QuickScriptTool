@@ -2,15 +2,20 @@
 
 #include "app_branding.h"
 #include "app_settings_store.h"
+#include "app_theme.h"
+#include "theme_custom_dialog.h"
 #include "controls.h"
 #include "drawing.h"
 #include "modern_edit.h"
+#include "render_context.h"
 #include "scheduled_task_ui.h"
 #include "taskbar_window.h"
+#include "ui_scale.h"
 #include "utils.h"
 
 #include <windowsx.h>
 #include <commctrl.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -18,7 +23,11 @@
 
 namespace {
 
-HWND g_activeSettingsDialogHwnd = nullptr;
+int SL(int v) { return UiLen(v); }
+int DialogContentTop() { return SL(kTitleH + 44); }
+int DialogFooterTop(int clientH) { return clientH - SL(52); }
+int DialogTabW(int clientW) { return clientW / 5; }
+int AiRowH() { return SL(48); }
 
 void SetEditText(HWND edit, const std::wstring& text) {
     if (edit) SetWindowTextW(edit, text.c_str());
@@ -28,31 +37,6 @@ std::wstring FormatDouble4(double v) {
     wchar_t buf[32]{};
     swprintf_s(buf, L"%.4f", v);
     return buf;
-}
-
-void DrawTextIn(HDC hdc, const std::wstring& text, RECT rc, COLORREF color,
-                UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS) {
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, color);
-    DrawTextW(hdc, text.c_str(), -1, &rc, format);
-}
-
-void FillAlphaRect(HDC hdc, RECT rc, COLORREF color, BYTE alpha) {
-    const int w = rc.right - rc.left;
-    const int h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) return;
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-    HGDIOBJ oldBmp = SelectObject(mem, bmp);
-    RECT local{0, 0, w, h};
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(mem, &local, brush);
-    DeleteObject(brush);
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, 0};
-    GdiAlphaBlend(hdc, rc.left, rc.top, w, h, mem, 0, 0, w, h, bf);
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
 }
 
 void MoveCtrl(HWND hwnd, int x, int y, int w, int h) {
@@ -69,14 +53,42 @@ HWND MakeBorderedEdit(HWND parent, const wchar_t* text, int id) {
 
 }  // namespace
 
+namespace {
+HWND g_activeSettingsDialogHwnd = nullptr;
+}  // namespace
+
+HWND SettingsDialog::ActiveHwnd() {
+    return g_activeSettingsDialogHwnd;
+}
+
 void NotifyActiveSettingsDialogSync() {
     if (g_activeSettingsDialogHwnd) {
         PostMessageW(g_activeSettingsDialogHwnd, WM_SETTINGS_EXTERNAL_SYNC, 0, 0);
     }
 }
 
+void NotifyActiveSettingsDialogRelayout() {
+    if (g_activeSettingsDialogHwnd) {
+        SendMessageW(g_activeSettingsDialogHwnd, WM_APP_UI_LAYOUT_REFRESH, 0, 0);
+    }
+}
+
 int SettingsDialog::CenteredEditY(int rowTop, int rowHeight) const {
-    return rowTop + (rowHeight - kEditH) / 2;
+    return rowTop + (rowHeight - SL(kEditH)) / 2;
+}
+
+int SettingsDialog::ClientW() const {
+    RECT rc{};
+    if (hwnd_) GetClientRect(hwnd_, &rc);
+    const int w = static_cast<int>(rc.right - rc.left);
+    return w > 0 ? w : UiHomeWidth();
+}
+
+int SettingsDialog::ClientH() const {
+    RECT rc{};
+    if (hwnd_) GetClientRect(hwnd_, &rc);
+    const int h = static_cast<int>(rc.bottom - rc.top);
+    return h > 0 ? h : UiHomeHeight();
 }
 
 int SettingsDialog::BodyTextWidth(const wchar_t* text) const {
@@ -91,26 +103,26 @@ int SettingsDialog::BodyTextWidth(const wchar_t* text) const {
 }
 
 void SettingsDialog::UpdateInlineLayout() {
-    const int gap = kCoordEditGap;
-    inlineLayout_.randomIntervalEditX = kLabelAfterCheck + BodyTextWidth(L"启用随机间隔时间，最长为") + gap;
-    inlineLayout_.randomUnitX = inlineLayout_.randomIntervalEditX + kEditW + gap;
-    inlineLayout_.pressReleaseEditX = kLabelAfterCheck + BodyTextWidth(L"启用按下抬起间隔，间隔") + gap;
-    inlineLayout_.pressReleaseUnitX = inlineLayout_.pressReleaseEditX + kEditW + gap;
-    inlineLayout_.clickLimitEditX = kLabelAfterCheck + BodyTextWidth(L"启用次数限制，点击") + gap;
-    inlineLayout_.clickLimitSuffixX = inlineLayout_.clickLimitEditX + kEditW + gap;
+    const int gap = SL(kCoordEditGap);
+    inlineLayout_.randomIntervalEditX = SL(kLabelAfterCheck) + BodyTextWidth(L"启用随机间隔时间，最长为") + gap;
+    inlineLayout_.randomUnitX = inlineLayout_.randomIntervalEditX + SL(kEditW) + gap;
+    inlineLayout_.pressReleaseEditX = SL(kLabelAfterCheck) + BodyTextWidth(L"启用按下抬起间隔，间隔") + gap;
+    inlineLayout_.pressReleaseUnitX = inlineLayout_.pressReleaseEditX + SL(kEditW) + gap;
+    inlineLayout_.clickLimitEditX = SL(kLabelAfterCheck) + BodyTextWidth(L"启用次数限制，点击") + gap;
+    inlineLayout_.clickLimitSuffixX = inlineLayout_.clickLimitEditX + SL(kEditW) + gap;
 
-    inlineLayout_.playbackCountEditX = kIndent + BodyTextWidth(L"回放") + gap;
-    inlineLayout_.playbackCountSuffixX = inlineLayout_.playbackCountEditX + kSmallEditW + gap;
-    inlineLayout_.playbackMinEditX = kIndent + BodyTextWidth(L"最小间隔") + gap;
-    inlineLayout_.playbackMinUnitX = inlineLayout_.playbackMinEditX + kEditW + gap;
+    inlineLayout_.playbackCountEditX = SL(kIndent) + BodyTextWidth(L"回放") + gap;
+    inlineLayout_.playbackCountSuffixX = inlineLayout_.playbackCountEditX + SL(kSmallEditW) + gap;
+    inlineLayout_.playbackMinEditX = SL(kIndent) + BodyTextWidth(L"最小间隔") + gap;
+    inlineLayout_.playbackMinUnitX = inlineLayout_.playbackMinEditX + SL(kEditW) + gap;
     inlineLayout_.playbackMaxLabelX = inlineLayout_.playbackMinUnitX + BodyTextWidth(L"秒") + gap;
     inlineLayout_.playbackMaxEditX = inlineLayout_.playbackMaxLabelX + BodyTextWidth(L"最大间隔") + gap;
-    inlineLayout_.playbackMaxUnitX = inlineLayout_.playbackMaxEditX + kEditW + gap;
+    inlineLayout_.playbackMaxUnitX = inlineLayout_.playbackMaxEditX + SL(kEditW) + gap;
 
-    inlineLayout_.jitterXEditX = kIndent + BodyTextWidth(L"横坐标抖动(X)") + gap;
-    inlineLayout_.jitterYEditX = kJitterYGroupLeft + BodyTextWidth(L"纵坐标抖动(Y)") + gap;
-    inlineLayout_.fixedXEditX = kIndent + BodyTextWidth(L"横坐标(X)") + gap;
-    inlineLayout_.fixedYEditX = kFixedYGroupLeft + BodyTextWidth(L"纵坐标(Y)") + gap;
+    inlineLayout_.jitterXEditX = SL(kIndent) + BodyTextWidth(L"横坐标抖动(X)") + gap;
+    inlineLayout_.jitterYEditX = SL(kJitterYGroupLeft) + BodyTextWidth(L"纵坐标抖动(Y)") + gap;
+    inlineLayout_.fixedXEditX = SL(kIndent) + BodyTextWidth(L"横坐标(X)") + gap;
+    inlineLayout_.fixedYEditX = SL(kFixedYGroupLeft) + BodyTextWidth(L"纵坐标(Y)") + gap;
 
     static const wchar_t* kAiLabels[] = {
         L"API 地址:", L"API 密钥:", L"模型名称:", L"温度参数:", L"最大Token:",
@@ -120,39 +132,25 @@ void SettingsDialog::UpdateInlineLayout() {
         maxAiLabelW = std::max(maxAiLabelW, BodyTextWidth(label));
     }
     inlineLayout_.aiLabelW = maxAiLabelW;
-    inlineLayout_.aiEditX = kMargin + maxAiLabelW + gap;
-    inlineLayout_.aiTempHintX = inlineLayout_.aiEditX + kSmallEditW + gap;
+    inlineLayout_.aiEditX = SL(kMargin) + maxAiLabelW + gap;
+    inlineLayout_.aiTempHintX = inlineLayout_.aiEditX + SL(kSmallEditW) + gap;
 }
 
 void SettingsDialog::CenterEditTextVertically(HWND edit) {
-    if (!edit) return;
-    RECT rc{};
-    GetClientRect(edit, &rc);
-    const HFONT font = reinterpret_cast<HFONT>(SendMessageW(edit, WM_GETFONT, 0, 0));
-    HDC hdc = GetDC(edit);
-    HFONT oldFont = font ? reinterpret_cast<HFONT>(SelectObject(hdc, font)) : nullptr;
-    TEXTMETRICW tm{};
-    GetTextMetricsW(hdc, &tm);
-    if (oldFont) SelectObject(hdc, oldFont);
-    ReleaseDC(edit, hdc);
-    const int textH = tm.tmHeight;
-    const int pad = std::max(0, static_cast<int>((rc.bottom - rc.top - textH) / 2)) + 3;
-    rc.top = pad;
-    rc.bottom = rc.top + textH + 2;
-    SendMessageW(edit, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&rc));
+    CenterModernSingleLineEditText(edit);
 }
 
 int SettingsDialog::ClickRowY(int index) const {
     const int base = ClickTop();
-    const int jitterSub = base + kRowH * 2 + 34;
-    const int fixedCb = jitterSub + kSubRowH + 12;
-    const int fixedSub = fixedCb + 34;
-    const int crossY = fixedSub + kSubRowH;
-    const int countCb = crossY + kSubRowH + 10;
+    const int jitterSub = base + SL(kRowH) * 2 + SL(34);
+    const int fixedCb = jitterSub + SL(kSubRowH) + SL(12);
+    const int fixedSub = fixedCb + SL(34);
+    const int crossY = fixedSub + SL(kSubRowH);
+    const int countCb = crossY + SL(kSubRowH) + SL(10);
     switch (index) {
     case 0: return base;
-    case 1: return base + kRowH;
-    case 2: return base + kRowH * 2;
+    case 1: return base + SL(kRowH);
+    case 2: return base + SL(kRowH) * 2;
     case 3: return fixedCb;
     case 4: return countCb;
     default: return base;
@@ -161,7 +159,7 @@ int SettingsDialog::ClickRowY(int index) const {
 
 RECT SettingsDialog::ClickCheckboxRect(int index) const {
     const int top = ClickRowY(index);
-    return RECT{kMargin, top, kMargin + kCheckboxSize, top + kCheckboxSize};
+    return RECT{SL(kMargin), top, SL(kMargin) + SL(kCheckboxSize), top + SL(kCheckboxSize)};
 }
 
 bool SettingsDialog::HitClickCheckbox(int x, int y, int& outIndex) const {
@@ -173,8 +171,8 @@ bool SettingsDialog::HitClickCheckbox(int x, int y, int& outIndex) const {
 
 int SettingsDialog::PlaybackRowY(int index) const {
     const int base = PlaybackTop();
-    const int sec1 = base + kSubLineOffset + kSubRowH + 14;
-    const int sec2 = sec1 + kSubLineOffset + kSubRowH + 14;
+    const int sec1 = base + SL(kSubLineOffset) + SL(kSubRowH) + SL(14);
+    const int sec2 = sec1 + SL(kSubLineOffset) + SL(kSubRowH) + SL(14);
     switch (index) {
     case 0: return base;
     case 1: return sec1;
@@ -186,8 +184,8 @@ int SettingsDialog::PlaybackRowY(int index) const {
 
 RECT SettingsDialog::PlaybackCheckboxRect(int index) const {
     const int top = PlaybackRowY(index);
-    const int left = (index == 3) ? 400 : kMargin;
-    return RECT{left, top, left + kCheckboxSize, top + kCheckboxSize};
+    const int left = (index == 3) ? SL(400) : SL(kMargin);
+    return RECT{left, top, left + SL(kCheckboxSize), top + SL(kCheckboxSize)};
 }
 
 bool SettingsDialog::HitPlaybackCheckbox(int x, int y, int& outIndex) const {
@@ -198,31 +196,58 @@ bool SettingsDialog::HitPlaybackCheckbox(int x, int y, int& outIndex) const {
 }
 
 RECT SettingsDialog::OtherCheckboxRect(int index) const {
-    const int top = kContentTop + kContentPad + index * kRowH;
-    return RECT{kMargin, top, kMargin + kCheckboxSize, top + kCheckboxSize};
+    const int top = DialogContentTop() + SL(kContentPad) + index * SL(kRowH);
+    return RECT{SL(kMargin), top, SL(kMargin) + SL(kCheckboxSize), top + SL(kCheckboxSize)};
+}
+
+RECT SettingsDialog::OtherThemeLabelRect() const {
+    const int top = DialogContentTop() + SL(kContentPad) + 4 * SL(kRowH) + SL(8);
+    return RECT{SL(kMargin), top, SL(kMargin) + SL(kThemeLabelW), top + SL(kAiTopRowBtnH)};
+}
+
+RECT SettingsDialog::OtherThemeComboRect() const {
+    const RECT label = OtherThemeLabelRect();
+    return RECT{label.right + SL(12), label.top,
+        label.right + SL(12) + SL(kThemeComboW), label.bottom};
+}
+
+void SettingsDialog::RefreshThemeCombo() {
+    std::vector<std::wstring> names;
+    names.reserve(static_cast<size_t>(quickscript::kThemeCount) + 1);
+    names.push_back(L"自定义");
+    const quickscript::AppTheme* catalog = quickscript::ThemeCatalog();
+    for (int i = 0; i < quickscript::kThemeCount; ++i)
+        names.push_back(catalog[i].name ? catalog[i].name : L"");
+    themeCombo_.SetItems(std::move(names));
+
+    working_.other.themeId = std::clamp(working_.other.themeId, 0, quickscript::kThemeCount - 1);
+    const int sel = working_.other.useCustomTheme
+        ? quickscript::kCustomThemeComboIndex
+        : (working_.other.themeId + 1);
+    themeCombo_.SetSelectedIndex(sel);
 }
 
 RECT SettingsDialog::AiCheckboxRect() const {
-    const int top = kContentTop + kContentPad;
-    return RECT{kMargin, top, kMargin + kCheckboxSize, top + kCheckboxSize};
+    const int top = DialogContentTop() + SL(kContentPad);
+    return RECT{SL(kMargin), top, SL(kMargin) + SL(kCheckboxSize), top + SL(kCheckboxSize)};
 }
 
 RECT SettingsDialog::AiAddModelBtnRect() const {
-    const int top = kContentTop + kContentPad;
-    const int right = kDialogW - kMargin;
-    return RECT{right - kAiAddModelBtnW, top, right, top + kAiTopRowBtnH};
+    const int top = DialogContentTop() + SL(kContentPad);
+    const int right = ClientW() - SL(kMargin);
+    return RECT{right - SL(kAiAddModelBtnW), top, right, top + SL(kAiTopRowBtnH)};
 }
 
 RECT SettingsDialog::AiDeleteModelBtnRect() const {
     const RECT add = AiAddModelBtnRect();
-    return RECT{add.left - kAiTopRowGap - kAiDeleteBtnW, add.top,
-        add.left - kAiTopRowGap, add.bottom};
+    return RECT{add.left - SL(kAiTopRowGap) - SL(kAiDeleteBtnW), add.top,
+        add.left - SL(kAiTopRowGap), add.bottom};
 }
 
 RECT SettingsDialog::AiModelComboRect() const {
     const RECT del = AiDeleteModelBtnRect();
-    return RECT{del.left - kAiTopRowGap - kAiModelComboW, del.top,
-        del.left - kAiTopRowGap, del.bottom};
+    return RECT{del.left - SL(kAiTopRowGap) - SL(kAiModelComboW), del.top,
+        del.left - SL(kAiTopRowGap), del.bottom};
 }
 
 bool SettingsDialog::HitAiAddModelBtn(int x, int y) const {
@@ -361,39 +386,38 @@ void SettingsDialog::ToggleCheckbox(Tab tab, int index) {
 void SettingsDialog::PositionChildControls() {
     UpdateInlineLayout();
 
-    const int jitterSubY = ClickRowY(2) + kSubLineOffset;
-    const int fixedSubY = ClickRowY(3) + kSubLineOffset;
-    const int crossY = fixedSubY + kSubRowH + 4;
+    const int jitterSubY = ClickRowY(2) + SL(kSubLineOffset);
+    const int fixedSubY = ClickRowY(3) + SL(kSubLineOffset);
+    const int crossY = fixedSubY + SL(kSubRowH) + SL(4);
 
     MoveEditInFrame(editRandomInterval_, inlineLayout_.randomIntervalEditX,
-        CenteredEditY(ClickRowY(0), kCheckboxSize), kEditW, kEditH);
+        CenteredEditY(ClickRowY(0), SL(kCheckboxSize)), SL(kEditW), SL(kEditH));
     MoveEditInFrame(editPressRelease_, inlineLayout_.pressReleaseEditX,
-        CenteredEditY(ClickRowY(1), kCheckboxSize), kEditW, kEditH);
-    MoveEditInFrame(editJitterX_, inlineLayout_.jitterXEditX, CenteredEditY(jitterSubY, kSubRowH), kSmallEditW, kEditH);
-    MoveEditInFrame(editJitterY_, inlineLayout_.jitterYEditX, CenteredEditY(jitterSubY, kSubRowH), kSmallEditW, kEditH);
-    MoveEditInFrame(editFixedX_, inlineLayout_.fixedXEditX, CenteredEditY(fixedSubY, kSubRowH), kSmallEditW, kEditH);
-    MoveEditInFrame(editFixedY_, inlineLayout_.fixedYEditX, CenteredEditY(fixedSubY, kSubRowH), kSmallEditW, kEditH);
-    MoveCtrl(crosshairBtn_, kIndent, crossY, 420, 38);
+        CenteredEditY(ClickRowY(1), SL(kCheckboxSize)), SL(kEditW), SL(kEditH));
+    MoveEditInFrame(editJitterX_, inlineLayout_.jitterXEditX, CenteredEditY(jitterSubY, SL(kSubRowH)), SL(kSmallEditW), SL(kEditH));
+    MoveEditInFrame(editJitterY_, inlineLayout_.jitterYEditX, CenteredEditY(jitterSubY, SL(kSubRowH)), SL(kSmallEditW), SL(kEditH));
+    MoveEditInFrame(editFixedX_, inlineLayout_.fixedXEditX, CenteredEditY(fixedSubY, SL(kSubRowH)), SL(kSmallEditW), SL(kEditH));
+    MoveEditInFrame(editFixedY_, inlineLayout_.fixedYEditX, CenteredEditY(fixedSubY, SL(kSubRowH)), SL(kSmallEditW), SL(kEditH));
+    MoveCtrl(crosshairBtn_, SL(kIndent), crossY, SL(kCrosshairBtnW), SL(kCrosshairBtnH));
     MoveEditInFrame(editClickLimit_, inlineLayout_.clickLimitEditX,
-        CenteredEditY(ClickRowY(4), kCheckboxSize), kEditW, kEditH);
+        CenteredEditY(ClickRowY(4), SL(kCheckboxSize)), SL(kEditW), SL(kEditH));
 
-    const int pbSub0 = PlaybackRowY(0) + kSubLineOffset;
-    const int pbSub1 = PlaybackRowY(1) + kSubLineOffset;
+    const int pbSub0 = PlaybackRowY(0) + SL(kSubLineOffset);
+    const int pbSub1 = PlaybackRowY(1) + SL(kSubLineOffset);
     MoveEditInFrame(editPlaybackCount_, inlineLayout_.playbackCountEditX,
-        CenteredEditY(pbSub0, kSubRowH), kSmallEditW, kEditH);
+        CenteredEditY(pbSub0, SL(kSubRowH)), SL(kSmallEditW), SL(kEditH));
     MoveEditInFrame(editPlaybackMin_, inlineLayout_.playbackMinEditX,
-        CenteredEditY(pbSub1, kSubRowH), kEditW, kEditH);
+        CenteredEditY(pbSub1, SL(kSubRowH)), SL(kEditW), SL(kEditH));
     MoveEditInFrame(editPlaybackMax_, inlineLayout_.playbackMaxEditX,
-        CenteredEditY(pbSub1, kSubRowH), kEditW, kEditH);
+        CenteredEditY(pbSub1, SL(kSubRowH)), SL(kEditW), SL(kEditH));
 
-    static constexpr int kAiTop = kContentTop + kContentPad;
-    static constexpr int kAiRowH = 48;
-    const int aiEditW = kDialogW - inlineLayout_.aiEditX - kMargin;
-    MoveEditInFrame(editApiUrl_, inlineLayout_.aiEditX, CenteredEditY(kAiTop + kAiRowH, kAiRowH), aiEditW, kEditH);
-    MoveEditInFrame(editApiKey_, inlineLayout_.aiEditX, CenteredEditY(kAiTop + kAiRowH * 2, kAiRowH), aiEditW, kEditH);
-    MoveEditInFrame(editModelName_, inlineLayout_.aiEditX, CenteredEditY(kAiTop + kAiRowH * 3, kAiRowH), aiEditW, kEditH);
-    MoveEditInFrame(editTemperature_, inlineLayout_.aiEditX, CenteredEditY(kAiTop + kAiRowH * 4, kAiRowH), kSmallEditW, kEditH);
-    MoveEditInFrame(editMaxTokens_, inlineLayout_.aiEditX, CenteredEditY(kAiTop + kAiRowH * 5, kAiRowH), kSmallEditW, kEditH);
+    const int aiTop = DialogContentTop() + SL(kContentPad);
+    const int aiEditW = ClientW() - inlineLayout_.aiEditX - SL(kMargin);
+    MoveEditInFrame(editApiUrl_, inlineLayout_.aiEditX, CenteredEditY(aiTop + AiRowH(), AiRowH()), aiEditW, SL(kEditH));
+    MoveEditInFrame(editApiKey_, inlineLayout_.aiEditX, CenteredEditY(aiTop + AiRowH() * 2, AiRowH()), aiEditW, SL(kEditH));
+    MoveEditInFrame(editModelName_, inlineLayout_.aiEditX, CenteredEditY(aiTop + AiRowH() * 3, AiRowH()), aiEditW, SL(kEditH));
+    MoveEditInFrame(editTemperature_, inlineLayout_.aiEditX, CenteredEditY(aiTop + AiRowH() * 4, AiRowH()), SL(kSmallEditW), SL(kEditH));
+    MoveEditInFrame(editMaxTokens_, inlineLayout_.aiEditX, CenteredEditY(aiTop + AiRowH() * 5, AiRowH()), SL(kSmallEditW), SL(kEditH));
 
     const HWND edits[] = {
         editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
@@ -404,12 +428,17 @@ void SettingsDialog::PositionChildControls() {
     for (HWND edit : edits) CenterEditTextVertically(edit);
 }
 
-bool SettingsDialog::Show(HWND owner, quickscript::AppSettings& settings) {
+bool SettingsDialog::Show(HWND owner, quickscript::AppSettings& settings, SavedCallback onSaved) {
+    if (IsAlive()) {
+        SetForegroundWindow(hwnd_);
+        return true;
+    }
+
     owner_ = owner;
     settings_ = &settings;
     working_ = settings;
-    done_ = false;
     saved_ = false;
+    onSaved_ = std::move(onSaved);
     activeTab_ = Tab::Click;
 
     static bool registered = false;
@@ -426,46 +455,37 @@ bool SettingsDialog::Show(HWND owner, quickscript::AppSettings& settings) {
     }
 
     RECT ownerRc{};
-    GetWindowRect(owner, &ownerRc);
+    if (owner && IsWindow(owner))
+        GetWindowRect(owner, &ownerRc);
+
+    // 单例设置窗与主窗重叠；不级联偏移
     hwnd_ = CreateWindowExW(0, cls, L"", WS_POPUP | WS_CLIPCHILDREN,
-        ownerRc.left, ownerRc.top, kDialogW, kDialogH, owner, nullptr,
+        ownerRc.left, ownerRc.top, UiHomeWidth(), UiHomeHeight(), nullptr, nullptr,
         GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
 
+    UiResizeHwndToHome(hwnd_);
+    PositionChildControls();
+
     g_activeSettingsDialogHwnd = hwnd_;
-    ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-设置");
+
+    ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-设置", true);
     outerShadow_.Attach(hwnd_);
 
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
-    EnableWindow(owner, FALSE);
+    return true;
+}
 
-    MSG msg{};
-    while (!done_ && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_QUIT) {
-            PostQuitMessage(static_cast<int>(msg.wParam));
-            done_ = true;
-            break;
-        }
-        if (!StModalMessageForDialog(msg, hwnd_, aiModelCombo_.PopupHwnd(), nullptr, owner_)) continue;
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+SettingsDialog::SettingsDialog() = default;
 
-    if (IsWindow(hwnd_)) {
-        ShowWindow(hwnd_, SW_HIDE);
+SettingsDialog::~SettingsDialog() {
+    onSaved_ = nullptr;
+    if (IsAlive()) {
         DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
     }
-
-    if (IsWindow(owner)) {
-        EnableWindow(owner, TRUE);
-        SetForegroundWindow(owner);
-    }
-    g_activeSettingsDialogHwnd = nullptr;
-    StDiscardSpuriousInputAfterModal(owner);
-
-    return saved_;
 }
 
 LRESULT CALLBACK SettingsDialog::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -496,24 +516,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
 
     switch (msg) {
     case WM_CREATE: {
-        titleFont_ = CreateFontW(26, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        closeFont_ = CreateFontW(36, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        bodyFont_ = CreateFontW(26, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        tabFont_ = CreateFontW(28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        smallFont_ = CreateFontW(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        aboutTitleFont_ = CreateFontW(42, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        RecreateUiFonts();
 
         crosshairDragCursor_ = CreateCrosshairDragCursor(kCrosshairBlue);
         crosshairDrag_.SetOwner(hwnd_);
@@ -525,7 +528,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         editJitterY_ = MakeBorderedEdit(hwnd_, L"2", kEditJitterY);
         editFixedX_ = MakeBorderedEdit(hwnd_, L"0", kEditFixedX);
         editFixedY_ = MakeBorderedEdit(hwnd_, L"0", kEditFixedY);
-        crosshairBtn_ = MakeGreenButton(hwnd_, L"拖动准星到需要点击的地方", kCrosshairBtn, 0, 0, 420, 38);
+        crosshairBtn_ = MakeGreenButton(hwnd_, L"拖动准星到需要点击的地方", kCrosshairBtn, 0, 0, SL(kCrosshairBtnW), SL(kCrosshairBtnH));
         editClickLimit_ = MakeBorderedEdit(hwnd_, L"0", kEditClickLimit);
         editPlaybackCount_ = MakeBorderedEdit(hwnd_, L"1", kEditPlaybackCount);
         editPlaybackMin_ = MakeBorderedEdit(hwnd_, L"0.5000", kEditPlaybackMin);
@@ -540,6 +543,27 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         aiModelCombo_.SetPlaceholder(L"请选择已添加的模型");
         aiModelCombo_.SetSelectionCallback([this](int index) {
             LoadAiProfileIntoControls(index);
+        });
+        themeCombo_.Init(hwnd_, bodyFont_);
+        themeCombo_.SetPlaceholder(L"请选择主题");
+        themeCombo_.SetSelectionCallback([this](int index) {
+            const int total = quickscript::kThemeCount + 1;
+            if (index < 0 || index >= total) return;
+            if (index == quickscript::kCustomThemeComboIndex) {
+                COLORREF main = static_cast<COLORREF>(working_.other.customMainColor & 0xFFFFFF);
+                COLORREF accent = static_cast<COLORREF>(working_.other.customAccentColor & 0xFFFFFF);
+                if (!quickscript::ShowCustomThemePicker(hwnd_, main, accent)) {
+                    RefreshThemeCombo();
+                    return;
+                }
+                working_.other.useCustomTheme = true;
+                working_.other.customMainColor = static_cast<int>(main & 0xFFFFFF);
+                working_.other.customAccentColor = static_cast<int>(accent & 0xFFFFFF);
+            } else {
+                working_.other.useCustomTheme = false;
+                working_.other.themeId = index - 1;
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
         });
 
         crosshairDrag_.RegisterButton(crosshairBtn_, {CrosshairDragMode::Coordinates, nullptr});
@@ -560,6 +584,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         PositionChildControls();
         SyncControlsFromSettings();
         RefreshAiModelCombo();
+        RefreshThemeCombo();
         UpdateControlVisibility();
         promptModal_.Bind(hwnd_, bodyFont_);
         return 0;
@@ -573,6 +598,17 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND:
         return 1;
+    case WM_SIZE:
+        PositionChildControls();
+        return 0;
+    case WM_DPICHANGED:
+    case WM_DISPLAYCHANGE:
+        if (owner_ && IsWindow(owner_))
+            PostMessageW(owner_, WM_APP_UI_SCALE_SYNC, 0, 1);
+        return 0;
+    case WM_APP_UI_LAYOUT_REFRESH:
+        RelayoutForScaleChange();
+        return 0;
     case WM_NCHITTEST: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd_, &pt);
@@ -591,16 +627,25 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOVE:
     case WM_WINDOWPOSCHANGED:
         if (aiModelCombo_.IsOpen()) aiModelCombo_.SyncPopupPosition(AiModelComboRect());
+        if (themeCombo_.IsOpen()) themeCombo_.SyncPopupPosition(OtherThemeComboRect());
         return DefWindowProcW(hwnd_, msg, wp, lp);
     case WM_ACTIVATE:
-        if (LOWORD(wp) == WA_INACTIVE) aiModelCombo_.Close();
+        if (LOWORD(wp) == WA_INACTIVE) {
+            aiModelCombo_.Close();
+            themeCombo_.Close();
+        }
         if (LOWORD(wp) == WA_INACTIVE && crosshairDrag_.IsActive()) crosshairDrag_.End();
         return DefWindowProcW(hwnd_, msg, wp, lp);
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
         if (promptModal_.visible()) return 0;
-        if (HitClose(x, y)) { aiModelCombo_.Close(); done_ = true; DestroyWindow(hwnd_); return 0; }
+        if (HitClose(x, y)) {
+            aiModelCombo_.Close();
+            themeCombo_.Close();
+            DestroyWindow(hwnd_);
+            return 0;
+        }
         if (PtIn(RestoreLinkRect(), x, y)) { RestoreDefaults(); InvalidateRect(hwnd_, nullptr, FALSE); return 0; }
         if (PtIn(SaveBtnRect(), x, y)) { SaveAndClose(); return 0; }
         if (activeTab_ == Tab::About && PtIn(CheckUpgradeBtnRect(), x, y)) {
@@ -609,7 +654,10 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         for (int t = 0; t < 5; ++t) {
             if (PtIn(TabRect(static_cast<Tab>(t)), x, y)) {
-                if (activeTab_ != static_cast<Tab>(t)) aiModelCombo_.Close();
+                if (activeTab_ != static_cast<Tab>(t)) {
+                    aiModelCombo_.Close();
+                    themeCombo_.Close();
+                }
                 activeTab_ = static_cast<Tab>(t);
                 UpdateControlVisibility();
                 InvalidateRect(hwnd_, nullptr, FALSE);
@@ -649,6 +697,10 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 }
             }
+            if (themeCombo_.HitField(OtherThemeComboRect(), x, y)) {
+                themeCombo_.Toggle(OtherThemeComboRect());
+                return 0;
+            }
         } else if (activeTab_ == Tab::AiApi) {
             if (PtIn(AiCheckboxRect(), x, y)) {
                 ToggleCheckbox(Tab::AiApi, 0);
@@ -676,6 +728,14 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 aiModelCombo_.Close();
             }
         }
+        if (themeCombo_.IsOpen()) {
+            POINT screenPt{x, y};
+            ClientToScreen(hwnd_, &screenPt);
+            if (!themeCombo_.HitPopupScreen(screenPt.x, screenPt.y)
+                && !themeCombo_.HitField(OtherThemeComboRect(), x, y)) {
+                themeCombo_.Close();
+            }
+        }
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -694,6 +754,8 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (hd != hoverAiDeleteModel_) { hoverAiDeleteModel_ = hd; needRedraw = true; }
         const bool hm = activeTab_ == Tab::AiApi && aiModelCombo_.HitField(AiModelComboRect(), x, y);
         if (hm != hoverAiModelCombo_) { hoverAiModelCombo_ = hm; needRedraw = true; }
+        const bool ht = activeTab_ == Tab::Other && themeCombo_.HitField(OtherThemeComboRect(), x, y);
+        if (ht != hoverThemeCombo_) { hoverThemeCombo_ = ht; needRedraw = true; }
         HWND ch = crosshairDrag_.HitButton(x, y, [this](HWND btn) {
             RECT rc{}; GetWindowRect(btn, &rc);
             POINT tl{rc.left, rc.top};
@@ -719,18 +781,61 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (settings_) working_ = *settings_;
         SyncControlsFromSettings();
         RefreshAiModelCombo();
+        RefreshThemeCombo();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     case WM_DESTROY:
+        outerShadow_.Detach();
         aiModelCombo_.Destroy();
+        themeCombo_.Destroy();
         g_activeSettingsDialogHwnd = nullptr;
         CleanupGdi();
-        done_ = true;
+        hwnd_ = nullptr;
         return 0;
     default:
         break;
     }
     return DefWindowProcW(hwnd_, msg, wp, lp);
+}
+
+void SettingsDialog::RecreateUiFonts() {
+    if (titleFont_) { DeleteObject(titleFont_); titleFont_ = nullptr; }
+    if (closeFont_) { DeleteObject(closeFont_); closeFont_ = nullptr; }
+    if (bodyFont_) { DeleteObject(bodyFont_); bodyFont_ = nullptr; }
+    if (tabFont_) { DeleteObject(tabFont_); tabFont_ = nullptr; }
+    if (smallFont_) { DeleteObject(smallFont_); smallFont_ = nullptr; }
+    if (aboutTitleFont_) { DeleteObject(aboutTitleFont_); aboutTitleFont_ = nullptr; }
+    titleFont_ = CreateFontW(UiFontHeight(26), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    closeFont_ = CreateFontW(UiFontHeight(36), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    bodyFont_ = CreateFontW(UiFontHeight(26), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    tabFont_ = CreateFontW(UiFontHeight(28), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    smallFont_ = CreateFontW(UiFontHeight(22), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    aboutTitleFont_ = CreateFontW(UiFontHeight(42), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        kUiFontQuality, DEFAULT_PITCH, L"Microsoft YaHei UI");
+}
+
+void SettingsDialog::RelayoutForScaleChange() {
+    if (!hwnd_) return;
+    RecreateUiFonts();
+    ApplyFont(hwnd_, bodyFont_);
+    aiModelCombo_.Init(hwnd_, bodyFont_);
+    themeCombo_.Init(hwnd_, bodyFont_);
+    UpdateInlineLayout();
+    UiResizeWindowClient(hwnd_, UiHomeWidth(), UiHomeHeight(), true);
+    PositionChildControls();
+    RedrawWindow(hwnd_, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 void SettingsDialog::CleanupGdi() {
@@ -745,19 +850,34 @@ void SettingsDialog::CleanupGdi() {
 
 bool SettingsDialog::PtIn(const RECT& rc, int x, int y) const { return StPtIn(rc, x, y); }
 bool SettingsDialog::HitClose(int x, int y) const { return PtIn(CloseRect(), x, y); }
-bool SettingsDialog::HitTitle(int x, int y) const { return y >= 0 && y < kTitleH && x < CloseRect().left; }
+bool SettingsDialog::HitTitle(int x, int y) const { return y >= 0 && y < SL(kTitleH) && x < CloseRect().left; }
 
-RECT SettingsDialog::CloseRect() const { return RECT{kDialogW - kCloseBtnW, 0, kDialogW, kTitleH}; }
+RECT SettingsDialog::CloseRect() const {
+    const int w = ClientW();
+    return RECT{w - SL(kCloseBtnW), 0, w, SL(kTitleH)};
+}
 RECT SettingsDialog::TabRect(Tab tab) const {
     const int idx = static_cast<int>(tab);
-    return RECT{idx * kTabW, kTitleH, (idx + 1) * kTabW, kContentTop};
+    const int tabW = DialogTabW(ClientW());
+    return RECT{idx * tabW, SL(kTitleH), (idx + 1) * tabW, DialogContentTop()};
 }
-RECT SettingsDialog::FooterRect() const { return RECT{0, kFooterTop, kDialogW, kDialogH}; }
-RECT SettingsDialog::RestoreLinkRect() const { return RECT{kMargin, kFooterTop + 8, kMargin + 180, kFooterTop + kFooterH - 8}; }
-RECT SettingsDialog::SaveBtnRect() const { return RECT{kDialogW - kMargin - 96, kFooterTop + 8, kDialogW - kMargin, kFooterTop + kFooterH - 8}; }
+RECT SettingsDialog::FooterRect() const {
+    const int w = ClientW();
+    const int h = ClientH();
+    return RECT{0, DialogFooterTop(h), w, h};
+}
+RECT SettingsDialog::RestoreLinkRect() const {
+    const int footerTop = DialogFooterTop(ClientH());
+    return RECT{SL(kMargin), footerTop + SL(8), SL(kMargin) + SL(180), footerTop + SL(kFooterH) - SL(8)};
+}
+RECT SettingsDialog::SaveBtnRect() const {
+    const int w = ClientW();
+    const int footerTop = DialogFooterTop(ClientH());
+    return RECT{w - SL(kMargin) - SL(96), footerTop + SL(8), w - SL(kMargin), footerTop + SL(kFooterH) - SL(8)};
+}
 RECT SettingsDialog::CheckUpgradeBtnRect() const {
     const RECT save = SaveBtnRect();
-    return RECT{save.left - 116, save.top, save.left - 12, save.bottom};
+    return RECT{save.left - SL(116), save.top, save.left - SL(12), save.bottom};
 }
 
 void SettingsDialog::SyncControlsFromSettings() {
@@ -802,6 +922,14 @@ void SettingsDialog::SyncSettingsFromControls() {
     working_.ai.temperature = ToDouble(editTemperature_, 0.3);
     working_.ai.maxTokens = ToInt(editMaxTokens_, 4096);
     working_.ai.maxTokens = std::clamp(working_.ai.maxTokens, 1, 393216);
+
+    const int themeSel = themeCombo_.SelectedIndex();
+    if (themeSel == quickscript::kCustomThemeComboIndex) {
+        working_.other.useCustomTheme = true;
+    } else if (themeSel > 0 && themeSel <= quickscript::kThemeCount) {
+        working_.other.useCustomTheme = false;
+        working_.other.themeId = themeSel - 1;
+    }
 }
 
 void SettingsDialog::UpdateControlVisibility() {
@@ -816,6 +944,8 @@ void SettingsDialog::UpdateControlVisibility() {
     const HWND aiCtrls[] = {editApiUrl_, editApiKey_, editModelName_,
         editTemperature_, editMaxTokens_};
     for (HWND e : aiCtrls) if (e) ShowWindow(e, aiTab ? SW_SHOW : SW_HIDE);
+    if (!aiTab && aiModelCombo_.IsOpen()) aiModelCombo_.Close();
+    if (activeTab_ != Tab::Other && themeCombo_.IsOpen()) themeCombo_.Close();
     if (clickTab || playbackTab || aiTab) PositionChildControls();
 }
 
@@ -823,36 +953,25 @@ void SettingsDialog::RestoreDefaults() {
     working_ = quickscript::DefaultAppSettings();
     SyncControlsFromSettings();
     RefreshAiModelCombo();
+    RefreshThemeCombo();
     UpdateControlVisibility();
 }
 
 void SettingsDialog::SaveAndClose() {
     SyncSettingsFromControls();
-    if (settings_) *settings_ = working_;
+    if (settings_) {
+        *settings_ = working_;
+        SaveAppSettings(*settings_);
+    }
     saved_ = true;
-    done_ = true;
+    SavedCallback cb = std::move(onSaved_);
+    onSaved_ = nullptr;
     DestroyWindow(hwnd_);
-}
-
-void SettingsDialog::FillGradientRect(HDC hdc, RECT rc, COLORREF start, COLORREF end, bool vertical) {
-    TRIVERTEX vertex[2]{};
-    vertex[0].x = rc.left; vertex[0].y = rc.top;
-    vertex[0].Red = static_cast<COLOR16>(GetRValue(start) << 8);
-    vertex[0].Green = static_cast<COLOR16>(GetGValue(start) << 8);
-    vertex[0].Blue = static_cast<COLOR16>(GetBValue(start) << 8);
-    vertex[0].Alpha = 0;
-    vertex[1].x = rc.right; vertex[1].y = rc.bottom;
-    vertex[1].Red = static_cast<COLOR16>(GetRValue(end) << 8);
-    vertex[1].Green = static_cast<COLOR16>(GetGValue(end) << 8);
-    vertex[1].Blue = static_cast<COLOR16>(GetBValue(end) << 8);
-    vertex[1].Alpha = 0;
-    GRADIENT_RECT gr{0, 1};
-    GradientFill(hdc, vertex, 2, &gr, 1, vertical ? GRADIENT_FILL_RECT_V : GRADIENT_FILL_RECT_H);
+    if (cb) cb();
 }
 
 void SettingsDialog::DrawSettingsTab(HDC hdc, const RECT& rc, Tab tab, const wchar_t* text) {
-    if (activeTab_ == tab) FillGradientRect(hdc, rc, RGB(59, 157, 92), RGB(44, 128, 75), true);
-    else FillRectColor(hdc, rc, kMainGreen);
+    if (activeTab_ == tab) FillRectColor(hdc, rc, kTabActiveGreen);
     SelectObject(hdc, tabFont_);
     DrawTextIn(hdc, text, rc, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
@@ -882,41 +1001,41 @@ void SettingsDialog::PaintClickTab(HDC hdc) {
     for (int i = 0; i < 5; ++i) {
         const RECT cb = ClickCheckboxRect(i);
         StDrawCheckbox(hdc, cb, checks[i]);
-        DrawTextIn(hdc, labels[i], RECT{cb.right + 10, cb.top, kDialogW - kMargin, cb.bottom},
+        DrawTextIn(hdc, labels[i], RECT{cb.right + SL(10), cb.top, ClientW() - SL(kMargin), cb.bottom},
             kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
-    const int jitterSubY = ClickRowY(2) + kSubLineOffset;
-    const int fixedSubY = ClickRowY(3) + kSubLineOffset;
+    const int jitterSubY = ClickRowY(2) + SL(kSubLineOffset);
+    const int fixedSubY = ClickRowY(3) + SL(kSubLineOffset);
     UpdateInlineLayout();
 
-    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.randomUnitX, ClickRowY(0), inlineLayout_.randomUnitX + 40, ClickRowY(0) + kCheckboxSize},
+    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.randomUnitX, ClickRowY(0), inlineLayout_.randomUnitX + SL(40), ClickRowY(0) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"秒(建议0.001~0.05)", RECT{inlineLayout_.pressReleaseUnitX, ClickRowY(1), kDialogW - kMargin, ClickRowY(1) + kCheckboxSize},
+    DrawTextIn(hdc, L"秒(建议0.001~0.05)", RECT{inlineLayout_.pressReleaseUnitX, ClickRowY(1), ClientW() - SL(kMargin), ClickRowY(1) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextIn(hdc, L"横坐标抖动(X)", RECT{kIndent, jitterSubY, inlineLayout_.jitterXEditX - kCoordEditGap, jitterSubY + kSubRowH},
+    DrawTextIn(hdc, L"横坐标抖动(X)", RECT{SL(kIndent), jitterSubY, inlineLayout_.jitterXEditX - SL(kCoordEditGap), jitterSubY + SL(kSubRowH)},
         c.enableCoordinateJitter ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.jitterXEditX + kSmallEditW + kCoordEditGap, jitterSubY,
-        inlineLayout_.jitterXEditX + kSmallEditW + kCoordEditGap + 44, jitterSubY + kSubRowH},
+    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.jitterXEditX + SL(kSmallEditW) + SL(kCoordEditGap), jitterSubY,
+        inlineLayout_.jitterXEditX + SL(kSmallEditW) + SL(kCoordEditGap) + SL(44), jitterSubY + SL(kSubRowH)},
         c.enableCoordinateJitter ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"纵坐标抖动(Y)", RECT{kJitterYGroupLeft, jitterSubY, inlineLayout_.jitterYEditX - kCoordEditGap, jitterSubY + kSubRowH},
+    DrawTextIn(hdc, L"纵坐标抖动(Y)", RECT{SL(kJitterYGroupLeft), jitterSubY, inlineLayout_.jitterYEditX - SL(kCoordEditGap), jitterSubY + SL(kSubRowH)},
         c.enableCoordinateJitter ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.jitterYEditX + kSmallEditW + kCoordEditGap, jitterSubY,
-        inlineLayout_.jitterYEditX + kSmallEditW + kCoordEditGap + 44, jitterSubY + kSubRowH},
+    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.jitterYEditX + SL(kSmallEditW) + SL(kCoordEditGap), jitterSubY,
+        inlineLayout_.jitterYEditX + SL(kSmallEditW) + SL(kCoordEditGap) + SL(44), jitterSubY + SL(kSubRowH)},
         c.enableCoordinateJitter ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextIn(hdc, L"横坐标(X)", RECT{kIndent, fixedSubY, inlineLayout_.fixedXEditX - kCoordEditGap, fixedSubY + kSubRowH},
+    DrawTextIn(hdc, L"横坐标(X)", RECT{SL(kIndent), fixedSubY, inlineLayout_.fixedXEditX - SL(kCoordEditGap), fixedSubY + SL(kSubRowH)},
         c.enableFixedCoordinates ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.fixedXEditX + kSmallEditW + kCoordEditGap, fixedSubY,
-        inlineLayout_.fixedXEditX + kSmallEditW + kCoordEditGap + 50, fixedSubY + kSubRowH},
+    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.fixedXEditX + SL(kSmallEditW) + SL(kCoordEditGap), fixedSubY,
+        inlineLayout_.fixedXEditX + SL(kSmallEditW) + SL(kCoordEditGap) + SL(50), fixedSubY + SL(kSubRowH)},
         c.enableFixedCoordinates ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"纵坐标(Y)", RECT{kFixedYGroupLeft, fixedSubY, inlineLayout_.fixedYEditX - kCoordEditGap, fixedSubY + kSubRowH},
+    DrawTextIn(hdc, L"纵坐标(Y)", RECT{SL(kFixedYGroupLeft), fixedSubY, inlineLayout_.fixedYEditX - SL(kCoordEditGap), fixedSubY + SL(kSubRowH)},
         c.enableFixedCoordinates ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.fixedYEditX + kSmallEditW + kCoordEditGap, fixedSubY,
-        inlineLayout_.fixedYEditX + kSmallEditW + kCoordEditGap + 50, fixedSubY + kSubRowH},
+    DrawTextIn(hdc, L"像素", RECT{inlineLayout_.fixedYEditX + SL(kSmallEditW) + SL(kCoordEditGap), fixedSubY,
+        inlineLayout_.fixedYEditX + SL(kSmallEditW) + SL(kCoordEditGap) + SL(50), fixedSubY + SL(kSubRowH)},
         c.enableFixedCoordinates ? kText : kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextIn(hdc, L"次后，自动停止。", RECT{inlineLayout_.clickLimitSuffixX, ClickRowY(4), kDialogW - kMargin, ClickRowY(4) + kCheckboxSize},
+    DrawTextIn(hdc, L"次后，自动停止。", RECT{inlineLayout_.clickLimitSuffixX, ClickRowY(4), ClientW() - SL(kMargin), ClickRowY(4) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -936,33 +1055,35 @@ void SettingsDialog::PaintPlaybackTab(HDC hdc) {
         StDrawCheckbox(hdc, cb, checked);
     }
 
-    const int sub0 = PlaybackRowY(0) + kSubLineOffset;
-    const int sub1 = PlaybackRowY(1) + kSubLineOffset;
-    const int hintY = PlaybackRowY(2) + kRowH + 8;
+    const int sub0 = PlaybackRowY(0) + SL(kSubLineOffset);
+    const int sub1 = PlaybackRowY(1) + SL(kSubLineOffset);
     UpdateInlineLayout();
 
-    DrawTextIn(hdc, L"启用回放次数", RECT{kLabelAfterCheck, PlaybackRowY(0), kDialogW - kMargin, PlaybackRowY(0) + kCheckboxSize},
+    DrawTextIn(hdc, L"启用回放次数", RECT{SL(kLabelAfterCheck), PlaybackRowY(0), ClientW() - SL(kMargin), PlaybackRowY(0) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"回放", RECT{kIndent, sub0, inlineLayout_.playbackCountEditX - kCoordEditGap, sub0 + kSubRowH}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"次后，自动停止(默认为0无限循环)", RECT{inlineLayout_.playbackCountSuffixX, sub0, kDialogW - kMargin, sub0 + kSubRowH},
+    DrawTextIn(hdc, L"回放", RECT{SL(kIndent), sub0, inlineLayout_.playbackCountEditX - SL(kCoordEditGap), sub0 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"次后，自动停止(默认为0无限循环)", RECT{inlineLayout_.playbackCountSuffixX, sub0, ClientW() - SL(kMargin), sub0 + SL(kSubRowH)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextIn(hdc, L"启用回放间隔(多次回放间的间隔)", RECT{kLabelAfterCheck, PlaybackRowY(1), kDialogW - kMargin, PlaybackRowY(1) + kCheckboxSize},
+    DrawTextIn(hdc, L"启用回放间隔(多次回放间的间隔)", RECT{SL(kLabelAfterCheck), PlaybackRowY(1), ClientW() - SL(kMargin), PlaybackRowY(1) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"最小间隔", RECT{kIndent, sub1, inlineLayout_.playbackMinEditX - kCoordEditGap, sub1 + kSubRowH}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.playbackMinUnitX, sub1, inlineLayout_.playbackMaxLabelX - kCoordEditGap, sub1 + kSubRowH}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"最大间隔", RECT{inlineLayout_.playbackMaxLabelX, sub1, inlineLayout_.playbackMaxEditX - kCoordEditGap, sub1 + kSubRowH}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.playbackMaxUnitX, sub1, kDialogW - kMargin, sub1 + kSubRowH}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"最小间隔", RECT{SL(kIndent), sub1, inlineLayout_.playbackMinEditX - SL(kCoordEditGap), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.playbackMinUnitX, sub1, inlineLayout_.playbackMaxLabelX - SL(kCoordEditGap), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"最大间隔", RECT{inlineLayout_.playbackMaxLabelX, sub1, inlineLayout_.playbackMaxEditX - SL(kCoordEditGap), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.playbackMaxUnitX, sub1, ClientW() - SL(kMargin), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextIn(hdc, L"启用/关闭宏调试信息输出窗口", RECT{kLabelAfterCheck, PlaybackRowY(2), 390, PlaybackRowY(2) + kCheckboxSize},
+    DrawTextIn(hdc, L"启用/关闭宏调试信息输出窗口", RECT{SL(kLabelAfterCheck), PlaybackRowY(2), SL(390), PlaybackRowY(2) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"自动输出宏关键函数调试信息", RECT{438, PlaybackRowY(2), kDialogW - kMargin, PlaybackRowY(2) + kCheckboxSize},
+    DrawTextIn(hdc, L"自动输出宏关键函数调试信息", RECT{SL(438), PlaybackRowY(2), ClientW() - SL(kMargin), PlaybackRowY(2) + SL(kCheckboxSize)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(hdc, smallFont_);
+    const int hintTop = PlaybackRowY(2) + SL(kRowH) + SL(8);
     DrawTextIn(hdc,
-        L"*点击上方勾选框可关闭调试信息输出窗口，可也点击标题栏激活窗口后，按Ctrl+C(有光标时需要按两次)或Ctrl+Break关闭；其他方式关闭将导致鼠大侠退出。",
-        RECT{kMargin, hintY, kDialogW - kMargin, hintY + 64}, kHint, DT_LEFT | DT_WORDBREAK);
+        L"相对鼠标回放使用 SendInput（回放时临时关闭鼠标加速以贴近录制值）。"
+        L"部分仅接受 Raw Input 的游戏可能仍与真鼠标手感有差异。",
+        RECT{SL(kMargin), hintTop, ClientW() - SL(kMargin), hintTop + SL(48)},
+        kHint, DT_LEFT | DT_TOP | DT_WORDBREAK);
 }
 
 void SettingsDialog::PaintOtherTab(HDC hdc) {
@@ -976,22 +1097,15 @@ void SettingsDialog::PaintOtherTab(HDC hdc) {
     for (int i = 0; i < 4; ++i) {
         const RECT rc = OtherCheckboxRect(i);
         StDrawCheckbox(hdc, rc, checks[i]);
-        DrawTextIn(hdc, labels[i], RECT{rc.right + 10, rc.top, kDialogW - kMargin, rc.bottom},
+        DrawTextIn(hdc, labels[i], RECT{rc.right + SL(10), rc.top, ClientW() - SL(kMargin), rc.bottom},
             kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
+
+    DrawTextIn(hdc, L"界面主题", OtherThemeLabelRect(), kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    themeCombo_.DrawField(hdc, OtherThemeComboRect(), hoverThemeCombo_);
 }
 
 void SettingsDialog::PaintAboutTab(HDC hdc) {
-    HPEN pen = CreatePen(PS_SOLID, 2, kMainGreen);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    Ellipse(hdc, kMargin + 8, kContentTop + 24, kMargin + 72, kContentTop + 88);
-    MoveToEx(hdc, kMargin + 40, kContentTop + 18, nullptr);
-    LineTo(hdc, kMargin + 40, kContentTop + 50);
-    MoveToEx(hdc, kMargin + 24, kContentTop + 18, nullptr);
-    LineTo(hdc, kMargin + 56, kContentTop + 18);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-
     const auto& name = quickscript::AppBranding::AppDisplayName();
     const auto& version = quickscript::AppBranding::Version();
     const auto& tagline = quickscript::AppBranding::Tagline();
@@ -999,41 +1113,41 @@ void SettingsDialog::PaintAboutTab(HDC hdc) {
     const auto& contact = quickscript::AppBranding::ContactInfo();
     const auto& qq = quickscript::AppBranding::QqGroup();
     SelectObject(hdc, aboutTitleFont_);
-    DrawTextIn(hdc, name, RECT{kMargin + 88, kContentTop + 20, 400, kContentTop + 72},
+    DrawTextIn(hdc, name, RECT{SL(kMargin) + SL(8), DialogContentTop() + SL(20), SL(kMargin) + SL(200), DialogContentTop() + SL(72)},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, bodyFont_);
-    DrawTextIn(hdc, version, RECT{kMargin + 220, kContentTop + 36, 400, kContentTop + 68},
+    DrawTextIn(hdc, version, RECT{SL(kMargin) + SL(136), DialogContentTop() + SL(36), SL(400), DialogContentTop() + SL(68)},
         kMainGreen, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, smallFont_);
-    DrawTextIn(hdc, tagline, RECT{kMargin + 88, kContentTop + 76, 500, kContentTop + 100},
+    DrawTextIn(hdc, tagline, RECT{SL(kMargin) + SL(8), DialogContentTop() + SL(76), SL(500), DialogContentTop() + SL(100)},
         kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    const RECT infoBox{kMargin, kContentTop + 120, kDialogW - kMargin, kContentTop + 260};
+    const RECT infoBox{SL(kMargin), DialogContentTop() + SL(120), ClientW() - SL(kMargin), DialogContentTop() + SL(260)};
     DrawBorderRect(hdc, infoBox, kComboBorderGray);
     SelectObject(hdc, bodyFont_);
 
-    const int rowH = 40;
-    const int valueLeft = infoBox.left + 120;
+    const int rowH = SL(40);
+    const int valueLeft = infoBox.left + SL(120);
     const COLORREF linkColor = RGB(0, 102, 204);
 
-    DrawTextIn(hdc, L"官网地址：", RECT{infoBox.left + 16, infoBox.top + 16, valueLeft, infoBox.top + 16 + rowH},
+    DrawTextIn(hdc, L"官网地址：", RECT{infoBox.left + SL(16), infoBox.top + SL(16), valueLeft, infoBox.top + SL(16) + rowH},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     if (!website.empty()) {
-        DrawTextIn(hdc, website, RECT{valueLeft, infoBox.top + 16, infoBox.right - 16, infoBox.top + 16 + rowH},
+        DrawTextIn(hdc, website, RECT{valueLeft, infoBox.top + SL(16), infoBox.right - SL(16), infoBox.top + SL(16) + rowH},
             linkColor, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
-    DrawTextIn(hdc, L"联系方式：", RECT{infoBox.left + 16, infoBox.top + 16 + rowH, valueLeft, infoBox.top + 16 + rowH * 2},
+    DrawTextIn(hdc, L"联系方式：", RECT{infoBox.left + SL(16), infoBox.top + SL(16) + rowH, valueLeft, infoBox.top + SL(16) + rowH * 2},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     if (!contact.empty()) {
-        DrawTextIn(hdc, contact, RECT{valueLeft, infoBox.top + 16 + rowH, infoBox.right - 16, infoBox.top + 16 + rowH * 2},
+        DrawTextIn(hdc, contact, RECT{valueLeft, infoBox.top + SL(16) + rowH, infoBox.right - SL(16), infoBox.top + SL(16) + rowH * 2},
             linkColor, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
-    DrawTextIn(hdc, L"QQ交流群：", RECT{infoBox.left + 16, infoBox.top + 16 + rowH * 2, valueLeft, infoBox.top + 16 + rowH * 3},
+    DrawTextIn(hdc, L"QQ交流群：", RECT{infoBox.left + SL(16), infoBox.top + SL(16) + rowH * 2, valueLeft, infoBox.top + SL(16) + rowH * 3},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     if (!qq.empty()) {
-        DrawTextIn(hdc, qq, RECT{valueLeft, infoBox.top + 16 + rowH * 2, infoBox.right - 16, infoBox.top + 16 + rowH * 3},
+        DrawTextIn(hdc, qq, RECT{valueLeft, infoBox.top + SL(16) + rowH * 2, infoBox.right - SL(16), infoBox.top + SL(16) + rowH * 3},
             linkColor, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 }
@@ -1042,15 +1156,14 @@ void SettingsDialog::PaintAiApiTab(HDC hdc) {
     const auto& ai = working_.ai;
     SelectObject(hdc, bodyFont_);
 
-    static constexpr int kAiTop = kContentTop + kContentPad;
-    static constexpr int kAiLabelX = kMargin;
-    static constexpr int kAiRowH = 48;
+    const int aiTop = DialogContentTop() + SL(kContentPad);
+    const int aiLabelX = SL(kMargin);
     UpdateInlineLayout();
 
     const RECT aiCb = AiCheckboxRect();
     StDrawCheckbox(hdc, aiCb, ai.enabled);
     DrawTextIn(hdc, L"启用 AI 脚本助手",
-        RECT{aiCb.right + 10, aiCb.top, AiModelComboRect().left - 8, aiCb.bottom},
+        RECT{aiCb.right + SL(10), aiCb.top, AiModelComboRect().left - SL(8), aiCb.bottom},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     StDrawGreenButton(hdc, bodyFont_, AiAddModelBtnRect(), L"添加模型", hoverAiAddModel_);
@@ -1059,7 +1172,7 @@ void SettingsDialog::PaintAiApiTab(HDC hdc) {
 
     const auto drawLabel = [&](int row, const wchar_t* label) {
         DrawTextIn(hdc, label,
-            RECT{kAiLabelX, kAiTop + kAiRowH * row, kAiLabelX + inlineLayout_.aiLabelW, kAiTop + kAiRowH * row + kAiRowH},
+            RECT{aiLabelX, aiTop + AiRowH() * row, aiLabelX + inlineLayout_.aiLabelW, aiTop + AiRowH() * row + AiRowH()},
             kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     };
 
@@ -1070,7 +1183,7 @@ void SettingsDialog::PaintAiApiTab(HDC hdc) {
     drawLabel(5, L"最大Token:");
 
     DrawTextIn(hdc, L"(0.0-2.0)",
-        RECT{inlineLayout_.aiTempHintX, kAiTop + kAiRowH * 4, kDialogW - kMargin, kAiTop + kAiRowH * 4 + kAiRowH},
+        RECT{inlineLayout_.aiTempHintX, aiTop + AiRowH() * 4, ClientW() - SL(kMargin), aiTop + AiRowH() * 4 + AiRowH()},
         kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 底部提示
@@ -1078,7 +1191,7 @@ void SettingsDialog::PaintAiApiTab(HDC hdc) {
     DrawTextIn(hdc,
         L"请填 OpenAI 兼容地址（Chat Completions）。可填 base_url，如 https://api.openai.com/v1\n"
         L"不支持 Anthropic 原生 /v1/messages；DeepSeek 等 OpenAI 兼容服务同样可用。",
-        RECT{kMargin, kAiTop + kAiRowH * 6 + 4, kDialogW - kMargin, kFooterTop - 12},
+        RECT{SL(kMargin), aiTop + AiRowH() * 6 + SL(4), ClientW() - SL(kMargin), DialogFooterTop(ClientH()) - SL(12)},
         kHint, DT_LEFT | DT_WORDBREAK);
 }
 
@@ -1089,18 +1202,13 @@ void SettingsDialog::Paint() {
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
     HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    RenderBatchScope batch(mem);
     FillRectColor(mem, rc, kWhite);
-    FillRectColor(mem, RECT{0, 0, rc.right, kTitleH}, kMainGreen);
-    FillRectColor(mem, RECT{0, kTitleH, rc.right, kContentTop}, kMainGreen);
-    HPEN pen = CreatePen(PS_SOLID, 2, kWhite);
-    HGDIOBJ oldPen = SelectObject(mem, pen);
-    Ellipse(mem, 11, 10, 28, 28);
-    MoveToEx(mem, 19, 7, nullptr); LineTo(mem, 19, 15);
-    MoveToEx(mem, 12, 7, nullptr); LineTo(mem, 26, 7);
-    SelectObject(mem, oldPen); DeleteObject(pen);
+    FillRectColor(mem, RECT{0, 0, rc.right, SL(kTitleH)}, kNavStripGreen);
+    FillRectColor(mem, RECT{0, SL(kTitleH), rc.right, DialogContentTop()}, kNavStripGreen);
     SelectObject(mem, titleFont_);
-    DrawTextIn(mem, L"鼠大侠-设置", RECT{33, 0, 220, kTitleH}, kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    if (hoverClose_) FillAlphaRect(mem, CloseRect(), RGB(0, 0, 0), kCloseHoverAlpha);
+    DrawTextIn(mem, L"鼠大侠-设置", RECT{SL(16), 0, SL(220), SL(kTitleH)}, kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (hoverClose_) ::FillAlphaRect(mem, CloseRect(), RGB(0, 0, 0), kCloseHoverAlpha);
     SelectObject(mem, closeFont_);
     DrawTextIn(mem, L"×", CloseRect(), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     DrawSettingsTab(mem, TabRect(Tab::Click), Tab::Click, L"点击设置");
@@ -1125,6 +1233,7 @@ void SettingsDialog::Paint() {
         };
         for (HWND edit : edits) DrawEditOuterBorder(mem, hwnd_, edit);
     }
+    batch.End();
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);

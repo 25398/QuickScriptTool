@@ -46,6 +46,7 @@ void CrosshairDragController::Begin(const CrosshairDragBinding& binding) {
     if (!owner_ || !dragCursor_) return;
     mode_ = binding.mode;
     targetEdit_ = binding.targetEdit;
+    onWindowTarget_ = binding.onWindowTarget;
     active_ = true;
     savedCursor_ = SetClassLongPtrW(owner_, GCLP_HCURSOR, reinterpret_cast<LONG_PTR>(dragCursor_));
     SetCursor(dragCursor_);
@@ -64,6 +65,7 @@ void CrosshairDragController::End() {
     active_ = false;
     mode_ = CrosshairDragMode::Coordinates;
     targetEdit_ = nullptr;
+    onWindowTarget_ = nullptr;
     InvalidateButtons();
 }
 
@@ -88,9 +90,15 @@ bool CrosshairDragController::HandleMessage(UINT msg, WPARAM wp, LPARAM lp,
     case WM_LBUTTONDOWN:
         return true;
     case WM_LBUTTONUP: {
-        if (mode_ == CrosshairDragMode::ProgramPath) {
-            POINT pt{};
-            GetCursorPos(&pt);
+        POINT pt{};
+        GetCursorPos(&pt);
+        if (mode_ == CrosshairDragMode::WindowTarget) {
+            const WindowInfoFromPoint info = GetWindowInfoFromPoint(pt.x, pt.y);
+            if (onWindowTarget_) onWindowTarget_(info);
+            if (!info.processPath.empty() && targetEdit_) {
+                SetWindowTextW(targetEdit_, info.processPath.c_str());
+            }
+        } else if (mode_ == CrosshairDragMode::ProgramPath) {
             const std::wstring path = GetProcessPathFromPoint(pt.x, pt.y);
             if (!path.empty()) {
                 if (onProgramPath) onProgramPath(path);

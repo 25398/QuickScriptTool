@@ -7,16 +7,20 @@
 #include <utility>
 #include <vector>
 
+#include "process_utils.h"
+
 /// 准星拖拽模式
 enum class CrosshairDragMode {
-    Coordinates,  ///< 获取屏幕坐标
-    ProgramPath,  ///< 获取窗口进程路径
+    Coordinates,   ///< 获取屏幕坐标
+    ProgramPath,   ///< 仅获取窗口进程路径（运行/关闭程序等）
+    WindowTarget,  ///< 绑定目标窗口：路径 + 标题 + 类名
 };
 
 /// 单个准星按钮绑定
 struct CrosshairDragBinding {
     CrosshairDragMode mode = CrosshairDragMode::Coordinates;
     HWND targetEdit = nullptr;
+    std::function<void(const WindowInfoFromPoint&)> onWindowTarget = nullptr;
 };
 
 /// 可复用的准星拖拽控制器（坐标拾取 / 程序路径查找）
@@ -52,5 +56,6 @@ private:
     bool active_ = false;
     CrosshairDragMode mode_ = CrosshairDragMode::Coordinates;
     HWND targetEdit_ = nullptr;
+    std::function<void(const WindowInfoFromPoint&)> onWindowTarget_;
     std::vector<std::pair<HWND, CrosshairDragBinding>> buttons_;
 };

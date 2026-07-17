@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "drawing.h"
+#include "render_context.h"
 #include "scheduled_task_ui.h"
 
 #include <windowsx.h>
@@ -329,16 +330,15 @@ LRESULT ScheduledDateTimePicker::Handle(UINT msg, WPARAM wp, LPARAM lp) {
 void ScheduledDateTimePicker::Paint() {
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hwnd_, &ps);
+    RenderBatchScope batch(hdc);
     RECT client{};
     GetClientRect(hwnd_, &client);
     FillRectColor(hdc, client, kWhite);
     DrawBorderRect(hdc, client, kComboPopupBorderGray);
 
     SelectObject(hdc, bodyFont_);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, kHint);
-    RECT hintRc{8, 8, kPickerW - 8, 36};
-    DrawTextW(hdc, L"滚轮或点击调整", -1, &hintRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"滚轮或点击调整", RECT{8, 8, kPickerW - 8, 36}, kHint,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     const int colCount = static_cast<int>(columns_.size());
     const int colW = ColWidth();
@@ -357,8 +357,8 @@ void ScheduledDateTimePicker::Paint() {
             wchar_t buf[32]{};
             swprintf_s(buf, L"%d%s", val, col.suffix.c_str());
             RECT rowRc{cx, top + r * kRowH, cx + colW, top + (r + 1) * kRowH};
-            SetTextColor(hdc, r == 2 ? kMainGreen : kText);
-            DrawTextW(hdc, buf, -1, &rowRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextIn(hdc, buf, rowRc, r == 2 ? kMainGreen : kText,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         if (c > 0) {
             HPEN pen = CreatePen(PS_SOLID, 1, kLineGreen);
@@ -372,5 +372,6 @@ void ScheduledDateTimePicker::Paint() {
 
     RECT okRc{8, kPickerH - 38, kPickerW - 8, kPickerH - 8};
     StDrawGreenButton(hdc, bodyFont_, okRc, L"确定", false, true);
+    batch.End();
     EndPaint(hwnd_, &ps);
 }

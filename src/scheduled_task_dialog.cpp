@@ -2,6 +2,7 @@
 
 #include "drawing.h"
 #include "modern_edit.h"
+#include "render_context.h"
 #include "scheduled_task_datetime_picker.h"
 #include "scheduled_task_ui.h"
 #include "taskbar_window.h"
@@ -73,10 +74,10 @@ void ScheduledTaskDialog::Show(HWND owner, ScheduledTaskScheduler& scheduler) {
     ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-定时任务");
     outerShadow_.Attach(hwnd_);
 
+    // 不 cloak 主窗：对话框小于主窗，cloak 会挖透明洞露出桌面/IDE。
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
-    ShowWindow(owner, SW_HIDE);
 
     MSG msg{};
     while (!done_ && GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -97,14 +98,10 @@ void ScheduledTaskDialog::Show(HWND owner, ScheduledTaskScheduler& scheduler) {
         SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         DestroyWindow(hwnd_);
     }
-
     StDiscardSpuriousInputAfterModal(owner);
     if (IsWindow(owner)) {
-        ShowWindow(owner, SW_SHOW);
-    }
-    StDiscardSpuriousInputAfterModal(owner);
-
-    if (IsWindow(owner)) {
+        RedrawWindow(owner, nullptr, nullptr,
+            RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         SetForegroundWindow(owner);
     }
 }
@@ -193,9 +190,9 @@ LRESULT ScheduledTaskDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SHOWWINDOW:
         if (!wp && view_ == View::Create) CloseAllPopups();
         return DefWindowProcW(hwnd_, msg, wp, lp);
-    // ── Enter size move (create view popup management) ────────
+    // ── Enter size move：保持弹层打开并在后续 MOVE 中跟锚点同步 ──
     case WM_ENTERSIZEMOVE:
-        if (view_ == View::Create) CloseAllPopups();
+        if (view_ == View::Create) SyncPopups();
         return 0;
     // ── Size (create view popup management) ───────────────────
     case WM_SIZE:
@@ -568,6 +565,7 @@ void ScheduledTaskDialog::Paint() {
     HDC hdc = CreateCompatibleDC(screenDc);
     HBITMAP bmp = CreateCompatibleBitmap(screenDc, dw, kDialogH);
     HGDIOBJ oldBmp = SelectObject(hdc, bmp);
+    RenderBatchScope batch(hdc);
     FillRectColor(hdc, RECT{0, 0, dw, kDialogH}, kWhite);
 
     if (view_ == View::List) {
@@ -576,6 +574,7 @@ void ScheduledTaskDialog::Paint() {
         PaintCreate(hdc);
     }
 
+    batch.End();
     BitBlt(windowDc, 0, 0, dw, kDialogH, hdc, 0, 0, SRCCOPY);
     SelectObject(hdc, oldBmp);
     DeleteObject(bmp);
@@ -591,19 +590,15 @@ void ScheduledTaskDialog::PaintList(HDC hdc) {
         L"鼠大侠-定时任务", hoverClose_, RECT{dw - kCloseBtnW, 0, dw, kTitleH});
 
     SelectObject(hdc, listFont_);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, kText);
     RECT listLabel{kMargin, kTitleH + 10, 120, kTitleH + kToolbarH};
-    DrawTextW(hdc, L"任务列表", -1, &listLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"任务列表", listLabel, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     StDrawCheckbox(hdc, DisableAllCheckboxRect(), scheduler_->GlobalDisabled());
-    SetTextColor(hdc, kText);
     RECT disableLabel{156, kTitleH + 8, 300, kTitleH + kToolbarH};
-    DrawTextW(hdc, L"禁用所有任务", -1, &disableLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"禁用所有任务", disableLabel, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    SetTextColor(hdc, kOrange);
     RECT pauseHint = PauseHintRect();
-    DrawTextW(hdc, L"任务编辑中，任务调度已暂停", -1, &pauseHint,
+    DrawTextIn(hdc, L"任务编辑中，任务调度已暂停", pauseHint, kOrange,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     StDrawGreenButton(hdc, listFont_, CreateBtnRect(), L"任务创建", hoverCreate_);

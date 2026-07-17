@@ -31,6 +31,8 @@ struct ImageMatchOptions {
     double scaleStep = 0.05;         // 缩放步长
     int maxMatches = 20;             // 最多返回匹配数
     double maxOverlap = 0.5;         // 最大重叠比例 (NMS 参数)
+    bool crossResolutionMatch = false; // 跨分辨率：放宽候选阈值
+    bool disablePyramid = false;       // 固定尺度时禁用金字塔（位置更准、更快）
 };
 
 // 图像匹配输出 (多结果)
@@ -38,6 +40,8 @@ struct ImageMatchOutput {
     bool found = false;                        // 是否有匹配
     int elapsedMs = 0;                         // 匹配耗时 (毫秒)
     std::vector<ImageMatchResult> matches;      // 匹配结果列表
+    double debugBestNccPercent = 0.0;          // NCC 峰值（含未过阈值的候选，调试用）
+    int debugRawCandidates = 0;                // 各引擎原始候选总数
 };
 
 // ── 位图加载/保存 ──────────────────────────────────────────────
@@ -80,6 +84,23 @@ inline ImageMatchResult NormalizeMatchVarResult(ImageMatchResult match, double t
         return ImageMatchResult{};
     }
     return match;
+}
+
+// 匹配区域几何中心（比 match.x/y 更可靠，避免多尺度匹配时中心偏移）
+inline void FindImageMatchCenter(const ImageMatchResult& m, int& cx, int& cy) {
+    if (!m.found) {
+        cx = cy = 0;
+        return;
+    }
+    cx = m.topLeftX + (m.bottomRightX - m.topLeftX) / 2;
+    cy = m.topLeftY + (m.bottomRightY - m.topLeftY) / 2;
+}
+
+inline void FindImageClickPoint(const ImageMatchResult& m, int offsetX, int offsetY, int& tx, int& ty) {
+    int cx = 0, cy = 0;
+    FindImageMatchCenter(m, cx, cy);
+    tx = cx + offsetX;
+    ty = cy + offsetY;
 }
 
 // ── 辅助功能 ──────────────────────────────────────────────────

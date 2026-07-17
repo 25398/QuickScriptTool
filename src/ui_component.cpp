@@ -8,22 +8,23 @@
 #include "config.h"
 #include "controls.h"
 #include "modern_edit.h"
+#include "ui_scale.h"
 
 // ══════════════════════════════════════════════════════════════════
 // 缩放辅助函数 (基于 1024->1200 设计稿比例)
 // ══════════════════════════════════════════════════════════════════
 
 int ScaleX(int baseX) {
-    return MulDiv(baseX, kEditorWidth, kEditorBaseWidth);
+    return MulDiv(baseX, UiEditorWidth(), kEditorBaseWidth);
 }
 int ScaleY(int baseY) {
-    return MulDiv(baseY, kEditorHeight, kEditorBaseHeight);
+    return MulDiv(baseY, UiEditorHeight(), kEditorBaseHeight);
 }
 int ScaleW(int baseW) {
-    return MulDiv(baseW, kEditorWidth, kEditorBaseWidth);
+    return MulDiv(baseW, UiEditorWidth(), kEditorBaseWidth);
 }
 int ScaleH(int baseH) {
-    return MulDiv(baseH, kEditorHeight, kEditorBaseHeight);
+    return MulDiv(baseH, UiEditorHeight(), kEditorBaseHeight);
 }
 
 // ══════════════════════════════════════════════════════════════════

@@ -1,0 +1,40 @@
+#include <winver.h>
+
+#ifdef APSTUDIO_INVOKED
+#error this file is not editable by App Studio
+#endif
+
+#ifndef VS_VERSION_INFO
+#define VS_VERSION_INFO 1
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "QuickScriptTool"
+            VALUE "FileDescription", "QuickScriptTool module self-test (unit tests, no input injection)"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "QstModuleSelfTest"
+            VALUE "LegalCopyright", "Copyright (C) QuickScriptTool"
+            VALUE "OriginalFilename", "QstRecorderLogicTest.exe"
+            VALUE "ProductName", "QuickScriptTool SelfTest"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
+IDI_APPICON ICON "app_icon.ico"

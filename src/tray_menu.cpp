@@ -51,11 +51,12 @@ TrayMenuAction TrayMenu::Show(HWND owner, POINT screenPt) {
     }
 
     ClampMenuPosition(screenPt, kMenuW, kMenuH);
+    // 不以 owner 为父窗：模态期间 owner 若被 Disable，子菜单会一起禁用导致托盘右键无响应
     dialog.hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         cls, L"", WS_POPUP,
         screenPt.x, screenPt.y, kMenuW, kMenuH,
-        owner, nullptr, GetModuleHandleW(nullptr), &dialog);
+        nullptr, nullptr, GetModuleHandleW(nullptr), &dialog);
     if (!dialog.hwnd_) return TrayMenuAction::None;
 
     ShowWindow(dialog.hwnd_, SW_SHOW);
@@ -109,13 +110,14 @@ LRESULT TrayMenu::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_ACTIVATE:
+        // 失活关闭不要清掉已经点选的「退出」结果（避免点退出时先失活导致退出丢失）。
         if (LOWORD(wp) == WA_INACTIVE) {
             PostMessageW(hwnd_, kDeactivateCloseMsg, 0, 0);
             return 0;
         }
         return 0;
     case kDeactivateCloseMsg:
-        Close(TrayMenuAction::None);
+        if (result_ == TrayMenuAction::None) Close(TrayMenuAction::None);
         return 0;
     case WM_MOUSEMOVE: {
         TrackMouseLeave();
@@ -134,13 +136,20 @@ LRESULT TrayMenu::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd_, nullptr, FALSE);
         }
         return 0;
-    case WM_LBUTTONDOWN: {
+    case WM_LBUTTONUP: {
+        // 用 UP 而不是 DOWN：避免按下瞬间菜单失活把「退出」吞成 None。
         const int x = GET_X_LPARAM(lp);
         const int y = GET_Y_LPARAM(lp);
         const int hit = HitItem(x, y);
-        if (hit == static_cast<int>(Item::ShowWindow)) Close(TrayMenuAction::ShowWindow);
-        else if (hit == static_cast<int>(Item::Exit)) Close(TrayMenuAction::Exit);
-        else Close(TrayMenuAction::None);
+        if (hit == static_cast<int>(Item::ShowWindow)) {
+            result_ = TrayMenuAction::ShowWindow;
+            Close(TrayMenuAction::ShowWindow);
+        } else if (hit == static_cast<int>(Item::Exit)) {
+            result_ = TrayMenuAction::Exit;
+            Close(TrayMenuAction::Exit);
+        } else {
+            Close(TrayMenuAction::None);
+        }
         return 0;
     }
     case WM_PAINT: {
@@ -182,7 +191,12 @@ void TrayMenu::TrackMouseLeave() {
 }
 
 void TrayMenu::Close(TrayMenuAction action) {
-    if (result_ == TrayMenuAction::None) result_ = action;
+    // 已选定「退出/显示」时不允许被失活关闭覆盖成 None。
+    if (result_ == TrayMenuAction::None) {
+        result_ = action;
+    } else if (action != TrayMenuAction::None) {
+        result_ = action;
+    }
     if (IsWindow(hwnd_)) DestroyWindow(hwnd_);
     else done_ = true;
 }

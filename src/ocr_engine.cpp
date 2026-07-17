@@ -863,6 +863,71 @@ OcrEngineOutput RunOcrOnScreenRegion(
     return output;
 }
 
+OcrEngineOutput RunOcrOnBitmap(HBITMAP bmp, int coordOffsetX, int coordOffsetY, bool digitsOnly) {
+    OcrEngineOutput output;
+    if (!bmp) {
+        output.error = L"无法截取识别区域";
+        return output;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const std::wstring imagePath = TempOcrImagePath();
+    if (!SaveBitmapToFile(bmp, imagePath)) {
+        output.error = L"无法保存临时截图";
+        return output;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ocrSession.mu);
+        if (g_ocrSession.process) {
+            std::string jsonOut;
+            std::wstring sessionError;
+            if (SessionRequestLocked(g_ocrSession, imagePath, digitsOnly, jsonOut, sessionError)) {
+                output = ParseOcrJson(jsonOut);
+            } else {
+                output.error = sessionError.empty() ? L"OCR 服务请求失败" : sessionError;
+            }
+        } else if (g_ocrSession.refCount > 0) {
+            output.error = L"OCR 服务不可用";
+        } else {
+            output = RunOcrOnImagePathOneShot(imagePath, digitsOnly);
+        }
+    }
+    DeleteFileW(imagePath.c_str());
+
+    const auto elapsedMs = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    if (!output.success) {
+        if (output.error.empty()) output.error = L"文字识别失败";
+        output.elapsedMs = elapsedMs;
+        return output;
+    }
+
+    BITMAP bm{};
+    int cropW = 1;
+    int cropH = 1;
+    if (GetObject(bmp, sizeof(bm), &bm)) {
+        cropW = std::max(1, static_cast<int>(bm.bmWidth));
+        cropH = std::max(1, static_cast<int>(bm.bmHeight));
+    }
+    for (auto& line : output.lines) {
+        if (digitsOnly && (line.x2 <= line.x1 || line.y2 <= line.y1)) {
+            line.x1 = 0;
+            line.y1 = 0;
+            line.x2 = cropW;
+            line.y2 = cropH;
+        }
+        line.x1 += coordOffsetX;
+        line.y1 += coordOffsetY;
+        line.x2 += coordOffsetX;
+        line.y2 += coordOffsetY;
+    }
+
+    output.elapsedMs = elapsedMs;
+    return output;
+}
+
 std::wstring ConcatOcrLines(const OcrEngineOutput& output) {
     std::wstring text;
     for (size_t i = 0; i < output.lines.size(); ++i) {

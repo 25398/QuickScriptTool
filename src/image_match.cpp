@@ -210,6 +210,25 @@ HBITMAP CaptureScreenRegion(int x1, int y1, int x2, int y2) {
 }
 
 void GetVirtualScreenRect(int& x, int& y, int& w, int& h) {
+    struct Ctx { RECT r{}; bool any = false; };
+    Ctx ctx;
+    EnumDisplayMonitors(nullptr, nullptr,
+        [](HMONITOR hm, HDC, LPRECT, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            MONITORINFO mi{ sizeof(mi) };
+            if (!GetMonitorInfoW(hm, &mi)) return TRUE;
+            if (!c->any) { c->r = mi.rcMonitor; c->any = true; }
+            else UnionRect(&c->r, &c->r, &mi.rcMonitor);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.any) {
+        x = ctx.r.left;
+        y = ctx.r.top;
+        w = ctx.r.right - ctx.r.left;
+        h = ctx.r.bottom - ctx.r.top;
+        return;
+    }
     x = GetSystemMetrics(SM_XVIRTUALSCREEN);
     y = GetSystemMetrics(SM_YVIRTUALSCREEN);
     w = GetSystemMetrics(SM_CXVIRTUALSCREEN);

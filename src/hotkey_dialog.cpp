@@ -2,6 +2,7 @@
 // UI 绘制沿用现有样式；消息泵、悬停与关闭流程参考定时任务对话框。
 #include "hotkey_dialog.h"
 #include "drawing.h"
+#include "render_context.h"
 #include "scheduled_task_ui.h"
 #include "taskbar_window.h"
 #include <windowsx.h>
@@ -258,6 +259,7 @@ void HotkeyCapture::InvalidateValueArea() {
 void HotkeyCapture::OnPaint() {
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hwnd_, &ps);
+    RenderBatchScope batch(hdc);
 
     RECT rc{};
     GetClientRect(hwnd_, &rc);
@@ -266,20 +268,15 @@ void HotkeyCapture::OnPaint() {
     RECT bottom{0, 155, rc.right, rc.bottom};
     FillRectColor(hdc, bottom, RGB(247, 247, 247));
 
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(150, 150, 150));
     SelectObject(hdc, font_);
     const wchar_t* prompt = (scriptHotkey_ || globalStartStop_)
         ? L"请直接在键盘上输入新的热键"
         : L"请直接在键盘上输入要点击的键（\n截屏键";
-    RECT promptRc{16, 16, 348, 74};
-    DrawTextW(hdc, prompt, -1, &promptRc, DT_LEFT);
+    DrawTextIn(hdc, prompt, RECT{16, 16, 348, 74}, RGB(150, 150, 150), DT_LEFT);
 
     SelectObject(hdc, valueFont_);
-    SetTextColor(hdc, RGB(80, 80, 80));
     const std::wstring val = current_.enabled ? current_.text : L"无";
-    RECT valRc = ValueRect();
-    DrawTextW(hdc, val.c_str(), -1, &valRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, val, ValueRect(), RGB(80, 80, 80), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     DrawBtn(hdc, OkRect(), L"确定", true, hoverOk_);
     DrawBtn(hdc, CancelRect(), L"取消", true, hoverCancel_);
@@ -288,36 +285,22 @@ void HotkeyCapture::OnPaint() {
         DrawBtn(hdc, DeleteRect(), L"删除热键", false, hoverDelete_);
     }
 
+    batch.End();
     EndPaint(hwnd_, &ps);
 }
 
 void HotkeyCapture::DrawBtn(HDC hdc, const RECT& rc, const wchar_t* text,
                             bool green, bool hover) {
-    COLORREF fill, border, txt;
+    COLORREF fill, txt;
     if (green) {
         fill = hover ? kButtonGreenHover : kButtonGreen;
-        border = fill;
         txt = kWhite;
     } else {
         fill = hover ? kGrayButtonHover : kGrayButton;
-        border = hover ? kGrayButtonHover : kGrayButtonBorder;
         txt = hover ? kGrayButtonText : RGB(140, 140, 140);
     }
 
-    HBRUSH brush = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, border);
-    HGDIOBJ oldBrush = SelectObject(hdc, brush);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 5, 5);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(brush);
-    DeleteObject(pen);
-
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, txt);
-    HGDIOBJ oldFont = SelectObject(hdc, font_);
-    DrawTextW(hdc, text, -1, const_cast<RECT*>(&rc),
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, oldFont);
+    FillRoundRectColor(hdc, rc, fill, 5);
+    SelectObject(hdc, font_);
+    DrawTextIn(hdc, text, rc, txt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
