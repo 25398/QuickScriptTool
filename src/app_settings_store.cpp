@@ -86,6 +86,10 @@ void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& o
     out.playSoundOnStart = ParseBoolField(obj, L"playSoundOnStart", out.playSoundOnStart);
     out.hideBottomRightTip = ParseBoolField(obj, L"hideBottomRightTip", out.hideBottomRightTip);
     out.closeToTray = ParseBoolField(obj, L"closeToTray", out.closeToTray);
+    out.autoStartOnBoot = ParseBoolField(obj, L"autoStartOnBoot", out.autoStartOnBoot);
+    out.resolveImeConflict = ParseBoolField(obj, L"resolveImeConflict", out.resolveImeConflict);
+    out.holdThresholdSeconds = ParseDoubleField(obj, L"holdThresholdSeconds", out.holdThresholdSeconds);
+    out.holdThresholdSeconds = NormalizeHoldThresholdSeconds(out.holdThresholdSeconds);
     out.themeId = ParseIntField(obj, L"themeId", out.themeId);
     out.themeId = std::clamp(out.themeId, 0, quickscript::kThemeCount - 1);
     out.useCustomTheme = ParseBoolField(obj, L"useCustomTheme", out.useCustomTheme);
@@ -197,6 +201,9 @@ void WriteOtherSettings(std::wofstream& file, const quickscript::OtherTabSetting
     file << L"    \"playSoundOnStart\": " << (s.playSoundOnStart ? L"true" : L"false") << L",\n";
     file << L"    \"hideBottomRightTip\": " << (s.hideBottomRightTip ? L"true" : L"false") << L",\n";
     file << L"    \"closeToTray\": " << (s.closeToTray ? L"true" : L"false") << L",\n";
+    file << L"    \"autoStartOnBoot\": " << (s.autoStartOnBoot ? L"true" : L"false") << L",\n";
+    file << L"    \"resolveImeConflict\": " << (s.resolveImeConflict ? L"true" : L"false") << L",\n";
+    file << L"    \"holdThresholdSeconds\": " << s.holdThresholdSeconds << L",\n";
     file << L"    \"themeId\": " << s.themeId << L",\n";
     file << L"    \"useCustomTheme\": " << (s.useCustomTheme ? L"true" : L"false") << L",\n";
     file << L"    \"customMainColor\": " << s.customMainColor << L",\n";

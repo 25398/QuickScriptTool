@@ -2,6 +2,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <unordered_set>
@@ -231,6 +232,23 @@ double ExtractNumber(const std::wstring& src,
     const auto end = src.find_first_of(L",}\n", colon + 1);
     try {
         return std::stod(Trim(src.substr(colon + 1, end - colon - 1)));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+bool ExtractBool(const std::wstring& src, const std::wstring& key, bool fallback) {
+    const auto pos = src.find(L"\"" + key + L"\"");
+    if (pos == std::wstring::npos) return fallback;
+    const auto colon = src.find(L':', pos);
+    if (colon == std::wstring::npos) return fallback;
+    size_t i = colon + 1;
+    while (i < src.size() && (src[i] == L' ' || src[i] == L'\t')) ++i;
+    if (i < src.size() && src.compare(i, 4, L"true") == 0) return true;
+    if (i < src.size() && src.compare(i, 5, L"false") == 0) return false;
+    const auto end = src.find_first_of(L",}\n", colon + 1);
+    try {
+        return std::stod(Trim(src.substr(colon + 1, end - colon - 1))) != 0.0;
     } catch (...) {
         return fallback;
     }
@@ -834,9 +852,77 @@ std::wstring HotkeyText(UINT modifiers, UINT vk) {
     return text;
 }
 
+std::wstring HotkeyText(UINT modifiers, UINT vk, bool holdMode) {
+    // 显示名仅键位；「按住/按」由黄条等上下文文案表达
+    (void)holdMode;
+    return HotkeyText(modifiers, vk);
+}
+
+double NormalizeHoldThresholdSeconds(double seconds) {
+    if (!(seconds > 0.0) || !std::isfinite(seconds)) return 0.2;
+    if (seconds > 60.0) return 60.0;
+    return seconds;
+}
+
+DWORD HoldThresholdMsFromSeconds(double seconds) {
+    const double sec = NormalizeHoldThresholdSeconds(seconds);
+    const double ms = sec * 1000.0 + 0.5;
+    if (ms < 1.0) return 1;
+    if (ms > 60000.0) return 60000;
+    return static_cast<DWORD>(ms);
+}
+
+std::wstring FormatHoldThresholdLabel(double seconds) {
+    const double sec = NormalizeHoldThresholdSeconds(seconds);
+    wchar_t buf[64]{};
+    swprintf_s(buf, L"%.4g", sec);
+    return buf;
+}
+
 std::wstring FormatDuration(double sec) {
     const int total = std::max(0, static_cast<int>(sec + 0.5));
     const int m = total / 60;
     const int s = total % 60;
     return std::to_wstring(m) + L"' " + std::to_wstring(s) + L"\"";
+}
+
+namespace {
+constexpr wchar_t kAutoStartRunKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kAutoStartValueName[] = L"鼠大侠";
+}
+
+bool SetAutoStartOnBoot(bool enabled) {
+    HKEY key = nullptr;
+    const LONG open = RegOpenKeyExW(HKEY_CURRENT_USER, kAutoStartRunKey, 0,
+        KEY_SET_VALUE | KEY_QUERY_VALUE, &key);
+    if (open != ERROR_SUCCESS || !key) return false;
+    bool ok = false;
+    if (enabled) {
+        wchar_t exePath[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+            const std::wstring cmd = L"\"" + std::wstring(exePath) + L"\"";
+            ok = RegSetValueExW(key, kAutoStartValueName, 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(cmd.c_str()),
+                static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+        }
+    } else {
+        const LONG del = RegDeleteValueW(key, kAutoStartValueName);
+        ok = (del == ERROR_SUCCESS || del == ERROR_FILE_NOT_FOUND);
+    }
+    RegCloseKey(key);
+    return ok;
+}
+
+bool IsAutoStartOnBootEnabled() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kAutoStartRunKey, 0, KEY_QUERY_VALUE, &key)
+        != ERROR_SUCCESS || !key) {
+        return false;
+    }
+    DWORD type = 0;
+    DWORD size = 0;
+    const LONG q = RegQueryValueExW(key, kAutoStartValueName, nullptr, &type, nullptr, &size);
+    RegCloseKey(key);
+    return q == ERROR_SUCCESS && type == REG_SZ && size > sizeof(wchar_t);
 }

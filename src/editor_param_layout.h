@@ -675,6 +675,7 @@ inline UILayout Loop() {
             UIComponent::EditorLabel(L"循环类型", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
+            // 目前仅「次数循环」生效；类型下拉预留扩展（条件/时长等）
             UIComponent::Combo(L"次数循环", EID_LoopTypeCombo, kPanelWidth, 21),
         }, 0, 0, 19)                               // y=244
         .AddRow({
@@ -683,7 +684,7 @@ inline UILayout Loop() {
             UIComponent::Edit(L"-1", EID_LoopCount, 54, 22),
         }, 0, 0, 6)                                // y=272
         .AddRow({
-            UIComponent::Hint(L"*提示:-1表示无限循环", kParamFieldWidth, 28),
+            UIComponent::Hint(L"*提示:-1表示无限循环；勾选下方可按变量解析次数", kParamFieldWidth, 40),
         }, 0, 0, 8)                                // y=308
         .AddRow({
             UIComponent::CheckBox(L"来自变量表达式", EID_LoopFromVar, 180, 25),
@@ -698,7 +699,7 @@ inline UILayout Loop() {
             UIComponent::FieldEdit(L"", EID_LoopVarName, kParamFieldWidth, kPanelSingleFieldH),
         }, 0, 0, 6)                                // y=432
         .AddRow({
-            UIComponent::Hint(L"*提示:可用于标识当前循环次数，或作为数据索引", kParamFieldWidth, 40),
+            UIComponent::Hint(L"*提示:记录当前第几次循环，可用于索引/条件判断", kParamFieldWidth, 40),
         });
 }
 
@@ -1047,7 +1048,7 @@ inline UILayout IfCondition() {
             UIComponent::Combo(L"并且(and)", EID_IfConnector, kPanelWidth, 21),
         }, 0, 0, 11)                               // y=378
         .AddRow({
-            UIComponent::Button(L"添加判断条件", EID_IfAddCondition, kPanelWidth, 28),
+            UIComponent::GreenButton(L"添加判断条件", EID_IfAddCondition, kPanelWidth, 28),
         }, 0, 0, 6)                                // y=412
         .AddRow({
             UIComponent::Label(L"判断条件:", -1, 80, 22),
@@ -1127,7 +1128,7 @@ inline UILayout RunProgramFile() {
             UIComponent::MultilineEdit(L"", EID_RunProgramPath, kPanelWidth, kPanelTextFieldH),
         }, 0, 0, 8)                                // y=304
         .AddRow({
-            UIComponent::Button(L"选择要启动的程序", EID_RunProgramBrowse, kPanelWidth, 28),
+            UIComponent::GreenButton(L"选择要启动的程序", EID_RunProgramBrowse, kPanelWidth, 28),
         }, 0, 0, 4)                                // y=336, label "或" at y=340
         .AddRow({
             UIComponent::Label(L"或", -1, 20, 22),
@@ -1216,7 +1217,7 @@ inline UILayout TimerRecord() {
             UIComponent::EditorLabel(L"计时器变量命名", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::MultilineEdit(L"", EID_TimerVarName, kPanelWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"", EID_TimerVarName, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::Hint(L"*提示: 记录从此动作到引用该变量时经过的秒数(向下取整); 同名变量会重置计时", kPanelWidth, 56),
@@ -1232,7 +1233,7 @@ inline UILayout GetCursorPos() {
             UIComponent::Label(L"变量命名", -1, 120, 25),
         }, 0, 0, 1)
         .AddRow({
-            UIComponent::MultilineEdit(L"", EID_CursorPosVarName, kParamFieldWidth, kPanelTextFieldH),
+            UIComponent::FieldEdit(L"", EID_CursorPosVarName, kParamFieldWidth, kPanelSingleFieldH),
         }, 0, 0, 6)
         .AddRow({
             UIComponent::Hint(

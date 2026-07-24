@@ -25,7 +25,7 @@ const wchar_t* kRefFormat = LR"(【脚本文件格式】
 
 顶层字段：
 
-  scriptName, recordTime, durationSeconds, hotkeyText, hotkeyVk, hotkeyModifiers,
+  scriptName, recordTime, durationSeconds, hotkeyText, hotkeyVk, hotkeyModifiers, hotkeyHold,
   coordMeta, windowMode, breakoutTimeSeconds, actions[]
 
 录制文件还可包含：
@@ -316,6 +316,9 @@ createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow
   windowMode.autoLaunchTarget     1=运行前自动启动目标程序
   windowMode.launchArgs           启动参数
   windowMode.allowForegroundInputFallback  后台输入失败时是否抢焦点（默认 0）
+  windowMode.fakeFocusEnabled              窗口模式(宏桌面)游戏假焦点实验开关（默认 0；进程注入，勿用于联机/反作弊；CDP 策略下忽略）
+  windowMode.inputStrategy                 auto | softMessage | cdp（Chrome/Edge 网页会自动兼容：必要时重启浏览器并恢复标签，用户无需手动开调试）
+  windowMode.cdpPort                       CDP 远程调试端口（默认 9222）
 
 示例（后台窗口模式）：
 
@@ -334,7 +337,10 @@ createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow
     "targetPickX": 0,
     "targetPickY": 0,
     "launchArgs": "",
-    "allowForegroundInputFallback": 0
+    "allowForegroundInputFallback": 0,
+    "fakeFocusEnabled": 0,
+    "inputStrategy": "auto",
+    "cdpPort": 9222
   }
 
 注意：

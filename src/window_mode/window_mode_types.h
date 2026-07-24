@@ -45,6 +45,13 @@ enum class WindowModeExecutionKind {
     BackgroundWindow, ///< 后台窗口模式：用户桌面上已打开的窗口
 };
 
+/// 窗口模式输入策略。
+enum class WindowModeInputStrategy {
+    Auto = 0,         ///< Chrome/Edge 类名 → CDP/扩展；其它 → softMessage
+    SoftMessage = 1,  ///< Win32 PostMessage / 假焦点
+    Cdp = 2,          ///< 配套扩展（优先）或 CDP
+};
+
 struct WindowModeScriptConfig {
     bool enabled = false;
     WindowModeExecutionKind executionKind = WindowModeExecutionKind::HiddenDesktop;
@@ -62,6 +69,11 @@ struct WindowModeScriptConfig {
     int targetPickX = 0;
     int targetPickY = 0;
     bool allowForegroundInputFallback = false;
+
+    /// 假焦点实验开关（进程注入）；CDP 策略下忽略。
+    bool fakeFocusEnabled = false;
+    WindowModeInputStrategy inputStrategy = WindowModeInputStrategy::Auto;
+    int cdpPort = 9222;
 };
 
 /// 「不选择窗口」「指定窗口类」：有目标路径时窗口不存在应自动启动。
@@ -72,6 +84,29 @@ inline bool ShouldAutoLaunchTarget(const WindowModeScriptConfig& config) {
         return true;
     }
     return config.autoLaunchTarget;
+}
+
+bool LooksLikeChromiumBrowserClass(const std::wstring& className);
+WindowModeInputStrategy ResolveInputStrategy(const WindowModeScriptConfig& config);
+void AnnotateInputStrategyForSave(WindowModeScriptConfig& config);
+std::wstring EnsureRemoteDebuggingLaunchArgs(const std::wstring& args, int port);
+
+inline bool UsesCdpInput(const WindowModeScriptConfig& config) {
+    return config.enabled
+        && ResolveInputStrategy(config) == WindowModeInputStrategy::Cdp;
+}
+
+/// 假焦点仅在「窗口模式 + 开关 + 非 CDP」下启用；后台窗口模式本阶段不启用。
+inline bool UsesFakeFocus(const WindowModeScriptConfig& config) {
+    return config.enabled
+        && config.fakeFocusEnabled
+        && config.executionKind == WindowModeExecutionKind::HiddenDesktop
+        && !UsesCdpInput(config);
+}
+
+/// CDP：绑窗后由 Park 自行 Minimize→Move 宏桌面（勿再二次最小化）；假焦点保持可见。
+inline bool ShouldMinimizeTargetAfterBind(const WindowModeScriptConfig& config) {
+    return !UsesFakeFocus(config) && !UsesCdpInput(config);
 }
 
 struct WindowModeSessionState {

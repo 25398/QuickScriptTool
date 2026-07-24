@@ -1,6 +1,67 @@
 #include "window_mode_types.h"
 
+#include <algorithm>
+#include <cctype>
+
 namespace windowmode {
+
+namespace {
+
+std::wstring ToLowerCopy(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+    return value;
+}
+
+}  // namespace
+
+bool LooksLikeChromiumBrowserClass(const std::wstring& className) {
+    if (className.empty()) return false;
+    const std::wstring lower = ToLowerCopy(className);
+    // Chrome / Edge / Chromium 顶层与常见子类。
+    if (lower.find(L"chrome_widgetwin") != std::wstring::npos) return true;
+    if (lower.find(L"chrome_renderwidgethosthwnd") != std::wstring::npos) return true;
+    if (lower.rfind(L"chrome_", 0) == 0) return true;
+    return false;
+}
+
+WindowModeInputStrategy ResolveInputStrategy(const WindowModeScriptConfig& config) {
+    if (config.inputStrategy == WindowModeInputStrategy::Cdp) {
+        return WindowModeInputStrategy::Cdp;
+    }
+    if (config.inputStrategy == WindowModeInputStrategy::SoftMessage) {
+        return WindowModeInputStrategy::SoftMessage;
+    }
+    // Auto
+    if (LooksLikeChromiumBrowserClass(config.windowClassName)
+        || LooksLikeChromiumBrowserClass(config.childWindowClassName)) {
+        return WindowModeInputStrategy::Cdp;
+    }
+    return WindowModeInputStrategy::SoftMessage;
+}
+
+void AnnotateInputStrategyForSave(WindowModeScriptConfig& config) {
+    if (config.inputStrategy != WindowModeInputStrategy::Auto) return;
+    if (LooksLikeChromiumBrowserClass(config.windowClassName)
+        || LooksLikeChromiumBrowserClass(config.childWindowClassName)) {
+        config.inputStrategy = WindowModeInputStrategy::Cdp;
+        if (config.cdpPort <= 0) config.cdpPort = 9222;
+    }
+}
+
+std::wstring EnsureRemoteDebuggingLaunchArgs(const std::wstring& args, int port) {
+    if (port <= 0) port = 9222;
+    const std::wstring needle = L"--remote-debugging-port=";
+    std::wstring lower = ToLowerCopy(args);
+    if (lower.find(ToLowerCopy(needle)) != std::wstring::npos) {
+        return args;
+    }
+    std::wstring out = args;
+    if (!out.empty() && out.back() != L' ') out.push_back(L' ');
+    out += needle;
+    out += std::to_wstring(port);
+    return out;
+}
 
 const wchar_t* HealthToDisplayText(WindowModeHealth health) {
     switch (health) {

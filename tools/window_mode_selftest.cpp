@@ -10,11 +10,16 @@
 #include "selftest_harness.h"
 
 #include "window_mode/window_mode_executor.h"
+#include "window_mode/window_mode_json.h"
+#include "window_mode/window_mode_types.h"
 #include "window_mode/window_target.h"
 #include "window_mode/background_window_input.h"
+#include "window_mode/ext_bridge/ext_bridge_server.h"
+#include "window_mode/fake_focus/fake_focus_soft_input_host.h"
 #include "action_utils.h"
 
 #include <shellapi.h>
+#include <dwmapi.h>
 
 #include <atomic>
 #include <chrono>
@@ -55,6 +60,30 @@ const selftest::CaseInfo kCases[] = {
         L"WindowsApps Notepad path + UseEditorWindowClass binds RichEdit child"},
     {L"macro_editor_open_named_doc", L"macro",
         L"UseEditorWindowClass opens specific document from window title + searchDir"},
+    {L"fake_focus_json_roundtrip", L"default",
+        L"fakeFocusEnabled JSON parse/write defaults false and roundtrips"},
+    {L"input_strategy_cdp_auto", L"default",
+        L"Chrome_WidgetWin class → CDP strategy on save/resolve; game exe stays softMessage"},
+    {L"ext_bridge_config_parse", L"default",
+        L"ParseExtBridgeConfigJson accepts port/token; rejects bad JSON"},
+    {L"fake_focus_minimize_gate", L"default",
+        L"UsesFakeFocus only for HiddenDesktop; CDP keeps restored (no minimize-after-bind)"},
+    {L"soft_message_exe_gates", L"default",
+        L"Unity/game exe: softMessage, minimize-after-bind; fakeFocus keeps restored (no CDP prepare)"},
+    {L"restore_prefer_maximized", L"default",
+        L"RestoreMinimizedQuietPreferMax restores Zoomed after minimize; normal stay unzoomed"},
+    {L"fake_focus_hook_local", L"default",
+        L"Load FakeFocus64/32 locally: GetForegroundWindow returns target; uninstall restores"},
+    {L"fake_focus_soft_input", L"default",
+        L"Phase2: soft shared memory drives GetCursorPos/GetAsyncKeyState/GetKeyboardState"},
+    {L"anjuzhen_script_wm_config", L"default",
+        L"Parse build/*/scripts/安居镇.json windowMode: fakeFocus + Chrome child class"},
+    {L"invisible_child_class_bind", L"default",
+        L"FindChildWindowByClass finds WS_CHILD without WS_VISIBLE (macro-desktop case)"},
+    {L"browser_render_skips_d3d", L"default",
+        L"FindBrowserRenderWidget ignores Intermediate D3D; prefers RenderWidget or null"},
+    {L"cdp_park_expandable", L"default",
+        L"PrepareMacroDesktopForCdpBind: Move macro desk; no Cloak; no offscreen"},
 };
 
 void PrintHelp() {
@@ -484,6 +513,634 @@ void TestMacroDesktopSmoke() {
     }
 }
 
+void TestFakeFocusJsonRoundtrip() {
+    const std::wstring rawMissing = L"{\"enabled\":1,\"executionKind\":\"hiddenDesktop\"}";
+    const auto cfgMissing = windowmode::ParseWindowModeConfigObject(rawMissing);
+    const bool missingOk = !cfgMissing.fakeFocusEnabled;
+
+    const std::wstring rawOn =
+        L"{\"enabled\":1,\"executionKind\":\"hiddenDesktop\",\"fakeFocusEnabled\":1}";
+    const auto cfgOn = windowmode::ParseWindowModeConfigObject(rawOn);
+    const bool onOk = cfgOn.fakeFocusEnabled;
+
+    std::wstring written;
+    windowmode::WindowModeScriptConfig cfg{};
+    cfg.enabled = true;
+    cfg.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    cfg.fakeFocusEnabled = true;
+    windowmode::WriteWindowModeJson(written, cfg, false);
+    const bool writeOk = written.find(L"\"fakeFocusEnabled\": 1") != std::wstring::npos;
+    const auto round = windowmode::ParseWindowModeJson(written);
+    const bool roundOk = round.fakeFocusEnabled;
+
+    // 关闭窗口模式后写盘/读盘不得保留路径与类名。
+    windowmode::WindowModeScriptConfig disabled = cfg;
+    disabled.enabled = false;
+    disabled.targetExePath = L"C:\\\\Games\\\\a.exe";
+    disabled.windowClassName = L"Chrome_WidgetWin_1";
+    disabled.windowName = L"stale";
+    std::wstring writtenOff;
+    windowmode::WriteWindowModeJson(writtenOff, disabled, false);
+    const auto parsedOff = windowmode::ParseWindowModeJson(writtenOff);
+    const bool clearOk = !parsedOff.enabled
+        && parsedOff.targetExePath.empty()
+        && parsedOff.windowClassName.empty()
+        && parsedOff.windowName.empty()
+        && writtenOff.find(L"C:\\\\Games") == std::wstring::npos;
+
+    const std::wstring rawStale =
+        L"{\"enabled\":0,\"targetExePath\":\"C:\\\\old.exe\",\"windowClassName\":\"X\"}";
+    const auto stale = windowmode::ParseWindowModeConfigObject(rawStale);
+    const bool loadClearOk = !stale.enabled
+        && stale.targetExePath.empty()
+        && stale.windowClassName.empty();
+
+    const bool ok = missingOk && onOk && writeOk && roundOk && clearOk && loadClearOk;
+    Emit(L"fake_focus_json_roundtrip", ok,
+        ok ? L"" : L"fakeFocusEnabled JSON roundtrip / disabled-clear failed");
+}
+
+void TestInputStrategyCdpAuto() {
+    windowmode::WindowModeScriptConfig chrome{};
+    chrome.enabled = true;
+    chrome.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    chrome.windowClassName = L"Chrome_WidgetWin_1";
+    chrome.fakeFocusEnabled = true;
+    chrome.inputStrategy = windowmode::WindowModeInputStrategy::Auto;
+
+    const bool resolveOk =
+        windowmode::ResolveInputStrategy(chrome) == windowmode::WindowModeInputStrategy::Cdp
+        && windowmode::UsesCdpInput(chrome)
+        && !windowmode::UsesFakeFocus(chrome)
+        && !windowmode::ShouldMinimizeTargetAfterBind(chrome);
+
+    windowmode::AnnotateInputStrategyForSave(chrome);
+    std::wstring written;
+    windowmode::WriteWindowModeJson(written, chrome, false);
+    const bool writeOk = written.find(L"\"inputStrategy\": \"cdp\"") != std::wstring::npos
+        && written.find(L"\"cdpPort\":") != std::wstring::npos;
+    const auto round = windowmode::ParseWindowModeJson(written);
+    const bool roundOk = round.inputStrategy == windowmode::WindowModeInputStrategy::Cdp
+        && round.cdpPort == 9222;
+
+    windowmode::WindowModeScriptConfig game{};
+    game.enabled = true;
+    game.windowClassName = L"UnityWndClass";
+    game.inputStrategy = windowmode::WindowModeInputStrategy::Auto;
+    game.fakeFocusEnabled = true;
+    const bool gameOk =
+        windowmode::ResolveInputStrategy(game) == windowmode::WindowModeInputStrategy::SoftMessage
+        && !windowmode::UsesCdpInput(game)
+        && windowmode::UsesFakeFocus(game);
+
+    const std::wstring args = windowmode::EnsureRemoteDebuggingLaunchArgs(L"", 9222);
+    const bool argsOk = args.find(L"--remote-debugging-port=9222") != std::wstring::npos;
+
+    // 显式 softMessage 不被 Annotate 覆盖
+    windowmode::WindowModeScriptConfig forceSoft = chrome;
+    forceSoft.inputStrategy = windowmode::WindowModeInputStrategy::SoftMessage;
+    windowmode::AnnotateInputStrategyForSave(forceSoft);
+    const bool forceOk = forceSoft.inputStrategy == windowmode::WindowModeInputStrategy::SoftMessage;
+
+    const bool ok = resolveOk && writeOk && roundOk && gameOk && argsOk && forceOk;
+    Emit(L"input_strategy_cdp_auto", ok,
+        ok ? L"" : L"CDP/softMessage strategy resolution or JSON annotate failed");
+}
+
+void TestExtBridgeConfigParse() {
+    int port = 0;
+    std::string token;
+    const bool good = windowmode::ParseExtBridgeConfigJson(
+        "{\"ok\":true,\"port\":19228,\"token\":\"0123456789abcdef\"}", port, token)
+        && port == 19228
+        && token == "0123456789abcdef";
+    int badPort = 0;
+    std::string badTok;
+    const bool reject = !windowmode::ParseExtBridgeConfigJson(
+        "{\"port\":80,\"token\":\"short\"}", badPort, badTok);
+    Emit(L"ext_bridge_config_parse", good && reject,
+        (good && reject) ? L"" : L"ext bridge config parse failed");
+}
+
+void TestFakeFocusMinimizeGate() {
+    windowmode::WindowModeScriptConfig cfg{};
+    cfg.enabled = true;
+    cfg.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    cfg.fakeFocusEnabled = false;
+    const bool offOk = !windowmode::UsesFakeFocus(cfg)
+        && windowmode::ShouldMinimizeTargetAfterBind(cfg);
+
+    cfg.fakeFocusEnabled = true;
+    const bool onOk = windowmode::UsesFakeFocus(cfg)
+        && !windowmode::ShouldMinimizeTargetAfterBind(cfg);
+
+    cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    const bool bgOk = !windowmode::UsesFakeFocus(cfg)
+        && windowmode::ShouldMinimizeTargetAfterBind(cfg);
+
+    const bool ok = offOk && onOk && bgOk;
+    Emit(L"fake_focus_minimize_gate", ok,
+        ok ? L"" : L"UsesFakeFocus / minimize gate mismatch");
+}
+
+void TestRestorePreferMaximized() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"QstRestoreMaxSelfTest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"QstRestoreMax",
+        WS_OVERLAPPEDWINDOW, 80, 80, 640, 480, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+        Emit(L"restore_prefer_maximized", false, L"CreateWindow failed");
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+    const bool maxOk = IsZoomed(hwnd) != FALSE;
+    ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+    const bool minOk = IsIconic(hwnd) != FALSE;
+    // 安静铺满工作区：禁止依赖 IsZoomed（Maximize API 会切虚拟桌面）。
+    const bool restoredMax = windowmode::RestoreMinimizedQuietPreferMax(hwnd)
+        && !IsIconic(hwnd)
+        && windowmode::WindowFillsWorkArea(hwnd)
+        && !IsZoomed(hwnd);
+
+    ShowWindow(hwnd, SW_RESTORE);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    MoveWindow(hwnd, 100, 100, 700, 500, TRUE);
+    ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+    const bool restoredNormal = windowmode::RestoreMinimizedQuietPreferMax(hwnd)
+        && !IsIconic(hwnd)
+        && !windowmode::WindowFillsWorkArea(hwnd)
+        && !IsZoomed(hwnd);
+
+    DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+
+    const bool ok = maxOk && minOk && restoredMax && restoredNormal;
+    wchar_t detail[160]{};
+    swprintf_s(detail, L"max=%d min=%d fill=%d noZoom=%d restNorm=%d",
+        maxOk ? 1 : 0, minOk ? 1 : 0, restoredMax ? 1 : 0,
+        restoredMax ? 1 : 0, restoredNormal ? 1 : 0);
+    Emit(L"restore_prefer_maximized", ok, detail);
+}
+
+void TestSoftMessageExeGates() {
+    // 原 exe 链路：非 Chrome 类 → softMessage；默认可最小化；假焦点则保持还原。
+    windowmode::WindowModeScriptConfig exe{};
+    exe.enabled = true;
+    exe.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    exe.windowClassName = L"UnityWndClass";
+    exe.inputStrategy = windowmode::WindowModeInputStrategy::Auto;
+    exe.fakeFocusEnabled = false;
+
+    const bool softOk =
+        windowmode::ResolveInputStrategy(exe) == windowmode::WindowModeInputStrategy::SoftMessage
+        && !windowmode::UsesCdpInput(exe)
+        && !windowmode::UsesFakeFocus(exe)
+        && windowmode::ShouldMinimizeTargetAfterBind(exe);
+
+    exe.fakeFocusEnabled = true;
+    const bool ffOk =
+        windowmode::UsesFakeFocus(exe)
+        && !windowmode::UsesCdpInput(exe)
+        && !windowmode::ShouldMinimizeTargetAfterBind(exe);
+
+    // 显式 softMessage 即使用 Chrome 类也不走扩展桥策略。
+    windowmode::WindowModeScriptConfig forceSoft{};
+    forceSoft.enabled = true;
+    forceSoft.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    forceSoft.windowClassName = L"Chrome_WidgetWin_1";
+    forceSoft.inputStrategy = windowmode::WindowModeInputStrategy::SoftMessage;
+    forceSoft.fakeFocusEnabled = true;
+    const bool forceOk =
+        windowmode::ResolveInputStrategy(forceSoft) == windowmode::WindowModeInputStrategy::SoftMessage
+        && !windowmode::UsesCdpInput(forceSoft)
+        && windowmode::UsesFakeFocus(forceSoft);
+
+    const bool ok = softOk && ffOk && forceOk;
+    Emit(L"soft_message_exe_gates", ok,
+        ok ? L"" : L"softMessage/exe strategy or minimize/fakeFocus gates wrong");
+}
+
+std::wstring SelfExeDir() {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring full(path);
+    const auto slash = full.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return L"";
+    return full.substr(0, slash + 1);
+}
+
+void TestFakeFocusHookLocal() {
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        Emit(L"fake_focus_hook_local", false,
+            (L"LoadLibrary failed: " + dllPath).c_str());
+        return;
+    }
+
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    using IsInstalledFn = BOOL(WINAPI*)();
+    auto* install = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_Install"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    auto* isInstalled = reinterpret_cast<IsInstalledFn>(GetProcAddress(mod, "FakeFocus_IsInstalled"));
+    if (!install || !uninstall || !isInstalled) {
+        FreeLibrary(mod);
+        Emit(L"fake_focus_hook_local", false, L"missing FakeFocus exports");
+        return;
+    }
+
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"QST FakeFocus Probe",
+        WS_OVERLAPPEDWINDOW, 40, 40, 240, 120, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        FreeLibrary(mod);
+        Emit(L"fake_focus_hook_local", false, L"CreateWindow failed");
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    HWND before = GetForegroundWindow();
+    const BOOL installed = install(hwnd);
+    HWND hooked = GetForegroundWindow();
+    const BOOL active = isInstalled();
+    uninstall();
+    HWND after = GetForegroundWindow();
+    DestroyWindow(hwnd);
+    FreeLibrary(mod);
+
+    const bool ok = installed && active && hooked == hwnd
+        && (after == before || after != hwnd);
+    wchar_t detail[256]{};
+    swprintf_s(detail,
+        L"install=%d hooked=%p expect=%p before=%p after=%p",
+        installed ? 1 : 0, hooked, hwnd, before, after);
+    Emit(L"fake_focus_hook_local", ok, ok ? L"" : detail);
+}
+
+void TestFakeFocusSoftInput() {
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+
+    std::wstring softErr;
+    if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+        Emit(L"fake_focus_soft_input", false,
+            softErr.empty() ? L"Attach soft input failed" : softErr.c_str());
+        return;
+    }
+
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(L"fake_focus_soft_input", false, L"LoadLibrary failed");
+        return;
+    }
+
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    using HasSoftFn = BOOL(WINAPI*)();
+    auto* install = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_Install"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    auto* hasSoft = reinterpret_cast<HasSoftFn>(GetProcAddress(mod, "FakeFocus_HasSoftInput"));
+    if (!install || !uninstall || !hasSoft) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(L"fake_focus_soft_input", false, L"missing exports");
+        return;
+    }
+
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"QST SoftInput Probe",
+        WS_OVERLAPPEDWINDOW, 80, 80, 200, 100, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(L"fake_focus_soft_input", false, L"CreateWindow failed");
+        return;
+    }
+
+    if (!install(hwnd) || !hasSoft()) {
+        uninstall();
+        DestroyWindow(hwnd);
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(L"fake_focus_soft_input", false, L"Install/HasSoftInput failed");
+        return;
+    }
+
+    windowmode::FakeFocusSoftInput_SetCursorScreen(1234, 5678);
+    windowmode::FakeFocusSoftInput_SetMouseButtonVk(VK_LBUTTON, true);
+    windowmode::FakeFocusSoftInput_SetKey(VK_SPACE, true);
+
+    POINT pt{};
+    const BOOL cursorOk = GetCursorPos(&pt);
+    const SHORT lbtn = GetAsyncKeyState(VK_LBUTTON);
+    const SHORT space = GetAsyncKeyState(VK_SPACE);
+    BYTE keys[256]{};
+    const BOOL kbOk = GetKeyboardState(keys);
+
+    uninstall();
+    DestroyWindow(hwnd);
+    FreeLibrary(mod);
+    windowmode::FakeFocusSoftInput_Detach();
+
+    const bool ok = cursorOk && pt.x == 1234 && pt.y == 5678
+        && (lbtn & 0x8000) != 0
+        && (space & 0x8000) != 0
+        && kbOk && (keys[VK_LBUTTON] & 0x80) != 0
+        && (keys[VK_SPACE] & 0x80) != 0;
+    wchar_t detail[256]{};
+    swprintf_s(detail, L"pt=(%ld,%ld) lbtn=0x%04x space=0x%04x kbL=0x%02x kbSp=0x%02x",
+        pt.x, pt.y, static_cast<unsigned>(lbtn) & 0xFFFF,
+        static_cast<unsigned>(space) & 0xFFFF,
+        keys[VK_LBUTTON], keys[VK_SPACE]);
+    Emit(L"fake_focus_soft_input", ok, ok ? L"" : detail);
+}
+
+std::wstring ReadFileUtf8AsWide(const std::wstring& path) {
+    HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return L"";
+    const DWORD size = GetFileSize(hf, nullptr);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > 8 * 1024 * 1024) {
+        CloseHandle(hf);
+        return L"";
+    }
+    std::string bytes(size, '\0');
+    DWORD read = 0;
+    const BOOL ok = ReadFile(hf, bytes.data(), size, &read, nullptr);
+    CloseHandle(hf);
+    if (!ok || read == 0) return L"";
+    bytes.resize(read);
+    if (bytes.size() >= 3
+        && static_cast<unsigned char>(bytes[0]) == 0xEF
+        && static_cast<unsigned char>(bytes[1]) == 0xBB
+        && static_cast<unsigned char>(bytes[2]) == 0xBF) {
+        bytes.erase(0, 3);
+    }
+    const int n = MultiByteToWideChar(CP_UTF8, 0, bytes.data(),
+        static_cast<int>(bytes.size()), nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring wide(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()),
+        wide.data(), n);
+    return wide;
+}
+
+std::wstring FindAnjuzhenScriptPath() {
+    const std::wstring exeDir = SelfExeDir();
+    const wchar_t* rel[] = {
+        L"scripts\\安居镇.json",
+        L"..\\Debug\\scripts\\安居镇.json",
+        L"..\\Release\\scripts\\安居镇.json",
+        L"..\\..\\build\\Debug\\scripts\\安居镇.json",
+        L"..\\..\\build\\Release\\scripts\\安居镇.json",
+    };
+    for (const wchar_t* r : rel) {
+        const std::wstring path = exeDir + r;
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return path;
+    }
+    // Absolute fallback for this workspace.
+    const std::wstring abs = L"D:\\other\\software\\build\\Debug\\scripts\\安居镇.json";
+    if (GetFileAttributesW(abs.c_str()) != INVALID_FILE_ATTRIBUTES) return abs;
+    return L"";
+}
+
+void TestAnjuzhenScriptWmConfig() {
+    // 不依赖用户脚本文件是否仍在 build/*/scripts（易被清掉）；用内嵌样例校验解析。
+    const std::wstring sample =
+        L"{\n"
+        L"  \"windowMode\": {\n"
+        L"    \"enabled\": 1,\n"
+        L"    \"executionKind\": \"hiddenDesktop\",\n"
+        L"    \"windowClassName\": \"Chrome_WidgetWin_1\",\n"
+        L"    \"childWindowClassName\": \"Chrome_RenderWidgetHostHWND\",\n"
+        L"    \"fakeFocusEnabled\": 1\n"
+        L"  }\n"
+        L"}\n";
+    const auto cfg = windowmode::ParseWindowModeJson(sample);
+    const bool ok = cfg.enabled
+        && cfg.executionKind == windowmode::WindowModeExecutionKind::HiddenDesktop
+        && cfg.fakeFocusEnabled
+        && cfg.windowClassName.find(L"Chrome_WidgetWin") != std::wstring::npos
+        && cfg.childWindowClassName == L"Chrome_RenderWidgetHostHWND"
+        && windowmode::ResolveInputStrategy(cfg) == windowmode::WindowModeInputStrategy::Cdp
+        && windowmode::UsesCdpInput(cfg)
+        && !windowmode::UsesFakeFocus(cfg)
+        && !windowmode::ShouldMinimizeTargetAfterBind(cfg);
+
+    // 运行时：非 Chrome_ 类窗不应被判定为「假焦点不支持」。
+    HWND probe = CreateWindowExW(0, L"STATIC", L"qst_wm_probe",
+        WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    const bool helperOk = !probe
+        || !windowmode::IsBrowserFakeFocusUnsupported(probe);
+    if (probe) DestroyWindow(probe);
+
+    Emit(L"anjuzhen_script_wm_config", ok && helperOk,
+        ok && helperOk ? L"sample JSON + CDP strategy"
+                       : (ok ? L"IsBrowserFakeFocusUnsupported helper mismatch"
+                             : L"windowMode sample parse or helper mismatch"));
+}
+
+constexpr wchar_t kInvisibleChildClass[] = L"QstInvisibleChildSelfTest";
+
+void TestInvisibleChildClassBind() {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kInvisibleChildClass;
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    HWND parent = CreateWindowExW(0, L"STATIC", L"QST InvisibleChild Parent",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 40, 400, 300,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!parent) {
+        Emit(L"invisible_child_class_bind", false, L"parent create failed");
+        return;
+    }
+    // Intentionally omit WS_VISIBLE — mimics Chrome_RenderWidgetHostHWND off virtual desktop.
+    HWND child = CreateWindowExW(0, kInvisibleChildClass, L"",
+        WS_CHILD, 10, 10, 220, 180,
+        parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!child) {
+        DestroyWindow(parent);
+        Emit(L"invisible_child_class_bind", false, L"invisible child create failed");
+        return;
+    }
+
+    HWND found = windowmode::FindChildWindowByClass(parent, kInvisibleChildClass);
+    const bool ok = found == child && !IsWindowVisible(child);
+    Emit(L"invisible_child_class_bind", ok,
+        ok ? L"found invisible child by class" : L"FindChildWindowByClass missed invisible child");
+    DestroyWindow(parent);
+}
+
+constexpr wchar_t kD3dClass[] = L"Intermediate D3D Window";
+constexpr wchar_t kRenderClass[] = L"Chrome_RenderWidgetHostHWND";
+
+void TestBrowserRenderSkipsD3d() {
+    static bool registered = false;
+    if (!registered) {
+        for (const wchar_t* name : {kD3dClass, kRenderClass}) {
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.lpszClassName = name;
+            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+            RegisterClassExW(&wc);
+        }
+        registered = true;
+    }
+
+    HWND parent = CreateWindowExW(0, L"STATIC", L"QST Browser Parent",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 60, 60, 500, 400,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!parent) {
+        Emit(L"browser_render_skips_d3d", false, L"parent create failed");
+        return;
+    }
+
+    HWND d3d = CreateWindowExW(0, kD3dClass, L"",
+        WS_CHILD, 0, 0, 480, 360,
+        parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // Zero-area render widget — must still win over D3D for input binding.
+    HWND render = CreateWindowExW(0, kRenderClass, L"",
+        WS_CHILD, 0, 0, 0, 0,
+        parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!d3d || !render) {
+        DestroyWindow(parent);
+        Emit(L"browser_render_skips_d3d", false, L"child create failed");
+        return;
+    }
+
+    HWND found = windowmode::FindBrowserRenderWidget(parent);
+    const bool preferRender = found == render;
+    DestroyWindow(render);
+
+    HWND foundD3dOnly = windowmode::FindBrowserRenderWidget(parent);
+    const bool skipD3d = foundD3dOnly == nullptr
+        && windowmode::IsBrowserCompositorHwnd(d3d)
+        && windowmode::FindBrowserCaptureSurface(parent) == d3d;
+
+    const bool ok = preferRender && skipD3d;
+    Emit(L"browser_render_skips_d3d", ok,
+        ok ? L"render preferred; d3d capture-only"
+           : L"FindBrowserRenderWidget incorrectly used Intermediate D3D");
+    DestroyWindow(parent);
+}
+
+#ifndef DWMWA_CLOAK
+#define DWMWA_CLOAK 13
+#endif
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+#ifndef DWMWA_DISALLOW_PEEK
+#define DWMWA_DISALLOW_PEEK 11
+#endif
+
+void TestCdpParkExpandable() {
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"QST CDP Park Probe",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 90, 90, 640, 480,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        Emit(L"cdp_park_expandable", false, L"CreateWindow failed");
+        return;
+    }
+    ShowWindow(hwnd, SW_RESTORE);
+    UpdateWindow(hwnd);
+
+    // 模拟旧版 Cloak 残余：Cloak+α=1。Park 必须刮干净。
+    BOOL cloakOn = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloakOn, sizeof(cloakOn));
+    SetWindowLongPtr(hwnd, GWL_EXSTYLE, GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA);
+    windowmode::SuppressMacroDesktopTaskbarPreview(hwnd);
+
+    // Park：刮掉 Cloak/α=1；Minimize→Move 宏桌面（禁屏外）。
+    windowmode::PrepareMacroDesktopForCdpBind(hwnd);
+
+    BYTE alphaAfterPark = 255;
+    auto readGhost = [&](BYTE& alphaOut) {
+        alphaOut = 255;
+        DWORD flags = 0;
+        COLORREF key = 0;
+        const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        BOOL cloaked = 0;
+        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+        if (ex & WS_EX_LAYERED) {
+            GetLayeredWindowAttributes(hwnd, &key, &alphaOut, &flags);
+        }
+        const bool layeredGhost = (ex & WS_EX_LAYERED) != 0
+            && (flags & LWA_ALPHA) != 0 && alphaOut <= 2;
+        const bool appCloak = (static_cast<DWORD>(cloaked) & DWM_CLOAKED_APP) != 0;
+        return layeredGhost || appCloak;
+    };
+
+    const bool notLatched = !windowmode::IsMacroVisionLatched(hwnd);
+    const bool peekCleared = !windowmode::IsMacroDesktopTaskbarPreviewSuppressed(hwnd);
+    const bool isGhost = readGhost(alphaAfterPark);
+    const bool alwaysExpandable = !isGhost; // 无 Cloak 鬼影；任务栏可展开
+
+    // 第二次 Park：不得再切屏操作；保持可查询状态。
+    windowmode::PrepareMacroDesktopForCdpBind(hwnd);
+    BYTE alphaAfterRaise = 255;
+    windowmode::RaiseMacroDesktopWindowForWatch(hwnd); // 用户不在宏桌面应为 no-op
+    const bool stillNotGhost = !readGhost(alphaAfterRaise);
+
+    // 结束路径：恢复停放前坐标再最小化，任务栏还原不得落在 -32000。
+    windowmode::RestoreMacroDesktopWindowAfterRun(hwnd);
+    WINDOWPLACEMENT wpEnd{};
+    wpEnd.length = sizeof(WINDOWPLACEMENT);
+    const bool gotWp = GetWindowPlacement(hwnd, &wpEnd) == TRUE;
+    const bool restoreRectOk = gotWp
+        && wpEnd.rcNormalPosition.left > -10000
+        && wpEnd.rcNormalPosition.top > -10000;
+    ShowWindow(hwnd, SW_RESTORE);
+    UpdateWindow(hwnd);
+    RECT wr{};
+    const bool gotWr = GetWindowRect(hwnd, &wr) == TRUE;
+    const bool onScreen = gotWr && wr.left > -10000 && wr.top > -10000
+        && wr.right > wr.left + 64 && wr.bottom > wr.top + 64;
+
+    windowmode::ReleaseMacroDesktopVisionLatch(hwnd);
+    windowmode::ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+    DestroyWindow(hwnd);
+
+    const bool ok = notLatched && peekCleared && alwaysExpandable && stillNotGhost
+        && restoreRectOk && onScreen;
+    wchar_t detail[320]{};
+    swprintf_s(detail,
+        L"noLatch=%d peekOff=%d ghost=%d exp=%d aPark=%u aRaise=%u restOk=%d onScr=%d rc=(%ld,%ld)",
+        notLatched ? 1 : 0, peekCleared ? 1 : 0,
+        isGhost ? 1 : 0, alwaysExpandable ? 1 : 0,
+        static_cast<unsigned>(alphaAfterPark), static_cast<unsigned>(alphaAfterRaise),
+        restoreRectOk ? 1 : 0, onScreen ? 1 : 0,
+        gotWr ? wr.left : 0L, gotWr ? wr.top : 0L);
+    Emit(L"cdp_park_expandable", ok,
+        ok ? L"park: macro Move; no ghost; EndRun restore ok" : detail);
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -538,6 +1195,18 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     TestDesktopQuickInputCancel();
+    TestFakeFocusJsonRoundtrip();
+    TestInputStrategyCdpAuto();
+    TestExtBridgeConfigParse();
+    TestFakeFocusMinimizeGate();
+    TestSoftMessageExeGates();
+    TestRestorePreferMaximized();
+    TestFakeFocusHookLocal();
+    TestFakeFocusSoftInput();
+    TestAnjuzhenScriptWmConfig();
+    TestInvisibleChildClassBind();
+    TestBrowserRenderSkipsD3d();
+    TestCdpParkExpandable();
 
     if (runMacro) TestMacroDesktopSmoke();
 

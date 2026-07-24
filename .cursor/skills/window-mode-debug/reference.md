@@ -50,6 +50,64 @@
 - **测什么**：桌面模式 `SendQuickInputText(..., cancelFlag)` 在取消后迅速返回。  
 - **代码**：`src/action_utils.cpp`  
 
+### `fake_focus_json_roundtrip`
+
+- **测什么**：缺省无字段 → `fakeFocusEnabled=false`；写入/再解析为 1。  
+- **代码**：`src/window_mode/window_mode_json.cpp`  
+
+### `input_strategy_cdp_auto`
+
+- **测什么**：`Chrome_WidgetWin_*` → `ResolveInputStrategy=Cdp` / 保存注明 `inputStrategy:cdp`；独立游戏类名保持 softMessage；`--remote-debugging-port` 附加。  
+- **代码**：`window_mode_types.*`、`window_mode_json.cpp`、`cdp/cdp_input.*`  
+
+### `fake_focus_minimize_gate`
+
+- **测什么**：仅 `HiddenDesktop + fakeFocusEnabled`（且非 CDP）时 `UsesFakeFocus`；此时禁止绑窗后最小化。  
+- **代码**：`src/window_mode/window_mode_types.h`  
+
+### `soft_message_exe_gates`
+
+- **测什么**：Unity 等游戏类名 → softMessage、绑后可最小化；假焦点时保持还原；显式 softMessage 不走 CDP。  
+- **代码**：`window_mode_types.h`、绑定分支 `window_mode_session.cpp`（勿对 exe 调 `PrepareMacroDesktopForExtVision`）  
+
+### `restore_prefer_maximized`
+
+- **测什么**：最大化→最小化后安静铺满工作区（`WindowFillsWorkArea`），且**不得** `IsZoomed`（禁止 Maximize API 切桌面）；普通窗不得被铺满。  
+- **代码**：`window_target.cpp` `RestoreMinimizedQuietPreferMax`  
+
+### `fake_focus_hook_local`
+
+- **测什么**：本进程 `LoadLibrary(FakeFocus64/32.dll)` 后 `GetForegroundWindow` 返回目标 HWND；卸载后恢复。  
+- **代码**：`src/window_mode/fake_focus/**`  
+
+### `fake_focus_soft_input`
+
+- **测什么**：共享内存写入光标/按键后，目标进程内 `GetCursorPos` / `GetAsyncKeyState` / `GetKeyboardState` 反映软状态。  
+- **代码**：`fake_focus_soft_input.h`、`fake_focus_soft_input_host.*`、`fake_focus_dll.cpp`  
+
+### `anjuzhen_script_wm_config`
+
+- **测什么**：样例 JSON 含 Chrome 类名时解析为 CDP 策略（`UsesCdpInput`，假焦点注入关闭）。  
+- **代码**：`window_mode_json.cpp`、`window_mode_types.h`  
+
+### `invisible_child_class_bind`
+
+- **测什么**：无 `WS_VISIBLE` 的子窗仍能被 `FindChildWindowByClass` 找到。  
+- **用户症状**：宏桌面绑 Edge 仍停在 `Chrome_WidgetWin_1`，软点击/按键无效。  
+- **代码**：`window_target.cpp` → `FindLargestChildByClass` / `FindChildWindowByClass`  
+
+### `browser_render_skips_d3d`
+
+- **测什么**：`FindBrowserRenderWidget` 不返回 `Intermediate D3D Window`；截图可用 `FindBrowserCaptureSurface`。  
+- **用户症状**：绑到合成层后按键/点击全无响应。  
+- **代码**：`window_target.cpp`、`ResolveBindHwnd`、`background_window_input.cpp`  
+
+### `cdp_park_expandable`
+
+- **测什么**：`PrepareMacroDesktopForCdpBind` 刮掉遗留 Cloak/α=1、窗非最小化、Peek 抑制、不 Cloak（≥1.1.39 移除 Cloak/α=1）。窗在另一桌面天然不可见，用户切换可正常展开。
+- **用户症状**：宏桌面打不开幽灵窗；执行中切屏到宏桌面。  
+- **代码**：`window_target.cpp` → `PrepareMacroDesktopForCdpBind`；见 [cdp-lessons.md](cdp-lessons.md)  
+
 ## 可选：`--macro`
 
 ### `macro_desktop_launch_bind`
@@ -72,6 +130,8 @@
 ## 尚未自动化（需主程序 + 用户脚本）
 
 - 真实找图模板匹配率、偏移点击、Caret、商店 AppsFolder 启动压底观感  
+- CDP 同进程 Edge：扩展 v1.1.6+ 禁止挂浏览器级其它窗 iframe（仅本 tab / autoAttach / 精确 DOM src）；标题戳记只证明壳页  
+- CDP 找图：优先扩展截图；**禁止** debugger soft-swap（detach iframe↔壳页），否则 MV3 断桥。布局/清戳记用 `chrome.scripting`。canvas/双挂/visibleTab 失败才 Win32。  
 - Agent 绿了之后再用 `QuickScriptTool.exe` + 用户宏做最终确认  
 
 ## JSON 输出约定

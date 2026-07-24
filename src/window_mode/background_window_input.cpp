@@ -295,6 +295,10 @@ bool GetLastSoftMouseClientPos(HWND hwnd, int& cx, int& cy) {
     return true;
 }
 
+void RememberSoftMouseClientPos(HWND hwnd, int cx, int cy) {
+    RememberClientPos(hwnd, cx, cy);
+}
+
 void ResetSoftMouseState() {
     g_softMouseFlags = 0;
     g_haveLastClientPos = false;

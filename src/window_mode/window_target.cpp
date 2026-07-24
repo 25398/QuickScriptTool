@@ -6,7 +6,9 @@
 #include "window_capture.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -119,11 +121,81 @@ bool ProcessMatchesQuery(DWORD pid, const WindowTargetQuery& query) {
     return false;
 }
 
+// Edge/Chrome 标题噪声：标签数、用户配置、浏览器名、扩展钉窗戳记 —— 变化会导致误判「未找到窗」。
+std::wstring StripBrowserTitleNoise(std::wstring title) {
+    auto trim = [](std::wstring& s) {
+        while (!s.empty() && (s.front() == L' ' || s.front() == L'\t')) s.erase(s.begin());
+        while (!s.empty() && (s.back() == L' ' || s.back() == L'\t')) s.pop_back();
+    };
+    trim(title);
+    if (title.empty()) return title;
+
+    // 扩展标题戳记：QSTD########: ...
+    if (title.size() > 5 && (title[0] == L'Q' || title[0] == L'q')
+        && (title[1] == L'S' || title[1] == L's')
+        && (title[2] == L'T' || title[2] == L't')
+        && (title[3] == L'D' || title[3] == L'd')) {
+        const auto colon = title.find(L':');
+        if (colon != std::wstring::npos && colon >= 4 && colon < 20) {
+            title = title.substr(colon + 1);
+            trim(title);
+        }
+    }
+
+    auto stripSuffixCi = [&](const wchar_t* suffix) {
+        const size_t n = wcslen(suffix);
+        if (title.size() < n) return;
+        if (_wcsicmp(title.c_str() + (title.size() - n), suffix) == 0) {
+            title.resize(title.size() - n);
+            trim(title);
+        }
+    };
+    stripSuffixCi(L" - microsoft edge");
+    stripSuffixCi(L" - google chrome");
+    stripSuffixCi(L" - chromium");
+    stripSuffixCi(L" - brave");
+
+    // " - 用户配置 N"
+    {
+        const std::wstring marker = L" - 用户配置 ";
+        const auto pos = title.rfind(marker);
+        if (pos != std::wstring::npos) {
+            bool allDigit = true;
+            for (size_t i = pos + marker.size(); i < title.size(); ++i) {
+                if (title[i] < L'0' || title[i] > L'9') { allDigit = false; break; }
+            }
+            if (allDigit && pos + marker.size() < title.size()) {
+                title.resize(pos);
+                trim(title);
+            }
+        }
+    }
+
+    // " 和另外 N 个页面"
+    {
+        const std::wstring marker = L" 和另外 ";
+        const auto pos = title.find(marker);
+        if (pos != std::wstring::npos) {
+            title.resize(pos);
+            trim(title);
+        }
+    }
+    return title;
+}
+
 bool TitleMatches(const std::wstring& title, const std::wstring& titleContains) {
     if (titleContains.empty()) return true;
     const std::wstring titleLower = ToLowerCopy(title);
     const std::wstring needleLower = ToLowerCopy(titleContains);
-    return titleLower.find(needleLower) != std::wstring::npos;
+    if (titleLower.find(needleLower) != std::wstring::npos) return true;
+
+    const std::wstring cleanTitle = ToLowerCopy(StripBrowserTitleNoise(title));
+    const std::wstring cleanNeedle = ToLowerCopy(StripBrowserTitleNoise(titleContains));
+    if (cleanNeedle.empty()) return true;
+    if (cleanTitle.find(cleanNeedle) != std::wstring::npos) return true;
+    // 配置标题更长（含旧标签数）时，允许窗口标题是配置的前缀主干。
+    if (!cleanTitle.empty() && cleanNeedle.find(cleanTitle) != std::wstring::npos) return true;
+    return false;
 }
 
 bool ClassMatches(const std::wstring& actual, const std::wstring& expected) {
@@ -670,25 +742,54 @@ HWND FindBrowserRenderWidget(HWND top) {
     top = TopLevelTargetWindow(top);
     if (!top || !IsWindow(top)) return nullptr;
 
+    // 输入绑定：必须是真正的 RenderWidget；允许不可见/零面积（宏桌面/未布局）。
+    // 禁止 Intermediate D3D Window（合成层，点不中页面）。
     static const wchar_t* kRenderClasses[] = {
         L"Chrome_RenderWidgetHostHWND",
         L"Internet Explorer_Server",
     };
-    HWND best = nullptr;
-    int bestArea = 0;
     for (const wchar_t* cls : kRenderClasses) {
-        if (HWND found = FindLargestChildByClass(top, cls)) {
-            RECT rc{};
-            if (!GetClientRect(found, &rc)) continue;
-            const int area = std::max(0, static_cast<int>(rc.right - rc.left))
-                * std::max(0, static_cast<int>(rc.bottom - rc.top));
-            if (area > bestArea) {
-                bestArea = area;
-                best = found;
-            }
+        if (HWND found = FindChildInTree(top, cls)) {
+            if (!IsBrowserCompositorHwnd(found)) return found;
         }
     }
-    return best;
+    return nullptr;
+}
+
+bool IsBrowserCompositorHwnd(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    const std::wstring lower = ToLowerCopy(cls);
+    if (lower.find(L"intermediate d3d") != std::wstring::npos) return true;
+    if (lower.find(L"d3d") != std::wstring::npos
+        && lower.find(L"renderwidget") == std::wstring::npos) {
+        return true;
+    }
+    return false;
+}
+
+HWND FindBrowserCaptureSurface(HWND top) {
+    top = TopLevelTargetWindow(top);
+    if (!top || !IsWindow(top)) return nullptr;
+    if (HWND render = FindBrowserRenderWidget(top)) return render;
+
+    // 无 RenderWidget 时：找最大 compositor 供截图。
+    struct Ctx { HWND best; int area; } ctx{nullptr, -1};
+    EnumChildWindows(top, [](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (!IsBrowserCompositorHwnd(hwnd)) return TRUE;
+        RECT rc{};
+        if (!GetClientRect(hwnd, &rc)) return TRUE;
+        const int area = std::max(0, static_cast<int>(rc.right - rc.left))
+            * std::max(0, static_cast<int>(rc.bottom - rc.top));
+        if (area > c->area) {
+            c->area = area;
+            c->best = hwnd;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.best;
 }
 
 HWND TopLevelTargetWindow(HWND hwnd) {
@@ -1500,6 +1601,849 @@ WindowModeHealth EvaluateTargetHealth(HWND hwnd, HDC /*probeDc*/) {
         return WindowModeHealth::TargetNoRender;
     }
     return WindowModeHealth::Ok;
+}
+
+// =============================================================================
+// CDP / 扩展停放与展开（≥1.1.39：不 Cloak/α=1，只 Move）
+// =============================================================================
+
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+#ifndef DWMWA_DISALLOW_PEEK
+#define DWMWA_DISALLOW_PEEK 11
+#endif
+#ifndef DWMWA_FORCE_ICONIC_REPRESENTATION
+#define DWMWA_FORCE_ICONIC_REPRESENTATION 7
+#endif
+#ifndef DWMWA_HAS_ICONIC_BITMAP
+#define DWMWA_HAS_ICONIC_BITMAP 10
+#endif
+
+namespace {
+
+std::mutex g_cdpParkMu;
+std::unordered_map<HWND, bool> g_peekSuppressed;
+std::unordered_map<HWND, bool> g_cdpPinned;
+std::unordered_map<HWND, WINDOWPLACEMENT> g_cdpParkPlacement;
+std::unordered_map<HWND, SIZE> g_cdpParkSize; // 首次屏外尺寸冻结
+std::atomic<HWND> g_watchHwnd{nullptr};
+std::atomic_bool g_watchStop{true};
+std::thread g_watchThread;
+std::mutex g_watchMu;
+
+bool PlacementLooksOnScreen(const RECT& rc) {
+    return rc.left > -10000 && rc.top > -10000
+        && rc.right > rc.left + 64 && rc.bottom > rc.top + 64;
+}
+
+RECT WorkAreaFallbackRect() {
+    HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        return mi.rcWork;
+    }
+    return RECT{0, 0, 1280, 800};
+}
+
+/// 观看展开用：把目标矩形钳进工作区，避免 2582x1390@40,40 溢出屏幕「像没展开」。
+void FitRectIntoWorkArea(RECT& dest, int& destW, int& destH) {
+    const RECT wa = WorkAreaFallbackRect();
+    const int waW = (std::max)(640, static_cast<int>(wa.right - wa.left));
+    const int waH = (std::max)(400, static_cast<int>(wa.bottom - wa.top));
+    if (destW > waW) destW = waW;
+    if (destH > waH) destH = waH;
+    if (destW < 640) destW = (std::min)(1280, waW);
+    if (destH < 400) destH = (std::min)(800, waH);
+    dest.left = wa.left;
+    dest.top = wa.top;
+    if (dest.left + destW > wa.right) dest.left = wa.right - destW;
+    if (dest.top + destH > wa.bottom) dest.top = wa.bottom - destH;
+    if (dest.left < wa.left) dest.left = wa.left;
+    if (dest.top < wa.top) dest.top = wa.top;
+    dest.right = dest.left + destW;
+    dest.bottom = dest.top + destH;
+}
+
+bool SoftRestoreNonActivating(HWND hwnd);
+void StripCloakAndNearInvisibleAlpha(HWND hwnd);
+
+void RememberCdpParkPlacement(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    std::lock_guard<std::mutex> lock(g_cdpParkMu);
+
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (!GetWindowPlacement(hwnd, &wp)) return;
+
+    if (!IsIconic(hwnd)) {
+        RECT wr{};
+        if (GetWindowRect(hwnd, &wr) && PlacementLooksOnScreen(wr)) {
+            wp.rcNormalPosition = wr;
+        }
+    }
+    if (!PlacementLooksOnScreen(wp.rcNormalPosition)) {
+        // 已有合格缓存则保留；否则用工作区兜底。
+        auto it = g_cdpParkPlacement.find(hwnd);
+        if (it != g_cdpParkPlacement.end()
+            && PlacementLooksOnScreen(it->second.rcNormalPosition)) {
+            return;
+        }
+        wp.rcNormalPosition = WorkAreaFallbackRect();
+    }
+    wp.flags = static_cast<UINT>(wp.flags & ~WPF_RESTORETOMAXIMIZED);
+    g_cdpParkPlacement[hwnd] = wp;
+}
+
+bool RestoreCdpParkPlacementThenMinimize(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (vda.EnsureLoaded(err)) {
+        if (vda.IsPinnedWindow(hwnd) > 0) vda.UnPinWindow(hwnd);
+        std::lock_guard<std::mutex> lock(g_cdpParkMu);
+        g_cdpPinned.erase(hwnd);
+        g_cdpParkSize.erase(hwnd);
+    }
+
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(WINDOWPLACEMENT);
+    bool haveSaved = false;
+    {
+        std::lock_guard<std::mutex> lock(g_cdpParkMu);
+        auto it = g_cdpParkPlacement.find(hwnd);
+        if (it != g_cdpParkPlacement.end()) {
+            wp = it->second;
+            haveSaved = true;
+            g_cdpParkPlacement.erase(it);
+        }
+    }
+    if (!haveSaved) {
+        if (!GetWindowPlacement(hwnd, &wp)) return false;
+    }
+    if (!PlacementLooksOnScreen(wp.rcNormalPosition)) {
+        wp.rcNormalPosition = WorkAreaFallbackRect();
+    }
+    wp.length = sizeof(WINDOWPLACEMENT);
+    wp.flags = static_cast<UINT>(wp.flags & ~WPF_RESTORETOMAXIMIZED);
+    wp.showCmd = SW_SHOWMINNOACTIVE;
+    if (!SetWindowPlacement(hwnd, &wp)) {
+        if (!IsIconic(hwnd)) ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        return false;
+    }
+    return true;
+}
+
+// 定论（2026-07-23 晚）：
+// - 异桌还原(无 Pin) → 鼠标/焦点会把用户切到宏桌面【刚证伪】
+// - 长期最小化 → WebGL 静帧【证伪】
+// - Pin+屏外 → 不切屏且出帧；须：① 保持工作区尺寸防点偏 ② 观看 UnPin+迁回宏桌面+还原 ③ 禁刷 SetWindowPlacement
+bool WindowNeedsCdpReveal(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (IsIconic(hwnd)) return true;
+    RECT wr{};
+    if (GetWindowRect(hwnd, &wr) && wr.left <= -10000) return true;
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (vda.EnsureLoaded(err) && vda.IsPinnedWindow(hwnd) > 0) return true;
+    return false;
+}
+
+bool IsCdpLiveOffscreenParked(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return false;
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (!vda.EnsureLoaded(err) || vda.IsPinnedWindow(hwnd) <= 0) return false;
+    RECT wr{};
+    if (!GetWindowRect(hwnd, &wr)) return false;
+    return wr.left <= -10000;
+}
+
+void ResolveCdpParkSize(HWND hwnd, int& outW, int& outH) {
+    outW = 1280;
+    outH = 800;
+    {
+        std::lock_guard<std::mutex> lock(g_cdpParkMu);
+        auto sz = g_cdpParkSize.find(hwnd);
+        if (sz != g_cdpParkSize.end() && sz->second.cx >= 640 && sz->second.cy >= 400) {
+            outW = sz->second.cx;
+            outH = sz->second.cy;
+            return;
+        }
+        auto it = g_cdpParkPlacement.find(hwnd);
+        if (it != g_cdpParkPlacement.end()
+            && PlacementLooksOnScreen(it->second.rcNormalPosition)) {
+            const RECT& rc = it->second.rcNormalPosition;
+            outW = (std::max)(640, static_cast<int>(rc.right - rc.left));
+            outH = (std::max)(400, static_cast<int>(rc.bottom - rc.top));
+        }
+    }
+    RECT wr{};
+    if (GetWindowRect(hwnd, &wr) && PlacementLooksOnScreen(wr)) {
+        outW = (std::max)(outW, static_cast<int>(wr.right - wr.left));
+        outH = (std::max)(outH, static_cast<int>(wr.bottom - wr.top));
+    }
+    std::lock_guard<std::mutex> lock(g_cdpParkMu);
+    g_cdpParkSize[hwnd] = SIZE{outW, outH};
+}
+
+bool CdpHideLiveOffscreen(HWND hwnd, int viewBefore) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (IsCdpLiveOffscreenParked(hwnd)) return true;
+
+    auto& vda = VirtualDesktopAccessor::Instance();
+    RememberCdpParkPlacement(hwnd);
+
+    int w = 1280, h = 800;
+    ResolveCdpParkSize(hwnd, w, h);
+
+    // 关键：先把 placement 设到屏外再取消最小化，禁止「先还原到屏上再挪走」白屏闪一下。
+    // Pin 放到挪屏外之后：Pin 窗全桌可见，先 Pin 再 SHOW 必闪。
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (!GetWindowPlacement(hwnd, &wp)) {
+        wp.length = sizeof(WINDOWPLACEMENT);
+    }
+    wp.flags = static_cast<UINT>(wp.flags & ~WPF_RESTORETOMAXIMIZED);
+    wp.showCmd = SW_SHOWNOACTIVATE;
+    wp.rcNormalPosition = RECT{-32000, -32000, -32000 + w, -32000 + h};
+    SetWindowPlacement(hwnd, &wp);
+
+    if (IsIconic(hwnd)) {
+        SoftRestoreNonActivating(hwnd); // 此时 rcNormal 已是屏外 → quietPark
+    }
+    // 禁 SWP_SHOWWINDOW / FRAMECHANGED / 多余重绘：Pin 时会在用户桌闪白框。
+    SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, w, h,
+        SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOREDRAW);
+    if (IsIconic(hwnd)) {
+        WINDOWPLACEMENT again{};
+        again.length = sizeof(WINDOWPLACEMENT);
+        if (GetWindowPlacement(hwnd, &again)) {
+            again.showCmd = SW_SHOWNOACTIVATE;
+            again.rcNormalPosition = RECT{-32000, -32000, -32000 + w, -32000 + h};
+            SetWindowPlacement(hwnd, &again);
+        }
+        SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, w, h,
+            SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOREDRAW);
+    }
+
+    if (vda.IsPinnedWindow(hwnd) <= 0) {
+        if (!vda.PinWindow(hwnd)) {
+            WindowModeLog(L"[窗口模式] CDP 出帧: PinWindow 失败");
+        }
+        std::lock_guard<std::mutex> lock(g_cdpParkMu);
+        g_cdpPinned[hwnd] = true;
+    }
+
+    if (viewBefore >= 0) vda.HoldView(viewBefore, 80);
+
+    const bool live = !IsIconic(hwnd);
+    WindowModeLogf(L"[窗口模式] CDP 出帧隐藏: iconic=%d pin=%d offscreen=1 size=%dx%d",
+        live ? 0 : 1, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, w, h);
+    return live;
+}
+
+bool CdpRevealOnMacroForWatch(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (!UserOnMacroDesktopNow()) return false;
+    // 已展开：绝对不要再 SetWindowPlacement（会二次切屏）。
+    if (!WindowNeedsCdpReveal(hwnd)) return true;
+
+    auto& vda = VirtualDesktopAccessor::Instance();
+    for (int i = 0; i < 3 && vda.IsPinnedWindow(hwnd) > 0; ++i) {
+        vda.UnPinWindow(hwnd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_cdpParkMu);
+        g_cdpPinned.erase(hwnd);
+    }
+
+    // UnPin 后窗可能落在当前桌；强制迁回「鼠标宏」。
+    MacroVirtualDesktop desk;
+    if (desk.OpenOrCreate()) {
+        desk.MoveWindowToMacroDesktop(hwnd);
+    }
+
+    RECT dest = WorkAreaFallbackRect();
+    int destW = dest.right - dest.left;
+    int destH = dest.bottom - dest.top;
+    {
+        std::lock_guard<std::mutex> lock(g_cdpParkMu);
+        auto it = g_cdpParkPlacement.find(hwnd);
+        if (it != g_cdpParkPlacement.end()
+            && PlacementLooksOnScreen(it->second.rcNormalPosition)) {
+            dest = it->second.rcNormalPosition;
+            destW = (std::max)(640, static_cast<int>(dest.right - dest.left));
+            destH = (std::max)(400, static_cast<int>(dest.bottom - dest.top));
+        } else {
+            auto sz = g_cdpParkSize.find(hwnd);
+            if (sz != g_cdpParkSize.end() && sz->second.cx >= 640 && sz->second.cy >= 400) {
+                destW = sz->second.cx;
+                destH = sz->second.cy;
+                dest.right = dest.left + destW;
+                dest.bottom = dest.top + destH;
+            }
+        }
+    }
+    FitRectIntoWorkArea(dest, destW, destH);
+
+    RECT wr{};
+    GetWindowRect(hwnd, &wr);
+    const bool alreadyOnScreen = !IsIconic(hwnd) && PlacementLooksOnScreen(wr);
+    // 最大化常见 left/top 为负（如 -11,-11）：仍算在屏上，但任务栏点不开时常因仍 Pin/Peek。
+    // 仅剩 Pin：禁再刷 Placement。
+    if (alreadyOnScreen) {
+        if (vda.IsPinnedWindow(hwnd) > 0) {
+            vda.UnPinWindow(hwnd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+        StripCloakAndNearInvisibleAlpha(hwnd);
+        ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+        // 已在屏上但尺寸大于工作区（停放冻结的超大框）：收拢，否则像「展不开」。
+        {
+            int w = wr.right - wr.left;
+            int h = wr.bottom - wr.top;
+            const RECT wa = WorkAreaFallbackRect();
+            const int waW = wa.right - wa.left;
+            const int waH = wa.bottom - wa.top;
+            if (w > waW + 8 || h > waH + 8 || wr.left < wa.left - 8 || wr.top < wa.top - 8) {
+                RECT fit = wr;
+                FitRectIntoWorkArea(fit, w, h);
+                SetWindowPos(hwnd, HWND_TOP, fit.left, fit.top, w, h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                wr = fit;
+            }
+        }
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        const bool ok = vda.IsPinnedWindow(hwnd) <= 0 && !IsIconic(hwnd);
+        WindowModeLogf(L"[窗口模式] 观看：仅 UnPin（已在屏上）ok=%d pin=%d pos=%d,%d",
+            ok ? 1 : 0, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, wr.left, wr.top);
+        return ok;
+    }
+
+    // 负边框/超大停放尺寸：钳进工作区（FitRectIntoWorkArea 已处理）。
+    // 非 iconic 但屏外：SetWindowPlacement 只改「还原矩形」、不挪当前可见窗（已踩坑）。
+    // 必须 SetWindowPos 强制搬回工作区。
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (!GetWindowPlacement(hwnd, &wp)) {
+        wp.length = sizeof(WINDOWPLACEMENT);
+    }
+    wp.flags = static_cast<UINT>(wp.flags & ~WPF_RESTORETOMAXIMIZED);
+    wp.showCmd = SW_SHOWNOACTIVATE;
+    wp.rcNormalPosition = RECT{dest.left, dest.top, dest.left + destW, dest.top + destH};
+    SetWindowPlacement(hwnd, &wp);
+    if (IsIconic(hwnd)) {
+        SoftRestoreNonActivating(hwnd); // 用户已在宏桌面，同桌允许
+    }
+    SetWindowPos(hwnd, HWND_TOP, dest.left, dest.top, destW, destH,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    if (vda.IsPinnedWindow(hwnd) > 0) {
+        vda.UnPinWindow(hwnd);
+    }
+    if (desk.OpenOrCreate()) {
+        desk.MoveWindowToMacroDesktop(hwnd);
+    }
+    StripCloakAndNearInvisibleAlpha(hwnd);
+    ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+
+    GetWindowRect(hwnd, &wr);
+    const bool ok = !IsIconic(hwnd) && PlacementLooksOnScreen(wr)
+        && vda.IsPinnedWindow(hwnd) <= 0;
+    if (ok) {
+        WindowModeLogf(L"[窗口模式] 观看：已 UnPin 并还原到宏桌面（可展开） pos=%d,%d %dx%d",
+            wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top);
+    } else {
+        WindowModeLogf(L"[窗口模式] 观看：展开未完成 iconic=%d pin=%d left=%d",
+            IsIconic(hwnd) ? 1 : 0, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, wr.left);
+    }
+    return ok;
+}
+
+bool SoftRestoreCdpIfUserOnMacro(HWND hwnd) {
+    return CdpRevealOnMacroForWatch(hwnd);
+}
+
+bool IsAppCloakedOrNearInvisible(HWND hwnd, BYTE* alphaOut = nullptr) {
+    if (alphaOut) *alphaOut = 255;
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    BOOL cloaked = 0;
+    DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    const bool appCloak = (static_cast<DWORD>(cloaked) & 0x1) != 0; // DWM_CLOAKED_APP
+    const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    BYTE alpha = 255;
+    DWORD flags = 0;
+    COLORREF key = 0;
+    if (ex & WS_EX_LAYERED) {
+        GetLayeredWindowAttributes(hwnd, &key, &alpha, &flags);
+    }
+    if (alphaOut) *alphaOut = alpha;
+    const bool layeredGhost = (ex & WS_EX_LAYERED) != 0
+        && (flags & LWA_ALPHA) != 0 && alpha <= 2;
+    return appCloak || layeredGhost;
+}
+
+void StripCloakAndNearInvisibleAlpha(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+
+    BOOL cloak = FALSE;
+    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+
+    const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (ex & WS_EX_LAYERED) {
+        BYTE alpha = 255;
+        DWORD flags = 0;
+        COLORREF key = 0;
+        GetLayeredWindowAttributes(hwnd, &key, &alpha, &flags);
+        if ((flags & LWA_ALPHA) && alpha <= 2) {
+            // 还原为不透明；若原本无 layered 需求则剥掉 EXSTYLE。
+            SetLayeredWindowAttributes(hwnd, key, 255, LWA_ALPHA);
+            // 不强制去掉 WS_EX_LAYERED（浏览器常自带），只保证可见。
+        }
+    }
+}
+
+bool SoftRestoreNonActivating(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (!IsIconic(hwnd)) return true;
+
+    // 同桌面允许 ShowWindow；异桌面 Show 会把用户视图拽到该窗所在桌面（已证伪）。
+    const bool onCurrentVd = IsWindowOnUserCurrentDesktop(hwnd);
+
+    WINDOWPLACEMENT before{};
+    before.length = sizeof(WINDOWPLACEMENT);
+    const bool haveBefore = GetWindowPlacement(hwnd, &before) == TRUE;
+    // Pin+屏外停放：placement 已在屏外时禁 ShowWindow（否则用户桌白闪一帧，已证伪）。
+    const bool restoreOffscreen = haveBefore && before.rcNormalPosition.left <= -10000;
+    bool pinned = false;
+    {
+        auto& vda = VirtualDesktopAccessor::Instance();
+        std::wstring err;
+        if (vda.EnsureLoaded(err)) pinned = vda.IsPinnedWindow(hwnd) > 0;
+    }
+    // Pin 窗全桌「可见」：连 SetWindowPlacement(SHOW*) / ShowWindow 都会在用户桌闪白框。
+    const bool quietPark = restoreOffscreen || pinned;
+
+    SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
+
+    if (quietPark) {
+        // 调用方已写屏外 Placement；此处禁任何 SHOW*（含再写 Placement），避免 Pin 全桌白闪。
+        // 仍 iconic 时由 CdpHideLiveOffscreen 用 Placement+SetWindowPos(NOREDRAW) 收尾。
+        return !IsIconic(hwnd);
+    }
+
+    WINDOWPLACEMENT wp = before;
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (haveBefore || GetWindowPlacement(hwnd, &wp)) {
+        wp.showCmd = SW_SHOWNOACTIVATE;
+        SetWindowPlacement(hwnd, &wp);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (IsIconic(hwnd) && onCurrentVd) {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    return !IsIconic(hwnd);
+}
+
+}  // namespace
+
+bool UserOnMacroDesktopNow() {
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (!vda.EnsureLoaded(err)) return false;
+    const int cur = vda.GetCurrentDesktopNumber();
+    if (cur < 0) return false;
+    return vda.DesktopNameMatches(cur, kMacroDesktopDisplayName);
+}
+
+bool WindowFillsWorkArea(HWND hwnd, int slackPx) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return false;
+    RECT wr{};
+    if (!GetWindowRect(hwnd, &wr)) return false;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    const RECT& wa = mi.rcWork;
+    const int slack = std::max(0, slackPx);
+    return wr.left <= wa.left + slack
+        && wr.top <= wa.top + slack
+        && wr.right >= wa.right - slack
+        && wr.bottom >= wa.bottom - slack;
+}
+
+bool RestoreMinimizedQuietPreferMax(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (!GetWindowPlacement(hwnd, &wp)) return false;
+
+    // 曾最大化：安静铺满工作区（禁止 ShowWindow(MAXIMIZE)）。
+    const bool wantFill = (wp.flags & WPF_RESTORETOMAXIMIZED) != 0
+        || wp.showCmd == SW_SHOWMAXIMIZED;
+
+    if (!SoftRestoreNonActivating(hwnd)) return false;
+
+    if (wantFill) {
+        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) {
+            const RECT& wa = mi.rcWork;
+            SetWindowPos(hwnd, HWND_BOTTOM,
+                wa.left, wa.top, wa.right - wa.left, wa.bottom - wa.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+    return !IsIconic(hwnd);
+}
+
+bool IsBrowserFakeFocusUnsupported(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    return LooksLikeChromiumBrowserClass(cls);
+}
+
+void SuppressMacroDesktopTaskbarPreview(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    BOOL on = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_DISALLOW_PEEK, &on, sizeof(on));
+    DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &on, sizeof(on));
+    DwmSetWindowAttribute(hwnd, DWMWA_HAS_ICONIC_BITMAP, &on, sizeof(on));
+    std::lock_guard<std::mutex> lock(g_cdpParkMu);
+    g_peekSuppressed[hwnd] = true;
+}
+
+bool IsMacroDesktopTaskbarPreviewSuppressed(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd) return false;
+    std::lock_guard<std::mutex> lock(g_cdpParkMu);
+    const auto it = g_peekSuppressed.find(hwnd);
+    return it != g_peekSuppressed.end() && it->second;
+}
+
+void ClearMacroDesktopTaskbarPreviewSuppression(HWND hwnd) {
+    auto clearOne = [](HWND h) {
+        if (!h || !IsWindow(h)) return;
+        BOOL off = FALSE;
+        DwmSetWindowAttribute(h, DWMWA_DISALLOW_PEEK, &off, sizeof(off));
+        DwmSetWindowAttribute(h, DWMWA_FORCE_ICONIC_REPRESENTATION, &off, sizeof(off));
+        DwmSetWindowAttribute(h, DWMWA_HAS_ICONIC_BITMAP, &off, sizeof(off));
+    };
+    std::lock_guard<std::mutex> lock(g_cdpParkMu);
+    if (hwnd) {
+        hwnd = TopLevelTargetWindow(hwnd);
+        clearOne(hwnd);
+        g_peekSuppressed.erase(hwnd);
+        return;
+    }
+    for (auto& kv : g_peekSuppressed) {
+        clearOne(kv.first);
+    }
+    g_peekSuppressed.clear();
+}
+
+bool IsMacroVisionLatched(HWND) { return false; }
+bool IsMacroVisionCaptureReady(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    // CDP Pin+屏外即视为可出帧；用户在宏桌面且已展开亦就绪。勿恒 false（否则每次找图再 Park）。
+    if (IsCdpLiveOffscreenParked(hwnd)) return true;
+    if (UserOnMacroDesktopNow() && !WindowNeedsCdpReveal(hwnd)) return true;
+    return false;
+}
+bool IsMacroVisionInvisibilityActive(HWND hwnd) {
+    return IsAppCloakedOrNearInvisible(hwnd);
+}
+
+void ForceRevealMacroDesktopWindow(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    // 用户不在宏桌面时 ForceReveal/刮 α → Win11 切到宏桌面目标窗（已证伪）。
+    if (!UserOnMacroDesktopNow()) return;
+    if (!IsAppCloakedOrNearInvisible(hwnd)) return;
+    StripCloakAndNearInvisibleAlpha(hwnd);
+    WindowModeLog(L"[窗口模式] ForceReveal: 已刮掉 Cloak/近透明 α（用户已在宏桌面）");
+}
+
+void RaiseMacroDesktopWindowForWatch(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    if (!WindowNeedsCdpReveal(hwnd)) return; // 已展开：禁碰窗
+    CdpRevealOnMacroForWatch(hwnd);
+}
+
+void ReleaseMacroDesktopVisionLatch(HWND hwnd) {
+    ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+}
+
+void RestoreMacroDesktopWindowAfterRun(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+    if (RestoreCdpParkPlacementThenMinimize(hwnd)) {
+        WindowModeLog(L"[窗口模式] 会话结束: 已 UnPin/恢复坐标并最小化（禁 GoTo）");
+        return;
+    }
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (vda.EnsureLoaded(err) && vda.IsPinnedWindow(hwnd) > 0) {
+        vda.UnPinWindow(hwnd);
+    }
+    if (!IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+    }
+    WindowModeLog(L"[窗口模式] 会话结束: 已最小化目标（禁 GoTo/ForceReveal）");
+}
+
+bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (!vda.EnsureLoaded(err)) {
+        WindowModeLog(L"[窗口模式] CDP 停放: VDA 不可用");
+        return false;
+    }
+
+    const int viewBefore = vda.GetCurrentDesktopNumber();
+
+    MacroVirtualDesktop desk;
+    if (!desk.OpenOrCreate()) {
+        WindowModeLog(L"[窗口模式] CDP 停放: 宏桌面未就绪");
+        return false;
+    }
+    const int macroIdx = desk.DesktopIndex();
+
+    auto holdView = [&](int ms) {
+        if (viewBefore >= 0) vda.HoldView(viewBefore, ms);
+    };
+
+    if (IsAppCloakedOrNearInvisible(hwnd)) {
+        StripCloakAndNearInvisibleAlpha(hwnd);
+    }
+    RememberCdpParkPlacement(hwnd);
+
+    if (UserOnMacroDesktopNow()) {
+        const int winDesk = vda.GetWindowDesktopNumber(hwnd);
+        if (macroIdx >= 0 && winDesk >= 0 && winDesk != macroIdx
+            && !vda.IsWindowOnDesktopNumber(hwnd, macroIdx)
+            && vda.IsPinnedWindow(hwnd) <= 0) {
+            MinimizeForQuietDesktopMove(hwnd);
+            desk.MoveWindowToMacroDesktop(hwnd);
+        }
+        CdpRevealOnMacroForWatch(hwnd);
+        holdView(80);
+        WindowModeLogf(L"[窗口模式] CDP 停放: 用户在宏桌面 iconic=%d",
+            IsIconic(hwnd) ? 1 : 0);
+        return true;
+    }
+
+    if (IsCdpLiveOffscreenParked(hwnd)) {
+        WindowModeLog(L"[窗口模式] CDP 停放: 已 Pin+屏外出帧，跳过");
+        return true;
+    }
+
+    const int winDesk = vda.GetWindowDesktopNumber(hwnd);
+    const bool alreadyOnMacro = (macroIdx >= 0)
+        && (winDesk == macroIdx || vda.IsWindowOnDesktopNumber(hwnd, macroIdx));
+
+    if (!alreadyOnMacro) {
+        // 先最小化再 UnPin：避免「UnPin 后仍可见」在用户桌闪一帧。
+        MinimizeForQuietDesktopMove(hwnd);
+        if (vda.IsPinnedWindow(hwnd) > 0) {
+            vda.UnPinWindow(hwnd);
+            std::lock_guard<std::mutex> lock(g_cdpParkMu);
+            g_cdpPinned.erase(hwnd);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        holdView(40);
+        if (!desk.MoveWindowToMacroDesktop(hwnd)) {
+            WindowModeLogf(L"[窗口模式] CDP 停放 Move 失败: %s", desk.LastError().c_str());
+            holdView(150);
+            return false;
+        }
+    }
+
+    ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+    const bool live = CdpHideLiveOffscreen(hwnd, viewBefore);
+    holdView(80);
+    WindowModeLogf(L"[窗口模式] CDP 停放: iconic=%d live=%d（Move+Pin屏外；禁异桌裸还原）",
+        IsIconic(hwnd) ? 1 : 0, live ? 1 : 0);
+    return live || alreadyOnMacro;
+}
+
+void PrepareMacroDesktopForCdpBind(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    ParkCdpBrowserOnMacroDesktop(hwnd);
+}
+
+bool EnsureCdpBrowserLiveFrames(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (UserOnMacroDesktopNow()) {
+        if (!WindowNeedsCdpReveal(hwnd)) return true;
+        return CdpRevealOnMacroForWatch(hwnd);
+    }
+    if (IsCdpLiveOffscreenParked(hwnd)) return true;
+    const int viewBefore = VirtualDesktopAccessor::Instance().GetCurrentDesktopNumber();
+    return CdpHideLiveOffscreen(hwnd, viewBefore);
+}
+
+bool EnsureTargetOnMacroDesktop(HWND hwnd, bool minimizeIfMoved) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    // Pin+屏外：已在宏桌面工作面；VDA 常报 desk=-1。再 Move/SoftRestore 会拆停放并切屏。
+    if (IsCdpLiveOffscreenParked(hwnd)) return true;
+
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (!vda.EnsureLoaded(err)) return false;
+    const int macroIdx = vda.FindDesktopIndexByName(kMacroDesktopDisplayName);
+    if (macroIdx >= 0 && vda.IsWindowOnDesktopNumber(hwnd, macroIdx)) {
+        return true;
+    }
+    // 已 Pin（含尚未移到屏外的瞬间）：勿 Move，避免 PreservingView 失败切屏。
+    if (vda.IsPinnedWindow(hwnd) > 0) return true;
+
+    MacroVirtualDesktop desk;
+    if (!desk.OpenOrCreate()) return false;
+    if (minimizeIfMoved) {
+        MinimizeForQuietDesktopMove(hwnd);
+    }
+    if (!desk.MoveWindowToMacroDesktop(hwnd)) return false;
+    if (!minimizeIfMoved) {
+        SoftRestoreNonActivating(hwnd);
+    }
+    StripCloakAndNearInvisibleAlpha(hwnd);
+    ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
+    return true;
+}
+
+void ScheduleCdpParkViewPin(int /*preferDesk*/, int /*durationMs*/) {
+    // 已废止：持续 GoTo 钉视违反「只搬窗」。
+}
+
+void StartCdpMacroDesktopWatchPump(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    std::lock_guard<std::mutex> lock(g_watchMu);
+    g_watchStop.store(true, std::memory_order_release);
+    g_watchHwnd.store(nullptr, std::memory_order_release);
+    if (g_watchThread.joinable()) {
+        g_watchThread.join();
+    }
+    g_watchStop.store(false, std::memory_order_release);
+    g_watchHwnd.store(hwnd, std::memory_order_release);
+    g_watchThread = std::thread([] {
+        int onMacroStreak = 0;
+        int offMacroStreak = 0;
+        int revealTries = 0;
+        int sinceRevealTick = 0;
+        bool revealed = false;
+        while (!g_watchStop.load(std::memory_order_acquire)) {
+            HWND h = g_watchHwnd.load(std::memory_order_acquire);
+            const bool onMacro = h && IsWindow(h) && UserOnMacroDesktopNow();
+            if (onMacro) {
+                offMacroStreak = 0;
+                // ~0.3s 确认即揭开（原 ~4s 用户觉得展开太慢）；离桌仍用更长确认防误收
+                if (++onMacroStreak >= 3) {
+                    if (!WindowNeedsCdpReveal(h)) {
+                        revealed = true;
+                        revealTries = 0;
+                        sinceRevealTick = 0;
+                    } else {
+                        ++sinceRevealTick;
+                        // 首揭；失败后再隔 ~1s 重试（最多 3 次）
+                        if (revealTries == 0 || (revealTries < 3 && sinceRevealTick >= 10)) {
+                            RaiseMacroDesktopWindowForWatch(h);
+                            ++revealTries;
+                            sinceRevealTick = 0;
+                            if (!WindowNeedsCdpReveal(h)) {
+                                revealed = true;
+                            } else {
+                                RECT wr{};
+                                if (GetWindowRect(h, &wr) && !IsIconic(h)
+                                    && PlacementLooksOnScreen(wr)) {
+                                    revealed = true;
+                                }
+                            }
+                        }
+                    }
+                    onMacroStreak = 3;
+                }
+            } else if (h && IsWindow(h)) {
+                onMacroStreak = 0;
+                // ~1s 确认离桌
+                if (++offMacroStreak >= 10) {
+                    if (revealed && !IsCdpLiveOffscreenParked(h)
+                        && !UserOnMacroDesktopNow()) {
+                        const int view = VirtualDesktopAccessor::Instance().GetCurrentDesktopNumber();
+                        if (CdpHideLiveOffscreen(h, view)) {
+                            WindowModeLog(L"[窗口模式] 用户已离宏桌面：已回 Pin+屏外（防切屏）");
+                        }
+                        revealed = false;
+                        revealTries = 0;
+                        sinceRevealTick = 0;
+                    }
+                    offMacroStreak = 10;
+                }
+            } else {
+                onMacroStreak = 0;
+                offMacroStreak = 0;
+                revealed = false;
+                revealTries = 0;
+                sinceRevealTick = 0;
+            }
+            // 100ms 一轮
+            for (int i = 0; i < 2 && !g_watchStop.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    });
+}
+
+void SignalStopCdpMacroDesktopWatchPump() {
+    g_watchStop.store(true, std::memory_order_release);
+    g_watchHwnd.store(nullptr, std::memory_order_release);
+}
+
+void StopCdpMacroDesktopWatchPump() {
+    SignalStopCdpMacroDesktopWatchPump();
+    std::lock_guard<std::mutex> lock(g_watchMu);
+    if (g_watchThread.joinable()) {
+        g_watchThread.join();
+    }
 }
 
 }  // namespace windowmode

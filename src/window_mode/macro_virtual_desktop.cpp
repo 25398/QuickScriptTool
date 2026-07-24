@@ -311,6 +311,25 @@ void MacroVirtualDesktop::Close() {
     ready_ = false;
 }
 
+void MacroVirtualDesktop::WarmupAtProcessStart() {
+    auto& vda = VirtualDesktopAccessor::Instance();
+    std::wstring err;
+    if (!vda.EnsureLoaded(err)) return;
+    const int index = vda.FindDesktopIndexByName(kMacroDesktopDisplayName);
+    if (index < 0) {
+        WindowModeLog(L"[窗口模式] 预热：未找到「鼠标宏」桌面（创建推迟到绑窗）");
+        return;
+    }
+    GUID id{};
+    if (!LoadMacroDesktopId(index, id)) {
+        vda.GetDesktopIdByNumber(index, id);
+    }
+    if (!GuidIsEmpty(id)) {
+        SaveMacroDesktopCache(index, id);
+    }
+    WindowModeLog(L"[窗口模式] 预热：已缓存「鼠标宏」桌面（CreateDesktop+HoldView 未跑）");
+}
+
 bool MacroVirtualDesktop::IsValid() const {
     return ready_ && desktopIndex_ >= 0;
 }

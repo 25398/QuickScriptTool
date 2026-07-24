@@ -47,6 +47,10 @@ bool IsDescendantProcess(DWORD pid, DWORD ancestorPid);
 HWND FindChildWindowByClass(HWND parent, const std::wstring& childClassName);
 /// Edge/Chrome 页面渲染区（Flash/HTML5 游戏），优先于顶层 Chrome_WidgetWin_1。
 HWND FindBrowserRenderWidget(HWND top);
+/// Intermediate D3D Window 等合成层：仅截图可用，不可作输入绑定目标。
+bool IsBrowserCompositorHwnd(HWND hwnd);
+/// 找图/截图表面：优先 RenderWidget；否则可回退 compositor（D3D）。
+HWND FindBrowserCaptureSurface(HWND top);
 bool MainWindowHasChildClass(HWND hwnd, const std::wstring& childClassName);
 HWND TopLevelTargetWindow(HWND hwnd);
 bool IsWindowOnUserCurrentDesktop(HWND hwnd);
@@ -81,6 +85,51 @@ void HideTransientGdiPlusWindows(DWORD extraPid = 0);
 void PinMacroDesktopWindowBottom(HWND hwnd);
 /// 跨虚拟桌面移动前安静最小化，避免窗口乱跳。
 void MinimizeForQuietDesktopMove(HWND hwnd);
+
+/// 安静铺满监视器工作区（禁止 SW_SHOWMAXIMIZED——会切虚拟桌面）。
+bool RestoreMinimizedQuietPreferMax(HWND hwnd);
+/// 顶层窗是否已接近监视器工作区尺寸（安静铺满后的判据，替代 IsZoomed）。
+bool WindowFillsWorkArea(HWND hwnd, int slackPx = 48);
+/// Chrome/Edge 顶层不支持假焦点注入。
+bool IsBrowserFakeFocusUnsupported(HWND hwnd);
+
+/// CDP：Pin+屏外出帧；用户在宏桌面且仍需揭开时再 UnPin。
+bool EnsureCdpBrowserLiveFrames(HWND hwnd);
+/// CDP/扩展：Move「鼠标宏」后 Pin+屏外（禁异桌裸还原，否则鼠标切屏）。
+bool ParkCdpBrowserOnMacroDesktop(HWND hwnd);
+/// CDP 绑窗最小停放（内部走 ParkCdpBrowserOnMacroDesktop）。
+void PrepareMacroDesktopForCdpBind(HWND hwnd);
+/// 若目标已偏离「鼠标宏」则安静迁回（默认不强制最小化）。
+bool EnsureTargetOnMacroDesktop(HWND hwnd, bool minimizeIfMoved = false);
+
+/// 宏桌面目标：禁 Peek 预览（softMessage 可用；CDP 停放后须 Clear）。
+void SuppressMacroDesktopTaskbarPreview(HWND hwnd);
+bool IsMacroDesktopTaskbarPreviewSuppressed(HWND hwnd);
+void ClearMacroDesktopTaskbarPreviewSuppression(HWND hwnd = nullptr);
+
+/// 强制揭开 DWM Cloak / 近透明 Layered。
+void ForceRevealMacroDesktopWindow(HWND hwnd);
+/// 用户在「鼠标宏」观看：揭 Cloak（不抢前台激活）。仅当仍有隐身时生效。
+void RaiseMacroDesktopWindowForWatch(HWND hwnd);
+
+/// 找图 latch（遗留 softMessage Cloak 路径）；CDP ≥1.1.39 不 latch。
+bool IsMacroVisionLatched(HWND hwnd);
+bool IsMacroVisionCaptureReady(HWND hwnd);
+bool IsMacroVisionInvisibilityActive(HWND hwnd);
+void ReleaseMacroDesktopVisionLatch(HWND hwnd = nullptr);
+void RestoreMacroDesktopWindowAfterRun(HWND hwnd);
+
+/// 用户当前是否在「鼠标宏」虚拟桌面（只读，不切桌）。
+bool UserOnMacroDesktopNow();
+
+/// CDP 运行期：仅当用户已在「鼠标宏」且仍有隐身时 Raise；永不 GoTo。
+void StartCdpMacroDesktopWatchPump(HWND hwnd);
+/// 仅置停止标志（热键 UI 线程可用）；不 join。
+void SignalStopCdpMacroDesktopWatchPump();
+/// 置停止并 join（EndRun / 析构路径）。
+void StopCdpMacroDesktopWatchPump();
+/// 已废止：持续 GoTo 钉视。保留符号，调用为空操作。
+void ScheduleCdpParkViewPin(int preferDesk, int durationMs = 5000);
 
 /// 找图/OCR：宏桌面统一先最小化再无感展开 + GDI；结束后还原，若误切桌面则切回。
 class ScopedVisionCapturePrep {

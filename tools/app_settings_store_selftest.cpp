@@ -11,6 +11,7 @@
 #include "app_theme.h"
 #include "utils.h"
 
+#include <cmath>
 #include <fstream>
 #include <string>
 
@@ -41,6 +42,8 @@ const selftest::CaseInfo kCases[] = {
         L"ai.savedModels modelName roundtrip"},
     {L"save_load_home_tab", L"default",
         L"home.activeTab + selectedScriptPath roundtrip"},
+    {L"save_load_other_os_flags", L"default",
+        L"autoStartOnBoot + resolveImeConflict roundtrip"},
     {L"load_garbage_partial_safe", L"default",
         L"Garbage JSON does not crash; defaults remain usable"},
 };
@@ -197,6 +200,19 @@ void CaseHomeTab(SettingsFileGuard& /*g*/) {
     Emit(L"save_load_home_tab", ok, ok ? L"" : L"home state lost");
 }
 
+void CaseOtherOsFlags(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.other.autoStartOnBoot = true;
+    s.other.resolveImeConflict = true;
+    s.other.holdThresholdSeconds = 0.35;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    const bool ok = loaded.other.autoStartOnBoot && loaded.other.resolveImeConflict
+        && std::abs(loaded.other.holdThresholdSeconds - 0.35) < 1e-9;
+    Emit(L"save_load_other_os_flags", ok, ok ? L"" : L"other OS flags lost");
+}
+
 void CaseGarbage(SettingsFileGuard& /*g*/) {
     WriteRawSettings(AppSettingsFilePath(), "{not json!!!}");
     AppSettings loaded{};
@@ -244,6 +260,7 @@ int wmain(int argc, wchar_t** argv) {
         CaseWmPreviewClamp(guard);
         CaseAiModels(guard);
         CaseHomeTab(guard);
+        CaseOtherOsFlags(guard);
         CaseGarbage(guard);
     }
 

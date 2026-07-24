@@ -31,4 +31,10 @@
 // 5) 其它摘要
 //    - 「指定窗口类」自动打开文档：目标程序 + 文件参数；禁止裸 ShellExecute(文档) 当主路径。
 //    - 命令行参数先剥外层引号；childWindowClassName 时后台与宏桌面都要能绑子控件。
+//
+// 6) CDP + 配套扩展（浏览器）输入策略分流
+//    A) CDP/扩展：键鼠/找图走扩展；宿主 Minimize→Move「鼠标宏」后 Pin+屏外（工作区尺寸）。
+//       异桌裸还原会在鼠标时切屏（已证伪）。观看 UnPin+迁回宏桌面；已展开禁再 Placement。
+//    B) softMessage / 假焦点：宏桌面 + Win32；绑后可最小化。
+//    详见 .cursor/skills/window-mode-debug/cdp-requirements.md / cdp-lessons.md
 // =============================================================================

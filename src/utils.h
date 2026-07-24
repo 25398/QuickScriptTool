@@ -48,6 +48,8 @@ std::vector<std::wstring> ExtractJsonActionBlocks(const std::wstring& content);
 std::wstring ReadAll(const std::wstring& path);
 std::wstring ExtractString(const std::wstring& src, const std::wstring& key);
 double      ExtractNumber(const std::wstring& src, const std::wstring& key, double fallback);
+/// 解析 JSON 布尔：支持 true/false 与 1/0（ExtractNumber 无法解析 true/false）
+bool        ExtractBool(const std::wstring& src, const std::wstring& key, bool fallback);
 int         CountActionsInJson(const std::wstring& content);
 /// 更新 JSON 中某个字符串字段的值（字段必须已存在）
 std::wstring UpdateJsonStringField(const std::wstring& content,
@@ -90,6 +92,8 @@ std::string ReadTextFromZip(const std::wstring& zipPath, const std::string& arch
 // ── 热键与按键名称 ────────────────────────────────────────────────
 std::wstring VkName(UINT vk);
 std::wstring HotkeyText(UINT modifiers, UINT vk);
+/// holdMode：按下/松开各触发一次（与鼠标左键启停同语义）
+std::wstring HotkeyText(UINT modifiers, UINT vk, bool holdMode);
 
 /// Hotkey 数据结构 — 存储热键组合、文本、开关状态
 struct Hotkey {
@@ -97,7 +101,15 @@ struct Hotkey {
     UINT vk = VK_F8;
     std::wstring text = L"F8";
     bool enabled = true;
+    /// 按住启停：按下达阈值后启动，松开停止（捕获时按住达「长按判定」设为 true）
+    bool holdMode = false;
 };
+
+/// 规范化长按判定秒数（须 > 0，默认 0.2）
+double NormalizeHoldThresholdSeconds(double seconds);
+DWORD HoldThresholdMsFromSeconds(double seconds);
+/// 格式化为提示文案用数字（如 0.2、1）
+std::wstring FormatHoldThresholdLabel(double seconds);
 
 /// 脚本元数据结构 — 存储脚本文件的基本信息
 struct ScriptMeta {
@@ -111,3 +123,7 @@ struct ScriptMeta {
 
 /// 格式化秒数为 分'秒" 格式
 std::wstring FormatDuration(double sec);
+
+/// 开机自动启动（HKCU\\...\\Run，值名「鼠大侠」）
+bool SetAutoStartOnBoot(bool enabled);
+bool IsAutoStartOnBootEnabled();

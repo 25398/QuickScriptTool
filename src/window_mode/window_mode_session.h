@@ -29,6 +29,8 @@ public:
     const WindowModeScriptConfig& Config() const { return config_; }
     HiddenDesktop& Desktop() { return desktop_; }
     bool RefreshInputBinding(std::wstring& err);
+    /// CDP：宏桌面被删则重建；目标偏离则再 Park（PreservingView）。
+    bool EnsureMacroDesktopReady(std::wstring& err);
 
 private:
     bool EnsureDesktop(std::wstring& err);

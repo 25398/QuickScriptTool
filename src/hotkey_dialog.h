@@ -15,7 +15,8 @@ public:
     ~HotkeyCapture() = default;
 
     bool Show(HWND owner, const Hotkey& oldValue, bool scriptHotkey,
-              Hotkey& out, bool globalStartStop = false);
+              Hotkey& out, bool globalStartStop = false,
+              double holdThresholdSeconds = 0.2);
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -27,9 +28,17 @@ private:
     void OnMouseLeave();
     void OnSetCursor();
     void OnLButtonDown(int x, int y);
-    void OnKey(UINT vk);
+    void OnKeyDown(UINT vk);
+    void OnKeyUp(UINT vk);
+    void OnHoldCaptureTimer();
     void Close(bool accept);
     void CleanupGdi();
+    void CancelPendingCapture();
+    void ApplyCapturedKey(UINT vk, UINT mods, bool holdMode);
+    bool IsHotkeyCaptureMode() const { return scriptHotkey_ || globalStartStop_; }
+    DWORD CaptureHoldMs() const {
+        return HoldThresholdMsFromSeconds(holdThresholdSeconds_);
+    }
 
     void SetHoverFlag(bool& flag, bool value, const RECT& rc);
     void UpdateHover(int x, int y);
@@ -49,6 +58,8 @@ private:
 
     void DrawBtn(HDC hdc, const RECT& rc, const wchar_t* text, bool green, bool hover);
 
+    static constexpr UINT_PTR kHoldCaptureTimerId = 1;
+
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
     HFONT font_ = nullptr;
@@ -57,6 +68,7 @@ private:
     Hotkey current_{};
     bool scriptHotkey_ = false;
     bool globalStartStop_ = false;
+    double holdThresholdSeconds_ = 0.2;
     bool done_ = false;
     bool accepted_ = false;
     bool trackingMouse_ = false;
@@ -64,5 +76,9 @@ private:
     bool hoverCancel_ = false;
     bool hoverReset_ = false;
     bool hoverDelete_ = false;
+    bool pendingDown_ = false;
+    UINT pendingVk_ = 0;
+    UINT pendingMods_ = 0;
+    DWORD pendingDownTick_ = 0;
     WindowOuterShadow outerShadow_;
 };

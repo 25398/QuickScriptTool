@@ -78,6 +78,17 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block) {
     cfg.targetPickX = static_cast<int>(ExtractNumber(block, L"targetPickX", 0.0));
     cfg.targetPickY = static_cast<int>(ExtractNumber(block, L"targetPickY", 0.0));
     cfg.allowForegroundInputFallback = ParseBool01(block, L"allowForegroundInputFallback", false);
+    cfg.fakeFocusEnabled = ParseBool01(block, L"fakeFocusEnabled", false);
+    const std::wstring strategy = ExtractString(block, L"inputStrategy");
+    if (strategy == L"softMessage" || strategy == L"postMessage") {
+        cfg.inputStrategy = WindowModeInputStrategy::SoftMessage;
+    } else if (strategy == L"cdp") {
+        cfg.inputStrategy = WindowModeInputStrategy::Cdp;
+    } else {
+        cfg.inputStrategy = WindowModeInputStrategy::Auto;
+    }
+    cfg.cdpPort = static_cast<int>(ExtractNumber(block, L"cdpPort", 9222.0));
+    if (cfg.cdpPort <= 0) cfg.cdpPort = 9222;
     if (cfg.windowName.empty() && !cfg.targetWindowTitle.empty()) {
         cfg.windowName = cfg.targetWindowTitle;
     }
@@ -89,6 +100,17 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block) {
             && !cfg.targetExePath.empty()) {
             cfg.enabled = true;
         }
+    }
+    // 关闭窗口模式时清掉目标身份，避免残留误绑。
+    if (enabledKeyPresent && !cfg.enabled) {
+        cfg.targetExePath.clear();
+        cfg.targetWindowTitle.clear();
+        cfg.windowName.clear();
+        cfg.windowClassName.clear();
+        cfg.childWindowClassName.clear();
+        cfg.launchArgs.clear();
+        cfg.fakeFocusEnabled = false;
+        cfg.inputStrategy = WindowModeInputStrategy::Auto;
     }
     return cfg;
 }
@@ -124,23 +146,40 @@ WindowModeScriptConfig ParseWindowModeJson(const std::wstring& content) {
 }
 
 void WriteWindowModeJson(std::wstring& out, const WindowModeScriptConfig& cfg, bool trailingComma) {
+    WindowModeScriptConfig w = cfg;
+    if (!w.enabled) {
+        w.targetExePath.clear();
+        w.targetWindowTitle.clear();
+        w.windowName.clear();
+        w.windowClassName.clear();
+        w.childWindowClassName.clear();
+        w.launchArgs.clear();
+        w.fakeFocusEnabled = false;
+        w.inputStrategy = WindowModeInputStrategy::Auto;
+    }
     out += L"  \"windowMode\": {\n";
-    out += L"    \"enabled\": " + std::to_wstring(cfg.enabled ? 1 : 0) + L",\n";
-    out += L"    \"executionKind\": \"" + ExecutionKindToJson(cfg.executionKind) + L"\",\n";
-    out += L"    \"targetExePath\": \"" + EscapeJson(cfg.targetExePath) + L"\",\n";
-    out += L"    \"targetWindowTitle\": \"" + EscapeJson(cfg.targetWindowTitle) + L"\",\n";
-    out += L"    \"coordSpace\": \"" + CoordSpaceToJson(cfg.coordSpace) + L"\",\n";
-    out += L"    \"autoLaunchTarget\": " + std::to_wstring(cfg.autoLaunchTarget ? 1 : 0) + L",\n";
-    out += L"    \"launchArgs\": \"" + EscapeJson(cfg.launchArgs) + L"\",\n";
-    out += L"    \"selectMethod\": \"" + SelectMethodToJson(cfg.selectMethod) + L"\",\n";
-    out += L"    \"windowName\": \"" + EscapeJson(cfg.windowName) + L"\",\n";
-    out += L"    \"windowClassName\": \"" + EscapeJson(cfg.windowClassName) + L"\",\n";
-    out += L"    \"childWindowClassName\": \"" + EscapeJson(cfg.childWindowClassName) + L"\",\n";
-    out += L"    \"useTopLevelWindow\": " + std::to_wstring(cfg.useTopLevelWindow ? 1 : 0) + L",\n";
-    out += L"    \"targetPickX\": " + std::to_wstring(cfg.targetPickX) + L",\n";
-    out += L"    \"targetPickY\": " + std::to_wstring(cfg.targetPickY) + L",\n";
+    out += L"    \"enabled\": " + std::to_wstring(w.enabled ? 1 : 0) + L",\n";
+    out += L"    \"executionKind\": \"" + ExecutionKindToJson(w.executionKind) + L"\",\n";
+    out += L"    \"targetExePath\": \"" + EscapeJson(w.targetExePath) + L"\",\n";
+    out += L"    \"targetWindowTitle\": \"" + EscapeJson(w.targetWindowTitle) + L"\",\n";
+    out += L"    \"coordSpace\": \"" + CoordSpaceToJson(w.coordSpace) + L"\",\n";
+    out += L"    \"autoLaunchTarget\": " + std::to_wstring(w.autoLaunchTarget ? 1 : 0) + L",\n";
+    out += L"    \"launchArgs\": \"" + EscapeJson(w.launchArgs) + L"\",\n";
+    out += L"    \"selectMethod\": \"" + SelectMethodToJson(w.selectMethod) + L"\",\n";
+    out += L"    \"windowName\": \"" + EscapeJson(w.windowName) + L"\",\n";
+    out += L"    \"windowClassName\": \"" + EscapeJson(w.windowClassName) + L"\",\n";
+    out += L"    \"childWindowClassName\": \"" + EscapeJson(w.childWindowClassName) + L"\",\n";
+    out += L"    \"useTopLevelWindow\": " + std::to_wstring(w.useTopLevelWindow ? 1 : 0) + L",\n";
+    out += L"    \"targetPickX\": " + std::to_wstring(w.targetPickX) + L",\n";
+    out += L"    \"targetPickY\": " + std::to_wstring(w.targetPickY) + L",\n";
     out += L"    \"allowForegroundInputFallback\": "
-        + std::to_wstring(cfg.allowForegroundInputFallback ? 1 : 0) + L"\n";
+        + std::to_wstring(w.allowForegroundInputFallback ? 1 : 0) + L",\n";
+    out += L"    \"fakeFocusEnabled\": " + std::to_wstring(w.fakeFocusEnabled ? 1 : 0) + L",\n";
+    const wchar_t* strategy = L"auto";
+    if (w.inputStrategy == WindowModeInputStrategy::SoftMessage) strategy = L"softMessage";
+    else if (w.inputStrategy == WindowModeInputStrategy::Cdp) strategy = L"cdp";
+    out += L"    \"inputStrategy\": \"" + std::wstring(strategy) + L"\",\n";
+    out += L"    \"cdpPort\": " + std::to_wstring(w.cdpPort > 0 ? w.cdpPort : 9222) + L"\n";
     out += L"  }" + std::wstring(trailingComma ? L",\n" : L"\n");
 }
 

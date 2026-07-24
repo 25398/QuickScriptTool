@@ -374,6 +374,7 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
     data.hotkey.text = ExtractString(content, L"hotkeyText");
     data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
     data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+    data.hotkey.holdMode = ExtractBool(content, L"hotkeyHold", false);
     data.hotkey.enabled = data.hotkey.vk != 0;
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
         ExtractNumber(content, L"breakoutTimeSeconds", 0));
@@ -444,6 +445,7 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
     data.hotkey.text = ExtractString(content, L"hotkeyText");
     data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
     data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+    data.hotkey.holdMode = ExtractBool(content, L"hotkeyHold", false);
     data.hotkey.enabled = data.hotkey.vk != 0;
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
         ExtractNumber(content, L"breakoutTimeSeconds", 0));
@@ -519,6 +521,7 @@ bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data) {
     file << L"  \"hotkeyText\": \"" << EscapeJson(data.hotkey.text) << L"\",\n";
     file << L"  \"hotkeyVk\": " << data.hotkey.vk << L",\n";
     file << L"  \"hotkeyModifiers\": " << data.hotkey.modifiers << L",\n";
+    file << L"  \"hotkeyHold\": " << (data.hotkey.holdMode ? 1 : 0) << L",\n";
     if (!IsRecordingScriptPath(path)) {
         file << L"  \"breakoutTimeSeconds\": " << normalized.breakoutTimeSeconds << L",\n";
     }

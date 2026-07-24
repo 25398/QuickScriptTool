@@ -78,12 +78,16 @@
 #include "find_image_ui_debug.h"
 #include "taskbar_window.h"
 #include "breakout_input.h"
+
+#include <imm.h>
+#pragma comment(lib, "imm32.lib")
 #include "window_mode/window_mode_session.h"
 #include "window_mode/window_mode_executor.h"
 #include "window_mode/window_mode_log.h"
 #include "window_mode/window_mode_json.h"
 #include "window_mode/window_pick_dialog.h"
 #include "window_mode/window_coords.h"
+#include "window_mode/ext_bridge/ext_bridge_server.h"
 #include "process_utils.h"
 
 // ── Global-hotkey low-level hook (fallback when RegisterHotKey is unavailable) ──
@@ -101,17 +105,149 @@ inline bool ghHotkeyEnabled = false;
 /// 回放/录制/连点进行中：热键停止时放宽修饰键判定。
 inline std::atomic<bool> ghHotkeySessionBusy{false};
 constexpr UINT_PTR kHotkeyLatchSyncTimerId = 0x48534B31u; // 'HSK1'
-/// 仅左键：长按超过阈值后开始连点，松开停止；右键仍为单击切换
-constexpr DWORD kMouseHoldHotkeyMs = 200;
+/// 仅左键 / holdMode：按住超过阈值后开始，松开停止；右键等仍为单击切换
+/// 阈值由「其他设置 → 长按判定」写入 ghHoldThresholdMs（默认 200ms）
+inline std::atomic<DWORD> ghHoldThresholdMs{200};
+inline DWORD CurrentHoldThresholdMs() {
+    const DWORD ms = ghHoldThresholdMs.load(std::memory_order_relaxed);
+    return ms < 1 ? 200 : ms;
+}
 inline DWORD ghHotkeyMouseDownTick = 0;
 inline bool ghHotkeyMouseHoldArmed = false;  // 已按下、等待达到长按阈值
 inline bool ghHotkeyMouseHoldDown = false;   // 已触发开始，等待松开停止
-/// WM_GLOBAL_HOTKEY_DETECTED 的 wParam：左键按住启停命令
+/// 全局热键为「按住启停」模式（键盘捕获达判定时间，或鼠标左键）
+inline bool ghHotkeyHoldMode = false;
+/// WM_GLOBAL_HOTKEY_DETECTED 的 wParam：按住启停命令；lParam 非 0 时为脚本热键 id
 constexpr WPARAM kHotHoldStart = 1;
 constexpr WPARAM kHotHoldStop = 2;
 
+/// 当前由「按住启停」拉起的热键 id（脚本 id 或 HOTKEY_GLOBAL_ID）。
+/// 必须独立于 hook 表：SuspendHotkeys/RegisterAllHotkeys 会重建表并清掉 holdActive，
+/// 否则松开无法停止。
+inline std::atomic<int> ghActiveHoldHotkeyId{0};
+
+inline void SetActiveHoldHotkeyId(int id) {
+    ghActiveHoldHotkeyId.store(id, std::memory_order_relaxed);
+}
+inline void ClearActiveHoldHotkeyId() {
+    ghActiveHoldHotkeyId.store(0, std::memory_order_relaxed);
+}
+inline bool IsActiveHoldHotkeyId(int id) {
+    return id != 0 && ghActiveHoldHotkeyId.load(std::memory_order_relaxed) == id;
+}
+
+/// 设置热键弹窗打开时：放行「正在编辑」的那枚键（便于同键改短按↔长按），其它占用键仍拦截。
+inline bool ghHotkeyCaptureOpen = false;
+inline UINT ghHotkeyCaptureIgnoreVk = 0;
+
+inline bool IsHotkeyCapturePassThroughVk(UINT vk) {
+    return ghHotkeyCaptureOpen && ghHotkeyCaptureIgnoreVk != 0 && vk == ghHotkeyCaptureIgnoreVk;
+}
+
+/// 宏回放中：已注销 RegisterHotKey（避免吞掉 SendInput），脚本热键改由 LL 钩子识别物理键。
+inline bool ghPlaybackHotkeySuspended = false;
+/// 「中文输入法不触发热键」：键盘热键不走 RegisterHotKey（否则系统会吞键），改由 LL 决定放行/触发。
+inline std::atomic<bool> ghPassThroughTypingHotkeys{false};
+constexpr int kMaxPlaybackScriptHooks = 64;
+struct PlaybackScriptHook {
+    UINT vk = 0;
+    UINT mods = 0;
+    int hotkeyId = 0;
+    bool holdMode = false;
+    bool holdArmed = false;
+    bool holdActive = false;
+    bool holdExtended = false;
+    DWORD holdDownTick = 0;
+    uint32_t holdSeq = 0;         // 本次按下序号
+    uint32_t holdInvalidSeq = 0;  // 短按抬起作废的序号（禁止随后误启）
+};
+inline PlaybackScriptHook ghPlaybackScriptHooks[kMaxPlaybackScriptHooks]{};
+inline int ghPlaybackScriptHookCount = 0;
+
+/// 全局按住：按下序号 / 短按作废序号（不用 GetAsyncKeyState，吞键后异步键态不可信）
+inline std::atomic<uint32_t> ghHoldSeqCounter{1};
+inline uint32_t ghHotkeyHoldSeq = 0;
+inline uint32_t ghHotkeyHoldInvalidSeq = 0;
+inline uint32_t ghHotkeyHoldPostedSeq = 0;
+
+inline uint32_t NextHoldSeq() {
+    return ghHoldSeqCounter.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void InvalidateHoldSeq(uint32_t seq) {
+    if (seq != 0) ghHotkeyHoldInvalidSeq = seq;
+}
+
+inline bool IsHoldSeqInvalid(uint32_t seq) {
+    return seq == 0 || seq == ghHotkeyHoldInvalidSeq;
+}
+
 inline bool NeedsMouseHoldHotkey(UINT vk) {
     return vk == VK_LBUTTON;
+}
+
+inline bool NeedsHoldHotkey() {
+    return ghHotkeyHoldMode || NeedsMouseHoldHotkey(ghHotkeyVk);
+}
+
+inline bool IsMouseVk(UINT vk) {
+    return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON
+        || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+}
+
+inline bool QueryRemoteImeOpenFree(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    const HWND imeWnd = ImmGetDefaultIMEWnd(hwnd);
+    if (!imeWnd) return false;
+    DWORD_PTR status = 0;
+    if (SendMessageTimeoutW(imeWnd, WM_IME_CONTROL, 0x5, 0,
+            SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &status) == 0) {
+        return false;
+    }
+    return status != 0;
+}
+
+inline bool QueryRemoteImeNativeModeFree(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    const HWND imeWnd = ImmGetDefaultIMEWnd(hwnd);
+    if (!imeWnd) return false;
+    DWORD_PTR mode = 0;
+    if (SendMessageTimeoutW(imeWnd, WM_IME_CONTROL, 0x1, 0,
+            SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &mode) == 0) {
+        return false;
+    }
+    return (mode & 0x1) != 0;
+}
+
+/// 仅当中文输入法已打开 / 中文模式 / 正在组字时放行热键字符、不触发宏。
+inline bool IsChineseImeActiveForHotkeyPass() {
+    HWND fg = GetForegroundWindow();
+    if (!fg || !IsWindow(fg)) return false;
+
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    if (fgPid == GetCurrentProcessId()) return false;
+
+    DWORD tid = GetWindowThreadProcessId(fg, nullptr);
+    HWND focus = fg;
+    GUITHREADINFO gi{};
+    gi.cbSize = sizeof(gi);
+    if (tid && GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) focus = gi.hwndFocus;
+
+    if (QueryRemoteImeOpenFree(focus) || QueryRemoteImeOpenFree(fg)) return true;
+    if (QueryRemoteImeNativeModeFree(focus) || QueryRemoteImeNativeModeFree(fg)) return true;
+
+    auto imeComposing = [](HWND hwnd) -> bool {
+        if (!hwnd) return false;
+        HIMC himc = ImmGetContext(hwnd);
+        if (!himc) return false;
+        const LONG comp = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
+        ImmReleaseContext(hwnd, himc);
+        return comp > 0;
+    };
+    if (imeComposing(focus) || (focus != fg && imeComposing(fg))) return true;
+
+    return false;
 }
 
 inline bool CheckHotkeyModifiers(UINT required, bool requireNoExtras) {
@@ -136,31 +272,82 @@ inline bool CheckHotkeyModifiers(UINT required, bool requireNoExtras) {
 }
 
 /// 钩子丢 KEYUP 时，用异步键态清掉闩锁，避免启停热键永久哑火。
-/// 注意：左键按住模式禁止用 GetAsyncKeyState——连点 SendInput 的 LEFTUP 会污染键态，导致误停。
+/// 只用于「清除」：异步键态不可靠时不得据此把 NeedKeyUp 强制保持为 true。
+/// 注意：按住模式禁止用 GetAsyncKeyState——连点 SendInput 的 LEFTUP 会污染键态。
 inline void SyncHotkeyLatches() {
     if (!ghHotkeyEnabled || ghHotkeyVk == 0) return;
-    if (NeedsMouseHoldHotkey(ghHotkeyVk)) return;
+    if (NeedsHoldHotkey()) return;
     if ((GetAsyncKeyState(static_cast<int>(ghHotkeyVk)) & 0x8000) == 0) {
         ghHotkeyNeedKeyUp = false;
         ghHotkeyPending = false;
     }
 }
 
-/// 左键长按：按下后计时，仍按住且达到阈值才开始连点（抬起仅由钩子非注入 UP 取消/停止）
+inline void ClearToggleHotkeyLatches() {
+    ghHotkeyNeedKeyUp = false;
+    ghHotkeyPending = false;
+    ghHotkeyHandling = false;
+}
+
+/// 按住热键：按下后计时，仍按住且达到阈值才开始（抬起仅由钩子非注入 UP 取消/停止）
+/// 键盘勿用 GetAsyncKeyState 判是否仍按下：LL 钩子吞掉连发后异步键态常误报已抬起，长按会永不起。
+/// 短按与 Poll 竞态：用 holdSeq / holdInvalidSeq 作废已排队的 Start。
 inline void PollMouseHoldHotkey() {
     if (!ghHotkeyEnabled || !ghHotkeyHwnd || !ghHotkeyMouseHoldArmed || ghHotkeyMouseHoldDown) return;
-    if (!NeedsMouseHoldHotkey(ghHotkeyVk)) return;
-    if (GetTickCount() - ghHotkeyMouseDownTick < kMouseHoldHotkeyMs) return;
-    if (ghHotkeyNeedKeyUp || ghHotkeyPending || ghHotkeyHandling) return;
-    const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
-    if (!CheckHotkeyModifiers(ghHotkeyMods, !busy)) {
+    if (!NeedsHoldHotkey()) return;
+    if (GetTickCount() - ghHotkeyMouseDownTick < CurrentHoldThresholdMs()) return;
+    if (ghHotkeyPending || ghHotkeyHandling) return;
+    // 仅鼠标左键可用异步键态（按下全程放行）；键盘必须跳过
+    if (NeedsMouseHoldHotkey(ghHotkeyVk)
+        && (GetAsyncKeyState(static_cast<int>(ghHotkeyVk)) & 0x8000) == 0) {
         ghHotkeyMouseHoldArmed = false;
+        ghHotkeyMouseDownTick = 0;
+        InvalidateHoldSeq(ghHotkeyHoldSeq);
         return;
     }
+    if (IsHoldSeqInvalid(ghHotkeyHoldSeq) || !ghHotkeyMouseHoldArmed) return;
+    const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
+    if (!CheckHotkeyModifiers(ghHotkeyMods, !busy)) {
+        // 修饰键不对：保持武装，等用户松修饰或继续按住后再试（不直接取消，避免误判）
+        return;
+    }
+    const uint32_t seq = ghHotkeyHoldSeq;
+    if (IsHoldSeqInvalid(seq) || !ghHotkeyMouseHoldArmed) return;
+    ghHotkeyNeedKeyUp = false;
     ghHotkeyMouseHoldArmed = false;
     ghHotkeyMouseHoldDown = true;
     ghHotkeyPending = true;
+    ghHotkeyHoldPostedSeq = seq;
+    SetActiveHoldHotkeyId(HOTKEY_GLOBAL_ID);
     PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStart, 0);
+}
+
+inline void PollScriptHoldHotkeys() {
+    if (!ghHotkeyHwnd) return;
+    const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
+    for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+        auto& h = ghPlaybackScriptHooks[i];
+        if (!h.holdMode || !h.holdArmed || h.holdActive || !h.vk) continue;
+        if (GetTickCount() - h.holdDownTick < CurrentHoldThresholdMs()) continue;
+        if (h.holdSeq == 0 || h.holdSeq == h.holdInvalidSeq) {
+            h.holdArmed = false;
+            h.holdDownTick = 0;
+            continue;
+        }
+        if (!CheckHotkeyModifiers(h.mods, !busy)) continue;
+        const uint32_t seq = h.holdSeq;
+        if (!h.holdArmed || seq == h.holdInvalidSeq) continue;
+        h.holdArmed = false;
+        h.holdActive = true;
+        SetActiveHoldHotkeyId(h.hotkeyId);
+        PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStart,
+            static_cast<LPARAM>(h.hotkeyId));
+    }
+}
+
+inline void PollHoldHotkeys() {
+    PollMouseHoldHotkey();
+    PollScriptHoldHotkeys();
 }
 
 inline void FlushQueuedGlobalHotkeys(HWND hwnd) {
@@ -177,32 +364,180 @@ inline void FlushQueuedGlobalHotkeys(HWND hwnd) {
     }
 }
 
-inline bool IsMouseVk(UINT vk) {
-    return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON
-        || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
-}
-
 inline LRESULT CALLBACK HotkeyKbProc(int code, WPARAM wp, LPARAM lp) {
-    if (code >= 0 && ghHotkeyEnabled && !IsMouseVk(ghHotkeyVk)) {
+    if (code >= 0) {
         auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         // 忽略脚本 SendInput 注入，避免误触发启停热键
         if (!(ks->flags & LLKHF_INJECTED)) {
+            // 设置热键中：当前正在改的那枚键交给捕获窗，不触发启停
+            if (IsHotkeyCapturePassThroughVk(ks->vkCode)) {
+                return CallNextHookEx(nullptr, code, wp, lp);
+            }
             const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
             const bool up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
-            if (up && ks->vkCode == ghHotkeyVk) {
-                ghHotkeyPending = false;
-                ghHotkeyNeedKeyUp = false;
-            }
-            if (down && ks->vkCode == ghHotkeyVk) {
-                // 同一次物理按下：RegisterHotKey 已处理后等到抬起再响应。
-                if (ghHotkeyNeedKeyUp || ghHotkeyPending || ghHotkeyHandling) {
-                    return CallNextHookEx(nullptr, code, wp, lp);
+            const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
+            const bool passMode = ghPassThroughTypingHotkeys.load(std::memory_order_relaxed);
+            const bool scriptViaHook = ghPlaybackHotkeySuspended || passMode;
+
+            // 中文输入法已触发：放行热键字符；忙碌态仍触发以便停止
+            const bool passToApp = passMode && !busy && IsChineseImeActiveForHotkeyPass();
+
+            if (ghHotkeyEnabled && !IsMouseVk(ghHotkeyVk) && ks->vkCode == ghHotkeyVk) {
+                if (NeedsHoldHotkey()) {
+                    if (up) {
+                        const bool wasArmed = ghHotkeyMouseHoldArmed;
+                        const bool wasActive = ghHotkeyMouseHoldDown
+                            || IsActiveHoldHotkeyId(HOTKEY_GLOBAL_ID);
+                        const uint32_t seq = ghHotkeyHoldSeq;
+                        ghHotkeyMouseHoldArmed = false;
+                        ghHotkeyMouseDownTick = 0;
+                        ghHotkeyMouseHoldDown = false;
+                        if (wasActive) {
+                            // 松开停止（含 RegisterAllHotkeys 清掉 holdDown 后仍能停）
+                            ghHotkeyNeedKeyUp = false;
+                            ClearActiveHoldHotkeyId();
+                            if (ghHotkeyHandling || ghHotkeyPending) {
+                                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStop, 0);
+                            } else {
+                                ghHotkeyPending = true;
+                                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStop, 0);
+                            }
+                            return 1;
+                        }
+                        if (wasArmed) {
+                            // 短按：作废本次序号，防止 Poll 已排队的 Start 误启
+                            InvalidateHoldSeq(seq);
+                            ghHotkeyNeedKeyUp = false;
+                            ghHotkeyPending = false;
+                            return CallNextHookEx(nullptr, code, wp, lp);
+                        }
+                        ghHotkeyNeedKeyUp = false;
+                        ghHotkeyPending = false;
+                    } else if (down) {
+                        if (passToApp) {
+                            return CallNextHookEx(nullptr, code, wp, lp);
+                        }
+                        if (ghHotkeyMouseHoldDown || IsActiveHoldHotkeyId(HOTKEY_GLOBAL_ID)
+                            || ghHotkeyPending || ghHotkeyHandling) {
+                            return 1;
+                        }
+                        if (ghHotkeyMouseHoldArmed) {
+                            if (GetTickCount() - ghHotkeyMouseDownTick >= CurrentHoldThresholdMs()
+                                && CheckHotkeyModifiers(ghHotkeyMods, !busy)
+                                && !IsHoldSeqInvalid(ghHotkeyHoldSeq)) {
+                                const uint32_t seq = ghHotkeyHoldSeq;
+                                ghHotkeyNeedKeyUp = false;
+                                ghHotkeyMouseHoldArmed = false;
+                                ghHotkeyMouseHoldDown = true;
+                                ghHotkeyPending = true;
+                                ghHotkeyHoldPostedSeq = seq;
+                                SetActiveHoldHotkeyId(HOTKEY_GLOBAL_ID);
+                                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStart, 0);
+                                return 1;
+                            }
+                            // 未达阈值：吞掉自动重复，避免灌字卡顿
+                            return 1;
+                        }
+                        // 新按下：武装并放行首击，短按才能正常输入
+                        ghHotkeyNeedKeyUp = false;
+                        ghHotkeyMouseDownTick = GetTickCount();
+                        ghHotkeyMouseHoldArmed = true;
+                        ghHotkeyMouseHoldDown = false;
+                        ghHotkeyHoldSeq = NextHoldSeq();
+                        return CallNextHookEx(nullptr, code, wp, lp);
+                    }
+                } else {
+                    // 单击切换（非按住启停）
+                    if (up) {
+                        ghHotkeyPending = false;
+                        ghHotkeyNeedKeyUp = false;
+                    }
+                    if (down) {
+                        if (passToApp) {
+                            return CallNextHookEx(nullptr, code, wp, lp);
+                        }
+                        if (ghHotkeyNeedKeyUp || ghHotkeyPending || ghHotkeyHandling) {
+                            return CallNextHookEx(nullptr, code, wp, lp);
+                        }
+                        // 已 RegisterHotKey 时只走系统通道，避免 LL 再投递一次；
+                        // 否则 Suspend 清闩锁后键盘连发会立刻再触发「停止」。
+                        const bool registerHotkeyActive = !passMode && !ghPlaybackHotkeySuspended;
+                        if (registerHotkeyActive) {
+                            return CallNextHookEx(nullptr, code, wp, lp);
+                        }
+                        if (CheckHotkeyModifiers(ghHotkeyMods, !busy)) {
+                            ghHotkeyPending = true;
+                            PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
+                            return 1;
+                        }
+                    }
                 }
-                // 忙碌态（回放/录制/连点）放宽修饰键，确保能停。
-                const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
-                if (CheckHotkeyModifiers(ghHotkeyMods, !busy)) {
-                    ghHotkeyPending = true;
-                    PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, 0, 0);
+            }
+
+            if (ghHotkeyHwnd && (down || up)) {
+                for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+                    auto& h = ghPlaybackScriptHooks[i];
+                    if (!h.vk || IsMouseVk(h.vk) || ks->vkCode != h.vk) continue;
+
+                    if (h.holdMode) {
+                        // 抬起：不校验修饰键（用户常先松 Ctrl 再松主键，否则短按/停止会丢）
+                        if (up) {
+                            const bool wasArmed = h.holdArmed;
+                            const bool wasActive = h.holdActive || IsActiveHoldHotkeyId(h.hotkeyId);
+                            const uint32_t seq = h.holdSeq;
+                            h.holdArmed = false;
+                            h.holdDownTick = 0;
+                            h.holdActive = false;
+                            h.holdExtended = false;
+                            if (wasActive) {
+                                ClearActiveHoldHotkeyId();
+                                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStop,
+                                    static_cast<LPARAM>(h.hotkeyId));
+                                return 1;
+                            }
+                            if (wasArmed) {
+                                h.holdInvalidSeq = seq;
+                                return CallNextHookEx(nullptr, code, wp, lp);
+                            }
+                            break;
+                        }
+                        if (!down) break;
+                        if (!CheckHotkeyModifiers(h.mods, !busy)) continue;
+                        if (passToApp) {
+                            return CallNextHookEx(nullptr, code, wp, lp);
+                        }
+                        if (h.holdActive || IsActiveHoldHotkeyId(h.hotkeyId)) {
+                            return 1;
+                        }
+                        if (h.holdArmed) {
+                            if (GetTickCount() - h.holdDownTick >= CurrentHoldThresholdMs()
+                                && h.holdSeq != 0 && h.holdSeq != h.holdInvalidSeq) {
+                                h.holdArmed = false;
+                                h.holdActive = true;
+                                SetActiveHoldHotkeyId(h.hotkeyId);
+                                PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStart,
+                                    static_cast<LPARAM>(h.hotkeyId));
+                                return 1;
+                            }
+                            return 1; // 吞自动重复
+                        }
+                        h.holdDownTick = GetTickCount();
+                        h.holdArmed = true;
+                        h.holdActive = false;
+                        h.holdExtended = (ks->flags & LLKHF_EXTENDED) != 0;
+                        h.holdSeq = NextHoldSeq();
+                        // 放行首击，短按正常输入
+                        return CallNextHookEx(nullptr, code, wp, lp);
+                    }
+
+                    if (!CheckHotkeyModifiers(h.mods, !busy)) continue;
+                    if (!scriptViaHook || !down) continue;
+                    if (passToApp) {
+                        return CallNextHookEx(nullptr, code, wp, lp);
+                    }
+                    PostMessageW(ghHotkeyHwnd, WM_HOTKEY, static_cast<WPARAM>(h.hotkeyId), 0);
+                    if (passMode || ghPlaybackHotkeySuspended) return 1;
+                    break;
                 }
             }
         }
@@ -225,15 +560,21 @@ inline LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
                 btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
                 if (wp == WM_XBUTTONDOWN) down = true; else up = true;
             }
+            if (btnVk && IsHotkeyCapturePassThroughVk(btnVk)) {
+                return CallNextHookEx(nullptr, code, wp, lp);
+            }
             if (up && btnVk == ghHotkeyVk) {
                 if (NeedsMouseHoldHotkey(btnVk)) {
                     const bool wasArmed = ghHotkeyMouseHoldArmed;
-                    const bool wasActive = ghHotkeyMouseHoldDown;
+                    const bool wasActive = ghHotkeyMouseHoldDown
+                        || IsActiveHoldHotkeyId(HOTKEY_GLOBAL_ID);
+                    const uint32_t seq = ghHotkeyHoldSeq;
                     ghHotkeyMouseHoldArmed = false;
                     ghHotkeyMouseDownTick = 0;
                     ghHotkeyMouseHoldDown = false;
                     // 未达长按阈值的短按：取消，不启停
                     if (wasArmed && !wasActive) {
+                        InvalidateHoldSeq(seq);
                         ghHotkeyNeedKeyUp = false;
                         ghHotkeyPending = false;
                         return CallNextHookEx(nullptr, code, wp, lp);
@@ -241,18 +582,17 @@ inline LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
                     // 已触发连点：松开即停（仅信任非注入物理抬起）
                     if (wasActive) {
                         ghHotkeyNeedKeyUp = false;
+                        ClearActiveHoldHotkeyId();
                         if (ghHotkeyHandling || ghHotkeyPending) {
-                            // 启动处理中：标记，等 Guard 结束再投递停止
-                            ghHotkeyMouseHoldDown = false;
                             PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStop, 0);
                         } else {
                             ghHotkeyPending = true;
                             PostMessageW(ghHotkeyHwnd, WM_GLOBAL_HOTKEY_DETECTED, kHotHoldStop, 0);
                         }
-                    } else {
-                        ghHotkeyNeedKeyUp = false;
-                        ghHotkeyPending = false;
+                        return 1;
                     }
+                    ghHotkeyNeedKeyUp = false;
+                    ghHotkeyPending = false;
                 } else {
                     ghHotkeyPending = false;
                     ghHotkeyNeedKeyUp = false;
@@ -267,9 +607,13 @@ inline LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
                     if (ghHotkeyNeedKeyUp) {
                         return CallNextHookEx(nullptr, code, wp, lp);
                     }
+                    if (ghHotkeyMouseHoldDown || IsActiveHoldHotkeyId(HOTKEY_GLOBAL_ID)) {
+                        return 1;
+                    }
                     ghHotkeyMouseDownTick = GetTickCount();
                     ghHotkeyMouseHoldArmed = true;
                     ghHotkeyMouseHoldDown = false;
+                    ghHotkeyHoldSeq = NextHoldSeq();
                     return CallNextHookEx(nullptr, code, wp, lp);
                 }
                 if (ghHotkeyNeedKeyUp) {
@@ -324,7 +668,7 @@ private:
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     friend LRESULT CALLBACK ClickerDropPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
-    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kOcrDigitsOnly, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName, kAiPrompt, kAiInsertVar, kAiVarCombo, kAiModel, kAiContextMode, kAiOutputVar, kAiOutputType, kAiTimeout, kAiFallback, kAiImageScale, kAiRegionByImage, kAiRegionByImage2, kAiFindSelectRegion, kAiFindMatchThreshold, kAiFindScaleMin, kAiFindScaleMax, kAiTargetPreview, kAiTargetScreenshot, kAiTargetLocal, kAiTargetClear, kAiFullScreen, kAiSelectRegion, kAiSearchRegion, kAiSearchX1, kAiSearchY1, kAiSearchX2, kAiSearchY2, kAiMaxSteps, kAiWithImage, kAiConfirm, kAiMaxStepsHint, kCursorPosVarName, kGotoStepExpr, kMoveRelX, kMoveRelY, kMoveRelRandomX, kMoveRelRandomY, kBreakoutTime = 5099, kWmSelectMethod = 5101, kWmSpecifyWindowBtn, kWmTargetPath, kWmTargetBrowse, kWmTargetCrosshair };
+    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kOcrDigitsOnly, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName, kAiPrompt, kAiInsertVar, kAiVarCombo, kAiModel, kAiContextMode, kAiOutputVar, kAiOutputType, kAiTimeout, kAiFallback, kAiImageScale, kAiRegionByImage, kAiRegionByImage2, kAiFindSelectRegion, kAiFindMatchThreshold, kAiFindScaleMin, kAiFindScaleMax, kAiTargetPreview, kAiTargetScreenshot, kAiTargetLocal, kAiTargetClear, kAiFullScreen, kAiSelectRegion, kAiSearchRegion, kAiSearchX1, kAiSearchY1, kAiSearchX2, kAiSearchY2, kAiMaxSteps, kAiWithImage, kAiConfirm, kAiMaxStepsHint, kCursorPosVarName, kGotoStepExpr, kMoveRelX, kMoveRelY, kMoveRelRandomX, kMoveRelRandomY, kBreakoutTime = 5099, kWmSelectMethod = 5101, kWmSpecifyWindowBtn, kWmTargetPath, kWmTargetBrowse, kWmTargetCrosshair, kWmFakeFocus };
     enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, Settings, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
@@ -483,7 +827,7 @@ private:
         case WM_TIMER:
             if (wp == kHotkeyLatchSyncTimerId) {
                 SyncHotkeyLatches();
-                PollMouseHoldHotkey();
+                PollHoldHotkeys();
                 return 0;
             }
             if (wp == kDisplaySyncTimerId) {
@@ -502,7 +846,11 @@ private:
             if (wp == kScheduledTaskTimerId) { scheduledTasks_.Tick(); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_HOTKEY: OnHotkey(static_cast<int>(wp)); return 0;
-        case WM_GLOBAL_HOTKEY_DETECTED: OnHotkey(HOTKEY_GLOBAL_ID, static_cast<int>(wp)); return 0;
+        case WM_GLOBAL_HOTKEY_DETECTED: {
+            const int id = lp ? static_cast<int>(lp) : HOTKEY_GLOBAL_ID;
+            OnHotkey(id, static_cast<int>(wp));
+            return 0;
+        }
         case WM_GETICON:
             if (breakoutPaused_.load(std::memory_order_relaxed)) {
                 const UINT which = static_cast<UINT>(wp);
@@ -518,6 +866,18 @@ private:
             }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_RUN_DONE: OnRunDone(); return 0;
+        case WM_APP_EXT_RUN_SCRIPT: {
+            auto* path = reinterpret_cast<std::wstring*>(lp);
+            if (path) {
+                RunActionsFromPath(*path);
+                delete path;
+            }
+            extRunPending_ = false;
+            return 0;
+        }
+        case WM_APP_EXT_STOP_SCRIPT:
+            StopRun();
+            return 0;
         case WM_APP_BREAKOUT_UI: UpdateBreakoutPauseIcons(); return 0;
         case WM_APP_RESTORE_INSTANCE: RestoreMainWindowForUser(); return 0;
         case WM_APP_EDITOR_FINISH_OPEN:
@@ -778,6 +1138,7 @@ private:
         LoadAppSettings(appSettings_);
         quickscript::ApplyThemeFromSettings(appSettings_);
         ApplyDebugWindowSetting();
+        ApplyOtherOsSettings();
         CleanOrphanImages();  // 启动时清理孤立图片
         CreateEditorDropPopup();
         CreateClickerDropPopup();
@@ -800,7 +1161,152 @@ private:
         outerShadow_.Attach(hwnd_);
         SyncUiScaleLayout();
         if (page_ == Page::Home) ShowEditorControls(false);
+        StartExtBridgeAlwaysOn();
     }
+
+    /// 进程启动后常开本机桥（扩展顶栏弹窗 / 窗口模式共用）。失败只打日志。
+    void StartExtBridgeAlwaysOn() {
+        using namespace windowmode;
+        ExtScriptApiHandlers handlers;
+        handlers.listScripts = [this]() {
+            std::vector<ExtScriptInfo> out;
+            EnsureScriptsDir();
+            WIN32_FIND_DATAW fd{};
+            const auto pattern = ScriptsDir() + L"\\*.json";
+            HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+            if (h == INVALID_HANDLE_VALUE) return out;
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                ExtScriptInfo info;
+                info.file = ToUtf8(fd.cFileName);
+                const std::wstring full = ScriptsDir() + L"\\" + fd.cFileName;
+                info.path = ToUtf8(full);
+                const auto content = ReadAll(full);
+                std::wstring name = ExtractString(content, L"scriptName");
+                if (name.empty()) name = fd.cFileName;
+                info.name = ToUtf8(name);
+                const auto wm = windowmode::ParseWindowModeJson(content);
+                info.windowModeEnabled = wm.enabled;
+                info.windowName = ToUtf8(wm.windowName.empty()
+                    ? wm.targetWindowTitle : wm.windowName);
+                info.windowClassName = ToUtf8(wm.windowClassName);
+                {
+                    const auto resolved = windowmode::ResolveInputStrategy(wm);
+                    if (resolved == windowmode::WindowModeInputStrategy::Cdp) {
+                        info.inputStrategy = "cdp";
+                    } else if (resolved == windowmode::WindowModeInputStrategy::SoftMessage) {
+                        info.inputStrategy = "softMessage";
+                    } else {
+                        info.inputStrategy = "auto";
+                    }
+                }
+                out.push_back(std::move(info));
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+            return out;
+        };
+        handlers.runScript = [this](const std::string& pathOrFileUtf8, std::string& err) -> bool {
+            if (running_.load()) {
+                err = "busy";
+                return false;
+            }
+            if (extRunPending_.exchange(true)) {
+                err = "busy";
+                return false;
+            }
+            std::wstring resolved;
+            if (!ResolveExtScriptPath(pathOrFileUtf8, resolved, err)) {
+                extRunPending_ = false;
+                return false;
+            }
+            auto* heap = new std::wstring(std::move(resolved));
+            if (!PostMessageW(hwnd_, WM_APP_EXT_RUN_SCRIPT, 0, reinterpret_cast<LPARAM>(heap))) {
+                delete heap;
+                extRunPending_ = false;
+                err = "post_failed";
+                return false;
+            }
+            return true;
+        };
+        handlers.stopScript = [this]() {
+            PostMessageW(hwnd_, WM_APP_EXT_STOP_SCRIPT, 0, 0);
+        };
+        handlers.getRunState = [this]() {
+            ExtRunState st;
+            st.running = running_.load() || extRunPending_.load();
+            std::lock_guard<std::mutex> lock(extScriptStateMu_);
+            st.currentScript = ToUtf8(runningScriptName_);
+            return st;
+        };
+        ExtBridgeServer::Instance().SetScriptApiHandlers(std::move(handlers));
+        std::wstring bridgeErr;
+        if (!ExtBridgeServer::Instance().Start(bridgeErr)) {
+            windowmode::WindowModeLogf(L"[扩展桥] 常开启动失败: %s",
+                bridgeErr.empty() ? L"(unknown)" : bridgeErr.c_str());
+        } else {
+            windowmode::WindowModeLogf(L"[扩展桥] 常开监听 port=%d",
+                ExtBridgeServer::Instance().Port());
+        }
+    // softMessage/假焦点/CDP 窗口模式都可能用到「鼠标宏」；预热只查找不创建。
+        windowmode::MacroVirtualDesktop::WarmupAtProcessStart();
+    }
+
+    static bool IsPathInsideScriptsDir(const std::wstring& path) {
+        wchar_t fullBuf[MAX_PATH]{};
+        wchar_t scriptsBuf[MAX_PATH]{};
+        if (!GetFullPathNameW(path.c_str(), MAX_PATH, fullBuf, nullptr)) return false;
+        if (!GetFullPathNameW(ScriptsDir().c_str(), MAX_PATH, scriptsBuf, nullptr)) return false;
+        std::wstring full = fullBuf;
+        std::wstring scripts = scriptsBuf;
+        while (!scripts.empty() && (scripts.back() == L'\\' || scripts.back() == L'/')) {
+            scripts.pop_back();
+        }
+        if (full.size() <= scripts.size()) return false;
+        if (_wcsnicmp(full.c_str(), scripts.c_str(), scripts.size()) != 0) return false;
+        const wchar_t sep = full[scripts.size()];
+        return sep == L'\\' || sep == L'/';
+    }
+
+    bool ResolveExtScriptPath(const std::string& pathOrFileUtf8, std::wstring& outPath,
+        std::string& err) const {
+        if (pathOrFileUtf8.empty()) {
+            err = "bad_path";
+            return false;
+        }
+        std::wstring input = FromUtf8(pathOrFileUtf8);
+        const bool looksLikeFile = input.find(L'\\') == std::wstring::npos
+            && input.find(L'/') == std::wstring::npos
+            && (input.size() < 2 || input[1] != L':');
+        std::wstring candidate;
+        if (looksLikeFile) {
+            std::wstring file = input;
+            if (file.size() < 5
+                || _wcsicmp(file.c_str() + file.size() - 5, L".json") != 0) {
+                file += L".json";
+            }
+            candidate = ScriptsDir() + L"\\" + file;
+        } else {
+            candidate = input;
+        }
+        wchar_t fullBuf[MAX_PATH]{};
+        if (!GetFullPathNameW(candidate.c_str(), MAX_PATH, fullBuf, nullptr)) {
+            err = "bad_path";
+            return false;
+        }
+        outPath = fullBuf;
+        if (!IsPathInsideScriptsDir(outPath)) {
+            err = "bad_path";
+            return false;
+        }
+        const DWORD attrs = GetFileAttributesW(outPath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            err = "bad_path";
+            return false;
+        }
+        return true;
+    }
+
+
 
     // ── Editor control creation ────────────────────────────────────
     void CreateEditorControls() {
@@ -847,6 +1353,12 @@ private:
         ShowWindow(wmTargetPathEdit_, SW_HIDE);
         ShowWindow(wmTargetBrowseBtn_, SW_HIDE);
         ShowWindow(wmTargetCrosshairBtn_, SW_HIDE);
+        wmFakeFocusCheck_ = MakeCheckBox(hwnd_, L"聚焦", kWmFakeFocus, 0, 84, kEditorWmFakeFocusW, kEditorMacroHeaderRowH);
+        editorControls_.push_back(wmFakeFocusCheck_);
+        ShowWindow(wmFakeFocusCheck_, SW_HIDE);
+        // 与参数区勾选框同一套 owner-draw / 点击切换（prop 状态），否则 BN_CLICKED 读不到勾选。
+        SetWindowSubclass(wmFakeFocusCheck_, EditorChildSubclassProc, 1,
+            reinterpret_cast<DWORD_PTR>(this));
         labelList_ = MakeLabel(hwnd_, L"动作列表", -1, kEditorListLabelX, kEditorToolbarLabelY, 80, kEditorMacroHeaderRowH); editorControls_.push_back(labelList_);
         labelBatchCount_ = MakeLabel(hwnd_, L"已选中:0个", -1, 95, kEditorToolbarLabelY, 120, kEditorMacroHeaderRowH); editorControls_.push_back(labelBatchCount_);
         ShowWindow(labelBatchCount_, SW_HIDE);
@@ -1212,7 +1724,7 @@ private:
             loopTypeCombo_ = r.HwndForId(EID_LoopTypeCombo);
             loopCount_ = r.HwndForId(EID_LoopCount); loopFromVar_ = r.HwndForId(EID_LoopFromVar);
             loopVarExpr_ = r.HwndForId(EID_LoopVarExpr); loopVarName_ = r.HwndForId(EID_LoopVarName);
-            popupLoopType_.items = {L"次数循环", L"变量"}; popupLoopType_.sel = 0;
+            popupLoopType_.items = {L"次数循环"}; popupLoopType_.sel = 0;
         }
 
         // ── 14. 结束循环 ──
@@ -1537,7 +2049,7 @@ private:
     void HideEditorMacroHeaderControls() const {
         for (HWND h : {labelMacro_, name_, labelBreakoutTime_, breakoutTimeEdit_,
                 wmSelectMethod_, wmSpecifyWindowBtn_, wmTargetPathEdit_,
-                wmTargetBrowseBtn_, wmTargetCrosshairBtn_}) {
+                wmTargetBrowseBtn_, wmTargetCrosshairBtn_, wmFakeFocusCheck_}) {
             if (h) ShowWindow(h, SW_HIDE);
         }
     }
@@ -2375,12 +2887,19 @@ private:
 
     void PostLayoutParamPanelRedraw() {
         if (!paramViewport_ || page_ != Page::Editor) return;
-        RefreshGrayButtonsInParamViewport();
+        // 先刷非灰按钮子控件；灰按钮必须最后画，否则 viewport 白底/邻近勾选框会盖住上边框。
         for (HWND child = GetWindow(paramViewport_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
             if (!IsWindowVisible(child)) continue;
             if (IsEditorParamComboHwnd(child)) continue;
+            if (IsGrayButton(child)) continue;
             RedrawWindow(child, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
+        if (popupAction_.sel == 18) {
+            const bool regionByImage = ocrRegionByImageCheck_ && Checked(ocrRegionByImageCheck_);
+            if (regionByImage) RaiseOcrFindImageHeaderControls();
+            else RaiseOcrRegionButtons();
+        }
+        RefreshGrayButtonsInParamViewport();
     }
 
     void RaiseAiFindImageHeaderControls() const {
@@ -3478,6 +3997,8 @@ private:
         const int oldScroll = paramScrollY_;
         paramScrollY_ = std::clamp(paramScrollY_ + deltaY, 0, maxScroll);
         if (oldScroll == paramScrollY_) return;
+        // 参数区内锚点的下拉随内容滚出视口；滚动时关闭，避免菜单悬在滚动区外
+        CloseEditorPopupIfParamAnchored();
         // 滚轮滚动：冻结重绘→移位→单次合成刷新，避免整区闪烁与按钮边缘残影
         LockParamViewportRedraw();
         ApplyParamScrollOffset(/*repaintChrome*/ false, /*eraseViewport*/ false,
@@ -3490,6 +4011,15 @@ private:
                 ReleaseDC(hwnd_, mainDc);
             }
         }
+    }
+
+    bool EditorPopupUsesParamViewportAnchor() const {
+        // 0=模式 1=动作类型 23=窗口选择方式：均在参数滚动区外
+        return editorPopupOpen_ >= 2 && editorPopupOpen_ != 23;
+    }
+
+    void CloseEditorPopupIfParamAnchored() {
+        if (EditorPopupUsesParamViewportAnchor()) CloseEditorPopup();
     }
 
     int MaxParamScroll() const {
@@ -4868,12 +5398,13 @@ private:
 
         int y = OcrContentStartY();
         if (ocrRegionByImageCheck_) {
-            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, kFindBlockW, fieldH);
+            // MoveOcrAt 内部会再 Scale，此处必须传设计像素，勿传已缩放的 fieldH
+            MoveOcrAt(ocrRegionByImageCheck_, kFindContentLeft, y, kFindBlockW, 22);
             ShowWindow(ocrRegionByImageCheck_, SW_SHOW);
             y += fieldH + rowGap;
         }
         if (ocrDigitsOnlyCheck_) {
-            MoveOcrAt(ocrDigitsOnlyCheck_, kFindContentLeft, y, kFindBlockW, fieldH);
+            MoveOcrAt(ocrDigitsOnlyCheck_, kFindContentLeft, y, kFindBlockW, 22);
             ShowWindow(ocrDigitsOnlyCheck_, SW_SHOW);
             y += fieldH + rowGap;
         }
@@ -4961,7 +5492,8 @@ private:
             MoveOcrAt(ocrTestBtn_, kFindContentLeft, y, kFindBtnW, kFindBtnH);
             y += btnH + rowGap;
         }
-        if (regionByImage && paramViewport_) InvalidateRect(paramViewport_, nullptr, TRUE);
+        // 勿单独 Invalidate viewport：异步 WM_PAINT 白底会盖住灰按钮上边框；
+        // SyncParamScrollLayout → RepaintParamPanelChrome / PostLayoutParamPanelRedraw 已统一刷新。
         paramScrollY_ = 0;
         SyncParamScrollLayout(y);
     }
@@ -5540,10 +6072,11 @@ private:
         const int id = GetDlgCtrlID(ctrl);
         const bool lockVp = (id == EditorParamLayout::EID_OcrDigitsOnly && paramViewport_);
         if (lockVp) LockParamViewportRedraw();
-        if (id == EditorParamLayout::EID_OcrDigitsOnly) RefreshOcrNeighborGrayButtons();
         SetChecked(ctrl, !Checked(ctrl));
         if (!IsMarkedParamCheckbox(ctrl)) RedrawParamCheckbox(ctrl);
         if (lockVp) UnlockParamViewportRedraw();
+        // 勾选框重绘之后再抬灰按钮，避免「纯数字」白底盖住「全图/选取区域」上边框。
+        if (id == EditorParamLayout::EID_OcrDigitsOnly) RefreshOcrNeighborGrayButtons();
         OnParamCheckboxClicked(ctrl);
     }
 
@@ -5755,6 +6288,8 @@ private:
         };
         clearMarked(paramViewport_);
         for (HWND h : editorControls_) {
+            // 窗口模式「聚焦」属于脚本级开关，勿随动作表单清空。
+            if (h == wmFakeFocusCheck_) continue;
             if (h && IsMarkedParamCheckbox(h)) SetChecked(h, false, false);
         }
     }
@@ -7095,6 +7630,11 @@ private:
         if (id >= kHotCustom && id <= kHotSpace) { SetCommonHotkeyFromMenu(id); return; }
         if (id == kWmSpecifyWindowBtn && code == BN_CLICKED) { ShowWindowClassPickDialog(); return; }
         if (id == kWmTargetBrowse && code == BN_CLICKED) { BrowseProgramExecutable(wmTargetPathEdit_); return; }
+        if (id == kWmFakeFocus && code == BN_CLICKED) {
+            // 鼠标点击由 EditorChildSubclassProc → ToggleParamCheckbox 处理；此处仅同步到 config。
+            SyncScriptWindowModeFromEditor();
+            return;
+        }
     }
 
     void InsertAction(size_t pos, const ScriptAction& src, int indentOverride = -1, bool selectInserted = true) {
@@ -7266,6 +7806,7 @@ private:
                     meta.hotkey.text = ExtractString(content, L"hotkeyText");
                     meta.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
                     meta.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+                    meta.hotkey.holdMode = ExtractBool(content, L"hotkeyHold", false);
                     meta.hotkey.enabled = meta.hotkey.vk != 0;
                     scripts_.push_back(meta);
                 }
@@ -7295,6 +7836,7 @@ private:
                     meta.hotkey.text = ExtractString(content, L"hotkeyText");
                     meta.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
                     meta.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+                    meta.hotkey.holdMode = ExtractBool(content, L"hotkeyHold", false);
                     meta.hotkey.enabled = meta.hotkey.vk != 0;
                     recordings_.push_back(meta);
                 }
@@ -7934,7 +8476,10 @@ private:
     int MaxRecordingScroll() const { return std::max(0, RecordingContentHeight() - HomeListHeight()); }
     void ClampRecordingScroll() { homeScrollOffset_ = std::clamp(homeScrollOffset_, 0, MaxRecordingScroll()); }
     RECT RecordingCardRect(int i) const { return HomeCardRect(i); }
-    std::wstring RecordingHotkeyText(const ScriptMeta& rec) const { return rec.hotkey.enabled && !rec.hotkey.text.empty() ? rec.hotkey.text : L"设置热键"; }
+    std::wstring RecordingHotkeyText(const ScriptMeta& rec) const {
+        if (!rec.hotkey.enabled || rec.hotkey.text.empty()) return L"设置热键";
+        return rec.hotkey.holdMode ? (rec.hotkey.text + L"（长按）") : rec.hotkey.text;
+    }
     RECT RecordingHotkeyRect(int i) const {
         if (i < 0 || i >= static_cast<int>(recordings_.size())) return RECT{};
         RECT r = RecordingCardRect(i);
@@ -7948,7 +8493,8 @@ private:
     RECT RecorderBannerKeyRect() const {
         // 与 PaintRecorderHome 黄条居中布局保持一致（命中热区跟着文案走）
         const RECT cr = CreateRect();
-        const std::wstring prefix = L"按";
+        const bool hold = GlobalHotkeyUsesHold();
+        const std::wstring prefix = hold ? L"按住" : L"按";
         std::wstring suffix;
         if (recording_) suffix = L"键停止 录制";
         else if (selectedRecording_ >= 0) suffix = L"键开始 回放";
@@ -7986,7 +8532,10 @@ private:
         int x = cr.left + (cr.right - cr.left - total) / 2 + wClick + gap;
         return RECT{x, cr.top + padV, x + createBtnW, cr.bottom - padV};
     }
-    std::wstring ScriptHotkeyText(const ScriptMeta& script) const { return script.hotkey.enabled && !script.hotkey.text.empty() ? script.hotkey.text : L"设置热键"; }
+    std::wstring ScriptHotkeyText(const ScriptMeta& script) const {
+        if (!script.hotkey.enabled || script.hotkey.text.empty()) return L"设置热键";
+        return script.hotkey.holdMode ? (script.hotkey.text + L"（长按）") : script.hotkey.text;
+    }
     RECT ScriptHotkeyRect(int i) const {
         if (i < 0 || i >= static_cast<int>(scripts_.size())) return RECT{};
         RECT r = HomeCardRect(i);
@@ -8094,7 +8643,8 @@ private:
 
     RECT CommonHotRect() const {
         const RECT cr = CreateRect();
-        const std::wstring prefix = L"按";
+        const bool hold = GlobalHotkeyUsesHold();
+        const std::wstring prefix = hold ? L"按住" : L"按";
         const std::wstring suffix = L"键开始 运行宏";
         const int hotW = std::max(UiLen(80), TextWidth(globalHotkey_.text, bigFont_) + UiLen(28));
         const int prefixW = TextWidth(prefix, bigFont_);
@@ -8293,16 +8843,32 @@ private:
     }
     RECT ClickerBannerKeyRect() const {
         RECT cr = CreateRect();
+        const bool hold = GlobalHotkeyUsesHold();
+        const std::wstring prefix = hold ? L"按住" : L"按";
         const std::wstring hotText = globalHotkey_.text.empty() ? L"F8" : globalHotkey_.text;
+        const std::wstring suffix = clicking_
+            ? (L"键停止 连点（当前 " + ClickerButtonTitle() + L" " + ClickIntervalComboText() + L"）")
+            : (L"键开始 " + ClickerButtonTitle() + L" 连点");
         const int hotW = std::max(UiLen(56), TextWidth(hotText, bigFont_) + UiLen(20));
-        return RECT{cr.left + UiLen(204), cr.top + UiLen(21), cr.left + UiLen(204) + hotW, cr.bottom - UiLen(21)};
+        const int gap = UiLen(10);
+        const int prefixW = TextWidth(prefix, bigFont_);
+        const int totalW = prefixW + gap + hotW + gap + TextWidth(suffix, bigFont_);
+        const int centered = (cr.right - cr.left - totalW) / 2;
+        const int pad = centered > UiLen(20) ? centered : UiLen(20);
+        const int left = cr.left + pad + prefixW + gap;
+        return RECT{left, cr.top + UiLen(21), left + hotW, cr.bottom - UiLen(21)};
     }
-    // 主界面卡片右侧操作列：宏/录制共用；右缘留白 16（相对上一版翻倍）
-    // rightPad=16，列宽=72 → rightStart=88
-    RECT HomeCardEditBtn(const RECT& r) const { return UiEdgeRect(r, 88, 14, 16, 45); }
-    RECT HomeCardDeleteBtn(const RECT& r) const { return UiEdgeRect(r, 88, 56, 16, 88); }
-    RECT HomeCardSelectedTag(const RECT& r) const { return UiEdgeRect(r, 88, 58, 16, 95); }
-    RECT HomeCardNameRect(const RECT& r) const { return UiInsetRect(r, 14, 17, 96, 48); }
+
+    bool GlobalHotkeyUsesHold() const {
+        return globalHotkey_.holdMode || NeedsMouseHoldHotkey(globalHotkey_.vk);
+    }
+    // 主界面卡片右侧操作列：宏/录制共用；右缘留白 16
+    // 「取消选择」「已选中✓」需同宽且左右对齐；列宽取够「取消选择」（88，原 72 会裁字）
+    // rightPad=16，列宽=88 → rightStart=104
+    RECT HomeCardEditBtn(const RECT& r) const { return UiEdgeRect(r, 104, 14, 16, 45); }
+    RECT HomeCardDeleteBtn(const RECT& r) const { return UiEdgeRect(r, 104, 56, 16, 88); }
+    RECT HomeCardSelectedTag(const RECT& r) const { return UiEdgeRect(r, 104, 58, 16, 95); }
+    RECT HomeCardNameRect(const RECT& r) const { return UiInsetRect(r, 14, 17, 112, 48); }
     RECT HomeCardMetaLeft(const RECT& r) const {
         return RECT{r.left + UiLen(14), r.top + UiLen(58), r.left + UiLen(350), r.top + UiLen(88)};
     }
@@ -8310,11 +8876,11 @@ private:
         return RECT{r.left + UiLen(344), r.top + UiLen(58), r.left + UiLen(510), r.top + UiLen(88)};
     }
     // 「重命名/删除」与宏「编辑/删除」同列；「优化」同行等高，紧挨其左（右对齐贴齐）
-    RECT RecordingOptimizeRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 148, 14, 100, 45); }
-    RECT RecordingRenameRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 88, 14, 16, 45); }
-    RECT RecordingDeleteRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 88, 56, 16, 88); }
-    RECT RecordingDeselectRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 88, 14, 16, 45); }
-    RECT RecordingSelectedTagRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 88, 58, 16, 95); }
+    RECT RecordingOptimizeRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 164, 14, 116, 45); }
+    RECT RecordingRenameRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 104, 14, 16, 45); }
+    RECT RecordingDeleteRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 104, 56, 16, 88); }
+    RECT RecordingDeselectRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 104, 14, 16, 45); }
+    RECT RecordingSelectedTagRect(int i) const { return UiEdgeRect(RecordingCardRect(i), 104, 58, 16, 95); }
     RECT RecorderHotkeyRect() const { return UiRect4(267, 397, 359, 438); }
     RECT RecorderScopeRect() const { return UiRect4(556, 369, 692, 412); }
 
@@ -8344,6 +8910,8 @@ private:
                 self->FillParamViewportGaps(hdc, hwnd, ps.rcPaint);
                 self->PaintEditorParamChrome(hdc, hwnd);
                 EndPaint(hwnd, &ps);
+                // 父窗白底填充后须再刷灰按钮，否则「全图/选取区域」上边框常被盖住
+                self->RefreshGrayButtonsInParamViewport();
                 return 0;
             }
             case WM_MOUSEWHEEL:
@@ -8377,18 +8945,20 @@ private:
             case WM_PAINT:
                 return DefSubclassProc(hwnd, msg, wp, lp);
             case WM_LBUTTONDOWN:
+                // 按下即切换（与设置页一致），避免等 UP 才反馈、连点时显得迟钝。
                 SetFocus(hwnd);
                 SetCapture(hwnd);
+                self->ToggleParamCheckbox(hwnd);
                 return 0;
             case WM_LBUTTONDBLCLK:
+                // 系统对第二次按下发 DBLCLK 而非 DOWN；原先直接吞掉会导致快速连点只生效一次。
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+                self->ToggleParamCheckbox(hwnd);
                 return 0;
             case WM_LBUTTONUP:
-                // 必须本控件收到过 DOWN（capture）：下拉在 DOWN 时切类型会露出勾选框，
-                // 随后的 UP 若落在「左Win」上，不能当成一次点击。
-                if (GetCapture() == hwnd) {
-                    ReleaseCapture();
-                    self->ToggleParamCheckbox(hwnd);
-                }
+                // 仍用 capture：下拉切类型露出勾选框后，误落在本控件上的 UP 不得再切一次。
+                if (GetCapture() == hwnd) ReleaseCapture();
                 return 0;
             case WM_KEYDOWN:
                 if (wp == VK_SPACE) {
@@ -8790,6 +9360,7 @@ private:
             return;
         }
         if (paramScrollbarDragging_) {
+            CloseEditorPopupIfParamAnchored();
             UpdateParamScrollFromThumb(y - paramScrollbarDragOffset_);
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             ApplyParamScrollOffset(true, false);
@@ -8881,7 +9452,7 @@ private:
                     if (i == selectedRecording_) {
                         if (PtIn(RecordingDeselectRect(i), x, y)) return HoverButton::HomeEdit;
                         if (PtIn(RecordingSelectedTagRect(i), x, y)) return HoverButton::HomeCard;
-                    } else {
+                    } else if (i == recordingHover_) {
                         if (PtIn(RecordingOptimizeRect(i), x, y)) return HoverButton::HomeEdit;
                         if (PtIn(RecordingRenameRect(i), x, y)) return HoverButton::HomeEdit;
                         if (PtIn(RecordingDeleteRect(i), x, y)) return HoverButton::HomeDelete;
@@ -8918,8 +9489,12 @@ private:
                 RECT edit = HomeCardEditBtn(r);
                 RECT del = HomeCardDeleteBtn(r);
                 if (PtIn(hot, x, y)) return HoverButton::ScriptHotkey;
-                if (PtIn(edit, x, y)) return HoverButton::HomeEdit;
-                if (PtIn(del, x, y)) return HoverButton::HomeDelete;
+                if (i == selectedScript_ && PtIn(edit, x, y)) return HoverButton::HomeEdit;
+                if (i == homeHover_) {
+                    if (i != selectedScript_ && PtIn(edit, x, y)) return HoverButton::HomeEdit;
+                    if (PtIn(del, x, y)) return HoverButton::HomeDelete;
+                }
+                if (PtIn(r, x, y)) return HoverButton::HomeCard;
             }
             return HoverButton::None;
         }
@@ -9310,12 +9885,15 @@ private:
     }
 
     void CaptureGlobalHotkey() {
+        BeginHotkeyCaptureRelease(globalHotkey_);
         HotkeyCapture cap;
         Hotkey out;
-        if (!cap.Show(hwnd_, globalHotkey_, false, out, true) || !out.enabled || out.vk == 0) return;
-        globalHotkey_ = out;
-        RegisterAllHotkeys();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        const bool ok = cap.Show(hwnd_, globalHotkey_, false, out, true,
+                appSettings_.other.holdThresholdSeconds)
+            && out.enabled && out.vk != 0;
+        if (ok) globalHotkey_ = out;
+        EndHotkeyCaptureRelease();
+        if (ok) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     bool HandleClickerIntervalClick(int x, int y) {
@@ -9492,7 +10070,7 @@ private:
         } else if (clickerDropPopupKind_ == 1) {
             static const HotkeyMenuItem kItems[] = {
                 {kHotCustom, L"自定义", L"将您指定的按键设为启停热键"},
-                {kHotLeft, L"鼠标左键", L"长按左键开始连点，松开停止（约0.2秒）"},
+                {kHotLeft, L"鼠标左键", L"按住左键开始连点，松开停止"},
                 {kHotMiddle, L"鼠标中键", L"将点击中键设为启停热键"},
                 {kHotRight, L"鼠标右键", L"将点击右键设为启停热键"},
                 {kHotX1, L"鼠标侧键1", L"一般为鼠标左侧后部的键"},
@@ -9772,12 +10350,16 @@ private:
 
     void CaptureRecordingHotkey(int index) {
         if (index < 0 || index >= static_cast<int>(recordings_.size())) return;
+        BeginHotkeyCaptureRelease(recordings_[static_cast<size_t>(index)].hotkey);
         HotkeyCapture cap; Hotkey out;
-        if (cap.Show(hwnd_, recordings_[static_cast<size_t>(index)].hotkey, true, out)) {
+        const bool ok = cap.Show(hwnd_, recordings_[static_cast<size_t>(index)].hotkey, true, out,
+                false, appSettings_.other.holdThresholdSeconds);
+        if (ok) {
             recordings_[static_cast<size_t>(index)].hotkey = out;
             PersistRecordingHotkey(index);
-            InvalidateRect(hwnd_, nullptr, FALSE);
         }
+        EndHotkeyCaptureRelease();
+        if (ok) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void PersistRecordingHotkey(int index) {
@@ -10114,7 +10696,7 @@ private:
             if (r.bottom < list.top || r.top > list.bottom) continue;
             if (!PtIn(r, x, y)) continue;
             if (x >= RecordingHotkeyRect(i).left && x <= RecordingHotkeyRect(i).right && y >= RecordingHotkeyRect(i).top && y <= RecordingHotkeyRect(i).bottom) { CaptureRecordingHotkey(i); return; }
-            if (i != selectedRecording_) {
+            if (i != selectedRecording_ && i == recordingHover_) {
                 if (PtIn(RecordingOptimizeRect(i), x, y)) {
                     RecordingOptimizeDialog optimizeDlg;
                     if (optimizeDlg.Show(hwnd_, recordings_[static_cast<size_t>(i)]).saved) {
@@ -10226,8 +10808,21 @@ private:
             RECT hot = ScriptHotkeyRect(i);
             RECT edit = HomeCardEditBtn(r);
             RECT del = HomeCardDeleteBtn(r);
-            if (x >= edit.left && x <= edit.right && y >= edit.top && y <= edit.bottom) { if (selectedScript_ == i) { selectedScript_ = -1; InvalidateRect(hwnd_, nullptr, FALSE); } else { ShowEditorFor(i, false); } return; }
-            if (x >= del.left && x <= del.right && y >= del.top && y <= del.bottom) { ConfirmDelete(i); return; }
+            if (i == selectedScript_ && x >= edit.left && x <= edit.right && y >= edit.top && y <= edit.bottom) {
+                selectedScript_ = -1;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (i == homeHover_) {
+                if (i != selectedScript_ && x >= edit.left && x <= edit.right && y >= edit.top && y <= edit.bottom) {
+                    ShowEditorFor(i, false);
+                    return;
+                }
+                if (x >= del.left && x <= del.right && y >= del.top && y <= del.bottom) {
+                    ConfirmDelete(i);
+                    return;
+                }
+            }
             if (x >= hot.left && x <= hot.right && y >= hot.top && y <= hot.bottom) { CaptureScriptHotkey(i); return; }
             selectedScript_ = selectedScript_ == i ? -1 : i;
             if (selectedScript_ >= 0) selectedRecording_ = -1;  // 与鼠标录制选择互斥
@@ -10272,13 +10867,16 @@ private:
 
     void CaptureScriptHotkey(int index) {
         if (index < 0 || index >= static_cast<int>(scripts_.size())) return;
+        BeginHotkeyCaptureRelease(scripts_[static_cast<size_t>(index)].hotkey);
         HotkeyCapture cap; Hotkey out;
-        if (cap.Show(hwnd_, scripts_[static_cast<size_t>(index)].hotkey, true, out)) {
+        const bool ok = cap.Show(hwnd_, scripts_[static_cast<size_t>(index)].hotkey, true, out,
+                false, appSettings_.other.holdThresholdSeconds);
+        if (ok) {
             scripts_[static_cast<size_t>(index)].hotkey = out;
             PersistScriptHotkey(index);
-            RegisterAllHotkeys();
-            InvalidateRect(hwnd_, nullptr, FALSE);
         }
+        EndHotkeyCaptureRelease();
+        if (ok) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void PersistScriptHotkey(int index) {
@@ -10344,7 +10942,7 @@ private:
         HMENU menu = CreatePopupMenu();
         hotkeyMenuItems_ = {
             {kHotCustom, L"自定义", L"将您指定的按键设为启停热键"},
-            {kHotLeft, L"鼠标左键", L"长按左键开始连点，松开停止（约0.2秒）"},
+            {kHotLeft, L"鼠标左键", L"按住左键开始连点，松开停止"},
             {kHotMiddle, L"鼠标中键", L"将点击中键设为启停热键"},
             {kHotRight, L"鼠标右键", L"将点击右键设为启停热键"},
             {kHotX1, L"鼠标侧键1", L"一般为鼠标左侧后部的键"},
@@ -10369,25 +10967,168 @@ private:
     void ShowCommonHotkeyMenu() { ShowHotkeyMenuAt(CommonHotRect()); }
 
     void SetCommonHotkeyFromMenu(int id) {
-        if (id == kHotCustom) { HotkeyCapture cap; Hotkey out; if (cap.Show(hwnd_, globalHotkey_, false, out, true)) globalHotkey_ = out; }
-        else if (id == kHotLeft) globalHotkey_ = Hotkey{0, VK_LBUTTON, L"鼠标左键", true};
-        else if (id == kHotMiddle) globalHotkey_ = Hotkey{0, VK_MBUTTON, L"鼠标中键", true};
-        else if (id == kHotRight) globalHotkey_ = Hotkey{0, VK_RBUTTON, L"鼠标右键", true};
-        else if (id == kHotX1) globalHotkey_ = Hotkey{0, VK_XBUTTON1, L"鼠标侧键1", true};
-        else if (id == kHotX2) globalHotkey_ = Hotkey{0, VK_XBUTTON2, L"鼠标侧键2", true};
-        else if (id == kHotSpace) globalHotkey_ = Hotkey{0, VK_SPACE, L"空格键", true};
-        RegisterAllHotkeys(); InvalidateRect(hwnd_, nullptr, FALSE);
+        if (id == kHotCustom) {
+            BeginHotkeyCaptureRelease(globalHotkey_);
+            HotkeyCapture cap; Hotkey out;
+            if (cap.Show(hwnd_, globalHotkey_, false, out, true,
+                    appSettings_.other.holdThresholdSeconds))
+                globalHotkey_ = out;
+            EndHotkeyCaptureRelease();
+        }
+        else if (id == kHotLeft) globalHotkey_ = Hotkey{0, VK_LBUTTON, L"鼠标左键", true, false};
+        else if (id == kHotMiddle) globalHotkey_ = Hotkey{0, VK_MBUTTON, L"鼠标中键", true, false};
+        else if (id == kHotRight) globalHotkey_ = Hotkey{0, VK_RBUTTON, L"鼠标右键", true, false};
+        else if (id == kHotX1) globalHotkey_ = Hotkey{0, VK_XBUTTON1, L"鼠标侧键1", true, false};
+        else if (id == kHotX2) globalHotkey_ = Hotkey{0, VK_XBUTTON2, L"鼠标侧键2", true, false};
+        else if (id == kHotSpace) globalHotkey_ = Hotkey{0, VK_SPACE, L"空格键", true, false};
+        if (id != kHotCustom) RegisterAllHotkeys();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    /// 设置热键弹窗：临时注销/放行「正在编辑」的键，便于同键短按↔长按切换；其它占用键仍拦截。
+    void BeginHotkeyCaptureRelease(const Hotkey& editing) {
+        ghHotkeyCaptureOpen = true;
+        ghHotkeyCaptureIgnoreVk = (editing.enabled && editing.vk) ? editing.vk : 0;
+        ghHotkeyMouseHoldArmed = false;
+        ghHotkeyMouseHoldDown = false;
+        ghHotkeyMouseDownTick = 0;
+        ghHotkeyPending = false;
+        ghHotkeyNeedKeyUp = false;
+        if (!ghHotkeyCaptureIgnoreVk || !hwnd_) return;
+
+        const UINT vk = ghHotkeyCaptureIgnoreVk;
+        const UINT mods = editing.modifiers;
+        if (globalHotkey_.enabled && globalHotkey_.vk == vk && globalHotkey_.modifiers == mods) {
+            UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID);
+        }
+        for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
+            const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
+            if (hk.enabled && hk.vk == vk && hk.modifiers == mods) {
+                UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i);
+            }
+        }
+        for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+            if (ghPlaybackScriptHooks[i].vk == vk) {
+                ghPlaybackScriptHooks[i].holdArmed = false;
+                ghPlaybackScriptHooks[i].holdActive = false;
+            }
+        }
+    }
+
+    void EndHotkeyCaptureRelease() {
+        ghHotkeyCaptureOpen = false;
+        ghHotkeyCaptureIgnoreVk = 0;
+        RegisterAllHotkeys();
     }
 
     void RegisterAllHotkeys() {
         UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID);
-        if (globalHotkey_.enabled && globalHotkey_.vk) RegisterHotKey(hwnd_, HOTKEY_GLOBAL_ID, globalHotkey_.modifiers, globalHotkey_.vk);
         for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i);
-        for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
-            const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
-            if (hk.enabled && hk.vk) RegisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i, hk.modifiers, hk.vk);
+
+        const bool passMode = appSettings_.other.resolveImeConflict;
+        ghPassThroughTypingHotkeys.store(passMode, std::memory_order_relaxed);
+
+        // 重建前保留按住状态，避免启动脚本时 Suspend→Register 清掉 holdActive 导致松不开
+        struct SavedHoldState {
+            int hotkeyId = 0;
+            bool holdArmed = false;
+            bool holdActive = false;
+            bool holdExtended = false;
+            DWORD holdDownTick = 0;
+            uint32_t holdSeq = 0;
+            uint32_t holdInvalidSeq = 0;
+        };
+        SavedHoldState savedHold[kMaxPlaybackScriptHooks]{};
+        int savedHoldCount = 0;
+        for (int i = 0; i < ghPlaybackScriptHookCount && savedHoldCount < kMaxPlaybackScriptHooks; ++i) {
+            const auto& h = ghPlaybackScriptHooks[i];
+            if (!h.holdMode || (!h.holdArmed && !h.holdActive && h.holdInvalidSeq == 0)) continue;
+            savedHold[savedHoldCount++] = SavedHoldState{
+                h.hotkeyId, h.holdArmed, h.holdActive, h.holdExtended, h.holdDownTick,
+                h.holdSeq, h.holdInvalidSeq};
         }
+
+        // 始终刷新脚本热键表，供回放挂起 / 输入放行 / 长按模式的 LL 钩子使用
+        ghPlaybackScriptHookCount = 0;
+        for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
+            if (ghPlaybackScriptHookCount >= kMaxPlaybackScriptHooks) break;
+            const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
+            if (!hk.enabled || !hk.vk || IsMouseVk(hk.vk)) continue;
+            ghPlaybackScriptHooks[ghPlaybackScriptHookCount++] = PlaybackScriptHook{
+                hk.vk, hk.modifiers, HOTKEY_SCRIPT_BASE + i, hk.holdMode};
+        }
+        for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+            auto& h = ghPlaybackScriptHooks[i];
+            if (!h.holdMode) continue;
+            for (int s = 0; s < savedHoldCount; ++s) {
+                if (savedHold[s].hotkeyId != h.hotkeyId) continue;
+                h.holdArmed = savedHold[s].holdArmed;
+                h.holdActive = savedHold[s].holdActive;
+                h.holdExtended = savedHold[s].holdExtended;
+                h.holdDownTick = savedHold[s].holdDownTick;
+                h.holdSeq = savedHold[s].holdSeq;
+                h.holdInvalidSeq = savedHold[s].holdInvalidSeq;
+                break;
+            }
+            if (IsActiveHoldHotkeyId(h.hotkeyId)) {
+                h.holdActive = true;
+                h.holdArmed = false;
+            }
+        }
+
+        auto skipKeyboardRegisterFor = [](const Hotkey& hk) {
+            // 键盘长按必须走 LL（要收 KEYUP）；RegisterHotKey 会吞键且无抬起
+            return hk.holdMode && hk.vk && !IsMouseVk(hk.vk);
+        };
+
+        // 回放挂起或「中文输入法不触发热键」：键盘热键不注册 RegisterHotKey（系统会吞键导致打不出字母）
+        const bool skipKeyboardRegister = ghPlaybackHotkeySuspended || passMode;
+        if (!skipKeyboardRegister) {
+            if (globalHotkey_.enabled && globalHotkey_.vk && !skipKeyboardRegisterFor(globalHotkey_)) {
+                RegisterHotKey(hwnd_, HOTKEY_GLOBAL_ID, globalHotkey_.modifiers, globalHotkey_.vk);
+            }
+            for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
+                const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
+                if (hk.enabled && hk.vk && !skipKeyboardRegisterFor(hk)) {
+                    RegisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i, hk.modifiers, hk.vk);
+                }
+            }
+        } else {
+            // 鼠标类全局热键仍可用 RegisterHotKey；键盘走 LL
+            if (!ghPlaybackHotkeySuspended && globalHotkey_.enabled && globalHotkey_.vk
+                && IsMouseVk(globalHotkey_.vk)) {
+                RegisterHotKey(hwnd_, HOTKEY_GLOBAL_ID, globalHotkey_.modifiers, globalHotkey_.vk);
+            }
+            if (!ghPlaybackHotkeySuspended) {
+                for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
+                    const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
+                    if (hk.enabled && hk.vk && IsMouseVk(hk.vk)) {
+                        RegisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i, hk.modifiers, hk.vk);
+                    }
+                }
+            }
+        }
+
         RefreshGlobalHotkeyHooks();
+        ghHotkeyHwnd = hwnd_;
+        if (!ghHotkeyKbHook) {
+            HINSTANCE inst = GetModuleHandleW(nullptr);
+            ghHotkeyKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, HotkeyKbProc, inst, 0);
+        }
+    }
+
+    /// 回放期间注销 RegisterHotKey：系统会吞掉同键 SendInput；物理启停改走 LL 钩子。
+    void SuspendHotkeysForPlayback() {
+        ghPlaybackHotkeySuspended = true;
+        RegisterAllHotkeys();
+    }
+
+    void ResumeHotkeysAfterPlayback() {
+        ghPlaybackHotkeySuspended = false;
+        ClearActiveHoldHotkeyId();
+        ClearToggleHotkeyLatches();
+        ghPlaybackScriptHookCount = 0;
+        RegisterAllHotkeys();
     }
 
     void InstallGlobalHotkeyHooks() {
@@ -10395,6 +11136,7 @@ private:
         ghHotkeyEnabled   = true;
         ghHotkeyVk        = globalHotkey_.vk;
         ghHotkeyMods      = globalHotkey_.modifiers;
+        ghHotkeyHoldMode  = globalHotkey_.holdMode;
         ghHotkeyPending   = false;
         ghHotkeyNeedKeyUp = false;
         ghHotkeyMouseHoldArmed = false;
@@ -10405,7 +11147,8 @@ private:
             ghHotkeyKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, HotkeyKbProc, inst, 0);
         if (IsMouseVk(ghHotkeyVk) && !ghHotkeyMouseHook)
             ghHotkeyMouseHook = SetWindowsHookExW(WH_MOUSE_LL, HotkeyMouseProc, inst, 0);
-        SetTimer(hwnd_, kHotkeyLatchSyncTimerId, 50, nullptr);
+        // 按住轮询：16ms 更贴近阈值，减少「刚过判定却慢半拍才启动」
+        if (hwnd_) SetTimer(hwnd_, kHotkeyLatchSyncTimerId, 16, nullptr);
     }
 
     void UninstallGlobalHotkeyHooks() {
@@ -10416,33 +11159,52 @@ private:
     }
 
     void RefreshGlobalHotkeyHooks() {
+        const UINT prevVk = ghHotkeyVk;
+        const bool prevHold = ghHotkeyHoldMode;
+        const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
+        const bool keepHoldLatch = (ghHotkeyMouseHoldArmed || ghHotkeyMouseHoldDown
+            || IsActiveHoldHotkeyId(HOTKEY_GLOBAL_ID));
+        // 启动宏 Suspend→Refresh 时保留 NeedKeyUp，挡住 LL 连发；脚本结束 Resume 会 ClearToggleHotkeyLatches
+        const bool keepToggleLatch = busy || ghHotkeyHandling
+            || (ghHotkeyNeedKeyUp && ghPlaybackHotkeySuspended);
         ghHotkeyVk      = globalHotkey_.vk;
         ghHotkeyMods    = globalHotkey_.modifiers;
+        ghHotkeyHoldMode = globalHotkey_.holdMode;
         ghHotkeyEnabled = globalHotkey_.enabled;
-        ghHotkeyPending = false;
-        ghHotkeyNeedKeyUp = false;
-        ghHotkeyMouseHoldArmed = false;
-        ghHotkeyMouseHoldDown = false;
-        ghHotkeyMouseDownTick = 0;
+        if (keepHoldLatch && prevVk == ghHotkeyVk && prevHold == ghHotkeyHoldMode && NeedsHoldHotkey()) {
+            if (IsActiveHoldHotkeyId(HOTKEY_GLOBAL_ID)) {
+                ghHotkeyMouseHoldDown = true;
+                ghHotkeyMouseHoldArmed = false;
+            }
+        } else if (!keepToggleLatch) {
+            ghHotkeyPending = false;
+            ghHotkeyNeedKeyUp = false;
+            ghHotkeyMouseHoldArmed = false;
+            ghHotkeyMouseHoldDown = false;
+            ghHotkeyMouseDownTick = 0;
+        }
         HINSTANCE inst  = GetModuleHandleW(nullptr);
         if (IsMouseVk(ghHotkeyVk) && !ghHotkeyMouseHook)
             ghHotkeyMouseHook = SetWindowsHookExW(WH_MOUSE_LL, HotkeyMouseProc, inst, 0);
         else if (!IsMouseVk(ghHotkeyVk) && ghHotkeyMouseHook)
             { UnhookWindowsHookEx(ghHotkeyMouseHook); ghHotkeyMouseHook = nullptr; }
+        // 确保按住轮询定时器仍在（防止被其它路径 Kill 掉后键盘按住永不触发）
+        if (hwnd_) SetTimer(hwnd_, kHotkeyLatchSyncTimerId, 16, nullptr);
     }
 
     void OnHotkey(int id, int holdCmd = 0) {
         // RegisterHotKey 与 LL 钩子双通道：用 NeedKeyUp 吃掉同一次物理按下的重复。
         // StopRecording/保存期间 UI 线程不泵消息，返回后队列里的第二通道不能再开录制。
         if (id == HOTKEY_GLOBAL_ID) {
-            const bool holdKey = NeedsMouseHoldHotkey(ghHotkeyVk);
+            const bool holdKey = NeedsHoldHotkey();
 
-            // 左键松开停止：优先处理，不被 Handling 闩锁吞掉
+            // 松开停止：优先处理，不被 Handling 闩锁吞掉
             if (holdKey && holdCmd == static_cast<int>(kHotHoldStop)) {
                 ghHotkeyNeedKeyUp = false;
                 ghHotkeyPending = false;
                 ghHotkeyMouseHoldArmed = false;
                 ghHotkeyMouseHoldDown = false;
+                ClearActiveHoldHotkeyId();
                 if (clicking_) { StopClicking(); return; }
                 if (recording_) { StopRecording(); return; }
                 if (running_) { StopRun(); return; }
@@ -10452,40 +11214,67 @@ private:
             if (ghHotkeyHandling) return;
             SyncHotkeyLatches();
 
-            // 仅左键：长按达阈值后启动（右键等仍走下方单击切换）
+            // 长按达阈值后启动（普通单击热键仍走下方切换）
             if (holdKey && holdCmd == static_cast<int>(kHotHoldStart)) {
-                if (ghHotkeyNeedKeyUp) return;
                 const DWORD now = GetTickCount();
-                if (now - lastHotkeyTick_ < 30u) return;
+                if (now - lastHotkeyTick_ < 30u) {
+                    ghHotkeyPending = false;
+                    ClearActiveHoldHotkeyId();
+                    ghHotkeyMouseHoldArmed = false;
+                    ghHotkeyMouseHoldDown = false;
+                    return;
+                }
+                // 短按抬起已作废本序号：丢弃迟到的 Start（勿用 GetAsyncKeyState）
+                if (ghHotkeyHoldPostedSeq != 0
+                    && ghHotkeyHoldPostedSeq == ghHotkeyHoldInvalidSeq) {
+                    ghHotkeyPending = false;
+                    ClearActiveHoldHotkeyId();
+                    ghHotkeyMouseHoldArmed = false;
+                    ghHotkeyMouseHoldDown = false;
+                    return;
+                }
                 lastHotkeyTick_ = now;
                 ghHotkeyHandling = true;
                 ghHotkeyNeedKeyUp = false;
                 ghHotkeyPending = false;
+                SetActiveHoldHotkeyId(HOTKEY_GLOBAL_ID);
                 struct HoldStartGuard {
+                    bool started = false;
                     ~HoldStartGuard() {
-                        // 不要 Flush 掉可能已排队的 kHotHoldStop；不要用 GetAsyncKeyState 判抬起
+                        // 未真正启动时清掉 holdDown，否则后续按住会被吞掉
+                        if (!started) {
+                            ghHotkeyMouseHoldArmed = false;
+                            ghHotkeyMouseHoldDown = false;
+                            ClearActiveHoldHotkeyId();
+                        }
                         ghHotkeyNeedKeyUp = false;
                         ghHotkeyPending = false;
                         ghHotkeyHandling = false;
                     }
                 } holdGuard;
                 if (clicking_ || recording_ || running_) return;
+                if (ShouldSuppressHotkeyWhileTyping()) return;
                 if (activeHomeTab_ != quickscript::MainTab::Clicker) {
                     if (selectedScript_ >= 0) {
+                        holdGuard.started = true;
                         RunScriptByIndex(selectedScript_);
                     } else if (selectedRecording_ >= 0 && selectedRecording_ < static_cast<int>(recordings_.size())) {
+                        holdGuard.started = true;
                         LoadScriptFile(recordings_[static_cast<size_t>(selectedRecording_)].path);
                         RunCurrentActions();
                     } else if (activeHomeTab_ == quickscript::MainTab::Recorder) {
+                        holdGuard.started = true;
                         ToggleRecording();
                     }
                     return;
                 }
+                holdGuard.started = true;
                 StartClicking();
                 return;
             }
 
-            if (ghHotkeyNeedKeyUp) return;
+            // 单击切换：RegisterHotKey 每次完整按下只投递一次，不能再用 NeedKeyUp 挡掉——
+            // 否则「上一轮 NeedKeyUp 未清 + 本轮已按下」会被 Sync 误判成仍未抬起，表现为偶发无响应。
             const DWORD now = GetTickCount();
             const bool busy = clicking_ || recording_ || running_
                 || ghHotkeySessionBusy.load(std::memory_order_relaxed);
@@ -10493,20 +11282,14 @@ private:
             if (now - lastHotkeyTick_ < minGap) return;
             lastHotkeyTick_ = now;
             ghHotkeyHandling = true;
-            ghHotkeyNeedKeyUp = true;
             ghHotkeyPending = false;
+            // 置位以挡住 Suspend 后 LL 连发；抬起由钩子 KEYUP / Sync 清除（只清不强制保持）
+            ghHotkeyNeedKeyUp = true;
             struct HotkeyHandlingGuard {
                 HWND hwnd;
                 ~HotkeyHandlingGuard() {
                     FlushQueuedGlobalHotkeys(hwnd);
-                    // 处理期间 KEYUP 可能已到：若键已松开则允许下次；否则保持到抬起。
                     SyncHotkeyLatches();
-                    if ((ghHotkeyVk && (GetAsyncKeyState(static_cast<int>(ghHotkeyVk)) & 0x8000)) == 0) {
-                        ghHotkeyNeedKeyUp = false;
-                        ghHotkeyPending = false;
-                    } else {
-                        ghHotkeyNeedKeyUp = true;
-                    }
                     ghHotkeyHandling = false;
                 }
             } handlingGuard{hwnd_};
@@ -10514,6 +11297,8 @@ private:
             if (clicking_) { StopClicking(); return; }
             if (recording_) { StopRecording(); return; }
             if (running_) { StopRun(); return; }
+            // 「中文输入法不触发热键」：IME 开启时不启动连点/宏/录制（停止不受影响）
+            if (ShouldSuppressHotkeyWhileTyping()) return;
             if (activeHomeTab_ != quickscript::MainTab::Clicker) {
                 if (selectedScript_ >= 0) {
                     RunScriptByIndex(selectedScript_);
@@ -10529,8 +11314,61 @@ private:
             return;
         }
         if (clicking_ || recording_) return;
+        if (id >= HOTKEY_SCRIPT_BASE) {
+            const int scriptIndex = id - HOTKEY_SCRIPT_BASE;
+            const bool holdKey = scriptIndex >= 0
+                && scriptIndex < static_cast<int>(scripts_.size())
+                && scripts_[static_cast<size_t>(scriptIndex)].hotkey.holdMode;
+
+            if (holdKey && holdCmd == static_cast<int>(kHotHoldStop)) {
+                for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+                    if (ghPlaybackScriptHooks[i].hotkeyId == id) {
+                        ghPlaybackScriptHooks[i].holdArmed = false;
+                        ghPlaybackScriptHooks[i].holdActive = false;
+                        break;
+                    }
+                }
+                ClearActiveHoldHotkeyId();
+                if (running_) StopRun();
+                return;
+            }
+            if (holdKey && holdCmd == static_cast<int>(kHotHoldStart)) {
+                if (running_) return;
+                // 短按抬起已作废：丢弃迟到 Start
+                for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+                    auto& h = ghPlaybackScriptHooks[i];
+                    if (h.hotkeyId != id) continue;
+                    if (h.holdSeq != 0 && h.holdSeq == h.holdInvalidSeq) {
+                        ClearActiveHoldHotkeyId();
+                        h.holdArmed = false;
+                        h.holdActive = false;
+                        return;
+                    }
+                    break;
+                }
+                if (ShouldSuppressHotkeyWhileTyping()) {
+                    ClearActiveHoldHotkeyId();
+                    for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+                        if (ghPlaybackScriptHooks[i].hotkeyId == id) {
+                            ghPlaybackScriptHooks[i].holdArmed = false;
+                            ghPlaybackScriptHooks[i].holdActive = false;
+                            break;
+                        }
+                    }
+                    return;
+                }
+                SetActiveHoldHotkeyId(id);
+                RunScriptByIndex(scriptIndex);
+                return;
+            }
+
+            // 「中文输入法不触发热键」：IME 开启时不启动宏（运行中仍可停）
+            if (!running_ && ShouldSuppressHotkeyWhileTyping()) return;
+            if (running_) { StopRun(); return; }
+            RunScriptByIndex(scriptIndex);
+            return;
+        }
         if (running_) { StopRun(); return; }
-        if (id >= HOTKEY_SCRIPT_BASE) RunScriptByIndex(id - HOTKEY_SCRIPT_BASE);
     }
 
     void RunScriptByIndex(int index) {
@@ -10602,7 +11440,8 @@ private:
         return hwnd == labelMacro_ || hwnd == name_ || hwnd == mode_
             || hwnd == labelBreakoutTime_ || hwnd == breakoutTimeEdit_
             || hwnd == wmSelectMethod_ || hwnd == wmSpecifyWindowBtn_
-            || hwnd == wmTargetPathEdit_ || hwnd == wmTargetBrowseBtn_ || hwnd == wmTargetCrosshairBtn_;
+            || hwnd == wmTargetPathEdit_ || hwnd == wmTargetBrowseBtn_ || hwnd == wmTargetCrosshairBtn_
+            || hwnd == wmFakeFocusCheck_;
     }
 
     RECT wmModeLabelRect_{};
@@ -10657,6 +11496,7 @@ private:
         if (wmTargetPathEdit_) ShowWindow(wmTargetPathEdit_, SW_HIDE);
         if (wmTargetBrowseBtn_) ShowWindow(wmTargetBrowseBtn_, SW_HIDE);
         if (wmTargetCrosshairBtn_) ShowWindow(wmTargetCrosshairBtn_, SW_HIDE);
+        if (wmFakeFocusCheck_) ShowWindow(wmFakeFocusCheck_, SW_HIDE);
 
         const int rowY = ScaleEditorY(kEditorMacroHeaderRowY);
         const int rowH = ScaleEditorH(kEditorMacroHeaderRowH);
@@ -10740,13 +11580,42 @@ private:
                 const int targetRowY = rowY + rowH + ScaleEditorY(kEditorWmRowGap);
                 const int crossW = ScaleEditorW(kEditorWmTargetCrosshairW);
                 const int browseW = ScaleEditorW(kEditorWmTargetBrowseW);
-                const int crossX = targetContentRight - crossW;
+                const bool showFakeFocus = popupMode_.sel == 1;
+                const int ffW = showFakeFocus ? ScaleEditorW(kEditorWmFakeFocusW) : 0;
+                // 自右向左：聚焦 | 准星 | 浏览 | 路径（聚焦紧挨准星右侧，同排对齐）
+                int right = targetContentRight;
+                int ffX = 0;
+                if (showFakeFocus) {
+                    ffX = right - ffW;
+                    right = ffX - btnGap;
+                }
+                const int crossX = right - crossW;
                 const int browseX = crossX - btnGap - browseW;
                 const int pathW = std::max(ScaleEditorW(120), browseX - btnGap - contentLeft);
 
                 if (wmTargetPathEdit_) MoveWindow(wmTargetPathEdit_, contentLeft, targetRowY, pathW, rowH, FALSE);
                 if (wmTargetBrowseBtn_) MoveWindow(wmTargetBrowseBtn_, browseX, targetRowY, browseW, rowH, FALSE);
                 if (wmTargetCrosshairBtn_) MoveWindow(wmTargetCrosshairBtn_, crossX, targetRowY, crossW, rowH, FALSE);
+                if (wmFakeFocusCheck_) {
+                    ShowWindow(wmFakeFocusCheck_, showFakeFocus ? SW_SHOW : SW_HIDE);
+                    if (showFakeFocus) {
+                        MoveWindow(wmFakeFocusCheck_, ffX, targetRowY, ffW, rowH, FALSE);
+                        SetWindowPos(wmFakeFocusCheck_, HWND_TOP, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
+                }
+            } else if (wmFakeFocusCheck_) {
+                // 无目标程序行时：第二行右缘与目标行同一 contentRight，避免压住工具栏。
+                const bool showFakeFocus = popupMode_.sel == 1;
+                ShowWindow(wmFakeFocusCheck_, showFakeFocus ? SW_SHOW : SW_HIDE);
+                if (showFakeFocus) {
+                    const int ffW = ScaleEditorW(kEditorWmFakeFocusW);
+                    const int ffY = rowY + rowH + ScaleEditorY(kEditorWmRowGap);
+                    const int ffX = ScaleEditorX(kEditorWmContentRight) - ffW;
+                    MoveWindow(wmFakeFocusCheck_, ffX, ffY, ffW, rowH, FALSE);
+                    SetWindowPos(wmFakeFocusCheck_, HWND_TOP, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
         } else {
             wmModeLabelRect_ = {};
@@ -10791,6 +11660,17 @@ private:
         if (!scriptWindowMode_.windowName.empty()) {
             scriptWindowMode_.targetWindowTitle = scriptWindowMode_.windowName;
         }
+        if (wmFakeFocusCheck_) {
+            scriptWindowMode_.fakeFocusEnabled =
+                IsParamCheckboxChecked(wmFakeFocusCheck_)
+                && scriptWindowMode_.executionKind
+                    == windowmode::WindowModeExecutionKind::HiddenDesktop;
+        } else if (scriptWindowMode_.executionKind
+            != windowmode::WindowModeExecutionKind::HiddenDesktop) {
+            scriptWindowMode_.fakeFocusEnabled = false;
+        }
+        // 注意：切到默认模式时不要清内存/编辑框——手滑切走再切回要能恢复。
+        // 持久化清空只在写盘：enabled=0 时 WriteWindowModeJson 落空配置。
     }
 
     void SyncWindowModeUiFromScript() {
@@ -10806,6 +11686,12 @@ private:
             SetText(wmSelectMethod_, popupWmSelectMethod_.items[static_cast<size_t>(popupWmSelectMethod_.sel)]);
         }
         if (wmTargetPathEdit_) SetText(wmTargetPathEdit_, scriptWindowMode_.targetExePath);
+        if (wmFakeFocusCheck_) {
+            const bool check = scriptWindowMode_.fakeFocusEnabled
+                && scriptWindowMode_.executionKind
+                    == windowmode::WindowModeExecutionKind::HiddenDesktop;
+            SetParamCheckboxChecked(wmFakeFocusCheck_, check, false);
+        }
         if (page_ == Page::Editor) UpdateEditorWindowModeChrome();
     }
 
@@ -10826,6 +11712,7 @@ private:
         if (!pick.documentPath.empty()) {
             scriptWindowMode_.launchArgs = L"\"" + pick.documentPath + L"\"";
         }
+        windowmode::AnnotateInputStrategyForSave(scriptWindowMode_);
         if (wmTargetPathEdit_ && !pick.processPath.empty()) SetText(wmTargetPathEdit_, pick.processPath);
         SyncScriptWindowModeFromEditor();
     }
@@ -10857,6 +11744,7 @@ private:
                 cfg.launchArgs = L"\"" + stem + L"\"";
             }
         }
+        windowmode::AnnotateInputStrategyForSave(cfg);
     }
 
     static void ApplyWindowInfoToConfig(windowmode::WindowModeScriptConfig& cfg,
@@ -10869,6 +11757,7 @@ private:
         cfg.targetWindowTitle = cfg.windowName;
         cfg.targetPickX = info.x;
         cfg.targetPickY = info.y;
+        windowmode::AnnotateInputStrategyForSave(cfg);
     }
 
     bool IsOwnProcessWindowAt(int x, int y) const {
@@ -11011,7 +11900,10 @@ private:
         FinalizeWindowModeAutoLaunch(cfg);
         // 再次强制：防止上游 JSON / 旧字段把 autoLaunch 关掉。
         cfg.autoLaunchTarget = windowmode::ShouldAutoLaunchTarget(cfg);
-        if (!cfg.allowForegroundInputFallback) {
+        if (windowmode::UsesFakeFocus(cfg)) {
+            // 假焦点禁止任何前台抢焦点 fallback。
+            cfg.allowForegroundInputFallback = false;
+        } else if (!cfg.allowForegroundInputFallback) {
             cfg.allowForegroundInputFallback = appSettings_.windowMode.allowForegroundInputFallback;
         }
         return true;
@@ -11037,6 +11929,7 @@ private:
         if (!settingsDialog_->Show(hwnd_, appSettings_, [this]() {
             ApplyThemeAndRefreshUi();
             ApplyDebugWindowSetting();
+            ApplyOtherOsSettings();
         })) {
             settingsDialog_.reset();
         }
@@ -11138,6 +12031,13 @@ private:
         return simulatingInputDepth_.load(std::memory_order_relaxed) > 0;
     }
 
+    /// 「中文输入法不触发热键」：中文 IME 打开/组字时不启动（与 LL 钩子共用检测）。
+    bool ShouldSuppressHotkeyWhileTyping() const {
+        if (!appSettings_.other.resolveImeConflict) return false;
+        if (ghHotkeySessionBusy.load(std::memory_order_relaxed)) return false;
+        return IsChineseImeActiveForHotkeyPass();
+    }
+
     void SendHeldModifiers(const ScriptAction& a, bool down) {
         if (a.holdLeftWin) SendKey(VK_LWIN, down);
         if (a.holdRightWin) SendKey(VK_RWIN, down);
@@ -11219,6 +12119,14 @@ private:
             return;
         }
         running_ = true; stopFlag_ = false; breakoutUserInput_ = false; breakoutPaused_ = false;
+        SuspendHotkeysForPlayback();
+        {
+            std::lock_guard<std::mutex> lock(extScriptStateMu_);
+            runningScriptPath_ = selfPath;
+            const auto slash = selfPath.find_last_of(L"\\/");
+            runningScriptName_ = (slash == std::wstring::npos)
+                ? selfPath : selfPath.substr(slash + 1);
+        }
         ghHotkeySessionBusy.store(true, std::memory_order_relaxed);
         MouseInputRouter::Instance().Configure();
         BeginHighResTimer(); // 宏内短等待（录制轨迹）需要 1ms 定时器精度
@@ -11342,7 +12250,8 @@ private:
                     wchar_t buf[192]{};
                     swprintf_s(buf, L"窗口模式已绑定 hwnd=0x%p class=%s%s",
                         th, cls,
-                        wmExec.UsesBackgroundWindow() ? L" [后台]" : L" [鼠标宏桌面]");
+                        wmExec.UsesBackgroundWindow() ? L" [后台]"
+                            : (wmExec.IsCdpInputMode() ? L" [鼠标宏·扩展]" : L" [鼠标宏桌面]"));
                     AppendDebugLog(buf);
                 }
             }
@@ -11922,47 +12831,53 @@ private:
                         cx = a.x + RandomInt(a.randomX);
                         cy = a.y + RandomInt(a.randomY);
                     }
-                    MarkSimulatedInput();
+                    // 窗口模式 CDP/扩展键鼠不走本机 SendInput，勿 Mark（否则脱离检测会误判忙碌）。
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
                     wmSendHeldModifiers(a, true);
                     wmMouseClick(cx, cy, a.button);
                     wmSendHeldModifiers(a, false);
-                    UnmarkSimulatedInput();
+                    if (markSim) UnmarkSimulatedInput();
                     // duration=两次重复之间的间隔；执行 1 次时不等待，首前/末后也不插等待
                     if (ShouldWaitAfterRepeat(a, i) && !stopFlag_) {
                         SleepInterruptible(a.duration + RandomDelay(a.randomDuration));
                     }
                 }
                 else if (a.type == ActionType::KeyDown) {
-                    MarkSimulatedInput();
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
                     wmSendHeldModifiers(a, true);
                     wmSendKey(a.keyVk, true);
                     heldKeyVk = a.keyVk;
                     heldKeys.insert(a.keyVk);
-                    UnmarkSimulatedInput();
+                    if (markSim) UnmarkSimulatedInput();
                 }
                 else if (a.type == ActionType::KeyUp) {
-                    MarkSimulatedInput();
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
                     wmSendKey(a.keyVk, false);
                     if (heldKeyVk == a.keyVk) heldKeyVk = 0;
                     heldKeys.erase(a.keyVk);
                     wmSendHeldModifiers(a, false);
-                    UnmarkSimulatedInput();
+                    if (markSim) UnmarkSimulatedInput();
                 }
                 else if (a.type == ActionType::KeyClick) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) {
-                    MarkSimulatedInput();
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
                     wmSendHeldModifiers(a, true);
                     wmSendKey(a.keyVk, true);
                     wmSendKey(a.keyVk, false);
                     wmSendHeldModifiers(a, false);
-                    UnmarkSimulatedInput();
+                    if (markSim) UnmarkSimulatedInput();
                     if (ShouldWaitAfterRepeat(a, i) && !stopFlag_) {
                         SleepInterruptible(a.duration + RandomDelay(a.randomDuration));
                     }
                 }
                 else if (a.type == ActionType::HotkeyShortcut) for (int i = 0; i < a.clickCount && !stopFlag_; ++i) {
-                    MarkSimulatedInput();
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
                     wmSendShortcut(a);
-                    UnmarkSimulatedInput();
+                    if (markSim) UnmarkSimulatedInput();
                     if (ShouldWaitAfterRepeat(a, i) && !stopFlag_) {
                         SleepInterruptible(a.duration + RandomDelay(a.randomDuration));
                     }
@@ -12024,6 +12939,15 @@ private:
                             ImageMatchOutput output = wmExecPtr->FindImageClient(
                                 a, lockedScreen_, lockedVirtX_, lockedVirtY_);
                             lastFindMs = output.elapsedMs;
+                            if (appSettings_.playback.autoOutputKeyFunctionDebug
+                                && output.matches.empty()) {
+                                wchar_t buf[320]{};
+                                swprintf_s(buf,
+                                    L"找图诊断(窗口模式) 无匹配 %dms bestNcc=%.1f%% "
+                                    L"（应走扩展/客户区；若见全屏找图调试则窗口模式未激活）",
+                                    output.elapsedMs, output.debugBestNccPercent);
+                                AppendDebugLog(buf);
+                            }
                             if (output.matches.empty()) return {};
                             return output.matches.front();
                         }
@@ -12181,10 +13105,20 @@ private:
                             } else if (a.findImageFollowUp == 1) {
                                 wmSetPos(tx, ty, 0, 0);
                                 if (appSettings_.playback.autoOutputKeyFunctionDebug) {
-                                    POINT cur{};
-                                    GetCursorPos(&cur);
-                                    wchar_t buf[128]{};
-                                    swprintf_s(buf, L"找图光标实际位置=(%d,%d)", cur.x, cur.y);
+                                    wchar_t buf[160]{};
+                                    if (wmUsesTarget()) {
+                                        int ccx = 0, ccy = 0;
+                                        if (wmExecPtr->GetCursorClientPos(ccx, ccy)) {
+                                            swprintf_s(buf, L"找图软光标客户区=(%d,%d) 目标=(%d,%d)",
+                                                ccx, ccy, tx, ty);
+                                        } else {
+                                            swprintf_s(buf, L"找图软光标未知 目标=(%d,%d)", tx, ty);
+                                        }
+                                    } else {
+                                        POINT cur{};
+                                        GetCursorPos(&cur);
+                                        swprintf_s(buf, L"找图光标实际位置=(%d,%d)", cur.x, cur.y);
+                                    }
                                     AppendDebugLog(buf);
                                 }
                             }
@@ -12195,7 +13129,8 @@ private:
                                 std::chrono::steady_clock::now() - findStart).count();
                             if (elapsed >= findTimeSec) break;
                         }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        // 可中断等待；窗口模式单次找图常 1~2s，重试间隔宜短以便热键立刻停
+                        SleepInterruptible(0.05);
                     } while (!stopFlag_ && !BreakoutTriggered());
                     if (appSettings_.playback.autoOutputKeyFunctionDebug) {
                         AppendDebugLog(FormatFindImageDebug(a, lastRawMatch, lastHadTarget, lastTargetX, lastTargetY));
@@ -12862,7 +13797,9 @@ private:
     void StopRun() {
         stopFlag_ = true;
         aiHttpAbort_.Abort();
-        ghHotkeyPending = false;
+        // 扩展桥可能卡在 WS/CDP 等待：先 Abort 再清闩锁，保证热键能强行中止。
+        windowmode::WindowModeExecutor::NotifyCancel();
+        ClearToggleHotkeyLatches();
     }
     void ReleaseAllHeldInputs() {
         if (running_) MarkSimulatedInput();
@@ -12969,9 +13906,11 @@ private:
             TaskbarYieldMessages();
             breakoutTaskbarTransition_ = false;
         } else {
-            SetWindowPos(hwnd_, HWND_TOP, rc.left, rc.top, w, h, SWP_SHOWWINDOW);
-            ShowWindow(hwnd_, SW_SHOW);
-            SetForegroundWindow(hwnd_);
+            // 自动隐藏后恢复：进任务栏但不抢焦点，避免打断用户当前操作
+            SetWindowPos(hwnd_, HWND_BOTTOM, rc.left, rc.top, w, h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+            PrepareHwndTaskbarLivePreview(hwnd_);
         }
 
         breakoutPlacement_ = BreakoutTaskbarPlacement{};
@@ -12980,8 +13919,15 @@ private:
 
     void OnRunDone() {
         running_ = false;
+        extRunPending_ = false;
+        ResumeHotkeysAfterPlayback();
+        {
+            std::lock_guard<std::mutex> lock(extScriptStateMu_);
+            runningScriptPath_.clear();
+            runningScriptName_.clear();
+        }
         ghHotkeySessionBusy.store(recording_ || clicking_, std::memory_order_relaxed);
-        ghHotkeyPending = false;
+        ClearToggleHotkeyLatches();
         EndHighResTimer();
         breakout_input::UninstallBreakoutHooks();
         breakoutHookState_ = BreakoutHookState{};
@@ -13001,6 +13947,9 @@ private:
             if (IsWindowVisible(hwnd_)) {
                 ApplyMainWindowNormalTaskbarPresentation(hwnd_);
                 RestoreWindowTaskbarLivePreview(hwnd_);
+                // 预览/FRAMECHANGED 可能抬升 Z 序：再沉底且不激活
+                SetWindowPos(hwnd_, HWND_BOTTOM, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
         EnsureTrayIcon();
@@ -13203,6 +14152,11 @@ private:
         static std::atomic_bool quitting{false};
         if (quitting.exchange(true)) {
             TerminateProcess(GetCurrentProcess(), 0);
+        }
+
+        try {
+            windowmode::ExtBridgeServer::Instance().Stop();
+        } catch (...) {
         }
 
         // ExitProcess 可能卡在 VDA/WinRT 的 DLL_PROCESS_DETACH，进程变幽灵。
@@ -14186,7 +15140,7 @@ private:
             && (existing.right - existing.left) == w && (existing.bottom - existing.top) == h;
         if (samePos && EditorDropPopupVisible()) return;
         SetWindowPos(editorDropPopup_, HWND_TOPMOST, x, y, w, h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
     void InvalidateEditorPopupRow(int idx) {
@@ -14341,11 +15295,16 @@ private:
         if (scrollMax <= 0) return;
         const int oldScroll = editorPopupScroll_;
         editorPopupScroll_ = std::clamp(editorPopupScroll_ + (delta < 0 ? 1 : -1), 0, scrollMax);
-        if (oldScroll != editorPopupScroll_ && editorDropPopup_) {
-            InvalidateRect(editorDropPopup_, nullptr, FALSE);
-            if (quickInputTipShown_ == QuickInputTipKind::VariableHelp) SyncQuickInputTipPopup();
-            else if (editorPopupOpen_ == 7 && editorPopupHover_ >= 0) BeginQuickInputVarTipHover(editorPopupHover_);
-        }
+        if (oldScroll == editorPopupScroll_ || !editorDropPopup_) return;
+        // 滚动后按光标重算 hover（与动作列表滚轮一致），避免高亮停在旧索引
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(editorDropPopup_, &pt);
+        const int idx = HitEditorPopupItemLocal(pt.x, pt.y);
+        if (idx != editorPopupHover_) editorPopupHover_ = idx;
+        InvalidateRect(editorDropPopup_, nullptr, FALSE);
+        if (quickInputTipShown_ == QuickInputTipKind::VariableHelp) SyncQuickInputTipPopup();
+        else if (editorPopupOpen_ == 7 && editorPopupHover_ >= 0) BeginQuickInputVarTipHover(editorPopupHover_);
     }
 
     void SelectEditorPopupItem(int idx) {
@@ -14657,14 +15616,17 @@ private:
                     DeleteDC(mem);
                 }
             }
-            DrawBorderRect(hdc, rc, border);
+            DrawBorderRect(hdc, RECT{rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1}, border);
             return;
         }
         wchar_t text[64]{};
         GetWindowTextW(dis->hwndItem, text, 64);
         SelectObject(hdc, editorFont_ ? editorFont_ : font_);
         DrawTextIn(hdc, text, rc, kGrayButtonText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        DrawBorderRect(hdc, rc, border);
+        // 边框内缩 1px：D2D DrawRectangle 描边居中，贴 client 边缘时上/左边易被裁掉半像素
+        RECT borderRc{rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1};
+        if (borderRc.right > borderRc.left && borderRc.bottom > borderRc.top)
+            DrawBorderRect(hdc, borderRc, border);
     }
 
     void DrawOwnerButton(DRAWITEMSTRUCT* dis) {
@@ -14777,15 +15739,22 @@ private:
         RECT hint = CreateRect();
         FillRectColor(hdc, hint, clicking_ ? RGB(255, 200, 200) : kCreateYellow);
         SelectObject(hdc, bigFont_);
+        const bool hold = GlobalHotkeyUsesHold();
+        const std::wstring prefix = hold ? L"按住" : L"按";
         const std::wstring hotText = globalHotkey_.text.empty() ? L"F8" : globalHotkey_.text;
-        RECT keyBox = ClickerBannerKeyRect();
-        DrawTextIn(hdc, L"按", RECT{hint.left + UiLen(166), hint.top, keyBox.left - UiLen(5), hint.bottom}, kBannerText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        FillRectColor(hdc, keyBox, clicking_ ? RGB(200, 50, 50) : kOrange);
-        DrawTextIn(hdc, hotText, keyBox, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         const std::wstring actionText = clicking_
             ? (L"键停止 连点（当前 " + ClickerButtonTitle() + L" " + ClickIntervalComboText() + L"）")
             : (L"键开始 " + ClickerButtonTitle() + L" 连点");
-        DrawTextIn(hdc, actionText, RECT{keyBox.right + UiLen(10), hint.top, hint.right - UiLen(20), hint.bottom}, clicking_ ? RGB(180, 40, 40) : kBannerText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT keyBox = ClickerBannerKeyRect();
+        const int gap = UiLen(10);
+        const int prefixW = TextWidth(prefix, bigFont_);
+        RECT prefixRc{keyBox.left - gap - prefixW, hint.top, keyBox.left - gap, hint.bottom};
+        const COLORREF bannerFg = clicking_ ? RGB(180, 40, 40) : kBannerText;
+        DrawTextIn(hdc, prefix, prefixRc, bannerFg, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        FillRectColor(hdc, keyBox, clicking_ ? RGB(200, 50, 50) : kOrange);
+        DrawTextIn(hdc, hotText, keyBox, kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, actionText, RECT{keyBox.right + gap, hint.top, hint.right - UiLen(12), hint.bottom},
+            bannerFg, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, homeFont_);
     }
 
@@ -14820,11 +15789,11 @@ private:
                 DrawTextIn(hdc, L"录制时间: " + recordings_[static_cast<size_t>(i)].recordTime, HomeCardMetaLeft(r), kSecondaryText);
                 DrawTextIn(hdc, L"时长: " + FormatDuration(recordings_[static_cast<size_t>(i)].durationSeconds), HomeCardMetaRight(r), kSecondaryText);
                 if (i == selectedRecording_) {
-                    DrawTextIn(hdc, L"取消选择", RecordingDeselectRect(i), kWhite, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                    DrawTextIn(hdc, L"取消选择", RecordingDeselectRect(i), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                     RECT tag = RecordingSelectedTagRect(i);
                     FillRectColor(hdc, tag, kSelectedYellow);
-                    DrawTextIn(hdc, L"已选中⌄", tag, kMainGreen, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                } else {
+                    DrawTextIn(hdc, L"已选中\u2713", tag, kMainGreen, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                } else if (i == recordingHover_) {
                     DrawTextIn(hdc, L"优化", RecordingOptimizeRect(i), kWhite, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
                     // 与宏「编辑/删除」同列右对齐（「重命名」三字、「删除」两字）
                     DrawTextIn(hdc, L"重命名", RecordingRenameRect(i), kWhite, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -14846,7 +15815,8 @@ private:
                 kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SelectObject(hdc, bigFont_);
-        const std::wstring prefix = L"按";
+        const bool hold = GlobalHotkeyUsesHold();
+        const std::wstring prefix = hold ? L"按住" : L"按";
         std::wstring suffix;
         if (recording_) suffix = L"键停止 录制";
         else if (selectedRecording_ >= 0) suffix = L"键开始 回放";
@@ -14926,12 +15896,17 @@ private:
             SelectObject(hdc, homeFont_);
             DrawTextIn(hdc, L"录制时间: " + scripts_[static_cast<size_t>(i)].recordTime, HomeCardMetaLeft(r), kSecondaryText);
             DrawTextIn(hdc, L"动作数: " + std::to_wstring(scripts_[static_cast<size_t>(i)].actionCount), HomeCardMetaRight(r), kSecondaryText);
-            DrawTextIn(hdc, i == selectedScript_ ? L"取消选择" : L"编辑", HomeCardEditBtn(r), kWhite, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-            DrawTextIn(hdc, L"删除", HomeCardDeleteBtn(r), kWhite, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             if (i == selectedScript_) {
+                DrawTextIn(hdc, L"取消选择", HomeCardEditBtn(r), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                if (i == homeHover_) {
+                    DrawTextIn(hdc, L"删除", HomeCardDeleteBtn(r), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
                 RECT tag = HomeCardSelectedTag(r);
                 FillRectColor(hdc, tag, kSelectedYellow);
-                DrawTextIn(hdc, L"已选中⌄", tag, kMainGreen, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextIn(hdc, L"已选中\u2713", tag, kMainGreen, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else if (i == homeHover_) {
+                DrawTextIn(hdc, L"编辑", HomeCardEditBtn(r), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextIn(hdc, L"删除", HomeCardDeleteBtn(r), kWhite, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
         }
         RestoreDC(hdc, saved);
@@ -14940,7 +15915,8 @@ private:
         FillRectColor(hdc, cr, kCreateYellow);
         SelectObject(hdc, bigFont_);
         if (selectedScript_ >= 0) {
-            const std::wstring prefix = L"按";
+            const bool hold = GlobalHotkeyUsesHold();
+            const std::wstring prefix = hold ? L"按住" : L"按";
             const std::wstring suffix = L"键开始 运行宏";
             RECT hot = CommonHotRect();
             const int gap = UiLen(20);
@@ -15207,6 +16183,15 @@ private:
         else HideDebugWindow();
     }
 
+    void ApplyOtherOsSettings() {
+        SetAutoStartOnBoot(appSettings_.other.autoStartOnBoot);
+        ghHoldThresholdMs.store(
+            HoldThresholdMsFromSeconds(appSettings_.other.holdThresholdSeconds),
+            std::memory_order_relaxed);
+        // 「中文输入法不触发热键」：切换 RegisterHotKey / LL 放行模式
+        RegisterAllHotkeys();
+    }
+
     void UpdateStatusTip() {
         if (appSettings_.other.hideBottomRightTip) { HideStatusTip(); return; }
         const wchar_t* text = breakoutPaused_.load(std::memory_order_relaxed) ? L"脱离中..."
@@ -15228,7 +16213,7 @@ private:
         if (statusTipWindow_) ShowWindow(statusTipWindow_, SW_HIDE);
     }
 
-    void Cleanup() { SaveHomeState(); outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); KillTimer(hwnd_, kHotkeyLatchSyncTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } macroDebugWindow_.Destroy(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); ForceEndBreakoutUiState(); breakout_input::UninstallBreakoutHooks(); stopFlag_ = true; if (worker_.joinable()) worker_.detach(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
+    void Cleanup() { SaveHomeState(); outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); KillTimer(hwnd_, kHotkeyLatchSyncTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } macroDebugWindow_.Destroy(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); ForceEndBreakoutUiState(); breakout_input::UninstallBreakoutHooks(); stopFlag_ = true; if (worker_.joinable()) worker_.detach(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } ghPlaybackHotkeySuspended = false; ghPassThroughTypingHotkeys.store(false, std::memory_order_relaxed); ghPlaybackScriptHookCount = 0; UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() {
         if (recording_) {
@@ -15445,6 +16430,10 @@ private:
     BreakoutHookState breakoutHookState_{};
     DWORD lastHotkeyTick_ = 0;
     std::atomic_bool running_{false}, stopFlag_{false}; AiHttpAbortSlot aiHttpAbort_; std::thread worker_; std::mt19937 rng_{std::random_device{}()};
+    std::atomic_bool extRunPending_{false};
+    std::mutex extScriptStateMu_;
+    std::wstring runningScriptPath_;
+    std::wstring runningScriptName_;
     windowmode::WindowModeScriptConfig scriptWindowMode_{};
     CoordMeta loadedCoordMeta_{};  // 当前加载脚本的 coordMeta，供保存时复用
     windowmode::WindowPickDialog wmPickDialog_{};
@@ -15453,6 +16442,7 @@ private:
     HWND wmTargetPathEdit_ = nullptr;
     HWND wmTargetBrowseBtn_ = nullptr;
     HWND wmTargetCrosshairBtn_ = nullptr;
+    HWND wmFakeFocusCheck_ = nullptr;
     ScheduledTaskScheduler scheduledTasks_;
     // Recording
     std::atomic_bool recording_{false};

@@ -23,6 +23,8 @@ public:
     int CreateDesktopPreservingView() const;
     bool MoveWindowToDesktopNumber(HWND hwnd, int desktopNumber) const;
     bool MoveWindowToDesktopNumberPreservingView(HWND hwnd, int desktopNumber) const;
+    /// 若当前视图偏离 preferredDesk，在 durationMs 内短轮询钉回（搬窗瞬时纠正用）。
+    void HoldView(int preferredDesk, int durationMs = 250) const;
     int GetCurrentDesktopNumber() const;
     bool GoToDesktopNumber(int desktopNumber) const;
     int GetWindowDesktopNumber(HWND hwnd) const;

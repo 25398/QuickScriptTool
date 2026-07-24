@@ -1355,6 +1355,9 @@ AgentTool MakeListSettingsTool() {
         ss << L"  宏启动时播放提示音: " << (settings.other.playSoundOnStart ? L"是" : L"否") << L"\n";
         ss << L"  隐藏右下角弹窗提示: " << (settings.other.hideBottomRightTip ? L"是" : L"否") << L"\n";
         ss << L"  关闭按钮最小化到托盘: " << (settings.other.closeToTray ? L"是" : L"否") << L"\n";
+        ss << L"  开机自动启动: " << (settings.other.autoStartOnBoot ? L"是" : L"否") << L"\n";
+        ss << L"  中文输入法不触发热键: " << (settings.other.resolveImeConflict ? L"是" : L"否") << L"\n";
+        ss << L"  长按判定(秒): " << FormatHoldThresholdLabel(settings.other.holdThresholdSeconds) << L"\n";
 
         ss << L"\n修改设置请使用 updateSettings 工具。";
         return ss.str();
@@ -1399,7 +1402,10 @@ AgentTool MakeUpdateSettingsTool() {
             "autoHideMainWindow": { "type": "boolean", "description": "宏执行后自动隐藏主窗口" },
             "playSoundOnStart": { "type": "boolean", "description": "宏启动时播放提示音" },
             "hideBottomRightTip": { "type": "boolean", "description": "隐藏右下角弹窗提示" },
-            "closeToTray": { "type": "boolean", "description": "关闭按钮最小化到托盘" }
+            "closeToTray": { "type": "boolean", "description": "关闭按钮最小化到托盘" },
+            "autoStartOnBoot": { "type": "boolean", "description": "开机自动启动" },
+            "resolveImeConflict": { "type": "boolean", "description": "中文输入法开启/组字时不触发鼠标宏热键" },
+            "holdThresholdSeconds": { "type": "number", "description": "长按判定秒数（>0，热键按住启停与捕获共用）" }
         },
         "required": ["category"]
     })";
@@ -1451,6 +1457,12 @@ AgentTool MakeUpdateSettingsTool() {
             setBool("playSoundOnStart", settings.other.playSoundOnStart);
             setBool("hideBottomRightTip", settings.other.hideBottomRightTip);
             setBool("closeToTray", settings.other.closeToTray);
+            setBool("autoStartOnBoot", settings.other.autoStartOnBoot);
+            setBool("resolveImeConflict", settings.other.resolveImeConflict);
+            if (params.contains("holdThresholdSeconds")) {
+                settings.other.holdThresholdSeconds = NormalizeHoldThresholdSeconds(
+                    params["holdThresholdSeconds"].get<double>());
+            }
         } else {
             return L"[错误] 无效的 category：" + category + L"。可选值：click, playback, other";
         }

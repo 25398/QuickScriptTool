@@ -152,6 +152,24 @@ bool ApplyAgentWindowModeParams(const json& params, windowmode::WindowModeScript
         if (wm.contains("allowForegroundInputFallback")) {
             cfg.allowForegroundInputFallback = wm.value("allowForegroundInputFallback", 0) != 0;
         }
+        if (wm.contains("fakeFocusEnabled")) {
+            cfg.fakeFocusEnabled = wm.value("fakeFocusEnabled", 0) != 0;
+        }
+        if (wm.contains("inputStrategy")) {
+            const std::string s = wm.value("inputStrategy", "auto");
+            if (s == "softMessage" || s == "postMessage") {
+                cfg.inputStrategy = windowmode::WindowModeInputStrategy::SoftMessage;
+            } else if (s == "cdp") {
+                cfg.inputStrategy = windowmode::WindowModeInputStrategy::Cdp;
+            } else {
+                cfg.inputStrategy = windowmode::WindowModeInputStrategy::Auto;
+            }
+        }
+        if (wm.contains("cdpPort")) {
+            cfg.cdpPort = wm.value("cdpPort", 9222);
+            if (cfg.cdpPort <= 0) cfg.cdpPort = 9222;
+        }
+        windowmode::AnnotateInputStrategyForSave(cfg);
         if (cfg.windowName.empty() && !cfg.targetWindowTitle.empty()) {
             cfg.windowName = cfg.targetWindowTitle;
         }

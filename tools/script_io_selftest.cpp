@@ -41,6 +41,8 @@ const selftest::CaseInfo kCases[] = {
         L"ScriptActionToJsonString writes integer dx/dy for relative move"},
     {L"save_load_roundtrip_actions", L"default",
         L"Save/Load denorm=false keeps wait action"},
+    {L"hotkey_hold_roundtrip", L"default",
+        L"hotkeyHold 1/0 and legacy true/false load as holdMode"},
     {L"load_invalid_coordmeta_fallback", L"default",
         L"Broken coordMeta falls back to standard meta"},
     {L"parse_truncated_no_crash", L"default",
@@ -169,6 +171,33 @@ void CaseSaveLoadRoundtrip() {
     Emit(L"save_load_roundtrip_actions", ok, ok ? L"" : L"roundtrip failed");
 }
 
+void CaseHotkeyHoldRoundtrip() {
+    const std::wstring path = TempScriptPath(L"io_hold");
+    ScriptFileData data{};
+    data.scriptName = L"hold-test";
+    data.hotkey = Hotkey{0, VK_F9, L"F9", true, true};
+    data.coordMeta = StandardScriptCoordMeta();
+    data.coordsNormalized = true;
+    const bool saved = SaveScriptFileData(path, data);
+    ScriptFileData loaded = LoadScriptFileData(path, false);
+    const std::wstring written = ReadAll(path);
+    DeleteFileW(path.c_str());
+
+    const bool writeOk = saved && written.find(L"\"hotkeyHold\": 1") != std::wstring::npos
+        && loaded.hotkey.holdMode && loaded.hotkey.vk == VK_F9;
+
+    // 兼容旧文件里的 true/false（曾用 ExtractNumber 读读成点击）
+    const bool legacyTrue = ExtractBool(
+        L"{\"hotkeyHold\": true, \"hotkeyVk\": 120}", L"hotkeyHold", false);
+    const bool legacyFalse = !ExtractBool(
+        L"{\"hotkeyHold\": false, \"hotkeyVk\": 120}", L"hotkeyHold", true);
+    const bool numZero = !ExtractBool(L"{\"hotkeyHold\": 0}", L"hotkeyHold", true);
+
+    const bool ok = writeOk && legacyTrue && legacyFalse && numZero;
+    Emit(L"hotkey_hold_roundtrip", ok,
+        ok ? L"" : L"holdMode lost on save/load or legacy true parse");
+}
+
 void CaseInvalidCoordMeta() {
     const std::wstring path = TempScriptPath(L"io_badmeta");
     // refWidth 0 should fall back to standard when loading
@@ -253,6 +282,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseParseMoveMouseRelative();
     CaseWriteMoveMouseRelative();
     CaseSaveLoadRoundtrip();
+    CaseHotkeyHoldRoundtrip();
     CaseInvalidCoordMeta();
     CaseTruncated();
     CaseWriteActionJson();

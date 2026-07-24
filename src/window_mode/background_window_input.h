@@ -21,5 +21,7 @@ void PostScrollWheelToWindow(HWND hwnd, int cx, int cy, int steps, bool vertical
 /// Last client position posted via soft mouse APIs (for GetCursorPos in window modes).
 bool GetLastSoftMouseClientPos(HWND hwnd, int& cx, int& cy);
 void ResetSoftMouseState();
+/// CDP/扩展：Move 后记住客户区坐标，供后续「点击当前位置」(0,0) 使用。
+void RememberSoftMouseClientPos(HWND hwnd, int cx, int cy);
 
 }  // namespace windowmode

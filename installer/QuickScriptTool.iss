@@ -1,9 +1,12 @@
 ; QuickScriptTool 安装包脚本（Inno Setup 6）
 ; 1. 先运行: powershell -ExecutionPolicy Bypass -File tools\package_release.ps1
+;    （会校验并打包 Edge 配套扩展 extension\edge；缺扩展会失败 — 见 extension\PACKAGING.md）
 ; 2. （可选）下载 vc_redist.x64.exe 放到 installer\redist\ 目录
 ;    https://aka.ms/vs/17/release/vc_redist.x64.exe
 ; 3. 用 Inno Setup 编译本文件，或在命令行执行:
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\QuickScriptTool.iss
+;
+; 扩展：必须随包安装到 {app}\extension\edge（勿删下行 Source；勿加 skipifsourcedoesntexist）
 
 #define MyAppName "鼠大侠脚本工具"
 #define MyAppExeName "QuickScriptTool.exe"
@@ -38,6 +41,8 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Source: "{#SourceDir}\QuickScriptTool.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\opencv_world*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion recursesubdirs
+; 配套扩展（网页键鼠桥）— 必选。缺文件时 ISCC 应报错，避免装完没有 extension\edge
+Source: "{#SourceDir}\extension\edge\*"; DestDir: "{app}\extension\edge"; Flags: ignoreversion recursesubdirs
 Source: "{#RedistDir}\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: RedistBundled
 
 [Dirs]

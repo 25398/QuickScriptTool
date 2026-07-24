@@ -51,6 +51,16 @@ HWND MakeBorderedEdit(HWND parent, const wchar_t* text, int id) {
     return MakeModernSingleLineEdit(parent, text, id, 0, 0, 0, 0);
 }
 
+/// 切换子控件可见性且不触发立即重绘，避免「输入框先于父窗自定义绘制」闪一下。
+void SetChildVisibleNoRedraw(HWND child, bool visible) {
+    if (!child || !IsWindow(child)) return;
+    const bool isVis = (GetWindowLongW(child, GWL_STYLE) & WS_VISIBLE) != 0;
+    if (isVis == visible) return;
+    SetWindowPos(child, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW
+        | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+}
+
 }  // namespace
 
 namespace {
@@ -195,13 +205,49 @@ bool SettingsDialog::HitPlaybackCheckbox(int x, int y, int& outIndex) const {
     return false;
 }
 
+int SettingsDialog::OtherColWidth() const {
+    return (ClientW() - SL(kMargin) * 2 - SL(16)) / 2;
+}
+
+int SettingsDialog::OtherRightColLeft() const {
+    return SL(kMargin) + OtherColWidth() + SL(16);
+}
+
 RECT SettingsDialog::OtherCheckboxRect(int index) const {
-    const int top = DialogContentTop() + SL(kContentPad) + index * SL(kRowH);
-    return RECT{SL(kMargin), top, SL(kMargin) + SL(kCheckboxSize), top + SL(kCheckboxSize)};
+    const int col = index / 3;
+    const int row = index % 3;
+    const int left = (col == 0) ? SL(kMargin) : OtherRightColLeft();
+    const int top = DialogContentTop() + SL(kContentPad) + row * SL(kRowH);
+    return RECT{left, top, left + SL(kCheckboxSize), top + SL(kCheckboxSize)};
+}
+
+RECT SettingsDialog::OtherCheckboxLabelRect(int index) const {
+    const RECT box = OtherCheckboxRect(index);
+    const int col = index / 3;
+    const int right = (col == 0)
+        ? OtherRightColLeft() - SL(8)
+        : ClientW() - SL(kMargin);
+    return RECT{box.right + SL(10), box.top, right, box.bottom};
+}
+
+RECT SettingsDialog::OtherHoldLabelRect() const {
+    const int top = DialogContentTop() + SL(kContentPad) + 3 * SL(kRowH) + SL(4);
+    return RECT{SL(kMargin), top, SL(kMargin) + SL(100), top + SL(kAiTopRowBtnH)};
+}
+
+RECT SettingsDialog::OtherHoldEditRect() const {
+    const RECT label = OtherHoldLabelRect();
+    return RECT{label.right + SL(8), label.top,
+        label.right + SL(8) + SL(kEditW), label.bottom};
+}
+
+RECT SettingsDialog::OtherHoldUnitRect() const {
+    const RECT edit = OtherHoldEditRect();
+    return RECT{edit.right + SL(8), edit.top, edit.right + SL(40), edit.bottom};
 }
 
 RECT SettingsDialog::OtherThemeLabelRect() const {
-    const int top = DialogContentTop() + SL(kContentPad) + 4 * SL(kRowH) + SL(8);
+    const int top = DialogContentTop() + SL(kContentPad) + 3 * SL(kRowH) + SL(4) + SL(kRowH);
     return RECT{SL(kMargin), top, SL(kMargin) + SL(kThemeLabelW), top + SL(kAiTopRowBtnH)};
 }
 
@@ -375,6 +421,8 @@ void SettingsDialog::ToggleCheckbox(Tab tab, int index) {
         case 1: o.playSoundOnStart = !o.playSoundOnStart; break;
         case 2: o.hideBottomRightTip = !o.hideBottomRightTip; break;
         case 3: o.closeToTray = !o.closeToTray; break;
+        case 4: o.autoStartOnBoot = !o.autoStartOnBoot; break;
+        case 5: o.resolveImeConflict = !o.resolveImeConflict; break;
         default: break;
         }
     } else if (tab == Tab::AiApi) {
@@ -411,6 +459,12 @@ void SettingsDialog::PositionChildControls() {
     MoveEditInFrame(editPlaybackMax_, inlineLayout_.playbackMaxEditX,
         CenteredEditY(pbSub1, SL(kSubRowH)), SL(kEditW), SL(kEditH));
 
+    {
+        const RECT holdEdit = OtherHoldEditRect();
+        MoveEditInFrame(editHoldThreshold_, holdEdit.left, holdEdit.top,
+            holdEdit.right - holdEdit.left, holdEdit.bottom - holdEdit.top);
+    }
+
     const int aiTop = DialogContentTop() + SL(kContentPad);
     const int aiEditW = ClientW() - inlineLayout_.aiEditX - SL(kMargin);
     MoveEditInFrame(editApiUrl_, inlineLayout_.aiEditX, CenteredEditY(aiTop + AiRowH(), AiRowH()), aiEditW, SL(kEditH));
@@ -423,6 +477,7 @@ void SettingsDialog::PositionChildControls() {
         editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
         editFixedX_, editFixedY_, editClickLimit_,
         editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+        editHoldThreshold_,
         editApiUrl_, editApiKey_, editModelName_, editTemperature_, editMaxTokens_,
     };
     for (HWND edit : edits) CenterEditTextVertically(edit);
@@ -472,8 +527,11 @@ bool SettingsDialog::Show(HWND owner, quickscript::AppSettings& settings, SavedC
     ApplyTaskbarWindowStyle(hwnd_, L"鼠大侠-设置", true);
     outerShadow_.Attach(hwnd_);
 
-    SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    UpdateWindow(hwnd_);
+    // 先显示但不立即重绘，再同步刷父窗自绘 + 全部子控件，避免输入框先于标签/标题出现。
+    SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOREDRAW);
+    RedrawWindow(hwnd_, nullptr, nullptr,
+        RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     SetForegroundWindow(hwnd_);
     return true;
 }
@@ -533,6 +591,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         editPlaybackCount_ = MakeBorderedEdit(hwnd_, L"1", kEditPlaybackCount);
         editPlaybackMin_ = MakeBorderedEdit(hwnd_, L"0.5000", kEditPlaybackMin);
         editPlaybackMax_ = MakeBorderedEdit(hwnd_, L"1.0000", kEditPlaybackMax);
+        editHoldThreshold_ = MakeBorderedEdit(hwnd_, L"0.2", kEditHoldThreshold);
 
         editApiUrl_ = MakeBorderedEdit(hwnd_, L"", kEditApiUrl);
         editApiKey_ = MakeModernSingleLineEdit(hwnd_, L"", kEditApiKey, 0, 0, 0, 0, ES_PASSWORD);
@@ -581,6 +640,17 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }, 0, reinterpret_cast<DWORD_PTR>(this));
         ApplyFont(hwnd_, bodyFont_);
         UpdateInlineLayout();
+        // Make* 默认 WS_VISIBLE：先全部藏起，再按当前 Tab 显示，避免首帧露出未布局的编辑框。
+        {
+            const HWND hideAll[] = {
+                editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
+                editFixedX_, editFixedY_, editClickLimit_, crosshairBtn_,
+                editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+                editHoldThreshold_,
+                editApiUrl_, editApiKey_, editModelName_, editTemperature_, editMaxTokens_,
+            };
+            for (HWND h : hideAll) SetChildVisibleNoRedraw(h, false);
+        }
         PositionChildControls();
         SyncControlsFromSettings();
         RefreshAiModelCombo();
@@ -690,8 +760,11 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         } else if (activeTab_ == Tab::Other) {
-            for (int row = 0; row < 4; ++row) {
-                if (PtIn(OtherCheckboxRect(row), x, y)) {
+            for (int row = 0; row < 6; ++row) {
+                const RECT box = OtherCheckboxRect(row);
+                const RECT label = OtherCheckboxLabelRect(row);
+                const RECT hit{box.left, box.top, label.right, box.bottom};
+                if (PtIn(hit, x, y)) {
                     ToggleCheckbox(Tab::Other, row);
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     return 0;
@@ -893,6 +966,7 @@ void SettingsDialog::SyncControlsFromSettings() {
     SetEditText(editPlaybackCount_, std::to_wstring(p.playbackCount));
     SetEditText(editPlaybackMin_, FormatDouble4(p.playbackIntervalMinSeconds));
     SetEditText(editPlaybackMax_, FormatDouble4(p.playbackIntervalMaxSeconds));
+    SetEditText(editHoldThreshold_, FormatHoldThresholdLabel(working_.other.holdThresholdSeconds));
 
     SetEditText(editApiUrl_, working_.ai.apiUrl);
     SetEditText(editApiKey_, working_.ai.apiKey);
@@ -916,6 +990,11 @@ void SettingsDialog::SyncSettingsFromControls() {
     p.playbackIntervalMaxSeconds = std::max(p.playbackIntervalMinSeconds,
         ToDouble(editPlaybackMax_, p.playbackIntervalMaxSeconds));
 
+    {
+        const double hold = ToDouble(editHoldThreshold_, working_.other.holdThresholdSeconds);
+        working_.other.holdThresholdSeconds = NormalizeHoldThresholdSeconds(hold);
+    }
+
     working_.ai.apiUrl = GetText(editApiUrl_);
     working_.ai.apiKey = GetText(editApiKey_);
     working_.ai.modelName = GetText(editModelName_);
@@ -935,18 +1014,30 @@ void SettingsDialog::SyncSettingsFromControls() {
 void SettingsDialog::UpdateControlVisibility() {
     const bool clickTab = activeTab_ == Tab::Click;
     const bool playbackTab = activeTab_ == Tab::Playback;
+    const bool otherTab = activeTab_ == Tab::Other;
     const bool aiTab = activeTab_ == Tab::AiApi;
+    const bool parentVisible = IsWindowVisible(hwnd_) != FALSE;
+
+    if (parentVisible) SendMessageW(hwnd_, WM_SETREDRAW, FALSE, 0);
+
     const HWND clickEdits[] = {editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
         editFixedX_, editFixedY_, editClickLimit_, crosshairBtn_};
-    for (HWND e : clickEdits) if (e) ShowWindow(e, clickTab ? SW_SHOW : SW_HIDE);
+    for (HWND e : clickEdits) SetChildVisibleNoRedraw(e, clickTab);
     const HWND playbackEdits[] = {editPlaybackCount_, editPlaybackMin_, editPlaybackMax_};
-    for (HWND e : playbackEdits) if (e) ShowWindow(e, playbackTab ? SW_SHOW : SW_HIDE);
+    for (HWND e : playbackEdits) SetChildVisibleNoRedraw(e, playbackTab);
+    SetChildVisibleNoRedraw(editHoldThreshold_, otherTab);
     const HWND aiCtrls[] = {editApiUrl_, editApiKey_, editModelName_,
         editTemperature_, editMaxTokens_};
-    for (HWND e : aiCtrls) if (e) ShowWindow(e, aiTab ? SW_SHOW : SW_HIDE);
+    for (HWND e : aiCtrls) SetChildVisibleNoRedraw(e, aiTab);
     if (!aiTab && aiModelCombo_.IsOpen()) aiModelCombo_.Close();
     if (activeTab_ != Tab::Other && themeCombo_.IsOpen()) themeCombo_.Close();
-    if (clickTab || playbackTab || aiTab) PositionChildControls();
+    if (clickTab || playbackTab || otherTab || aiTab) PositionChildControls();
+
+    if (parentVisible) {
+        SendMessageW(hwnd_, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(hwnd_, nullptr, nullptr,
+            RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
 }
 
 void SettingsDialog::RestoreDefaults() {
@@ -1091,15 +1182,22 @@ void SettingsDialog::PaintOtherTab(HDC hdc) {
     const wchar_t* labels[] = {
         L"启用连点/录制/回放后自动隐藏主窗口", L"启动连点/录制/回放时播放声音",
         L"关闭右下角连点/录制/回放提示", L"点击主界面关闭按钮隐藏到托盘",
+        L"开机自动启动", L"中文输入法不触发热键",
     };
-    const bool checks[] = {o.autoHideMainWindow, o.playSoundOnStart, o.hideBottomRightTip, o.closeToTray};
+    const bool checks[] = {
+        o.autoHideMainWindow, o.playSoundOnStart, o.hideBottomRightTip, o.closeToTray,
+        o.autoStartOnBoot, o.resolveImeConflict,
+    };
     SelectObject(hdc, bodyFont_);
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         const RECT rc = OtherCheckboxRect(i);
         StDrawCheckbox(hdc, rc, checks[i]);
-        DrawTextIn(hdc, labels[i], RECT{rc.right + SL(10), rc.top, ClientW() - SL(kMargin), rc.bottom},
-            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, labels[i], OtherCheckboxLabelRect(i),
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
+
+    DrawTextIn(hdc, L"长按判定", OtherHoldLabelRect(), kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(hdc, L"秒", OtherHoldUnitRect(), kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     DrawTextIn(hdc, L"界面主题", OtherThemeLabelRect(), kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     themeCombo_.DrawField(hdc, OtherThemeComboRect(), hoverThemeCombo_);
@@ -1229,6 +1327,7 @@ void SettingsDialog::Paint() {
             editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
             editFixedX_, editFixedY_, editClickLimit_,
             editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+            editHoldThreshold_,
             editApiUrl_, editApiKey_, editModelName_, editTemperature_, editMaxTokens_,
         };
         for (HWND edit : edits) DrawEditOuterBorder(mem, hwnd_, edit);

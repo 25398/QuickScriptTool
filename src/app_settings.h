@@ -38,6 +38,10 @@ struct OtherTabSettings {
     bool playSoundOnStart = false;
     bool hideBottomRightTip = true;
     bool closeToTray = true;
+    bool autoStartOnBoot = false;
+    bool resolveImeConflict = false;
+    /// 长按判定（秒）：热键捕获与运行时按住启停的最小按住时间，须 > 0
+    double holdThresholdSeconds = 0.2;
     int themeId = 0;
     /// 为 true 时使用 customMain/Accent，忽略预设 themeId 的外观（themeId 仍保留以便取消自定义后回退）
     bool useCustomTheme = false;

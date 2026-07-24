@@ -68,6 +68,8 @@ LRESULT CALLBACK ClickerDropPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 
 LRESULT MainWindow::RouteEditorDropPopup(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hwnd, &ps);

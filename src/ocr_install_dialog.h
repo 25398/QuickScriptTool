@@ -26,12 +26,12 @@ private:
 
     void CleanupGdi();
     void Paint();
-    void DrawInstallButton(HDC hdc, const RECT& rc);
     void DrawProgressBar(HDC hdc);
-    void DrawCloseButton(HDC hdc);
+    void InvalidateHoverTargets();
     bool HitInstallButton(int x, int y) const;
     bool HitCloseButton(int x, int y) const;
     bool HitTitleBar(int x, int y) const;
+    void UpdateHover(int x, int y);
     void BeginInstall();
     void OnInstallProgress(int percent, const std::wstring& status);
     void OnInstallFinished(bool ok, const std::wstring& message);
@@ -55,6 +55,7 @@ private:
     bool installing_ = false;
     bool hoverInstall_ = false;
     bool hoverClose_ = false;
+    bool trackingMouse_ = false;
     int progress_ = 0;
     std::wstring statusText_;
     std::wstring resultMessage_;

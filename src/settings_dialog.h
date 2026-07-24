@@ -81,10 +81,16 @@ private:
     RECT PlaybackCheckboxRect(int index) const;
     bool HitPlaybackCheckbox(int x, int y, int& outIndex) const;
 
-    // ── 其他设置页布局 ─────────────────────────────────────────────
+    // ── 其他设置页布局（两列） ─────────────────────────────────────
     RECT OtherCheckboxRect(int index) const;
+    RECT OtherCheckboxLabelRect(int index) const;
+    RECT OtherHoldLabelRect() const;
+    RECT OtherHoldEditRect() const;
+    RECT OtherHoldUnitRect() const;
     RECT OtherThemeLabelRect() const;
     RECT OtherThemeComboRect() const;
+    int OtherColWidth() const;
+    int OtherRightColLeft() const;
 
     void RefreshThemeCombo();
 
@@ -180,6 +186,7 @@ private:
         kEditPlaybackCount,
         kEditPlaybackMin,
         kEditPlaybackMax,
+        kEditHoldThreshold = 2110,
         kCrosshairBtn = 2120,
         kEditApiUrl = 2130,
         kEditApiKey,
@@ -224,6 +231,7 @@ private:
     HWND editPlaybackCount_ = nullptr;
     HWND editPlaybackMin_ = nullptr;
     HWND editPlaybackMax_ = nullptr;
+    HWND editHoldThreshold_ = nullptr;
     HWND crosshairBtn_ = nullptr;
 
     HWND editApiUrl_ = nullptr;

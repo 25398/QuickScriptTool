@@ -697,6 +697,7 @@ void RecordingOptimizeDialog::BeginProgressiveLoad() {
     hotkey_.text = ExtractString(content, L"hotkeyText");
     hotkey_.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
     hotkey_.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
+    hotkey_.holdMode = ExtractBool(content, L"hotkeyHold", false);
     hotkey_.enabled = hotkey_.vk != 0;
 
     loadCoordsNormalized_ = HasCoordMetaJson(content);

@@ -101,6 +101,7 @@ constexpr int kEditorBreakoutEditW = 80;
 constexpr int kEditorWmTargetBrowseW = 50;
 constexpr int kEditorWmTargetCrosshairW = 136;
 constexpr int kEditorWmTargetBtnGap = 6;
+constexpr int kEditorWmFakeFocusW = 72;  // 「聚焦」勾选，紧挨准星右侧
 constexpr int kEditorActionComboW = 205;
 constexpr int kEditorActionComboH = 21;
 constexpr int kEditorComboRight = 995;
@@ -237,6 +238,8 @@ constexpr UINT WM_APP_OPTIMIZE_LOAD = WM_APP + 33;
 constexpr UINT WM_APP_OPTIMIZE_LOADED = WM_APP + 34;
 constexpr UINT WM_APP_OPTIMIZE_PRERENDER = WM_APP + 35;
 constexpr UINT WM_APP_EDITOR_PARSE_MORE = WM_APP + 36;
+constexpr UINT WM_APP_EXT_RUN_SCRIPT = WM_APP + 37;
+constexpr UINT WM_APP_EXT_STOP_SCRIPT = WM_APP + 38;
 constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
 
 // ── 主题感知颜色（运行时随 CurrentTheme() 变化） ──────────────────

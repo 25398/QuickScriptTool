@@ -2,8 +2,9 @@
 
 #include "config.h"
 #include "drawing.h"
-#include "render_context.h"
 #include "ocr_engine.h"
+#include "render_context.h"
+#include "scheduled_task_ui.h"
 #include "taskbar_window.h"
 
 #include <windowsx.h>
@@ -35,12 +36,15 @@ bool OcrInstallDialog::Show(HWND owner, bool repairMode) {
         : L"已就绪，点击安装开始下载安装...";
     resultMessage_.clear();
     installRunning_ = false;
+    hoverInstall_ = false;
+    hoverClose_ = false;
+    trackingMouse_ = false;
 
     static bool registered = false;
     const wchar_t* clsName = L"QuickScriptOcrInstallDlg";
     if (!registered) {
         WNDCLASSW wc{};
-        wc.style = CS_HREDRAW | CS_VREDRAW;
+        // 不用 CS_HREDRAW|CS_VREDRAW，避免尺寸/移动时整窗重绘闪烁
         wc.lpfnWndProc = &OcrInstallDialog::WndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = clsName;
@@ -72,10 +76,17 @@ bool OcrInstallDialog::Show(HWND owner, bool repairMode) {
 
     MSG msg{};
     while (!done_ && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(static_cast<int>(msg.wParam));
+            done_ = true;
+            break;
+        }
+        if (!StModalMessageForDialog(msg, hwnd_, nullptr, nullptr, owner)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    StDiscardSpuriousInputAfterModal(owner);
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);
     return accepted_;
@@ -126,21 +137,37 @@ LRESULT OcrInstallDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         Paint();
         return 0;
     case WM_MOUSEMOVE: {
-        const int x = GET_X_LPARAM(lp);
-        const int y = GET_Y_LPARAM(lp);
-        const bool hoverInstall = HitInstallButton(x, y) && !installing_;
-        const bool hoverClose = HitCloseButton(x, y) && !installing_;
-        if (hoverInstall != hoverInstall_ || hoverClose != hoverClose_) {
-            hoverInstall_ = hoverInstall;
-            hoverClose_ = hoverClose;
-            InvalidateRect(hwnd_, nullptr, FALSE);
+        if (!trackingMouse_) {
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd_;
+            trackingMouse_ = TrackMouseEvent(&tme) != FALSE;
         }
-        if (HitInstallButton(x, y) || HitCloseButton(x, y)) {
-            SetCursor(LoadCursorW(nullptr, IDC_HAND));
-        } else if (HitTitleBar(x, y)) {
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        UpdateHover(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        trackingMouse_ = false;
+        if (hoverInstall_ || hoverClose_) {
+            hoverInstall_ = false;
+            hoverClose_ = false;
+            InvalidateHoverTargets();
         }
         return 0;
+    case WM_SETCURSOR: {
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd_, &pt);
+            if ((!installing_ && HitInstallButton(pt.x, pt.y)) || HitCloseButton(pt.x, pt.y)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        break;
     }
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp);
@@ -183,8 +210,9 @@ LRESULT OcrInstallDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         CleanupGdi();
         return 0;
     default:
-        return DefWindowProcW(hwnd_, msg, wp, lp);
+        break;
     }
+    return DefWindowProcW(hwnd_, msg, wp, lp);
 }
 
 void OcrInstallDialog::CleanupGdi() {
@@ -196,14 +224,20 @@ void OcrInstallDialog::CleanupGdi() {
     titleFont_ = bodyFont_ = nameFont_ = btnFont_ = closeFont_ = nullptr;
 }
 
-void OcrInstallDialog::DrawCloseButton(HDC hdc) {
+void OcrInstallDialog::InvalidateHoverTargets() {
     RECT close = CloseRect();
-    if (hoverClose_) {
-        FillRectColor(hdc, close, kCloseHover);
-    }
-    SelectObject(hdc, closeFont_);
-    SetTextColor(hdc, RGB(255, 255, 255));
-    DrawTextW(hdc, L"×", -1, &close, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    RECT install = InstallBtnRect();
+    InvalidateRect(hwnd_, &close, FALSE);
+    InvalidateRect(hwnd_, &install, FALSE);
+}
+
+void OcrInstallDialog::UpdateHover(int x, int y) {
+    const bool hoverInstall = HitInstallButton(x, y) && !installing_;
+    const bool hoverClose = HitCloseButton(x, y) && !installing_;
+    if (hoverInstall == hoverInstall_ && hoverClose == hoverClose_) return;
+    hoverInstall_ = hoverInstall;
+    hoverClose_ = hoverClose;
+    InvalidateHoverTargets();
 }
 
 void OcrInstallDialog::Paint() {
@@ -214,15 +248,12 @@ void OcrInstallDialog::Paint() {
     GetClientRect(hwnd_, &client);
     FillRectColor(hdc, client, kWhite);
 
-    RECT title = TitleBarRect();
-    FillRectColor(hdc, title, kMainGreen);
-    HGDIOBJ oldFont = SelectObject(hdc, titleFont_);
-    DrawTextIn(hdc, L"  鼠大侠-插件安装", title, RGB(255, 255, 255),
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawCloseButton(hdc);
+    const wchar_t* title = repairMode_ ? L"鼠大侠-插件修复" : L"鼠大侠-插件安装";
+    StDrawTitleBar(hdc, titleFont_, closeFont_, kDialogW, kTitleH, title,
+        hoverClose_, CloseRect());
 
     SelectObject(hdc, bodyFont_);
-    DrawTextIn(hdc, L"安装插件:", RECT{28, 52, kDialogW - 28, 84}, RGB(50, 50, 50),
+    DrawTextIn(hdc, L"安装插件:", RECT{28, 52, kDialogW - 28, 84}, kText,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(hdc, nameFont_);
@@ -230,98 +261,56 @@ void OcrInstallDialog::Paint() {
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(hdc, bodyFont_);
-    DrawTextIn(hdc, L"插件说明:", RECT{28, 132, kDialogW - 28, 156}, RGB(50, 50, 50),
+    DrawTextIn(hdc, L"插件说明:", RECT{28, 132, kDialogW - 28, 156}, kText,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     RECT descBox = DescBoxRect();
-    FillRectColor(hdc, descBox, RGB(255, 255, 255));
+    FillRectColor(hdc, descBox, kWhite);
     DrawBorderRect(hdc, descBox, kComboBorderGray);
     RECT descTextRc{descBox.left + 14, descBox.top + 12, descBox.right - 14, descBox.bottom - 12};
     const wchar_t* desc =
         L"此插件支持中文（简/繁）、英文等多种语言文字识别，识别速度快、准确度高。"
         L"首次安装将自动安装 Python 3.12 并下载 OCR 依赖，请保持联网并耐心等待。";
-    DrawTextIn(hdc, desc, descTextRc, RGB(50, 50, 50), DT_LEFT | DT_WORDBREAK);
+    DrawTextIn(hdc, desc, descTextRc, kText, DT_LEFT | DT_WORDBREAK);
 
     SelectObject(hdc, bodyFont_);
-    DrawTextIn(hdc, statusText_, RECT{28, 296, kDialogW - 28, 346}, RGB(80, 80, 80),
+    DrawTextIn(hdc, statusText_, RECT{28, 296, kDialogW - 28, 346}, kSecondaryText,
         DT_CENTER | DT_VCENTER | DT_WORDBREAK);
 
     DrawProgressBar(hdc);
 
-    if (!installing_ || progress_ >= 100) {
-        RECT installRc = InstallBtnRect();
-        DrawInstallButton(hdc, installRc);
+    RECT installRc = InstallBtnRect();
+    if (installing_ && progress_ < 100) {
+        StDrawGreenButton(hdc, btnFont_, installRc, L"安装中...", false, false);
     } else {
-        RECT installRc = InstallBtnRect();
-        HBRUSH disabled = CreateSolidBrush(RGB(180, 220, 195));
-        HGDIOBJ oldBrush = SelectObject(hdc, disabled);
-        HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        RoundRect(hdc, installRc.left, installRc.top, installRc.right, installRc.bottom, 8, 8);
-        SelectObject(hdc, oldPen);
-        SelectObject(hdc, oldBrush);
-        DeleteObject(disabled);
-        SelectObject(hdc, btnFont_);
-        DrawTextIn(hdc, L"安装中...", installRc, RGB(255, 255, 255),
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* label = repairMode_ ? L"修复/更新" : L"安装插件";
+        if (progress_ >= 100 && accepted_) label = L"完成";
+        StDrawGreenButton(hdc, btnFont_, installRc, label, hoverInstall_, true);
     }
 
-    SelectObject(hdc, oldFont);
     batch.End();
     EndPaint(hwnd_, &ps);
 }
 
 void OcrInstallDialog::DrawProgressBar(HDC hdc) {
     const RECT track = ProgressRect();
-    HBRUSH trackBrush = CreateSolidBrush(RGB(230, 230, 230));
-    HPEN trackPen = CreatePen(PS_SOLID, 1, RGB(210, 210, 210));
-    HGDIOBJ oldBrush = SelectObject(hdc, trackBrush);
-    HGDIOBJ oldPen = SelectObject(hdc, trackPen);
-    RoundRect(hdc, track.left, track.top, track.right, track.bottom, 12, 12);
+    FillRoundRectColor(hdc, track, RGB(230, 230, 230), 12);
+    DrawBorderRoundRect(hdc, track, RGB(210, 210, 210), 12);
 
     if (progress_ > 0) {
         const int trackW = track.right - track.left - 6;
         const int fillW = std::max(12, trackW * progress_ / 100);
         RECT fillRc{track.left + 3, track.top + 3, track.left + 3 + fillW, track.bottom - 3};
-        HBRUSH fillBrush = CreateSolidBrush(kMainGreen);
-        SelectObject(hdc, fillBrush);
-        SelectObject(hdc, GetStockObject(NULL_PEN));
-        RoundRect(hdc, fillRc.left, fillRc.top, fillRc.right, fillRc.bottom, 10, 10);
-        DeleteObject(fillBrush);
+        FillRoundRectColor(hdc, fillRc, kMainGreen, 10);
     }
-
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(trackPen);
-    DeleteObject(trackBrush);
-}
-
-void OcrInstallDialog::DrawInstallButton(HDC hdc, const RECT& rc) {
-    const COLORREF fill = hoverInstall_ ? kDarkGreen : kMainGreen;
-    HBRUSH brush = CreateSolidBrush(fill);
-    HGDIOBJ oldBrush = SelectObject(hdc, brush);
-    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(brush);
-
-    SetTextColor(hdc, RGB(255, 255, 255));
-    HGDIOBJ oldFont = SelectObject(hdc, btnFont_);
-    const wchar_t* label = repairMode_ ? L"修复/更新" : L"安装插件";
-    if (progress_ >= 100 && accepted_) label = L"完成";
-    RECT textRc = rc;
-    DrawTextW(hdc, label, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, oldFont);
 }
 
 bool OcrInstallDialog::HitInstallButton(int x, int y) const {
-    const RECT rc = InstallBtnRect();
-    return x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom;
+    return StPtIn(InstallBtnRect(), x, y);
 }
 
 bool OcrInstallDialog::HitCloseButton(int x, int y) const {
-    const RECT rc = CloseRect();
-    return x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom;
+    return StPtIn(CloseRect(), x, y);
 }
 
 bool OcrInstallDialog::HitTitleBar(int x, int y) const {
@@ -333,6 +322,7 @@ void OcrInstallDialog::BeginInstall() {
     installing_ = true;
     progress_ = 0;
     statusText_ = L"正在准备安装...";
+    hoverInstall_ = false;
     InvalidateRect(hwnd_, nullptr, FALSE);
 
     OcrInstallDialog* self = this;

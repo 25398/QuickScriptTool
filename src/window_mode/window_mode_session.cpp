@@ -8,6 +8,7 @@
 #include "window_mode_log.h"
 #include "window_mode_requirements.h"
 #include "macro_virtual_desktop.h"
+#include "virtual_desktop_accessor.h"
 #include "image_match.h"
 
 #include <shellapi.h>
@@ -446,6 +447,33 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
     GetClientRect(bindHwnd, &clientRc);
     state.clientW = std::max(0, static_cast<int>(clientRc.right - clientRc.left));
     state.clientH = std::max(0, static_cast<int>(clientRc.bottom - clientRc.top));
+    // Pin+屏外时 Chromium 偶发回报缩略客户区（如 215x28），会导致找图映射/点击全偏。
+    if (state.clientW < 400 || state.clientH < 300) {
+        HWND root = GetAncestor(bindHwnd, GA_ROOT);
+        if (!root) root = top;
+        RECT rootRc{};
+        if (root && GetClientRect(root, &rootRc)) {
+            const int rw = std::max(0, static_cast<int>(rootRc.right - rootRc.left));
+            const int rh = std::max(0, static_cast<int>(rootRc.bottom - rootRc.top));
+            if (rw >= 400 && rh >= 300) {
+                state.clientW = rw;
+                state.clientH = rh;
+                bindHwnd = root;
+            }
+        }
+        if (state.clientW < 400 || state.clientH < 300) {
+            RECT wr{};
+            if (root && GetWindowRect(root, &wr)) {
+                const int ww = std::max(0, static_cast<int>(wr.right - wr.left));
+                const int wh = std::max(0, static_cast<int>(wr.bottom - wr.top));
+                if (ww >= 640 && wh >= 400) {
+                    state.clientW = ww;
+                    state.clientH = wh;
+                    WindowModeLogf(L"[窗口模式] 客户区异常，改用窗口外框 %dx%d", ww, wh);
+                }
+            }
+        }
+    }
 
     int sx1 = 0, sy1 = 0, sx2 = 0, sy2 = 0;
     if (!MapClientRectToScreen(bindHwnd, 0, 0, state.clientW, state.clientH, sx1, sy1, sx2, sy2)) {
@@ -895,7 +923,19 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
             if (HWND found = findOnMacroDesktop(refindQuery, true)) return found;
             return candidate;
         }
-        // ?
+        const bool cdp = UsesCdpInput(config_);
+        if (cdp) {
+            // CDP：Park = Minimize→Move「鼠标宏」；命中宏桌面 Enum 优先。
+            PrepareMacroDesktopForCdpBind(candidate);
+            WindowModeSleepInterruptible(cancelFlag_, std::chrono::milliseconds(10));
+            if (IsCancelled()) return nullptr;
+            candidate = TopLevelWindow(candidate);
+            if (candidate && IsWindow(candidate)) {
+                if (HWND found = findOnMacroDesktop(refindQuery, true)) return found;
+                return candidate;
+            }
+            return nullptr;
+        }
         ForceHideLaunchedWindowQuiet(candidate);
         MinimizeForQuietDesktopMove(candidate);
         WindowModeSleepInterruptible(cancelFlag_, std::chrono::milliseconds(15));
@@ -907,6 +947,9 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         ForceHideLaunchedWindowQuiet(candidate);
         PinMacroDesktopWindowBottom(candidate);
         ShowWindow(candidate, SW_SHOWMINNOACTIVE);
+        WindowModeSleepInterruptible(cancelFlag_, std::chrono::milliseconds(10));
+        if (IsCancelled()) return nullptr;
+        candidate = TopLevelWindow(candidate);
         if (HWND found = findOnMacroDesktop(refindQuery, true)) return found;
         WindowTargetQuery relaxed = refindQuery;
         relaxed.titleContains.clear();
@@ -921,6 +964,11 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
     auto findMacroTarget = [&](const WindowTargetQuery& q) -> HWND {
         HWND found = findOnMacroDesktop(q, true);
         if (!found) found = findOnMacroDesktop(q, false);
+        // CDP：Enum 偶发丢窗时按标题在任意桌面回退，再 Park 进宏桌面。
+        if (!found && UsesCdpInput(config_)) {
+            found = findAnywhere(q, true);
+            if (!found) found = findAnywhere(q, false);
+        }
         return found;
     };
 
@@ -1246,9 +1294,13 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
     }
 
     if (!background) {
-        PinMacroDesktopWindowBottom(top);
-        if (!IsIconic(top)) {
-            ShowWindow(top, SW_SHOWMINNOACTIVE);
+        if (UsesCdpInput(config_)) {
+            PrepareMacroDesktopForCdpBind(top);
+        } else {
+            PinMacroDesktopWindowBottom(top);
+            if (ShouldMinimizeTargetAfterBind(config_) && !IsIconic(top)) {
+                ShowWindow(top, SW_SHOWMINNOACTIVE);
+            }
         }
     } else if (ownsLaunchedProcess_) {
         SquashBackgroundLaunchedWindow(top, cancelFlag_);
@@ -1364,6 +1416,37 @@ void WindowModeSession::Stop() {
     launchSearchDir_.clear();
 }
 
+bool WindowModeSession::EnsureMacroDesktopReady(std::wstring& err) {
+    err.clear();
+    if (config_.executionKind == WindowModeExecutionKind::BackgroundWindow) {
+        return true;
+    }
+    if (!desktop_.IsValid()) {
+        if (!desktop_.OpenOrCreate()) {
+            err = desktop_.LastError().empty()
+                ? L"无法重建「鼠标宏」虚拟桌面" : desktop_.LastError();
+            state_.macroDesktopIndex = -1;
+            return false;
+        }
+    }
+    state_.macroDesktopId = desktop_.DesktopId();
+    state_.macroDesktopIndex = desktop_.DesktopIndex();
+
+    HWND top = TopLevelWindow(state_.targetHwnd);
+    if (!top || !IsWindow(top)) return true;
+
+    if (UsesCdpInput(config_)) {
+        // CDP 运行期严禁 Move/Pin/SoftRestore：VDA 误报或 Pin 残留会导致
+        // 每次找图「0→1 Move + 出帧」闪屏，窗也落不稳在宏桌面。
+        return true;
+    }
+
+    if (!IsWindowOnVirtualDesktopIndex(top, state_.macroDesktopIndex)) {
+        EnsureTargetOnMacroDesktop(top, ShouldMinimizeTargetAfterBind(config_));
+    }
+    return true;
+}
+
 void WindowModeSession::ClearTargetBinding() {
     RestoreSavedTargetTopPlacement();
     ReleaseLaunchedProcess();
@@ -1465,13 +1548,57 @@ bool WindowModeSession::LaunchTargetOnDesktop(std::wstring& err) {
         hasLaunchTimeUtc_ = true;
     }
 
-    // ?
+    // 「指定窗口类」有标题但无本地文档：禁止开空白记事本；先绑已有窗。
+    // CDP/浏览器：标题是网页名，不是本地文件 —— 禁止报「文档参数缺失」。
     if (editorNeedsIdentity && documentFile.empty()) {
-        WindowModeLog(L"[\u7a97\u53e3\u6a21\u5f0f] \u6307\u5b9a\u7a97\u53e3\u7c7b\uff1a\u65e0\u53ef\u7528\u6587\u6863\u8def\u5f84\uff0c\u5c1d\u8bd5\u7ed1\u5b9a\u5df2\u6709\u6807\u9898\u7a97\uff08\u4e0d\u5f00\u7a7a\u767d\uff09");
+        WindowModeLog(L"[窗口模式] 指定窗口类：无可用文档路径，尝试绑定已有标题窗（不开空白）");
         if (BindTargetWindow(err)) return true;
-        err = L"\u6307\u5b9a\u7a97\u53e3\u7c7b\u9700\u8981\u6807\u9898\u5bf9\u5e94\u6587\u6863\uff0c\u4f46\u672a\u89e3\u6790\u5230\u6587\u4ef6\uff08\u8bf7\u8bbe\u5b8c\u6574\u542f\u52a8\u53c2\u6570\uff0c\u6216\u628a\u6587\u4ef6\u653e\u5728\u811a\u672c\u76ee\u5f55\uff09";
-        state_.lastError = err;
-        return false;
+        const bool browserTarget =
+            UsesCdpInput(config_)
+            || LooksLikeChromiumBrowserClass(config_.windowClassName)
+            || LooksLikeChromiumBrowserClass(config_.childWindowClassName);
+        if (browserTarget) {
+            WindowTargetQuery anywhereQ{};
+            anywhereQ.exePath = targetPath;
+            anywhereQ.allowStoreNotepadHandoff = true;
+            anywhereQ.titleContains =
+                !config_.windowName.empty() ? config_.windowName : config_.targetWindowTitle;
+            if (anywhereQ.titleContains.empty()) anywhereQ.titleContains = expectTitle;
+            if (!config_.windowClassName.empty()) {
+                anywhereQ.className = config_.windowClassName;
+            }
+            HWND hit = FindMainWindowDefault(anywhereQ, true);
+            if (!hit) hit = FindMainWindowDefault(anywhereQ, false);
+            if (hit) {
+                PrepareMacroDesktopForCdpBind(hit);
+                if (BindTargetWindow(err)) return true;
+                HWND bindHwnd = nullptr;
+                if (WaitForBindHwnd(hit, config_, false, cancelFlag_, bindHwnd)
+                    && ApplyBoundTargetState(hit, bindHwnd, state_, config_, err, false, false)) {
+                    err.clear();
+                    state_.lastError.clear();
+                    WindowModeLog(L"[窗口模式] CDP：已按浏览器窗绑定（跳过文档启动）");
+                    return true;
+                }
+            }
+            // 有 URL/启动参数时继续走下方启动；否则提示先打开网页（勿报文档缺失）。
+            const std::wstring args = EffectiveLaunchArgs(config_);
+            const bool looksUrl = args.size() >= 7
+                && (_wcsnicmp(args.c_str(), L"http://", 7) == 0
+                    || (args.size() >= 8 && _wcsnicmp(args.c_str(), L"https://", 8) == 0));
+            if (!looksUrl && args.empty()) {
+                err = L"未找到标题含「" + expectTitle + L"」的浏览器窗口。"
+                      L"请先打开该网页后再运行（浏览器窗口模式不需要本地文档参数）。";
+                state_.lastError = err;
+                return false;
+            }
+            WindowModeLog(L"[窗口模式] CDP/浏览器：无已有窗，使用启动参数打开（非本地文档）");
+        } else {
+            err = L"指定窗口类需要标题对应文档，但未解析到文件"
+                  L"（请设置完整启动参数，或把文件放在脚本目录）";
+            state_.lastError = err;
+            return false;
+        }
     }
 
     auto squashMoved = [&](HWND wnd) {
@@ -1638,11 +1765,30 @@ bool WindowModeSession::LaunchTargetOnDefaultDesktop(std::wstring& err) {
     hasLaunchTimeUtc_ = true;
 
     if (editorNeedsIdentity && documentFile.empty()) {
-        WindowModeLog(L"[\u7a97\u53e3\u6a21\u5f0f] \u540e\u53f0\u6307\u5b9a\u7a97\u53e3\u7c7b\uff1a\u65e0\u6587\u6863\u8def\u5f84\uff0c\u4ec5\u7ed1\u5b9a\u5df2\u6709\u6807\u9898\u7a97");
+        WindowModeLog(L"[窗口模式] 后台指定窗口类：无文档路径，仅绑定已有标题窗");
         if (BindTargetWindow(err)) return true;
-        err = L"\u6307\u5b9a\u7a97\u53e3\u7c7b\u9700\u8981\u6807\u9898\u5bf9\u5e94\u6587\u6863\uff0c\u4f46\u672a\u89e3\u6790\u5230\u6587\u4ef6\uff08\u8bf7\u8bbe\u5b8c\u6574\u542f\u52a8\u53c2\u6570\uff0c\u6216\u628a\u6587\u4ef6\u653e\u5728\u811a\u672c\u76ee\u5f55\uff09";
-        state_.lastError = err;
-        return false;
+        const bool browserTarget =
+            UsesCdpInput(config_)
+            || LooksLikeChromiumBrowserClass(config_.windowClassName)
+            || LooksLikeChromiumBrowserClass(config_.childWindowClassName);
+        if (browserTarget) {
+            const std::wstring args = EffectiveLaunchArgs(config_);
+            const bool looksUrl = args.size() >= 7
+                && (_wcsnicmp(args.c_str(), L"http://", 7) == 0
+                    || (args.size() >= 8 && _wcsnicmp(args.c_str(), L"https://", 8) == 0));
+            if (!looksUrl && args.empty()) {
+                err = L"未找到标题含「" + expectTitle + L"」的浏览器窗口。"
+                      L"请先打开该网页后再运行（浏览器窗口模式不需要本地文档参数）。";
+                state_.lastError = err;
+                return false;
+            }
+            WindowModeLog(L"[窗口模式] 后台 CDP/浏览器：使用启动参数打开（非本地文档）");
+        } else {
+            err = L"指定窗口类需要标题对应文档，但未解析到文件"
+                  L"（请设置完整启动参数，或把文件放在脚本目录）";
+            state_.lastError = err;
+            return false;
+        }
     }
 
     if (!documentFile.empty()) {

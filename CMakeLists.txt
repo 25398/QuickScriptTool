@@ -35,6 +35,11 @@ set(WINDOW_MODE_CORE_SOURCES
     src/window_mode/background_window_input.cpp
     src/window_mode/background_uia_input.cpp
     src/window_mode/window_mode_permission.cpp
+    src/window_mode/fake_focus/fake_focus_injector.cpp
+    src/window_mode/fake_focus/fake_focus_soft_input_host.cpp
+    src/window_mode/cdp/cdp_input.cpp
+    src/window_mode/ext_bridge/ext_bridge_server.cpp
+    src/window_mode/ext_bridge/ext_input.cpp
 )
 
 add_library(window_mode_core OBJECT ${WINDOW_MODE_CORE_SOURCES})
@@ -57,9 +62,59 @@ target_link_libraries(window_mode_core PUBLIC
     d3d11
     dxgi
     windowsapp
+    winhttp
+    psapi
+    ws2_32
+    bcrypt
 )
 if(MSVC)
     target_compile_options(window_mode_core PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+# ── FakeFocus DLL（目标进程内 hook；按当前架构输出 FakeFocus64/32）──
+set(FAKEFOCUS_DLL_SOURCES
+    src/window_mode/fake_focus/fake_focus_dll.cpp
+    src/window_mode/fake_focus/fake_focus_hook.cpp
+)
+add_library(FakeFocus SHARED ${FAKEFOCUS_DLL_SOURCES})
+target_compile_definitions(FakeFocus PRIVATE UNICODE _UNICODE NOMINMAX FAKEFOCUS_EXPORTS)
+target_include_directories(FakeFocus PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/window_mode/fake_focus
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(FakeFocus PRIVATE user32 dwmapi)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(FakeFocus PROPERTIES OUTPUT_NAME FakeFocus64)
+else()
+    set_target_properties(FakeFocus PROPERTIES OUTPUT_NAME FakeFocus32)
+endif()
+if(MSVC)
+    target_compile_options(FakeFocus PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+# ── CdpEnable DLL（已停用注入路径；保留目标供归档，默认不编入 ALL）──
+add_library(CdpEnable SHARED EXCLUDE_FROM_ALL src/window_mode/cdp/cdp_enable_dll.cpp)
+target_compile_definitions(CdpEnable PRIVATE UNICODE _UNICODE NOMINMAX)
+target_link_libraries(CdpEnable PRIVATE user32)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(CdpEnable PROPERTIES OUTPUT_NAME CdpEnable64)
+else()
+    set_target_properties(CdpEnable PROPERTIES OUTPUT_NAME CdpEnable32)
+endif()
+if(MSVC)
+    target_compile_options(CdpEnable PRIVATE /W4 /permissive- /utf-8)
+endif()
+
+# 从 x64 工程额外编一份 FakeFocus32.dll（用 Hostx64\\x86 工具链）
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_FAKEFOCUS32_SCRIPT "${CMAKE_SOURCE_DIR}/src/window_mode/fake_focus/build_fakefocus32.cmd")
+    add_custom_target(FakeFocus32 ALL
+        COMMAND "${_FAKEFOCUS32_SCRIPT}" "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/$<CONFIG>"
+        DEPENDS ${FAKEFOCUS_DLL_SOURCES} ${_FAKEFOCUS32_SCRIPT}
+        COMMENT "Building FakeFocus32.dll (x86)"
+        VERBATIM
+    )
+    add_dependencies(FakeFocus32 FakeFocus)
 endif()
 
 set(SCRIPT_CORE_COMMON_SOURCES
@@ -268,12 +323,19 @@ endif()
 
 qst_add_selftest(WindowModeSelfTest
     tools/window_mode_selftest.cpp
+    src/window_mode/window_mode_json.cpp
     LIBS
         window_mode_core
         script_core_common
         ${OpenCV_LIBS}
         user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
 )
+add_dependencies(QuickScriptTool FakeFocus)
+add_dependencies(WindowModeSelfTest FakeFocus)
+if(TARGET FakeFocus32)
+    add_dependencies(WindowModeSelfTest FakeFocus32)
+    add_dependencies(QuickScriptTool FakeFocus32)
+endif()
 
 qst_add_selftest(ScheduledTaskSelfTest
     tools/scheduled_task_selftest.cpp
@@ -409,6 +471,7 @@ if(WIN32)
     endforeach()
     add_custom_command(TARGET QuickScriptTool POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/tools"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/extension/edge/icons"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/resources/breakout_pause.ico"
             "$<TARGET_FILE_DIR:QuickScriptTool>/breakout_pause.ico"
@@ -424,7 +487,10 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/requirements-ocr.txt"
             "$<TARGET_FILE_DIR:QuickScriptTool>/tools/requirements-ocr.txt"
-        COMMENT "Copying PaddleOCR helper and icons")
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/extension/edge"
+            "$<TARGET_FILE_DIR:QuickScriptTool>/extension/edge"
+        COMMENT "Copying PaddleOCR helper, icons, and Edge extension")
     foreach(_vda_dll IN ITEMS
         "VirtualDesktopAccessor11.dll"
         "VirtualDesktopAccessor10.dll")
@@ -436,4 +502,5 @@ if(WIN32)
                 COMMENT "Copying VirtualDesktopAccessor ${_vda_dll}")
         endif()
     endforeach()
+    # FakeFocus DLL 已由 OUTPUT 目录与 FakeFocus/FakeFocus32 目标写入 build/$<CONFIG>/
 endif()

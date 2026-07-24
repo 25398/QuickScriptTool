@@ -159,7 +159,7 @@
         } else {
             static const HotkeyMenuItem kItems[] = {
                 {kHotCustom, L"自定义", L"将您指定的按键设为启停热键"},
-                {kHotLeft, L"鼠标左键", L"长按左键开始连点，松开停止（约0.2秒）"},
+                {kHotLeft, L"鼠标左键", L"按住左键开始连点，松开停止"},
                 {kHotMiddle, L"鼠标中键", L"将点击中键设为启停热键"},
                 {kHotRight, L"鼠标右键", L"将点击右键设为启停热键"},
                 {kHotX1, L"鼠标侧键1", L"一般为鼠标左侧后部的键"},
@@ -207,9 +207,19 @@
         if (!pc || pc->items.empty()) return;
         RECT client{};
         GetClientRect(popupHwnd, &client);
-        FillRectColor(hdc, client, kWhite);
-        DrawBorderRect(hdc, client, kComboPopupBorderGray);
-        ResolveRenderContext(hdc).DrawLine(client.right - 1, client.top, client.right - 1, client.bottom - 1,
+        const int w = client.right - client.left;
+        const int h = client.bottom - client.top;
+        if (w <= 0 || h <= 0) return;
+
+        // 双缓冲，避免滚轮/hover 时先擦白再画造成整层闪烁
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+        RenderBatchScope batch(mem);
+
+        FillRectColor(mem, client, kWhite);
+        DrawBorderRect(mem, client, kComboPopupBorderGray);
+        ResolveRenderContext(mem).DrawLine(client.right - 1, client.top, client.right - 1, client.bottom - 1,
             kComboPopupBorderGray, 1.0f);
 
         const int itemH = kEditorPopupItemH;
@@ -217,7 +227,7 @@
         const int visible = EditorPopupVisibleCount();
         const int scrollMax = std::max(0, total - visible);
         editorPopupScroll_ = std::clamp(editorPopupScroll_, 0, scrollMax);
-        SelectObject(hdc, editorFont_);
+        SelectObject(mem, editorFont_);
         const int contentRight = client.right - 1 - (scrollMax > 0 ? 12 : 0);
         for (int vis = 0; vis < visible; ++vis) {
             const int i = vis + editorPopupScroll_;
@@ -226,19 +236,25 @@
             const bool selected = pc->sel == i;
             const bool hovered = !selected && editorPopupHover_ == i;
             COLORREF rowBg = selected ? kComboMenuSelectBlue : (hovered ? kComboMenuHoverBlue : kWhite);
-            FillRectColor(hdc, row, rowBg);
-            DrawTextIn(hdc, pc->items[static_cast<size_t>(i)], RECT{row.left + 10, row.top, row.right - 6, row.bottom},
+            FillRectColor(mem, row, rowBg);
+            DrawTextIn(mem, pc->items[static_cast<size_t>(i)], RECT{row.left + 10, row.top, row.right - 6, row.bottom},
                 selected ? kComboMenuSelectText : kText);
         }
         if (scrollMax > 0) {
             RECT track{client.right - 10, client.top + 1, client.right - 1, client.bottom - 1};
-            FillRectColor(hdc, track, kComboScrollTrackGray);
+            FillRectColor(mem, track, kComboScrollTrackGray);
             const int trackH = track.bottom - track.top;
             const int thumbH = std::max(18, trackH * visible / total);
             const int thumbTop = track.top + (trackH - thumbH) * editorPopupScroll_ / scrollMax;
             RECT thumb{track.left, thumbTop, track.right, thumbTop + thumbH};
-            FillRectColor(hdc, thumb, kComboScrollThumbGray);
+            FillRectColor(mem, thumb, kComboScrollThumbGray);
         }
+
+        batch.End();
+        BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
     }
 
     namespace {

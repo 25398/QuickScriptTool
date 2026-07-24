@@ -23,6 +23,9 @@ public:
     const GUID& DesktopId() const { return desktopId_; }
     int DesktopIndex() const { return desktopIndex_; }
 
+    /// 进程启动时预热：只查找缓存/已有「鼠标宏」，不创建、不切桌面。
+    static void WarmupAtProcessStart();
+
     bool LaunchProcess(const std::wstring& exe, const std::wstring& args, PROCESS_INFORMATION& outPi,
         const std::wstring& titleContains = L"");
     bool MoveWindowToMacroDesktop(HWND hwnd);

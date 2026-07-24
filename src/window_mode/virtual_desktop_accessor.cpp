@@ -318,14 +318,23 @@ bool VirtualDesktopAccessor::MoveWindowToDesktopNumberPreservingView(HWND hwnd,
     const int viewBefore = GetCurrentDesktopNumber();
     const bool ok = MoveWindowToDesktopNumber(hwnd, desktopNumber);
     if (viewBefore >= 0) {
-        for (int i = 0; i < 8; ++i) {
-            const int now = GetCurrentDesktopNumber();
-            if (now < 0 || now == viewBefore) break;
-            GoToDesktopNumber(viewBefore);
-            Sleep(8);
-        }
+        HoldView(viewBefore, 80);
     }
     return ok;
+}
+
+void VirtualDesktopAccessor::HoldView(int preferredDesk, int durationMs) const {
+    if (preferredDesk < 0) return;
+    if (durationMs < 0) durationMs = 0;
+    const DWORD deadline = GetTickCount() + static_cast<DWORD>(durationMs);
+    for (;;) {
+        const int now = GetCurrentDesktopNumber();
+        if (now >= 0 && now != preferredDesk) {
+            GoToDesktopNumber(preferredDesk);
+        }
+        if (GetTickCount() >= deadline) break;
+        Sleep(8);
+    }
 }
 
 int VirtualDesktopAccessor::GetWindowDesktopNumber(HWND hwnd) const {

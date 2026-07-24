@@ -1,0 +1,28 @@
+---
+description: Edge 配套扩展必须随软件打包；打 zip/安装包时勿遗漏 extension/edge
+globs: extension/**/*,tools/pack_edge_extension.ps1,tools/package_release.ps1,installer/**/*.iss
+alwaysApply: false
+---
+
+# Edge 网页键鼠桥 — 打包硬规则
+
+完整规范：`extension/PACKAGING.md`
+
+## 何时必须遵守
+
+- 用户要求打 zip、安装包、Release 包、发版
+- 修改 `extension/edge/**`、`tools/package_release.ps1`、`installer/*.iss`
+
+## 必做
+
+1. 源码只改 `extension/edge/`（不要只改 `build/*/extension/edge`）
+2. 版本：`manifest.json` 的 `version` **==** `background.js` 的 `BRIDGE_VERSION`
+3. 跑通：`powershell -File tools\pack_edge_extension.ps1`（或 `-SkipZip`）
+4. 软件发版走：`tools\package_release.ps1`（会强制带上扩展；失败即停）
+5. ISS 必须安装 `{app}\extension\edge\*`，**禁止** `skipifsourcedoesntexist`
+
+## 禁止
+
+- 手搓不完整 zip（缺 icons / options / background）
+- zip 多包一层导致解压后找不到根级 `manifest.json`
+- 宣称「安装包已打好」但未包含 `extension\edge`
