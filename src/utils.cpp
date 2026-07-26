@@ -45,7 +45,8 @@ std::wstring TimestampName() {
     using namespace std::chrono;
     const auto ts = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
-    return L"鼠标宏-" + std::to_wstring(ts);
+    // 仅时间戳；业务前缀由调用方加（鼠标宏- / 鼠标录制- / 任务-），避免叠成「鼠标录制-鼠标宏-…」
+    return std::to_wstring(ts);
 }
 
 // ── 窗口文本操作 ──────────────────────────────────────────────────
@@ -370,6 +371,10 @@ std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& j
                 && ExtractNumber(block, L"ocrRegionByImage", 0) != 0) {
                 paths.insert(ResolveImagePath(imgPath));
             }
+        }
+        const auto recordedCapturePath = ExtractString(block, L"recordedCapturePath");
+        if (!recordedCapturePath.empty()) {
+            paths.insert(ResolveImagePath(recordedCapturePath));
         }
         const auto aiTargetImagePath = ExtractString(block, L"aiTargetImagePath");
         if (!aiTargetImagePath.empty()

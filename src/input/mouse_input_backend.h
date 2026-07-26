@@ -2,6 +2,7 @@
 
 #include "script_types.h"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -15,12 +16,16 @@ struct MouseBackendStats {
     uint64_t batchedSubmits = 0;
 };
 
-/// SendInput 相对鼠标回放（关闭加速后 1:1 mickey）。
+/// SendInput 相对鼠标回放（关加速 + 必要时亚阈值拆分，贴近 Raw 计数）。
 class MouseInputRouter {
 public:
     static MouseInputRouter& Instance();
 
     void Configure();
+    /// 仅清零计数（多轮回放时每轮统计独立）。
+    void ResetStats();
+    /// 大包是否拆成亚阈值步进（仅加速未真正关闭时需要；拆包会改变游戏收到的报告次数）。
+    void SetSplitLargeMoves(bool enable);
     /// 仅在时间轴迟到时限制突发；准点时不垫间隔。
     void SetCatchUpGapUs(uint64_t minGapUs);
     void NoteWaitLatenessUs(uint64_t lateUs);
@@ -44,5 +49,7 @@ private:
     LARGE_INTEGER qpcFreq_{};
     int64_t lastSendInputQpc_ = 0;
     uint64_t catchUpGapUs_ = 250;
-    uint64_t lastWaitLateUs_ = 0;
+    bool splitLargeMoves_ = true;
+    /// 由 Wait 热路径写入；Pace 只读，避免每次等待抢同一把锁。
+    std::atomic<uint64_t> lastWaitLateUs_{0};
 };

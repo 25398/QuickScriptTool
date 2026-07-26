@@ -1111,6 +1111,13 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                 if (!found)
                     toolResult = L"[错误] 未知工具：" + tc.name;
 
+                // 大录制 readScript / 动作一览等若仍过长，截断后再入历史，避免下轮请求体膨胀卡死
+                constexpr size_t kMaxToolResultChars = 100000;
+                if (toolResult.size() > kMaxToolResultChars) {
+                    toolResult.resize(kMaxToolResultChars);
+                    toolResult += L"\n...(工具结果过长已截断；优化请用 optimizeScript/optimizeRecording，勿再请求全文)";
+                }
+
                 if (callbacks.onToolResult)
                     callbacks.onToolResult(tc.name, toolResult);
 

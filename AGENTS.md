@@ -23,6 +23,7 @@
 | 设置库 | `AppSettingsStoreSelfTest` | 见元 Skill FAIL 表 |
 | 主题 UI | `ThemeUiSelfTest` | 见元 Skill FAIL 表 |
 | 录制回放 | `RecorderSelfTest` → `QstRecorderLogicTest.exe` | 见元 Skill FAIL 表 |
+| 虚拟 HID | `VirtualHidSelfTest` | `driver/qst_vhid/` + `src/input/virtual_hid.*` |
 
 共享 harness：`tools/selftest_harness.h`。各 exe：`tools/*_selftest.cpp`。
 

@@ -80,6 +80,13 @@ private:
     int PlaybackRowY(int index) const;
     RECT PlaybackCheckboxRect(int index) const;
     bool HitPlaybackCheckbox(int x, int y, int& outIndex) const;
+    RECT HidInstallBtnRect() const;
+    RECT VirtualHidInstallBtnRect() const;
+    /// 0=系统模拟 1=Interception 2=虚拟HID（互斥单选）
+    RECT BackendOptionRect(int index) const;
+    bool HitBackendOption(int x, int y, int& outIndex) const;
+    void InstallHidDriver();
+    void InstallVirtualHidDriver();
 
     // ── 其他设置页布局（两列） ─────────────────────────────────────
     RECT OtherCheckboxRect(int index) const;
@@ -128,6 +135,8 @@ private:
         int playbackMaxLabelX = 0;
         int playbackMaxEditX = 0;
         int playbackMaxUnitX = 0;
+        int recordingCaptureHalfSizeEditX = 0;
+        int recordingCaptureHalfSizeHintX = 0;
         int aiEditX = 0;
         int aiTempHintX = 0;
         int aiLabelW = 0;
@@ -186,6 +195,7 @@ private:
         kEditPlaybackCount,
         kEditPlaybackMin,
         kEditPlaybackMax,
+        kEditRecordingCaptureHalfSize,
         kEditHoldThreshold = 2110,
         kCrosshairBtn = 2120,
         kEditApiUrl = 2130,
@@ -208,6 +218,8 @@ private:
     bool hoverRestore_ = false;
     bool hoverSave_ = false;
     bool hoverCheckUpgrade_ = false;
+    bool hoverHidInstall_ = false;
+    bool hoverVirtualHidInstall_ = false;
     bool hoverAiAddModel_ = false;
     bool hoverAiDeleteModel_ = false;
     bool hoverAiModelCombo_ = false;
@@ -231,6 +243,7 @@ private:
     HWND editPlaybackCount_ = nullptr;
     HWND editPlaybackMin_ = nullptr;
     HWND editPlaybackMax_ = nullptr;
+    HWND editRecordingCaptureHalfSize_ = nullptr;
     HWND editHoldThreshold_ = nullptr;
     HWND crosshairBtn_ = nullptr;
 

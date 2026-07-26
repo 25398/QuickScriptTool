@@ -26,6 +26,7 @@ std::wstring FindImagesDir();
 void        EnsureScriptsDir();
 void        EnsureFindImagesDir();
 std::wstring NowText();
+/// 当前 Unix 秒时间戳字符串（无业务前缀；前缀由调用方拼接）
 std::wstring TimestampName();
 
 // ── 窗口文本操作 ──────────────────────────────────────────────────

@@ -35,8 +35,10 @@ std::wstring ActionTypeBriefLabel(ActionType type);
 /// JSON type 字段 → 编辑器中文动作名
 std::wstring JsonTypeBriefLabel(const std::wstring& jsonType);
 
-/// 脚本动作列表的可读大纲（供 AI 回复用户时引用）
-std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions);
+/// 脚本动作列表的可读大纲（供 AI 回复用户时引用）。
+/// maxLines：最多输出多少行动作；超出时保留头尾并注明省略。0=不限制（不推荐给 Agent）。
+std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions,
+    size_t maxLines = 80);
 
 /// 动作 type 英文标识 → 中文说法对照表（注入 AI 提示）
 std::wstring ActionTypeReplyCatalog();
@@ -76,6 +78,9 @@ void MouseClick(MouseButtonType button);
 /// 相对移动鼠标（dx/dy 像素，SendInput MOUSEEVENTF_MOVE；FPS 视角等）
 void SendMouseMoveRelative(int dx, int dy);
 
+/// 前台绝对移标：HID 会话走 Interception absolute，否则 SetCursorPos
+bool SetCursorScreenPos(int x, int y);
+
 /// 精密回放时临时关闭鼠标加速并设中性速度（录制为 Raw，回放 SendInput 会再套加速）
 class MouseBallisticsGuard {
 public:
@@ -83,8 +88,11 @@ public:
     ~MouseBallisticsGuard();
     MouseBallisticsGuard(const MouseBallisticsGuard&) = delete;
     MouseBallisticsGuard& operator=(const MouseBallisticsGuard&) = delete;
+    /// SPI 关闭加速后 GET 校验是否成功（成功则可按 Raw 包大小单次注入）
+    bool FlatVerified() const { return flatVerified_; }
 private:
     bool active_ = false;
+    bool flatVerified_ = false;
     int mouseParams_[3]{};
     int mouseSpeed_ = 10;
 };

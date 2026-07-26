@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "鼠大侠",
+  "version": "1.1.43",
+  "description": "配合鼠大侠窗口模式，在已打开的 Edge/Chrome 标签页后台投递键鼠（无需 remote-debugging-port）。",
+  "permissions": ["debugger", "tabs", "windows", "storage", "alarms", "scripting"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "ws://127.0.0.1/*",
+    "ws://localhost/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "鼠大侠",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

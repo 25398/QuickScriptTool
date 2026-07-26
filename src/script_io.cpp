@@ -2,6 +2,7 @@
 
 #include "action_utils.h"
 #include "coord_space.h"
+#include "recorder_timeline.h"
 #include "window_mode/window_mode_json.h"
 
 #include <fstream>
@@ -132,7 +133,11 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.holdLeftShift = ExtractNumber(block, L"holdLeftShift", 0) != 0;
     a.holdRightShift = ExtractNumber(block, L"holdRightShift", 0) != 0;
     a.clickCount = static_cast<int>(ExtractNumber(block, L"clickCount", 1));
-    a.duration = ExtractNumber(block, L"duration", 0.1);
+    {
+        double durationDefault = 0.1;
+        if (ActionCarriesRecordingPreDelay(a.type)) durationDefault = 0.0;
+        a.duration = ExtractNumber(block, L"duration", durationDefault);
+    }
     a.randomDuration = ExtractNumber(block, L"randomDuration", 0.0);
     a.timingUs = static_cast<uint64_t>(std::max(0.0,
         ExtractNumber(block, L"timingUs", 0.0)));
@@ -204,6 +209,12 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.aiWithImage = ExtractNumber(block, L"aiWithImage", 1) != 0;
     a.aiFallbackValue = ExtractString(block, L"aiFallbackValue");
     a.aiConfirmExecute = ExtractNumber(block, L"aiConfirmExecute", 0) != 0;
+    a.recordedCapturePath = ExtractString(block, L"recordedCapturePath");
+    if (!a.recordedCapturePath.empty()) {
+        a.recordedCapturePath = ResolveImagePath(a.recordedCapturePath);
+    }
+    a.captureOffsetX = static_cast<int>(ExtractNumber(block, L"captureOffsetX", 0));
+    a.captureOffsetY = static_cast<int>(ExtractNumber(block, L"captureOffsetY", 0));
     return a;
 }
 
@@ -335,7 +346,16 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     file << L"      \"aiMaxSteps\": " << a.aiMaxSteps << L",\n";
     file << L"      \"aiWithImage\": " << (a.aiWithImage ? 1 : 0) << L",\n";
     file << L"      \"aiFallbackValue\": \"" << EscapeJson(a.aiFallbackValue) << L"\",\n";
-    file << L"      \"aiConfirmExecute\": " << (a.aiConfirmExecute ? 1 : 0) << L"\n";
+    file << L"      \"aiConfirmExecute\": " << (a.aiConfirmExecute ? 1 : 0);
+    if (!a.recordedCapturePath.empty()) {
+        const std::wstring savedCap = ImagePathForJson(EnsureImageInLibrary(a.recordedCapturePath));
+        file << L",\n      \"recordedCapturePath\": \"" << EscapeJson(savedCap) << L"\"";
+    }
+    if (!a.recordedCapturePath.empty() || a.captureOffsetX != 0 || a.captureOffsetY != 0) {
+        file << L",\n      \"captureOffsetX\": " << a.captureOffsetX;
+        file << L",\n      \"captureOffsetY\": " << a.captureOffsetY;
+    }
+    file << L"\n";
     file << L"    }" << (last ? L"\n" : L",\n");
 }
 
@@ -359,6 +379,17 @@ bool ScriptNormValuesLookLikePixels(const std::vector<ScriptAction>& actions) {
 }
 
 }  // namespace
+
+void NormalizeInputTiming(ScriptFileData& data, const std::wstring& path,
+    bool forceRecordingExpand) {
+    if (data.inputTimingVersion >= kInputTimingVersionExplicitWaits) return;
+    ExpandRecordingPreDelayPolicy policy{};
+    policy.treatAsRecordingTimeline = forceRecordingExpand
+        || IsRecordingScriptPath(path)
+        || data.inputTimingVersion == 1;
+    data.actions = ExpandRecordingPreDelaysToExplicitWaits(data.actions, policy);
+    data.inputTimingVersion = kInputTimingVersionExplicitWaits;
+}
 
 ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDisplay) {
     ScriptFileData data{};
@@ -429,6 +460,7 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
         DenormalizeScriptToCurrentScreen(data.actions);
     }
 
+    NormalizeInputTiming(data, path);
     return data;
 }
 
@@ -480,6 +512,8 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
         DenormalizeScriptToCurrentScreen(data.actions);
     }
 
+    // 无路径：仅 version==1 视为录制时间线；scripts 默认 0.1 不展开
+    NormalizeInputTiming(data, L"");
     return data;
 }
 
@@ -489,8 +523,13 @@ bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data) {
     if (IsRecordingScriptPath(path)) {
         normalized.windowMode = windowmode::DefaultWindowModeConfig();
         normalized.breakoutTimeSeconds = 0;
+        normalized.inputTimingVersion = kInputTimingVersionExplicitWaits;
     } else if (normalized.windowMode.enabled) {
         normalized.breakoutTimeSeconds = 0;
+    }
+    if (normalized.inputTimingVersion > 0
+        && normalized.inputTimingVersion < kInputTimingVersionExplicitWaits) {
+        NormalizeInputTiming(normalized, path);
     }
 
     // 像素→n* 用当前屏幕；JSON coordMeta 固定为标准 2560×1440

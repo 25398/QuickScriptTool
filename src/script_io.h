@@ -24,9 +24,14 @@ struct ScriptFileData {
     bool coordsNormalized = false;  // JSON 中坐标是否为归一化格式
     double breakoutTimeSeconds = 0; // 默认模式脱离时间（秒），0 表示禁用
     int recordingCaptureMode = -1;  // -1=旧文件/未知，0=自动，1=桌面绝对，2=FPS相对
-    int inputTimingVersion = 0;      // 1=整数微秒绝对时间轴语义
+    // 0/缺省=旧文件；1=微秒轴但仍可把前延迟挂在动作上；2=时间只在显式 Wait（及重复间隔）
+    int inputTimingVersion = 0;
     std::vector<ScriptAction> actions;
 };
+
+/// 若 version<2：安全 Expand 前延迟为 Wait，合并相邻 Wait，升为 version=2。
+void NormalizeInputTiming(ScriptFileData& data, const std::wstring& path,
+    bool forceRecordingExpand = false);
 
 /// 规范化脱离时间：空值/负数/非数字均视为 0
 inline double NormalizeBreakoutTimeSeconds(double seconds) {

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -37,6 +38,7 @@
 #include "drawing.h"
 #include "hotkey_dialog.h"
 #include "image_match.h"
+#include "input/foreground_input_router.h"
 #include "input/mouse_input_backend.h"
 #include "input_timeline_scheduler.h"
 #include "macro_variables.h"
@@ -51,6 +53,7 @@
 #include "process_utils.h"
 #include "recorder.h"
 #include "recorder_timeline.h"
+#include "recording_to_findimage.h"
 #include "recording_optimize_dialog.h"
 #include "scheduled_task_dialog.h"
 #include "scheduled_task_scheduler.h"
@@ -58,6 +61,7 @@
 #include "settings_dialog.h"
 #include "tray_menu.h"
 #include "match_overlay.h"
+#include "findimage_crop_editor.h"
 #include "ocr_overlay.h"
 #include "screenshot_overlay.h"
 #include "editor_dropdown.h"
@@ -668,7 +672,9 @@ private:
     friend LRESULT CALLBACK EditorTipPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     friend LRESULT CALLBACK ClickerDropPopupWndProc(HWND, UINT, WPARAM, LPARAM);
     enum class Page { Home, Editor };
-    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kOcrDigitsOnly, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName, kAiPrompt, kAiInsertVar, kAiVarCombo, kAiModel, kAiContextMode, kAiOutputVar, kAiOutputType, kAiTimeout, kAiFallback, kAiImageScale, kAiRegionByImage, kAiRegionByImage2, kAiFindSelectRegion, kAiFindMatchThreshold, kAiFindScaleMin, kAiFindScaleMax, kAiTargetPreview, kAiTargetScreenshot, kAiTargetLocal, kAiTargetClear, kAiFullScreen, kAiSelectRegion, kAiSearchRegion, kAiSearchX1, kAiSearchY1, kAiSearchX2, kAiSearchY2, kAiMaxSteps, kAiWithImage, kAiConfirm, kAiMaxStepsHint, kCursorPosVarName, kGotoStepExpr, kMoveRelX, kMoveRelY, kMoveRelRandomX, kMoveRelRandomY, kBreakoutTime = 5099, kWmSelectMethod = 5101, kWmSpecifyWindowBtn, kWmTargetPath, kWmTargetBrowse, kWmTargetCrosshair, kWmFakeFocus };
+    // 注意：自 kMoveX 起的序号必须与 editor_param_layout.h 的 EID_* 对齐。
+    // 工具栏「转为找图」勿插在中间，否则找图测试/预览等 WM_COMMAND 会错位（预览误触发清除）。
+    enum Id { kScriptName = 1001, kModeCombo, kActionCombo, kAdd, kModify, kClear, kSave, kCancel, kLoad, kBatchExit, kBatchSelectAll, kBatchDeselect, kBatchDelete, kBatchCopy, kMoveX, kMoveY, kMoveRandomX, kMoveRandomY, kMoveFromVar, kMoveVarX, kMoveVarY, kClickButton, kClickCount, kClickWait, kClickRandom, kWaitDuration, kWaitRandom, kRemark, kListRemarkEdit, kClose, kKeyCapture, kClickLWin, kClickRWin, kClickLCtrl, kClickRCtrl, kClickLAlt, kClickRAlt, kClickLShift, kClickRShift, kKeyLWin, kKeyRWin, kKeyLCtrl, kKeyRCtrl, kKeyLAlt, kKeyRAlt, kKeyLShift, kKeyRShift, kCrosshair, kLoopCount, kLoopFromVar, kLoopVarExpr, kLoopVarName, kDefineBlockName, kRunBlockCombo, kKeyPressCapture, kMousePressButton, kMousePressLWin, kMousePressRWin, kMousePressLCtrl, kMousePressRCtrl, kMousePressLAlt, kMousePressRAlt, kMousePressLShift, kMousePressRShift, kKeyPressLWin, kKeyPressRWin, kKeyPressLCtrl, kKeyPressRCtrl, kKeyPressLAlt, kKeyPressRAlt, kKeyPressLShift, kKeyPressRShift, kHotkeyShortcutCombo, kHotkeyShortcutCount, kHotkeyShortcutWait, kHotkeyShortcutRandom, kQuickInputText, kQuickInputVarCombo, kQuickInputInsert, kQuickInputCharInterval, kQuickInputCount, kQuickInputWait, kQuickInputRandom, kRunMacroCombo, kMousePlaybackCombo, kMousePlaybackCount, kMousePlaybackWait, kMousePlaybackRandom, kScrollVertical, kScrollHorizontal, kScrollSteps, kScrollDirection, kScrollCount, kScrollWait, kScrollRandom, kFindFullScreen, kFindSelectRegion, kFindX1, kFindY1, kFindX2, kFindY2, kFindTest, kFindScreenshot, kFindLocalImage, kFindClearImage, kFindImagePreview, kFindMatchThreshold, kFindScaleMin, kFindScaleMax, kFindFollowUp, kFindOffsetX, kFindOffsetY, kFindSelectOffset, kFindUntilFound, kFindMatchVar, kOcrFullScreen, kOcrSelectRegion, kOcrX1, kOcrY1, kOcrX2, kOcrY2, kOcrResultMode, kOcrSearchText, kOcrSearchVarCombo, kOcrSearchVarInsert, kOcrFollowUp, kOcrOffsetX, kOcrOffsetY, kOcrSelectOffset, kOcrUntilFound, kOcrResultVar, kOcrTest, kOcrInstallDep, kOcrRegionByImage, kOcrFindSelectRegion, kOcrFindScreenshot, kOcrFindLocalImage, kOcrFindClearImage, kOcrFindImagePreview, kOcrFindMatchThreshold, kOcrFindScaleMin, kOcrFindScaleMax, kOcrDigitsOnly, kIfVarCombo, kIfOperator, kIfValue, kIfConnector, kIfAddCondition, kIfConditionList, kRunProgramCombo, kRunProgramPath, kRunProgramBrowse, kRunProgramCrosshair, kRunProgramArgs, kCloseProgramPath, kCloseProgramBrowse, kCloseProgramCrosshair, kCloseProgramMatchFileName, kOpenWebpageUrl, kOpenFilePath, kOpenFileBrowse, kTimerVarName, kAiPrompt, kAiInsertVar, kAiVarCombo, kAiModel, kAiContextMode, kAiOutputVar, kAiOutputType, kAiTimeout, kAiFallback, kAiImageScale, kAiRegionByImage, kAiRegionByImage2, kAiFindSelectRegion, kAiFindMatchThreshold, kAiFindScaleMin, kAiFindScaleMax, kAiTargetPreview, kAiTargetScreenshot, kAiTargetLocal, kAiTargetClear, kAiFullScreen, kAiSelectRegion, kAiSearchRegion, kAiSearchX1, kAiSearchY1, kAiSearchX2, kAiSearchY2, kAiMaxSteps, kAiWithImage, kAiConfirm, kAiMaxStepsHint, kCursorPosVarName, kGotoStepExpr, kMoveRelX, kMoveRelY, kMoveRelRandomX, kMoveRelRandomY, kBreakoutTime = 5099, kWmSelectMethod = 5101, kWmSpecifyWindowBtn, kWmTargetPath, kWmTargetBrowse, kWmTargetCrosshair, kWmFakeFocus, kConvertToFindImage = 5201 };
     enum class HoverButton { None, Import, Export, Load, Clear, Add, Modify, Cancel, Save, Close, Minimize, Settings, HomeCard, HomeScroll, EditorScroll, Create, CommonHotkey, HomeEdit, HomeDelete, ScriptHotkey, Row, RowCopy, RowDelete, RowCheckbox, BatchExit, BatchSelectAll, BatchDeselect, BatchDelete, BatchCopy, Crosshair, ClickerInterval, ClickerHotkey, RecorderHotkey };
     enum MenuId { kCopyLast = 3001, kCopyFirst, kCopyBeforeSelected, kCopyAfterSelected, kAddLast, kAddFirst, kAddBeforeSelected, kAddAfterSelected, kAddAsChild, kHotCustom = 3101, kHotF8, kHotF10, kHotLeft, kHotMiddle, kHotRight, kHotX1, kHotX2, kHotSpace };
     struct HotkeyMenuItem { int id; const wchar_t* title; const wchar_t* desc; };
@@ -1363,6 +1369,7 @@ private:
         labelBatchCount_ = MakeLabel(hwnd_, L"已选中:0个", -1, 95, kEditorToolbarLabelY, 120, kEditorMacroHeaderRowH); editorControls_.push_back(labelBatchCount_);
         ShowWindow(labelBatchCount_, SW_HIDE);
         loadBtn_ = MakeGreenButton(hwnd_, L"批量编辑", kLoad, 546, kEditorToolbarBtnY, 105, kEditorToolbarBtnH); editorControls_.push_back(loadBtn_);
+        convertToFindImageBtn_ = MakeGreenButton(hwnd_, L"转为找图", kConvertToFindImage, 428, kEditorToolbarBtnY, 105, kEditorToolbarBtnH); editorControls_.push_back(convertToFindImageBtn_);
         clearBtn_ = MakeGreenButton(hwnd_, L"清空列表", kClear, 664, kEditorToolbarBtnY, 105, kEditorToolbarBtnH); editorControls_.push_back(clearBtn_);
         batchExitBtn_ = MakeGreenButton(hwnd_, L"退出批量编辑", kBatchExit, 258, kEditorToolbarBtnY, 118, kEditorToolbarBtnH); editorControls_.push_back(batchExitBtn_);
         batchSelectAllBtn_ = MakeGreenButton(hwnd_, L"全选", kBatchSelectAll, 390, kEditorToolbarBtnY, 68, kEditorToolbarBtnH); editorControls_.push_back(batchSelectAllBtn_);
@@ -3392,7 +3399,7 @@ private:
             currentScriptIndex_ = -1;
             currentPath_.clear();
             currentRecordTime_ = NowText();
-            SetText(name_, TimestampName());
+            SetText(name_, L"鼠标宏-" + TimestampName());
             loadedCoordMeta_ = StandardScriptCoordMeta();
             ResetEditorScriptChromeDefaults();
             SetPopupSel(popupMode_, mode_, 0);
@@ -5856,6 +5863,106 @@ private:
         scrollOffset_ = std::clamp(scrollOffset_, 0, MaxEditorScroll());
         RefreshActionListLayer();
         ApplyEditorFooterLayout();
+        UpdateConvertToFindImageButton();
+    }
+
+    void UpdateConvertToFindImageButton() {
+        if (!convertToFindImageBtn_) return;
+        if (batchEditMode_) {
+            EnableWindow(convertToFindImageBtn_, FALSE);
+            return;
+        }
+        const auto probe = ProbeClickUnitFromSelection(actions_, selectedIndex_);
+        EnableWindow(convertToFindImageBtn_, probe.unit.ok ? TRUE : FALSE);
+    }
+
+    void ConvertSelectedActionToFindImage() {
+        if (batchEditMode_ || selectedIndex_ < 0) return;
+        const auto probe = ProbeClickUnitFromSelection(actions_, selectedIndex_);
+        if (!probe.unit.ok) {
+            ShowPromptInfo(L"当前选中项无法转为找图点击。");
+            return;
+        }
+        const int downIdx = probe.unit.downIndex;
+        if (downIdx < 0 || downIdx >= static_cast<int>(actions_.size())) return;
+
+        auto runConvert = [this](const ClickUnit& unit, const std::wstring& expectedPath) {
+            ConvertToFindImageOptions options{};
+            options.requireCapturePath = true;
+            // 编辑器单选：只删当前选中的绝对 Move，不误删未选中的前置轨迹
+            options.restrictAbsMoveErase = true;
+            RenumberScriptActions(actions_);
+            if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())
+                && actions_[static_cast<size_t>(selectedIndex_)].type == ActionType::MoveMouse) {
+                options.erasableAbsMoveNos.insert(
+                    actions_[static_cast<size_t>(selectedIndex_)].originalNo);
+            }
+            ClickUnit work = unit;
+            if (!ConvertOneClickUnitToFindImage(actions_, work, options)) {
+                ShowPromptInfo(L"转换失败。");
+                return;
+            }
+            RenumberScriptActions(actions_);
+            const std::wstring resolved = EnsureImageInLibrary(expectedPath);
+            const std::wstring alt = resolved.empty() ? ResolveImagePath(expectedPath) : resolved;
+            selectedIndex_ = -1;
+            for (int i = 0; i < static_cast<int>(actions_.size()); ++i) {
+                const auto& a = actions_[static_cast<size_t>(i)];
+                if (a.type != ActionType::FindImage) continue;
+                if (a.imagePath == expectedPath || a.imagePath == resolved || a.imagePath == alt) {
+                    selectedIndex_ = i;
+                    break;
+                }
+            }
+            RenumberActions();
+            UpdateConvertToFindImageButton();
+            UpdateEditMode();
+            OnActionsChanged();
+        };
+
+        const std::wstring existingPath = actions_[static_cast<size_t>(downIdx)].recordedCapturePath;
+        if (!existingPath.empty()) {
+            runConvert(probe.unit, existingPath);
+            return;
+        }
+
+        promptModal_.ShowConfirm(
+            L"未找到录制模板，将按当前屏幕在点击附近截取模板。\n请先回到目标界面后再确认。",
+            [this, probe, downIdx, runConvert](bool ok) {
+                if (!ok) return;
+                int cx = 0, cy = 0;
+                if (!ResolveClickScreenPoint(actions_, probe.unit, cx, cy)) {
+                    ShowPromptInfo(L"无法解析点击坐标。");
+                    return;
+                }
+                const int half = ClampClickCaptureHalfSize(
+                    appSettings_.playback.recordingClickCaptureHalfSize);
+                int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+                GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+                const auto rect = ComputeClickCaptureRect(
+                    cx, cy, half, vsX, vsY, vsX + vsW, vsY + vsH);
+                if (!rect.valid) {
+                    ShowPromptInfo(L"截取区域过小，无法生成模板。");
+                    return;
+                }
+                EnsureFindImagesDir();
+                const std::wstring path = FindImagesDir() + L"\\"
+                    + MakeRecordingClickCaptureFileName(
+                        static_cast<uint64_t>(GetTickCount64()),
+                        static_cast<uint64_t>(downIdx + 1));
+                HBITMAP bmp = CaptureScreenRegion(rect.x1, rect.y1, rect.x2, rect.y2);
+                if (!bmp || !SaveBitmapToFile(bmp, path)) {
+                    DeleteBitmapHandle(bmp);
+                    ShowPromptInfo(L"屏幕截取失败。");
+                    return;
+                }
+                DeleteBitmapHandle(bmp);
+                newImagePaths_.insert(path);
+                actions_[static_cast<size_t>(downIdx)].recordedCapturePath = path;
+                actions_[static_cast<size_t>(downIdx)].captureOffsetX = rect.offsetX;
+                actions_[static_cast<size_t>(downIdx)].captureOffsetY = rect.offsetY;
+                runConvert(probe.unit, path);
+            });
     }
 
     void ClearEditorActions() {
@@ -5936,6 +6043,7 @@ private:
 
     void UpdateBatchToolbar() {
         ShowWindow(loadBtn_, batchEditMode_ ? SW_HIDE : SW_SHOW);
+        ShowWindow(convertToFindImageBtn_, batchEditMode_ ? SW_HIDE : SW_SHOW);
         ShowWindow(clearBtn_, batchEditMode_ ? SW_HIDE : SW_SHOW);
         ShowWindow(batchExitBtn_, batchEditMode_ ? SW_SHOW : SW_HIDE);
         ShowWindow(batchSelectAllBtn_, batchEditMode_ ? SW_SHOW : SW_HIDE);
@@ -5948,6 +6056,7 @@ private:
         const bool hasSelection = BatchSelectedCount() > 0;
         EnableWindow(batchDeleteBtn_, hasSelection ? TRUE : FALSE);
         EnableWindow(batchCopyBtn_, hasSelection ? TRUE : FALSE);
+        UpdateConvertToFindImageButton();
         InvalidateToolbarArea();
     }
 
@@ -6714,7 +6823,7 @@ private:
         else if (action.type == ActionType::FindImage) {
             SetPopupSel(popupAction_, actionCombo_, 17);
             findImageFullScreen_ = action.searchFullScreen;
-            findImagePath_ = action.imagePath;
+            findImagePath_ = ResolveImagePath(action.imagePath);
             if (action.searchFullScreen) {
                 ApplyFindImageFullScreen();
             } else {
@@ -6928,7 +7037,7 @@ private:
             findImagePreviewBitmap_ = nullptr;
         }
         if (!findImagePath_.empty()) {
-            findImagePreviewBitmap_ = LoadBitmapFromFile(findImagePath_);
+            findImagePreviewBitmap_ = LoadBitmapFromFile(ResolveImagePath(findImagePath_));
         }
         if (findImagePreviewBtn_) {
             RedrawWindow(findImagePreviewBtn_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
@@ -7100,7 +7209,9 @@ private:
     }
 
     bool HasFindImageTemplate(const std::wstring& path) const {
-        return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (path.empty()) return false;
+        const std::wstring resolved = ResolveImagePath(path);
+        return GetFileAttributesW(resolved.c_str()) != INVALID_FILE_ATTRIBUTES;
     }
 
     void BeginOcrFindRegionSelect() {
@@ -7326,6 +7437,67 @@ private:
         UpdateFindImagePreview();
     }
 
+    void OpenFindImageCropEditor() {
+        if (batchEditMode_) return;
+        if (popupAction_.sel != 17) return;
+        if (screenshotOverlay_ && screenshotOverlay_->IsOpen()) {
+            ShowPromptInfo(L"请先结束当前的截图/测试/选偏移操作。");
+            return;
+        }
+        if (findImageCropEditor_ && findImageCropEditor_->IsOpen()) {
+            ShowPromptInfo(L"请先结束当前的截图/测试/选偏移操作。");
+            return;
+        }
+        if (!HasFindImageTemplate(findImagePath_)) {
+            ShowPromptInfo(L"请先截图或选择本地图片。");
+            return;
+        }
+        const std::wstring path = ResolveImagePath(findImagePath_);
+        HBITMAP probe = LoadBitmapFromFile(path);
+        if (!probe) {
+            ShowPromptInfo(L"无法打开裁切：模板无效或尺寸过小。");
+            return;
+        }
+        BITMAP bm{};
+        GetObjectW(probe, sizeof(bm), &bm);
+        DeleteBitmapHandle(probe);
+        if (bm.bmWidth < kFindImageCropMinSide || bm.bmHeight < kFindImageCropMinSide) {
+            ShowPromptInfo(L"无法打开裁切：模板无效或尺寸过小。");
+            return;
+        }
+
+        if (!findImageCropEditor_) findImageCropEditor_ = std::make_unique<FindImageCropEditor>();
+        GetWindowRect(hwnd_, &findRegionSavedRect_);
+        ShowWindow(hwnd_, SW_HIDE);
+        const int ox = ToInt(findOffsetX_);
+        const int oy = ToInt(findOffsetY_);
+        const bool saveVar = popupFindFollowUp_.sel == 2;
+        const FindImageCropEditorResult result =
+            findImageCropEditor_->Show(hwnd_, path, ox, oy, saveVar);
+        RestoreEditorAfterScreenOverlay();
+
+        if (!result.confirmed) return;
+        if (result.fullImageNoOp) {
+            // 可选提示：本迭代静默关闭即可
+            return;
+        }
+        findImagePath_ = result.newPath;
+        newImagePaths_.insert(result.newPath);
+        SetText(findOffsetX_, std::to_wstring(result.offsetX));
+        SetText(findOffsetY_, std::to_wstring(result.offsetY));
+        RefreshCoordFieldEdits({findOffsetX_, findOffsetY_});
+        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())
+            && actions_[static_cast<size_t>(selectedIndex_)].type == ActionType::FindImage) {
+            auto& a = actions_[static_cast<size_t>(selectedIndex_)];
+            a.imagePath = result.newPath;
+            a.offsetX = result.offsetX;
+            a.offsetY = result.offsetY;
+            SyncFindImageOffsetNorm(a);
+            OnActionsChanged();
+        }
+        UpdateFindImagePreview();
+    }
+
     void BeginAiRegionSelect() {
         if (!hwnd_) return;
         if (!screenshotOverlay_) screenshotOverlay_ = std::make_unique<ScreenshotOverlay>();
@@ -7505,7 +7677,8 @@ private:
             }
         };
         // 无图时在此直接返回，不调用 MatchOverlay / 屏幕冻结
-        if (!HasFindImageTemplate(findImagePath_)) {
+        const std::wstring testPath = ResolveImagePath(findImagePath_);
+        if (!HasFindImageTemplate(testPath)) {
             finishTest();
             QueuePromptInfo(L"请先设置要查找的图片。");
             return;
@@ -7536,7 +7709,7 @@ private:
         const TemplateScale ts = ComputeTemplateScale(execMeta, vsW, vsH);
         const ImageMatchOptions findOpt = BuildExecutionFindImageOptions(probe, ts);
 
-        matchOverlay_->Show(findImagePath_, sx1, sy1, sx2, sy2, findOpt,
+        matchOverlay_->Show(testPath, sx1, sy1, sx2, sy2, findOpt,
                             MatchOverlayMode::Test);
 
         RestoreEditorAfterScreenOverlay();
@@ -7578,6 +7751,7 @@ private:
         if (id == kBatchDeselect) { BatchDeselectAll(); return; }
         if (id == kBatchDelete) { BatchDeleteSelected(); return; }
         if (id == kBatchCopy) { BatchCopySelected(); return; }
+        if (id == kConvertToFindImage) { ConvertSelectedActionToFindImage(); return; }
         if (id == kKeyCapture) { CaptureActionKey(); return; }
         if (id == kKeyPressCapture) { CaptureKeyPress(); return; }
         if (id == kQuickInputInsert) { InsertQuickInputVariable(); return; }
@@ -7593,7 +7767,7 @@ private:
         if (id == kFindSelectRegion) { BeginFindRegionSelect(false); return; }
         if (id == kFindScreenshot) { BeginFindRegionSelect(true); return; }
         if (id == kFindLocalImage) { LoadFindImageFromFile(); return; }
-        if (id == kFindImagePreview) { LoadFindImageFromFile(); return; }
+        if (id == kFindImagePreview) { OpenFindImageCropEditor(); return; }
         if (id == kFindClearImage) { ClearFindImage(); return; }
         if (id == kFindTest) {
             FiDbgLogFmt(L"ON_COMMAND_FIND_TEST",
@@ -8192,6 +8366,7 @@ private:
             RegisterAllHotkeys();
         }
         InvalidateRect(hwnd_, nullptr, TRUE);
+        ShowPromptInfo(L"导入成功！");
     }
 
     void ImportScriptFromJsonFile(const std::wstring& path, bool toRecordings) {
@@ -8347,7 +8522,7 @@ private:
 
     void ExportSelectedScript() {
         if (selectedScript_ < 0 || selectedScript_ >= static_cast<int>(scripts_.size())) {
-            ShowPromptInfo(L"请选择要导出的宏");
+            ShowPromptInfo(L"请选择要导出的宏。");
             return;
         }
         const auto& script = scripts_[static_cast<size_t>(selectedScript_)];
@@ -10722,7 +10897,10 @@ private:
     }
 
     void ExportSelectedRecording() {
-        if (selectedRecording_ < 0 || selectedRecording_ >= static_cast<int>(recordings_.size())) return;
+        if (selectedRecording_ < 0 || selectedRecording_ >= static_cast<int>(recordings_.size())) {
+            ShowPromptInfo(L"请选择要导出的录制。");
+            return;
+        }
         auto& meta = recordings_[static_cast<size_t>(selectedRecording_)];
         const auto content = ReadAll(meta.path);
         const auto imgPaths = CollectImagePathsFromJson(content);
@@ -10756,11 +10934,11 @@ private:
             const auto zipResult = CreateZipFile(zipPath, files, meta.path);
             if (zipResult.success) {
                 if (zipResult.skippedFiles.empty()) {
-                    MessageBoxW(hwnd_, L"录制已导出。图片已一同打包。可在\"鼠标宏\"中导入此文件。", L"导出", MB_OK | MB_ICONINFORMATION);
+                    ShowPromptInfo(L"导出成功！图片已一同打包。");
                 } else {
-                    const std::wstring msg = L"录制已导出，但有 " + std::to_wstring(zipResult.skippedFiles.size())
-                        + L" 张图片未找到已跳过。\n\n可在\"鼠标宏\"中导入此文件，导入后需重新设置图片。";
-                    ShowPromptInfo(msg.c_str());
+                    const std::wstring msg = L"导出成功，但有 " + std::to_wstring(zipResult.skippedFiles.size())
+                        + L" 张图片未找到已跳过。\n\n对方导入后需要重新截图或选择本地图片。";
+                    ShowPromptInfo(msg);
                 }
             } else {
                 ShowPromptInfo(L"导出失败：无法创建 ZIP 文件，请检查保存路径是否有写入权限。");
@@ -10780,8 +10958,11 @@ private:
             ofn.nFilterIndex = 1;
             ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
             if (!GetSaveFileNameW(&ofn)) return;
-            CopyFileW(meta.path.c_str(), fileBuffer, FALSE);
-            MessageBoxW(hwnd_, L"录制已导出。可在\"鼠标宏\"中导入此文件。", L"导出", MB_OK | MB_ICONINFORMATION);
+            if (!CopyFileW(meta.path.c_str(), fileBuffer, FALSE)) {
+                ShowPromptInfo(L"导出失败：无法写入目标文件。");
+            } else {
+                ShowPromptInfo(L"导出成功！");
+            }
         }
     }
 
@@ -11192,6 +11373,32 @@ private:
         if (hwnd_) SetTimer(hwnd_, kHotkeyLatchSyncTimerId, 16, nullptr);
     }
 
+    /// 全局启停热键「启动」：严格按当前主界面 Tab 分流，互不串用对方选中项。
+    /// 选中缓存（selectedScript_/selectedRecording_）仍可按原逻辑保留，但不跨 Tab 触发。
+    bool TryStartByActiveHomeTab() {
+        using quickscript::MainTab;
+        switch (activeHomeTab_) {
+        case MainTab::Macro:
+            if (selectedScript_ >= 0 && selectedScript_ < static_cast<int>(scripts_.size())) {
+                RunScriptByIndex(selectedScript_);
+                return true;
+            }
+            return false;
+        case MainTab::Recorder:
+            if (selectedRecording_ >= 0 && selectedRecording_ < static_cast<int>(recordings_.size())) {
+                LoadScriptFile(recordings_[static_cast<size_t>(selectedRecording_)].path);
+                RunCurrentActions();
+                return true;
+            }
+            ToggleRecording();
+            return true;
+        case MainTab::Clicker:
+        case MainTab::ScriptCustom:
+        default:
+            return false;
+        }
+    }
+
     void OnHotkey(int id, int holdCmd = 0) {
         // RegisterHotKey 与 LL 钩子双通道：用 NeedKeyUp 吃掉同一次物理按下的重复。
         // StopRecording/保存期间 UI 线程不泵消息，返回后队列里的第二通道不能再开录制。
@@ -11254,22 +11461,12 @@ private:
                 } holdGuard;
                 if (clicking_ || recording_ || running_) return;
                 if (ShouldSuppressHotkeyWhileTyping()) return;
-                if (activeHomeTab_ != quickscript::MainTab::Clicker) {
-                    if (selectedScript_ >= 0) {
-                        holdGuard.started = true;
-                        RunScriptByIndex(selectedScript_);
-                    } else if (selectedRecording_ >= 0 && selectedRecording_ < static_cast<int>(recordings_.size())) {
-                        holdGuard.started = true;
-                        LoadScriptFile(recordings_[static_cast<size_t>(selectedRecording_)].path);
-                        RunCurrentActions();
-                    } else if (activeHomeTab_ == quickscript::MainTab::Recorder) {
-                        holdGuard.started = true;
-                        ToggleRecording();
-                    }
+                if (activeHomeTab_ == quickscript::MainTab::Clicker) {
+                    holdGuard.started = true;
+                    StartClicking();
                     return;
                 }
-                holdGuard.started = true;
-                StartClicking();
+                holdGuard.started = TryStartByActiveHomeTab();
                 return;
             }
 
@@ -11299,18 +11496,11 @@ private:
             if (running_) { StopRun(); return; }
             // 「中文输入法不触发热键」：IME 开启时不启动连点/宏/录制（停止不受影响）
             if (ShouldSuppressHotkeyWhileTyping()) return;
-            if (activeHomeTab_ != quickscript::MainTab::Clicker) {
-                if (selectedScript_ >= 0) {
-                    RunScriptByIndex(selectedScript_);
-                } else if (selectedRecording_ >= 0 && selectedRecording_ < static_cast<int>(recordings_.size())) {
-                    LoadScriptFile(recordings_[static_cast<size_t>(selectedRecording_)].path);
-                    RunCurrentActions();
-                } else if (activeHomeTab_ == quickscript::MainTab::Recorder) {
-                    ToggleRecording();
-                }
+            if (activeHomeTab_ == quickscript::MainTab::Clicker) {
+                ToggleClicker();
                 return;
             }
-            ToggleClicker();
+            TryStartByActiveHomeTab();
             return;
         }
         if (clicking_ || recording_) return;
@@ -12095,6 +12285,9 @@ private:
         SyncNormFieldsFromPixels(execActions,
             CaptureCurrentCoordMeta(runCfg.enabled ? &runCfg : nullptr));
         execActions = PrepareScriptActionsForExecution(execActions, execMeta);
+        // 旧录制里相对移动间隔可能被 Raw 积压压成 0~1ms；回放前按设备报告间隔拉开。
+        if (IsRecordingScriptPath(currentPath_) || ScriptIsTimedInputSequence(execActions))
+            RepairCompressedRelativeGaps(execActions);
 
         const double breakoutTime = runCfg.enabled ? 0.0 : ParseBreakoutTimeFromEditor();
         Hotkey scriptHotkey{};
@@ -12153,7 +12346,12 @@ private:
         }
         UpdateStatusTip();
         windowmode::SetWindowModeLogSink([this](const std::wstring& line) {
-            if (macroDebugWindow_.IsCreated()) macroDebugWindow_.AppendLog(line);
+            if (!macroDebugWindow_.IsCreated()) return;
+            if (deferPlaybackDebugUi_.load(std::memory_order_relaxed)) {
+                PushDeferredDebugLine(line);
+                return;
+            }
+            macroDebugWindow_.AppendLog(line);
         });
         if (macroDebugWindow_.IsCreated()) macroDebugWindow_.ClearLog();
         breakoutHookState_ = BreakoutHookState{};
@@ -12257,12 +12455,36 @@ private:
             }
             if (usesOcr) holdOcrSession();
 
+            {
+                const auto backend = wmCfg.enabled
+                    ? quickscript::ForegroundInputBackend::Software
+                    : appSettings_.playback.foregroundInputBackend;
+                ForegroundInputRouter::Instance().BeginSession(backend);
+                if (backend != quickscript::ForegroundInputBackend::Software
+                    && ForegroundInputRouter::Instance().IsHidActive()) {
+                    AppendDebugLog(std::wstring(L"前台注入后端：")
+                        + quickscript::ForegroundInputBackendName(
+                            ForegroundInputRouter::Instance().ActiveBackend()));
+                    AppendDebugLog(L"HID模式：绝对移标用 absolute stroke；相对移动用 relative 报告");
+                } else if (ForegroundInputRouter::Instance().DidFallback()) {
+                    const std::wstring fb = ForegroundInputRouter::Instance().FallbackReason();
+                    AppendDebugLog(fb);
+                    // 回放开始时再打一行醒目摘要，避免只扫过调试窗时漏看。
+                    AppendDebugLog(L"【警告】当前不是驱动级注入，安全软件/反作弊可能仍按系统模拟处理。");
+                }
+                if (backend != quickscript::ForegroundInputBackend::Software
+                    && workerBreakoutTime_ > 0) {
+                    AppendDebugLog(L"HID模式下脱离时间无法区分注入与真人输入，已暂停脱离检测");
+                    breakout_input::UninstallBreakoutHooks();
+                }
+            }
+
             auto wmSetPos = [this, wmExecPtr](int x, int y, int rx, int ry) {
                 if (wmExecPtr && wmExecPtr->IsActive()) {
                     wmExecPtr->MoveMouseClient(x, y, rx, ry, [this](int r) { return RandomInt(r); });
                 } else {
                     MarkSimulatedInput();
-                    SetCursorPos(x + RandomInt(rx), y + RandomInt(ry));
+                    SetCursorScreenPos(x + RandomInt(rx), y + RandomInt(ry));
                     UnmarkSimulatedInput();
                 }
             };
@@ -12713,9 +12935,41 @@ private:
             inputTimeline.enabled = IsRecordingScriptPath(selfPath)
                 || ScriptIsTimedInputSequence(actions);
 
-            // SendInput：准点与迟到均不垫间隔，靠绝对时间轴追赶，避免越追越稀、视角拉飘。
+            // 精密轴期间：调试行先写入内存，本轮结束后再批量刷窗。
+            // 这样既不影响时序，用户仍可复制完整日志（含 late 统计）供分析。
+            struct DeferPlaybackDebugUiGuard {
+                MainWindow* self = nullptr;
+                bool armed = false;
+                DeferPlaybackDebugUiGuard(MainWindow* s, bool enable) : self(s) {
+                    if (!s || !enable) return;
+                    s->ClearDeferredDebugLog();
+                    s->deferPlaybackDebugUi_.store(true, std::memory_order_relaxed);
+                    if (s->appSettings_.playback.autoOutputKeyFunctionDebug
+                        && s->macroDebugWindow_.IsCreated()) {
+                        s->macroDebugWindow_.AppendLog(
+                            L"精密时间轴回放：调试输出延后到全部轮次结束后再刷出（避免轮间卡顿影响游戏状态）");
+                    }
+                    armed = true;
+                }
+                ~DeferPlaybackDebugUiGuard() {
+                    if (!armed || !self) return;
+                    self->FlushDeferredDebugLog();
+                    self->deferPlaybackDebugUi_.store(false, std::memory_order_relaxed);
+                }
+            } deferDbgGuard(this, inputTimeline.enabled);
+
+            // 绝对时间轴开启时不再额外垫 SendInput 间隔：迟到限速会与追赶打架，加重跑次抖动。
             MouseInputRouter::Instance().SetCatchUpGapUs(0);
+            struct CatchUpGapResetGuard {
+                ~CatchUpGapResetGuard() {
+                    MouseInputRouter::Instance().SetCatchUpGapUs(0);
+                }
+            } catchUpGapResetGuard;
             MouseBallisticsGuard ballisticsGuard(inputTimeline.enabled);
+            // 加速已关：保持 Raw 原包大小；未关才拆包防加倍（拆包会改变报告次数）。
+            const bool splitLargeMoves =
+                inputTimeline.enabled && !ballisticsGuard.FlatVerified();
+            MouseInputRouter::Instance().SetSplitLargeMoves(splitLargeMoves);
             PlaybackProcessPriorityGuard processPriGuard(inputTimeline.enabled);
             PlaybackThreadAffinityGuard affinityGuard(inputTimeline.enabled);
             MultimediaTimerGuard timerPeriodGuard(inputTimeline.enabled);
@@ -12736,27 +12990,29 @@ private:
                 }
             } threadPriGuard(inputTimeline.enabled);
 
-            auto waitAbsoluteTimeline = [this, &inputTimeline](double waitSec, uint64_t timingUs = 0) {
+            bool timelineInterrupted = false;
+            auto waitAbsoluteTimeline = [this, &inputTimeline, &timelineInterrupted](
+                double waitSec, uint64_t timingUs = 0) {
                 if (timingUs == 0 && waitSec <= 0.0) {
                     MouseInputRouter::Instance().NoteWaitLatenessUs(0);
-                    return;
+                    return true;
                 }
                 const auto cancelled = [this] {
                     return stopFlag_.load(std::memory_order_relaxed)
                         || BreakoutTriggered();
                 };
-                // 绝对时间轴：优先微秒；迟到不回补 sleep，由后续 deadline 自然追赶。
-                if (timingUs > 0) {
-                    inputTimeline.precision.WaitDeltaUs(timingUs, cancelled);
-                } else {
-                    inputTimeline.precision.WaitDeltaSeconds(waitSec, cancelled);
-                }
+                // 绝对轴：与录制 QPC 戳对齐。间隙等待会叠 SendInput 开销，整体偏慢且更抖。
+                const bool ok = (timingUs > 0)
+                    ? inputTimeline.precision.WaitDeltaUs(timingUs, cancelled)
+                    : inputTimeline.precision.WaitDeltaSeconds(waitSec, cancelled);
                 MouseInputRouter::Instance().NoteWaitLatenessUs(
                     inputTimeline.precision.LastLatenessUs());
+                if (!ok) timelineInterrupted = true;
+                return ok;
             };
 
             executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &heldKeys, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx, &executeOne, &runAiActionExecute, &aiSessions, &aiLoopDepth, &pendingBreakLoop, wmExecPtr, &wmSetPos, &wmSendKey, &wmSendHeldModifiers, &wmMouseButton, &wmMouseClick, &wmSendShortcut, &wmUsesTarget, &wmUsesBackground, &activeCoordMeta, &currentTmplScale, execTargetW, execTargetH, &inputTimeline, &waitAbsoluteTimeline](const ScriptAction& a) {
-                // 录制折叠进来的 duration/timingUs=前延迟（Wait/Click/Scroll 等除外）
+                // 兼容未 Normalize 的旧内存对象：瞬时类仍可能带前延迟
                 if (inputTimeline.enabled && a.randomDuration <= 1e-12) {
                     const bool durationIsInterval =
                         a.type == ActionType::Wait
@@ -12766,9 +13022,12 @@ private:
                     }
                 }
 
-                if (appSettings_.playback.autoOutputKeyFunctionDebug
+                if (KeyFunctionDebugActive()
                     && a.type != ActionType::MoveMouse
                     && a.type != ActionType::MoveMouseRelative
+                    && a.type != ActionType::Wait
+                    && a.type != ActionType::KeyDown
+                    && a.type != ActionType::KeyUp
                     && a.type != ActionType::FindImage
                     && a.type != ActionType::TextRecognition) {
                     AppendDebugLog(FormatGenericActionDebug(a));
@@ -12781,8 +13040,8 @@ private:
                         if (!TryResolveIntOperand(a.moveVarExprX, ctx, x)) x = 0;
                         if (!TryResolveIntOperand(a.moveVarExprY, ctx, y)) y = 0;
                     }
-                    if (appSettings_.playback.autoOutputKeyFunctionDebug) {
-                        AppendDebugLog(FormatMoveMouseDebug(a, x, y));
+                    if (KeyFunctionDebugActive()) {
+                        AppendDeferredMoveAbsDebug(a, x, y);
                     }
                     const int rx = inputTimeline.enabled ? 0 : a.randomX;
                     const int ry = inputTimeline.enabled ? 0 : a.randomY;
@@ -12791,8 +13050,8 @@ private:
                 else if (a.type == ActionType::MoveMouseRelative) {
                     const int dx = a.x + (inputTimeline.enabled ? 0 : RandomInt(a.randomX));
                     const int dy = a.y + (inputTimeline.enabled ? 0 : RandomInt(a.randomY));
-                    if (appSettings_.playback.autoOutputKeyFunctionDebug) {
-                        AppendDebugLog(FormatMoveMouseRelativeDebug(a, dx, dy));
+                    if (KeyFunctionDebugActive()) {
+                        AppendDeferredMoveRelDebug(a, dx, dy);
                     }
                     MarkSimulatedInput();
                     SendMouseMoveRelative(dx, dy);
@@ -12809,6 +13068,11 @@ private:
                         waitAbsoluteTimeline(0.0, a.timingUs);
                     } else if (a.duration > 0.0) {
                         waitAbsoluteTimeline(a.duration, 0);
+                    }
+                    if (KeyFunctionDebugActive()) {
+                        AppendDeferredWaitDebug(a,
+                            inputTimeline.enabled
+                                ? inputTimeline.precision.LastLatenessUs() : 0);
                     }
                 }
                 else if (a.type == ActionType::MouseDown) {
@@ -12844,15 +13108,28 @@ private:
                     }
                 }
                 else if (a.type == ActionType::KeyDown) {
-                    const bool markSim = !wmUsesTarget();
-                    if (markSim) MarkSimulatedInput();
-                    wmSendHeldModifiers(a, true);
-                    wmSendKey(a.keyVk, true);
-                    heldKeyVk = a.keyVk;
-                    heldKeys.insert(a.keyVk);
-                    if (markSim) UnmarkSimulatedInput();
+                    // 已按住再 KeyDown = 录制自动重复；精密回放跳过注入，避免向游戏灌重复 KEYDOWN
+                    if (inputTimeline.enabled && heldKeys.count(a.keyVk)) {
+                        if (KeyFunctionDebugActive()) {
+                            AppendDebugLog(FormatGenericActionDebug(a) + L" (已按住，跳过)");
+                        }
+                    } else {
+                        if (KeyFunctionDebugActive()) {
+                            AppendDebugLog(FormatGenericActionDebug(a));
+                        }
+                        const bool markSim = !wmUsesTarget();
+                        if (markSim) MarkSimulatedInput();
+                        wmSendHeldModifiers(a, true);
+                        wmSendKey(a.keyVk, true);
+                        heldKeyVk = a.keyVk;
+                        heldKeys.insert(a.keyVk);
+                        if (markSim) UnmarkSimulatedInput();
+                    }
                 }
                 else if (a.type == ActionType::KeyUp) {
+                    if (KeyFunctionDebugActive()) {
+                        AppendDebugLog(FormatGenericActionDebug(a));
+                    }
                     const bool markSim = !wmUsesTarget();
                     if (markSim) MarkSimulatedInput();
                     wmSendKey(a.keyVk, false);
@@ -13099,8 +13376,8 @@ private:
                             if (a.findImageFollowUp == 0) {
                                 wmSetPos(tx, ty, 0, 0);
                                 MarkSimulatedInput();
-                                if (wmUsesTarget()) wmExecPtr->PostMouseClickAtClient(tx, ty, MouseButtonType::Left);
-                                else wmMouseClick(tx, ty, MouseButtonType::Left);
+                                if (wmUsesTarget()) wmExecPtr->PostMouseClickAtClient(tx, ty, a.button);
+                                else wmMouseClick(tx, ty, a.button);
                                 UnmarkSimulatedInput();
                             } else if (a.findImageFollowUp == 1) {
                                 wmSetPos(tx, ty, 0, 0);
@@ -13306,6 +13583,10 @@ private:
                     CoordMeta nestedMeta = ScriptCoordMetaForExecution(nestedData.coordMeta);
                     std::vector<ScriptAction> nested =
                         PrepareScriptActionsForExecution(nestedData.actions, nestedMeta);
+                    if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(nested)
+                        || nestedData.inputTimingVersion > 0) {
+                        RepairCompressedRelativeGaps(nested);
+                    }
                     if (!usesOcr && ScriptUsesTextRecognition(nested)) {
                         usesOcr = true;
                         workerUsesOcrVars_ = true;
@@ -13318,6 +13599,13 @@ private:
                     if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
                     activeActions = &nested;
                     runningScriptPath = path;
+                    // 嵌套录制/精密轨迹：对齐时间轴原点，避免沿用外层已漂移的 elapsed
+                    if (inputTimeline.enabled
+                        && (IsRecordingScriptPath(path)
+                            || ScriptIsTimedInputSequence(nested)
+                            || nestedData.inputTimingVersion > 0)) {
+                        inputTimeline.Reset();
+                    }
                     runRange(0, nested.size());
                     activeActions = prevActions;
                     runningScriptPath = prevPath;
@@ -13370,6 +13658,10 @@ private:
                     CoordMeta nestedMeta = ScriptCoordMetaForExecution(nestedData.coordMeta);
                     std::vector<ScriptAction> nested =
                         PrepareScriptActionsForExecution(nestedData.actions, nestedMeta);
+                    if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(nested)
+                        || nestedData.inputTimingVersion > 0) {
+                        RepairCompressedRelativeGaps(nested);
+                    }
                     const std::vector<ScriptAction>* prevActions = activeActions;
                     const std::wstring prevPath = runningScriptPath;
                     const CoordMeta prevCoordMeta = activeCoordMeta;
@@ -13377,6 +13669,12 @@ private:
                     if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
                     activeActions = &nested;
                     runningScriptPath = path;
+                    if (inputTimeline.enabled
+                        && (IsRecordingScriptPath(path)
+                            || ScriptIsTimedInputSequence(nested)
+                            || nestedData.inputTimingVersion > 0)) {
+                        inputTimeline.Reset();
+                    }
                     runRange(0, nested.size());
                     activeActions = prevActions;
                     runningScriptPath = prevPath;
@@ -13750,10 +14048,13 @@ private:
             while (!stopFlag_) {
                 ++curLoops_;
                 inputTimeline.Reset();
+                timelineInterrupted = false;
+                // 每轮独立统计，避免「第2轮 SendInput ok=上轮累计」误导。
+                if (inputTimeline.enabled) MouseInputRouter::Instance().ResetStats();
                 aiSessions.ClearMacro();
                 aiRootBudget = AiStepBudgetState{};
                 aiCurFrame = nullptr;
-                if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                if (KeyFunctionDebugActive()) {
                     AppendDebugLog(FormatMacroLoopDebug(curLoops_));
                 }
                 matchVars_.clear();
@@ -13764,6 +14065,33 @@ private:
                 pendingGoto.reset();
                 loopEntryGotoTarget.reset();
                 runRange(0, actions.size());
+                if (inputTimeline.enabled && KeyFunctionDebugActive()) {
+                    const auto st = inputTimeline.precision.Stats();
+                    const auto ms = MouseInputRouter::Instance().Stats();
+                    wchar_t summary[400]{};
+                    swprintf_s(summary,
+                        L"[时间轴统计] waits=%llu late>1ms=%llu p95=%lluus max=%lluus | "
+                        L"SendInput ok=%llu fail=%llu paced=%llu | "
+                        L"ballistics=%s split=%s",
+                        static_cast<unsigned long long>(st.eventCount),
+                        static_cast<unsigned long long>(st.lateEventCount),
+                        static_cast<unsigned long long>(st.p95LateUs),
+                        static_cast<unsigned long long>(st.maxLateUs),
+                        static_cast<unsigned long long>(ms.sentEvents),
+                        static_cast<unsigned long long>(ms.failedEvents),
+                        static_cast<unsigned long long>(ms.pacedWaits),
+                        ballisticsGuard.FlatVerified() ? L"flat" : L"accel?",
+                        splitLargeMoves ? L"on" : L"off");
+                    AppendDebugLog(summary);
+                    if (timelineInterrupted || stopFlag_.load(std::memory_order_relaxed)) {
+                        AppendDebugLog(
+                            stopFlag_.load(std::memory_order_relaxed)
+                                ? L"[时间轴] 本轮未跑完：已停止"
+                                : L"[时间轴] 本轮未跑完：等待被跳出打断");
+                    }
+                    // 不在轮间 Flush：1744 行格式化会卡住工作线程数百 ms～数秒，
+                    // 多轮 FPS 回放时游戏状态已漂。完整日志在全部结束后一次刷出。
+                }
                 const auto& ps = appSettings_.playback;
                 if (ps.enablePlaybackCount && ps.playbackCount > 0 && curLoops_ >= ps.playbackCount) break;
                 if (stopFlag_) break;
@@ -13788,6 +14116,7 @@ private:
             clearLockedScreen();
             if (ocrSessionHeld) ReleaseOcrSession();
             if (wmCfg.enabled) wmExec.EndRun();
+            ForegroundInputRouter::Instance().EndSession();
             breakout_input::UninstallBreakoutHooks();
             workerUsesOcrVars_ = false;
             PostMessageW(hwnd_, WM_RUN_DONE, 0, 0);
@@ -13807,17 +14136,14 @@ private:
         for (UINT vk : modKeys) {
             if (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) SendKey(vk, false);
         }
-        struct { int vk; DWORD flag; } mouseBtns[] = {
-            { VK_LBUTTON, MOUSEEVENTF_LEFTUP },
-            { VK_RBUTTON, MOUSEEVENTF_RIGHTUP },
-            { VK_MBUTTON, MOUSEEVENTF_MIDDLEUP },
+        struct { int vk; MouseButtonType button; } mouseBtns[] = {
+            { VK_LBUTTON, MouseButtonType::Left },
+            { VK_RBUTTON, MouseButtonType::Right },
+            { VK_MBUTTON, MouseButtonType::Middle },
         };
         for (const auto& btn : mouseBtns) {
             if (GetAsyncKeyState(btn.vk) & 0x8000) {
-                INPUT input{};
-                input.type = INPUT_MOUSE;
-                input.mi.dwFlags = btn.flag;
-                SendInput(1, &input, sizeof(INPUT));
+                MouseButtonEvent(btn.button, false);
             }
         }
         if (running_) UnmarkSimulatedInput();
@@ -13920,6 +14246,7 @@ private:
     void OnRunDone() {
         running_ = false;
         extRunPending_ = false;
+        ForegroundInputRouter::Instance().EndSession();
         ResumeHotkeysAfterPlayback();
         {
             std::lock_guard<std::mutex> lock(extScriptStateMu_);
@@ -14267,6 +14594,9 @@ private:
             : (recorderSettings_.inputMode == quickscript::RecorderInputMode::FpsRelative
                 ? RecordingCaptureMode::Relative : RecordingCaptureMode::Auto);
         SetRecordingCaptureMode(requestedMode);
+        SetRecordingClickCaptureConfig(
+            appSettings_.playback.recordingClickCaptureEnabled,
+            appSettings_.playback.recordingClickCaptureHalfSize);
         BeginHighResTimer();
         if (!InstallRecordingHooks()) {
             UninstallRecordingHooks();
@@ -14278,6 +14608,22 @@ private:
             return;
         }
         InitRecordingClock();
+        ClearRecordingDebugStats();
+        if (appSettings_.playback.enableDebugOutputWindow
+            && appSettings_.playback.autoOutputKeyFunctionDebug) {
+            ShowDebugWindow();
+            macroDebugWindow_.ClearLog();
+            SetRecordingDebugSink([this](const std::wstring& line) {
+                if (macroDebugWindow_.IsCreated()) macroDebugWindow_.AppendLog(line);
+            });
+            const wchar_t* modeName =
+                requestedMode == RecordingCaptureMode::Relative ? L"FPS相对"
+                : (requestedMode == RecordingCaptureMode::Absolute ? L"桌面绝对" : L"自动");
+            macroDebugWindow_.AppendLog(
+                std::wstring(L"开始键鼠录制 模式=") + modeName);
+        } else {
+            SetRecordingDebugSink({});
+        }
         {
             std::lock_guard<std::mutex> lock(g_recordMutex);
             g_recordedEvents.clear();
@@ -14315,11 +14661,41 @@ private:
         // 先卸钩并冲刷 Raw 累计（此时仍保持 g_recording，避免丢最后一段相对位移）
         UninstallRecordingHooks();
         g_recording = false;
+        SetRecordingDebugSink({});
+        FlushClickCaptures(3000);
         EndHighResTimer();
         RemoveTray();
         HideStatusTip();
         if (appSettings_.other.autoHideMainWindow && recordingWasVisible_) ShowWindow(hwnd_, SW_SHOW);
         ConvertRecordedToActions();
+        if (appSettings_.playback.enableDebugOutputWindow
+            && appSettings_.playback.autoOutputKeyFunctionDebug
+            && macroDebugWindow_.IsCreated()) {
+            const auto st = GetRecordingDebugStats();
+            wchar_t summary[320]{};
+            swprintf_s(summary,
+                L"[录制结束] 时长=%.3fs 动作=%zu | "
+                L"键↓%llu ↑%llu 跳过重复%llu | 鼠↓%llu ↑%llu 滚轮%llu | "
+                L"绝对移动%llu 相对移动%llu",
+                saveDurationSeconds_,
+                actions_.size(),
+                static_cast<unsigned long long>(st.keyDown),
+                static_cast<unsigned long long>(st.keyUp),
+                static_cast<unsigned long long>(st.keyRepeatSkipped),
+                static_cast<unsigned long long>(st.mouseDown),
+                static_cast<unsigned long long>(st.mouseUp),
+                static_cast<unsigned long long>(st.wheel),
+                static_cast<unsigned long long>(st.absMove),
+                static_cast<unsigned long long>(st.relMove));
+            macroDebugWindow_.AppendLog(summary);
+            std::vector<std::wstring> lines;
+            lines.reserve(actions_.size());
+            for (size_t i = 0; i < actions_.size(); ++i) {
+                actions_[i].originalNo = static_cast<int>(i + 1);
+                lines.push_back(FormatGenericActionDebug(actions_[i]));
+            }
+            if (!lines.empty()) macroDebugWindow_.AppendLogBatch(lines);
+        }
         if (!actions_.empty()) {
             SaveRecording();
         } else {
@@ -14339,17 +14715,26 @@ private:
         actions_ = std::move(converted.actions);
         saveDurationSeconds_ = converted.durationSeconds;
         currentRecordingCaptureMode_ = static_cast<int>(recorderSettings_.inputMode);
-        currentInputTimingVersion_ = 1;
+        currentInputTimingVersion_ = kInputTimingVersionExplicitWaits;
     }
 
     void SaveRecording() {
         EnsureScriptsDir();
-        std::wstring name = L"鼠标录制-" + TimestampName();
+        const std::wstring baseName = L"鼠标录制-" + TimestampName();
+        std::wstring name = baseName;
         std::wstring path = RecordingsDir() + L"\\" + name + L".json";
+        for (int suffix = 1; GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++suffix) {
+            name = baseName + L"-" + std::to_wstring(suffix);
+            path = RecordingsDir() + L"\\" + name + L".json";
+        }
         currentPath_ = path;
         currentRecordTime_ = NowText();
         SetText(name_, name);
+        // 录制保存不得沿用「宏编辑」残留的 currentScriptIndex_/热键（否则会出现同名感 + 误带 J 长按）
+        currentScriptIndex_ = -1;
+        saveHotkeyOverride_ = Hotkey{0, 0, L"", false};
         SaveScriptFile(path);
+        saveHotkeyOverride_.reset();
         saveDurationSeconds_ = 0;
         RefreshRunBlockCombo();
         LoadRecordings();
@@ -15986,9 +16371,133 @@ private:
     }
     LRESULT OnEditColor(HDC hdc) { SetBkMode(hdc, OPAQUE); SetTextColor(hdc, kText); SetBkColor(hdc, kWhite); return reinterpret_cast<LRESULT>(whiteBrush_); }
 
+    bool KeyFunctionDebugActive() const {
+        return appSettings_.playback.autoOutputKeyFunctionDebug
+            && macroDebugWindow_.IsCreated();
+    }
+
+    void ClearDeferredDebugLog() {
+        std::lock_guard<std::mutex> lock(deferredDebugMutex_);
+        deferredDebugRecs_.clear();
+        deferredDebugTexts_.clear();
+    }
+
+    void FlushDeferredDebugLog() {
+        std::vector<DeferredDbgRec> recs;
+        std::vector<std::wstring> texts;
+        {
+            std::lock_guard<std::mutex> lock(deferredDebugMutex_);
+            recs.swap(deferredDebugRecs_);
+            texts.swap(deferredDebugTexts_);
+        }
+        if (recs.empty() || !macroDebugWindow_.IsCreated()) return;
+        std::vector<std::wstring> batch;
+        batch.reserve(recs.size());
+        for (const auto& r : recs) {
+            switch (r.kind) {
+            case DeferredDbgKind::Line:
+                if (r.textIdx < texts.size()) batch.push_back(texts[r.textIdx]);
+                break;
+            case DeferredDbgKind::Wait: {
+                ScriptAction tmp{};
+                tmp.type = ActionType::Wait;
+                tmp.originalNo = r.no;
+                tmp.duration = r.duration;
+                tmp.randomDuration = r.randomDuration;
+                std::wstring line = FormatGenericActionDebug(tmp);
+                wchar_t suf[48]{};
+                swprintf_s(suf, L" late=%lluus",
+                    static_cast<unsigned long long>(r.lateUs));
+                line += suf;
+                batch.push_back(std::move(line));
+                break;
+            }
+            case DeferredDbgKind::MoveRel: {
+                ScriptAction tmp{};
+                tmp.type = ActionType::MoveMouseRelative;
+                tmp.originalNo = r.no;
+                batch.push_back(FormatMoveMouseRelativeDebug(tmp, r.x, r.y));
+                break;
+            }
+            case DeferredDbgKind::MoveAbs: {
+                ScriptAction tmp{};
+                tmp.type = ActionType::MoveMouse;
+                tmp.originalNo = r.no;
+                batch.push_back(FormatMoveMouseDebug(tmp, r.x, r.y));
+                break;
+            }
+            }
+        }
+        if (!batch.empty()) macroDebugWindow_.AppendLogBatch(batch);
+    }
+
+    void PushDeferredDebugLine(std::wstring text) {
+        std::lock_guard<std::mutex> lock(deferredDebugMutex_);
+        DeferredDbgRec rec{};
+        rec.kind = DeferredDbgKind::Line;
+        rec.textIdx = deferredDebugTexts_.size();
+        deferredDebugTexts_.push_back(std::move(text));
+        deferredDebugRecs_.push_back(rec);
+    }
+
     void AppendDebugLog(const std::wstring& text) {
-        if (!appSettings_.playback.autoOutputKeyFunctionDebug || !macroDebugWindow_.IsCreated()) return;
+        if (!KeyFunctionDebugActive()) return;
+        if (deferPlaybackDebugUi_.load(std::memory_order_relaxed)) {
+            PushDeferredDebugLine(text);
+            return;
+        }
         macroDebugWindow_.AppendLog(text);
+    }
+
+    void AppendDeferredWaitDebug(const ScriptAction& a, uint64_t lateUs) {
+        if (!KeyFunctionDebugActive()) return;
+        if (!deferPlaybackDebugUi_.load(std::memory_order_relaxed)) {
+            std::wstring line = FormatGenericActionDebug(a);
+            wchar_t suf[48]{};
+            swprintf_s(suf, L" late=%lluus",
+                static_cast<unsigned long long>(lateUs));
+            line += suf;
+            macroDebugWindow_.AppendLog(line);
+            return;
+        }
+        DeferredDbgRec rec{};
+        rec.kind = DeferredDbgKind::Wait;
+        rec.no = ActionDebugIndex(a);
+        rec.duration = a.duration;
+        rec.randomDuration = a.randomDuration;
+        rec.lateUs = lateUs;
+        std::lock_guard<std::mutex> lock(deferredDebugMutex_);
+        deferredDebugRecs_.push_back(rec);
+    }
+
+    void AppendDeferredMoveRelDebug(const ScriptAction& a, int dx, int dy) {
+        if (!KeyFunctionDebugActive()) return;
+        if (!deferPlaybackDebugUi_.load(std::memory_order_relaxed)) {
+            macroDebugWindow_.AppendLog(FormatMoveMouseRelativeDebug(a, dx, dy));
+            return;
+        }
+        DeferredDbgRec rec{};
+        rec.kind = DeferredDbgKind::MoveRel;
+        rec.no = ActionDebugIndex(a);
+        rec.x = dx;
+        rec.y = dy;
+        std::lock_guard<std::mutex> lock(deferredDebugMutex_);
+        deferredDebugRecs_.push_back(rec);
+    }
+
+    void AppendDeferredMoveAbsDebug(const ScriptAction& a, int x, int y) {
+        if (!KeyFunctionDebugActive()) return;
+        if (!deferPlaybackDebugUi_.load(std::memory_order_relaxed)) {
+            macroDebugWindow_.AppendLog(FormatMoveMouseDebug(a, x, y));
+            return;
+        }
+        DeferredDbgRec rec{};
+        rec.kind = DeferredDbgKind::MoveAbs;
+        rec.no = ActionDebugIndex(a);
+        rec.x = x;
+        rec.y = y;
+        std::lock_guard<std::mutex> lock(deferredDebugMutex_);
+        deferredDebugRecs_.push_back(rec);
     }
 
     void AppendBreakoutDebugLog(const std::wstring& text) {
@@ -16220,6 +16729,8 @@ private:
             recording_ = false;
             UninstallRecordingHooks();
             g_recording = false;
+            SetRecordingDebugSink({});
+            DiscardClickCaptures();
             EndHighResTimer();
         }
     }
@@ -16227,7 +16738,7 @@ private:
     HWND hwnd_ = nullptr; HMONITOR lastUiMonitor_ = nullptr; int lastUiScreenW_ = 0; int lastUiScreenH_ = 0;
     int lastUiScalePercent_ = 100; int displaySyncPass_ = 0;
     HFONT font_ = nullptr; HFONT editorFont_ = nullptr; HFONT bigFont_ = nullptr; HFONT titleFont_ = nullptr; HFONT hotFont_ = nullptr; HFONT closeFont_ = nullptr; HFONT homeFont_ = nullptr; HFONT homeTabFont_ = nullptr; HBRUSH whiteBrush_ = nullptr; HBRUSH panelBrush_ = nullptr; HBRUSH lineGreenBrush_ = nullptr;
-    HWND labelMacro_ = nullptr; HWND name_ = nullptr; HWND labelBreakoutTime_ = nullptr; HWND breakoutTimeEdit_ = nullptr; HWND mode_ = nullptr; HWND labelList_ = nullptr; HWND labelBatchCount_ = nullptr; HWND actionCombo_ = nullptr; HWND addBtn_ = nullptr; HWND modifyBtn_ = nullptr; HWND clearBtn_ = nullptr; HWND loadBtn_ = nullptr;
+    HWND labelMacro_ = nullptr; HWND name_ = nullptr; HWND labelBreakoutTime_ = nullptr; HWND breakoutTimeEdit_ = nullptr; HWND mode_ = nullptr; HWND labelList_ = nullptr; HWND labelBatchCount_ = nullptr; HWND actionCombo_ = nullptr; HWND addBtn_ = nullptr; HWND modifyBtn_ = nullptr; HWND clearBtn_ = nullptr; HWND loadBtn_ = nullptr; HWND convertToFindImageBtn_ = nullptr;
     HWND batchExitBtn_ = nullptr; HWND batchSelectAllBtn_ = nullptr; HWND batchDeselectBtn_ = nullptr; HWND batchDeleteBtn_ = nullptr; HWND batchCopyBtn_ = nullptr;
     HWND cancelBtn_ = nullptr; HWND saveBtn_ = nullptr; HWND crosshairBtn_ = nullptr; HWND paramViewport_ = nullptr; HWND paramTopMask_ = nullptr; HWND paramBottomMask_ = nullptr; HWND paramRightMask_ = nullptr;
     HWND runProgramCombo_ = nullptr; HWND runProgramPath_ = nullptr; HWND runProgramBrowseBtn_ = nullptr; HWND runProgramOrLabel_ = nullptr; HWND runProgramCrosshairBtn_ = nullptr; HWND runProgramArgs_ = nullptr;
@@ -16385,6 +16896,22 @@ private:
     bool hiddenToTray_ = false;
     int clickCountDone_ = 0;
     MacroDebugWindow macroDebugWindow_;
+    /// 精密时间轴回放：调试行写入内存，轮次结束后再刷窗
+    std::atomic<bool> deferPlaybackDebugUi_{false};
+    std::mutex deferredDebugMutex_;
+    enum class DeferredDbgKind : uint8_t { Line, Wait, MoveRel, MoveAbs };
+    struct DeferredDbgRec {
+        DeferredDbgKind kind = DeferredDbgKind::Line;
+        int no = 0;
+        int x = 0;
+        int y = 0;
+        double duration = 0;
+        double randomDuration = 0;
+        uint64_t lateUs = 0;
+        size_t textIdx = SIZE_MAX;
+    };
+    std::vector<DeferredDbgRec> deferredDebugRecs_;
+    std::vector<std::wstring> deferredDebugTexts_;
     HWND statusTipWindow_ = nullptr;
     PopupCombo popupMode_, popupWmSelectMethod_, popupAction_, popupMouseBtn_, popupClickBtn_, popupLoopType_, popupRunBlock_, popupHotkeyShortcut_, popupQuickInputVar_, popupRunMacro_, popupMousePlayback_, popupScrollDir_, popupFindFollowUp_, popupOcrResultMode_, popupOcrFollowUp_, popupOcrSearchVar_, popupIfVar_, popupIfOperator_, popupIfConnector_, popupRunProgram_, popupAiModel_, popupAiContextMode_, popupAiOutputType_, popupAiSearchRegion_;
     std::vector<QuickInputVarItem> quickInputVarItems_;
@@ -16406,6 +16933,7 @@ private:
     RECT findRegionSavedRect_{};
     std::unique_ptr<MatchOverlay> matchOverlay_;
     std::unique_ptr<OcrOverlay> ocrOverlay_;
+    std::unique_ptr<FindImageCropEditor> findImageCropEditor_;
     std::unique_ptr<ScreenshotOverlay> screenshotOverlay_;
     std::vector<std::unique_ptr<AgentDialog>> agentDialogs_;
     std::unique_ptr<SettingsDialog> settingsDialog_;

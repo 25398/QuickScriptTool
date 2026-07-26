@@ -188,11 +188,25 @@ void MacroDebugWindow::CloseByUser() {
 
 void MacroDebugWindow::AppendLog(const std::wstring& text) {
     if (!hwnd_) return;
+    bool needPost = false;
     {
         std::lock_guard<std::mutex> lock(logMutex_);
+        // 已有待刷日志时只入队，避免洪水 PostMessage 拖垮 UI/调度。
+        needPost = pendingLogs_.empty();
         pendingLogs_.push_back(text);
     }
-    PostMessageW(hwnd_, WM_DEBUG_APPEND, 0, 0);
+    if (needPost) PostMessageW(hwnd_, WM_DEBUG_APPEND, 0, 0);
+}
+
+void MacroDebugWindow::AppendLogBatch(const std::vector<std::wstring>& lines) {
+    if (!hwnd_ || lines.empty()) return;
+    bool needPost = false;
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        needPost = pendingLogs_.empty();
+        pendingLogs_.insert(pendingLogs_.end(), lines.begin(), lines.end());
+    }
+    if (needPost) PostMessageW(hwnd_, WM_DEBUG_APPEND, 0, 0);
 }
 
 void MacroDebugWindow::ClearLog() {
@@ -230,13 +244,23 @@ void MacroDebugWindow::FlushPendingLogs() {
         batch.swap(pendingLogs_);
         epoch = clearEpoch_;
     }
-    for (const auto& line : batch) {
-        {
-            std::lock_guard<std::mutex> lock(logMutex_);
-            if (clearEpoch_ != epoch) return;
-        }
-        AppendLogDirect(line);
+    if (batch.empty() || !edit_) return;
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        if (clearEpoch_ != epoch) return;
     }
+    // 多行合并为一次 EM_REPLACESEL，避免千次 Edit 更新卡 UI。
+    size_t totalChars = 0;
+    for (const auto& line : batch) totalChars += line.size() + 2;
+    std::wstring blob;
+    blob.reserve(totalChars);
+    for (const auto& line : batch) {
+        blob.append(line);
+        blob.append(L"\r\n");
+    }
+    const int len = GetWindowTextLengthW(edit_);
+    SendMessageW(edit_, EM_SETSEL, len, len);
+    SendMessageW(edit_, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(blob.c_str()));
 }
 
 void MacroDebugWindow::ApplyTopmost() {

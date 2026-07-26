@@ -4,6 +4,7 @@
 #include "action_utils.h"
 #include "coord_space.h"
 #include "drawing.h"
+#include "recorder_timeline.h"
 #include "render_context.h"
 #include "modern_edit.h"
 #include "script_io.h"
@@ -61,12 +62,14 @@ double ParseEditDouble(HWND edit, double fallback) {
 }
 
 constexpr const wchar_t* kSchemeItems[] = {
-    L"批量删除", L"等待时间调整", L"鼠标移动合并", L"鼠标移动压缩"};
+    L"批量删除", L"等待时间调整", L"鼠标移动合并", L"鼠标移动压缩", L"转为找图点击"};
 constexpr const wchar_t* kFilterItems[] = {
     L"全部", L"小于", L"小于等于", L"大于", L"大于等于", L"等于", L"不等于"};
+constexpr const wchar_t* kFindWaitModes[] = {
+    L"只找一次", L"直到找到再点击", L"最多找"};
 
 std::vector<std::wstring> SchemeItemStrings() {
-    return {kSchemeItems[0], kSchemeItems[1], kSchemeItems[2], kSchemeItems[3]};
+    return {kSchemeItems[0], kSchemeItems[1], kSchemeItems[2], kSchemeItems[3], kSchemeItems[4]};
 }
 
 std::vector<std::wstring> FilterItemStrings() {
@@ -100,6 +103,11 @@ RecordingOptimizeDialog::Result RecordingOptimizeDialog::Show(HWND owner, const 
     originalDuration_ = 0;
     currentDuration_ = 0;
     anchorIndex_ = 0;
+    convertResultText_.clear();
+    sourceRecordingCaptureMode_ = -1;
+    sourceInputTimingVersion_ = 0;
+    sourceCoordMeta_ = StandardScriptCoordMeta();
+    sourceBreakoutTimeSeconds_ = 0;
 
     static bool registered = false;
     const wchar_t* clsName = L"QuickScriptRecordingOptimizeDlg";
@@ -394,7 +402,8 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             if (optimizeScheme_ == 0) ApplyBatchDelete();
             else if (optimizeScheme_ == 1) ApplyWaitAdjust();
             else if (optimizeScheme_ == 2) ApplyMoveMerge();
-            else ApplyMoveCompress();
+            else if (optimizeScheme_ == 3) ApplyMoveCompress();
+            else ApplyConvertToFindImage();
             return 0;
         }
         const RECT prevBtn = PrevKeyBtnRect();
@@ -425,7 +434,8 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 L"选择从当前选择项到最前", L"选择从当前选择项到最后",
                 L"选择从当前选择项到下一关键操作间操作",
                 L"选择从当前选择项到上一关键操作间操作",
-                L"选择从当前已选两项间操作", L"清空选择", L"全选"});
+                L"选择从当前已选两项间操作", L"清空选择", L"全选",
+                L"选择可转找图的点击"});
             return 0;
         }
         const RECT panel = RightPanelRect();
@@ -458,6 +468,16 @@ LRESULT RecordingOptimizeDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 protectKeyOps_ = !protectKeyOps_;
                 InvalidatePanelArea();
                 return 0;
+            }
+        }
+        if (optimizeScheme_ == 4) {
+            for (int i = 0; i < 3; ++i) {
+                if (PtInRect(FindWaitRadioRect(i), x, y)) {
+                    findWaitMode_ = i;
+                    UpdatePanelControls();
+                    InvalidatePanelArea();
+                    return 0;
+                }
             }
         }
         if (optimizeScheme_ == 2) {
@@ -570,6 +590,10 @@ bool RecordingOptimizeDialog::HitClickableControl(int x, int y) const {
                 panel.left + S(kMargin) + S(kRadioSize), rowTop + (S(kRadioRowH) + S(kRadioSize)) / 2};
             if (PtInRect(radio, x, y)) return true;
         }
+    } else if (optimizeScheme_ == 4) {
+        for (int i = 0; i < 3; ++i) {
+            if (PtInRect(FindWaitRadioRect(i), x, y)) return true;
+        }
     }
     // 列表：整行可点选，但手型仅勾选框
     const int row = HitListRow(x, y);
@@ -642,8 +666,9 @@ COLORREF RecordingOptimizeDialog::RowBackgroundAt(int index) const {
 std::wstring RecordingOptimizeDialog::ActionDisplayText(const ScriptAction& action) const {
     switch (action.type) {
     case ActionType::Wait: {
-        const int ms = static_cast<int>(action.duration * 1000.0 + 0.5);
-        return L"等待:" + F3(action.duration) + L"秒(" + std::to_wstring(ms) + L"毫秒)";
+        const double sec = ActionStepUs(action) / 1000000.0;
+        const int ms = static_cast<int>(sec * 1000.0 + 0.5);
+        return L"等待:" + F3(sec) + L"秒(" + std::to_wstring(ms) + L"毫秒)";
     }
     case ActionType::MoveMouse:
         return L"鼠标移动到位置(" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y) + L")";
@@ -660,7 +685,10 @@ std::wstring RecordingOptimizeDialog::ActionDisplayText(const ScriptAction& acti
 
 double RecordingOptimizeDialog::ComputeDuration(const std::vector<ScriptAction>& actions) const {
     double total = 0;
-    for (const auto& a : actions) if (a.type == ActionType::Wait) total += a.duration;
+    for (const auto& a : actions) {
+        if (a.type != ActionType::Wait) continue;
+        total += ActionStepUs(a) / 1000000.0;
+    }
     return total;
 }
 
@@ -708,6 +736,13 @@ void RecordingOptimizeDialog::BeginProgressiveLoad() {
     } else {
         loadCoordMeta_ = StandardScriptCoordMeta();
     }
+    sourceRecordingCaptureMode_ = static_cast<int>(
+        ExtractNumber(content, L"recordingCaptureMode", -1));
+    sourceInputTimingVersion_ = std::max(0, static_cast<int>(
+        ExtractNumber(content, L"inputTimingVersion", 0)));
+    sourceBreakoutTimeSeconds_ = NormalizeBreakoutTimeSeconds(
+        ExtractNumber(content, L"breakoutTimeSeconds", 0));
+    sourceCoordMeta_ = loadCoordsNormalized_ ? loadCoordMeta_ : StandardScriptCoordMeta();
 
     actionBlocks_ = ExtractJsonActionBlocks(content);
     const int n = static_cast<int>(actionBlocks_.size());
@@ -777,6 +812,18 @@ void RecordingOptimizeDialog::EnsureActionsParsed(int begin, int end) {
 void RecordingOptimizeDialog::EnsureFullyParsed() {
     EnsureActionsParsed(0, static_cast<int>(actions_.size()));
     actionBlocks_.clear();
+    if (sourceInputTimingVersion_ < kInputTimingVersionExplicitWaits) {
+        ExpandRecordingPreDelayPolicy policy{};
+        policy.treatAsRecordingTimeline = IsRecordingScriptPath(sourcePath_)
+            || sourceInputTimingVersion_ == 1;
+        actions_ = ExpandRecordingPreDelaysToExplicitWaits(actions_, policy);
+        sourceInputTimingVersion_ = kInputTimingVersionExplicitWaits;
+        selected_.assign(actions_.size(), false);
+        rowLabels_.assign(actions_.size(), {});
+        actionParsed_.assign(actions_.size(), 1);
+        originalActionCount_ = static_cast<int>(actions_.size());
+        UpdateStats();
+    }
 }
 
 void RecordingOptimizeDialog::ApplyLoadedActions(ScriptFileData&& fileData) {
@@ -785,6 +832,13 @@ void RecordingOptimizeDialog::ApplyLoadedActions(ScriptFileData&& fileData) {
     actionBlocks_.clear();
     actionParsed_.assign(actions_.size(), 1);
     hotkey_ = fileData.hotkey;
+    sourceRecordingCaptureMode_ = fileData.recordingCaptureMode;
+    sourceInputTimingVersion_ = fileData.inputTimingVersion;
+    sourceCoordMeta_ = fileData.coordMeta;
+    if (sourceCoordMeta_.refWidth <= 0 || sourceCoordMeta_.refHeight <= 0)
+        sourceCoordMeta_ = StandardScriptCoordMeta();
+    sourceBreakoutTimeSeconds_ = fileData.breakoutTimeSeconds;
+    convertResultText_.clear();
     originalActionCount_ = static_cast<int>(actions_.size());
     if (fileData.durationSeconds > 0.0) {
         originalDuration_ = fileData.durationSeconds;
@@ -1056,7 +1110,31 @@ void RecordingOptimizeDialog::UpdatePanelControls() {
         ShowWindow(thresholdEdit_, SW_SHOW);
         SetWindowPos(valueEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         SetWindowPos(thresholdEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    } else if (optimizeScheme_ == 4) {
+        // 第三档「最多找 N 秒」：输入框始终显示（不随单选隐藏），避免只留空白缝并挡住「秒」
+        const RECT editRc = FindWaitTimeEditRect();
+        PositionEditInBorderFrame(valueEdit_, editRc.left, editRc.top,
+            editRc.right - editRc.left, editRc.bottom - editRc.top);
+        wchar_t buf[64]{};
+        swprintf_s(buf, L"%.3g", findWaitSeconds_);
+        SetWindowTextW(valueEdit_, buf);
+        ShowWindow(valueEdit_, SW_SHOW);
+        SetWindowPos(valueEdit_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
+}
+
+void RecordingOptimizeDialog::RedrawVisibleEdits() {
+    // 无 WS_CLIPCHILDREN：父窗 BitBlt 会盖住子 Edit，需在绘制后强制重画
+    auto redraw = [](HWND h) {
+        if (h && IsWindowVisible(h)) {
+            RedrawWindow(h, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
+        }
+    };
+    redraw(nameEdit_);
+    redraw(valueEdit_);
+    redraw(thresholdEdit_);
+    redraw(mergeWaitEdit_);
 }
 
 void RecordingOptimizeDialog::CenterEditTextVertically(HWND edit) {
@@ -1114,6 +1192,7 @@ LRESULT RecordingOptimizeDialog::HandleDropPopup(UINT msg, WPARAM wp, LPARAM lp)
             else if (kind == PopupKind::QuickSelect) QuickSelect(idx);
             else if (kind == PopupKind::OptimizeScheme) {
                 optimizeScheme_ = idx;
+                convertResultText_.clear();
                 UpdatePanelControls();
                 InvalidatePanelArea();
             } else if (kind == PopupKind::WaitFilter) {
@@ -1291,6 +1370,36 @@ void RecordingOptimizeDialog::QuickSelect(int mode) {
     }
     case 5: std::fill(selected_.begin(), selected_.end(), false); break;
     case 6: std::fill(selected_.begin(), selected_.end(), true); break;
+    case 7: {
+        // 勾选可升级点击单元：Down/Up + 可删的前置绝对 Move（便于一并转找图）
+        EnsureFullyParsed();
+        std::fill(selected_.begin(), selected_.end(), false);
+        const int n = static_cast<int>(actions_.size());
+        for (int i = 0; i < n; ++i) {
+            if (actions_[static_cast<size_t>(i)].type != ActionType::MouseDown
+                && actions_[static_cast<size_t>(i)].type != ActionType::MouseClick) {
+                continue;
+            }
+            const auto probe = ProbeClickUnitFromDown(actions_, i, 0, n);
+            if (!probe.unit.ok) continue;
+            const auto& down = actions_[static_cast<size_t>(probe.unit.downIndex)];
+            if (down.recordedCapturePath.empty()) continue;
+            selected_[static_cast<size_t>(probe.unit.downIndex)] = true;
+            if (probe.unit.upIndex >= 0 && probe.unit.upIndex < n)
+                selected_[static_cast<size_t>(probe.unit.upIndex)] = true;
+            if (probe.unit.snapMoveIndex >= 0) {
+                for (int k = probe.unit.snapMoveIndex; k < probe.unit.downIndex; ++k) {
+                    if (actions_[static_cast<size_t>(k)].type == ActionType::MoveMouse)
+                        selected_[static_cast<size_t>(k)] = true;
+                }
+            }
+            for (int k = probe.unit.downIndex + 1; k < probe.unit.upIndex; ++k) {
+                if (actions_[static_cast<size_t>(k)].type == ActionType::MoveMouse)
+                    selected_[static_cast<size_t>(k)] = true;
+            }
+        }
+        break;
+    }
     default: break;
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1333,8 +1442,16 @@ void RecordingOptimizeDialog::ApplyWaitAdjust() {
     for (int i = 0; i < static_cast<int>(actions_.size()); ++i) {
         if (!selected_[static_cast<size_t>(i)]) continue;
         auto& a = actions_[static_cast<size_t>(i)];
-        if (a.type != ActionType::Wait || !WaitMatchesFilter(a.duration, compareVal)) continue;
+        if (a.type != ActionType::Wait || !WaitMatchesFilter(
+                ActionStepUs(a) / 1000000.0, compareVal)) continue;
         a.duration = waitAdjustValue_;
+        if (a.duration > 0.0) {
+            const long double us = static_cast<long double>(a.duration) * 1000000.0L;
+            a.timingUs = static_cast<uint64_t>(std::llround(us));
+        } else {
+            a.timingUs = 0;
+        }
+        a.randomDuration = 0.0;
         ++changed;
     }
     if (changed == 0) ShowAlert(L"没有符合条件的等待动作被调整。");
@@ -1357,7 +1474,7 @@ void RecordingOptimizeDialog::ApplyMoveMerge() {
     bool hasMove = false;
     for (int idx : range) {
         const auto& a = actions_[static_cast<size_t>(idx)];
-        if (a.type == ActionType::Wait) waits.push_back(a.duration);
+        if (a.type == ActionType::Wait) waits.push_back(ActionStepUs(a) / 1000000.0);
         else if (a.type == ActionType::MoveMouse) { lastMove = a; hasMove = true; }
     }
     if (!hasMove) { ShowAlert(L"选中范围内没有鼠标移动动作。"); return; }
@@ -1368,8 +1485,20 @@ void RecordingOptimizeDialog::ApplyMoveMerge() {
     else if (mergeWaitMode_ == 2) mergedWait = waits.empty() ? 0 : waits.front();
     else if (mergeWaitMode_ == 3) mergedWait = waits.empty() ? 0 : waits.back();
     else mergedWait = mergeWaitValue_;
+    lastMove.duration = 0.0;
+    lastMove.timingUs = 0;
+    lastMove.randomDuration = 0.0;
     std::vector<ScriptAction> merged;
-    if (mergedWait > 0.0005) { ScriptAction wa{}; wa.type = ActionType::Wait; wa.duration = mergedWait; merged.push_back(wa); }
+    if (mergedWait > 0.0005) {
+        ScriptAction wa{};
+        wa.type = ActionType::Wait;
+        wa.duration = mergedWait;
+        if (wa.duration > 0.0) {
+            const long double us = static_cast<long double>(wa.duration) * 1000000.0L;
+            wa.timingUs = static_cast<uint64_t>(std::llround(us));
+        }
+        merged.push_back(wa);
+    }
     merged.push_back(lastMove);
     std::vector<ScriptAction> result;
     for (int i = 0; i < range.front(); ++i) result.push_back(actions_[static_cast<size_t>(i)]);
@@ -1397,24 +1526,73 @@ void RecordingOptimizeDialog::ApplyMoveCompress() {
     const auto range = ContiguousSelectedRange();
     struct Point { int x; int y; };
     std::vector<Point> points;
+    std::vector<uint64_t> gapBefore;
+    uint64_t pending = 0;
+    bool seenMove = false;
     for (int idx : range) {
         const auto& a = actions_[static_cast<size_t>(idx)];
-        if (a.type == ActionType::MoveMouse) points.push_back({a.x, a.y});
+        if (a.type == ActionType::Wait) {
+            if (seenMove) pending += ActionStepUs(a);
+            continue;
+        }
+        if (a.type == ActionType::MoveMouse) {
+            if (!seenMove) {
+                seenMove = true;
+                points.push_back({a.x, a.y});
+                pending = ActionStepUs(a);
+            } else {
+                gapBefore.push_back(pending + ActionStepUs(a));
+                pending = 0;
+                points.push_back({a.x, a.y});
+            }
+        }
     }
     if (points.size() < 2) { ShowAlert(L"选中范围内至少需要两个鼠标移动点。"); return; }
     auto dist = [](const Point& a, const Point& b) {
         const double dx = static_cast<double>(a.x - b.x), dy = static_cast<double>(a.y - b.y);
         return std::sqrt(dx * dx + dy * dy);
     };
-    std::vector<Point> compressed{points.front()};
+    std::vector<Point> compressed;
+    std::vector<uint64_t> compressedGaps;
+    compressed.push_back(points.front());
+    size_t lastKept = 0;
     for (size_t i = 1; i + 1 < points.size(); ++i) {
-        if (dist(compressed.back(), points[i]) >= compressThreshold_) compressed.push_back(points[i]);
+        if (dist(compressed.back(), points[i]) < compressThreshold_) continue;
+        uint64_t gapSum = 0;
+        for (size_t g = lastKept; g < i; ++g) gapSum += gapBefore[g];
+        compressedGaps.push_back(gapSum);
+        compressed.push_back(points[i]);
+        lastKept = i;
     }
-    if (compressed.back().x != points.back().x || compressed.back().y != points.back().y) compressed.push_back(points.back());
+    {
+        uint64_t gapSum = 0;
+        for (size_t g = lastKept; g < gapBefore.size(); ++g) gapSum += gapBefore[g];
+        if (compressed.back().x != points.back().x || compressed.back().y != points.back().y) {
+            compressedGaps.push_back(gapSum);
+            compressed.push_back(points.back());
+        }
+    }
     std::vector<ScriptAction> replacement;
     for (size_t i = 0; i < compressed.size(); ++i) {
-        if (i > 0) { ScriptAction wa{}; wa.type = ActionType::Wait; wa.duration = compressWait_; replacement.push_back(wa); }
-        ScriptAction mv{}; mv.type = ActionType::MoveMouse; mv.x = compressed[i].x; mv.y = compressed[i].y;
+        if (i > 0) {
+            const uint64_t gap = (i - 1 < compressedGaps.size()) ? compressedGaps[i - 1] : 0;
+            if (gap > 0) {
+                replacement.push_back(MakeExplicitWaitUs(gap));
+            } else if (compressWait_ > 0.0005) {
+                ScriptAction wa{};
+                wa.type = ActionType::Wait;
+                wa.duration = compressWait_;
+                const long double us = static_cast<long double>(wa.duration) * 1000000.0L;
+                wa.timingUs = static_cast<uint64_t>(std::llround(us));
+                replacement.push_back(wa);
+            }
+        }
+        ScriptAction mv{};
+        mv.type = ActionType::MoveMouse;
+        mv.x = compressed[i].x;
+        mv.y = compressed[i].y;
+        mv.duration = 0.0;
+        mv.timingUs = 0;
         replacement.push_back(mv);
     }
     std::vector<ScriptAction> result;
@@ -1426,6 +1604,79 @@ void RecordingOptimizeDialog::ApplyMoveCompress() {
     for (int i = 0; i < static_cast<int>(replacement.size()); ++i)
         selected_[static_cast<size_t>(range.front() + i)] = true;
     ApplyActionChange();
+}
+
+void RecordingOptimizeDialog::ApplyConvertToFindImage() {
+    if (SelectedCount() == 0) {
+        ShowAlert(L"请先选择要转为找图点击的动作（可用「快速选择 → 选择可转找图的点击」；"
+            L"需一并勾选要删除的前置「移动鼠标」）。");
+        return;
+    }
+    EnsureFullyParsed();
+    std::vector<char> sel;
+    sel.reserve(selected_.size());
+    for (bool b : selected_) sel.push_back(b ? 1 : 0);
+    ConvertToFindImageOptions options{};
+    options.requireCapturePath = true;
+    // 「最多找」输入框在方案 4 下始终可见，Apply 前同步秒数
+    if (IsWindowVisible(valueEdit_)) {
+        findWaitSeconds_ = ParseEditDouble(valueEdit_, findWaitSeconds_);
+        if (findWaitSeconds_ < 0.0) findWaitSeconds_ = 0.0;
+    }
+    options.findTimeExpr = ResolveConvertFindTimeExpr();
+    const ConvertToFindImageResult result =
+        ConvertActionsToFindImageSelected(actions_, sel, options);
+    convertResultText_ = result.detail.empty()
+        ? (L"成功 " + std::to_wstring(result.converted) + L"，跳过 "
+            + std::to_wstring(result.skipped)
+            + (result.converted > 0
+                ? L"。保存后请在编辑器对模板「预览」裁切特征区。"
+                : L""))
+        : result.detail;
+    selected_.assign(actions_.size(), false);
+    ApplyActionChange();
+    InvalidatePanelArea();
+}
+
+std::wstring RecordingOptimizeDialog::ResolveConvertFindTimeExpr() const {
+    if (findWaitMode_ == 1) return L"-1";
+    if (findWaitMode_ == 2) {
+        if (findWaitSeconds_ < 0.0) return L"-1";
+        if (findWaitSeconds_ <= 0.0) return L"0";
+        wchar_t buf[64]{};
+        swprintf_s(buf, L"%.6g", findWaitSeconds_);
+        return buf;
+    }
+    return L"0";
+}
+
+RECT RecordingOptimizeDialog::FindWaitRadioRect(int mode) const {
+    const RECT panel = RightPanelRect();
+    // 说明区约占 88px，其下为「找图等待」标题 + 三档单选
+    const int rowTop = panel.top + S(kPanelContentTop) + S(88) + S(28) + mode * S(kRadioRowH);
+    return RECT{panel.left + S(kMargin), rowTop + (S(kRadioRowH) - S(kRadioSize)) / 2,
+        panel.left + S(kMargin) + S(kRadioSize), rowTop + (S(kRadioRowH) + S(kRadioSize)) / 2};
+}
+
+RECT RecordingOptimizeDialog::FindWaitTimeEditRect() const {
+    const RECT panel = RightPanelRect();
+    const int rowTop = panel.top + S(kPanelContentTop) + S(88) + S(28) + 2 * S(kRadioRowH);
+    const int editTop = rowTop + (S(kRadioRowH) - S(kEditH)) / 2;
+    const int labelLeft = panel.left + S(kMargin) + S(kRadioSize) + S(8);
+    int labelW = S(72);  // 兜底：「最多找」三字
+    if (bodyFont_) {
+        HDC hdc = GetDC(nullptr);
+        if (hdc) {
+            HGDIOBJ old = SelectObject(hdc, bodyFont_);
+            SIZE sz{};
+            GetTextExtentPoint32W(hdc, L"最多找", 3, &sz);
+            SelectObject(hdc, old);
+            ReleaseDC(nullptr, hdc);
+            if (sz.cx > 0) labelW = sz.cx;
+        }
+    }
+    const int editLeft = labelLeft + labelW + S(8);
+    return RECT{editLeft, editTop, editLeft + S(kEditW), editTop + S(kEditH)};
 }
 
 void RecordingOptimizeDialog::ShowAlert(const wchar_t* message) {
@@ -1450,7 +1701,10 @@ bool RecordingOptimizeDialog::SaveToNewRecording() {
     if (data.durationSeconds <= 0.0) data.durationSeconds = currentDuration_;
     data.hotkey = hotkey_;
     data.windowMode = windowmode::DefaultWindowModeConfig();
-    data.breakoutTimeSeconds = 0;
+    data.recordingCaptureMode = sourceRecordingCaptureMode_;
+    data.inputTimingVersion = kInputTimingVersionExplicitWaits;
+    data.coordMeta = sourceCoordMeta_;
+    data.breakoutTimeSeconds = sourceBreakoutTimeSeconds_;
     data.actions = actions_;
     if (!SaveScriptFileData(path, data)) { ShowAlert(L"保存失败：无法写入文件，请检查磁盘空间和权限。"); return false; }
     savedPath_ = path;
@@ -1651,7 +1905,7 @@ void RecordingOptimizeDialog::PaintRightPanel(HDC hdc) {
         RECT hint{panel.left + S(kMargin), panel.bottom - S(108), panel.right - S(kMargin), panel.bottom - S(72)};
         DrawTextW(hdc, L"*本操作将合并已选择的等待移动操作为1个。并用选择的合并等待时间方式设置这个等待时间。", -1, &hint, DT_LEFT | DT_WORDBREAK);
         DrawGreenButton(hdc, applyBtn, L"开始合并", hoverApply_);
-    } else {
+    } else if (optimizeScheme_ == 3) {
         RECT waitLabel{panel.left + S(kMargin), panel.top + S(kPanelContentTop),
             panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(26)};
         DrawTextW(hdc, L"压缩后等待时间", -1, &waitLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1662,6 +1916,49 @@ void RecordingOptimizeDialog::PaintRightPanel(HDC hdc) {
             panel.right - S(kMargin), panel.top + S(kCompressThresholdLabelTop) + S(26)};
         DrawTextW(hdc, L"压缩阈值", -1, &thLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         DrawGreenButton(hdc, applyBtn, L"开始压缩", hoverApply_);
+    } else {
+        SelectObject(hdc, smallFont_);
+        SetTextColor(hdc, kHint);
+        RECT explain{panel.left + S(kMargin), panel.top + S(kPanelContentTop),
+            panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(84)};
+        DrawTextW(hdc,
+            L"将坐标点击升级为找图点击。拖拽过大、按住修饰键或无录制模板的点击会跳过。"
+            L"转换后请在编辑器对模板「预览」裁切特征区。",
+            -1, &explain, DT_LEFT | DT_WORDBREAK);
+        SelectObject(hdc, bodyFont_);
+        SetTextColor(hdc, kText);
+        RECT waitLabel{panel.left + S(kMargin), panel.top + S(kPanelContentTop) + S(88),
+            panel.right - S(kMargin), panel.top + S(kPanelContentTop) + S(88) + S(26)};
+        DrawTextW(hdc, L"找图等待:", -1, &waitLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        for (int i = 0; i < 3; ++i) {
+            const RECT radio = FindWaitRadioRect(i);
+            DrawRadio(hdc, radio, findWaitMode_ == i);
+            const int rowTop = radio.top - (S(kRadioRowH) - S(kRadioSize)) / 2;
+            if (i == 2) {
+                const RECT editRc = FindWaitTimeEditRect();
+                RECT prefixRc{panel.left + S(kMargin) + S(kRadioSize) + S(8), rowTop,
+                    editRc.left - S(4), rowTop + S(kRadioRowH)};
+                DrawTextW(hdc, L"最多找", -1, &prefixRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                // 外框（Edit 已 PositionEditInBorderFrame 内缩）；内容由 RedrawVisibleEdits 盖回
+                DrawBorderRect(hdc, editRc, kComboBorderGray);
+                RECT secLabel{editRc.right + S(6), editRc.top, editRc.right + S(36), editRc.bottom};
+                DrawTextW(hdc, L"秒", -1, &secLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                RECT radioText{panel.left + S(kMargin) + S(kRadioSize) + S(8), rowTop,
+                    panel.right - S(kMargin), rowTop + S(kRadioRowH)};
+                DrawTextW(hdc, kFindWaitModes[i], -1, &radioText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+        SelectObject(hdc, bodyFont_);
+        SetTextColor(hdc, kText);
+        DrawGreenButton(hdc, applyBtn, L"开始转换", hoverApply_);
+        SelectObject(hdc, smallFont_);
+        SetTextColor(hdc, kHint);
+        const wchar_t* resultText = convertResultText_.empty()
+            ? L"尚未转换" : convertResultText_.c_str();
+        RECT resultRc{panel.left + S(kMargin), applyBtn.top - S(52),
+            panel.right - S(kMargin), applyBtn.top - S(8)};
+        DrawTextW(hdc, resultText, -1, &resultRc, DT_LEFT | DT_WORDBREAK);
     }
     DrawEditControlBorder(hdc, hwnd_, valueEdit_);
     DrawEditControlBorder(hdc, hwnd_, thresholdEdit_);
@@ -1723,4 +2020,5 @@ void RecordingOptimizeDialog::Paint() {
     DeleteObject(bmp);
     DeleteDC(hdc);
     EndPaint(hwnd_, &ps);
+    RedrawVisibleEdits();
 }

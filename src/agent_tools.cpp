@@ -14,11 +14,13 @@
 #include "agent_reference.h"
 #include "agent_ai_actions.h"
 #include "agent_ui_notify.h"
+#include "recorder_timeline.h"
 #include "script_action_builder.h"
 #include "script_io.h"
 #include "utils.h"
 #include "window_mode/window_mode_json.h"
 
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <sstream>
@@ -97,7 +99,7 @@ CommonParams ParseCommonParams(const std::wstring& paramsJson) {
     return p;
 }
 
-// 列出单个目录下的脚本
+// 列出单个目录下的脚本（只解析 name/actions 长度，避免大录制全量 ScriptAction 解析卡住）
 void ListScriptsInDir(const std::wstring& dir, const std::wstring& label,
                       std::wstringstream& result, int& index) {
     std::wstring pattern = dir + L"\\*.json";
@@ -105,195 +107,63 @@ void ListScriptsInDir(const std::wstring& dir, const std::wstring& label,
     HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
-    std::vector<std::pair<std::wstring, ScriptFileData>> entries;
+    struct Entry {
+        std::wstring fileName;
+        std::wstring displayName;
+        int actionCount = 0;
+        std::wstring modeSummary;
+        int breakoutSec = 0;
+        bool windowEnabled = false;
+    };
+    std::vector<Entry> entries;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         std::wstring fileName(fd.cFileName);
         if (fileName.size() < 5 || fileName.substr(fileName.size() - 5) != L".json") continue;
         std::wstring fullPath = dir + L"\\" + fileName;
-        entries.push_back({ fileName, LoadScriptFileData(fullPath) });
+        Entry e;
+        e.fileName = fileName;
+        e.displayName = fileName;
+        try {
+            const std::wstring raw = ReadAll(fullPath);
+            const json j = json::parse(ToUtf8(raw));
+            if (j.contains("scriptName") && j["scriptName"].is_string())
+                e.displayName = FromUtf8(j["scriptName"].get<std::string>());
+            else if (j.contains("name") && j["name"].is_string())
+                e.displayName = FromUtf8(j["name"].get<std::string>());
+            if (j.contains("actions") && j["actions"].is_array())
+                e.actionCount = static_cast<int>(j["actions"].size());
+            if (j.contains("windowMode") && j["windowMode"].is_object()) {
+                const auto& wm = j["windowMode"];
+                e.windowEnabled = wm.value("enabled", 0) != 0;
+            }
+            if (!e.windowEnabled && j.contains("breakoutTimeSeconds") && j["breakoutTimeSeconds"].is_number())
+                e.breakoutSec = static_cast<int>(j["breakoutTimeSeconds"].get<double>());
+            // 轻量摘要：避免再 LoadScriptFileData；模式文案用 enabled 即可
+            e.modeSummary = e.windowEnabled ? L"窗口模式" : L"默认模式";
+        } catch (...) {
+            // 坏文件仍列出，动作数未知
+            e.displayName = fileName;
+            e.modeSummary = L"无法解析";
+        }
+        entries.push_back(std::move(e));
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
 
     if (entries.empty()) return;
 
     result << L"\n=== " << label << L" ===\n";
-    for (const auto& [fname, data] : entries) {
-        std::wstring name = data.scriptName.empty() ? fname : data.scriptName;
-        int count = static_cast<int>(data.actions.size());
-        result << index << L". " << fname << L" — \"" << name << L"\" ("
-            << count << L" 个动作, " << windowmode::WindowModeConfigSummary(data.windowMode);
-        if (!data.windowMode.enabled && EffectiveBreakoutTimeSeconds(data) > 0) {
-            result << L", 脱离" << static_cast<int>(EffectiveBreakoutTimeSeconds(data)) << L"s";
-        }
+    for (const auto& e : entries) {
+        result << index << L". " << e.fileName << L" — \"" << e.displayName << L"\" ("
+            << e.actionCount << L" 个动作, " << e.modeSummary;
+        if (!e.windowEnabled && e.breakoutSec > 0)
+            result << L", 脱离" << e.breakoutSec << L"s";
         result << L")\n";
         ++index;
     }
 }
 
-// ── 录制优化辅助函数 ──────────────────────────────────────────────
-
-bool IsKeyOperation(ActionType type) {
-    // 关键操作：键鼠点击/按下/滚轮/输入等；绝对/相对移动与等待是「间操作」
-    return type != ActionType::MoveMouse
-        && type != ActionType::MoveMouseRelative
-        && type != ActionType::Wait;
-}
-
-double ComputeMergedWait(const std::vector<double>& waits, const std::wstring& mode) {
-    if (waits.empty()) return 0.0;
-    if (mode == L"average" || mode == L"avg") {
-        double sum = 0;
-        for (double w : waits) sum += w;
-        return sum / static_cast<double>(waits.size());
-    }
-    if (mode == L"first") return waits.front();
-    if (mode == L"last") return waits.back();
-    double sum = 0;
-    for (double w : waits) sum += w;
-    return sum;
-}
-
-std::wstring ApplyMoveMerge(ScriptFileData& data, const std::wstring& waitMode) {
-    std::vector<ScriptAction> result;
-    std::vector<ScriptAction> segment;
-    int mergedSegments = 0;
-    int removedActions = 0;
-
-    auto flushSegment = [&]() {
-        if (segment.empty()) return;
-        std::vector<double> waits;
-        ScriptAction lastMove{};
-        bool hasMove = false;
-        int indent = segment[0].indent;
-
-        for (const auto& a : segment) {
-            if (a.type == ActionType::Wait) waits.push_back(a.duration);
-            else if (a.type == ActionType::MoveMouse) { lastMove = a; hasMove = true; }
-        }
-
-        if (hasMove) {
-            double mergedWait = ComputeMergedWait(waits, waitMode);
-            int before = static_cast<int>(segment.size());
-            if (mergedWait > 0.0005) {
-                ScriptAction wa{};
-                wa.type = ActionType::Wait;
-                wa.duration = mergedWait;
-                wa.indent = indent;
-                wa.customText = L"等待";
-                wa.remark = L"已合并";
-                result.push_back(wa);
-            }
-            result.push_back(lastMove);
-            removedActions += before - (mergedWait > 0.0005 ? 2 : 1);
-            ++mergedSegments;
-        } else {
-            for (auto& a : segment) result.push_back(std::move(a));
-        }
-        segment.clear();
-    };
-
-    for (auto& a : data.actions) {
-        if (IsKeyOperation(a.type)) {
-            flushSegment();
-            result.push_back(std::move(a));
-        } else {
-            segment.push_back(std::move(a));
-        }
-    }
-    flushSegment();
-
-    data.actions = std::move(result);
-    double total = 0;
-    for (const auto& a : data.actions)
-        if (a.type == ActionType::Wait) total += a.duration;
-    data.durationSeconds = total;
-
-    std::wstringstream ss;
-    ss << L"优化完成：合并了 " << mergedSegments << L" 个分段，移除 " << removedActions
-       << L" 个冗余动作。\n新脚本总动作数: " << data.actions.size()
-       << L"，总等待时长: " << total << L" 秒。";
-    return ss.str();
-}
-
-std::wstring ApplyMoveCompress(ScriptFileData& data, double distanceThreshold, double compressWait) {
-    std::vector<ScriptAction> result;
-    std::vector<ScriptAction> segment;
-    int compressedSegments = 0;
-    int removedPoints = 0;
-
-    struct Point { int x; int y; };
-    auto dist = [](const Point& a, const Point& b) {
-        double dx = static_cast<double>(a.x - b.x);
-        double dy = static_cast<double>(a.y - b.y);
-        return std::sqrt(dx * dx + dy * dy);
-    };
-
-    auto flushSegment = [&]() {
-        if (segment.empty()) return;
-        std::vector<Point> points;
-        int indent = segment[0].indent;
-        for (const auto& a : segment) {
-            if (a.type == ActionType::MoveMouse)
-                points.push_back({a.x, a.y});
-        }
-
-        if (points.size() >= 2) {
-            std::vector<Point> compressed{points.front()};
-            for (size_t i = 1; i + 1 < points.size(); ++i) {
-                if (dist(compressed.back(), points[i]) >= distanceThreshold)
-                    compressed.push_back(points[i]);
-            }
-            if (compressed.back().x != points.back().x || compressed.back().y != points.back().y)
-                compressed.push_back(points.back());
-
-            for (size_t i = 0; i < compressed.size(); ++i) {
-                if (i > 0) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = compressWait;
-                    wa.indent = indent;
-                    wa.customText = L"等待";
-                    result.push_back(wa);
-                }
-                ScriptAction mv{};
-                mv.type = ActionType::MoveMouse;
-                mv.x = compressed[i].x;
-                mv.y = compressed[i].y;
-                mv.indent = indent;
-                mv.customText = L"移动到 (" + std::to_wstring(mv.x) + L", " + std::to_wstring(mv.y) + L")";
-                result.push_back(mv);
-            }
-            removedPoints += static_cast<int>(points.size()) - static_cast<int>(compressed.size());
-            ++compressedSegments;
-        } else {
-            for (auto& a : segment) result.push_back(std::move(a));
-        }
-        segment.clear();
-    };
-
-    for (auto& a : data.actions) {
-        if (IsKeyOperation(a.type)) {
-            flushSegment();
-            result.push_back(std::move(a));
-        } else {
-            segment.push_back(std::move(a));
-        }
-    }
-    flushSegment();
-
-    data.actions = std::move(result);
-    double total = 0;
-    for (const auto& a : data.actions)
-        if (a.type == ActionType::Wait) total += a.duration;
-    data.durationSeconds = total;
-
-    std::wstringstream ss;
-    ss << L"路径压缩完成：压缩了 " << compressedSegments << L" 个路径段，移除 "
-       << removedPoints << L" 个冗余移动点（阈值 " << distanceThreshold << L" 像素）。\n"
-       << L"新脚本总动作数: " << data.actions.size() << L"。";
-    return ss.str();
-}
+// ── 录制优化：实现见 agent_script_ops（AgentOptimizeScriptFile）────────
 
 /// 统计数据，写入 ss
 void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
@@ -302,11 +172,16 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     int loopCount = 0, ifCount = 0, findImageCount = 0, clickCount = 0;
     int keyDownCount = 0, keyUpCount = 0, keyClickCount = 0;
     int otherCount = 0;
+    int substantive = 0;
 
     for (const auto& a : data.actions) {
+        if (a.type != ActionType::Wait) ++substantive;
         switch (a.type) {
         case ActionType::MoveMouse: ++moveCount; break;
-        case ActionType::Wait: ++waitCount; totalWait += a.duration; break;
+        case ActionType::Wait:
+            ++waitCount;
+            totalWait += ActionStepUs(a) / 1000000.0;
+            break;
         case ActionType::Loop: ++loopCount; ++keyCount; break;
         case ActionType::EndLoop: ++keyCount; break;
         case ActionType::If: ++ifCount; ++keyCount; break;
@@ -326,13 +201,14 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     if (!data.windowMode.enabled) {
         ss << L"脱离时间: " << EffectiveBreakoutTimeSeconds(data) << L" 秒\n";
     }
-    ss << L"总动作数: " << data.actions.size() << L"\n";
+    ss << L"总动作数: " << data.actions.size()
+       << L"（含显式等待；非等待 " << substantive << L"）\n";
     ss << L"总等待时长: " << totalWait << L" 秒\n";
     ss << L"记录时间: " << data.recordTime << L"\n\n";
 
     ss << L"动作分类:\n";
     ss << L"  鼠标移动: " << moveCount << L"\n";
-    ss << L"  等待: " << waitCount << L" (合计 " << totalWait << L"秒)\n";
+    ss << L"  等待: " << waitCount << L" (合计 " << totalWait << L"秒，含 timingUs)\n";
     ss << L"  鼠标点击: " << clickCount << L"\n";
     ss << L"  按键: 按下 " << keyDownCount << L" 次, 松开 " << keyUpCount << L" 次, 点击 " << keyClickCount << L" 次\n";
     ss << L"  识图: " << findImageCount << L"\n";
@@ -345,20 +221,23 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     size_t segStart = 0;
     bool hasMoveInSeg = false;
     int segMoves = 0, segWaits = 0;
+    constexpr int kMaxListedSegments = 40;
 
     auto flushSegment = [&](size_t endIdx) {
         if (hasMoveInSeg && endIdx > segStart) {
             ++segmentIdx;
-            size_t keyStart = segStart > 0 ? segStart - 1 : 0;
-            size_t keyEnd = endIdx < data.actions.size() ? endIdx : data.actions.size() - 1;
-            std::wstring startLabel = (segStart == 0) ? L"开头"
-                : (L"第" + std::to_wstring(data.actions[keyStart].originalNo) + L"步 "
-                    + ActionName(data.actions[keyStart]));
-            std::wstring endLabel = (endIdx >= data.actions.size()) ? L"结尾"
-                : (L"第" + std::to_wstring(data.actions[keyEnd].originalNo) + L"步 "
-                    + ActionName(data.actions[keyEnd]));
-            ss << L"  " << segmentIdx << L". [" << startLabel << L" → " << endLabel << L"] — "
-               << segMoves << L" 个移动, " << segWaits << L" 个等待\n";
+            if (segmentIdx <= kMaxListedSegments) {
+                size_t keyStart = segStart > 0 ? segStart - 1 : 0;
+                size_t keyEnd = endIdx < data.actions.size() ? endIdx : data.actions.size() - 1;
+                std::wstring startLabel = (segStart == 0) ? L"开头"
+                    : (L"第" + std::to_wstring(data.actions[keyStart].originalNo) + L"步 "
+                        + ActionName(data.actions[keyStart]));
+                std::wstring endLabel = (endIdx >= data.actions.size()) ? L"结尾"
+                    : (L"第" + std::to_wstring(data.actions[keyEnd].originalNo) + L"步 "
+                        + ActionName(data.actions[keyEnd]));
+                ss << L"  " << segmentIdx << L". [" << startLabel << L" → " << endLabel << L"] — "
+                   << segMoves << L" 个移动, " << segWaits << L" 个等待\n";
+            }
         }
         hasMoveInSeg = false;
         segMoves = 0;
@@ -366,18 +245,29 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     };
 
     for (size_t i = 0; i < data.actions.size(); ++i) {
-        bool isKey = (data.actions[i].type != ActionType::MoveMouse &&
-                      data.actions[i].type != ActionType::Wait);
+        const auto t = data.actions[i].type;
+        const bool isKey = t != ActionType::MoveMouse
+            && t != ActionType::MoveMouseRelative
+            && t != ActionType::Wait;
         if (isKey) { flushSegment(i); segStart = i + 1; }
         else {
-            if (data.actions[i].type == ActionType::MoveMouse) { hasMoveInSeg = true; ++segMoves; }
-            if (data.actions[i].type == ActionType::Wait) ++segWaits;
+            if (t == ActionType::MoveMouse || t == ActionType::MoveMouseRelative) {
+                hasMoveInSeg = true;
+                ++segMoves;
+            }
+            if (t == ActionType::Wait) ++segWaits;
         }
     }
     flushSegment(data.actions.size());
 
     if (segmentIdx == 0) ss << L"  (无可压缩分段)\n";
-    else ss << L"\n共 " << segmentIdx << L" 个可压缩分段，使用 optimizeScript 工具进行压缩。\n";
+    else {
+        if (segmentIdx > kMaxListedSegments) {
+            ss << L"  ...（另有 " << (segmentIdx - kMaxListedSegments)
+               << L" 个分段未列出）\n";
+        }
+        ss << L"\n共 " << segmentIdx << L" 个可压缩分段，使用 optimizeScript / optimizeRecording 工具进行压缩。\n";
+    }
 }
 
 }  // namespace
@@ -428,7 +318,11 @@ AgentTool MakeListScriptsTool() {
 AgentTool MakeReadScriptTool() {
     AgentTool tool;
     tool.name = L"readScript";
-    tool.description = L"读取指定脚本或录制的完整 JSON 内容（自动在 scripts 和 recordings 目录下查找）";
+    tool.description =
+        L"读取指定脚本或录制的内容摘要（自动在 scripts 和 recordings 目录下查找）。"
+        L"大文件（非 Wait 实质动作 >250 或 JSON 过长）只返回统计与动作一览摘要，不会返回完整 JSON。"
+        L"录制轨迹的间隔为显式 wait，不计入实质动作配额。";
+        L"若只需优化路径/合并等待，请直接用 optimizeScript 或 optimizeRecording，不要先 read 全文。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -458,22 +352,40 @@ AgentTool MakeReadScriptTool() {
         if (content.empty()) return L"[提示] 文件内容为空：" + p.fileName;
 
         ScriptFileData data = LoadScriptFileData(found.path);
+        constexpr size_t kMaxFullJsonChars = 48 * 1024;
+        constexpr size_t kMaxOutlineActions = 80;
+        const size_t substantiveCount = static_cast<size_t>(std::count_if(
+            data.actions.begin(), data.actions.end(),
+            [](const ScriptAction& a) { return a.type != ActionType::Wait; }));
+        const bool tooLarge = content.size() > kMaxFullJsonChars || substantiveCount > 250;
+
+        std::wstring out;
+        if (tooLarge) {
+            out = L"[大文件摘要 — 未返回完整 JSON，避免对话过长导致请求卡住]\n";
+            out += L"文件: " + p.fileName + L"\n";
+            out += L"原始字符约: " + std::to_wstring(content.size()) + L"\n";
+            out += L"动作数: " + std::to_wstring(data.actions.size()) + L"\n";
+            out += L"优化请直接调用 optimizeScript / optimizeRecording（可选先 getScriptStats）。\n";
+        } else {
+            out = content;
+        }
+
         if (content.find(L"\"windowMode\"") == std::wstring::npos) {
-            content += L"\n\n[提示] 该文件缺少 windowMode 字段，运行时将按默认模式执行。"
+            out += L"\n\n[提示] 该文件缺少 windowMode 字段，运行时将按默认模式执行。"
                 L" 保存或 writeScript 后会自动补全。\n";
         }
         if (!data.windowMode.enabled && content.find(L"\"breakoutTimeSeconds\"") == std::wstring::npos) {
-            content += L"[提示] 未写 breakoutTimeSeconds，视为 0（脱离时间禁用）。\n";
+            out += L"[提示] 未写 breakoutTimeSeconds，视为 0（脱离时间禁用）。\n";
         }
-        content += L"\n[脚本模式] " + windowmode::WindowModeConfigSummary(data.windowMode) + L"\n";
+        out += L"\n[脚本模式] " + windowmode::WindowModeConfigSummary(data.windowMode) + L"\n";
         if (!data.windowMode.enabled) {
-            content += L"[脱离时间] " + std::to_wstring(
+            out += L"[脱离时间] " + std::to_wstring(
                 static_cast<int>(EffectiveBreakoutTimeSeconds(data))) + L" 秒（0=禁用）\n";
         }
         if (!data.actions.empty()) {
-            content += L"\n\n" + FormatScriptActionsOutline(data.actions);
+            out += L"\n\n" + FormatScriptActionsOutline(data.actions, kMaxOutlineActions);
         }
-        return content;
+        return out;
     };
 
     return tool;
@@ -747,7 +659,7 @@ AgentTool MakeGetScriptStatsTool() {
 
         std::wstringstream ss;
         WriteScriptStats(data, ss);
-        ss << L"\n" << FormatScriptActionsOutline(data.actions);
+        ss << L"\n" << FormatScriptActionsOutline(data.actions, 80);
         return ss.str();
     };
 
@@ -1348,7 +1260,9 @@ AgentTool MakeListSettingsTool() {
         ss << L"  回放间隔: " << (settings.playback.enablePlaybackInterval ? L"启用" : L"禁用")
            << (settings.playback.enablePlaybackInterval ? L"（" + std::to_wstring(settings.playback.playbackIntervalMinSeconds) + L"~" + std::to_wstring(settings.playback.playbackIntervalMaxSeconds) + L" 秒）" : L"") << L"\n";
         ss << L"  调试输出窗口: " << (settings.playback.enableDebugOutputWindow ? L"启用" : L"禁用") << L"\n";
-        ss << L"  关键函数调试: " << (settings.playback.autoOutputKeyFunctionDebug ? L"启用" : L"禁用") << L"\n\n";
+        ss << L"  关键函数调试: " << (settings.playback.autoOutputKeyFunctionDebug ? L"启用" : L"禁用") << L"\n";
+        ss << L"  前台注入后端: "
+           << quickscript::ForegroundInputBackendName(settings.playback.foregroundInputBackend) << L"\n\n";
 
         ss << L"【其他设置】\n";
         ss << L"  宏执行后自动隐藏主窗口: " << (settings.other.autoHideMainWindow ? L"是" : L"否") << L"\n";
@@ -1399,6 +1313,8 @@ AgentTool MakeUpdateSettingsTool() {
             "playbackIntervalMaxSeconds": { "type": "number", "description": "回放间隔最大值（秒）" },
             "enableDebugOutputWindow": { "type": "boolean", "description": "启用调试输出窗口" },
             "autoOutputKeyFunctionDebug": { "type": "boolean", "description": "自动输出关键函数调试信息" },
+            "enableHidDriverSimulation": { "type": "boolean", "description": "兼容旧字段：true≈Interception，false≈Software；优先用 foregroundInputBackend" },
+            "foregroundInputBackend": { "type": "integer", "description": "前台注入后端：0=Software 1=Interception 2=VirtualHid" },
             "autoHideMainWindow": { "type": "boolean", "description": "宏执行后自动隐藏主窗口" },
             "playSoundOnStart": { "type": "boolean", "description": "宏启动时播放提示音" },
             "hideBottomRightTip": { "type": "boolean", "description": "隐藏右下角弹窗提示" },
@@ -1452,6 +1368,19 @@ AgentTool MakeUpdateSettingsTool() {
             setDouble("playbackIntervalMaxSeconds", settings.playback.playbackIntervalMaxSeconds);
             setBool("enableDebugOutputWindow", settings.playback.enableDebugOutputWindow);
             setBool("autoOutputKeyFunctionDebug", settings.playback.autoOutputKeyFunctionDebug);
+            if (params.contains("foregroundInputBackend")) {
+                settings.playback.foregroundInputBackend = quickscript::ClampForegroundInputBackend(
+                    params["foregroundInputBackend"].get<int>());
+                settings.playback.enableHidDriverSimulation =
+                    settings.playback.foregroundInputBackend
+                    != quickscript::ForegroundInputBackend::Software;
+            } else if (params.contains("enableHidDriverSimulation")) {
+                const bool on = params["enableHidDriverSimulation"].get<bool>();
+                settings.playback.enableHidDriverSimulation = on;
+                settings.playback.foregroundInputBackend = on
+                    ? quickscript::ForegroundInputBackend::Interception
+                    : quickscript::ForegroundInputBackend::Software;
+            }
         } else if (category == L"other") {
             setBool("autoHideMainWindow", settings.other.autoHideMainWindow);
             setBool("playSoundOnStart", settings.other.playSoundOnStart);

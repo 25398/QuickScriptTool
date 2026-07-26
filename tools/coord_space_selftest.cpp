@@ -8,7 +8,10 @@
 #include "selftest_harness.h"
 
 #include "coord_space.h"
+#include "findimage_template_crop.h"
+#include "image_match.h"
 #include "script_types.h"
+#include "utils.h"
 
 #include <cmath>
 #include <string>
@@ -45,6 +48,26 @@ const selftest::CaseInfo kCases[] = {
         L"Isotropic cross-res uses narrow scale band"},
     {L"resolve_click_point_offset", L"default",
         L"ResolveFindImageClickPoint applies nOffset on match box"},
+    {L"crop_normalize_inverted", L"crop",
+        L"R<L / B<T normalize"},
+    {L"crop_clamp_to_image", L"crop",
+        L"out-of-bounds clamp"},
+    {L"crop_full_identity", L"crop",
+        L"full image keeps offset"},
+    {L"crop_offset_preserves_click", L"crop",
+        L"100x80,(10,-4),[20,10,90,70) -> (5,-4)"},
+    {L"crop_allows_click_outside_rect", L"crop",
+        L"in-image click outside crop still ok"},
+    {L"crop_allows_click_outside_image", L"crop",
+        L"click outside image + valid crop ok"},
+    {L"crop_min_side", L"crop",
+        L"side <8 fails"},
+    {L"crop_odd_size_center", L"crop",
+        L"W=101 uses W/2"},
+    {L"crop_chain_twice", L"crop",
+        L"two crops preserve click vs original"},
+    {L"crop_noffset_roundtrip", L"crop",
+        L"Sync then round(nOffset*W)==offset"},
 };
 
 bool Near(double a, double b, double eps = 1e-6) {
@@ -196,6 +219,126 @@ void CaseResolveClick() {
         ok ? L"" : (L"tx=" + std::to_wstring(tx) + L" ty=" + std::to_wstring(ty)).c_str());
 }
 
+void CaseCropNormalize() {
+    const CropRect r = NormalizeCropRect(90, 70, 20, 10);
+    Emit(L"crop_normalize_inverted",
+        r.L == 20 && r.T == 10 && r.R == 90 && r.B == 70, L"");
+}
+
+void CaseCropClamp() {
+    CropRect r = NormalizeCropRect(-10, -5, 2000, 1500);
+    r = ClampCropRectToImage(r, 100, 80);
+    Emit(L"crop_clamp_to_image",
+        r.L == 0 && r.T == 0 && r.R == 100 && r.B == 80, L"");
+}
+
+void CaseCropFullIdentity() {
+    CropRect full{0, 0, 100, 80};
+    const auto res = ComputeCroppedFindImageOffset(100, 80, 10, -4, full);
+    Emit(L"crop_full_identity",
+        res.ok && IsFullImageCrop(res.rect, 100, 80)
+            && res.offsetX == 10 && res.offsetY == -4, L"");
+}
+
+void CaseCropOffsetPreserves() {
+    CropRect raw{20, 10, 90, 70};
+    const auto res = ComputeCroppedFindImageOffset(100, 80, 10, -4, raw);
+    Emit(L"crop_offset_preserves_click",
+        res.ok && res.offsetX == 5 && res.offsetY == -4
+            && res.rect.L == 20 && res.rect.T == 10
+            && res.rect.R == 90 && res.rect.B == 70, L"");
+}
+
+void CaseCropAllowsOutsideRect() {
+    // click=(50,40); crop excludes it → still ok, offset' relative to crop
+    CropRect raw{0, 0, 40, 30};
+    const auto res = ComputeCroppedFindImageOffset(100, 80, 0, 0, raw);
+    // offsetX'=(50-0)-20=30, offsetY'=(40-0)-15=25
+    Emit(L"crop_allows_click_outside_rect",
+        res.ok && res.offsetX == 30 && res.offsetY == 25, L"");
+}
+
+void CaseCropAllowsOutsideImage() {
+    // W/2=50, offset=100 → clickX=150 outside; crop ok without contain
+    CropRect raw{10, 10, 50, 50};
+    const auto res = ComputeCroppedFindImageOffset(100, 80, 100, 0, raw);
+    Emit(L"crop_allows_click_outside_image",
+        res.ok && res.reject == CropOffsetReject::None, L"");
+}
+
+void CaseCropMinSide() {
+    CropRect raw{0, 0, 7, 40};
+    const auto res = ComputeCroppedFindImageOffset(100, 80, 0, 0, raw);
+    Emit(L"crop_min_side",
+        !res.ok && res.reject == CropOffsetReject::MinSide, L"");
+}
+
+void CaseCropOddCenter() {
+    // W=101 → oldCx=W/2=50（向零）
+    CropRect raw{0, 0, 80, 80};
+    const auto res = ComputeCroppedFindImageOffset(101, 80, 0, 0, raw);
+    // offsetX'=(50-0)-40=10；若误用 (W+1)/2=51 会得到 11
+    Emit(L"crop_odd_size_center",
+        res.ok && res.offsetX == 10 && res.offsetY == 0, L"");
+}
+
+void CaseCropChainTwice() {
+    const int W0 = 100, H0 = 80, ox0 = 10, oy0 = -4;
+    const int clickX = W0 / 2 + ox0;
+    const int clickY = H0 / 2 + oy0;
+    auto r1 = ComputeCroppedFindImageOffset(W0, H0, ox0, oy0, CropRect{20, 10, 90, 70});
+    const int W1 = r1.rect.R - r1.rect.L;
+    const int H1 = r1.rect.B - r1.rect.T;
+    // second crop relative to first image
+    auto r2 = ComputeCroppedFindImageOffset(W1, H1, r1.offsetX, r1.offsetY,
+        CropRect{5, 5, W1 - 5, H1 - 5});
+    const int W2 = r2.rect.R - r2.rect.L;
+    const int H2 = r2.rect.B - r2.rect.T;
+    // Map click back to original: abs = L1 + L2 + (W2/2 + ox2)
+    const int click2 = (r2.rect.L) + (W2 / 2 + r2.offsetX);
+    const int click2y = (r2.rect.T) + (H2 / 2 + r2.offsetY);
+    const int absX = r1.rect.L + click2;
+    const int absY = r1.rect.T + click2y;
+    Emit(L"crop_chain_twice",
+        r1.ok && r2.ok && absX == clickX && absY == clickY, L"");
+}
+
+void CaseCropNOffsetRoundtrip() {
+    // Create solid 70x60 bmp then Sync
+    EnsureFindImagesDir();
+    const std::wstring path = FindImagesDir() + L"\\selftest_crop_noffset.bmp";
+    // Build via CaptureScreenRegion of a tiny area then... easier: use SaveCropped
+    // from a temporary captured piece. Or create DIB manually.
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 70;
+    bi.bmiHeader.biHeight = -60;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool ok = false;
+    if (bmp && bits) {
+        memset(bits, 0x40, static_cast<size_t>(70) * 60 * 4);
+        ok = SaveBitmapToFile(bmp, path);
+        DeleteBitmapHandle(bmp);
+    }
+    if (!ok) {
+        Emit(L"crop_noffset_roundtrip", false, L"failed to write stub bmp");
+        return;
+    }
+    ScriptAction a{};
+    a.type = ActionType::FindImage;
+    a.imagePath = path;
+    a.offsetX = 5;
+    a.offsetY = -4;
+    SyncFindImageOffsetNorm(a);
+    const int rx = static_cast<int>(std::round(a.nOffsetX * 70.0));
+    const int ry = static_cast<int>(std::round(a.nOffsetY * 60.0));
+    Emit(L"crop_noffset_roundtrip", rx == 5 && ry == -4, L"");
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -235,6 +378,16 @@ int wmain(int argc, wchar_t** argv) {
     CaseExecOptsSameRes();
     CaseExecOptsCrossIso();
     CaseResolveClick();
+    CaseCropNormalize();
+    CaseCropClamp();
+    CaseCropFullIdentity();
+    CaseCropOffsetPreserves();
+    CaseCropAllowsOutsideRect();
+    CaseCropAllowsOutsideImage();
+    CaseCropMinSide();
+    CaseCropOddCenter();
+    CaseCropChainTwice();
+    CaseCropNOffsetRoundtrip();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

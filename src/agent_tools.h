@@ -11,7 +11,7 @@
 /// 列出所有脚本和录制（名称、动作数量），同时搜索 scripts 和 recordings 目录
 AgentTool MakeListScriptsTool();
 
-/// 读取指定脚本或录制的完整 JSON 内容（自动在两个目录查找）
+/// 读取指定脚本或录制的内容（大文件返回摘要，避免完整 JSON 撑爆对话）
 AgentTool MakeReadScriptTool();
 
 /// 写入（覆盖）指定脚本或录制文件

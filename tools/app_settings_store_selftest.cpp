@@ -32,6 +32,12 @@ const selftest::CaseInfo kCases[] = {
         L"jitterX/Y + enableCoordinateJitter roundtrip"},
     {L"save_load_playback_flags", L"default",
         L"playbackCount + debug window flags roundtrip"},
+    {L"save_load_hid_driver_flag", L"default",
+        L"enableHidDriverSimulation legacy true maps to Interception"},
+    {L"save_load_foreground_input_backend", L"default",
+        L"foregroundInputBackend VirtualHid roundtrip"},
+    {L"save_load_recording_click_capture", L"default",
+        L"recordingClickCapture enabled/halfSize roundtrip + clamp"},
     {L"theme_id_clamped", L"default",
         L"themeId=99 clamps to kThemeCount-1"},
     {L"custom_theme_roundtrip", L"default",
@@ -134,6 +140,53 @@ void CasePlayback(SettingsFileGuard& /*g*/) {
         && loaded.playback.enableDebugOutputWindow
         && !loaded.playback.autoOutputKeyFunctionDebug;
     Emit(L"save_load_playback_flags", ok, ok ? L"" : L"playback roundtrip failed");
+}
+
+void CaseHidDriverFlag(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.playback.enableHidDriverSimulation = true;
+    // Legacy path without foregroundInputBackend field: store writes both.
+    s.playback.foregroundInputBackend = quickscript::ForegroundInputBackend::Interception;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    const bool ok = loaded.playback.enableHidDriverSimulation
+        && loaded.playback.foregroundInputBackend
+            == quickscript::ForegroundInputBackend::Interception;
+    Emit(L"save_load_hid_driver_flag", ok, ok ? L"" : L"HID flag roundtrip failed");
+}
+
+void CaseForegroundInputBackend(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.playback.foregroundInputBackend = quickscript::ForegroundInputBackend::VirtualHid;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    const bool ok = loaded.playback.foregroundInputBackend
+            == quickscript::ForegroundInputBackend::VirtualHid
+        && loaded.playback.enableHidDriverSimulation;
+    Emit(L"save_load_foreground_input_backend", ok,
+        ok ? L"" : L"foregroundInputBackend roundtrip failed");
+}
+
+void CaseRecordingClickCapture(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.playback.recordingClickCaptureEnabled = false;
+    s.playback.recordingClickCaptureHalfSize = 99;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    bool ok = !loaded.playback.recordingClickCaptureEnabled
+        && loaded.playback.recordingClickCaptureHalfSize == 99;
+    s.playback.recordingClickCaptureHalfSize = 200;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && loaded.playback.recordingClickCaptureHalfSize == 120;
+    s.playback.recordingClickCaptureHalfSize = 1;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && loaded.playback.recordingClickCaptureHalfSize == 16;
+    Emit(L"save_load_recording_click_capture", ok, ok ? L"" : L"capture settings/clamp failed");
 }
 
 void CaseThemeClamp(SettingsFileGuard& /*g*/) {
@@ -255,6 +308,9 @@ int wmain(int argc, wchar_t** argv) {
         CaseLoadMissing(guard);
         CaseClickJitter(guard);
         CasePlayback(guard);
+        CaseHidDriverFlag(guard);
+        CaseForegroundInputBackend(guard);
+        CaseRecordingClickCapture(guard);
         CaseThemeClamp(guard);
         CaseCustomTheme(guard);
         CaseWmPreviewClamp(guard);

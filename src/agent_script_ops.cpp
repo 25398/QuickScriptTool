@@ -3,6 +3,7 @@
 #include "action_tree.h"
 #include "agent_ui_notify.h"
 #include "agent_ai_actions.h"
+#include "recorder_timeline.h"
 #include "script_action_builder.h"
 #include "script_io.h"
 #include "utils.h"
@@ -188,7 +189,31 @@ double ApplyAgentBreakoutTimeParams(const json& params, bool windowModeEnabled) 
 }
 
 bool IsKeyOperation(ActionType type) {
-    return type != ActionType::MoveMouse && type != ActionType::Wait;
+    return type != ActionType::MoveMouse
+        && type != ActionType::MoveMouseRelative
+        && type != ActionType::Wait;
+}
+
+double WaitSecondsFromAction(const ScriptAction& a) {
+    return ActionStepUs(a) / 1000000.0;
+}
+
+ScriptAction MakeSyncedWait(double seconds, int indent, const std::wstring& remark = L"") {
+    ScriptAction wa{};
+    wa.type = ActionType::Wait;
+    wa.duration = std::max(0.0, seconds);
+    wa.timingUs = ActionStepUs(wa); // uses duration when timingUs==0 — need set after
+    if (wa.duration > 0.0) {
+        const long double us = static_cast<long double>(wa.duration) * 1000000.0L;
+        wa.timingUs = static_cast<uint64_t>(std::llround(us));
+    } else {
+        wa.timingUs = 0;
+    }
+    wa.randomDuration = 0.0;
+    wa.indent = indent;
+    wa.customText = L"等待";
+    wa.remark = remark;
+    return wa;
 }
 
 double ComputeMergedWait(const std::vector<double>& waits, const std::wstring& mode) {
@@ -210,18 +235,34 @@ std::wstring ApplyMoveMerge(ScriptFileData& data, const std::wstring& waitMode) 
     std::vector<ScriptAction> segment;
     int mergedSegments = 0;
     int removedActions = 0;
+    int preservedRelativeSegments = 0;
 
     auto flushSegment = [&]() {
         if (segment.empty()) return;
+        // 相对轨迹受保护：与优化对话框一致，禁止 merge 丢掉中间相对包。
+        bool hasRelative = false;
+        for (const auto& a : segment) {
+            if (a.type == ActionType::MoveMouseRelative) { hasRelative = true; break; }
+        }
+        if (hasRelative) {
+            for (auto& a : segment) result.push_back(std::move(a));
+            segment.clear();
+            ++preservedRelativeSegments;
+            return;
+        }
+
         std::vector<double> waits;
         ScriptAction lastMove{};
         bool hasMove = false;
         const int indent = segment[0].indent;
 
         for (const auto& a : segment) {
-            if (a.type == ActionType::Wait) waits.push_back(a.duration);
+            if (a.type == ActionType::Wait) waits.push_back(WaitSecondsFromAction(a));
             else if (a.type == ActionType::MoveMouse) {
                 lastMove = a;
+                lastMove.duration = 0.0;
+                lastMove.timingUs = 0;
+                lastMove.randomDuration = 0.0;
                 hasMove = true;
             }
         }
@@ -229,15 +270,8 @@ std::wstring ApplyMoveMerge(ScriptFileData& data, const std::wstring& waitMode) 
         if (hasMove) {
             const double mergedWait = ComputeMergedWait(waits, waitMode);
             const int before = static_cast<int>(segment.size());
-            if (mergedWait > 0.0005) {
-                ScriptAction wa{};
-                wa.type = ActionType::Wait;
-                wa.duration = mergedWait;
-                wa.indent = indent;
-                wa.customText = L"等待";
-                wa.remark = L"已合并";
-                result.push_back(wa);
-            }
+            if (mergedWait > 0.0005)
+                result.push_back(MakeSyncedWait(mergedWait, indent, L"已合并"));
             result.push_back(lastMove);
             removedActions += before - (mergedWait > 0.0005 ? 2 : 1);
             ++mergedSegments;
@@ -260,13 +294,18 @@ std::wstring ApplyMoveMerge(ScriptFileData& data, const std::wstring& waitMode) 
     data.actions = std::move(result);
     double total = 0;
     for (const auto& a : data.actions)
-        if (a.type == ActionType::Wait) total += a.duration;
+        if (a.type == ActionType::Wait) total += WaitSecondsFromAction(a);
     data.durationSeconds = total;
+    data.inputTimingVersion = kInputTimingVersionExplicitWaits;
 
     std::wstringstream ss;
     ss << L"优化完成：合并了 " << mergedSegments << L" 个分段，移除 " << removedActions
        << L" 个冗余动作。\n新脚本总动作数: " << data.actions.size()
        << L"，总等待时长: " << total << L" 秒。";
+    if (preservedRelativeSegments > 0) {
+        ss << L"\n已保留 " << preservedRelativeSegments
+           << L" 段相对移动轨迹（FPS 相对位移不可合并）。";
+    }
     return ss.str();
 }
 
@@ -285,44 +324,99 @@ std::wstring ApplyMoveCompress(ScriptFileData& data, double distanceThreshold, d
 
     auto flushSegment = [&]() {
         if (segment.empty()) return;
-        std::vector<Point> points;
         const int indent = segment[0].indent;
+
+        // 含相对移动：整段原样保留（与优化对话框「相对轨迹受保护」一致）
+        bool hasRelative = false;
         for (const auto& a : segment) {
-            if (a.type == ActionType::MoveMouse)
-                points.push_back({a.x, a.y});
+            if (a.type == ActionType::MoveMouseRelative) { hasRelative = true; break; }
         }
-
-        if (points.size() >= 2) {
-            std::vector<Point> compressed{points.front()};
-            for (size_t i = 1; i + 1 < points.size(); ++i) {
-                if (dist(compressed.back(), points[i]) >= distanceThreshold)
-                    compressed.push_back(points[i]);
-            }
-            if (compressed.back().x != points.back().x || compressed.back().y != points.back().y)
-                compressed.push_back(points.back());
-
-            for (size_t i = 0; i < compressed.size(); ++i) {
-                if (i > 0) {
-                    ScriptAction wa{};
-                    wa.type = ActionType::Wait;
-                    wa.duration = compressWait;
-                    wa.indent = indent;
-                    wa.customText = L"等待";
-                    result.push_back(wa);
-                }
-                ScriptAction mv{};
-                mv.type = ActionType::MoveMouse;
-                mv.x = compressed[i].x;
-                mv.y = compressed[i].y;
-                mv.indent = indent;
-                mv.customText = L"移动到 (" + std::to_wstring(mv.x) + L", " + std::to_wstring(mv.y) + L")";
-                result.push_back(mv);
-            }
-            removedPoints += static_cast<int>(points.size()) - static_cast<int>(compressed.size());
-            ++compressedSegments;
-        } else {
+        if (hasRelative) {
             for (auto& a : segment) result.push_back(std::move(a));
+            segment.clear();
+            return;
         }
+
+        // 收集绝对 Move 点，以及点之间 Wait/残留前延迟的 ActionStepUs 之和
+        std::vector<Point> points;
+        std::vector<uint64_t> gapBefore; // gapBefore[i] = 到达 points[i+1] 前的等待微秒
+        uint64_t pendingGap = 0;
+        std::vector<ScriptAction> leadingWaits;
+        bool seenMove = false;
+        for (const auto& a : segment) {
+            if (a.type == ActionType::Wait) {
+                if (!seenMove) leadingWaits.push_back(a);
+                else pendingGap += ActionStepUs(a);
+                continue;
+            }
+            if (a.type == ActionType::MoveMouse) {
+                if (!seenMove) {
+                    for (auto& w : leadingWaits) result.push_back(std::move(w));
+                    leadingWaits.clear();
+                    seenMove = true;
+                    points.push_back({a.x, a.y});
+                    pendingGap = ActionStepUs(a); // 迁移期残留前延迟并入下一段间隙
+                } else {
+                    gapBefore.push_back(pendingGap + ActionStepUs(a));
+                    pendingGap = 0;
+                    points.push_back({a.x, a.y});
+                }
+            }
+        }
+        for (auto& w : leadingWaits) result.push_back(std::move(w));
+
+        if (points.size() < 2) {
+            for (auto& a : segment) result.push_back(std::move(a));
+            segment.clear();
+            return;
+        }
+
+        std::vector<Point> compressed;
+        std::vector<uint64_t> compressedGaps;
+        compressed.push_back(points.front());
+        size_t lastKept = 0;
+        for (size_t i = 1; i + 1 < points.size(); ++i) {
+            if (dist(compressed.back(), points[i]) < distanceThreshold) continue;
+            uint64_t gapSum = 0;
+            for (size_t g = lastKept; g < i; ++g) gapSum += gapBefore[g];
+            compressedGaps.push_back(gapSum);
+            compressed.push_back(points[i]);
+            lastKept = i;
+        }
+        {
+            uint64_t gapSum = 0;
+            for (size_t g = lastKept; g < gapBefore.size(); ++g) gapSum += gapBefore[g];
+            if (compressed.back().x != points.back().x || compressed.back().y != points.back().y) {
+                compressedGaps.push_back(gapSum);
+                compressed.push_back(points.back());
+            } else if (!compressedGaps.empty()) {
+                // 终点已保留：丢弃的中间点间隙已计入上一 gap；尾间隙无下一 Wait
+            } else {
+                // 仅首尾且首==尾不应发生
+            }
+        }
+
+        for (size_t i = 0; i < compressed.size(); ++i) {
+            if (i > 0) {
+                const uint64_t gap = (i - 1 < compressedGaps.size()) ? compressedGaps[i - 1] : 0;
+                if (gap > 0)
+                    result.push_back(MakeExplicitWaitUs(gap, indent));
+                else if (compressWait > 0.0005)
+                    result.push_back(MakeSyncedWait(compressWait, indent));
+            }
+            ScriptAction mv{};
+            mv.type = ActionType::MoveMouse;
+            mv.x = compressed[i].x;
+            mv.y = compressed[i].y;
+            mv.indent = indent;
+            mv.duration = 0.0;
+            mv.timingUs = 0;
+            mv.customText = L"移动到 (" + std::to_wstring(mv.x) + L", "
+                + std::to_wstring(mv.y) + L")";
+            result.push_back(mv);
+        }
+        removedPoints += static_cast<int>(points.size()) - static_cast<int>(compressed.size());
+        ++compressedSegments;
         segment.clear();
     };
 
@@ -339,13 +433,15 @@ std::wstring ApplyMoveCompress(ScriptFileData& data, double distanceThreshold, d
     data.actions = std::move(result);
     double total = 0;
     for (const auto& a : data.actions)
-        if (a.type == ActionType::Wait) total += a.duration;
+        if (a.type == ActionType::Wait) total += WaitSecondsFromAction(a);
     data.durationSeconds = total;
+    data.inputTimingVersion = kInputTimingVersionExplicitWaits;
 
     std::wstringstream ss;
     ss << L"路径压缩完成：压缩了 " << compressedSegments << L" 个路径段，移除 "
        << removedPoints << L" 个冗余移动点（阈值 " << distanceThreshold << L" 像素）。\n"
-       << L"新脚本总动作数: " << data.actions.size() << L"。";
+       << L"新脚本总动作数: " << data.actions.size()
+       << L"（点间优先保留原 Wait 总和；compressWait 仅在总和为 0 时作可选间隔）。";
     return ss.str();
 }
 
@@ -386,8 +482,10 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
     if (dirHint == L"recordings") {
         data.windowMode = windowmode::DefaultWindowModeConfig();
         data.breakoutTimeSeconds = 0;
+        NormalizeInputTiming(data, RecordingsDir() + L"\\" + fileName, true);
     } else {
         data.breakoutTimeSeconds = EffectiveBreakoutTimeSeconds(data);
+        NormalizeInputTiming(data, ScriptsDir() + L"\\" + fileName, false);
     }
 
     const size_t stripped = StripCustomTextActions(data.actions);
@@ -455,8 +553,9 @@ AgentScriptOpResult AgentCreateMacroScript(const std::wstring& fileName,
     data.breakoutTimeSeconds = ApplyAgentBreakoutTimeParams(extraParams, data.windowMode.enabled);
     double totalWait = 0;
     for (const auto& a : data.actions)
-        if (a.type == ActionType::Wait) totalWait += a.duration;
+        if (a.type == ActionType::Wait) totalWait += ActionStepUs(a) / 1000000.0;
     data.durationSeconds = totalWait;
+    data.inputTimingVersion = kInputTimingVersionExplicitWaits;
 
     EnsureScriptsDir();
     const std::wstring fullPath = ScriptsDir() + L"\\" + fileName;

@@ -120,7 +120,11 @@ endif()
 set(SCRIPT_CORE_COMMON_SOURCES
     src/action_utils.cpp
     src/input/mouse_input_backend.cpp
+    src/input/hid_interception.cpp
+    src/input/virtual_hid.cpp
+    src/input/foreground_input_router.cpp
     src/coord_space.cpp
+    src/findimage_template_crop.cpp
     src/image_match.cpp
     src/image_match_engines.cpp
     src/ocr_engine.cpp
@@ -131,9 +135,10 @@ add_library(script_core_common OBJECT ${SCRIPT_CORE_COMMON_SOURCES})
 target_compile_definitions(script_core_common PUBLIC UNICODE _UNICODE NOMINMAX)
 target_include_directories(script_core_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/qst_vhid
     ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS})
+target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS} setupapi)
 if(MSVC)
     target_compile_options(script_core_common PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -159,11 +164,13 @@ add_executable(QuickScriptTool WIN32
     src/crosshair_drag.cpp
     src/find_image_ui_debug.cpp
     src/match_overlay.cpp
+    src/findimage_crop_editor.cpp
     src/popup_combo.cpp
     src/prompt_modal.cpp
     src/panel_popup_combo.cpp
     src/recorder.cpp
     src/recorder_timeline.cpp
+    src/recording_to_findimage.cpp
     src/input_timeline_scheduler.cpp
     src/recording_optimize_dialog.cpp
     src/app_settings_store.cpp
@@ -303,6 +310,7 @@ add_library(script_action_builder_core OBJECT
     src/app_settings_store.cpp
     src/app_theme.cpp
     src/script_io.cpp
+    src/recorder_timeline.cpp
     src/window_mode/window_mode_json.cpp
     src/window_mode/window_mode_types.cpp
 )
@@ -410,6 +418,12 @@ qst_add_selftest(AppSettingsStoreSelfTest
         user32 shell32 shlwapi
 )
 
+qst_add_selftest(VirtualHidSelfTest
+    tools/virtual_hid_selftest.cpp
+    src/input/virtual_hid.cpp
+    LIBS user32 setupapi
+)
+
 qst_add_selftest(ThemeUiSelfTest
     tools/theme_ui_selftest.cpp
     src/app_theme.cpp
@@ -423,10 +437,11 @@ qst_add_selftest(RecorderSelfTest
     tools/recorder_selftest.cpp
     tools/recorder_selftest_support.cpp
     src/recorder_timeline.cpp
+    src/recording_to_findimage.cpp
     src/input_timeline_scheduler.cpp
     src/utils.cpp
     resources/selftest_version.rc
-    LIBS user32 shell32 shlwapi winmm
+    LIBS user32 shell32 shlwapi winmm gdi32
 )
 # 输出名避开 Recorder*+SendInput 启发式指纹；CMake/技能里仍用目标名 RecorderSelfTest
 set_target_properties(RecorderSelfTest PROPERTIES OUTPUT_NAME QstRecorderLogicTest)
@@ -502,5 +517,26 @@ if(WIN32)
                 COMMENT "Copying VirtualDesktopAccessor ${_vda_dll}")
         endif()
     endforeach()
+    # Interception 用户态 DLL（驱动需用户自行安装，见 third_party/interception/README.md）
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_INTERCEPTION_DLL "${CMAKE_SOURCE_DIR}/third_party/interception/x64/interception.dll")
+    else()
+        set(_INTERCEPTION_DLL "${CMAKE_SOURCE_DIR}/third_party/interception/x86/interception.dll")
+    endif()
+    if(EXISTS "${_INTERCEPTION_DLL}")
+        add_custom_command(TARGET QuickScriptTool POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_INTERCEPTION_DLL}"
+                "$<TARGET_FILE_DIR:QuickScriptTool>/interception.dll"
+            COMMENT "Copying interception.dll")
+    endif()
+    set(_INTERCEPTION_INSTALLER "${CMAKE_SOURCE_DIR}/third_party/interception/install-interception.exe")
+    if(EXISTS "${_INTERCEPTION_INSTALLER}")
+        add_custom_command(TARGET QuickScriptTool POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_INTERCEPTION_INSTALLER}"
+                "$<TARGET_FILE_DIR:QuickScriptTool>/install-interception.exe"
+            COMMENT "Copying install-interception.exe")
+    endif()
     # FakeFocus DLL 已由 OUTPUT 目录与 FakeFocus/FakeFocus32 目标写入 build/$<CONFIG>/
 endif()

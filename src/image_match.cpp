@@ -8,6 +8,7 @@
 
 #include "image_match_engines.h"
 #include "image_match_internal.h"
+#include "input/mouse_input_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -149,6 +150,23 @@ HBITMAP LoadBitmapFromFile(const std::wstring& path) {
     if (!img.empty()) return BgrMatToHBitmap(img);
     return static_cast<HBITMAP>(LoadImageW(nullptr, path.c_str(), IMAGE_BITMAP, 0, 0,
                                            LR_LOADFROMFILE | LR_CREATEDIBSECTION));
+}
+
+bool SaveCroppedTemplateRegion(const std::wstring& srcPath,
+    int L, int T, int R, int B, const std::wstring& destPath) {
+    if (srcPath.empty() || destPath.empty()) return false;
+    const int cw = R - L;
+    const int ch = B - T;
+    if (cw <= 0 || ch <= 0) return false;
+    const cv::Mat full = ImReadW(srcPath);
+    if (full.empty()) return false;
+    const cv::Mat crop = CropBgrMat(full, L, T, cw, ch);
+    if (crop.empty()) return false;
+    HBITMAP bmp = BgrMatToHBitmap(crop);
+    if (!bmp) return false;
+    const bool ok = SaveBitmapToFile(bmp, destPath);
+    DeleteBitmapHandle(bmp);
+    return ok;
 }
 
 bool SaveBitmapToFile(HBITMAP bitmap, const std::wstring& path) {
@@ -338,19 +356,8 @@ ImageMatchResult FindTemplateOnScreen(
 void SendMouseWheel(int steps, bool vertical, bool horizontal, bool positive) {
     if (steps <= 0) return;
     const int delta = (positive ? 1 : -1) * WHEEL_DELTA;
-    INPUT input{};
-    input.type = INPUT_MOUSE;
     for (int i = 0; i < steps; ++i) {
-        input.mi.dwFlags = 0;
-        input.mi.mouseData = 0;
-        if (vertical) {
-            input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-            input.mi.mouseData = static_cast<DWORD>(delta);
-        }
-        if (horizontal) {
-            input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-            input.mi.mouseData = static_cast<DWORD>(delta);
-        }
-        if (input.mi.dwFlags) SendInput(1, &input, sizeof(INPUT));
+        if (vertical) MouseInputRouter::Instance().Wheel(delta, false);
+        if (horizontal) MouseInputRouter::Instance().Wheel(delta, true);
     }
 }

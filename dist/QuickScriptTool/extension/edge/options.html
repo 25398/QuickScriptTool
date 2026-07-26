@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>鼠大侠</title>
+  <style>
+    :root {
+      --ink: #0e141b;
+      --paper: #e8eef4;
+      --card: rgba(255, 255, 255, 0.72);
+      --line: rgba(14, 20, 27, 0.12);
+      --accent: #0d9488;
+      --accent-2: #0369a1;
+      --warn: #c2410c;
+      --ok: #15803d;
+      --muted: #5b6b7c;
+      --display: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+      --mono: "Cascadia Mono", "Consolas", "Microsoft YaHei", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+
+    body {
+      font-family: var(--display);
+      color: var(--ink);
+      background:
+        radial-gradient(900px 480px at 12% -10%, rgba(13, 148, 136, 0.28), transparent 55%),
+        radial-gradient(700px 420px at 100% 0%, rgba(3, 105, 161, 0.22), transparent 50%),
+        linear-gradient(165deg, #f4f7fa 0%, #d9e3ec 48%, #cfd9e4 100%);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(14, 20, 27, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(14, 20, 27, 0.04) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse at 50% 20%, #000 20%, transparent 75%);
+      pointer-events: none;
+      animation: gridDrift 28s linear infinite;
+    }
+
+    @keyframes gridDrift {
+      from { transform: translateY(0); }
+      to { transform: translateY(48px); }
+    }
+
+    @keyframes riseIn {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes pulseDot {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.35); opacity: 0.55; }
+    }
+
+    .wrap {
+      position: relative;
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+
+    .brand {
+      animation: riseIn 0.55s ease both;
+      margin-bottom: 28px;
+    }
+
+    .brand-mark {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.78rem;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--accent-2);
+      font-weight: 700;
+    }
+
+    .brand-mark span {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px rgba(13, 148, 136, 0.2);
+      animation: pulseDot 2.2s ease-in-out infinite;
+    }
+
+    h1 {
+      margin: 10px 0 8px;
+      font-size: clamp(2rem, 5vw, 2.75rem);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      font-weight: 750;
+    }
+
+    .tagline {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1.05rem;
+      max-width: 36ch;
+    }
+
+    .panel {
+      animation: riseIn 0.65s ease 0.08s both;
+      background: var(--card);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 22px 22px 18px;
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.7) inset,
+        0 18px 40px rgba(14, 20, 27, 0.08);
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .status-block { min-width: 0; flex: 1; }
+
+    .label {
+      font-size: 0.75rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    #state {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    #state[data-kind="ok"] { color: var(--ok); }
+    #state[data-kind="wait"] { color: var(--accent-2); }
+    #state[data-kind="bad"] { color: var(--warn); }
+
+    #detail {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+      word-break: break-word;
+    }
+
+    .btn {
+      appearance: none;
+      border: none;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+      padding: 12px 20px;
+      border-radius: 999px;
+      box-shadow: 0 10px 24px rgba(3, 105, 161, 0.28);
+      transition: transform 0.15s ease, filter 0.15s ease;
+    }
+
+    .btn:hover { transform: translateY(-1px); filter: brightness(1.05); }
+    .btn:active { transform: translateY(1px); }
+
+    .steps {
+      animation: riseIn 0.7s ease 0.16s both;
+      margin-top: 22px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 14px;
+      align-items: start;
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.55);
+      border: 1px solid var(--line);
+    }
+
+    .num {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      color: var(--accent-2);
+      background: linear-gradient(160deg, rgba(13, 148, 136, 0.18), rgba(3, 105, 161, 0.12));
+    }
+
+    .step h3 {
+      margin: 2px 0 4px;
+      font-size: 1rem;
+    }
+
+    .step p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.86em;
+      background: rgba(14, 20, 27, 0.06);
+      padding: 0.12em 0.4em;
+      border-radius: 6px;
+    }
+
+    .foot {
+      margin-top: 22px;
+      animation: riseIn 0.75s ease 0.22s both;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="brand">
+      <div class="brand-mark"><span></span>QST BRIDGE</div>
+      <h1>鼠大侠</h1>
+      <p class="tagline">网页键鼠桥 · 不重启浏览器，后台投递键鼠到游戏页</p>
+    </header>
+
+    <section class="panel">
+      <div class="row">
+        <div class="status-block">
+          <div class="label">链路状态</div>
+          <div id="state" data-kind="wait">检测中…</div>
+          <p id="detail"></p>
+        </div>
+        <button class="btn" id="reconnect" type="button">重新连接</button>
+      </div>
+    </section>
+
+    <section class="steps">
+      <article class="step">
+        <div class="num">01</div>
+        <div>
+          <h3>先跑鼠大侠</h3>
+          <p>启动窗口模式宏后，本机桥会在 <code>127.0.0.1:19228+</code> 监听。</p>
+        </div>
+      </article>
+      <article class="step">
+        <div class="num">02</div>
+        <div>
+          <h3>扩展装在游戏同一用户配置</h3>
+          <p>在游戏那个 Edge 窗口打开 <code>edge://extensions</code>，加载 / 重载本扩展（版本须为 <strong>1.1.22+</strong>）。跑宏时若仍显示「等待」，点右侧「重新连接」。</p>
+          <p>顶部黄条「已开始调试此浏览器」无法由扩展关闭，也不能限定到单个标签。可在 Edge 快捷方式追加 <code>--silent-debugger-extension-api</code>（完全退出 Edge 后生效）。</p>
+        </div>
+      </article>
+      <article class="step">
+        <div class="num">03</div>
+        <div>
+          <h3>状态变为已连接 / 已附着</h3>
+          <p>成功时会出现 <code>connected</code> 或 <code>attached</code>，并带上游戏页标题。</p>
+        </div>
+      </article>
+    </section>
+
+    <p class="foot">侧载扩展 · chrome.debugger · 本机 WebSocket · v1.1.22</p>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

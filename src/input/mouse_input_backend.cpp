@@ -1,8 +1,11 @@
 #include "mouse_input_backend.h"
+#include "mouse_rel_split.h"
+#include "foreground_input_router.h"
 
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -12,6 +15,17 @@ namespace {
 
 // 轻微迟到（调度抖动）不强行垫间隔，避免把轨迹拉稀。
 constexpr uint64_t kLatePaceThresholdUs = 600;
+
+// 默认第一加速阈值约 6；取 4 保证未关加速时也不会被加倍。
+constexpr int kSubThresholdMaxStep = 4;
+
+void FillMoveInput(INPUT& input, int dx, int dy) {
+    input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = dx;
+    input.mi.dy = dy;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+}
 
 }  // namespace
 
@@ -25,8 +39,22 @@ void MouseInputRouter::Configure() {
     stats_ = {};
     lastError_.clear();
     lastSendInputQpc_ = 0;
-    lastWaitLateUs_ = 0;
+    lastWaitLateUs_.store(0, std::memory_order_relaxed);
+    splitLargeMoves_ = true;
     if (qpcFreq_.QuadPart == 0) QueryPerformanceFrequency(&qpcFreq_);
+}
+
+void MouseInputRouter::ResetStats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_ = {};
+    lastError_.clear();
+    lastSendInputQpc_ = 0;
+    lastWaitLateUs_.store(0, std::memory_order_relaxed);
+}
+
+void MouseInputRouter::SetSplitLargeMoves(bool enable) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    splitLargeMoves_ = enable;
 }
 
 void MouseInputRouter::SetCatchUpGapUs(uint64_t minGapUs) {
@@ -35,8 +63,7 @@ void MouseInputRouter::SetCatchUpGapUs(uint64_t minGapUs) {
 }
 
 void MouseInputRouter::NoteWaitLatenessUs(uint64_t lateUs) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    lastWaitLateUs_ = lateUs;
+    lastWaitLateUs_.store(lateUs, std::memory_order_relaxed);
 }
 
 void MouseInputRouter::PaceLocked() {
@@ -46,8 +73,10 @@ void MouseInputRouter::PaceLocked() {
         lastSendInputQpc_ = now.QuadPart;
         return;
     }
+    const uint64_t waitLateUs =
+        lastWaitLateUs_.load(std::memory_order_relaxed);
     // catchUpGapUs_==0：永不垫间隔，尽量贴绝对时间轴（迟到则连发追赶）。
-    if (catchUpGapUs_ > 0 && lastWaitLateUs_ >= kLatePaceThresholdUs
+    if (catchUpGapUs_ > 0 && waitLateUs >= kLatePaceThresholdUs
         && lastSendInputQpc_ != 0) {
         const int64_t minGapQpc = static_cast<int64_t>(
             (static_cast<long double>(catchUpGapUs_) * qpcFreq_.QuadPart)
@@ -66,14 +95,63 @@ void MouseInputRouter::PaceLocked() {
 
 bool MouseInputRouter::SendInputMoveLocked(int dx, int dy) {
     PaceLocked();
-    INPUT input{};
-    input.type = INPUT_MOUSE;
-    input.mi.dx = dx;
-    input.mi.dy = dy;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
-    const bool ok = SendInput(1, &input, sizeof(input)) == 1;
-    ok ? ++stats_.sentEvents : ++stats_.failedEvents;
-    if (!ok) lastError_ = L"SendInput relative move failed";
+    if (ForegroundInputRouter::Instance().IsHidActive()) {
+        const bool needSplit = splitLargeMoves_
+            && (std::abs(dx) > kSubThresholdMaxStep
+                || std::abs(dy) > kSubThresholdMaxStep);
+        if (!needSplit) {
+            const bool ok = ForegroundInputRouter::Instance().MoveRelative(dx, dy);
+            ok ? ++stats_.sentEvents : ++stats_.failedEvents;
+            if (!ok) lastError_ = L"HID relative move failed";
+            return ok;
+        }
+        std::vector<std::pair<int, int>> steps;
+        AppendSubThresholdRelativeSteps(dx, dy, kSubThresholdMaxStep, steps);
+        bool allOk = true;
+        for (const auto& s : steps) {
+            if (!ForegroundInputRouter::Instance().MoveRelative(s.first, s.second)) {
+                allOk = false;
+            } else {
+                ++stats_.sentEvents;
+            }
+        }
+        if (!allOk) {
+            ++stats_.failedEvents;
+            lastError_ = L"HID relative move failed";
+        }
+        return allOk;
+    }
+    // 加速已关：按 Raw 原包一次注入，避免拆成多次报告改变游戏滤波。
+    // 加速未关：大包拆成亚阈值步进，防止阈值加倍。
+    const bool needSplit = splitLargeMoves_
+        && (std::abs(dx) > kSubThresholdMaxStep
+            || std::abs(dy) > kSubThresholdMaxStep);
+    if (!needSplit) {
+        INPUT input{};
+        FillMoveInput(input, dx, dy);
+        const bool ok = SendInput(1, &input, sizeof(input)) == 1;
+        ok ? ++stats_.sentEvents : ++stats_.failedEvents;
+        if (!ok) lastError_ = L"SendInput relative move failed";
+        return ok;
+    }
+    std::vector<std::pair<int, int>> steps;
+    steps.reserve(static_cast<size_t>(
+        (std::abs(dx) + kSubThresholdMaxStep - 1) / kSubThresholdMaxStep
+        + (std::abs(dy) + kSubThresholdMaxStep - 1) / kSubThresholdMaxStep));
+    AppendSubThresholdRelativeSteps(dx, dy, kSubThresholdMaxStep, steps);
+    std::vector<INPUT> inputs(steps.size());
+    for (size_t i = 0; i < steps.size(); ++i) {
+        FillMoveInput(inputs[i], steps[i].first, steps[i].second);
+    }
+    const UINT sent = SendInput(static_cast<UINT>(inputs.size()),
+        inputs.data(), sizeof(INPUT));
+    const bool ok = sent == inputs.size();
+    if (ok) {
+        stats_.sentEvents += sent;
+    } else {
+        stats_.failedEvents += inputs.size() - sent;
+        lastError_ = L"SendInput relative move failed";
+    }
     return ok;
 }
 
@@ -90,12 +168,46 @@ bool MouseInputRouter::SendInputMoveBatchLocked(
         return allOk;
     }
     PaceLocked();
-    std::vector<INPUT> inputs(deltas.size());
-    for (size_t i = 0; i < deltas.size(); ++i) {
-        inputs[i].type = INPUT_MOUSE;
-        inputs[i].mi.dx = deltas[i].first;
-        inputs[i].mi.dy = deltas[i].second;
-        inputs[i].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+    if (ForegroundInputRouter::Instance().IsHidActive()) {
+        std::vector<std::pair<int, int>> steps;
+        if (splitLargeMoves_) {
+            steps.reserve(deltas.size() * 2);
+            for (const auto& d : deltas) {
+                AppendSubThresholdRelativeSteps(
+                    d.first, d.second, kSubThresholdMaxStep, steps);
+            }
+        } else {
+            steps = deltas;
+        }
+        bool allOk = true;
+        for (const auto& s : steps) {
+            if (!ForegroundInputRouter::Instance().MoveRelative(s.first, s.second)) {
+                allOk = false;
+            } else {
+                ++stats_.sentEvents;
+            }
+        }
+        if (allOk) ++stats_.batchedSubmits;
+        else {
+            ++stats_.failedEvents;
+            lastError_ = L"HID relative batch failed";
+        }
+        return allOk;
+    }
+    std::vector<std::pair<int, int>> steps;
+    if (splitLargeMoves_) {
+        steps.reserve(deltas.size() * 2);
+        for (const auto& d : deltas) {
+            AppendSubThresholdRelativeSteps(
+                d.first, d.second, kSubThresholdMaxStep, steps);
+        }
+    } else {
+        steps = deltas;
+    }
+    if (steps.empty()) return true;
+    std::vector<INPUT> inputs(steps.size());
+    for (size_t i = 0; i < steps.size(); ++i) {
+        FillMoveInput(inputs[i], steps[i].first, steps[i].second);
     }
     const UINT sent = SendInput(static_cast<UINT>(inputs.size()),
         inputs.data(), sizeof(INPUT));
@@ -112,6 +224,12 @@ bool MouseInputRouter::SendInputMoveBatchLocked(
 
 bool MouseInputRouter::SendInputButtonLocked(MouseButtonType button, bool down) {
     PaceLocked();
+    if (ForegroundInputRouter::Instance().IsHidActive()) {
+        const bool ok = ForegroundInputRouter::Instance().Button(button, down);
+        ok ? ++stats_.sentEvents : ++stats_.failedEvents;
+        if (!ok) lastError_ = L"HID mouse button failed";
+        return ok;
+    }
     INPUT input{};
     input.type = INPUT_MOUSE;
     switch (button) {
@@ -137,6 +255,12 @@ bool MouseInputRouter::SendInputButtonLocked(MouseButtonType button, bool down) 
 
 bool MouseInputRouter::SendInputWheelLocked(int delta, bool horizontal) {
     PaceLocked();
+    if (ForegroundInputRouter::Instance().IsHidActive()) {
+        const bool ok = ForegroundInputRouter::Instance().Wheel(delta, horizontal);
+        ok ? ++stats_.sentEvents : ++stats_.failedEvents;
+        if (!ok) lastError_ = L"HID wheel failed";
+        return ok;
+    }
     INPUT input{};
     input.type = INPUT_MOUSE;
     input.mi.dwFlags = horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
@@ -163,6 +287,7 @@ bool MouseInputRouter::MoveRelativeBatch(
     for (const auto& d : deltas) {
         if (d.first != 0 || d.second != 0) filtered.push_back(d);
     }
+    if (filtered.empty()) return true;
     std::lock_guard<std::mutex> lock(mutex_);
     return SendInputMoveBatchLocked(filtered);
 }

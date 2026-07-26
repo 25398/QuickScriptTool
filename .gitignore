@@ -1,6 +1,12 @@
 # Build output
 build/
 out/
+driver/qst_vhid/bin/
+driver/qst_vhid/obj/
+driver/qst_vhid/package/
+driver/qst_vhid/certs/
+driver/qst_vhid/install_log.txt
+driver/qst_vhid/_elevate_install.ps1
 *.obj
 *.exe
 *.pdb
@@ -8,6 +14,8 @@ out/
 *.tlog
 *.lastbuildstate
 *.recipe
+*.sys
+*.cat
 
 # IDE / temp
 .vscode/

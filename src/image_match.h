@@ -49,6 +49,10 @@ HBITMAP LoadBitmapFromFile(const std::wstring& path);
 bool SaveBitmapToFile(HBITMAP bitmap, const std::wstring& path);
 void DeleteBitmapHandle(HBITMAP bitmap);
 
+/// 从源图裁 [L,T,R,B)（右下开）并保存为 BMP。失败返回 false。
+bool SaveCroppedTemplateRegion(const std::wstring& srcPath,
+    int L, int T, int R, int B, const std::wstring& destPath);
+
 // ── 屏幕捕获 ──────────────────────────────────────────────────
 HBITMAP CaptureScreenRegion(int x1, int y1, int x2, int y2);
 void GetVirtualScreenRect(int& x, int& y, int& w, int& h);

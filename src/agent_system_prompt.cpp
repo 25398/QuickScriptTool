@@ -33,6 +33,7 @@ std::wstring BuildAgentSystemPrompt(const std::wstring& modelName, const std::ws
     prompt += L"   · readAgentSkill(section=…) — 脚本策略、优化、定时任务、设置、回复风格\n";
     prompt += L"   · listAiModels — 已添加的宏 AI 模型\n";
     prompt += L"   · buildScriptActions(showSchema=true) — 动作参数字段速查\n";
+    prompt += L"   · 优化录制/宏：直接 optimizeRecording / optimizeScript，禁止为优化 readScript 拉全文\n";
     prompt += L"6. 思考与回复：口语化中文纯文本，禁止 Markdown，禁止英文字段名（详见 readAgentSkill section=reply）。"
         L"思考模型请简短思考、优先调用工具，把 token 留给工具执行与结果说明。\n";
     prompt += L"7. 禁止 customText 动作（说明写 remark）；一次性测试/流程脚本末尾须含 stopMacro（结束宏运行），"

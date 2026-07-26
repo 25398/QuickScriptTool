@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B5E8C1A2-9D4F-4A7B-8E3C-1F2A6B9D0C4E}</ProjectGuid>
+    <RootNamespace>QstVHid</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WDKContentRoot Condition="'$(WDKContentRoot)' == ''">C:\Program Files (x86)\Windows Kits\10\</WDKContentRoot>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <!-- Shim toolset may skip DesignTime WDK.props; force KM paths. -->
+  <PropertyGroup>
+    <KM_IncludePath>$(WDKContentRoot)Include\$(WindowsTargetPlatformVersion)\km</KM_IncludePath>
+    <DDK_INC_PATH>$(KM_IncludePath)\</DDK_INC_PATH>
+    <KIT_SHARED_IncludePath>$(WDKContentRoot)Include\$(WindowsTargetPlatformVersion)\shared</KIT_SHARED_IncludePath>
+    <DDK_LIB_PATH>$(WDKContentRoot)Lib\$(WindowsTargetPlatformVersion)\km\x64\</DDK_LIB_PATH>
+    <KMDF_INC_PATH>$(WDKContentRoot)Include\wdf\kmdf\1.33</KMDF_INC_PATH>
+    <KMDF_LIB_PATH>$(WDKContentRoot)Lib\wdf\kmdf\x64\</KMDF_LIB_PATH>
+    <KMDF_VER_PATH>1.33</KMDF_VER_PATH>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>33</KMDF_VERSION_MINOR>
+    <KernelBufferOverflowLib>$(DDK_LIB_PATH)bufferoverflowfastfailk.lib</KernelBufferOverflowLib>
+    <InfVerif_Executable></InfVerif_Executable>
+    <SkipPackageVerification>true</SkipPackageVerification>
+    <EnableInf2cat>false</EnableInf2cat>
+    <SignMode>Off</SignMode>
+    <DriverSign>Off</DriverSign>
+  </PropertyGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(KM_IncludePath);$(KIT_SHARED_IncludePath);$(KMDF_INC_PATH);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <ExceptionHandling></ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)vhfkm.lib;$(DDK_LIB_PATH)bufferoverflowfastfailk.lib;$(WDKContentRoot)Lib\wdf\kmdf\x64\1.33\WdfLdr.lib;$(WDKContentRoot)Lib\wdf\kmdf\x64\1.33\WdfDriverEntry.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(DDK_LIB_PATH)</AdditionalLibraryDirectories>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <EntryPointSymbol>FxDriverEntry</EntryPointSymbol>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(KM_IncludePath);$(KIT_SHARED_IncludePath);$(KMDF_INC_PATH);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <ExceptionHandling></ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)vhfkm.lib;$(DDK_LIB_PATH)bufferoverflowfastfailk.lib;$(WDKContentRoot)Lib\wdf\kmdf\x64\1.33\WdfLdr.lib;$(WDKContentRoot)Lib\wdf\kmdf\x64\1.33\WdfDriverEntry.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(DDK_LIB_PATH)</AdditionalLibraryDirectories>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <EntryPointSymbol>FxDriverEntry</EntryPointSymbol>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="driver.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="qst_vhid.inf">
+      <SpecifyArchitecture>true</SpecifyArchitecture>
+      <Architecture>amd64</Architecture>
+    </Inf>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -23,6 +23,8 @@ public:
     ///                   screen rect.  Receives empty rect on cancel.
     void Show(std::function<void(RECT)> onConfirm);
 
+    bool IsOpen() const { return hwnd_ != nullptr && IsWindow(hwnd_); }
+
     /// Set the title text shown in the toolbar (e.g. "屏幕截图" or "选取区域")
     void SetTitle(const std::wstring& title) { title_ = title; }
 

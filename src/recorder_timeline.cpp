@@ -4,8 +4,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
+#include <vector>
 
 namespace {
+
+// Raw 队列积压时 QPC 戳会挤在亚毫秒内；真实 HID 报告多在 1–8ms。
+constexpr uint64_t kCompressedRelGapMaxUs = 500;
+constexpr uint64_t kDefaultRelReportUs = 8000;
+constexpr uint64_t kHealthyRelGapMinUs = 2000;
+constexpr uint64_t kHealthyRelGapMaxUs = 16000;
 
 bool RecordedEventMatchesHotkey(const RecordedEvent& e, const Hotkey& hk) {
     if (!hk.enabled || !hk.vk) return false;
@@ -33,7 +41,135 @@ uint64_t SecondsToUs(double seconds) {
     return static_cast<uint64_t>(std::llround(us));
 }
 
+constexpr double kExpandDurationEps = 1e-9;
+
 }  // namespace
+
+uint64_t ActionStepUs(const ScriptAction& a) {
+    if (a.timingUs > 0) return a.timingUs;
+    return SecondsToUs(a.duration);
+}
+
+bool ActionCarriesRecordingPreDelay(ActionType t) {
+    switch (t) {
+    case ActionType::MoveMouse:
+    case ActionType::MoveMouseRelative:
+    case ActionType::MouseDown:
+    case ActionType::MouseUp:
+    case ActionType::KeyDown:
+    case ActionType::KeyUp:
+    case ActionType::FindImage:
+        return true;
+    default:
+        return false;
+    }
+}
+
+ScriptAction MakeExplicitWaitUs(uint64_t gapUs, int indent) {
+    ScriptAction wait{};
+    wait.type = ActionType::Wait;
+    wait.timingUs = gapUs;
+    wait.duration = gapUs / 1000000.0;
+    wait.randomDuration = 0.0;
+    wait.indent = indent;
+    return wait;
+}
+
+void MergeAdjacentExplicitWaits(std::vector<ScriptAction>& actions) {
+    if (actions.size() < 2) return;
+    std::vector<ScriptAction> out;
+    out.reserve(actions.size());
+    for (auto& a : actions) {
+        if (!out.empty()
+            && out.back().type == ActionType::Wait
+            && a.type == ActionType::Wait
+            && out.back().indent == a.indent
+            && out.back().randomDuration <= kExpandDurationEps
+            && a.randomDuration <= kExpandDurationEps) {
+            const uint64_t sum = ActionStepUs(out.back()) + ActionStepUs(a);
+            out.back().timingUs = sum;
+            out.back().duration = sum / 1000000.0;
+            out.back().randomDuration = 0.0;
+            continue;
+        }
+        out.push_back(std::move(a));
+    }
+    actions = std::move(out);
+}
+
+void RepairCompressedRelativeGaps(std::vector<ScriptAction>& actions) {
+    if (actions.size() < 2) return;
+
+    std::vector<uint64_t> healthy;
+    healthy.reserve(64);
+    for (size_t i = 1; i + 1 < actions.size(); ++i) {
+        if (actions[i].type != ActionType::Wait) continue;
+        if (actions[i - 1].type != ActionType::MoveMouseRelative) continue;
+        if (actions[i + 1].type != ActionType::MoveMouseRelative) continue;
+        if (actions[i].randomDuration > kExpandDurationEps) continue;
+        const uint64_t us = ActionStepUs(actions[i]);
+        if (us >= kHealthyRelGapMinUs && us <= kHealthyRelGapMaxUs)
+            healthy.push_back(us);
+    }
+
+    uint64_t targetUs = kDefaultRelReportUs;
+    if (!healthy.empty()) {
+        const size_t mid = healthy.size() / 2;
+        std::nth_element(healthy.begin(), healthy.begin() + static_cast<std::ptrdiff_t>(mid),
+            healthy.end());
+        targetUs = healthy[mid];
+        if (targetUs < 1000) targetUs = 1000;
+        if (targetUs > kHealthyRelGapMaxUs) targetUs = kHealthyRelGapMaxUs;
+    }
+
+    for (size_t i = 1; i + 1 < actions.size(); ++i) {
+        if (actions[i].type != ActionType::Wait) continue;
+        if (actions[i - 1].type != ActionType::MoveMouseRelative) continue;
+        if (actions[i + 1].type != ActionType::MoveMouseRelative) continue;
+        if (actions[i].randomDuration > kExpandDurationEps) continue;
+        if (ActionStepUs(actions[i]) >= kCompressedRelGapMaxUs) continue;
+        actions[i].timingUs = targetUs;
+        actions[i].duration = targetUs / 1000000.0;
+        actions[i].randomDuration = 0.0;
+    }
+
+    std::vector<ScriptAction> out;
+    out.reserve(actions.size() + actions.size() / 8 + 4);
+    for (auto& a : actions) {
+        if (a.type == ActionType::MoveMouseRelative
+            && !out.empty()
+            && out.back().type == ActionType::MoveMouseRelative) {
+            out.push_back(MakeExplicitWaitUs(targetUs, a.indent));
+        }
+        out.push_back(std::move(a));
+    }
+    actions = std::move(out);
+}
+
+std::vector<ScriptAction> ExpandRecordingPreDelaysToExplicitWaits(
+    const std::vector<ScriptAction>& actions,
+    ExpandRecordingPreDelayPolicy policy) {
+    std::vector<ScriptAction> out;
+    out.reserve(actions.size() * 2);
+    for (const auto& src : actions) {
+        ScriptAction a = src;
+        if (!ActionCarriesRecordingPreDelay(a.type)) {
+            out.push_back(std::move(a));
+            continue;
+        }
+        const uint64_t step = ActionStepUs(a);
+        const bool shouldExpand = (a.timingUs > 0)
+            || (policy.treatAsRecordingTimeline && a.duration > kExpandDurationEps);
+        a.timingUs = 0;
+        a.duration = 0.0;
+        a.randomDuration = 0.0;
+        if (shouldExpand && step > 0)
+            out.push_back(MakeExplicitWaitUs(step, a.indent));
+        out.push_back(std::move(a));
+    }
+    MergeAdjacentExplicitWaits(out);
+    return out;
+}
 
 void SortRecordedEvents(std::vector<RecordedEvent>& events) {
     std::stable_sort(events.begin(), events.end(),
@@ -53,10 +189,13 @@ RecordingConversionResult ConvertRecordedEventsToActions(
 
     out.durationSeconds = events.back().timeOffsetUs / 1000000.0;
     uint64_t previousUs = 0;
-    auto emitTimed = [&](ScriptAction action, uint64_t eventUs) {
+    std::unordered_set<UINT> heldKeys;
+    auto emitInstant = [&](ScriptAction action, uint64_t eventUs) {
         const uint64_t gapUs = eventUs >= previousUs ? eventUs - previousUs : 0;
-        action.timingUs = gapUs;
-        action.duration = gapUs / 1000000.0;
+        if (gapUs > 0)
+            out.actions.push_back(MakeExplicitWaitUs(gapUs, action.indent));
+        action.timingUs = 0;
+        action.duration = 0.0;
         action.randomDuration = 0.0;
         out.actions.push_back(std::move(action));
         previousUs = std::max(previousUs, eventUs);
@@ -69,34 +208,49 @@ RecordingConversionResult ConvertRecordedEventsToActions(
             action.x = e.x;
             action.y = e.y;
             action.randomX = action.randomY = 0;
-            emitTimed(action, e.timeOffsetUs);
+            emitInstant(action, e.timeOffsetUs);
             ++out.absoluteMoveCount;
         } else if (e.msg == kWmRecordedRelativeMove) {
             if (e.x == 0 && e.y == 0) continue;
-            // 仅合并同时间戳相对包，保总 dx/dy；勿合并有间隙的包以免压扁高报率轨迹。
-            if (!out.actions.empty()
-                && out.actions.back().type == ActionType::MoveMouseRelative
-                && e.timeOffsetUs == previousUs) {
-                out.actions.back().x += e.x;
-                out.actions.back().y += e.y;
-                ++out.relativeMoveCount;
-                continue;
-            }
+            // 不合并同戳相对包：FPS 常按包积分视角，合并会改变包结构。
             ScriptAction action{};
             action.type = ActionType::MoveMouseRelative;
             action.x = e.x;
             action.y = e.y;
             action.coordsAreNormalized = false;
-            emitTimed(action, e.timeOffsetUs);
+            emitInstant(action, e.timeOffsetUs);
             ++out.relativeMoveCount;
         } else if (e.msg == WM_KEYDOWN || e.msg == WM_SYSKEYDOWN
                 || e.msg == WM_KEYUP || e.msg == WM_SYSKEYUP) {
-            ScriptAction action{};
             const bool down = e.msg == WM_KEYDOWN || e.msg == WM_SYSKEYDOWN;
+            const UINT vk = static_cast<UINT>(e.vkOrButton);
+            // 过滤自动重复 KEYDOWN：已按住则只推进时间轴（保留 Wait），不再插重复按下。
+            if (down) {
+                if (heldKeys.count(vk)) {
+                    const uint64_t gapUs = e.timeOffsetUs >= previousUs
+                        ? e.timeOffsetUs - previousUs : 0;
+                    if (gapUs > 0)
+                        out.actions.push_back(MakeExplicitWaitUs(gapUs));
+                    previousUs = std::max(previousUs, e.timeOffsetUs);
+                    continue;
+                }
+                heldKeys.insert(vk);
+            } else {
+                if (!heldKeys.count(vk)) {
+                    const uint64_t gapUs = e.timeOffsetUs >= previousUs
+                        ? e.timeOffsetUs - previousUs : 0;
+                    if (gapUs > 0)
+                        out.actions.push_back(MakeExplicitWaitUs(gapUs));
+                    previousUs = std::max(previousUs, e.timeOffsetUs);
+                    continue;
+                }
+                heldKeys.erase(vk);
+            }
+            ScriptAction action{};
             action.type = down ? ActionType::KeyDown : ActionType::KeyUp;
-            action.keyVk = static_cast<UINT>(e.vkOrButton);
+            action.keyVk = vk;
             action.keyText = VkName(action.keyVk);
-            emitTimed(action, e.timeOffsetUs);
+            emitInstant(action, e.timeOffsetUs);
         } else if (e.msg == WM_LBUTTONDOWN || e.msg == WM_RBUTTONDOWN
                 || e.msg == WM_MBUTTONDOWN || e.msg == WM_XBUTTONDOWN
                 || e.msg == WM_LBUTTONUP || e.msg == WM_RBUTTONUP
@@ -106,17 +260,19 @@ RecordingConversionResult ConvertRecordedEventsToActions(
                 || e.msg == WM_MBUTTONDOWN || e.msg == WM_XBUTTONDOWN;
             action.type = down ? ActionType::MouseDown : ActionType::MouseUp;
             action.button = RecordedButton(e.vkOrButton);
-            emitTimed(action, e.timeOffsetUs);
+            action.x = e.x;
+            action.y = e.y;
+            if (down) {
+                action.recordedCapturePath = e.capturePath;
+                action.captureOffsetX = e.captureOffsetX;
+                action.captureOffsetY = e.captureOffsetY;
+            }
+            emitInstant(action, e.timeOffsetUs);
         } else if (e.msg == WM_MOUSEWHEEL || e.msg == WM_MOUSEHWHEEL) {
             const uint64_t gapUs = e.timeOffsetUs >= previousUs
                 ? e.timeOffsetUs - previousUs : 0;
             if (gapUs != 0) {
-                ScriptAction wait{};
-                wait.type = ActionType::Wait;
-                wait.timingUs = gapUs;
-                wait.duration = gapUs / 1000000.0;
-                wait.randomDuration = 0.0;
-                out.actions.push_back(wait);
+                out.actions.push_back(MakeExplicitWaitUs(gapUs));
                 previousUs = std::max(previousUs, e.timeOffsetUs);
             }
             ScriptAction action{};
@@ -131,6 +287,12 @@ RecordingConversionResult ConvertRecordedEventsToActions(
             out.actions.push_back(action);
         }
     }
+    RepairCompressedRelativeGaps(out.actions);
+    if (!out.actions.empty()) {
+        const auto timeline = CompileInputTimeline(out.actions);
+        if (!timeline.empty())
+            out.durationSeconds = timeline.back().deadlineUs / 1000000.0;
+    }
     return out;
 }
 
@@ -141,9 +303,7 @@ std::vector<TimedInputEvent> CompileInputTimeline(
     uint64_t elapsedUs = 0;
     for (const auto& action : actions) {
         if (action.randomDuration > 1e-12) return {};
-        const uint64_t stepUs = action.timingUs > 0
-            ? action.timingUs
-            : SecondsToUs(action.duration);
+        const uint64_t stepUs = ActionStepUs(action);
         if (action.type == ActionType::Wait) {
             elapsedUs += stepUs;
             continue;

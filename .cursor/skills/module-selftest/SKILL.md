@@ -58,6 +58,7 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 | `app_settings_store` | `AppSettingsStoreSelfTest` | 设置存读、theme/preview clamp、坏文件 | 下表 | `src/app_settings_store.cpp` |
 | `theme_ui` | `ThemeUiSelfTest` | 自定义主题/取色弹窗裁切、字号、随机色可用性 | 下表 | `src/theme_ui_layout.h`, `src/app_theme.cpp` |
 | `recorder` | `RecorderSelfTest`（产物 `QstRecorderLogicTest.exe`） | 录制排序/转换/时间轴/调度器 | 下表 | `src/recorder*.cpp`, `src/input_timeline_scheduler.cpp` |
+| `virtual_hid` | `VirtualHidSelfTest` | VirtualHid 键/相对/绝对/滚轮注入 | 下表 | `src/input/virtual_hid.*`, `driver/qst_vhid/` |
 
 ### 仍偏手工（无 exe）
 
@@ -174,11 +175,29 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `event_sort_timestamp_sequence` | `SortRecordedEvents` |
 | `relative_delta_conserved` / `mixed_capture_channels` | `ConvertRecordedEventsToActions` |
 | `same_timestamp_button_order` / `stop_hotkey_tail_trimmed` | `ConvertRecordedEventsToActions` |
-| `same_timestamp_relative_merge` | `ConvertRecordedEventsToActions`（同戳相对包合并） |
+| `same_timestamp_relative_keep` | `ConvertRecordedEventsToActions`（同戳相对包不合并） |
+| `timeline_soft_absorb_avoids_burst` | `PrecisionInputTimeline::WaitDeltaUs`（大卡顿拉伸） |
 | `wheel_gap_becomes_wait` | `ConvertRecordedEventsToActions`（滚轮前等待） |
 | `compile_integer_timeline` / `legacy_wait_timeline` | `CompileInputTimeline` |
 | `random_duration_rejects_timeline` | `CompileInputTimeline`（`randomDuration` 禁用精密轴） |
+| `timing_us_prefers_over_duration` | `CompileInputTimeline` / `ActionStepUs` |
+| `convert_gaps_become_waits` / `same_timestamp_no_wait` | `ConvertRecordedEventsToActions`（显式 Wait） |
+| `timeline_fold_vs_explicit_equiv` | `CompileInputTimeline` 折叠 vs Wait 等价 |
+| `expand_recording_keeps_gaps` / `expand_script_default_duration_no_wait` / `expand_idempotent` | `ExpandRecordingPreDelaysToExplicitWaits` |
+| `wait_stats_use_timing_us` | `ActionStepUs` |
+| `snap_timing_to_wait` / `convert_drops_approach_moves` | `recording_to_findimage`（前置 Wait） |
 | `scheduler_cancel_interrupts` / `scheduler_wait_until_elapsed` | `PrecisionInputTimeline` |
+
+### VirtualHidSelfTest
+
+| name | 优先查看 |
+|------|----------|
+| `device_open` | 驱动未装 / `_elevate_install.ps1` / 设备接口 GUID |
+| `key_press_release` | `VirtualHidBackend::SendKey` / Report ID 1 / scan→HID |
+| `mouse_rel_move` | Report ID 2 / `MoveRelative` |
+| `mouse_abs_jump` | Report ID 3 / 虚拟桌面归一化 |
+| `mouse_wheel` | Report ID 2 wheel/hwheel |
+| `release_all_no_stick` | `ReleaseAll` / EndSession |
 
 ## 相关
 

@@ -30,7 +30,7 @@ const wchar_t* kRefFormat = LR"(【脚本文件格式】
 
 录制文件还可包含：
   recordingCaptureMode  -1/缺失=旧文件，0=自动，1=桌面绝对，2=FPS相对
-  inputTimingVersion    1=整数微秒绝对时间轴语义
+  inputTimingVersion    0/缺省=旧文件；1=微秒轴但前延迟可挂在动作上；2=时间只在显式 wait（及重复间隔）
 
 breakoutTimeSeconds（脱离时间，仅默认模式生效）：
   数字，单位秒。0 或未填写视为禁用。
@@ -383,6 +383,8 @@ moveMouse:
 
   moveVarExprX/Y    表达式，如 "btn.x+10"、"anchor.x"、"{btnIcon}.y+5"
 
+  ★ 录制/精密轨迹：间隔只用 type=wait（可用 timingUs）；moveMouse/mouseDown/mouseUp/keyDown/keyUp 不要写 duration 当延时（瞬时动作 duration=0）
+
 
 
 moveMouseRelative:
@@ -401,7 +403,7 @@ mouseClick / mouseDown / mouseUp:
 
   clickCount        重复次数（mouseClick），默认 1
 
-  duration          两次重复之间的间隔秒数（仅 clickCount>1 生效；执行前/后不等待），默认 0.1
+  duration          mouseClick：两次重复之间的间隔（仅 clickCount>1）；mouseDown/Up：应为 0（勿当前延迟）
 
   randomDuration    间隔上的随机附加秒数，默认 0
 
@@ -1238,11 +1240,15 @@ std::wstring BuildReplySkillText() {
 const wchar_t* kSkillOptimize = LR"(【脚本优化 — readAgentSkill section=optimize】
 
 用户要求优化时，用 optimizeScript 或 optimizeRecording，不要手动读写模拟。
+禁止为了优化去 readScript 拉完整 JSON；大录制/宏只需 listScripts 确认文件名，可选 getScriptStats，然后直接优化。
 
 merge 模式：合并任意两个关键操作之间的移动+等待 → 一次等待+一次移动。
   等待默认累加（保持总时长）；用户可指定 average/first/last。
 
-compressPath 模式：按 distanceThreshold 去掉过密移动点，compressWait 为间隔。
+compressPath 模式：按 distanceThreshold 去掉过密移动点；点间优先保留原 Wait 总和，compressWait 仅在总和为 0 时作可选间隔（会改节奏）。
+merge/compress 后节奏来自显式 Wait；相对轨迹分段可 merge（MoveMouseRelative 不算关键操作打断）。
+
+路径压缩/合并不等于语义升级。要把坐标点击升级为找图点击，请用产品内「转为找图点击」（录制优化对话框方案，或编辑器「转为找图」），本迭代无对应 Agent 工具。
 
 可另存为其他文件名保留原版。
 )";

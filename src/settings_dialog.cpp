@@ -1,4 +1,5 @@
 #include "settings_dialog.h"
+#include "recording_to_findimage.h"
 
 #include "app_branding.h"
 #include "app_settings_store.h"
@@ -6,6 +7,8 @@
 #include "theme_custom_dialog.h"
 #include "controls.h"
 #include "drawing.h"
+#include "input/hid_interception.h"
+#include "input/virtual_hid.h"
 #include "modern_edit.h"
 #include "render_context.h"
 #include "scheduled_task_ui.h"
@@ -28,6 +31,18 @@ int DialogContentTop() { return SL(kTitleH + 44); }
 int DialogFooterTop(int clientH) { return clientH - SL(52); }
 int DialogTabW(int clientW) { return clientW / 5; }
 int AiRowH() { return SL(48); }
+
+// 前台注入三选一：文案需完整显示，勿用英文缩写塞进窄格
+const wchar_t* BackendOptionLabel(int index) {
+    switch (index) {
+    case 0: return L"系统模拟";
+    case 1: return L"Interception";
+    case 2: return L"虚拟HID";
+    default: return L"";
+    }
+}
+const wchar_t* kHidInstallBtnText = L"安装 Interception 驱动";
+const wchar_t* kVirtualHidInstallBtnText = L"安装虚拟 HID 驱动";
 
 void SetEditText(HWND edit, const std::wstring& text) {
     if (edit) SetWindowTextW(edit, text.c_str());
@@ -121,13 +136,26 @@ void SettingsDialog::UpdateInlineLayout() {
     inlineLayout_.clickLimitEditX = SL(kLabelAfterCheck) + BodyTextWidth(L"启用次数限制，点击") + gap;
     inlineLayout_.clickLimitSuffixX = inlineLayout_.clickLimitEditX + SL(kEditW) + gap;
 
-    inlineLayout_.playbackCountEditX = SL(kIndent) + BodyTextWidth(L"回放") + gap;
+    inlineLayout_.playbackCountEditX =
+        SL(kLabelAfterCheck) + BodyTextWidth(L"启用回放次数") + gap
+        + BodyTextWidth(L"回放") + gap;
     inlineLayout_.playbackCountSuffixX = inlineLayout_.playbackCountEditX + SL(kSmallEditW) + gap;
-    inlineLayout_.playbackMinEditX = SL(kIndent) + BodyTextWidth(L"最小间隔") + gap;
+    inlineLayout_.playbackMinEditX =
+        SL(kLabelAfterCheck) + BodyTextWidth(L"启用回放间隔") + gap
+        + BodyTextWidth(L"最小间隔") + gap;
     inlineLayout_.playbackMinUnitX = inlineLayout_.playbackMinEditX + SL(kEditW) + gap;
     inlineLayout_.playbackMaxLabelX = inlineLayout_.playbackMinUnitX + BodyTextWidth(L"秒") + gap;
     inlineLayout_.playbackMaxEditX = inlineLayout_.playbackMaxLabelX + BodyTextWidth(L"最大间隔") + gap;
     inlineLayout_.playbackMaxUnitX = inlineLayout_.playbackMaxEditX + SL(kEditW) + gap;
+    {
+        // 勾选文案与「模板半径：」之间留出明显空隙
+        const int afterCapture =
+            SL(kLabelAfterCheck) + BodyTextWidth(L"录制时自动截取点击模板") + SL(24);
+        inlineLayout_.recordingCaptureHalfSizeEditX =
+            afterCapture + BodyTextWidth(L"模板半径：") + gap;
+        inlineLayout_.recordingCaptureHalfSizeHintX =
+            inlineLayout_.recordingCaptureHalfSizeEditX + SL(kSmallEditW) + gap;
+    }
 
     inlineLayout_.jitterXEditX = SL(kIndent) + BodyTextWidth(L"横坐标抖动(X)") + gap;
     inlineLayout_.jitterYEditX = SL(kJitterYGroupLeft) + BodyTextWidth(L"纵坐标抖动(Y)") + gap;
@@ -181,13 +209,13 @@ bool SettingsDialog::HitClickCheckbox(int x, int y, int& outIndex) const {
 
 int SettingsDialog::PlaybackRowY(int index) const {
     const int base = PlaybackTop();
-    const int sec1 = base + SL(kSubLineOffset) + SL(kSubRowH) + SL(14);
-    const int sec2 = sec1 + SL(kSubLineOffset) + SL(kSubRowH) + SL(14);
     switch (index) {
     case 0: return base;
-    case 1: return sec1;
-    case 2: return sec2;
-    case 3: return sec2;
+    case 1: return base + SL(kRowH);
+    case 2: case 3: return base + SL(kRowH) * 2;
+    case 4: return base + SL(kRowH) * 3;
+    case 5: return base + SL(kRowH) * 4;       // 前台注入选项
+    case 6: return base + SL(kRowH) * 5;       // 驱动安装按钮
     default: return base;
     }
 }
@@ -199,10 +227,179 @@ RECT SettingsDialog::PlaybackCheckboxRect(int index) const {
 }
 
 bool SettingsDialog::HitPlaybackCheckbox(int x, int y, int& outIndex) const {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         if (PtIn(PlaybackCheckboxRect(i), x, y)) { outIndex = i; return true; }
     }
     return false;
+}
+
+RECT SettingsDialog::BackendOptionRect(int index) const {
+    const int y = PlaybackRowY(5);
+    const int h = SL(kCheckboxSize);
+    const int gapAfter = SL(18);
+    const int textPad = SL(6);
+    // 标签「注入方式」按实际字宽占位，避免挤在窄左边栏里被裁切
+    int left = SL(kMargin) + BodyTextWidth(L"注入方式") + SL(16);
+    for (int i = 0; i < 3; ++i) {
+        const int w = SL(kCheckboxSize) + textPad + BodyTextWidth(BackendOptionLabel(i)) + SL(4);
+        if (i == index) return RECT{left, y, left + w, y + h};
+        left += w + gapAfter;
+    }
+    return RECT{left, y, left, y + h};
+}
+
+bool SettingsDialog::HitBackendOption(int x, int y, int& outIndex) const {
+    for (int i = 0; i < 3; ++i) {
+        if (PtIn(BackendOptionRect(i), x, y)) { outIndex = i; return true; }
+    }
+    return false;
+}
+
+RECT SettingsDialog::HidInstallBtnRect() const {
+    const int y = PlaybackRowY(6);
+    const int h = SL(kCheckboxSize);
+    const int padX = SL(14);
+    const int w = BodyTextWidth(kHidInstallBtnText) + padX * 2;
+    const int left = SL(kMargin);
+    return RECT{left, y, left + std::max(w, SL(160)), y + h};
+}
+
+RECT SettingsDialog::VirtualHidInstallBtnRect() const {
+    const RECT leftBtn = HidInstallBtnRect();
+    const int padX = SL(14);
+    const int w = BodyTextWidth(kVirtualHidInstallBtnText) + padX * 2;
+    const int left = leftBtn.right + SL(12);
+    return RECT{left, leftBtn.top, left + std::max(w, SL(160)), leftBtn.bottom};
+}
+
+void SettingsDialog::InstallHidDriver() {
+    const std::wstring appDir = AppDir();
+    const std::wstring candidates[] = {
+        appDir + L"\\install-interception.exe",
+        appDir + L"\\tools\\install-interception.exe",
+    };
+    std::wstring path;
+    for (const auto& c : candidates) {
+        if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            path = c;
+            break;
+        }
+    }
+    if (path.empty()) {
+        ShowPromptAlert(L"未找到 Interception 安装程序。\n请使用完整发版包，或重新解压后再试。");
+        return;
+    }
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd = hwnd_;
+    sei.lpVerb = L"runas";
+    sei.lpFile = path.c_str();
+    sei.lpParameters = L"/install";
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) {
+            ShowPromptAlert(L"已取消安装，需要管理员权限才能继续。");
+        } else {
+            ShowPromptAlert(L"启动 Interception 安装程序失败。");
+        }
+        return;
+    }
+    if (sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 60000);
+        CloseHandle(sei.hProcess);
+    }
+
+    std::wstring probeErr;
+    const bool ready = HidInterceptionBackend::Instance().ProbeAvailable(&probeErr);
+    if (ready) {
+        ShowPromptAlert(L"Interception 驱动已就绪。\n可在上方选择「Interception」后回放。");
+    } else {
+        ShowPromptAlert(L"安装程序已执行。\n请重启电脑后再选择「Interception」。");
+    }
+}
+
+void SettingsDialog::InstallVirtualHidDriver() {
+    const std::wstring appDir = AppDir();
+    const std::wstring candidates[] = {
+        appDir + L"\\driver\\qst_vhid\\sign_and_install.ps1",
+        appDir + L"\\..\\driver\\qst_vhid\\sign_and_install.ps1",
+        appDir + L"\\install-qst-vhid.ps1",
+    };
+    std::wstring script;
+    for (const auto& c : candidates) {
+        wchar_t full[MAX_PATH]{};
+        if (GetFullPathNameW(c.c_str(), MAX_PATH, full, nullptr) == 0) continue;
+        if (GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) {
+            script = full;
+            break;
+        }
+    }
+    // Dev tree: resolve relative to exe → repo root
+    if (script.empty()) {
+        std::wstring tryPath = appDir + L"\\..\\..\\driver\\qst_vhid\\sign_and_install.ps1";
+        wchar_t full[MAX_PATH]{};
+        if (GetFullPathNameW(tryPath.c_str(), MAX_PATH, full, nullptr)
+            && GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) {
+            script = full;
+        }
+    }
+    if (script.empty()) {
+        ShowPromptAlert(L"未找到虚拟 HID 安装脚本。\n请使用完整发版包，或重新解压后再试。");
+        return;
+    }
+
+    std::wstring scriptDir = script;
+    const size_t slash = scriptDir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) scriptDir.resize(slash);
+    const std::wstring logPath = scriptDir + L"\\install_log.txt";
+
+    // 优先走带日志包装的提升脚本；否则直接 -File
+    std::wstring elevate = scriptDir + L"\\_elevate_install.ps1";
+    std::wstring params;
+    if (GetFileAttributesW(elevate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        params = L"-NoProfile -ExecutionPolicy Bypass -File \"" + elevate + L"\"";
+    } else {
+        params = L"-NoProfile -ExecutionPolicy Bypass -File \"" + script + L"\" -SkipBuild";
+    }
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd = hwnd_;
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"powershell.exe";
+    sei.lpParameters = params.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) {
+            ShowPromptAlert(L"已取消安装，需要管理员权限才能继续。");
+        } else {
+            ShowPromptAlert(L"启动虚拟 HID 安装脚本失败。");
+        }
+        return;
+    }
+    DWORD exitCode = 1;
+    if (sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 180000);
+        GetExitCodeProcess(sei.hProcess, &exitCode);
+        CloseHandle(sei.hProcess);
+    }
+
+    std::wstring probeErr;
+    if (VirtualHidBackend::Instance().ProbeAvailable(&probeErr)) {
+        ShowPromptAlert(L"虚拟 HID 已就绪。\n可在上方选择「虚拟HID」后回放。");
+        return;
+    }
+
+    std::wstring msg = L"虚拟 HID 仍未就绪。\n请重启电脑后再次点击安装。";
+    if (exitCode != 0) {
+        msg += L"\n安装退出码：" + std::to_wstring(exitCode) + L"。";
+    }
+    msg += L"\n详细日志：\n" + logPath;
+    ShowPromptAlert(msg);
 }
 
 int SettingsDialog::OtherColWidth() const {
@@ -412,8 +609,11 @@ void SettingsDialog::ToggleCheckbox(Tab tab, int index) {
         case 1: p.enablePlaybackInterval = !p.enablePlaybackInterval; break;
         case 2: p.enableDebugOutputWindow = !p.enableDebugOutputWindow; break;
         case 3: p.autoOutputKeyFunctionDebug = !p.autoOutputKeyFunctionDebug; break;
+        case 4: p.recordingClickCaptureEnabled = !p.recordingClickCaptureEnabled; break;
         default: break;
         }
+        p.enableHidDriverSimulation =
+            p.foregroundInputBackend != quickscript::ForegroundInputBackend::Software;
     } else if (tab == Tab::Other) {
         auto& o = working_.other;
         switch (index) {
@@ -450,14 +650,17 @@ void SettingsDialog::PositionChildControls() {
     MoveEditInFrame(editClickLimit_, inlineLayout_.clickLimitEditX,
         CenteredEditY(ClickRowY(4), SL(kCheckboxSize)), SL(kEditW), SL(kEditH));
 
-    const int pbSub0 = PlaybackRowY(0) + SL(kSubLineOffset);
-    const int pbSub1 = PlaybackRowY(1) + SL(kSubLineOffset);
+    const int pb0 = PlaybackRowY(0);
+    const int pb1 = PlaybackRowY(1);
+    const int pb4 = PlaybackRowY(4);
     MoveEditInFrame(editPlaybackCount_, inlineLayout_.playbackCountEditX,
-        CenteredEditY(pbSub0, SL(kSubRowH)), SL(kSmallEditW), SL(kEditH));
+        CenteredEditY(pb0, SL(kCheckboxSize)), SL(kSmallEditW), SL(kEditH));
     MoveEditInFrame(editPlaybackMin_, inlineLayout_.playbackMinEditX,
-        CenteredEditY(pbSub1, SL(kSubRowH)), SL(kEditW), SL(kEditH));
+        CenteredEditY(pb1, SL(kCheckboxSize)), SL(kEditW), SL(kEditH));
     MoveEditInFrame(editPlaybackMax_, inlineLayout_.playbackMaxEditX,
-        CenteredEditY(pbSub1, SL(kSubRowH)), SL(kEditW), SL(kEditH));
+        CenteredEditY(pb1, SL(kCheckboxSize)), SL(kEditW), SL(kEditH));
+    MoveEditInFrame(editRecordingCaptureHalfSize_, inlineLayout_.recordingCaptureHalfSizeEditX,
+        CenteredEditY(pb4, SL(kCheckboxSize)), SL(kSmallEditW), SL(kEditH));
 
     {
         const RECT holdEdit = OtherHoldEditRect();
@@ -476,7 +679,7 @@ void SettingsDialog::PositionChildControls() {
     const HWND edits[] = {
         editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
         editFixedX_, editFixedY_, editClickLimit_,
-        editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+        editPlaybackCount_, editPlaybackMin_, editPlaybackMax_, editRecordingCaptureHalfSize_,
         editHoldThreshold_,
         editApiUrl_, editApiKey_, editModelName_, editTemperature_, editMaxTokens_,
     };
@@ -591,6 +794,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         editPlaybackCount_ = MakeBorderedEdit(hwnd_, L"1", kEditPlaybackCount);
         editPlaybackMin_ = MakeBorderedEdit(hwnd_, L"0.5000", kEditPlaybackMin);
         editPlaybackMax_ = MakeBorderedEdit(hwnd_, L"1.0000", kEditPlaybackMax);
+        editRecordingCaptureHalfSize_ = MakeBorderedEdit(hwnd_, L"40", kEditRecordingCaptureHalfSize);
         editHoldThreshold_ = MakeBorderedEdit(hwnd_, L"0.2", kEditHoldThreshold);
 
         editApiUrl_ = MakeBorderedEdit(hwnd_, L"", kEditApiUrl);
@@ -645,7 +849,7 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             const HWND hideAll[] = {
                 editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
                 editFixedX_, editFixedY_, editClickLimit_, crosshairBtn_,
-                editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+                editPlaybackCount_, editPlaybackMin_, editPlaybackMax_, editRecordingCaptureHalfSize_,
                 editHoldThreshold_,
                 editApiUrl_, editApiKey_, editModelName_, editTemperature_, editMaxTokens_,
             };
@@ -753,6 +957,24 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         } else if (activeTab_ == Tab::Playback) {
+            if (PtIn(HidInstallBtnRect(), x, y)) {
+                InstallHidDriver();
+                return 0;
+            }
+            if (PtIn(VirtualHidInstallBtnRect(), x, y)) {
+                InstallVirtualHidDriver();
+                return 0;
+            }
+            int backend = -1;
+            if (HitBackendOption(x, y, backend)) {
+                working_.playback.foregroundInputBackend =
+                    quickscript::ClampForegroundInputBackend(backend);
+                working_.playback.enableHidDriverSimulation =
+                    working_.playback.foregroundInputBackend
+                    != quickscript::ForegroundInputBackend::Software;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             int row = -1;
             if (HitPlaybackCheckbox(x, y, row)) {
                 ToggleCheckbox(Tab::Playback, row);
@@ -819,6 +1041,10 @@ LRESULT SettingsDialog::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (HitClose(x, y) != hoverClose_) { hoverClose_ = HitClose(x, y); needRedraw = true; }
         if (PtIn(RestoreLinkRect(), x, y) != hoverRestore_) { hoverRestore_ = PtIn(RestoreLinkRect(), x, y); needRedraw = true; }
         if (PtIn(SaveBtnRect(), x, y) != hoverSave_) { hoverSave_ = PtIn(SaveBtnRect(), x, y); needRedraw = true; }
+        const bool hHid = activeTab_ == Tab::Playback && PtIn(HidInstallBtnRect(), x, y);
+        if (hHid != hoverHidInstall_) { hoverHidInstall_ = hHid; needRedraw = true; }
+        const bool hVhid = activeTab_ == Tab::Playback && PtIn(VirtualHidInstallBtnRect(), x, y);
+        if (hVhid != hoverVirtualHidInstall_) { hoverVirtualHidInstall_ = hVhid; needRedraw = true; }
         const bool hu = activeTab_ == Tab::About && PtIn(CheckUpgradeBtnRect(), x, y);
         if (hu != hoverCheckUpgrade_) { hoverCheckUpgrade_ = hu; needRedraw = true; }
         const bool ha = HitAiAddModelBtn(x, y);
@@ -966,6 +1192,7 @@ void SettingsDialog::SyncControlsFromSettings() {
     SetEditText(editPlaybackCount_, std::to_wstring(p.playbackCount));
     SetEditText(editPlaybackMin_, FormatDouble4(p.playbackIntervalMinSeconds));
     SetEditText(editPlaybackMax_, FormatDouble4(p.playbackIntervalMaxSeconds));
+    SetEditText(editRecordingCaptureHalfSize_, std::to_wstring(p.recordingClickCaptureHalfSize));
     SetEditText(editHoldThreshold_, FormatHoldThresholdLabel(working_.other.holdThresholdSeconds));
 
     SetEditText(editApiUrl_, working_.ai.apiUrl);
@@ -989,6 +1216,10 @@ void SettingsDialog::SyncSettingsFromControls() {
     p.playbackIntervalMinSeconds = std::max(0.0, ToDouble(editPlaybackMin_, p.playbackIntervalMinSeconds));
     p.playbackIntervalMaxSeconds = std::max(p.playbackIntervalMinSeconds,
         ToDouble(editPlaybackMax_, p.playbackIntervalMaxSeconds));
+    p.recordingClickCaptureHalfSize = ClampClickCaptureHalfSize(
+        static_cast<int>(ToDouble(editRecordingCaptureHalfSize_, p.recordingClickCaptureHalfSize)));
+    p.enableHidDriverSimulation =
+        p.foregroundInputBackend != quickscript::ForegroundInputBackend::Software;
 
     {
         const double hold = ToDouble(editHoldThreshold_, working_.other.holdThresholdSeconds);
@@ -1023,7 +1254,8 @@ void SettingsDialog::UpdateControlVisibility() {
     const HWND clickEdits[] = {editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
         editFixedX_, editFixedY_, editClickLimit_, crosshairBtn_};
     for (HWND e : clickEdits) SetChildVisibleNoRedraw(e, clickTab);
-    const HWND playbackEdits[] = {editPlaybackCount_, editPlaybackMin_, editPlaybackMax_};
+    const HWND playbackEdits[] = {editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+        editRecordingCaptureHalfSize_};
     for (HWND e : playbackEdits) SetChildVisibleNoRedraw(e, playbackTab);
     SetChildVisibleNoRedraw(editHoldThreshold_, otherTab);
     const HWND aiCtrls[] = {editApiUrl_, editApiKey_, editModelName_,
@@ -1050,15 +1282,40 @@ void SettingsDialog::RestoreDefaults() {
 
 void SettingsDialog::SaveAndClose() {
     SyncSettingsFromControls();
+    std::wstring warn;
     if (settings_) {
         *settings_ = working_;
         SaveAppSettings(*settings_);
+        if (working_.playback.foregroundInputBackend
+            == quickscript::ForegroundInputBackend::Interception) {
+            std::wstring err;
+            if (!HidInterceptionBackend::Instance().ProbeAvailable(&err)) {
+                warn = err.empty()
+                    ? L"设置已保存，但 Interception 未就绪，回放将回退系统模拟。\n请安装驱动并重启后再试。"
+                    : (L"设置已保存，但 Interception 未就绪，回放将回退系统模拟。\n" + err);
+            }
+        } else if (working_.playback.foregroundInputBackend
+            == quickscript::ForegroundInputBackend::VirtualHid) {
+            std::wstring err;
+            if (!VirtualHidBackend::Instance().ProbeAvailable(&err)) {
+                warn = err.empty()
+                    ? L"设置已保存，但虚拟 HID 未就绪，回放将回退系统模拟。\n请先点「安装虚拟 HID 驱动」。"
+                    : (L"设置已保存，但虚拟 HID 未就绪，回放将回退系统模拟。\n" + err);
+            }
+        }
     }
     saved_ = true;
     SavedCallback cb = std::move(onSaved_);
     onSaved_ = nullptr;
-    DestroyWindow(hwnd_);
-    if (cb) cb();
+    auto finish = [this, cb = std::move(cb)]() {
+        DestroyWindow(hwnd_);
+        if (cb) cb();
+    };
+    if (!warn.empty()) {
+        promptModal_.ShowInfo(warn, std::move(finish));
+        return;
+    }
+    finish();
 }
 
 void SettingsDialog::DrawSettingsTab(HDC hdc, const RECT& rc, Tab tab, const wchar_t* text) {
@@ -1133,8 +1390,9 @@ void SettingsDialog::PaintClickTab(HDC hdc) {
 void SettingsDialog::PaintPlaybackTab(HDC hdc) {
     const auto& p = working_.playback;
     SelectObject(hdc, bodyFont_);
+    UpdateInlineLayout();
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const RECT cb = PlaybackCheckboxRect(i);
         bool checked = false;
         switch (i) {
@@ -1142,39 +1400,95 @@ void SettingsDialog::PaintPlaybackTab(HDC hdc) {
         case 1: checked = p.enablePlaybackInterval; break;
         case 2: checked = p.enableDebugOutputWindow; break;
         case 3: checked = p.autoOutputKeyFunctionDebug; break;
+        case 4: checked = p.recordingClickCaptureEnabled; break;
         }
         StDrawCheckbox(hdc, cb, checked);
     }
 
-    const int sub0 = PlaybackRowY(0) + SL(kSubLineOffset);
-    const int sub1 = PlaybackRowY(1) + SL(kSubLineOffset);
-    UpdateInlineLayout();
+    const int y0 = PlaybackRowY(0);
+    const int y1 = PlaybackRowY(1);
+    const int y2 = PlaybackRowY(2);
+    const int y4 = PlaybackRowY(4);
+    const int y5 = PlaybackRowY(5);
+    const int rowH = SL(kCheckboxSize);
+    const int gap = SL(kCoordEditGap);
 
-    DrawTextIn(hdc, L"启用回放次数", RECT{SL(kLabelAfterCheck), PlaybackRowY(0), ClientW() - SL(kMargin), PlaybackRowY(0) + SL(kCheckboxSize)},
+    // 回放次数：启用文案 + 回放 [N] 次后停止
+    {
+        const int enableEnd = SL(kLabelAfterCheck) + BodyTextWidth(L"启用回放次数");
+        DrawTextIn(hdc, L"启用回放次数",
+            RECT{SL(kLabelAfterCheck), y0, enableEnd, y0 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        const int replayLeft = enableEnd + gap;
+        DrawTextIn(hdc, L"回放",
+            RECT{replayLeft, y0, inlineLayout_.playbackCountEditX - gap, y0 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"次后停止（0=无限）",
+            RECT{inlineLayout_.playbackCountSuffixX, y0, ClientW() - SL(kMargin), y0 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // 回放间隔：启用文案 + 最小/最大间隔
+    {
+        const int enableEnd = SL(kLabelAfterCheck) + BodyTextWidth(L"启用回放间隔");
+        DrawTextIn(hdc, L"启用回放间隔",
+            RECT{SL(kLabelAfterCheck), y1, enableEnd, y1 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"最小间隔",
+            RECT{enableEnd + gap, y1, inlineLayout_.playbackMinEditX - gap, y1 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"秒",
+            RECT{inlineLayout_.playbackMinUnitX, y1, inlineLayout_.playbackMaxLabelX - gap, y1 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"最大间隔",
+            RECT{inlineLayout_.playbackMaxLabelX, y1, inlineLayout_.playbackMaxEditX - gap, y1 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"秒",
+            RECT{inlineLayout_.playbackMaxUnitX, y1, ClientW() - SL(kMargin), y1 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    DrawTextIn(hdc, L"启用宏调试信息窗口",
+        RECT{SL(kLabelAfterCheck), y2, SL(390), y2 + rowH},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"回放", RECT{SL(kIndent), sub0, inlineLayout_.playbackCountEditX - SL(kCoordEditGap), sub0 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"次后，自动停止(默认为0无限循环)", RECT{inlineLayout_.playbackCountSuffixX, sub0, ClientW() - SL(kMargin), sub0 + SL(kSubRowH)},
+    DrawTextIn(hdc, L"自动输出关键函数调试信息",
+        RECT{SL(438), y2, ClientW() - SL(kMargin), y2 + rowH},
         kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextIn(hdc, L"启用回放间隔(多次回放间的间隔)", RECT{SL(kLabelAfterCheck), PlaybackRowY(1), ClientW() - SL(kMargin), PlaybackRowY(1) + SL(kCheckboxSize)},
-        kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"最小间隔", RECT{SL(kIndent), sub1, inlineLayout_.playbackMinEditX - SL(kCoordEditGap), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.playbackMinUnitX, sub1, inlineLayout_.playbackMaxLabelX - SL(kCoordEditGap), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"最大间隔", RECT{inlineLayout_.playbackMaxLabelX, sub1, inlineLayout_.playbackMaxEditX - SL(kCoordEditGap), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"秒", RECT{inlineLayout_.playbackMaxUnitX, sub1, ClientW() - SL(kMargin), sub1 + SL(kSubRowH)}, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    {
+        const int captureLabelEnd =
+            SL(kLabelAfterCheck) + BodyTextWidth(L"录制时自动截取点击模板");
+        DrawTextIn(hdc, L"录制时自动截取点击模板",
+            RECT{SL(kLabelAfterCheck), y4, captureLabelEnd, y4 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        const int radiusLeft = captureLabelEnd + SL(24);
+        DrawTextIn(hdc, L"模板半径：",
+            RECT{radiusLeft, y4, inlineLayout_.recordingCaptureHalfSizeEditX - gap, y4 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextIn(hdc, L"默认40≈80×80",
+            RECT{inlineLayout_.recordingCaptureHalfSizeHintX, y4, ClientW() - SL(kMargin), y4 + rowH},
+            kHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
 
-    DrawTextIn(hdc, L"启用/关闭宏调试信息输出窗口", RECT{SL(kLabelAfterCheck), PlaybackRowY(2), SL(390), PlaybackRowY(2) + SL(kCheckboxSize)},
-        kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextIn(hdc, L"自动输出宏关键函数调试信息", RECT{SL(438), PlaybackRowY(2), ClientW() - SL(kMargin), PlaybackRowY(2) + SL(kCheckboxSize)},
-        kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    SelectObject(hdc, smallFont_);
-    const int hintTop = PlaybackRowY(2) + SL(kRowH) + SL(8);
-    DrawTextIn(hdc,
-        L"相对鼠标回放使用 SendInput（回放时临时关闭鼠标加速以贴近录制值）。"
-        L"部分仅接受 Raw Input 的游戏可能仍与真鼠标手感有差异。",
-        RECT{SL(kMargin), hintTop, ClientW() - SL(kMargin), hintTop + SL(48)},
-        kHint, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    {
+        const int labelEnd = SL(kMargin) + BodyTextWidth(L"注入方式");
+        DrawTextIn(hdc, L"注入方式",
+            RECT{SL(kMargin), y5, labelEnd, y5 + rowH},
+            kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        const int sel = static_cast<int>(p.foregroundInputBackend);
+        for (int i = 0; i < 3; ++i) {
+            const RECT rc = BackendOptionRect(i);
+            StDrawRadio(hdc,
+                RECT{rc.left, rc.top, rc.left + SL(kCheckboxSize), rc.top + SL(kCheckboxSize)},
+                sel == i);
+            DrawTextIn(hdc, BackendOptionLabel(i),
+                RECT{rc.left + SL(kCheckboxSize) + SL(6), rc.top, rc.right, rc.bottom},
+                kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+        StDrawGreenButton(hdc, bodyFont_, HidInstallBtnRect(), kHidInstallBtnText, hoverHidInstall_);
+        StDrawGreenButton(hdc, bodyFont_, VirtualHidInstallBtnRect(),
+            kVirtualHidInstallBtnText, hoverVirtualHidInstall_);
+    }
 }
 
 void SettingsDialog::PaintOtherTab(HDC hdc) {
@@ -1326,7 +1640,7 @@ void SettingsDialog::Paint() {
         const HWND edits[] = {
             editRandomInterval_, editPressRelease_, editJitterX_, editJitterY_,
             editFixedX_, editFixedY_, editClickLimit_,
-            editPlaybackCount_, editPlaybackMin_, editPlaybackMax_,
+            editPlaybackCount_, editPlaybackMin_, editPlaybackMax_, editRecordingCaptureHalfSize_,
             editHoldThreshold_,
             editApiUrl_, editApiKey_, editModelName_, editTemperature_, editMaxTokens_,
         };

@@ -8,6 +8,26 @@
 
 namespace quickscript {
 
+enum class ForegroundInputBackend {
+    Software = 0,
+    Interception = 1,
+    VirtualHid = 2,
+};
+
+inline ForegroundInputBackend ClampForegroundInputBackend(int v) {
+    if (v < 0 || v > 2) return ForegroundInputBackend::Software;
+    return static_cast<ForegroundInputBackend>(v);
+}
+
+inline const wchar_t* ForegroundInputBackendName(ForegroundInputBackend b) {
+    switch (b) {
+    case ForegroundInputBackend::Interception: return L"Interception";
+    case ForegroundInputBackend::VirtualHid: return L"VirtualHid";
+    case ForegroundInputBackend::Software:
+    default: return L"Software";
+    }
+}
+
 struct ClickTabSettings {
     bool enableRandomInterval = false;
     double randomIntervalMaxSeconds = 0.5;
@@ -31,6 +51,14 @@ struct PlaybackTabSettings {
     double playbackIntervalMaxSeconds = 1.0;
     bool enableDebugOutputWindow = false;
     bool autoOutputKeyFunctionDebug = true;
+    /// 录制时对每次鼠标按下自动截取点击附近模板
+    bool recordingClickCaptureEnabled = true;
+    /// 模板半边像素（实际约 2N×2N）；读写时 clamp 到代码常量范围
+    int recordingClickCaptureHalfSize = 40;
+    /// 前台注入后端：Software / Interception / VirtualHid
+    ForegroundInputBackend foregroundInputBackend = ForegroundInputBackend::Software;
+    /// 兼容旧设置：true 且无 foregroundInputBackend 字段时视为 Interception
+    bool enableHidDriverSimulation = false;
 };
 
 struct OtherTabSettings {

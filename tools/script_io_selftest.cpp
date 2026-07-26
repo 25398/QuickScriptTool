@@ -50,7 +50,13 @@ const selftest::CaseInfo kCases[] = {
     {L"write_action_json_contains_type", L"default",
         L"ScriptActionToJsonString emits type wait"},
     {L"timing_us_roundtrip", L"default",
-        L"timingUs survives parse/write roundtrip"},
+        L"Wait timingUs survives parse/write roundtrip"},
+    {L"instant_duration_default_zero", L"default",
+        L"moveMouse missing duration parses as 0"},
+    {L"recorded_capture_path_roundtrip", L"default",
+        L"recordedCapturePath + captureOffset roundtrip"},
+    {L"collect_image_paths_recorded_capture", L"default",
+        L"CollectImagePathsFromJson includes recordedCapturePath"},
 };
 
 std::wstring TempScriptPath(const wchar_t* name) {
@@ -148,10 +154,11 @@ void CaseSaveLoadRoundtrip() {
     data.coordMeta = StandardScriptCoordMeta();
     data.coordsNormalized = true;
     data.recordingCaptureMode = 2;
-    data.inputTimingVersion = 1;
+    data.inputTimingVersion = 2;
     ScriptAction wait{};
     wait.type = ActionType::Wait;
     wait.duration = 0.2;
+    wait.timingUs = 200000;
     wait.originalNo = 1;
     data.actions.push_back(wait);
     ScriptAction stop{};
@@ -166,8 +173,9 @@ void CaseSaveLoadRoundtrip() {
     const bool ok = saved && loaded.actions.size() >= 1
         && loaded.actions[0].type == ActionType::Wait
         && std::fabs(loaded.actions[0].duration - 0.2) < 1e-6
+        && loaded.actions[0].timingUs == 200000
         && loaded.recordingCaptureMode == 2
-        && loaded.inputTimingVersion == 1;
+        && loaded.inputTimingVersion == 2;
     Emit(L"save_load_roundtrip_actions", ok, ok ? L"" : L"roundtrip failed");
 }
 
@@ -229,20 +237,56 @@ void CaseWriteActionJson() {
 
 void CaseTimingUsRoundtrip() {
     ScriptAction a{};
-    a.type = ActionType::MoveMouseRelative;
-    a.x = 3;
-    a.y = -1;
+    a.type = ActionType::Wait;
     a.duration = 0.012345;
     a.timingUs = 12345;
-    a.coordsAreNormalized = false;
     const std::wstring json = ScriptActionToJsonString(a);
     ScriptAction loaded = ParseScriptActionBlock(json, 1, false);
-    const bool ok = loaded.type == ActionType::MoveMouseRelative
+    const bool ok = loaded.type == ActionType::Wait
         && loaded.timingUs == 12345
-        && loaded.x == 3 && loaded.y == -1
         && json.find(L"\"timingUs\"") != std::wstring::npos;
     Emit(L"timing_us_roundtrip", ok,
         ok ? L"" : (L"json=" + json).c_str());
+}
+
+void CaseInstantDurationDefaultZero() {
+    ScriptAction loaded = ParseScriptActionBlock(
+        L"{\"type\":\"moveMouse\",\"x\":1,\"y\":2}", 0, false);
+    Emit(L"instant_duration_default_zero",
+        loaded.type == ActionType::MoveMouse
+            && loaded.duration == 0.0
+            && loaded.timingUs == 0, L"");
+}
+
+void CaseRecordedCaptureRoundtrip() {
+    ScriptAction a{};
+    a.type = ActionType::MouseDown;
+    a.button = MouseButtonType::Left;
+    a.x = 12;
+    a.y = 34;
+    a.recordedCapturePath = L"images\\rec_1_2.bmp";
+    a.captureOffsetX = 3;
+    a.captureOffsetY = -4;
+    const std::wstring json = ScriptActionToJsonString(a);
+    const ScriptAction loaded = ParseScriptActionBlock(json, 0, false);
+    const bool ok = loaded.type == ActionType::MouseDown
+        && loaded.x == 12 && loaded.y == 34
+        && loaded.captureOffsetX == 3 && loaded.captureOffsetY == -4
+        && !loaded.recordedCapturePath.empty()
+        && json.find(L"recordedCapturePath") != std::wstring::npos;
+    Emit(L"recorded_capture_path_roundtrip", ok,
+        ok ? L"" : (L"json=" + json).c_str());
+}
+
+void CaseCollectRecordedCapture() {
+    const std::wstring json =
+        L"{\"actions\":[{\"type\":\"mouseDown\",\"recordedCapturePath\":\"images\\\\rec_x.bmp\"}]}";
+    auto paths = CollectImagePathsFromJson(json);
+    bool found = false;
+    for (const auto& p : paths) {
+        if (p.find(L"rec_x.bmp") != std::wstring::npos) found = true;
+    }
+    Emit(L"collect_image_paths_recorded_capture", found, L"");
 }
 
 }  // namespace
@@ -287,6 +331,9 @@ int wmain(int argc, wchar_t** argv) {
     CaseTruncated();
     CaseWriteActionJson();
     CaseTimingUsRoundtrip();
+    CaseInstantDurationDefaultZero();
+    CaseRecordedCaptureRoundtrip();
+    CaseCollectRecordedCapture();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

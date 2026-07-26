@@ -23,7 +23,10 @@ public:
 
     void Reset();
     bool WaitDeltaSeconds(double seconds, const std::function<bool()>& cancelled);
+    /// 绝对时间轴：相对 origin 累加；过点则追赶（不拉伸原点）。
     bool WaitDeltaUs(uint64_t deltaUs, const std::function<bool()>& cancelled);
+    /// 间隙模式：从「此刻」睡满 deltaUs（测试/特殊用途；录制回放用 WaitDeltaUs）。
+    bool WaitGapUs(uint64_t deltaUs, const std::function<bool()>& cancelled);
     bool WaitUntilElapsedUs(uint64_t targetElapsedUs,
         const std::function<bool()>& cancelled);
     InputTimelineStats Stats() const;

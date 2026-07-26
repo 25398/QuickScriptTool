@@ -83,10 +83,11 @@ struct ScriptAction {
     bool holdRightShift = false;
     // Wait: 等待秒数。mouseClick/keyClick/hotkeyShortcut/quickInput/scrollWheel/mousePlayback:
     //   相邻两次重复之间的间隔（clickCount=1 时不生效；首前/末后不等待）
-    double duration = 0.1;
+    // 默认 0：瞬时类（Move*/Down/Up/KeyDown/Up/FindImage）必须为 0；Wait/重复间隔类构建时显式设默认。
+    double duration = 0.0;
     // Wait: 随机附加等待。上列重复类动作: 重复间隔上的随机附加秒数
     double randomDuration = 0.0;
-    // 录制精密时间轴：前延迟微秒（优先于 duration 的浮点往返，减少漂移）
+    // Wait（及迁移期残留）：微秒步长，优先于 duration 浮点；version≥2 瞬时类应为 0
     uint64_t timingUs = 0;
     int loopCount = -1;                       // 循环次数 (-1=无限循环)
     std::wstring loopVarName;                  // 循环变量名
@@ -157,6 +158,10 @@ struct ScriptAction {
     double nSearchX1 = 0.0, nSearchY1 = 0.0, nSearchX2 = 0.0, nSearchY2 = 0.0;
     double nOffsetX = 0.0, nOffsetY = 0.0;
     double nAiSearchX1 = 0.0, nAiSearchY1 = 0.0, nAiSearchX2 = 0.0, nAiSearchY2 = 0.0;
+    // ── 录制点击自动截模板（升级为 findImage 前）──
+    std::wstring recordedCapturePath;  // JSON: recordedCapturePath；仅 MouseDown 有意义
+    int captureOffsetX = 0;            // JSON: captureOffsetX
+    int captureOffsetY = 0;            // JSON: captureOffsetY
 };
 
 // ── 容器动作判断辅助函数 ────────────────────────────────────────

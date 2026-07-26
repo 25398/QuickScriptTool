@@ -262,7 +262,7 @@ void PromptModal::RefreshOwnerAfterClose() {
         RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
-void PromptModal::ShowInfo(const std::wstring& message) {
+void PromptModal::ShowInfo(const std::wstring& message, std::function<void()> onClose) {
     message_ = message;
     mode_ = PromptModalMode::Info;
     hoverOk_ = false;
@@ -272,7 +272,11 @@ void PromptModal::ShowInfo(const std::wstring& message) {
     armedButton_ = PromptModalButton::None;
     // Owner usually opens us on WM_LBUTTONDOWN; the matching UP must not hit OK.
     suppressClickUntilRelease_ = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    onDone_ = nullptr;
+    if (onClose) {
+        onDone_ = [fn = std::move(onClose)](bool) { fn(); };
+    } else {
+        onDone_ = nullptr;
+    }
     visible_ = true;
     SyncShield();
     if (shield_) {

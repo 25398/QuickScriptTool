@@ -43,6 +43,8 @@ Source: "{#SourceDir}\opencv_world*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion recursesubdirs
 ; 配套扩展（网页键鼠桥）— 必选。缺文件时 ISCC 应报错，避免装完没有 extension\edge
 Source: "{#SourceDir}\extension\edge\*"; DestDir: "{app}\extension\edge"; Flags: ignoreversion recursesubdirs
+; VHID 安装链（_elevate_install + package + import_certs）— 必选；缺文件时 ISCC 应报错
+Source: "{#SourceDir}\driver\qst_vhid\*"; DestDir: "{app}\driver\qst_vhid"; Flags: ignoreversion recursesubdirs
 Source: "{#RedistDir}\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: RedistBundled
 
 [Dirs]

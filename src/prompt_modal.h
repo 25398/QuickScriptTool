@@ -40,7 +40,7 @@ public:
     bool visible() const { return visible_; }
     PromptModalMode mode() const { return mode_; }
 
-    void ShowInfo(const std::wstring& message);
+    void ShowInfo(const std::wstring& message, std::function<void()> onClose = nullptr);
     void ShowConfirm(const std::wstring& message, std::function<void(bool accepted)> onDone);
     void Close(PromptModalButton button = PromptModalButton::None);
 

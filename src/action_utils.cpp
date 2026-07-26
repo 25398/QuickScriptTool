@@ -1,5 +1,6 @@
 // ── 脚本动作辅助函数实现 ────────────────────────────────────
 #include "action_utils.h"
+#include "input/foreground_input_router.h"
 #include "input/mouse_input_backend.h"
 
 #include <algorithm>
@@ -342,11 +343,13 @@ std::wstring JsonTypeBriefLabel(const std::wstring& jsonType) {
     return jsonType;
 }
 
-std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions) {
+std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions,
+    size_t maxLines) {
     if (actions.empty()) return L"";
     std::wstring out =
         L"【动作一览 — 对用户说明时必须用下列名称（与编辑器动作列一致），禁止说英文 type】\n";
-    for (size_t i = 0; i < actions.size(); ++i) {
+
+    auto appendOne = [&](size_t i) {
         const int no = actions[i].originalNo > 0
             ? actions[i].originalNo : static_cast<int>(i + 1);
         out += L"第" + std::to_wstring(no) + L"步 " + ActionName(actions[i]);
@@ -355,7 +358,20 @@ std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions
         if (!actions[i].remark.empty())
             out += L" 备注:" + actions[i].remark;
         out += L"\n";
+    };
+
+    if (maxLines == 0 || actions.size() <= maxLines) {
+        for (size_t i = 0; i < actions.size(); ++i) appendOne(i);
+        return out;
     }
+
+    const size_t head = maxLines / 2;
+    const size_t tail = maxLines - head;
+    for (size_t i = 0; i < head; ++i) appendOne(i);
+    out += L"...（中间省略 " + std::to_wstring(actions.size() - maxLines)
+        + L" 步；共 " + std::to_wstring(actions.size())
+        + L" 步。优化请用 optimizeScript/optimizeRecording，勿请求全文）\n";
+    for (size_t i = actions.size() - tail; i < actions.size(); ++i) appendOne(i);
     return out;
 }
 
@@ -418,6 +434,11 @@ bool ScriptIsTimedInputSequence(const std::vector<ScriptAction>& actions) {
         case ActionType::EndLoop:
         case ActionType::StopMacro:
         case ActionType::Goto:
+        case ActionType::FindImage:
+        case ActionType::MousePlayback: // 嵌套录制回放须走精密轴
+        case ActionType::RunMacro:
+        case ActionType::RunBlock:
+        case ActionType::DefineBlock:
             break;
         default:
             return false;
@@ -517,11 +538,11 @@ bool IsExtendedVirtualKey(UINT vk) {
     case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
     case VK_INSERT: case VK_DELETE:
     case VK_DIVIDE:   // 小键盘 /
-    case VK_NUMLOCK:
     case VK_RCONTROL: case VK_RMENU:
     case VK_LWIN: case VK_RWIN: case VK_APPS:
     case VK_SNAPSHOT:
         return true;
+    // NumLock 是非扩展 Set-1 0x45；标成 EXTENDED 会导致 VirtualHid 映射失败。
     default:
         return false;
     }
@@ -557,6 +578,10 @@ void SendKeyboardKey(UINT vk, bool down) {
     }
     if (scan == 0) return;
 
+    if (ForegroundInputRouter::Instance().IsHidActive()) {
+        if (ForegroundInputRouter::Instance().SendKey(scan, down, extended)) return;
+    }
+
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wScan = scan;
@@ -579,24 +604,45 @@ void SendMouseMoveRelative(int dx, int dy) {
     MouseInputRouter::Instance().MoveRelative(dx, dy);
 }
 
+bool SetCursorScreenPos(int x, int y) {
+    return ForegroundInputRouter::Instance().SetCursorScreen(x, y);
+}
+
 MouseBallisticsGuard::MouseBallisticsGuard(bool enable) {
     if (!enable) return;
     active_ = true;
     SystemParametersInfoW(SPI_GETMOUSE, 0, mouseParams_, 0);
     SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &mouseSpeed_, 0);
     // 阈值与增强精度全部清零；速度 10 = 1:1 mickey（贴合 Raw 录制计数值）
+    // 不用 SPIF_SENDCHANGE，避免广播惊动游戏/其它进程。
+    // SPIF_UPDATEINIFILE：部分环境仅 flags=0 时 GET 仍读到旧加速，写入用户配置更稳。
+    constexpr UINT kSpiFlags = SPIF_UPDATEINIFILE;
     int flat[3] = { 0, 0, 0 };
-    SystemParametersInfoW(SPI_SETMOUSE, 0, flat, SPIF_SENDCHANGE);
     int mid = 10;
-    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, &mid, SPIF_SENDCHANGE);
-    // 给系统一点时间让加速表生效；切勿再发零位移 SendInput（会灌进游戏导致视角微抖）。
-    Sleep(1);
+    auto applyFlat = [&]() {
+        SystemParametersInfoW(SPI_SETMOUSE, 0, flat, kSpiFlags);
+        SystemParametersInfoW(SPI_SETMOUSESPEED, 0, &mid, kSpiFlags);
+    };
+    auto readFlat = [&]() {
+        int check[3]{};
+        int speed = 0;
+        SystemParametersInfoW(SPI_GETMOUSE, 0, check, 0);
+        SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &speed, 0);
+        return check[0] == 0 && check[1] == 0 && check[2] == 0 && speed == 10;
+    };
+    applyFlat();
+    flatVerified_ = readFlat();
+    if (!flatVerified_) {
+        applyFlat();
+        flatVerified_ = readFlat();
+    }
 }
 
 MouseBallisticsGuard::~MouseBallisticsGuard() {
     if (!active_) return;
-    SystemParametersInfoW(SPI_SETMOUSE, 0, mouseParams_, SPIF_SENDCHANGE);
-    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, &mouseSpeed_, SPIF_SENDCHANGE);
+    constexpr UINT kSpiFlags = SPIF_UPDATEINIFILE;
+    SystemParametersInfoW(SPI_SETMOUSE, 0, mouseParams_, kSpiFlags);
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, &mouseSpeed_, kSpiFlags);
 }
 
 PlaybackProcessPriorityGuard::PlaybackProcessPriorityGuard(bool enable) {

@@ -61,12 +61,16 @@ bool GetTemplateBitmapSize(const std::wstring& path, int& outW, int& outH) {
     return true;
 }
 
+}  // namespace
+
 void SyncFindImageOffsetNorm(ScriptAction& a) {
     int tplW = 0, tplH = 0;
     if (!GetTemplateBitmapSize(a.imagePath, tplW, tplH)) return;
     a.nOffsetX = a.offsetX / static_cast<double>(tplW);
     a.nOffsetY = a.offsetY / static_cast<double>(tplH);
 }
+
+namespace {
 
 void DenormFindImageOffsetPixels(ScriptAction& a) {
     int tplW = 0, tplH = 0;

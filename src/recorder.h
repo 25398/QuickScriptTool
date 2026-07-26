@@ -10,7 +10,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <vector>
 
 enum class RecordingCaptureMode : int {
@@ -37,6 +39,9 @@ struct RecordedEvent {
     int x = 0, y = 0;          // 绝对坐标；相对移动时为 dx/dy
     int wheelDelta = 0;        // 滚轮增量（正上/右，负下/左）
     RecordedEventSource source = RecordedEventSource::Synthetic;
+    std::wstring capturePath;  // BUTTON DOWN 异步截图完成后回填
+    int captureOffsetX = 0;    // 边缘裁剪补偿 → FindImage.offset
+    int captureOffsetY = 0;
 };
 
 // ── 全局录制状态 ──────────────────────────────────────────────────
@@ -67,6 +72,30 @@ RecordingCaptureMode GetRecordingCaptureMode();
 
 /// 设置录制时需忽略的全局停止热键（避免终止键被录入脚本）
 void SetRecordingIgnoreHotkey(UINT modifiers, UINT vk, bool enabled);
+
+/// 录制调试输出（钩子线程可调；空 sink 关闭）。主窗在启停录制时接入宏调试窗。
+using RecordingDebugSink = std::function<void(const std::wstring&)>;
+void SetRecordingDebugSink(RecordingDebugSink sink);
+void ClearRecordingDebugStats();
+struct RecordingDebugStats {
+    uint64_t keyDown = 0;
+    uint64_t keyUp = 0;
+    uint64_t keyRepeatSkipped = 0;
+    uint64_t mouseDown = 0;
+    uint64_t mouseUp = 0;
+    uint64_t wheel = 0;
+    uint64_t absMove = 0;
+    uint64_t relMove = 0;
+};
+RecordingDebugStats GetRecordingDebugStats();
+
+/// 录制点击自动截模板：StartRecording 注入；钩子内仅入队
+void SetRecordingClickCaptureConfig(bool enabled, int halfSize);
+/// Stop 时在 Convert 前调用；超时后仍返回（缺 path 视为无模板）
+void FlushClickCaptures(DWORD timeoutMs = 3000);
+/// 异常停录：丢弃队列，不 Convert
+void DiscardClickCaptures();
+uint64_t GetRecordingClickCaptureSessionId();
 
 /// 提升系统定时器精度（回放/录制短等待）；成对调用 EndHighResTimer
 void BeginHighResTimer();

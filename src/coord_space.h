@@ -82,6 +82,9 @@ void DenormalizeScriptToCurrentScreen(std::vector<ScriptAction>& actions);
 /// 执行前：用内存中的像素字段刷新 n*（编辑器未保存的改动）
 void SyncNormFieldsFromPixels(std::vector<ScriptAction>& actions, const CoordMeta& meta);
 
+/// 找图 offset 像素 → nOffset（相对模板宽高）
+void SyncFindImageOffsetNorm(ScriptAction& a);
+
 /// 执行前：从 n* 反算到目标分辨率像素（深拷贝 actions 后调用，即运行副本）
 std::vector<ScriptAction> PrepareScriptActionsForExecution(
     const std::vector<ScriptAction>& actions, const CoordMeta& scriptMeta);

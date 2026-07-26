@@ -8,6 +8,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include <sstream>
 
@@ -254,6 +255,9 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         action.y = JsonInt(p, "y");
         action.randomX = std::max(0, JsonInt(p, "randomX"));
         action.randomY = std::max(0, JsonInt(p, "randomY"));
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
         break;
 
     case ActionType::MoveMouseRelative:
@@ -263,11 +267,21 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         action.randomX = std::max(0, JsonInt(p, "randomX"));
         action.randomY = std::max(0, JsonInt(p, "randomY"));
         action.coordsAreNormalized = false;
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
         break;
 
     case ActionType::Wait:
         action.duration = std::max(0.0, JsonDouble(p, "duration", JsonDouble(p, "seconds", 0.5)));
         action.randomDuration = std::max(0.0, JsonDouble(p, "randomDuration", 0.0));
+        action.timingUs = static_cast<uint64_t>(std::max(0.0, JsonDouble(p, "timingUs", 0.0)));
+        if (action.timingUs == 0 && action.duration > 0.0) {
+            const long double us = static_cast<long double>(action.duration) * 1000000.0L;
+            action.timingUs = static_cast<uint64_t>(std::llround(us));
+        } else if (action.timingUs > 0) {
+            action.duration = action.timingUs / 1000000.0;
+        }
         break;
 
     case ActionType::MouseClick:
@@ -281,7 +295,15 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
     case ActionType::MouseDown:
     case ActionType::MouseUp:
         action.button = ParseButton(p);
+        action.x = JsonInt(p, "x");
+        action.y = JsonInt(p, "y");
+        action.recordedCapturePath = Trim(JsonWString(p, "recordedCapturePath"));
+        action.captureOffsetX = JsonInt(p, "captureOffsetX");
+        action.captureOffsetY = JsonInt(p, "captureOffsetY");
         ApplyModifierFields(action, p);
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
         break;
 
     case ActionType::KeyClick:
@@ -298,6 +320,9 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         if (action.keyText.empty()) action.keyText = L"7";
         action.keyVk = ResolveKeyVk(p, action.keyText);
         ApplyModifierFields(action, p);
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
         break;
 
     case ActionType::HotkeyShortcut: {
@@ -369,6 +394,9 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         action.findImageFollowUp = ParseFollowUpValue(p, "findImageFollowUp", 0);
         action.offsetX = JsonInt(p, "offsetX");
         action.offsetY = JsonInt(p, "offsetY");
+        action.recordedCapturePath = Trim(JsonWString(p, "recordedCapturePath"));
+        action.captureOffsetX = JsonInt(p, "captureOffsetX");
+        action.captureOffsetY = JsonInt(p, "captureOffsetY");
         action.matchVarName = Trim(JsonWString(p, "matchVarName", L"matchRet"));
         if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
         if (action.findImageFollowUp == 2) {
@@ -377,6 +405,9 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
             action.findTimeExpr = JsonWString(p, "findTimeExpr", L"0");
             if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
         }
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
         break;
     }
 

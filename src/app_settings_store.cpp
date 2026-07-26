@@ -79,6 +79,26 @@ void LoadPlaybackSettings(const std::wstring& obj, quickscript::PlaybackTabSetti
     out.playbackIntervalMaxSeconds = ParseDoubleField(obj, L"playbackIntervalMaxSeconds", out.playbackIntervalMaxSeconds);
     out.enableDebugOutputWindow = ParseBoolField(obj, L"enableDebugOutputWindow", out.enableDebugOutputWindow);
     out.autoOutputKeyFunctionDebug = ParseBoolField(obj, L"autoOutputKeyFunctionDebug", out.autoOutputKeyFunctionDebug);
+    out.recordingClickCaptureEnabled = ParseBoolField(obj, L"recordingClickCaptureEnabled",
+        out.recordingClickCaptureEnabled);
+    out.recordingClickCaptureHalfSize = ParseIntField(obj, L"recordingClickCaptureHalfSize",
+        out.recordingClickCaptureHalfSize);
+    if (out.recordingClickCaptureHalfSize < 16) out.recordingClickCaptureHalfSize = 16;
+    if (out.recordingClickCaptureHalfSize > 120) out.recordingClickCaptureHalfSize = 120;
+    out.enableHidDriverSimulation = ParseBoolField(obj, L"enableHidDriverSimulation",
+        out.enableHidDriverSimulation);
+    if (obj.find(L"\"foregroundInputBackend\"") != std::wstring::npos) {
+        out.foregroundInputBackend = quickscript::ClampForegroundInputBackend(
+            ParseIntField(obj, L"foregroundInputBackend",
+                static_cast<int>(out.foregroundInputBackend)));
+    } else if (out.enableHidDriverSimulation) {
+        out.foregroundInputBackend = quickscript::ForegroundInputBackend::Interception;
+    } else {
+        out.foregroundInputBackend = quickscript::ForegroundInputBackend::Software;
+    }
+    // Keep legacy bool in sync for Agent / old UI paths
+    out.enableHidDriverSimulation =
+        out.foregroundInputBackend != quickscript::ForegroundInputBackend::Software;
 }
 
 void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& out) {
@@ -193,7 +213,13 @@ void WritePlaybackSettings(std::wofstream& file, const quickscript::PlaybackTabS
     file << L"    \"playbackIntervalMinSeconds\": " << s.playbackIntervalMinSeconds << L",\n";
     file << L"    \"playbackIntervalMaxSeconds\": " << s.playbackIntervalMaxSeconds << L",\n";
     file << L"    \"enableDebugOutputWindow\": " << (s.enableDebugOutputWindow ? L"true" : L"false") << L",\n";
-    file << L"    \"autoOutputKeyFunctionDebug\": " << (s.autoOutputKeyFunctionDebug ? L"true" : L"false") << L"\n";
+    file << L"    \"autoOutputKeyFunctionDebug\": " << (s.autoOutputKeyFunctionDebug ? L"true" : L"false") << L",\n";
+    file << L"    \"recordingClickCaptureEnabled\": " << (s.recordingClickCaptureEnabled ? L"true" : L"false") << L",\n";
+    file << L"    \"recordingClickCaptureHalfSize\": " << s.recordingClickCaptureHalfSize << L",\n";
+    file << L"    \"foregroundInputBackend\": " << static_cast<int>(s.foregroundInputBackend) << L",\n";
+    file << L"    \"enableHidDriverSimulation\": "
+        << ((s.foregroundInputBackend != quickscript::ForegroundInputBackend::Software) ? L"true" : L"false")
+        << L"\n";
 }
 
 void WriteOtherSettings(std::wofstream& file, const quickscript::OtherTabSettings& s) {

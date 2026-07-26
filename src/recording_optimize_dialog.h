@@ -13,6 +13,7 @@
 #include "drawing.h"
 #include "script_io.h"
 #include "script_types.h"
+#include "recording_to_findimage.h"
 #include "utils.h"
 #include "prompt_modal.h"
 #include "ui_scale.h"
@@ -208,6 +209,7 @@ private:
     void PrerenderMoreRowLabels();
     void ApplyActionChange();
     void UpdatePanelControls();
+    void RedrawVisibleEdits();
     void CenterEditTextVertically(HWND edit);
     void CreateDropPopup();
     void SyncDropPopup();
@@ -240,7 +242,11 @@ private:
     void ApplyWaitAdjust();
     void ApplyMoveMerge();
     void ApplyMoveCompress();
+    void ApplyConvertToFindImage();
     bool WaitMatchesFilter(double duration, double compareValue) const;
+    std::wstring ResolveConvertFindTimeExpr() const;
+    RECT FindWaitRadioRect(int mode) const;
+    RECT FindWaitTimeEditRect() const;
 
     void ShowAlert(const wchar_t* message);
     bool SaveToNewRecording();
@@ -266,6 +272,11 @@ private:
     std::vector<uint8_t> actionParsed_;
     bool loadCoordsNormalized_ = false;
     CoordMeta loadCoordMeta_{};
+    CoordMeta sourceCoordMeta_{};
+    int sourceRecordingCaptureMode_ = -1;
+    int sourceInputTimingVersion_ = 0;
+    double sourceBreakoutTimeSeconds_ = 0;
+    std::wstring convertResultText_;
     std::wstring sourcePath_;
     Hotkey hotkey_{};
     int originalActionCount_ = 0;
@@ -294,6 +305,9 @@ private:
     double mergeWaitValue_ = 0.1;
     double compressWait_ = 0.1;
     double compressThreshold_ = 1.0;
+    /// 转为找图：0=只找一次 1=直到找到 2=限时秒数
+    int findWaitMode_ = 0;
+    double findWaitSeconds_ = 30.0;
 
     bool done_ = false;
     bool saved_ = false;

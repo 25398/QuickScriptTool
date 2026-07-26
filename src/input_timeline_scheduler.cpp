@@ -8,9 +8,9 @@
 #endif
 
 namespace {
-// 高报率轨迹间隔常 <2ms；末段自旋加长，timer 切片缩短，压低尾部抖动。
-constexpr uint64_t kSpinRemainUs = 3500;
-constexpr uint64_t kTightSpinUs = 1200;
+// FPS 相对包常见 ~8ms：整段自旋，避免 waitable timer 唤醒抖动导致每次回放相位不同。
+constexpr uint64_t kSpinRemainUs = 12000;
+constexpr uint64_t kTightSpinUs = 1500;
 constexpr uint64_t kMaxTimerSliceUs = 500;
 }
 
@@ -75,7 +75,6 @@ bool PrecisionInputTimeline::WaitUntilDeadlineQpc(
             }
         }
 
-        // 最后 ~0.5ms：尽量不 Yield，减少被调度抢走的概率。
         if (remainingUs <= kTightSpinUs) {
             for (;;) {
                 if (cancelled()) return false;
@@ -114,6 +113,23 @@ bool PrecisionInputTimeline::WaitDeltaUs(
     if (originQpc_ == 0) Reset();
     elapsedUs_ += deltaUs;
     const int64_t deadline = originQpc_ + UsToQpcDelta(elapsedUs_);
+    const int64_t now = NowQpc();
+    if (now < deadline)
+        return WaitUntilDeadlineQpc(deadline, cancelled);
+
+    // 已过点：立刻追赶，不拉伸原点。
+    // 拉伸会让后续键鼠相对「开局时刻」永久偏相，FPS 开环下比偶发连发更伤还原。
+    lastLatenessUs_ = QpcDeltaToUs(now - deadline);
+    latenessUs_.push_back(lastLatenessUs_);
+    return !cancelled();
+}
+
+bool PrecisionInputTimeline::WaitGapUs(
+    uint64_t deltaUs, const std::function<bool()>& cancelled) {
+    if (deltaUs == 0) return !cancelled();
+    // 从此刻起睡满间隔：不追赶、不压缩，相对视角节奏与录制一致。
+    const int64_t deadline = NowQpc() + UsToQpcDelta(deltaUs);
+    elapsedUs_ += deltaUs;
     return WaitUntilDeadlineQpc(deadline, cancelled);
 }
 

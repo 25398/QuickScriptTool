@@ -1597,12 +1597,28 @@ void AgentDialog::OnStatus(const std::wstring& status) {
     if (status == lastStatusText_) return;
 
     lastStatusText_ = status;
+    // 尚无模型思考字时，把连接/等待进度写入思维链（不标记为已有思考，以免挡住真正推理）
+    if (thinkingBlockOpen_ && thinkingCharCount_ == 0)
+        AppendStyledText(L"· " + status + L"\n", kHint);
     const RECT thinkRc = ThinkingStatusRect();
     InvalidateRect(hwnd_, &thinkRc, FALSE);
 }
 
+void AgentDialog::OnToolCall(const std::wstring& name, const std::wstring& /*args*/) {
+    const std::wstring label = ToolSkillLabel(name);
+    if (thinkingBlockOpen_) {
+        AppendThinkingLine(L"· " + label);
+        return;
+    }
+    if (thinking_) {
+        lastStatusText_ = L"调用工具: " + label;
+        const RECT thinkRc = ThinkingStatusRect();
+        InvalidateRect(hwnd_, &thinkRc, FALSE);
+    }
+}
+
 void AgentDialog::OnReasoning(const std::wstring& reasoning) {
-    if (thinkingBlockOpen_ && !thinkingHasContent_)
+    if (thinkingBlockOpen_ && !thinkingHasContent_ && !reasoning.empty())
         AppendThinkingLine(reasoning);
 }
 
@@ -1631,19 +1647,6 @@ void AgentDialog::OnAssistantResponse(const std::wstring& text) {
         if (!text.empty()) AddMessage(L"assistant", text);
     }
     if (inputEdit_) SetFocus(inputEdit_);
-}
-
-void AgentDialog::OnToolCall(const std::wstring& name, const std::wstring& /*args*/) {
-    const std::wstring label = ToolSkillLabel(name);
-    if (thinkingBlockOpen_) {
-        AppendThinkingLine(L"· " + label);
-        return;
-    }
-    if (thinking_) {
-        lastStatusText_ = L"调用工具: " + label;
-        const RECT thinkRc = ThinkingStatusRect();
-        InvalidateRect(hwnd_, &thinkRc, FALSE);
-    }
 }
 
 void AgentDialog::OnError(const std::wstring& error) {

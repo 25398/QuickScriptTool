@@ -4,6 +4,7 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "utils.h"
+#include "input/foreground_input_router.h"
 
 #include <atomic>
 #include <vector>
@@ -77,6 +78,8 @@ inline void BreakoutSignalUserInput() {
 inline bool BreakoutShouldMonitor() {
     if (!g_breakoutHookState || !g_breakoutHookState->running) return false;
     if (!g_breakoutHookState->running->load(std::memory_order_relaxed)) return false;
+    // HID/Interception 注入不带 LLKHF_INJECTED，无法与真人输入区分；HID 会话内停用脱离检测。
+    if (ForegroundInputRouter::Instance().IsHidActive()) return false;
     if (g_breakoutHookState->simulatingDepth
         && g_breakoutHookState->simulatingDepth->load(std::memory_order_relaxed) > 0) {
         return false;

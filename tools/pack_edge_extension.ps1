@@ -77,7 +77,8 @@ if ($bridgeVer -ne $ver) {
 Write-Host ("OK  extension\edge v{0}  files+JSON OK" -f $ver)
 
 if ($SkipZip) {
-    exit 0
+    # Use return (not exit) so callers like package_release.ps1 keep their variables.
+    return
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -120,4 +121,4 @@ try {
 Write-Host ("OK  Zip: {0}" -f $zipPath)
 Write-Host ""
 Write-Host "Install: unzip, then edge://extensions -> Load unpacked -> folder with manifest.json"
-exit 0
+# Use return (not exit) so callers like package_release.ps1 keep their variables.

@@ -29,6 +29,8 @@ public:
 
     /// 线程安全：可从工作线程调用
     void AppendLog(const std::wstring& text);
+    /// 一次刷入多行（单次 Edit 更新），用于精密轴回放结束后批量输出
+    void AppendLogBatch(const std::vector<std::wstring>& lines);
     void ClearLog();
 
 private:
