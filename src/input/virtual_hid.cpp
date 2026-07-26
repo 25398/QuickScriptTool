@@ -210,9 +210,7 @@ bool VirtualHidBackend::SubmitMouseAbsLocked(unsigned char buttons, unsigned sho
 }
 
 bool VirtualHidBackend::SubmitMouseButtonsLocked() {
-    if (pointerMode_ == PointerMode::Absolute) {
-        return SubmitMouseAbsLocked(mouseButtons_, lastAbsX_, lastAbsY_);
-    }
+    // 按钮只发相对零位移，避免绝对报告把光标按主屏映射拽偏。
     return SubmitMouseRelLocked(mouseButtons_, 0, 0, 0, 0);
 }
 
@@ -247,6 +245,8 @@ bool VirtualHidBackend::Open(std::wstring* errorOut) {
     pointerMode_ = PointerMode::Relative;
     lastAbsX_ = 0;
     lastAbsY_ = 0;
+    lastScreenX_ = 0;
+    lastScreenY_ = 0;
     lastError_.clear();
     return true;
 }
@@ -265,6 +265,8 @@ void VirtualHidBackend::Close() {
     pointerMode_ = PointerMode::Relative;
     lastAbsX_ = 0;
     lastAbsY_ = 0;
+    lastScreenX_ = 0;
+    lastScreenY_ = 0;
 }
 
 bool VirtualHidBackend::IsOpen() const {
@@ -326,22 +328,28 @@ bool VirtualHidBackend::MoveRelative(int dx, int dy) {
 
 bool VirtualHidBackend::MoveAbsoluteScreen(int screenX, int screenY) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // 不向系统提交 HID 绝对报告：mouhid 多屏常按主屏映射，且与 SetCursorPos 异步打架导致轨迹乱漂。
+    // 桌面绝对回放由 ForegroundInputRouter::SetCursorScreen → SetCursorPos 落像素；
+    // 点击/滚轮仍走相对 HID 报告（见 SubmitMouseButtonsLocked / Wheel）。
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (vw <= 1 || vh <= 1) {
-        lastError_ = L"invalid virtual screen metrics";
-        return false;
+    if (vw > 1 && vh > 1) {
+        long long nx64 = (static_cast<long long>(screenX - vx) * 65535) / (vw - 1);
+        long long ny64 = (static_cast<long long>(screenY - vy) * 65535) / (vh - 1);
+        if (nx64 < 0) nx64 = 0;
+        if (ny64 < 0) ny64 = 0;
+        if (nx64 > 65535) nx64 = 65535;
+        if (ny64 > 65535) ny64 = 65535;
+        lastAbsX_ = static_cast<unsigned short>(nx64);
+        lastAbsY_ = static_cast<unsigned short>(ny64);
     }
-    const unsigned short nx = static_cast<unsigned short>(
-        (static_cast<long long>(screenX - vx) * 65535) / (vw - 1));
-    const unsigned short ny = static_cast<unsigned short>(
-        (static_cast<long long>(screenY - vy) * 65535) / (vh - 1));
     pointerMode_ = PointerMode::Absolute;
-    lastAbsX_ = nx;
-    lastAbsY_ = ny;
-    return SubmitMouseAbsLocked(mouseButtons_, nx, ny);
+    lastScreenX_ = screenX;
+    lastScreenY_ = screenY;
+    lastError_.clear();
+    return true;
 }
 
 bool VirtualHidBackend::Button(MouseButtonType button, bool down) {

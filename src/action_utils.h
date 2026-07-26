@@ -78,7 +78,7 @@ void MouseClick(MouseButtonType button);
 /// 相对移动鼠标（dx/dy 像素，SendInput MOUSEEVENTF_MOVE；FPS 视角等）
 void SendMouseMoveRelative(int dx, int dy);
 
-/// 前台绝对移标：HID 会话走 Interception absolute，否则 SetCursorPos
+/// 前台绝对移标：VirtualHid→SetCursorPos；Interception→绝对报告+钉像素；否则 SetCursorPos
 bool SetCursorScreenPos(int x, int y);
 
 /// 精密回放时临时关闭鼠标加速并设中性速度（录制为 Raw，回放 SendInput 会再套加速）

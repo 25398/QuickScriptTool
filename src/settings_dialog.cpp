@@ -315,7 +315,7 @@ void SettingsDialog::InstallHidDriver() {
     std::wstring probeErr;
     const bool ready = HidInterceptionBackend::Instance().ProbeAvailable(&probeErr);
     if (ready) {
-        ShowPromptAlert(L"Interception 驱动已就绪。\n可在上方选择「Interception」后回放。");
+        ShowPromptAlert(L"Interception 驱动已就绪。\n可在上方选择「Interception」后用于连点/录制回放/鼠标宏。");
     } else {
         ShowPromptAlert(L"安装程序已执行。\n请重启电脑后再选择「Interception」。");
     }
@@ -390,7 +390,7 @@ void SettingsDialog::InstallVirtualHidDriver() {
 
     std::wstring probeErr;
     if (VirtualHidBackend::Instance().ProbeAvailable(&probeErr)) {
-        ShowPromptAlert(L"虚拟 HID 已就绪。\n可在上方选择「虚拟HID」后回放。");
+        ShowPromptAlert(L"虚拟 HID 已就绪。\n可在上方选择「虚拟HID」后用于连点/录制回放/鼠标宏。");
         return;
     }
 
@@ -1291,16 +1291,16 @@ void SettingsDialog::SaveAndClose() {
             std::wstring err;
             if (!HidInterceptionBackend::Instance().ProbeAvailable(&err)) {
                 warn = err.empty()
-                    ? L"设置已保存，但 Interception 未就绪，回放将回退系统模拟。\n请安装驱动并重启后再试。"
-                    : (L"设置已保存，但 Interception 未就绪，回放将回退系统模拟。\n" + err);
+                    ? L"设置已保存，但 Interception 未就绪，连点/录制回放/鼠标宏将回退系统模拟。\n请安装驱动并重启后再试。"
+                    : (L"设置已保存，但 Interception 未就绪，连点/录制回放/鼠标宏将回退系统模拟。\n" + err);
             }
         } else if (working_.playback.foregroundInputBackend
             == quickscript::ForegroundInputBackend::VirtualHid) {
             std::wstring err;
             if (!VirtualHidBackend::Instance().ProbeAvailable(&err)) {
                 warn = err.empty()
-                    ? L"设置已保存，但虚拟 HID 未就绪，回放将回退系统模拟。\n请先点「安装虚拟 HID 驱动」。"
-                    : (L"设置已保存，但虚拟 HID 未就绪，回放将回退系统模拟。\n" + err);
+                    ? L"设置已保存，但虚拟 HID 未就绪，连点/录制回放/鼠标宏将回退系统模拟。\n请先点「安装虚拟 HID 驱动」。"
+                    : (L"设置已保存，但虚拟 HID 未就绪，连点/录制回放/鼠标宏将回退系统模拟。\n" + err);
             }
         }
     }

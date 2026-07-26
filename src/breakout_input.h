@@ -5,6 +5,7 @@
 
 #include "utils.h"
 #include "input/foreground_input_router.h"
+#include "input/synthetic_input_filter.h"
 
 #include <atomic>
 #include <vector>
@@ -78,13 +79,21 @@ inline void BreakoutSignalUserInput() {
 inline bool BreakoutShouldMonitor() {
     if (!g_breakoutHookState || !g_breakoutHookState->running) return false;
     if (!g_breakoutHookState->running->load(std::memory_order_relaxed)) return false;
-    // HID/Interception 注入不带 LLKHF_INJECTED，无法与真人输入区分；HID 会话内停用脱离检测。
-    if (ForegroundInputRouter::Instance().IsHidActive()) return false;
+    // Software SendInput：仍用 simulatingDepth；驱动级改走指纹 / VirtualHid Raw 设备过滤。
     if (g_breakoutHookState->simulatingDepth
-        && g_breakoutHookState->simulatingDepth->load(std::memory_order_relaxed) > 0) {
+        && g_breakoutHookState->simulatingDepth->load(std::memory_order_relaxed) > 0
+        && !ForegroundInputRouter::Instance().IsHidActive()) {
         return false;
     }
     return true;
+}
+
+/// VirtualHid 会话：Raw 用于识别自家设备；鼠标脱离主路径改回 LL（见 BreakoutMouseProc）。
+/// 保留此函数供 WM_INPUT 判断是否仍需做 Raw 侧辅助。
+inline bool BreakoutUseRawInputForMouse() {
+    return ForegroundInputRouter::Instance().IsHidActive()
+        && ForegroundInputRouter::Instance().ActiveBackend()
+            == quickscript::ForegroundInputBackend::VirtualHid;
 }
 
 inline LRESULT CALLBACK BreakoutKbProc(int code, WPARAM wp, LPARAM lp) {
@@ -92,9 +101,14 @@ inline LRESULT CALLBACK BreakoutKbProc(int code, WPARAM wp, LPARAM lp) {
         const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
         if (down) {
             auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
-            // 脚本注入的按键不算「用户脱离」
-            if (!(ks->flags & LLKHF_INJECTED)
-                && !BreakoutShouldIgnoreInput(WM_KEYDOWN, static_cast<UINT>(ks->vkCode))) {
+            const bool injected = (ks->flags & LLKHF_INJECTED) != 0;
+            const bool ext = (ks->flags & LLKHF_EXTENDED) != 0;
+            const UINT vk = static_cast<UINT>(ks->vkCode);
+            const auto scan = static_cast<unsigned short>(ks->scanCode);
+            // 脚本注入 / 驱动指纹 不算「用户脱离」
+            if (!injected
+                && !synthetic_input::MatchesKey(vk, scan, ext, true)
+                && !BreakoutShouldIgnoreInput(WM_KEYDOWN, vk)) {
                 BreakoutSignalUserInput();
             }
         }
@@ -104,21 +118,35 @@ inline LRESULT CALLBACK BreakoutKbProc(int code, WPARAM wp, LPARAM lp) {
 
 inline LRESULT CALLBACK BreakoutMouseProc(int code, WPARAM wp, LPARAM lp) {
     if (code >= 0 && BreakoutShouldMonitor()) {
+        // VirtualHid 与 Interception 均走 LL：
+        // - SetCursorPos 带 LLMHF_INJECTED，不会误脱离
+        // - 驱动注入无 INJECTED，靠 breakout 指纹（移动/键/按钮）过滤
+        // Raw Input 仍负责：识别自家 VirtualHid 设备；非自家 Raw 纯移动忽略（防 SetCursorPos 回灌）
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
-        if (!(ms->flags & LLMHF_INJECTED)) {
-            UINT btnVk = 0;
-            const UINT msg = static_cast<UINT>(wp);
-            if (wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP) btnVk = VK_LBUTTON;
-            else if (wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP) btnVk = VK_RBUTTON;
-            else if (wp == WM_MBUTTONDOWN || wp == WM_MBUTTONUP) btnVk = VK_MBUTTON;
-            else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
-                btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
-            }
-            const bool actionable = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN
-                || wp == WM_XBUTTONDOWN || wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL || wp == WM_MOUSEMOVE;
-            if (actionable && !BreakoutShouldIgnoreInput(msg, btnVk)) {
-                BreakoutSignalUserInput();
-            }
+        const bool injected = (ms->flags & LLMHF_INJECTED) != 0;
+        UINT btnVk = 0;
+        const UINT msg = static_cast<UINT>(wp);
+        bool down = false;
+        if (wp == WM_LBUTTONDOWN) { btnVk = VK_LBUTTON; down = true; }
+        else if (wp == WM_LBUTTONUP) { btnVk = VK_LBUTTON; }
+        else if (wp == WM_RBUTTONDOWN) { btnVk = VK_RBUTTON; down = true; }
+        else if (wp == WM_RBUTTONUP) { btnVk = VK_RBUTTON; }
+        else if (wp == WM_MBUTTONDOWN) { btnVk = VK_MBUTTON; down = true; }
+        else if (wp == WM_MBUTTONUP) { btnVk = VK_MBUTTON; }
+        else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
+            btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+            down = (wp == WM_XBUTTONDOWN);
+        }
+        const bool actionable = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN
+            || wp == WM_XBUTTONDOWN || wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL || wp == WM_MOUSEMOVE;
+        bool synthetic = injected;
+        if (!synthetic) {
+            if (wp == WM_MOUSEMOVE) synthetic = synthetic_input::MatchesMouseMove();
+            else if (wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL) synthetic = synthetic_input::MatchesMouseWheel();
+            else if (btnVk) synthetic = synthetic_input::MatchesMouseButton(btnVk, down);
+        }
+        if (actionable && !synthetic && !BreakoutShouldIgnoreInput(msg, btnVk)) {
+            BreakoutSignalUserInput();
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);

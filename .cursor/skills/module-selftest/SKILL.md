@@ -195,7 +195,7 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `device_open` | 驱动未装 / `_elevate_install.ps1` / 设备接口 GUID |
 | `key_press_release` | `VirtualHidBackend::SendKey` / Report ID 1 / scan→HID |
 | `mouse_rel_move` | Report ID 2 / `MoveRelative` |
-| `mouse_abs_jump` | Report ID 3 / 虚拟桌面归一化 |
+| `mouse_abs_jump` | 仅更新内部状态（不发 Report ID 3）；桌面绝对由 SetCursorPos |
 | `mouse_wheel` | Report ID 2 wheel/hwheel |
 | `release_all_no_stick` | `ReleaseAll` / EndSession |
 

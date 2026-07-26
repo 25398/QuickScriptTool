@@ -25,7 +25,7 @@ const selftest::CaseInfo kCases[] = {
     {L"key_numlock_non_ext", L"inject", L"NumLock scan 0x45 without E0 prefix"},
     {L"key_slot_compact", L"inject", L"Release middle key then press another (packed slots)"},
     {L"mouse_rel_move", L"inject", L"MoveRelative small dx/dy"},
-    {L"mouse_abs_jump", L"inject", L"MoveAbsoluteScreen near virtual desktop center"},
+    {L"mouse_abs_jump", L"inject", L"MoveAbsoluteScreen updates state (no abs HID submit)"},
     {L"mouse_wheel", L"inject", L"Wheel vertical notch + clear pulse"},
     {L"release_all_no_stick", L"inject", L"ReleaseAll clears keys/buttons"},
 };

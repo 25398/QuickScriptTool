@@ -40,6 +40,7 @@
 #include "image_match.h"
 #include "input/foreground_input_router.h"
 #include "input/mouse_input_backend.h"
+#include "input/synthetic_input_filter.h"
 #include "input_timeline_scheduler.h"
 #include "macro_variables.h"
 #include "macro_debug_window.h"
@@ -60,6 +61,7 @@
 #include "scheduled_task_ui.h"
 #include "settings_dialog.h"
 #include "tray_menu.h"
+#include "themed_popup_menu.h"
 #include "match_overlay.h"
 #include "findimage_crop_editor.h"
 #include "ocr_overlay.h"
@@ -141,11 +143,15 @@ inline bool IsActiveHoldHotkeyId(int id) {
 }
 
 /// 设置热键弹窗打开时：放行「正在编辑」的那枚键（便于同键改短按↔长按），其它占用键仍拦截。
+/// 动作「按键点击/按下」捕获时 passAll：放行全部键，避免与启停热键撞车导致无法录入。
 inline bool ghHotkeyCaptureOpen = false;
+inline bool ghHotkeyCapturePassAll = false;
 inline UINT ghHotkeyCaptureIgnoreVk = 0;
 
 inline bool IsHotkeyCapturePassThroughVk(UINT vk) {
-    return ghHotkeyCaptureOpen && ghHotkeyCaptureIgnoreVk != 0 && vk == ghHotkeyCaptureIgnoreVk;
+    if (!ghHotkeyCaptureOpen) return false;
+    if (ghHotkeyCapturePassAll) return true;
+    return ghHotkeyCaptureIgnoreVk != 0 && vk == ghHotkeyCaptureIgnoreVk;
 }
 
 /// 宏回放中：已注销 RegisterHotKey（避免吞掉 SendInput），脚本热键改由 LL 钩子识别物理键。
@@ -371,14 +377,20 @@ inline void FlushQueuedGlobalHotkeys(HWND hwnd) {
 inline LRESULT CALLBACK HotkeyKbProc(int code, WPARAM wp, LPARAM lp) {
     if (code >= 0) {
         auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
-        // 忽略脚本 SendInput 注入，避免误触发启停热键
-        if (!(ks->flags & LLKHF_INJECTED)) {
+        const bool injected = (ks->flags & LLKHF_INJECTED) != 0;
+        const bool extended = (ks->flags & LLKHF_EXTENDED) != 0;
+        const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+        const bool up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
+        // 忽略脚本 SendInput，以及 Interception/VirtualHid 注入指纹
+        if (!injected && !synthetic_input::MatchesKey(
+                static_cast<UINT>(ks->vkCode),
+                static_cast<unsigned short>(ks->scanCode),
+                extended,
+                down)) {
             // 设置热键中：当前正在改的那枚键交给捕获窗，不触发启停
             if (IsHotkeyCapturePassThroughVk(ks->vkCode)) {
                 return CallNextHookEx(nullptr, code, wp, lp);
             }
-            const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
-            const bool up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
             const bool busy = ghHotkeySessionBusy.load(std::memory_order_relaxed);
             const bool passMode = ghPassThroughTypingHotkeys.load(std::memory_order_relaxed);
             const bool scriptViaHook = ghPlaybackHotkeySuspended || passMode;
@@ -552,18 +564,21 @@ inline LRESULT CALLBACK HotkeyKbProc(int code, WPARAM wp, LPARAM lp) {
 inline LRESULT CALLBACK HotkeyMouseProc(int code, WPARAM wp, LPARAM lp) {
     if (code >= 0 && ghHotkeyEnabled && IsMouseVk(ghHotkeyVk)) {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
-        if (!(ms->flags & LLMHF_INJECTED)) {
-            bool down = false, up = false; UINT btnVk = 0;
-            if      (wp == WM_LBUTTONDOWN) { down = true; btnVk = VK_LBUTTON; }
-            else if (wp == WM_LBUTTONUP)   { up   = true; btnVk = VK_LBUTTON; }
-            else if (wp == WM_RBUTTONDOWN) { down = true; btnVk = VK_RBUTTON; }
-            else if (wp == WM_RBUTTONUP)   { up   = true; btnVk = VK_RBUTTON; }
-            else if (wp == WM_MBUTTONDOWN) { down = true; btnVk = VK_MBUTTON; }
-            else if (wp == WM_MBUTTONUP)   { up   = true; btnVk = VK_MBUTTON; }
-            else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
-                btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
-                if (wp == WM_XBUTTONDOWN) down = true; else up = true;
-            }
+        bool down = false, up = false; UINT btnVk = 0;
+        if      (wp == WM_LBUTTONDOWN) { down = true; btnVk = VK_LBUTTON; }
+        else if (wp == WM_LBUTTONUP)   { up   = true; btnVk = VK_LBUTTON; }
+        else if (wp == WM_RBUTTONDOWN) { down = true; btnVk = VK_RBUTTON; }
+        else if (wp == WM_RBUTTONUP)   { up   = true; btnVk = VK_RBUTTON; }
+        else if (wp == WM_MBUTTONDOWN) { down = true; btnVk = VK_MBUTTON; }
+        else if (wp == WM_MBUTTONUP)   { up   = true; btnVk = VK_MBUTTON; }
+        else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
+            btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+            if (wp == WM_XBUTTONDOWN) down = true; else up = true;
+        }
+        const bool injected = (ms->flags & LLMHF_INJECTED) != 0;
+        const bool syntheticBtn = btnVk
+            && synthetic_input::MatchesMouseButton(btnVk, down);
+        if (!injected && !syntheticBtn) {
             if (btnVk && IsHotkeyCapturePassThroughVk(btnVk)) {
                 return CallNextHookEx(nullptr, code, wp, lp);
             }
@@ -852,6 +867,20 @@ private:
             if (wp == kScheduledTaskTimerId) { scheduledTasks_.Tick(); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_HOTKEY: OnHotkey(static_cast<int>(wp)); return 0;
+        case WM_INPUT: {
+            // VirtualHid：按设备区分自家注入 vs 真人键鼠（脱离主路径）。
+            const bool monitorBreakout = breakout_input::BreakoutShouldMonitor()
+                && ForegroundInputRouter::Instance().IsHidActive()
+                && ForegroundInputRouter::Instance().ActiveBackend()
+                    == quickscript::ForegroundInputBackend::VirtualHid;
+            const auto hint = synthetic_input::OnRawInput(
+                reinterpret_cast<HRAWINPUT>(lp), monitorBreakout);
+            if (hint.userBreakout
+                && !breakout_input::BreakoutShouldIgnoreInput(hint.msg, hint.vk)) {
+                breakout_input::BreakoutSignalUserInput();
+            }
+            return DefWindowProcW(hwnd_, msg, wp, lp);
+        }
         case WM_GLOBAL_HOTKEY_DETECTED: {
             const int id = lp ? static_cast<int>(lp) : HOTKEY_GLOBAL_ID;
             OnHotkey(id, static_cast<int>(wp));
@@ -1155,6 +1184,8 @@ private:
         InvalidateRect(hwnd_, nullptr, TRUE);
         RegisterAllHotkeys();
         InstallGlobalHotkeyHooks();
+        // VirtualHid 脱离/热键：Raw Input 按 VID_5153&PID_5648 识别自家设备
+        synthetic_input::RegisterRawInputSink(hwnd_);
         scheduledTasks_.Reload();
         scheduledTasks_.SetRunCallback([this](const std::wstring& path) { RunActionsFromPath(path); });
         SetTimer(hwnd_, kScheduledTaskTimerId, 1000, nullptr);
@@ -5968,7 +5999,14 @@ private:
     void ClearEditorActions() {
         actions_.clear();
         collapsedContainers_.clear();
+        editorActionBlocks_.clear();
+        editorActionParsed_.clear();
+        editorParsePending_ = false;
+        editorParseCursor_ = 0;
+        MarkVisibleActionsDirty();
         selectedIndex_ = -1;
+        hoverIndex_ = -1;
+        editingRemarkIndex_ = -1;
         if (batchEditMode_) batchSelected_.clear();
         if (!loadingForm_) RestoreActionFormDraftForCurrentType();
         UpdateBatchToolbar();
@@ -6108,18 +6146,22 @@ private:
     void BatchDeleteSelected() {
         if (!batchEditMode_ || BatchSelectedCount() == 0) return;
         CommitInlineRemark();
+        // 从后往前按子树删除，且只刷新一次 UI（勿对每项调用 DeleteActionAt）
         for (int i = static_cast<int>(actions_.size()) - 1; i >= 0; --i) {
-            if (i < static_cast<int>(batchSelected_.size()) && batchSelected_[static_cast<size_t>(i)]) {
-                DeleteActionAt(i);
-            }
+            if (i >= static_cast<int>(batchSelected_.size()) || !batchSelected_[static_cast<size_t>(i)]) continue;
+            const int end = SubtreeEnd(i);
+            EraseEditorActionsRange(i, end);
         }
         batchSelected_.assign(actions_.size(), false);
         selectedIndex_ = -1;
         hoverIndex_ = -1;
-        if (!loadingForm_) RestoreActionFormDraftForCurrentType();
+        editingRemarkIndex_ = -1;
         RenumberActions();
+        RefreshRunBlockCombo();
+        if (!loadingForm_) RestoreActionFormDraftForCurrentType();
         UpdateBatchToolbar();
         UpdateEditMode();
+        OnActionsChanged();
     }
 
     void BatchCopySelected() {
@@ -6133,6 +6175,18 @@ private:
             }
         }
         for (const auto& copy : copies) actions_.push_back(copy);
+        if (!copies.empty()) {
+            // 追加的副本视为已解析，避免与分步解析数组长度错位
+            if (editorActionParsed_.size() == actions_.size() - copies.size()) {
+                editorActionParsed_.resize(actions_.size(), 1);
+            } else {
+                editorActionParsed_.assign(actions_.size(), 1);
+                editorActionBlocks_.clear();
+                editorParsePending_ = false;
+                editorParseCursor_ = static_cast<int>(actions_.size());
+            }
+            MarkVisibleActionsDirty();
+        }
         batchSelected_.assign(actions_.size(), false);
         RenumberActions();
         UpdateBatchToolbar();
@@ -7821,6 +7875,19 @@ private:
             return;
         }
         actions_.insert(actions_.begin() + static_cast<std::ptrdiff_t>(pos), action);
+        if (editorActionParsed_.size() + 1 == actions_.size()) {
+            editorActionParsed_.insert(editorActionParsed_.begin() + static_cast<std::ptrdiff_t>(pos), 1);
+        } else {
+            editorActionParsed_.assign(actions_.size(), 1);
+            editorActionBlocks_.clear();
+            editorParsePending_ = false;
+            editorParseCursor_ = static_cast<int>(actions_.size());
+        }
+        if (!editorActionBlocks_.empty() && editorActionBlocks_.size() + 1 == actions_.size()) {
+            editorActionBlocks_.insert(editorActionBlocks_.begin() + static_cast<std::ptrdiff_t>(pos), std::wstring{});
+        }
+        if (editorParseCursor_ > static_cast<int>(pos)) ++editorParseCursor_;
+        MarkVisibleActionsDirty();
         if (selectInserted) {
             selectedIndex_ = static_cast<int>(pos);
         } else if (selectedIndex_ >= static_cast<int>(pos)) {
@@ -7850,13 +7917,15 @@ private:
         if (selectedIndex_ < 0) { TryInsertActionFromForm(actions_.size()); return; }
         const ScriptAction preview = ActionFromForm();
         if (preview.type == ActionType::DefineBlock) { TryInsertActionFromForm(0, 0); return; }
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, kAddLast, L"添加到最后");
-        AppendMenuW(menu, MF_STRING, kAddFirst, L"插入到最前");
-        AppendMenuW(menu, MF_STRING, kAddBeforeSelected, L"插入到选择项前");
-        AppendMenuW(menu, MF_STRING, kAddAfterSelected, L"插入到选择项后");
-        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size()) && IsSubtreeContainer(actions_[static_cast<size_t>(selectedIndex_)].type)) {
-            AppendMenuW(menu, MF_STRING, kAddAsChild, L"添加为子节点");
+        std::vector<ThemedPopupMenuItem> items{
+            {kAddLast, L"添加到最后"},
+            {kAddFirst, L"插入到最前"},
+            {kAddBeforeSelected, L"插入到选择项前"},
+            {kAddAfterSelected, L"插入到选择项后"},
+        };
+        if (selectedIndex_ >= 0 && selectedIndex_ < static_cast<int>(actions_.size())
+            && IsSubtreeContainer(actions_[static_cast<size_t>(selectedIndex_)].type)) {
+            items.push_back({kAddAsChild, L"添加为子节点"});
         }
         POINT pt{x, y};
         if (x == 0 && y == 0) {
@@ -7864,8 +7933,8 @@ private:
         } else {
             ClientToScreen(hwnd_, &pt);
         }
-        TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_, nullptr);
-        DestroyMenu(menu);
+        const int id = ThemedPopupMenu::Show(hwnd_, pt, items);
+        if (id != 0) AddActionByMenu(id);
     }
 
     void AddActionByMenu(int id) {
@@ -7916,26 +7985,32 @@ private:
     }
 
     void CaptureKeyPress() {
+        BeginActionKeyCaptureRelease();
         HotkeyCapture cap;
         Hotkey oldValue{};
         oldValue.vk = formKeyPressVk_;
         oldValue.text = formKeyPressText_.empty() ? VkName(formKeyPressVk_) : formKeyPressText_;
         oldValue.enabled = oldValue.vk != 0;
         Hotkey out;
-        if (!cap.Show(hwnd_, oldValue, false, out) || !out.enabled || out.vk == 0) return;
+        const bool ok = cap.Show(hwnd_, oldValue, false, out);
+        EndHotkeyCaptureRelease();
+        if (!ok || !out.enabled || out.vk == 0) return;
         ApplyCapturedKeyToForm(out, formKeyPressVk_, formKeyPressText_, keyPressEdit_,
             keyPressLWin_, keyPressRWin_, keyPressLCtrl_, keyPressRCtrl_,
             keyPressLAlt_, keyPressRAlt_, keyPressLShift_, keyPressRShift_);
     }
 
     void CaptureActionKey() {
+        BeginActionKeyCaptureRelease();
         HotkeyCapture cap;
         Hotkey oldValue{};
         oldValue.vk = formKeyVk_;
         oldValue.text = formKeyText_.empty() ? VkName(formKeyVk_) : formKeyText_;
         oldValue.enabled = oldValue.vk != 0;
         Hotkey out;
-        if (!cap.Show(hwnd_, oldValue, false, out) || !out.enabled || out.vk == 0) return;
+        const bool ok = cap.Show(hwnd_, oldValue, false, out);
+        EndHotkeyCaptureRelease();
+        if (!ok || !out.enabled || out.vk == 0) return;
         ApplyCapturedKeyToForm(out, formKeyVk_, formKeyText_, keyEdit_,
             keyLWin_, keyRWin_, keyLCtrl_, keyRCtrl_,
             keyLAlt_, keyRAlt_, keyLShift_, keyRShift_);
@@ -8880,6 +8955,15 @@ private:
         visibleActionIndexCacheDirty_ = true;
     }
     const std::vector<int>& VisibleActionIndices() const {
+        // 删/插动作后若忘记 MarkVisibleActionsDirty，旧缓存会越界访问 actions_ → 卡死/崩溃
+        if (!visibleActionIndexCacheDirty_) {
+            for (int idx : visibleActionIndexCache_) {
+                if (idx < 0 || idx >= static_cast<int>(actions_.size())) {
+                    visibleActionIndexCacheDirty_ = true;
+                    break;
+                }
+            }
+        }
         if (visibleActionIndexCacheDirty_) {
             visibleActionIndexCache_.clear();
             visibleActionIndexCache_.reserve(actions_.size());
@@ -9265,19 +9349,23 @@ private:
 
     // ── Inline remark editing ──────────────────────────────────────
     void CommitInlineRemark() {
-        if (editingRemarkIndex_ < 0 || editingRemarkIndex_ >= static_cast<int>(actions_.size()) || !listRemarkEdit_) return;
+        if (editingRemarkIndex_ < 0 || !listRemarkEdit_) return;
+        const int idx = editingRemarkIndex_;
+        // 先清索引，避免 ShowWindow(SW_HIDE) 同步触发 EN_KILLFOCUS 重入
+        editingRemarkIndex_ = -1;
         if (IsWindowVisible(listRemarkEdit_)) {
-            actions_[static_cast<size_t>(editingRemarkIndex_)].remark = GetText(listRemarkEdit_);
+            if (idx >= 0 && idx < static_cast<int>(actions_.size())) {
+                actions_[static_cast<size_t>(idx)].remark = GetText(listRemarkEdit_);
+            }
             ShowWindow(listRemarkEdit_, SW_HIDE);
         }
-        editingRemarkIndex_ = -1;
         RefreshActionListLayer();
     }
 
     void CancelInlineRemark() {
         if (editingRemarkIndex_ < 0 || !listRemarkEdit_) return;
-        ShowWindow(listRemarkEdit_, SW_HIDE);
         editingRemarkIndex_ = -1;
+        ShowWindow(listRemarkEdit_, SW_HIDE);
         RefreshActionListLayer();
     }
 
@@ -11120,29 +11208,19 @@ private:
     }
 
     void ShowHotkeyMenuAt(RECT anchor) {
-        HMENU menu = CreatePopupMenu();
-        hotkeyMenuItems_ = {
-            {kHotCustom, L"自定义", L"将您指定的按键设为启停热键"},
-            {kHotLeft, L"鼠标左键", L"按住左键开始连点，松开停止"},
-            {kHotMiddle, L"鼠标中键", L"将点击中键设为启停热键"},
-            {kHotRight, L"鼠标右键", L"将点击右键设为启停热键"},
-            {kHotX1, L"鼠标侧键1", L"一般为鼠标左侧后部的键"},
-            {kHotX2, L"鼠标侧键2", L"一般为鼠标左侧前部的键"},
-            {kHotSpace, L"空格键", L"将空格键设为启停热键"}
+        const std::vector<ThemedPopupMenuItem> items{
+            {kHotCustom, L"自定义"},
+            {kHotLeft, L"鼠标左键"},
+            {kHotMiddle, L"鼠标中键"},
+            {kHotRight, L"鼠标右键"},
+            {kHotX1, L"鼠标侧键1"},
+            {kHotX2, L"鼠标侧键2"},
+            {kHotSpace, L"空格键"},
         };
-        for (size_t i = 0; i < hotkeyMenuItems_.size(); ++i) {
-            MENUITEMINFOW item{};
-            item.cbSize = sizeof(item);
-            item.fMask = MIIM_ID | MIIM_FTYPE | MIIM_DATA;
-            item.fType = MFT_OWNERDRAW;
-            item.wID = static_cast<UINT>(hotkeyMenuItems_[i].id);
-            item.dwItemData = reinterpret_cast<ULONG_PTR>(&hotkeyMenuItems_[i]);
-            InsertMenuItemW(menu, static_cast<UINT>(i), TRUE, &item);
-        }
         POINT pt{anchor.left, anchor.bottom};
         ClientToScreen(hwnd_, &pt);
-        TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_, nullptr);
-        DestroyMenu(menu);
+        const int id = ThemedPopupMenu::Show(hwnd_, pt, items);
+        if (id != 0) SetCommonHotkeyFromMenu(id);
     }
 
     void ShowCommonHotkeyMenu() { ShowHotkeyMenuAt(CommonHotRect()); }
@@ -11169,6 +11247,7 @@ private:
     /// 设置热键弹窗：临时注销/放行「正在编辑」的键，便于同键短按↔长按切换；其它占用键仍拦截。
     void BeginHotkeyCaptureRelease(const Hotkey& editing) {
         ghHotkeyCaptureOpen = true;
+        ghHotkeyCapturePassAll = false;
         ghHotkeyCaptureIgnoreVk = (editing.enabled && editing.vk) ? editing.vk : 0;
         ghHotkeyMouseHoldArmed = false;
         ghHotkeyMouseHoldDown = false;
@@ -11196,8 +11275,28 @@ private:
         }
     }
 
+    /// 动作按键捕获：放行全部键并临时注销 RegisterHotKey，允许录入与启停热键相同的键。
+    void BeginActionKeyCaptureRelease() {
+        ghHotkeyCaptureOpen = true;
+        ghHotkeyCapturePassAll = true;
+        ghHotkeyCaptureIgnoreVk = 0;
+        ghHotkeyMouseHoldArmed = false;
+        ghHotkeyMouseHoldDown = false;
+        ghHotkeyMouseDownTick = 0;
+        ghHotkeyPending = false;
+        ghHotkeyNeedKeyUp = false;
+        if (!hwnd_) return;
+        UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID);
+        for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i);
+        for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+            ghPlaybackScriptHooks[i].holdArmed = false;
+            ghPlaybackScriptHooks[i].holdActive = false;
+        }
+    }
+
     void EndHotkeyCaptureRelease() {
         ghHotkeyCaptureOpen = false;
+        ghHotkeyCapturePassAll = false;
         ghHotkeyCaptureIgnoreVk = 0;
         RegisterAllHotkeys();
     }
@@ -11296,6 +11395,20 @@ private:
             HINSTANCE inst = GetModuleHandleW(nullptr);
             ghHotkeyKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, HotkeyKbProc, inst, 0);
         }
+
+        // 注入指纹只盯启停热键 VK（脱离=0 时）；改热键后立刻刷新。
+        UINT watched[64]{};
+        int watchedN = 0;
+        auto pushWatched = [&](UINT vk) {
+            if (!vk || watchedN >= 64) return;
+            for (int i = 0; i < watchedN; ++i) if (watched[i] == vk) return;
+            watched[watchedN++] = vk;
+        };
+        if (globalHotkey_.enabled) pushWatched(globalHotkey_.vk);
+        for (const auto& s : scripts_) {
+            if (s.hotkey.enabled) pushWatched(s.hotkey.vk);
+        }
+        synthetic_input::SetWatchedHotkeyVks(watched, watchedN);
     }
 
     /// 回放期间注销 RegisterHotKey：系统会吞掉同键 SendInput；物理启停改走 LL 钩子。
@@ -12460,22 +12573,26 @@ private:
                     ? quickscript::ForegroundInputBackend::Software
                     : appSettings_.playback.foregroundInputBackend;
                 ForegroundInputRouter::Instance().BeginSession(backend);
+                // 脱离=0：不装脱离钩、不记移动/滚轮指纹；热键仍靠键/鼠标按钮指纹。
+                if (ForegroundInputRouter::Instance().IsHidActive()) {
+                    synthetic_input::SetBreakoutTracking(workerBreakoutTime_ > 0);
+                }
                 if (backend != quickscript::ForegroundInputBackend::Software
                     && ForegroundInputRouter::Instance().IsHidActive()) {
                     AppendDebugLog(std::wstring(L"前台注入后端：")
                         + quickscript::ForegroundInputBackendName(
                             ForegroundInputRouter::Instance().ActiveBackend()));
-                    AppendDebugLog(L"HID模式：绝对移标用 absolute stroke；相对移动用 relative 报告");
+                    AppendDebugLog(L"HID模式：VirtualHid 绝对移标用 SetCursorPos（不发绝对 HID，避免 mouhid 主屏映射乱漂）；相对/按键/滚轮仍走驱动");
+                    if (workerBreakoutTime_ > 0) {
+                        AppendDebugLog(L"驱动注入：脱离=LL；VirtualHid 绝对移标不记移动指纹(靠INJECTED)，真人挪鼠/点击可脱离");
+                    } else {
+                        AppendDebugLog(L"驱动注入：仅已登记启停热键指纹（脱离=0）");
+                    }
                 } else if (ForegroundInputRouter::Instance().DidFallback()) {
                     const std::wstring fb = ForegroundInputRouter::Instance().FallbackReason();
                     AppendDebugLog(fb);
                     // 回放开始时再打一行醒目摘要，避免只扫过调试窗时漏看。
                     AppendDebugLog(L"【警告】当前不是驱动级注入，安全软件/反作弊可能仍按系统模拟处理。");
-                }
-                if (backend != quickscript::ForegroundInputBackend::Software
-                    && workerBreakoutTime_ > 0) {
-                    AppendDebugLog(L"HID模式下脱离时间无法区分注入与真人输入，已暂停脱离检测");
-                    breakout_input::UninstallBreakoutHooks();
                 }
             }
 
@@ -12584,7 +12701,7 @@ private:
                 }
                 breakoutPaused_ = false;
                 if (!stopFlag_) {
-                    AppendBreakoutDebugLog(L"脱离时间：等待结束，宏继续运行");
+                    AppendBreakoutDebugLog(L"脱离时间：等待结束，从当前步骤重试后继续");
                 }
                 notifyBreakoutUi();
             };
@@ -13870,6 +13987,13 @@ private:
                     executeOne(action);
                     if (stopFlag_ || !breakoutUserInput_.load(std::memory_order_relaxed)) break;
                     waitBreakoutCooldown();
+                    // 脱离暂停期间墙钟继续走；精密时间轴若不清零，后续 Wait 会因「已过点」
+                    // 瞬间追赶跑完整轮，看起来像跳到脚本末尾，下一轮又从开头开始。
+                    // 与注入后端无关（系统模拟 / Interception / VirtualHid 共用此路径）。
+                    if (inputTimeline.enabled) {
+                        inputTimeline.Reset();
+                        timelineInterrupted = false;
+                    }
                 }
             };
 
@@ -14755,7 +14879,21 @@ private:
             ShowWindow(hwnd_, SW_HIDE);
         }
         UpdateStatusTip();
-        clickerThread_ = std::thread([this]() {
+        // 与录制回放/鼠标宏共用设置里的注入方式（系统模拟 / Interception / 虚拟HID）。
+        const auto clickBackend = appSettings_.playback.foregroundInputBackend;
+        clickerThread_ = std::thread([this, clickBackend]() {
+            ForegroundInputRouter::Instance().BeginSession(clickBackend);
+            struct SessionGuard {
+                ~SessionGuard() { ForegroundInputRouter::Instance().EndSession(); }
+            } sessionGuard;
+
+            MouseButtonType button = MouseButtonType::Left;
+            if (clickerSettings_.button == quickscript::MouseButtonChoice::Right) {
+                button = MouseButtonType::Right;
+            } else if (clickerSettings_.button == quickscript::MouseButtonChoice::Middle) {
+                button = MouseButtonType::Middle;
+            }
+
             const auto& cs = appSettings_.click;
             while (clicking_ && !stopFlag_) {
                 double interval = 0.1;
@@ -14785,31 +14923,16 @@ private:
                     clickX += RandomInt(cs.jitterX);
                     clickY += RandomInt(cs.jitterY);
                 }
-                SetCursorPos(clickX, clickY);
+                SetCursorScreenPos(clickX, clickY);
 
-                DWORD downFlag, upFlag;
-                if (clickerSettings_.button == quickscript::MouseButtonChoice::Left) {
-                    downFlag = MOUSEEVENTF_LEFTDOWN; upFlag = MOUSEEVENTF_LEFTUP;
-                } else if (clickerSettings_.button == quickscript::MouseButtonChoice::Right) {
-                    downFlag = MOUSEEVENTF_RIGHTDOWN; upFlag = MOUSEEVENTF_RIGHTUP;
-                } else {
-                    downFlag = MOUSEEVENTF_MIDDLEDOWN; upFlag = MOUSEEVENTF_MIDDLEUP;
-                }
-
-                INPUT downInput{};
-                downInput.type = INPUT_MOUSE;
-                downInput.mi.dwFlags = downFlag;
-                SendInput(1, &downInput, sizeof(INPUT));
+                MouseButtonEvent(button, true);
 
                 if (cs.enablePressReleaseInterval) {
                     SleepInterruptible(cs.pressReleaseIntervalSeconds);
                 }
 
                 if (clicking_ && !stopFlag_) {
-                    INPUT upInput{};
-                    upInput.type = INPUT_MOUSE;
-                    upInput.mi.dwFlags = upFlag;
-                    SendInput(1, &upInput, sizeof(INPUT));
+                    MouseButtonEvent(button, false);
                 }
 
                 ++clickCountDone_;
@@ -14877,8 +15000,14 @@ private:
         const int toggleW = std::max(1, UiLen(kExpandToggleWidth));
         return RECT{r.left + expandLeft, r.top + UiLen(8), r.left + expandLeft + toggleW, r.bottom - UiLen(8)};
     }
-    RECT CopyRect(int i) const { RECT r = RowRect(i); return RECT{r.right - 104, r.top + 6, r.right - 62, r.bottom - 6}; }
-    RECT DeleteRect(int i) const { RECT r = RowRect(i); return RECT{r.right - 58, r.top + 6, r.right - 18, r.bottom - 6}; }
+    RECT CopyRect(int i) const {
+        RECT r = RowRect(i);
+        return RECT{r.right - UiLen(104), r.top + UiLen(6), r.right - UiLen(62), r.bottom - UiLen(6)};
+    }
+    RECT DeleteRect(int i) const {
+        RECT r = RowRect(i);
+        return RECT{r.right - UiLen(58), r.top + UiLen(6), r.right - UiLen(18), r.bottom - UiLen(6)};
+    }
     bool PtIn(RECT r, int x, int y) const { return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom; }
 
     void OnEditorClick(int x, int y) {
@@ -14907,17 +15036,61 @@ private:
         SetCapture(hwnd_);
     }
 
-    void DeleteActionAt(int row) {
-        if (row < 0 || row >= static_cast<int>(actions_.size())) return;
-        const int end = SubtreeEnd(row);
+    // 删除 [row, end) 并同步可见缓存 / 分步解析状态（不做 UI 刷新）
+    void EraseEditorActionsRange(int row, int end) {
+        const int n = static_cast<int>(actions_.size());
+        if (row < 0 || end <= row || end > n) return;
         const int count = end - row;
-        const bool clearedSelection = selectedIndex_ >= row && selectedIndex_ < end;
+        // 先按删除前长度裁剪 batchSelected，避免 Sync 按新长度截尾导致漏删
+        if (batchEditMode_) {
+            if (static_cast<int>(batchSelected_.size()) == n) {
+                batchSelected_.erase(batchSelected_.begin() + row, batchSelected_.begin() + end);
+            } else {
+                batchSelected_.clear();
+            }
+        }
+        if (static_cast<int>(editorActionParsed_.size()) == n) {
+            editorActionParsed_.erase(editorActionParsed_.begin() + row, editorActionParsed_.begin() + end);
+        }
+        if (static_cast<int>(editorActionBlocks_.size()) == n) {
+            editorActionBlocks_.erase(editorActionBlocks_.begin() + row, editorActionBlocks_.begin() + end);
+        } else if (!editorActionBlocks_.empty()) {
+            editorActionBlocks_.clear();
+        }
         collapsedContainers_ = RemapCollapsedAfterDelete(collapsedContainers_, row, end);
         actions_.erase(actions_.begin() + row, actions_.begin() + end);
-        if (clearedSelection) selectedIndex_ = -1;
+        if (static_cast<int>(editorActionParsed_.size()) != static_cast<int>(actions_.size())) {
+            editorActionParsed_.assign(actions_.size(), 1);
+        }
+        if (batchEditMode_ && batchSelected_.size() != actions_.size()) {
+            batchSelected_.assign(actions_.size(), false);
+        }
+        if (editorActionBlocks_.empty()) {
+            editorParsePending_ = false;
+            editorParseCursor_ = static_cast<int>(actions_.size());
+        } else {
+            if (editorParseCursor_ >= end) editorParseCursor_ -= count;
+            else if (editorParseCursor_ > row) editorParseCursor_ = row;
+            editorParsePending_ = editorParseCursor_ < static_cast<int>(actions_.size());
+        }
+        if (selectedIndex_ >= row && selectedIndex_ < end) selectedIndex_ = -1;
         else if (selectedIndex_ >= end) selectedIndex_ -= count;
         if (hoverIndex_ >= row && hoverIndex_ < end) hoverIndex_ = -1;
         else if (hoverIndex_ >= end) hoverIndex_ -= count;
+        if (editingRemarkIndex_ >= row && editingRemarkIndex_ < end) {
+            editingRemarkIndex_ = -1;
+            if (listRemarkEdit_) ShowWindow(listRemarkEdit_, SW_HIDE);
+        } else if (editingRemarkIndex_ >= end) {
+            editingRemarkIndex_ -= count;
+        }
+        MarkVisibleActionsDirty();
+    }
+
+    void DeleteActionAt(int row) {
+        if (row < 0 || row >= static_cast<int>(actions_.size())) return;
+        const int end = SubtreeEnd(row);
+        const bool clearedSelection = selectedIndex_ >= row && selectedIndex_ < end;
+        EraseEditorActionsRange(row, end);
         RenumberActions();
         RefreshRunBlockCombo();
         // 删除当前选中项后恢复添加草稿（无草稿则该类型默认值）
@@ -15043,6 +15216,14 @@ private:
         actions_.erase(actions_.begin() + dragIndex_, actions_.begin() + dragEnd);
         collapsedContainers_ = RemapCollapsedAfterMove(collapsedContainers_, dragIndex_, dragEnd, insertIndex, count);
         actions_.insert(actions_.begin() + insertIndex, block.begin(), block.end());
+        // 拖拽改序后重建解析标记，避免与 actions_ 长度错位
+        editorActionParsed_.assign(actions_.size(), 1);
+        if (!editorActionBlocks_.empty()) {
+            editorActionBlocks_.clear();
+            editorParsePending_ = false;
+            editorParseCursor_ = static_cast<int>(actions_.size());
+        }
+        MarkVisibleActionsDirty();
         selectedIndex_ = insertIndex;
         RenumberActions();
         EnsureSelectedVisible();
@@ -15141,7 +15322,17 @@ private:
         scrollOffset_ = std::clamp(scrollOffset_, 0, MaxEditorScroll());
     }
 
-    void ShowCopyMenu(int x, int y) { HMENU menu = CreatePopupMenu(); AppendMenuW(menu, MF_STRING, kCopyLast, L"复制到最后"); AppendMenuW(menu, MF_STRING, kCopyFirst, L"复制到最前"); AppendMenuW(menu, MF_STRING, kCopyBeforeSelected, L"复制到当前项前"); AppendMenuW(menu, MF_STRING, kCopyAfterSelected, L"复制到当前项后"); POINT pt{x, y}; ClientToScreen(hwnd_, &pt); TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_, nullptr); DestroyMenu(menu); }
+    void ShowCopyMenu(int x, int y) {
+        POINT pt{x, y};
+        ClientToScreen(hwnd_, &pt);
+        const int id = ThemedPopupMenu::Show(hwnd_, pt, {
+            {kCopyLast, L"复制到最后"},
+            {kCopyFirst, L"复制到最前"},
+            {kCopyBeforeSelected, L"复制到当前项前"},
+            {kCopyAfterSelected, L"复制到当前项后"},
+        });
+        if (id != 0) CopyActionByMenu(id);
+    }
 
     void DrawTextIn(HDC hdc, const std::wstring& text, RECT rc, COLORREF color, UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -15806,10 +15997,6 @@ private:
             mis->itemHeight = kComboItemH;
             return;
         }
-        if (mis->CtlType == ODT_MENU) {
-            mis->itemWidth = 293;
-            mis->itemHeight = 45;
-        }
     }
 
     void DrawComboItem(DRAWITEMSTRUCT* dis) {
@@ -15842,27 +16029,8 @@ private:
         DrawTextIn(dis->hDC, text, RECT{rc.left + 8, rc.top, rc.right - 8, rc.bottom}, fg);
     }
 
-    void DrawHotkeyMenuItem(DRAWITEMSTRUCT* dis) {
-        if (!dis) return;
-        auto* item = reinterpret_cast<HotkeyMenuItem*>(dis->itemData);
-        if (!item) return;
-        const bool checked = IsHotkeyMenuChecked(item->id);
-        const bool selected = (dis->itemState & ODS_SELECTED) != 0;
-        RECT rc = dis->rcItem;
-        const COLORREF bg = (checked || selected) ? kBatchSelectedRow : RGB(255, 255, 255);
-        FillRectColor(dis->hDC, rc, bg);
-
-        RECT box{rc.left + 11, rc.top + 12, rc.left + 23, rc.top + 24};
-        DrawCheckbox(dis->hDC, box, checked);
-
-        SelectObject(dis->hDC, font_);
-        DrawTextIn(dis->hDC, item->title, RECT{rc.left + 46, rc.top + 3, rc.right - 10, rc.top + 22}, RGB(30, 30, 30));
-        DrawTextIn(dis->hDC, item->desc, RECT{rc.left + 46, rc.top + 23, rc.right - 10, rc.bottom - 3}, RGB(145, 150, 155));
-    }
-
     void DrawOwnerItem(DRAWITEMSTRUCT* dis) {
         if (!dis) return;
-        if (dis->CtlType == ODT_MENU) { DrawHotkeyMenuItem(dis); return; }
         if (dis->CtlType == ODT_COMBOBOX) { DrawComboItem(dis); return; }
         // 勾选框优先：避免被后面的绿按钮分支误吃
         if (IsMarkedParamCheckbox(dis->hwndItem)) { DrawParamPanelCheckboxItem(dis); return; }
@@ -16722,7 +16890,7 @@ private:
         if (statusTipWindow_) ShowWindow(statusTipWindow_, SW_HIDE);
     }
 
-    void Cleanup() { SaveHomeState(); outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); KillTimer(hwnd_, kHotkeyLatchSyncTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } macroDebugWindow_.Destroy(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); ForceEndBreakoutUiState(); breakout_input::UninstallBreakoutHooks(); stopFlag_ = true; if (worker_.joinable()) worker_.detach(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } ghPlaybackHotkeySuspended = false; ghPassThroughTypingHotkeys.store(false, std::memory_order_relaxed); ghPlaybackScriptHookCount = 0; UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
+    void Cleanup() { SaveHomeState(); outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); KillTimer(hwnd_, kHotkeyLatchSyncTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } macroDebugWindow_.Destroy(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); ForceEndBreakoutUiState(); breakout_input::UninstallBreakoutHooks(); synthetic_input::UnregisterRawInputSink(hwnd_); stopFlag_ = true; if (worker_.joinable()) worker_.detach(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } ghPlaybackHotkeySuspended = false; ghPassThroughTypingHotkeys.store(false, std::memory_order_relaxed); ghPlaybackScriptHookCount = 0; UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() {
         if (recording_) {
@@ -16832,7 +17000,6 @@ private:
     int paramContentBottom_ = 0;
     int paramControlsBottom_ = 0;
     int paramLayoutBottomHint_ = -1;
-    std::vector<HotkeyMenuItem> hotkeyMenuItems_;
     std::vector<ScriptMeta> scripts_; std::vector<ScriptMeta> recordings_;
     std::vector<AgentConversationMeta> agentConversations_;
     std::vector<ScriptAction> actions_;

@@ -51,4 +51,6 @@ private:
     PointerMode pointerMode_ = PointerMode::Relative;
     unsigned short lastAbsX_ = 0;
     unsigned short lastAbsY_ = 0;
+    int lastScreenX_ = 0;
+    int lastScreenY_ = 0;
 };

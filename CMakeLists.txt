@@ -123,6 +123,7 @@ set(SCRIPT_CORE_COMMON_SOURCES
     src/input/hid_interception.cpp
     src/input/virtual_hid.cpp
     src/input/foreground_input_router.cpp
+    src/input/synthetic_input_filter.cpp
     src/coord_space.cpp
     src/findimage_template_crop.cpp
     src/image_match.cpp
@@ -184,6 +185,7 @@ add_executable(QuickScriptTool WIN32
     src/ai_action_runtime.cpp
     src/ai_action_router.cpp
     src/tray_menu.cpp
+    src/themed_popup_menu.cpp
     src/taskbar_iconic_preview.cpp
     src/scheduled_task_types.cpp
     src/scheduled_task_store.cpp
