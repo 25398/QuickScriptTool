@@ -1,11 +1,13 @@
 #include "window_mode_session.h"
 
 #include "background_window_input.h"
+#include "background_input_target.h"
 #include "window_capture.h"
 #include "window_coords.h"
 #include "window_target.h"
 
 #include "window_mode_log.h"
+#include "window_mode_permission.h"
 #include "window_mode_requirements.h"
 #include "macro_virtual_desktop.h"
 #include "virtual_desktop_accessor.h"
@@ -214,52 +216,24 @@ std::wstring EffectiveLaunchArgs(const WindowModeScriptConfig& config) {
     return ExtractDocumentLaunchArg(config);
 }
 
-HWND ResolveBindHwnd(HWND top, const WindowModeScriptConfig& config, bool background) {
+HWND ResolveBindHwnd(HWND top, const WindowModeScriptConfig& config, bool /*background*/) {
     if (!top || !IsWindow(top)) return nullptr;
+    top = TopLevelTargetWindow(top);
 
-    HWND bindHwnd = top;
-    if (!config.childWindowClassName.empty()) {
-        HWND child = FindChildWindowByClass(top, config.childWindowClassName);
-        if (child) {
-            bindHwnd = child;
-        } else if (HWND render = FindBrowserRenderWidget(top)) {
-            bindHwnd = render;
-        } else if (HWND input = FindTextInputTarget(top)) {
-            bindHwnd = input;
-        }
-    } else if (HWND render = FindBrowserRenderWidget(top)) {
-        // Prefer browser content widget so message clicks land in the page/game surface.
-        bindHwnd = render;
-    } else if (background) {
-        if (HWND input = FindTextInputTarget(top)) {
-            bindHwnd = input;
-        }
+    // 桌面模拟器/Unity/传奇：假焦点绑顶层；MuMu 等安卓壳绑渲染子窗（坐标与 PostMessage 对齐）。
+    if (UsesFakeFocus(config) || UsesFakeFocusForTarget(config, top)) {
+        return top;
     }
-    return bindHwnd;
+
+    return FindBackgroundInputChild(top, &config);
 }
 
 bool ResolveInputBindHwnd(HWND top, const WindowModeScriptConfig& config, bool background,
     HWND& outHwnd) {
     outHwnd = nullptr;
     if (!top || !IsWindow(top)) return false;
-
-    HWND bindHwnd = ResolveBindHwnd(top, config, background);
-    if (bindHwnd && bindHwnd != top) {
-        outHwnd = bindHwnd;
-        return true;
-    }
-    if (!config.childWindowClassName.empty()) {
-        if (HWND child = FindChildWindowByClass(top, config.childWindowClassName)) {
-            outHwnd = child;
-            return true;
-        }
-    }
-    if (HWND input = FindTextInputTarget(top)) {
-        outHwnd = input;
-        return true;
-    }
-    outHwnd = top;
-    return true;
+    outHwnd = ResolveBindHwnd(top, config, background);
+    return outHwnd != nullptr;
 }
 
 bool LaunchViaShell(const std::wstring& path, const std::wstring& args,
@@ -392,6 +366,13 @@ bool WaitForBindHwnd(HWND top, const WindowModeScriptConfig& config, bool backgr
     outHwnd = nullptr;
     if (!top || !IsWindow(top)) return false;
 
+    // DeSmuME 等假焦点目标必须绑顶层；勿在后台模式误绑 Edit/子窗。
+    if (UsesFakeFocus(config) || IsDesktopEmulatorTarget(top, &config)
+        || UsesFakeFocusForTarget(config, top)) {
+        outHwnd = top;
+        return true;
+    }
+
     // ?
     const bool needsChild = !config.childWindowClassName.empty()
         || (background && config.selectMethod != WindowSelectMethod::NoSelect);
@@ -486,18 +467,16 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
 
     if (config.executionKind == WindowModeExecutionKind::BackgroundWindow) {
         if (runHealthCheck) {
-            // ?
             DWORD pidCheck = 0;
             GetWindowThreadProcessId(top, &pidCheck);
-            HANDLE process = pidCheck
-                ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pidCheck) : nullptr;
-            if (!process && pidCheck != 0) {
+            if (pidCheck != 0 && !CheckPermissionMatch(pidCheck)) {
                 state.health = WindowModeHealth::PermissionMismatch;
                 err = HealthToUserHint(state.health);
                 state.lastError = err;
+                WindowModeLogf(L"[窗口模式] 后台绑窗权限检查失败 pid=%lu（目标完整性更高）",
+                    static_cast<unsigned long>(pidCheck));
                 return false;
             }
-            if (process) CloseHandle(process);
             state.health = WindowModeHealth::Ok;
         } else {
             state.health = WindowModeHealth::Ok;
@@ -569,6 +548,10 @@ void SquashBackgroundLaunchedWindow(HWND hwnd, const std::atomic_bool* cancelFla
     if (!hwnd || !IsWindow(hwnd)) return;
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (root) hwnd = root;
+    if (IsRemoteDesktopWindow(hwnd) || LooksLikeFullscreenGameTarget(hwnd)) {
+        WindowModeLog(L"[窗口模式] 远程桌面/全屏游戏：跳过启动后压窗隐藏");
+        return;
+    }
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     ForceHideLaunchedWindowQuiet(hwnd);
@@ -784,6 +767,8 @@ bool TryCreateProcessLaunch(const std::wstring& exePath, const std::wstring& arg
     if (arg.size() >= 2 && arg.front() == L'"' && arg.back() == L'"') {
         arg = arg.substr(1, arg.size() - 2);
     }
+    // 去掉嵌入引号，防止 CreateProcess 命令行断引号注入
+    arg.erase(std::remove(arg.begin(), arg.end(), L'"'), arg.end());
 
     std::wstring cmdLine = L"\"" + exePath + L"\"";
     if (!arg.empty()) {
@@ -805,8 +790,8 @@ bool TryCreateProcessLaunch(const std::wstring& exePath, const std::wstring& arg
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_SHOWMINNOACTIVE;
 
-    // ?
-    if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+    // lpApplicationName 固定 exe，避免命令行改写可执行文件路径
+    if (!CreateProcessW(exePath.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE,
             0, nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
         err = L"CreateProcess \u5931\u8d25";
         return false;
@@ -871,6 +856,13 @@ bool WindowModeSession::EnsureDesktop(std::wstring& err) {
         state_.lastError = err;
         return false;
     }
+    // 双保险：即便上游漏降级，模拟器也绝不 CreateDesktop。
+    if (config_.executionKind == WindowModeExecutionKind::HiddenDesktop
+        && ConfigLooksLikeEmulatorTarget(config_)) {
+        config_.executionKind = WindowModeExecutionKind::BackgroundWindow;
+        WindowModeLogEvent(
+            L"[窗口模式] EnsureDesktop：模拟器目标强制后台窗口（跳过创建「鼠标宏」桌面）");
+    }
     if (config_.executionKind == WindowModeExecutionKind::BackgroundWindow) {
         state_.macroDesktopId = GUID{};
         state_.macroDesktopIndex = -1;
@@ -921,6 +913,20 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         candidate = TopLevelWindow(candidate);
         if (IsWindowOnVirtualDesktopIndex(candidate, macroDesktopIndex)) {
             if (HWND found = findOnMacroDesktop(refindQuery, true)) return found;
+            return candidate;
+        }
+        if (LooksLikeFullscreenGameTarget(candidate)) {
+            WindowModeLog(L"[窗口模式] 全屏游戏：绑定已有窗口，不搬「鼠标宏」/不置底");
+            return candidate;
+        }
+        if (IsRemoteDesktopWindow(candidate)) {
+            WindowModeLog(L"[窗口模式] 远程桌面：绑定已有窗口，不搬「鼠标宏」（SendInput 只打当前桌面前台）");
+            return candidate;
+        }
+        if (ConfigLooksLikeEmulatorTarget(config_)
+            || LooksLikeEmulatorTarget(config_, candidate)
+            || IsAndroidEmulatorTarget(candidate, &config_)) {
+            WindowModeLogEvent(L"[窗口模式] 模拟器：绑定已有窗口，不搬「鼠标宏」（请用后台窗口模式）");
             return candidate;
         }
         const bool cdp = UsesCdpInput(config_);
@@ -976,7 +982,8 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
     if (background) {
         if (state_.targetHwnd) {
             HWND existingTop = TopLevelWindow(state_.targetHwnd);
-            if (existingTop && IsWindow(existingTop)) {
+            if (existingTop && IsWindow(existingTop)
+                && DoesTopWindowMatchConfig(existingTop, config_)) {
                 DWORD pid = 0;
                 GetWindowThreadProcessId(existingTop, &pid);
                 if (state_.targetPid == 0 || pid == state_.targetPid) {
@@ -1218,7 +1225,10 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
 
         if (hwnd) {
             HWND top = TopLevelWindow(hwnd);
-            if (!IsWindowOnVirtualDesktopIndex(top, macroDesktopIndex)) {
+            if (IsRemoteDesktopWindow(top)) {
+                WindowModeLog(L"[窗口模式] 远程桌面：跳过迁入「鼠标宏」桌面（与后台窗口模式相同，仅假前台本机输入）");
+            } else if (!LooksLikeFullscreenGameTarget(top)
+                && !IsWindowOnVirtualDesktopIndex(top, macroDesktopIndex)) {
                 MinimizeForQuietDesktopMove(top);
                 WindowModeSleepInterruptible(cancelFlag_, std::chrono::milliseconds(20));
                 if (!desktop_.MoveWindowToMacroDesktop(top)) {
@@ -1293,12 +1303,16 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         return false;
     }
 
-    if (!background) {
+    if (LooksLikeFullscreenGameTarget(top) || IsRemoteDesktopWindow(top)) {
+        WindowModeLog(LooksLikeFullscreenGameTarget(top)
+            ? L"[窗口模式] 全屏游戏：绑定后不置底/不最小化（避免拆 DXGI 独占）"
+            : L"[窗口模式] 远程桌面：绑定后不置底/不最小化/不隐藏（避免会话窗消失）");
+    } else if (!background) {
         if (UsesCdpInput(config_)) {
             PrepareMacroDesktopForCdpBind(top);
         } else {
             PinMacroDesktopWindowBottom(top);
-            if (ShouldMinimizeTargetAfterBind(config_) && !IsIconic(top)) {
+            if (ShouldMinimizeTargetAfterBind(config_, top) && !IsIconic(top)) {
                 ShowWindow(top, SW_SHOWMINNOACTIVE);
             }
         }
@@ -1307,9 +1321,9 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         DWORD pid = 0;
         GetWindowThreadProcessId(top, &pid);
         HideTransientGdiPlusWindows(pid);
-    } else {
-        EnsureTargetBelowUserWindows(top);
     }
+    // 已有窗口：禁止压底/附加前台线程。SetWindowPos(SWP_SHOWWINDOW) 与
+    // AttachThreadInput 会把目标唤到前台，违背后台录制回放「完全不切前台」。
 
     err.clear();
     state_.lastError.clear();
@@ -1345,6 +1359,14 @@ bool WindowModeSession::Start(const WindowModeScriptConfig& config, std::wstring
     if (!config_.enabled) {
         state_.health = WindowModeHealth::Unknown;
         return true;
+    }
+    // 模拟器误选「窗口模式」会 CreateDesktop + 搬窗，易崩 MuMu/DeSmuME/melonDS；自动降级后台窗口。
+    if (config_.executionKind == WindowModeExecutionKind::HiddenDesktop
+        && ConfigLooksLikeEmulatorTarget(config_)) {
+        config_.executionKind = WindowModeExecutionKind::BackgroundWindow;
+        WindowModeLogEvent(
+            L"[窗口模式] 模拟器目标：已从「窗口模式」自动切换为「后台窗口模式」"
+            L"（不创建虚拟桌面、不搬窗）");
     }
     if (!EnsureDesktop(err)) return false;
     // ?
@@ -1391,16 +1413,19 @@ void WindowModeSession::SaveTargetTopPlacementIfNeeded(HWND top) {
 
 void WindowModeSession::RestoreSavedTargetTopPlacement() {
     if (!hasSavedTargetTopPlacement_) return;
-    if (config_.executionKind != WindowModeExecutionKind::BackgroundWindow) {
+    const bool wantsRestore =
+        config_.executionKind == WindowModeExecutionKind::BackgroundWindow
+        || (config_.executionKind == WindowModeExecutionKind::HiddenDesktop
+            && !UsesCdpInput(config_));
+    if (!wantsRestore) {
         hasSavedTargetTopPlacement_ = false;
         savedTargetTopHwnd_ = nullptr;
         return;
     }
 
     if (savedTargetTopHwnd_ && IsWindow(savedTargetTopHwnd_)) {
-        // ?
         RestoreBoundTargetTopWindow(savedTargetTopHwnd_, savedTargetTopWp_);
-        WindowModeLog(L"[\u7a97\u53e3\u6a21\u5f0f] \u4f1a\u8bdd\u7ed3\u675f: \u5df2\u91ca\u653e\u542f\u52a8\u8fdb\u7a0b\u4e0e\u76ee\u6807\u7ed1\u5b9a");
+        WindowModeLog(L"[窗口模式] 会话结束: 已还原目标窗口绑定时的最小化/位置状态");
     }
 
     hasSavedTargetTopPlacement_ = false;
@@ -1440,9 +1465,13 @@ bool WindowModeSession::EnsureMacroDesktopReady(std::wstring& err) {
         // 每次找图「0→1 Move + 出帧」闪屏，窗也落不稳在宏桌面。
         return true;
     }
+    if (LooksLikeFullscreenGameTarget(top)) {
+        WindowModeLog(L"[窗口模式] 全屏游戏：不搬到「鼠标宏」桌面（避免独占呈现冻结）");
+        return true;
+    }
 
     if (!IsWindowOnVirtualDesktopIndex(top, state_.macroDesktopIndex)) {
-        EnsureTargetOnMacroDesktop(top, ShouldMinimizeTargetAfterBind(config_));
+        EnsureTargetOnMacroDesktop(top, ShouldMinimizeTargetAfterBind(config_, top));
     }
     return true;
 }
@@ -1603,6 +1632,7 @@ bool WindowModeSession::LaunchTargetOnDesktop(std::wstring& err) {
 
     auto squashMoved = [&](HWND wnd) {
         if (!wnd || !IsWindow(wnd)) return;
+        if (LooksLikeFullscreenGameTarget(wnd)) return;
         ForceHideLaunchedWindowQuiet(wnd);
         MinimizeForQuietDesktopMove(wnd);
         desktop_.MoveWindowToMacroDesktop(wnd);

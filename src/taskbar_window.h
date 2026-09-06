@@ -48,26 +48,61 @@ inline bool GetWindowRestoredRect(HWND hwnd, RECT* rect) {
 /// 析构后恢复。上层窗口继续使用系统实时预览。
 class ScopedCoveredWindowThumbnail {
 public:
-    explicit ScopedCoveredWindowThumbnail(HWND hwnd);
-    ~ScopedCoveredWindowThumbnail();
+    explicit ScopedCoveredWindowThumbnail(HWND /*hwnd*/) {}
+    ~ScopedCoveredWindowThumbnail() = default;
     ScopedCoveredWindowThumbnail(const ScopedCoveredWindowThumbnail&) = delete;
     ScopedCoveredWindowThumbnail& operator=(const ScopedCoveredWindowThumbnail&) = delete;
-
-private:
-    HWND hwnd_ = nullptr;
-    bool active_ = false;
-    LONG_PTR savedExStyle_ = 0;
 };
 
-inline HICON LoadIconResource(UINT id, int cx, int cy) {
+inline HICON LoadIconFromSiblingFile(PCWSTR fileName, int cx, int cy) {
+    if (!fileName || !fileName[0]) return nullptr;
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(g_instance ? g_instance : GetModuleHandleW(nullptr), exePath, MAX_PATH);
+    wchar_t* slash = wcsrchr(exePath, L'\\');
+    if (!slash) return nullptr;
+    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - exePath), fileName);
+    if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) return nullptr;
     return static_cast<HICON>(LoadImageW(
+        nullptr, exePath, IMAGE_ICON, cx, cy, LR_LOADFROMFILE | LR_DEFAULTCOLOR));
+}
+
+inline HICON LoadIconResource(UINT id, int cx, int cy) {
+    HICON icon = static_cast<HICON>(LoadImageW(
         g_instance, MAKEINTRESOURCEW(id), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR));
+    if (icon) return icon;
+    // 资源被杀软剥离时回退到旁路 ico
+    PCWSTR file = L"app_icon.ico";
+    if (id == IDI_TRAY_RUNNING) file = L"tray_running.ico";
+    else if (id == IDI_BREAKOUT_PAUSE) file = L"breakout_pause.ico";
+    return LoadIconFromSiblingFile(file, cx, cy);
+}
+
+/// 进程内缓存：EnsureTrayIcon / WM_SETICON 会高频调用；每次 LoadImage 不 Destroy
+/// 会耗尽 USER 句柄（约 1 万），表现为托盘变默认 exe 图标、右键菜单空白。
+/// 按 (id,cx,cy) 缓存，任意尺寸调用都安全。
+inline HICON LoadIconResourceCached(UINT id, int cx, int cy) {
+    struct Entry {
+        UINT id = 0;
+        int cx = 0;
+        int cy = 0;
+        HICON icon = nullptr;
+    };
+    static Entry cache[48]{};
+    static int cacheCount = 0;
+    for (int i = 0; i < cacheCount; ++i) {
+        if (cache[i].id == id && cache[i].cx == cx && cache[i].cy == cy) return cache[i].icon;
+    }
+    HICON icon = LoadIconResource(id, cx, cy);
+    if (icon && cacheCount < static_cast<int>(sizeof(cache) / sizeof(cache[0]))) {
+        cache[cacheCount++] = Entry{id, cx, cy, icon};
+    }
+    return icon;
 }
 
 inline HICON LoadAppIcon(int cx = 0, int cy = 0) {
     if (cx <= 0) cx = GetSystemMetrics(SM_CXICON);
     if (cy <= 0) cy = GetSystemMetrics(SM_CYICON);
-    return LoadIconResource(IDI_APPICON, cx, cy);
+    return LoadIconResourceCached(IDI_APPICON, cx, cy);
 }
 
 inline HICON LoadAppIconSmall() {
@@ -76,13 +111,13 @@ inline HICON LoadAppIconSmall() {
 
 /// Win11 任务栏按钮用 ICON_SMALL2 辅助刷新；不要写入 GCLP_HICON/GCLP_HICONSM。
 inline HICON LoadAppIconForTaskbar() {
-    return LoadIconResource(IDI_APPICON, 256, 256);
+    return LoadIconResourceCached(IDI_APPICON, 256, 256);
 }
 
 inline HICON LoadTrayRunningIcon(int cx = 0, int cy = 0) {
     if (cx <= 0) cx = GetSystemMetrics(SM_CXICON);
     if (cy <= 0) cy = GetSystemMetrics(SM_CYICON);
-    return LoadIconResource(IDI_TRAY_RUNNING, cx, cy);
+    return LoadIconResourceCached(IDI_TRAY_RUNNING, cx, cy);
 }
 
 inline HICON LoadTrayRunningIconSmall() {
@@ -90,13 +125,13 @@ inline HICON LoadTrayRunningIconSmall() {
 }
 
 inline HICON LoadTrayRunningIconForTaskbar() {
-    return LoadIconResource(IDI_TRAY_RUNNING, 256, 256);
+    return LoadIconResourceCached(IDI_TRAY_RUNNING, 256, 256);
 }
 
 inline HICON LoadBreakoutPauseIcon(int cx = 0, int cy = 0) {
     if (cx <= 0) cx = GetSystemMetrics(SM_CXICON);
     if (cy <= 0) cy = GetSystemMetrics(SM_CYICON);
-    return LoadIconResource(IDI_BREAKOUT_PAUSE, cx, cy);
+    return LoadIconResourceCached(IDI_BREAKOUT_PAUSE, cx, cy);
 }
 
 inline HICON LoadBreakoutPauseIconSmall() {
@@ -104,11 +139,11 @@ inline HICON LoadBreakoutPauseIconSmall() {
 }
 
 inline HICON LoadBreakoutPauseIconForTaskbar() {
-    return LoadIconResource(IDI_BREAKOUT_PAUSE, 256, 256);
+    return LoadIconResourceCached(IDI_BREAKOUT_PAUSE, 256, 256);
 }
 
-inline constexpr wchar_t kMainTaskbarAppId[] = L"ShuDaXia.MouseMacro";
-inline constexpr wchar_t kBreakoutTaskbarAppId[] = L"ShuDaXia.MouseMacro.BreakoutPause";
+inline constexpr wchar_t kMainTaskbarAppId[] = L"ShuDaXia.KeyMouse";
+inline constexpr wchar_t kBreakoutTaskbarAppId[] = L"ShuDaXia.KeyMouse.BreakoutPause";
 
 inline bool SetWindowPropertyString(IPropertyStore* store, const PROPERTYKEY& key, PCWSTR value) {
     if (!store || !value || !value[0]) return false;
@@ -176,7 +211,7 @@ inline void SetWindowMainTaskbarIdentity(HWND hwnd) {
     wchar_t relaunchCmd[MAX_PATH + 4]{};
     swprintf_s(relaunchCmd, MAX_PATH + 4, L"\"%s\"", exePath);
     SetWindowTaskbarRelaunchProps(hwnd, kMainTaskbarAppId, iconPath,
-        L"鼠大侠-鼠标宏", relaunchCmd);
+        L"键鼠工坊", relaunchCmd);
 }
 
 inline void RestoreWindowMainTaskbarIdentity(HWND hwnd) {
@@ -198,7 +233,7 @@ inline void SetWindowBreakoutTaskbarIdentity(HWND hwnd) {
     wchar_t relaunchCmd[MAX_PATH + 4]{};
     swprintf_s(relaunchCmd, MAX_PATH + 4, L"\"%s\"", exePath);
     SetWindowTaskbarRelaunchProps(hwnd, kBreakoutTaskbarAppId, iconPath,
-        L"鼠大侠-鼠标宏脱离中", relaunchCmd);
+        L"键鼠工坊-脱离中", relaunchCmd);
 }
 
 #ifndef DWMWA_FORCE_ICONIC_REPRESENTATION
@@ -345,14 +380,14 @@ inline void SetWindowRunningTaskbarIdentity(HWND hwnd) {
     wchar_t relaunchCmd[MAX_PATH + 4]{};
     swprintf_s(relaunchCmd, MAX_PATH + 4, L"\"%s\"", exePath);
     SetWindowTaskbarRelaunchProps(hwnd, kMainTaskbarAppId, iconPath,
-        L"鼠大侠-鼠标宏运行中", relaunchCmd);
+        L"键鼠工坊-运行中", relaunchCmd);
 }
 
 inline void ApplyRunningTaskbarPresentation(HWND hwnd) {
     if (!hwnd) return;
     SetWindowRunningTaskbarIdentity(hwnd);
     ApplyRunningTaskbarWindowIcons(hwnd);
-    SetWindowTextW(hwnd, L"鼠大侠-鼠标宏运行中");
+    SetWindowTextW(hwnd, L"键鼠工坊-运行中");
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }

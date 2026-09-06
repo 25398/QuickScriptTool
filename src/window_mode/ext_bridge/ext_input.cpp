@@ -749,13 +749,13 @@ bool ExtInputSession::FinishAttachFromResult(const std::string& result, int tabI
     }
     if (!SupportsSafeExtScreenshot()) {
         WindowModeLog(L"[窗口模式] 警告: 扩展需 v1.0.21+ 才能扩展视觉找图；"
-            L"请在 edge://extensions 对「鼠大侠」点「重新加载」"
+            L"请在 edge://extensions 对「键鼠工坊」点「重新加载」"
             L"（目录 extension\\\\edge 或 build\\\\Release\\\\extension\\\\edge）");
     }
     if (!SupportsStableBridgeApi()) {
         // 仅日志：勿 MessageBox 抢焦点打断键鼠；找图需 1.1.15，输入仍可继续。
         WindowModeLog(L"[窗口模式] ★请重载扩展到 v1.1.43+★（HTTP 截图找图；轻量保活防卡帧）"
-            L" edge://extensions → 鼠大侠 → 重新加载（build\\\\Release\\\\extension\\\\edge）");
+            L" edge://extensions → 键鼠工坊 → 重新加载（build\\\\Release\\\\extension\\\\edge）");
     }
     const std::string via = extractStr("via");
     const std::string focus = extractStr("focus");

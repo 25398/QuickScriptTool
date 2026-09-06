@@ -78,6 +78,39 @@ void DrawClockGlyph(HDC hdc, int cx, int cy, int size, COLORREF color, int strok
 /// 标准箭头指针（取自系统 IDC_ARROW 轮廓，实心填充）
 void DrawPointerCursorGlyph(HDC hdc, int cx, int cy, int size, COLORREF color);
 
+/// 标题条底边 / Tab 下划线微动效相位（弧度）；由主窗定时器推进
+void SetChromePulsePhase(float phaseRadians);
+float ChromePulsePhase();
+/// 标题条底边 main→accent 细渐变线（设计高 kTitleAccentLineH）
+void DrawTitleAccentLine(HDC hdc, int clientWidth);
+/// 标题条填充 + accent 线（pulse 定时器仍可单独调用 DrawTitleAccentLine）
+void DrawTitleChrome(HDC hdc, int clientWidth, COLORREF fill);
+/// 选中 Tab 底部高亮下划线（设计高 kTabUnderlineH）
+void DrawTabActiveUnderline(HDC hdc, const RECT& tabRc);
+/// 主窗导航 Tab：选中底、图标、文字、下划线（paint/hit 共用 Tab RECT）
+void DrawNavTabButton(HDC hdc, const RECT& tabRc, const wchar_t* text, int iconType,
+    bool selected, HFONT tabFont);
+/// 通栏底栏带（设计顶 kHomeFooterTop）
+RECT HomeFooterBandRect(int clientWidth, int clientHeight);
+void DrawHomeFooterBand(HDC hdc, int clientWidth, int clientHeight);
+/// 底栏提示文案区（与 EngineHost::HomeFooterRect 同几何）
+RECT HomeFooterHintRect();
+void DrawHomeFooterHint(HDC hdc, const wchar_t* text, HFONT font);
+/// 列表卡片左边轨（主题色，非硬编码 Arctic）
+void DrawHomeCardRail(HDC hdc, const RECT& cardRc, bool selected, bool hovered);
+/// 首页列表卡片：白卡 + 轻阴影 + 左边轨 + 选中/悬停描边（fill 取自主题表面）
+void DrawHomeCard(HDC hdc, const RECT& cardRc, bool selected, bool hovered);
+/// 首页 CTA 条：深壳水平渐变 + 左侧彩轨（alert=运行中/录制中）
+void DrawHomeCtaBar(HDC hdc, const RECT& rc, bool alert);
+/// CTA 右侧描边键帽（mockup .cta-key）；与 hit-test 共用 CtaKeycapRect
+RECT CtaKeycapRect(const RECT& ctaRc);
+void DrawCtaKeycap(HDC hdc, const RECT& keyRc, const wchar_t* text, bool alert);
+/// 首页内容大卡片（frost + 顶彩条），连点/列表外框
+void DrawHomeContentPanel(HDC hdc, const RECT& rc);
+/// 编辑器动作行背景：选中/悬停/批选圆角 + 选中左轨（文案与 op 热区仍由调用方绘制）
+void DrawEditorActionRowBg(HDC hdc, const RECT& rowRc, bool selected, bool hovered,
+    bool batchMode, bool batchChecked);
+
 void DrawBorderRect(HDC hdc, const RECT& rc, COLORREF color);
 void FillRectColor(HDC hdc, const RECT& rc, COLORREF color);
 void FillGradientRect(HDC hdc, const RECT& rc, COLORREF start, COLORREF end, bool vertical);
@@ -87,6 +120,7 @@ void DrawFilledTriangle(HDC hdc, const POINT pts[3], COLORREF color);
 void DrawExpandTriangle(HDC hdc, const RECT& rc, bool expanded, COLORREF color);
 void DrawComboDownArrow(HDC hdc, int centerX, int centerY, COLORREF color = kMainGreen);
 void DrawTopActionGlyph(HDC hdc, const RECT& rc, int iconType);
+void DrawTopActionGlyph(HDC hdc, const RECT& rc, int iconType, COLORREF color);
 void DrawNavIcon(HDC hdc, const RECT& rc, int iconType, HFONT homeTabFont = nullptr);
 void DrawHomeRadio(HDC hdc, const RECT& rc, bool checked);
 void DrawRecorderEmptyIcon(HDC hdc);

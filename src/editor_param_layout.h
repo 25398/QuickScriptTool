@@ -148,6 +148,14 @@ constexpr int EID_OcrFindMatchThreshold   = 1140;
 constexpr int EID_OcrFindScaleMin         = 1141;
 constexpr int EID_OcrFindScaleMax         = 1142;
 constexpr int EID_OcrDigitsOnly           = 1143;
+constexpr int EID_OcrImageRegionX1        = 1190;
+constexpr int EID_OcrImageRegionY1        = 1191;
+constexpr int EID_OcrImageRegionX2        = 1192;
+constexpr int EID_OcrImageRegionY2        = 1193;
+constexpr int EID_AiImageRegionX1         = 1194;
+constexpr int EID_AiImageRegionY1         = 1195;
+constexpr int EID_AiImageRegionX2         = 1196;
+constexpr int EID_AiImageRegionY2         = 1197;
 constexpr int EID_IfVarCombo              = 1144;
 constexpr int EID_IfOperator              = 1145;
 constexpr int EID_IfValue                 = 1146;
@@ -197,7 +205,7 @@ constexpr int EID_AiSearchX2              = 1188;
 constexpr int EID_AiSearchY2              = 1189;
 constexpr int EID_AiMaxSteps              = 1190;
 constexpr int EID_AiWithImage             = 1191;
-constexpr int EID_AiConfirm               = 1192;
+constexpr int EID_AiLogicConvert          = 1192;
 constexpr int EID_AiMaxStepsHint          = 1193;
 constexpr int EID_CursorPosVarName        = 1194;
 constexpr int EID_GotoStepExpr            = 1195;
@@ -760,7 +768,7 @@ inline UILayout FindImageBase() {
     //   screenshot btn at y=316 (top of preview, same row)
     //   local btn     → y=361 (centered: (346+406)/2 - 15)
     //   clear btn     → y=406 (preview bottom 436 - 30)
-    //   匹配度 row    → y=448, end=478
+    //   范围 row      → y=448, end=478
     //   缩放 row      → y=478, end=508
     //   后续操作 row  → y=508, end=546
     return UILayout(kFindContentLeft, kFindRegionRowY, kFindBlockW, 0)  // rowGap=0
@@ -812,7 +820,7 @@ inline UILayout FindImageBase() {
         }, 0, 15, 0)
         // match row at y=448 (marginTop: 448 - 436 = 12)
         .AddRow({
-            UIComponent::Label(L"匹配度大于", -1, 90, 22),
+            UIComponent::Label(L"范围", -1, 90, 22),
             Gap(1),
             UIComponent::FieldEdit(L"65", EID_FindMatchThreshold, 40, 22),
             Gap(4),
@@ -984,8 +992,6 @@ inline UILayout OcrFindRegion() {
     return UILayout(kFindContentLeft, kFindImageLabelY, kFindBlockW)
         .AddRow({
             UIComponent::Label(L"要查找的图", -1, 90, kFindBtnH),
-            Gap(kFindActionBtnX - kFindContentLeft - 90),
-            UIComponent::GrayButton(L"选取区域", EID_OcrFindSelectRegion, kFindBtnW, kFindBtnH),
         }, 0, 0, kFindVGap)
         .AddRow({
             UIComponent::GrayButton(L"", EID_OcrFindImagePreview, kFindImageSize, kFindImageSize),
@@ -1001,7 +1007,7 @@ inline UILayout OcrFindRegion() {
             UIComponent::GrayButton(L"清除图片", EID_OcrFindClearImage, kFindBtnW, kFindBtnH),
         }, 0, 0, kFindVGap)
         .AddRow({
-            UIComponent::Label(L"匹配度大于", -1, 90, 22),
+            UIComponent::Label(L"范围", -1, 90, 22),
             Gap(1),
             UIComponent::FieldEdit(L"65", EID_OcrFindMatchThreshold, 40, 22),
             Gap(4),
@@ -1015,6 +1021,27 @@ inline UILayout OcrFindRegion() {
             UIComponent::Label(L"最大", -1, 40, 22),
             Gap(1),
             UIComponent::FieldEdit(L"1.1", EID_OcrFindScaleMax, 40, 22),
+        }, 0, 0, kFindVGap)
+        .AddRow({
+            UIComponent::GrayButton(L"选取区域位置", EID_OcrFindSelectRegion, kFindBlockW, kFindBtnH),
+        }, 0, 0, kFindVGap)
+        .AddRow({
+            UIComponent::Label(L"X1", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_OcrImageRegionX1, kFindEditW, 22),
+            Gap(kFindCoordPairGap),
+            UIComponent::Label(L"Y1", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_OcrImageRegionY1, kFindEditW, 22),
+        }, 0, 0, kFindVGap)
+        .AddRow({
+            UIComponent::Label(L"X2", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_OcrImageRegionX2, kFindEditW, 22),
+            Gap(kFindCoordPairGap),
+            UIComponent::Label(L"Y2", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_OcrImageRegionY2, kFindEditW, 22),
         });
 }
 
@@ -1096,10 +1123,10 @@ inline UILayout StopMacro() {
 inline UILayout Goto() {
     return UILayout(kParamPanelLeft, 174, kPanelWidth)
         .AddRow({
-            UIComponent::EditorLabel(L"跳转到动作序号", -1, kPanelWidth, 22),
+            UIComponent::EditorLabel(L"目标动作序号", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::FieldEdit(L"", EID_GotoStepExpr, kParamFieldWidth, kPanelSingleFieldH),
+            UIComponent::FieldEdit(L"", EID_GotoStepExpr, (kParamFieldWidth * 618) / 1000, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::Hint(
@@ -1233,7 +1260,7 @@ inline UILayout GetCursorPos() {
             UIComponent::Label(L"变量命名", -1, 120, 25),
         }, 0, 0, 1)
         .AddRow({
-            UIComponent::FieldEdit(L"", EID_CursorPosVarName, kParamFieldWidth, kPanelSingleFieldH),
+            UIComponent::FieldEdit(L"a", EID_CursorPosVarName, kParamFieldWidth, kPanelSingleFieldH),
         }, 0, 0, 6)
         .AddRow({
             UIComponent::Hint(
@@ -1248,9 +1275,7 @@ inline UILayout GetCursorPos() {
 inline UILayout AiCommon() {
     return UILayout(kParamPanelLeft, 174, kPanelWidth)
         .AddRow({
-            UIComponent::EditorLabel(L"提示词 (Prompt)", -1, kPanelWidth - 52 - 8, 22),
-            Gap(8),
-            UIComponent::CheckBox(L"图片", EID_AiWithImage, 52, 25),
+            UIComponent::EditorLabel(L"提示词 (Prompt)", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::MultilineEdit(L"", EID_AiPrompt, kPanelWidth, kPanelTextFieldH),
@@ -1298,6 +1323,13 @@ inline UILayout AiCommon() {
             UIComponent::FieldEdit(L"", EID_AiFallback, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
+            UIComponent::CheckBox(L"附带截图", EID_AiWithImage, kPanelWidth, 25),
+        }, 0, 0, 8)
+        // 逻辑转化勾选仍挂在公共布局创建控件，运行时摆到动作详情最底部
+        .AddRow({
+            UIComponent::CheckBox(L"逻辑转化", EID_AiLogicConvert, kPanelWidth, 25),
+        }, 0, 0, 8)
+        .AddRow({
             UIComponent::EditorLabel(L"输出变量名", -1, kPanelWidth, 22),
         }, 0, 0, 6)
         .AddRow({
@@ -1320,9 +1352,6 @@ inline UILayout AiImage() {
             UIComponent::FieldEdit(L"1.0", EID_AiImageScale, kPanelWidth, kPanelSingleFieldH),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage, kPanelWidth, 25),
-        }, 0, 0, 8)
-        .AddRow({
             UIComponent::Label(L"识别区域", -1, 60, 22),
             Gap(6),
             UIComponent::GrayButton(L"全图", EID_AiFullScreen, 44, 22),
@@ -1346,15 +1375,15 @@ inline UILayout AiImage() {
             UIComponent::Label(L"Y2", -1, 22, 22),
             Gap(6),
             UIComponent::FieldEdit(L"0", EID_AiSearchY2, 54, 22),
+        }, 0, 0, 8)
+        .AddRow({
+            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage, kPanelWidth, 25),
         });
 }
 
 inline UILayout AiAction() {
     return UILayout(kParamPanelLeft, 174, kPanelWidth)
         .AddRow({
-            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage2, kPanelWidth, 25),
-        }, 0, 0, 8)
-        .AddRow({
             UIComponent::Label(L"识别区域", -1, 60, 22),
             Gap(6),
             UIComponent::GrayButton(L"全图", EID_AiFullScreen, 44, 22),
@@ -1380,7 +1409,7 @@ inline UILayout AiAction() {
             UIComponent::FieldEdit(L"0", EID_AiSearchY2, 54, 22),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::CheckBox(L"确认后执行(安全模式)", EID_AiConfirm, 200, 25),
+            UIComponent::CheckBox(L"根据图片选取区域", EID_AiRegionByImage2, kPanelWidth, 25),
         });
 }
 
@@ -1388,8 +1417,6 @@ inline UILayout AiFindRegion() {
     return UILayout(kFindContentLeft, 174, kFindBlockW)
         .AddRow({
             UIComponent::Label(L"要查找的图", -1, 90, 22),
-            Gap(8),
-            UIComponent::GrayButton(L"选取区域", EID_AiFindSelectRegion, 90, 22),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::GrayButton(L"", EID_AiTargetPreview, 120, 120),
@@ -1405,7 +1432,7 @@ inline UILayout AiFindRegion() {
             UIComponent::GrayButton(L"清除图片", EID_AiTargetClear, 90, 28),
         }, 0, 0, 8)
         .AddRow({
-            UIComponent::Label(L"匹配度大于", -1, 90, 22),
+            UIComponent::Label(L"范围", -1, 90, 22),
             Gap(1),
             UIComponent::FieldEdit(L"65", EID_AiFindMatchThreshold, 40, 22),
             Gap(4),
@@ -1419,6 +1446,27 @@ inline UILayout AiFindRegion() {
             UIComponent::Label(L"最大", -1, 40, 22),
             Gap(1),
             UIComponent::FieldEdit(L"1.1", EID_AiFindScaleMax, 40, 22),
+        }, 0, 0, 8)
+        .AddRow({
+            UIComponent::GrayButton(L"选取区域位置", EID_AiFindSelectRegion, kFindBlockW, 28),
+        }, 0, 0, 8)
+        .AddRow({
+            UIComponent::Label(L"X1", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_AiImageRegionX1, kFindEditW, 22),
+            Gap(kFindCoordPairGap),
+            UIComponent::Label(L"Y1", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_AiImageRegionY1, kFindEditW, 22),
+        }, 0, 0, 8)
+        .AddRow({
+            UIComponent::Label(L"X2", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_AiImageRegionX2, kFindEditW, 22),
+            Gap(kFindCoordPairGap),
+            UIComponent::Label(L"Y2", -1, kFindCoordLabelW, 22),
+            Gap(kFindCoordLabelEditGap),
+            UIComponent::FieldEdit(L"0", EID_AiImageRegionY2, kFindEditW, 22),
         });
 }
 

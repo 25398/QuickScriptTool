@@ -37,6 +37,37 @@ UINT ReadModifierMask() {
 
 }  // namespace
 
+HotkeyCapture* HotkeyCapture::s_actionKeyCapture_ = nullptr;
+
+LRESULT CALLBACK HotkeyCapture::ActionKeyLlProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && s_actionKeyCapture_ && s_actionKeyCapture_->hwnd_
+        && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
+        const auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+        if (ks && (ks->vkCode == VK_LWIN || ks->vkCode == VK_RWIN)
+            && !(ks->flags & LLKHF_INJECTED)) {
+            // Win 键通常不进 WM_KEYDOWN；LL 钩子补投递，系统菜单仍可弹出（用户允许）
+            PostMessageW(s_actionKeyCapture_->hwnd_, WM_KEYDOWN, ks->vkCode, 0);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+void HotkeyCapture::InstallActionKeyLlHook() {
+    if (actionKeyLlHook_ || IsHotkeyCaptureMode()) return;
+    s_actionKeyCapture_ = this;
+    actionKeyLlHook_ = SetWindowsHookExW(
+        WH_KEYBOARD_LL, &HotkeyCapture::ActionKeyLlProc, GetModuleHandleW(nullptr), 0);
+    if (!actionKeyLlHook_) s_actionKeyCapture_ = nullptr;
+}
+
+void HotkeyCapture::UninstallActionKeyLlHook() {
+    if (actionKeyLlHook_) {
+        UnhookWindowsHookEx(actionKeyLlHook_);
+        actionKeyLlHook_ = nullptr;
+    }
+    if (s_actionKeyCapture_ == this) s_actionKeyCapture_ = nullptr;
+}
+
 bool HotkeyCapture::Show(HWND owner, const Hotkey& oldValue,
                          bool scriptHotkey, Hotkey& out,
                          bool globalStartStop,
@@ -55,6 +86,7 @@ bool HotkeyCapture::Show(HWND owner, const Hotkey& oldValue,
     pendingVk_ = 0;
     pendingMods_ = 0;
     pendingDownTick_ = 0;
+    actionKeyLlHook_ = nullptr;
 
     static bool registered = false;
     if (!registered) {
@@ -73,16 +105,19 @@ bool HotkeyCapture::Show(HWND owner, const Hotkey& oldValue,
     const int x = ownerRc.left + ((ownerRc.right - ownerRc.left) - kDlgW) / 2;
     const int y = ownerRc.top + ((ownerRc.bottom - ownerRc.top) - kDlgH) / 2;
 
-    hwnd_ = CreateWindowExW(WS_EX_DLGMODALFRAME, kDlgClass, L"设置热键",
+    hwnd_ = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, kDlgClass, L"设置热键",
         WS_POPUP | WS_MINIMIZEBOX, x, y, kDlgW, kDlgH,
         owner, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
 
     ApplyTaskbarWindowStyle(hwnd_, L"设置热键");
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
     SetFocus(hwnd_);
+    InstallActionKeyLlHook();
 
     MSG msg{};
     while (!done_ && GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -96,6 +131,7 @@ bool HotkeyCapture::Show(HWND owner, const Hotkey& oldValue,
         DispatchMessageW(&msg);
     }
 
+    UninstallActionKeyLlHook();
     if (IsWindow(hwnd_)) {
         ShowWindow(hwnd_, SW_HIDE);
         DestroyWindow(hwnd_);
@@ -292,11 +328,15 @@ void HotkeyCapture::ApplyCapturedKey(UINT vk, UINT mods, bool holdMode) {
 
 void HotkeyCapture::OnKeyDown(UINT vk) {
     if (vk == VK_PROCESSKEY) return;
-    if (IsModifierVk(vk)) return;
+    // 动作按键捕获：允许 Win 作为主键；热键模式仍仅把 Win 当修饰键
+    const bool winAsKey = !IsHotkeyCaptureMode() && (vk == VK_LWIN || vk == VK_RWIN);
+    if (IsModifierVk(vk) && !winAsKey) return;
 
     // 按键点击 / 按下抬起：按下即定键（无长按语义）
     if (!IsHotkeyCaptureMode()) {
-        ApplyCapturedKey(vk, ReadModifierMask(), false);
+        // Win 作主键时不叠 MOD_WIN，避免显示成 Win+LWin
+        const UINT mods = winAsKey ? 0 : ReadModifierMask();
+        ApplyCapturedKey(vk, mods, false);
         return;
     }
 
@@ -353,10 +393,10 @@ void HotkeyCapture::OnPaint() {
     SelectObject(hdc, font_);
     std::wstring prompt;
     if (IsHotkeyCaptureMode()) {
-        prompt = L"请直接在键盘上输入新的热键\n（按住设为启停，按住"
+        prompt = L"请按下要设置的热键\n（按住设为启停，按住"
             + FormatHoldThresholdLabel(holdThresholdSeconds_) + L"秒算按住）";
     } else {
-        prompt = L"请直接在键盘上输入要点击的键（\n截屏键";
+        prompt = L"请按下要点击的键\n（截屏键除外）";
     }
     DrawTextIn(hdc, prompt, RECT{16, 16, 348, 74}, RGB(150, 150, 150), DT_LEFT);
 

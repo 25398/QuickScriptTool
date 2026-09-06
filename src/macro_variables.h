@@ -15,6 +15,57 @@
 #include "ocr_result.h"
 #include "script_types.h"
 
+#include <windows.h>
+
+enum class ClipboardExpandMode {
+    Text,  // 快捷输入 / OCR / AI 文字分析：文本或文件路径；位图展开为空
+    Ai     // AI 图片分析 / AI 动作执行：文本+非图片路径；图片改为「见附图」
+};
+
+struct MacroClipboardSnapshot {
+    std::wstring text;
+    std::vector<std::wstring> files;
+    bool hasBitmap = false;
+    HBITMAP bitmap = nullptr;  // 快照持有；析构时 DeleteObject
+
+    MacroClipboardSnapshot() = default;
+    ~MacroClipboardSnapshot() { ClearBitmap(); }
+    MacroClipboardSnapshot(const MacroClipboardSnapshot&) = delete;
+    MacroClipboardSnapshot& operator=(const MacroClipboardSnapshot&) = delete;
+    MacroClipboardSnapshot(MacroClipboardSnapshot&& o) noexcept
+        : text(std::move(o.text))
+        , files(std::move(o.files))
+        , hasBitmap(o.hasBitmap)
+        , bitmap(o.bitmap) {
+        o.bitmap = nullptr;
+        o.hasBitmap = false;
+    }
+    MacroClipboardSnapshot& operator=(MacroClipboardSnapshot&& o) noexcept {
+        if (this != &o) {
+            ClearBitmap();
+            text = std::move(o.text);
+            files = std::move(o.files);
+            hasBitmap = o.hasBitmap;
+            bitmap = o.bitmap;
+            o.bitmap = nullptr;
+            o.hasBitmap = false;
+        }
+        return *this;
+    }
+    void ClearBitmap() {
+        if (bitmap) {
+            DeleteObject(bitmap);
+            bitmap = nullptr;
+        }
+    }
+};
+
+MacroClipboardSnapshot ReadMacroClipboardSnapshot();
+bool LooksLikeImageFilePath(const std::wstring& path);
+bool PromptMentionsCtrlClipboard(const std::wstring& text);
+/// 返回 HBITMAP（调用方 DeleteObject）；无位图时为空。
+void* DuplicateClipboardBitmapRaw();
+
 // 快捷输入变量提示项 (用于编辑器的变量自动提示)
 struct QuickInputVarItem {
     std::wstring display;    // 显示名 (如 "matchRet.x")
@@ -28,9 +79,12 @@ struct MacroVariableContext {
     const std::unordered_map<std::wstring, ImageMatchResult>* matchVars = nullptr;  // 找图结果变量
     const std::unordered_map<std::wstring, OcrVarResult>* ocrVars = nullptr;      // 文字识别变量
     const std::unordered_map<std::wstring, std::wstring>* aiVars = nullptr;       // AI输出变量
+    const std::unordered_map<std::wstring, std::wstring>* imageVars = nullptr;    // 图片变量→绝对路径
     const std::unordered_map<std::wstring, int>* loopVars = nullptr;                // 循环计数变量
     const std::unordered_map<std::wstring, std::chrono::steady_clock::time_point>* timerStarts = nullptr;  // 计时器变量起始时刻
     int curLoops = 0;  // 当前外层循环累计次数
+    const MacroClipboardSnapshot* clipboardSnapshot = nullptr;  // 非空则不再读系统剪贴板
+    ClipboardExpandMode clipboardExpandMode = ClipboardExpandMode::Text;
 };
 
 // 构建编辑器变量提示列表 (从脚本动作中提取所有定义过的变量)

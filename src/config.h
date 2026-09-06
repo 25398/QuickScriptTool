@@ -8,6 +8,10 @@
 // ── 窗口尺寸 ──────────────────────────────────────────────────────
 constexpr int kHomeWidth = 720;
 constexpr int kHomeHeight = 540;
+// Settings dialog (720x540, same width as home)
+constexpr int kSettingsWidth = 720;
+constexpr int kSettingsHeight = 540;
+
 constexpr int kEditorBaseWidth = 1024;
 constexpr int kEditorBaseHeight = 768;
 constexpr int kEditorWidth = 1200;
@@ -42,6 +46,31 @@ constexpr int kHomeCardGap = 13;
 constexpr int kHomeCardStep = kHomeCardH + kHomeCardGap;
 constexpr int kHomeScrollW = 16;
 constexpr int kEditorScrollW = 12;
+
+// Stub radii for shared draw helpers (WebView / unused GDI mockup paths)
+constexpr int kHomePanelRadius = 10;
+constexpr int kHomePanelAccentH = 3;
+constexpr int kHomeCardRadius = 9;
+constexpr int kHomeCardRailW = 4;
+constexpr int kHomeCtaRadius = 10;
+constexpr int kEditorRowRadius = 4;
+constexpr int kEditorFieldRadius = 6;
+constexpr int kEditorListRadius = 6;
+
+// 标题/导航/编辑列表操作区（drawing.cpp / ThemeUiSelfTest）
+constexpr int kTitleAccentLineH = 2;
+constexpr int kTabUnderlineH = 3;
+constexpr int kHomeNavTabTextInset = 52;
+constexpr int kEditorOpGap = 14;
+constexpr int kEditorOpBtnW = 42;
+constexpr int kEditorOpRightPad = 18;
+constexpr int kHomeCtaSideMinW = 160;
+constexpr int kHomeCtaPadX = 20;
+constexpr int kHomeFooterHintPadX = 20;
+constexpr int kEditorRightColWDesign = 218;
+constexpr int kEditorRightColMinW = 250;
+constexpr int kEditorRightColMaxW = 280;
+constexpr int kEditorBottomBarH = 60;
 
 // ── 固定颜色（不随主题变化） ──────────────────────────────────────
 constexpr COLORREF kHoverGray = RGB(205, 205, 205);
@@ -240,6 +269,16 @@ constexpr UINT WM_APP_OPTIMIZE_PRERENDER = WM_APP + 35;
 constexpr UINT WM_APP_EDITOR_PARSE_MORE = WM_APP + 36;
 constexpr UINT WM_APP_EXT_RUN_SCRIPT = WM_APP + 37;
 constexpr UINT WM_APP_EXT_STOP_SCRIPT = WM_APP + 38;
+/// 长按达阈值：Timer Queue 回调投递（不依赖隐藏窗 WM_TIMER，避免 coalescing 推迟）
+constexpr UINT WM_HOLD_THRESHOLD_FIRE = WM_APP + 39;
+/// 逻辑转化段末写回脚本后通知 UI 刷新编辑器
+constexpr UINT WM_APP_LOGIC_CONVERT_DONE = WM_APP + 40;
+/// 引擎 Init 结束后延迟启动扩展桥 / VDA 预热（避免 WM_CREATE 内 COM/VDA AV 整进程消失）
+constexpr UINT WM_APP_DEFER_EXT_BRIDGE = WM_APP + 41;
+/// 轮询线程发现 LL 钩子过期：请 UI 线程跑 TickHotkeyHookWatchdog（隐藏窗 WM_TIMER 会被 coalescing）
+constexpr UINT WM_APP_HOTKEY_WATCHDOG = WM_APP + 42;
+/// 当前脚本结束后启动排队的定时任务（避免在 OnRunDone 里重入 StartActionsWorker）
+constexpr UINT WM_APP_RUN_SCHEDULED_PENDING = WM_APP + 43;
 constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
 
 // ── 主题感知颜色（运行时随 CurrentTheme() 变化） ──────────────────
@@ -278,9 +317,19 @@ constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
 #define kPromptOkHover (quickscript::CurrentTheme().promptOkHover)
 #define kPromptOkText (quickscript::CurrentTheme().promptOkText)
 #define kPromptCancelBorder (quickscript::CurrentTheme().promptCancelBorder)
+#define kWorkspaceBg (quickscript::CurrentTheme().workspaceBg)
+#define kHomeBodyText (quickscript::CurrentTheme().homeText)
+#define kHomeMutedText (quickscript::CurrentTheme().homeMuted)
+#define kHomeMetaText (quickscript::CurrentTheme().homeMeta)
+#define kCtaText (quickscript::CurrentTheme().ctaText)
+#define kCtaMuted (quickscript::CurrentTheme().ctaMuted)
 constexpr int HOTKEY_COMMON_ID = 701;
 constexpr int HOTKEY_GLOBAL_ID = 702;
+/// 调试热键（编辑器调试会话内临时注册；F9 默认，仅缓存不持久化）
+constexpr int HOTKEY_DEBUG_ID = 703;
 constexpr int HOTKEY_SCRIPT_BASE = 800;
+/// 录制条目热键 id 基址（与脚本 800–899 错开）；OnHotkey 须先判本区间再判 SCRIPT_BASE。
+constexpr int HOTKEY_RECORDING_BASE = 900;
 constexpr BYTE kUiFontQuality = CLEARTYPE_NATURAL_QUALITY;
 constexpr UINT kHoverTimerId = 9001;
 constexpr UINT kQuickInputTipTimerId = 9002;
@@ -288,4 +337,7 @@ constexpr UINT kScheduledTaskTimerId = 9003;
 constexpr UINT kDisplaySyncTimerId = 9005;
 constexpr UINT kWindowModePreviewTimerId = 9004;
 constexpr UINT kBreakoutReturnTimerId = 9006;
+/// Chrome pulse timer (WebView shell only; GDI StartChromePulseTimer is no-op)
+constexpr UINT kChromePulseTimerId = 9007;
+constexpr UINT kChromePulseIntervalMs = 40;
 constexpr int kQuickInputTipDelayMs = 500;

@@ -85,6 +85,11 @@ void SyncNormFieldsFromPixelsAction(ScriptAction& a, const CoordMeta& meta) {
         a.coordsAreNormalized = false;
         return;
     }
+    // 窗口相对录制动作：x/y 即目标窗口客户区像素，跳过屏幕归一化。
+    if (a.windowRelative) {
+        a.coordsAreNormalized = false;
+        return;
+    }
     const double rw = static_cast<double>(meta.refWidth);
     const double rh = static_cast<double>(meta.refHeight);
     if (rw <= 0 || rh <= 0) return;
@@ -96,20 +101,11 @@ void SyncNormFieldsFromPixelsAction(ScriptAction& a, const CoordMeta& meta) {
     a.nRandomY = a.randomY / rh;
 
     if (!a.searchFullScreen) {
-        const bool relativeSearch = (a.type == ActionType::TextRecognition && a.ocrRegionByImage)
-            || ((a.type == ActionType::AiImageAnalysis || a.type == ActionType::AiActionExecute)
-                && a.aiRegionByImage);
-        if (relativeSearch) {
-            a.nSearchX1 = a.searchX1 / rw;
-            a.nSearchY1 = a.searchY1 / rh;
-            a.nSearchX2 = a.searchX2 / rw;
-            a.nSearchY2 = a.searchY2 / rh;
-        } else {
-            a.nSearchX1 = (a.searchX1 - meta.refOriginX) / rw;
-            a.nSearchY1 = (a.searchY1 - meta.refOriginY) / rh;
-            a.nSearchX2 = (a.searchX2 - meta.refOriginX) / rw;
-            a.nSearchY2 = (a.searchY2 - meta.refOriginY) / rh;
-        }
+        // search 区域始终为屏幕绝对坐标（OCR「根据图片」的相对偏移在 imageRegion*）
+        a.nSearchX1 = (a.searchX1 - meta.refOriginX) / rw;
+        a.nSearchY1 = (a.searchY1 - meta.refOriginY) / rh;
+        a.nSearchX2 = (a.searchX2 - meta.refOriginX) / rw;
+        a.nSearchY2 = (a.searchY2 - meta.refOriginY) / rh;
     } else {
         a.nSearchX1 = 0.0;
         a.nSearchY1 = 0.0;
@@ -123,16 +119,21 @@ void SyncNormFieldsFromPixelsAction(ScriptAction& a, const CoordMeta& meta) {
         SyncFindImageOffsetNorm(a);
     }
 
-    if (a.aiSearchRegion == 6) {
+    // 模板内相对偏移：按参考分辨率归一化（与历史 OCR 锚点行为一致）
+    a.nImageRegionX1 = a.imageRegionX1 / rw;
+    a.nImageRegionY1 = a.imageRegionY1 / rh;
+    a.nImageRegionX2 = a.imageRegionX2 / rw;
+    a.nImageRegionY2 = a.imageRegionY2 / rh;
+
+    // AI 识别区域始终按屏幕绝对坐标归一化
+    const bool isAiRegionAction = (a.type == ActionType::AiImageAnalysis
+        || a.type == ActionType::AiActionExecute);
+    if (a.aiSearchRegion == 6
+        || (isAiRegionAction && (a.aiSearchX2 > a.aiSearchX1 || a.searchFullScreen))) {
         a.nAiSearchX1 = (a.aiSearchX1 - meta.refOriginX) / rw;
         a.nAiSearchY1 = (a.aiSearchY1 - meta.refOriginY) / rh;
         a.nAiSearchX2 = (a.aiSearchX2 - meta.refOriginX) / rw;
         a.nAiSearchY2 = (a.aiSearchY2 - meta.refOriginY) / rh;
-    } else if (a.aiRegionByImage) {
-        a.nAiSearchX1 = a.aiSearchX1 / rw;
-        a.nAiSearchY1 = a.aiSearchY1 / rh;
-        a.nAiSearchX2 = a.aiSearchX2 / rw;
-        a.nAiSearchY2 = a.aiSearchY2 / rh;
     }
 }
 
@@ -264,6 +265,7 @@ void NormalizeScriptCoords(std::vector<ScriptAction>& actions, const CoordMeta& 
 
 void DenormalizeActionCoords(ScriptAction& a, const CoordMeta& meta, int targetW, int targetH) {
     if (a.type == ActionType::MoveMouseRelative) return;
+    if (a.windowRelative) return;  // 窗口相对坐标保持客户区像素
     (void)meta;
     const double tw = static_cast<double>(targetW);
     const double th = static_cast<double>(targetH);
@@ -279,21 +281,10 @@ void DenormalizeActionCoords(ScriptAction& a, const CoordMeta& meta, int targetW
 
     const bool hasSearch = (a.nSearchX2 > a.nSearchX1 || a.nSearchY2 > a.nSearchY1);
     if (hasSearch) {
-        // OCR/AI 锚点模式：search 区域为相对偏移，不含虚拟桌面原点
-        const bool relativeSearch = (a.type == ActionType::TextRecognition && a.ocrRegionByImage)
-            || ((a.type == ActionType::AiImageAnalysis || a.type == ActionType::AiActionExecute)
-                && a.aiRegionByImage);
-        if (relativeSearch) {
-            a.searchX1 = static_cast<int>(std::round(a.nSearchX1 * tw));
-            a.searchY1 = static_cast<int>(std::round(a.nSearchY1 * th));
-            a.searchX2 = static_cast<int>(std::round(a.nSearchX2 * tw));
-            a.searchY2 = static_cast<int>(std::round(a.nSearchY2 * th));
-        } else {
-            a.searchX1 = vsX + static_cast<int>(std::round(a.nSearchX1 * tw));
-            a.searchY1 = vsY + static_cast<int>(std::round(a.nSearchY1 * th));
-            a.searchX2 = vsX + static_cast<int>(std::round(a.nSearchX2 * tw));
-            a.searchY2 = vsY + static_cast<int>(std::round(a.nSearchY2 * th));
-        }
+        a.searchX1 = vsX + static_cast<int>(std::round(a.nSearchX1 * tw));
+        a.searchY1 = vsY + static_cast<int>(std::round(a.nSearchY1 * th));
+        a.searchX2 = vsX + static_cast<int>(std::round(a.nSearchX2 * tw));
+        a.searchY2 = vsY + static_cast<int>(std::round(a.nSearchY2 * th));
     }
 
     a.offsetX = static_cast<int>(std::round(a.nOffsetX * tw));
@@ -302,19 +293,17 @@ void DenormalizeActionCoords(ScriptAction& a, const CoordMeta& meta, int targetW
         DenormFindImageOffsetPixels(a);
     }
 
+    a.imageRegionX1 = static_cast<int>(std::round(a.nImageRegionX1 * tw));
+    a.imageRegionY1 = static_cast<int>(std::round(a.nImageRegionY1 * th));
+    a.imageRegionX2 = static_cast<int>(std::round(a.nImageRegionX2 * tw));
+    a.imageRegionY2 = static_cast<int>(std::round(a.nImageRegionY2 * th));
+
     const bool hasAiSearch = (a.nAiSearchX2 > a.nAiSearchX1 || a.nAiSearchY2 > a.nAiSearchY1);
     if (hasAiSearch) {
-        if (a.aiRegionByImage) {
-            a.aiSearchX1 = static_cast<int>(std::round(a.nAiSearchX1 * tw));
-            a.aiSearchY1 = static_cast<int>(std::round(a.nAiSearchY1 * th));
-            a.aiSearchX2 = static_cast<int>(std::round(a.nAiSearchX2 * tw));
-            a.aiSearchY2 = static_cast<int>(std::round(a.nAiSearchY2 * th));
-        } else {
-            a.aiSearchX1 = vsX + static_cast<int>(std::round(a.nAiSearchX1 * tw));
-            a.aiSearchY1 = vsY + static_cast<int>(std::round(a.nAiSearchY1 * th));
-            a.aiSearchX2 = vsX + static_cast<int>(std::round(a.nAiSearchX2 * tw));
-            a.aiSearchY2 = vsY + static_cast<int>(std::round(a.nAiSearchY2 * th));
-        }
+        a.aiSearchX1 = vsX + static_cast<int>(std::round(a.nAiSearchX1 * tw));
+        a.aiSearchY1 = vsY + static_cast<int>(std::round(a.nAiSearchY1 * th));
+        a.aiSearchX2 = vsX + static_cast<int>(std::round(a.nAiSearchX2 * tw));
+        a.aiSearchY2 = vsY + static_cast<int>(std::round(a.nAiSearchY2 * th));
     }
 }
 
@@ -356,7 +345,14 @@ void MigrateLegacyScriptToNormalized(std::vector<ScriptAction>& actions,
             SyncFindImageOffsetNorm(a);
         }
 
-        if (a.aiSearchRegion == 6) {
+        a.nImageRegionX1 = a.imageRegionX1 / rw;
+        a.nImageRegionY1 = a.imageRegionY1 / rh;
+        a.nImageRegionX2 = a.imageRegionX2 / rw;
+        a.nImageRegionY2 = a.imageRegionY2 / rh;
+
+        if (a.aiSearchRegion == 6
+            || ((a.type == ActionType::AiImageAnalysis || a.type == ActionType::AiActionExecute)
+                && (a.aiSearchX2 > a.aiSearchX1 || a.searchFullScreen))) {
             a.nAiSearchX1 = (a.aiSearchX1 - assumedRef.refOriginX) / rw;
             a.nAiSearchY1 = (a.aiSearchY1 - assumedRef.refOriginY) / rh;
             a.nAiSearchX2 = (a.aiSearchX2 - assumedRef.refOriginX) / rw;
@@ -442,8 +438,28 @@ ImageMatchOptions BuildExecutionFindImageOptions(const ScriptAction& action,
     ImageMatchOptions opt;
     opt.thresholdPercent = action.matchThreshold;
 
+    if (action.perfectMatch) {
+        // 完美匹配：强制 1:1 + 关金字塔；通过与否由像素终审决定（不走阈值）
+        opt.perfectMatch = true;
+        opt.perfectMatchChannelTol = 1;
+        opt.scaleMin = 1.0;
+        opt.scaleMax = 1.0;
+        opt.scaleStep = 1.0;
+        opt.disablePyramid = true;
+        opt.crossResolutionMatch = false;
+        opt.maxMatches = 20;
+        opt.maxOverlap = 0.5;
+        return opt;
+    }
+
     double userMin = action.imageScaleMin > 0.0 ? action.imageScaleMin : action.imageScale;
     double userMax = action.imageScaleMax > 0.0 ? action.imageScaleMax : userMin;
+    if (userMax < userMin) userMax = userMin;
+    // 防 CPU 风暴：脚本给超大 scale 区间时全帧 matchTemplate 会跑几分钟。
+    constexpr double kMinScale = 0.1;
+    constexpr double kMaxScale = 4.0;
+    userMin = std::clamp(userMin, kMinScale, kMaxScale);
+    userMax = std::clamp(userMax, kMinScale, kMaxScale);
     if (userMax < userMin) userMax = userMin;
 
     const double sx = resolutionScale.sx > 0.0 ? resolutionScale.sx : 1.0;
@@ -481,7 +497,10 @@ ImageMatchOptions BuildExecutionFindImageOptions(const ScriptAction& action,
     } else {
         opt.scaleMin = userMin;
         opt.scaleMax = userMax;
-        opt.scaleStep = 0.05;
+        // 采样数上限：区间过大时放大步长，防止 matchTemplate 风暴（上限约 64 次）。
+        constexpr double kMaxSamples = 64.0;
+        const double span = userMax - userMin;
+        opt.scaleStep = span > kMaxSamples * 0.05 ? span / kMaxSamples : 0.05;
     }
 
     opt.maxMatches = 20;

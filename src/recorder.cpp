@@ -8,6 +8,7 @@
 #include "recorder.h"
 
 #include "image_match.h"
+#include "input/input_emergency_teardown.h"
 #include "recording_to_findimage.h"
 #include "utils.h"
 
@@ -27,9 +28,10 @@
 std::vector<RecordedEvent> g_recordedEvents;
 std::mutex g_recordMutex;
 std::atomic_bool g_recording{false};
-std::atomic<UINT> g_recordingIgnoreModifiers{0};
-std::atomic<UINT> g_recordingIgnoreVk{0};
-std::atomic_bool g_recordingIgnoreEnabled{false};
+constexpr int kMaxRecordingIgnoreHotkeys = 96;
+RecordingIgnoreChord g_recordingIgnoreList[kMaxRecordingIgnoreHotkeys]{};
+int g_recordingIgnoreCount = 0;
+std::mutex g_recordingIgnoreMu;
 HHOOK g_keyboardHook = nullptr;
 HHOOK g_mouseHook = nullptr;
 
@@ -46,6 +48,35 @@ std::atomic<RecordingCaptureMode> g_captureMode{RecordingCaptureMode::Auto};
 /// Auto 模式：最近一次判定为相对采集的录制时间戳；用于短时粘滞，避免进游戏后光标闪一下就混入绝对 Move。
 std::atomic<uint64_t> g_lastRelativeActiveUs{0};
 constexpr uint64_t kAutoRelativeStickyUs = 250000; // 250ms
+
+std::atomic<int> g_captureScope{1}; // 默认全局，与「未配置」安全侧一致；Start 前由设置覆盖
+std::mutex g_scopeMu;
+HWND g_scopeRoot = nullptr;
+bool g_scopeArmOnExternal = false;
+DWORD g_scopeOwnPid = 0;
+
+std::mutex g_wmTargetMu;
+RecordingWindowTarget g_wmTarget;
+
+HWND RootHwndOf(HWND h) {
+    if (!h || !IsWindow(h)) return nullptr;
+    HWND r = GetAncestor(h, GA_ROOT);
+    return r ? r : h;
+}
+
+bool SameRootTree(HWND a, HWND b) {
+    HWND ra = RootHwndOf(a);
+    HWND rb = RootHwndOf(b);
+    return ra && rb && ra == rb;
+}
+
+bool PidOfHwnd(HWND h, DWORD* outPid) {
+    if (!h || !outPid) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    *outPid = pid;
+    return pid != 0;
+}
 
 std::atomic_bool g_rawThreadRun{false};
 std::thread g_rawThread;
@@ -103,9 +134,18 @@ constexpr size_t kClickCaptureQueueMax = 64;
 
 struct ClickCaptureRequest {
     uint64_t sequence = 0;
+    HBITMAP bmp = nullptr; // 队列持有，worker 写盘后 DeleteObject
+    int offsetX = 0;
+    int offsetY = 0;
+};
+
+struct HoverPatch {
+    HBITMAP bmp = nullptr;
     int cx = 0;
     int cy = 0;
-    int halfSize = 40;
+    HWND hwnd = nullptr;
+    ClickCaptureRectResult rect{};
+    DWORD tick = 0;
 };
 
 std::mutex g_captureMutex;
@@ -115,11 +155,137 @@ std::atomic_bool g_captureWorkerRun{false};
 std::atomic_bool g_captureAccepting{false};
 std::atomic_int g_captureInFlight{0};
 std::atomic_bool g_captureEnabled{true};
+std::atomic_bool g_captureSkipRelative{false};  // 图片定位：相对事件不截图
 std::atomic_int g_captureHalfSize{40};
 std::atomic_uint64_t g_captureSessionId{0};
 std::atomic_uint32_t g_captureSessionSalt{0};
 std::atomic_uint64_t g_captureDropped{0};
 std::thread g_captureWorker;
+
+std::mutex g_hoverMu;
+HoverPatch g_hover;
+std::atomic<DWORD> g_hoverLastUpdateTick{0};
+constexpr DWORD kHoverPatchMinIntervalMs = 16;
+constexpr int kHoverPatchMaxClickDeltaPx = 8;
+
+bool ShouldCaptureRelativeNow();
+
+HBITMAP CloneHbitmap(HBITMAP src) {
+    if (!src) return nullptr;
+    BITMAP bm{};
+    if (!GetObjectW(src, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+        return nullptr;
+    }
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc) return nullptr;
+    HDC srcDc = CreateCompatibleDC(screenDc);
+    HDC dstDc = CreateCompatibleDC(screenDc);
+    HBITMAP dst = CreateCompatibleBitmap(screenDc, bm.bmWidth, bm.bmHeight);
+    if (!srcDc || !dstDc || !dst) {
+        if (dst) DeleteObject(dst);
+        if (srcDc) DeleteDC(srcDc);
+        if (dstDc) DeleteDC(dstDc);
+        ReleaseDC(nullptr, screenDc);
+        return nullptr;
+    }
+    HGDIOBJ oldSrc = SelectObject(srcDc, src);
+    HGDIOBJ oldDst = SelectObject(dstDc, dst);
+    BitBlt(dstDc, 0, 0, bm.bmWidth, bm.bmHeight, srcDc, 0, 0, SRCCOPY);
+    SelectObject(srcDc, oldSrc);
+    SelectObject(dstDc, oldDst);
+    DeleteDC(srcDc);
+    DeleteDC(dstDc);
+    ReleaseDC(nullptr, screenDc);
+    return dst;
+}
+
+void ClearHoverPatchLocked() {
+    if (g_hover.bmp) {
+        DeleteObject(g_hover.bmp);
+        g_hover.bmp = nullptr;
+    }
+    g_hover = {};
+}
+
+void DrainCaptureQueueLocked() {
+    while (!g_captureQueue.empty()) {
+        ClickCaptureRequest old = g_captureQueue.front();
+        g_captureQueue.pop_front();
+        if (old.bmp) DeleteObject(old.bmp);
+    }
+}
+
+bool GrabVisibleClickPatch(int cx, int cy, HWND clientHwnd, int half,
+    HBITMAP& outBmp, ClickCaptureRectResult& outRect) {
+    outBmp = nullptr;
+    outRect = {};
+    half = ClampClickCaptureHalfSize(half);
+    if (clientHwnd && IsWindow(clientHwnd)) {
+        RECT cr{};
+        if (!GetClientRect(clientHwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) return false;
+        outRect = ComputeClickCaptureRect(cx, cy, half, 0, 0, cr.right, cr.bottom);
+        if (!outRect.valid) return false;
+        POINT tl{outRect.x1, outRect.y1};
+        POINT br{outRect.x2, outRect.y2};
+        if (!ClientToScreen(clientHwnd, &tl) || !ClientToScreen(clientHwnd, &br)) return false;
+        outBmp = CaptureScreenRegion(tl.x, tl.y, br.x, br.y);
+        return outBmp != nullptr;
+    }
+    int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+    GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+    outRect = ComputeClickCaptureRect(cx, cy, half, vsX, vsY, vsX + vsW, vsY + vsH);
+    if (!outRect.valid) return false;
+    outBmp = CaptureScreenRegion(outRect.x1, outRect.y1, outRect.x2, outRect.y2);
+    return outBmp != nullptr;
+}
+
+void MaybeUpdateHoverPatch(int cx, int cy, HWND clientHwnd) {
+    if (!g_captureAccepting.load(std::memory_order_relaxed)) return;
+    if (!g_captureEnabled.load(std::memory_order_relaxed)) return;
+    if (g_captureSkipRelative.load(std::memory_order_relaxed)
+        && ShouldCaptureRelativeNow()) return;
+    const DWORD now = GetTickCount();
+    const DWORD last = g_hoverLastUpdateTick.load(std::memory_order_relaxed);
+    if (last != 0 && (now - last) < kHoverPatchMinIntervalMs) {
+        std::lock_guard<std::mutex> lock(g_hoverMu);
+        if (g_hover.bmp && HoverPatchCoversClick(g_hover.cx, g_hover.cy, cx, cy,
+            kHoverPatchMaxClickDeltaPx)) {
+            return;
+        }
+    }
+    const int half = g_captureHalfSize.load(std::memory_order_relaxed);
+    HBITMAP bmp = nullptr;
+    ClickCaptureRectResult rect{};
+    if (!GrabVisibleClickPatch(cx, cy, clientHwnd, half, bmp, rect)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_hoverMu);
+        ClearHoverPatchLocked();
+        g_hover.bmp = bmp;
+        g_hover.cx = cx;
+        g_hover.cy = cy;
+        g_hover.hwnd = clientHwnd;
+        g_hover.rect = rect;
+        g_hover.tick = now;
+    }
+    g_hoverLastUpdateTick.store(now, std::memory_order_relaxed);
+}
+
+HBITMAP TakePreClickPatch(int cx, int cy, HWND clientHwnd, ClickCaptureRectResult& outRect) {
+    outRect = {};
+    {
+        std::lock_guard<std::mutex> lock(g_hoverMu);
+        if (g_hover.bmp
+            && g_hover.hwnd == clientHwnd
+            && HoverPatchCoversClick(g_hover.cx, g_hover.cy, cx, cy, kHoverPatchMaxClickDeltaPx)) {
+            outRect = g_hover.rect;
+            return CloneHbitmap(g_hover.bmp);
+        }
+    }
+    const int half = g_captureHalfSize.load(std::memory_order_relaxed);
+    HBITMAP bmp = nullptr;
+    if (!GrabVisibleClickPatch(cx, cy, clientHwnd, half, bmp, outRect)) return nullptr;
+    return bmp;
+}
 
 void EnsureCaptureWorkerStarted() {
     bool expected = false;
@@ -138,31 +304,24 @@ void EnsureCaptureWorkerStarted() {
                 g_captureQueue.pop_front();
             }
             g_captureInFlight.fetch_add(1, std::memory_order_relaxed);
-            int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
-            GetVirtualScreenRect(vsX, vsY, vsW, vsH);
-            const auto rect = ComputeClickCaptureRect(
-                req.cx, req.cy, req.halfSize,
-                vsX, vsY, vsX + vsW, vsY + vsH);
-            if (rect.valid) {
+            if (req.bmp) {
                 EnsureFindImagesDir();
                 const uint64_t sessionId = g_captureSessionId.load(std::memory_order_relaxed);
                 const std::wstring fileName = MakeRecordingClickCaptureFileName(sessionId, req.sequence);
                 const std::wstring path = FindImagesDir() + L"\\" + fileName;
-                HBITMAP bmp = CaptureScreenRegion(rect.x1, rect.y1, rect.x2, rect.y2);
-                if (bmp) {
-                    if (SaveBitmapToFile(bmp, path)) {
-                        std::lock_guard<std::mutex> lock(g_recordMutex);
-                        for (auto& ev : g_recordedEvents) {
-                            if (ev.sequence == req.sequence) {
-                                ev.capturePath = path;
-                                ev.captureOffsetX = rect.offsetX;
-                                ev.captureOffsetY = rect.offsetY;
-                                break;
-                            }
+                if (SaveBitmapToFile(req.bmp, path)) {
+                    std::lock_guard<std::mutex> lock(g_recordMutex);
+                    for (auto& ev : g_recordedEvents) {
+                        if (ev.sequence == req.sequence) {
+                            ev.capturePath = path;
+                            ev.captureOffsetX = req.offsetX;
+                            ev.captureOffsetY = req.offsetY;
+                            break;
                         }
                     }
-                    DeleteBitmapHandle(bmp);
                 }
+                DeleteObject(req.bmp);
+                req.bmp = nullptr;
             }
             g_captureInFlight.fetch_sub(1, std::memory_order_relaxed);
             g_captureCv.notify_all();
@@ -170,19 +329,27 @@ void EnsureCaptureWorkerStarted() {
     });
 }
 
-void EnqueueClickCapture(uint64_t sequence, int cx, int cy) {
+void EnqueueClickCapture(uint64_t sequence, int cx, int cy, HWND clientHwnd) {
     if (!g_captureAccepting.load(std::memory_order_relaxed)) return;
     if (!g_captureEnabled.load(std::memory_order_relaxed)) return;
+    // 图片定位：处于相对采集阶段时不截图（相对移动/点击无找图转换意义）
+    if (g_captureSkipRelative.load(std::memory_order_relaxed)
+        && ShouldCaptureRelativeNow()) return;
+    ClickCaptureRectResult rect{};
+    HBITMAP bmp = TakePreClickPatch(cx, cy, clientHwnd, rect);
+    if (!bmp) return;
     EnsureCaptureWorkerStarted();
     ClickCaptureRequest req{};
     req.sequence = sequence;
-    req.cx = cx;
-    req.cy = cy;
-    req.halfSize = g_captureHalfSize.load(std::memory_order_relaxed);
+    req.bmp = bmp;
+    req.offsetX = rect.offsetX;
+    req.offsetY = rect.offsetY;
     {
         std::lock_guard<std::mutex> lock(g_captureMutex);
         while (g_captureQueue.size() >= kClickCaptureQueueMax) {
+            ClickCaptureRequest old = g_captureQueue.front();
             g_captureQueue.pop_front();
+            if (old.bmp) DeleteObject(old.bmp);
             g_captureDropped.fetch_add(1, std::memory_order_relaxed);
         }
         g_captureQueue.push_back(req);
@@ -224,27 +391,38 @@ bool ModifiersMatch(UINT modifiers) {
 }
 
 bool ShouldIgnoreRecordedInput(UINT msg, WPARAM vkOrButton) {
-    if (!g_recordingIgnoreEnabled.load(std::memory_order_relaxed)) return false;
-    const UINT ignoreVk = g_recordingIgnoreVk.load(std::memory_order_relaxed);
-    if (!ignoreVk) return false;
-    const UINT ignoreMod = g_recordingIgnoreModifiers.load(std::memory_order_relaxed);
+    RecordingIgnoreChord local[kMaxRecordingIgnoreHotkeys]{};
+    int count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_recordingIgnoreMu);
+        count = g_recordingIgnoreCount;
+        for (int i = 0; i < count; ++i) local[i] = g_recordingIgnoreList[i];
+    }
+    if (count <= 0) return false;
 
-    if (ignoreVk == VK_LBUTTON) {
-        return msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP;
-    }
-    if (ignoreVk == VK_RBUTTON) {
-        return msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP;
-    }
-    if (ignoreVk == VK_MBUTTON) {
-        return msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP;
-    }
-    if (ignoreVk == VK_XBUTTON1 || ignoreVk == VK_XBUTTON2) {
-        return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP;
-    }
+    auto chordMatches = [&](const RecordingIgnoreChord& chord) -> bool {
+        if (!chord.vk) return false;
+        if (chord.vk == VK_LBUTTON) {
+            return msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP;
+        }
+        if (chord.vk == VK_RBUTTON) {
+            return msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP;
+        }
+        if (chord.vk == VK_MBUTTON) {
+            return msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP;
+        }
+        if (chord.vk == VK_XBUTTON1 || chord.vk == VK_XBUTTON2) {
+            return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP;
+        }
+        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP) {
+            if (static_cast<UINT>(vkOrButton) != chord.vk) return false;
+            return ModifiersMatch(chord.modifiers);
+        }
+        return false;
+    };
 
-    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP) {
-        if (static_cast<UINT>(vkOrButton) != ignoreVk) return false;
-        return ModifiersMatch(ignoreMod);
+    for (int i = 0; i < count; ++i) {
+        if (chordMatches(local[i])) return true;
     }
     return false;
 }
@@ -274,6 +452,7 @@ bool ShouldCaptureRelativeNow() {
 void EmitRelativeMoveEvent(int dx, int dy, uint64_t nowUs) {
     if (dx == 0 && dy == 0) return;
     if (!g_recording.load(std::memory_order_relaxed)) return;
+    if (!RecordingScopeAllowsEvent(true, 0, 0)) return; // 相对视角：跟前台窗
 
     // 队列积压时多个 WM_INPUT 会在短时间内被处理：QPC 戳挤在亚毫秒内。
     // 用 EMA 报告间隔拉开，避免回放时在同一游戏帧内连发。
@@ -540,10 +719,68 @@ RecordingCaptureMode GetRecordingCaptureMode() {
     return g_captureMode.load(std::memory_order_relaxed);
 }
 
+void SetRecordingWindowTarget(const RecordingWindowTarget& target) {
+    std::lock_guard<std::mutex> lock(g_wmTargetMu);
+    g_wmTarget = target;
+}
+
+RecordingWindowTarget GetRecordingWindowTarget() {
+    std::lock_guard<std::mutex> lock(g_wmTargetMu);
+    return g_wmTarget;
+}
+
+bool MapRecordingPointToClientIfWindowRelative(int& x, int& y) {
+    const RecordingWindowTarget t = GetRecordingWindowTarget();
+    if (!t.enabled || !t.hwnd || !IsWindow(t.hwnd)) return false;
+    RECT client{};
+    if (!GetClientRect(t.hwnd, &client)) return false;
+    POINT pt{x, y};
+    if (!ScreenToClient(t.hwnd, &pt)) return false;
+    if (pt.x < 0 || pt.y < 0 || pt.x >= client.right || pt.y >= client.bottom) {
+        return false;
+    }
+    x = pt.x;
+    y = pt.y;
+    return true;
+}
+
+namespace {
+
+/// 窗口相对录制：屏幕坐标 → 目标窗口客户区坐标；窗口外事件返回 false（不录制）。
+bool MapRecordingPointToClient(const RecordingWindowTarget& t, int& x, int& y) {
+    if (!t.enabled || !t.hwnd || !IsWindow(t.hwnd)) return true;
+    RECT client{};
+    if (!GetClientRect(t.hwnd, &client)) return false;
+    POINT pt{x, y};
+    if (!ScreenToClient(t.hwnd, &pt)) return false;
+    if (pt.x < 0 || pt.y < 0 || pt.x >= client.right || pt.y >= client.bottom) {
+        return false;
+    }
+    x = pt.x;
+    y = pt.y;
+    return true;
+}
+
+}  // namespace
+
+void SetRecordingIgnoreHotkeys(const RecordingIgnoreChord* items, int count) {
+    std::lock_guard<std::mutex> lock(g_recordingIgnoreMu);
+    g_recordingIgnoreCount = 0;
+    if (!items || count <= 0) return;
+    const int n = (count < kMaxRecordingIgnoreHotkeys) ? count : kMaxRecordingIgnoreHotkeys;
+    for (int i = 0; i < n; ++i) {
+        if (!items[i].vk) continue;
+        g_recordingIgnoreList[g_recordingIgnoreCount++] = items[i];
+    }
+}
+
 void SetRecordingIgnoreHotkey(UINT modifiers, UINT vk, bool enabled) {
-    g_recordingIgnoreModifiers.store(modifiers, std::memory_order_relaxed);
-    g_recordingIgnoreVk.store(vk, std::memory_order_relaxed);
-    g_recordingIgnoreEnabled.store(enabled && vk != 0, std::memory_order_relaxed);
+    if (!enabled || !vk) {
+        SetRecordingIgnoreHotkeys(nullptr, 0);
+        return;
+    }
+    RecordingIgnoreChord one{modifiers, vk};
+    SetRecordingIgnoreHotkeys(&one, 1);
 }
 
 void SetRecordingDebugSink(RecordingDebugSink sink) {
@@ -576,10 +813,14 @@ RecordingDebugStats GetRecordingDebugStats() {
 }
 
 LRESULT CALLBACK KeyboardHookProc(int code, WPARAM wp, LPARAM lp) {
+    input_emergency::LlHookGuard llGuard;
     if (code >= 0 && g_recording) {
         auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN
             || wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+            if (!RecordingScopeAllowsEvent(true, 0, 0)) {
+                return CallNextHookEx(nullptr, code, wp, lp);
+            }
             if (ShouldIgnoreRecordedInput(
                     wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN ? WM_KEYDOWN : WM_KEYUP,
                     ks->vkCode)) {
@@ -631,10 +872,22 @@ LRESULT CALLBACK KeyboardHookProc(int code, WPARAM wp, LPARAM lp) {
 }
 
 LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
+    input_emergency::LlHookGuard llGuard;
     if (code >= 0 && g_recording) {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
+        if (!RecordingScopeAllowsEvent(false, ms->pt.x, ms->pt.y)) {
+            return CallNextHookEx(nullptr, code, wp, lp);
+        }
+        const RecordingWindowTarget wmTgt = GetRecordingWindowTarget();
+        int px = ms->pt.x;
+        int py = ms->pt.y;
+        // 窗口相对录制：只录目标窗口内事件，坐标转客户区（跟随窗口回放）。
+        if (!MapRecordingPointToClient(wmTgt, px, py)) {
+            return CallNextHookEx(nullptr, code, wp, lp);
+        }
         const uint64_t nowUs = RecordingOffsetUs();
         if (wp == WM_MOUSEMOVE) {
+            MaybeUpdateHoverPatch(px, py, wmTgt.enabled ? wmTgt.hwnd : nullptr);
             if (ShouldCaptureRelativeNow()) {
                 return CallNextHookEx(nullptr, code, wp, lp);
             }
@@ -646,7 +899,7 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
                 ev.sequence = NextEventSequence();
                 ev.msg = WM_MOUSEMOVE;
                 ev.vkOrButton = 0;
-                ev.x = ms->pt.x; ev.y = ms->pt.y;
+                ev.x = px; ev.y = py;
                 ev.source = RecordedEventSource::LowLevelHook;
                 std::lock_guard<std::mutex> lock(g_recordMutex);
                 g_recordedEvents.push_back(ev);
@@ -661,14 +914,16 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
             ev.sequence = NextEventSequence();
             ev.msg = static_cast<UINT>(wp);
             ev.vkOrButton = VK_LBUTTON;
-            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            ev.x = px; ev.y = py;
             ev.source = RecordedEventSource::LowLevelHook;
             {
                 std::lock_guard<std::mutex> lock(g_recordMutex);
                 g_recordedEvents.push_back(ev);
             }
             NoteRecordedMouseButton(ev);
-            if (IsButtonDownMsg(ev.msg)) EnqueueClickCapture(ev.sequence, ev.x, ev.y);
+            if (IsButtonDownMsg(ev.msg)) {
+                EnqueueClickCapture(ev.sequence, ev.x, ev.y, wmTgt.enabled ? wmTgt.hwnd : nullptr);
+            }
         } else if (wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP) {
             if (ShouldIgnoreRecordedInput(static_cast<UINT>(wp), VK_RBUTTON)) {
                 return CallNextHookEx(nullptr, code, wp, lp);
@@ -678,14 +933,16 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
             ev.sequence = NextEventSequence();
             ev.msg = static_cast<UINT>(wp);
             ev.vkOrButton = VK_RBUTTON;
-            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            ev.x = px; ev.y = py;
             ev.source = RecordedEventSource::LowLevelHook;
             {
                 std::lock_guard<std::mutex> lock(g_recordMutex);
                 g_recordedEvents.push_back(ev);
             }
             NoteRecordedMouseButton(ev);
-            if (IsButtonDownMsg(ev.msg)) EnqueueClickCapture(ev.sequence, ev.x, ev.y);
+            if (IsButtonDownMsg(ev.msg)) {
+                EnqueueClickCapture(ev.sequence, ev.x, ev.y, wmTgt.enabled ? wmTgt.hwnd : nullptr);
+            }
         } else if (wp == WM_MBUTTONDOWN || wp == WM_MBUTTONUP) {
             if (ShouldIgnoreRecordedInput(static_cast<UINT>(wp), VK_MBUTTON)) {
                 return CallNextHookEx(nullptr, code, wp, lp);
@@ -695,14 +952,16 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
             ev.sequence = NextEventSequence();
             ev.msg = static_cast<UINT>(wp);
             ev.vkOrButton = VK_MBUTTON;
-            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            ev.x = px; ev.y = py;
             ev.source = RecordedEventSource::LowLevelHook;
             {
                 std::lock_guard<std::mutex> lock(g_recordMutex);
                 g_recordedEvents.push_back(ev);
             }
             NoteRecordedMouseButton(ev);
-            if (IsButtonDownMsg(ev.msg)) EnqueueClickCapture(ev.sequence, ev.x, ev.y);
+            if (IsButtonDownMsg(ev.msg)) {
+                EnqueueClickCapture(ev.sequence, ev.x, ev.y, wmTgt.enabled ? wmTgt.hwnd : nullptr);
+            }
         } else if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
             UINT btn = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
             if (ShouldIgnoreRecordedInput(static_cast<UINT>(wp), btn)) {
@@ -713,21 +972,23 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
             ev.sequence = NextEventSequence();
             ev.msg = static_cast<UINT>(wp);
             ev.vkOrButton = btn;
-            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            ev.x = px; ev.y = py;
             ev.source = RecordedEventSource::LowLevelHook;
             {
                 std::lock_guard<std::mutex> lock(g_recordMutex);
                 g_recordedEvents.push_back(ev);
             }
             NoteRecordedMouseButton(ev);
-            if (IsButtonDownMsg(ev.msg)) EnqueueClickCapture(ev.sequence, ev.x, ev.y);
+            if (IsButtonDownMsg(ev.msg)) {
+                EnqueueClickCapture(ev.sequence, ev.x, ev.y, wmTgt.enabled ? wmTgt.hwnd : nullptr);
+            }
         } else if (wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL) {
             RecordedEvent ev{};
             ev.timeOffsetUs = nowUs;
             ev.sequence = NextEventSequence();
             ev.msg = static_cast<UINT>(wp);
             ev.vkOrButton = 0;
-            ev.x = ms->pt.x; ev.y = ms->pt.y;
+            ev.x = px; ev.y = py;
             ev.wheelDelta = GET_WHEEL_DELTA_WPARAM(ms->mouseData);
             ev.source = RecordedEventSource::LowLevelHook;
             {
@@ -742,6 +1003,66 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+void SetRecordingCaptureScope(int scope) {
+    g_captureScope.store(scope <= 0 ? 0 : 1, std::memory_order_relaxed);
+}
+
+int GetRecordingCaptureScope() {
+    return g_captureScope.load(std::memory_order_relaxed);
+}
+
+void BeginRecordingScopeSession(HWND preferredForeground, DWORD ownProcessId) {
+    std::lock_guard<std::mutex> lock(g_scopeMu);
+    g_scopeOwnPid = ownProcessId;
+    g_scopeRoot = nullptr;
+    g_scopeArmOnExternal = false;
+    if (g_captureScope.load(std::memory_order_relaxed) != 0) {
+        return; // Global
+    }
+    HWND fg = preferredForeground && IsWindow(preferredForeground)
+        ? preferredForeground : GetForegroundWindow();
+    HWND root = RootHwndOf(fg);
+    DWORD pid = 0;
+    if (root && PidOfHwnd(root, &pid) && ownProcessId != 0 && pid == ownProcessId) {
+        // 从本软件 UI 点开始录制：等第一个外部窗口输入再锁定
+        g_scopeArmOnExternal = true;
+        return;
+    }
+    g_scopeRoot = root;
+}
+
+void EndRecordingScopeSession() {
+    std::lock_guard<std::mutex> lock(g_scopeMu);
+    g_scopeRoot = nullptr;
+    g_scopeArmOnExternal = false;
+    g_scopeOwnPid = 0;
+}
+
+bool RecordingScopeAllowsEvent(bool isKeyboard, int screenX, int screenY) {
+    const int scope = g_captureScope.load(std::memory_order_relaxed);
+    if (scope != 0) return true;
+
+    HWND candidate = nullptr;
+    if (isKeyboard) {
+        candidate = RootHwndOf(GetForegroundWindow());
+    } else {
+        POINT pt{screenX, screenY};
+        candidate = RootHwndOf(WindowFromPoint(pt));
+    }
+
+    DWORD candPid = 0;
+    const bool own = PidOfHwnd(candidate, &candPid) && g_scopeOwnPid != 0 && candPid == g_scopeOwnPid;
+
+    std::lock_guard<std::mutex> lock(g_scopeMu);
+    const auto decision = EvaluateRecordingScopeFilter(
+        scope, g_scopeRoot, g_scopeArmOnExternal, candidate, own);
+    if (decision.newRoot) {
+        g_scopeRoot = decision.newRoot;
+        g_scopeArmOnExternal = false;
+    }
+    return decision.accept;
 }
 
 bool InstallRecordingHooks() {
@@ -773,8 +1094,13 @@ void SetRecordingClickCaptureConfig(bool enabled, int halfSize) {
     g_captureHalfSize.store(ClampClickCaptureHalfSize(halfSize), std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(g_captureMutex);
-        g_captureQueue.clear();
+        DrainCaptureQueueLocked();
     }
+    {
+        std::lock_guard<std::mutex> lock(g_hoverMu);
+        ClearHoverPatchLocked();
+    }
+    g_hoverLastUpdateTick.store(0, std::memory_order_relaxed);
     const uint32_t salt = g_captureSessionSalt.fetch_add(1, std::memory_order_relaxed) + 1;
     const uint64_t sessionId = (GetTickCount64() << 16) ^ static_cast<uint64_t>(salt);
     g_captureSessionId.store(sessionId, std::memory_order_relaxed);
@@ -784,6 +1110,10 @@ void SetRecordingClickCaptureConfig(bool enabled, int halfSize) {
         EnsureFindImagesDir();
         EnsureCaptureWorkerStarted();
     }
+}
+
+void SetRecordingClickCaptureSkipRelative(bool skip) {
+    g_captureSkipRelative.store(skip, std::memory_order_relaxed);
 }
 
 void FlushClickCaptures(DWORD timeoutMs) {
@@ -809,8 +1139,13 @@ void FlushClickCaptures(DWORD timeoutMs) {
 
 void DiscardClickCaptures() {
     g_captureAccepting.store(false, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(g_captureMutex);
-    g_captureQueue.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_captureMutex);
+        DrainCaptureQueueLocked();
+    }
+    std::lock_guard<std::mutex> lock(g_hoverMu);
+    ClearHoverPatchLocked();
+    g_hoverLastUpdateTick.store(0, std::memory_order_relaxed);
 }
 
 uint64_t GetRecordingClickCaptureSessionId() {

@@ -4,7 +4,9 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "utils.h"
+#include "breakout_cooldown.h"
 #include "input/foreground_input_router.h"
+#include "input/input_emergency_teardown.h"
 #include "input/synthetic_input_filter.h"
 
 #include <atomic>
@@ -71,6 +73,30 @@ inline bool BreakoutShouldIgnoreInput(UINT msg, UINT vk) {
     return false;
 }
 
+inline BreakoutHoldTracker g_breakoutUserHolds;
+
+inline void BreakoutNoteUserHold(UINT vk) {
+    g_breakoutUserHolds.NoteDown(vk);
+}
+
+inline void BreakoutNoteUserRelease(UINT vk) {
+    g_breakoutUserHolds.NoteUp(vk);
+}
+
+inline void BreakoutClearUserHolds() {
+    g_breakoutUserHolds.Clear();
+}
+
+inline bool BreakoutUserHolding() {
+    return g_breakoutUserHolds.Holding();
+}
+
+inline void BreakoutReconcileUserHolds() {
+    g_breakoutUserHolds.Reconcile([](UINT vk) {
+        return (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+    });
+}
+
 inline void BreakoutSignalUserInput() {
     if (!g_breakoutHookState || !g_breakoutHookState->userInput) return;
     g_breakoutHookState->userInput->store(true, std::memory_order_relaxed);
@@ -97,19 +123,27 @@ inline bool BreakoutUseRawInputForMouse() {
 }
 
 inline LRESULT CALLBACK BreakoutKbProc(int code, WPARAM wp, LPARAM lp) {
+    input_emergency::LlHookGuard llGuard;
     if (code >= 0 && BreakoutShouldMonitor()) {
         const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
-        if (down) {
+        const bool up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        if (down || up) {
             auto* ks = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
             const bool injected = (ks->flags & LLKHF_INJECTED) != 0;
             const bool ext = (ks->flags & LLKHF_EXTENDED) != 0;
             const UINT vk = static_cast<UINT>(ks->vkCode);
             const auto scan = static_cast<unsigned short>(ks->scanCode);
+            const UINT ignoreMsg = down ? static_cast<UINT>(WM_KEYDOWN) : static_cast<UINT>(WM_KEYUP);
             // 脚本注入 / 驱动指纹 不算「用户脱离」
             if (!injected
-                && !synthetic_input::MatchesKey(vk, scan, ext, true)
-                && !BreakoutShouldIgnoreInput(WM_KEYDOWN, vk)) {
-                BreakoutSignalUserInput();
+                && !synthetic_input::MatchesKey(vk, scan, ext, down)
+                && !BreakoutShouldIgnoreInput(ignoreMsg, vk)) {
+                if (down) {
+                    BreakoutNoteUserHold(vk);
+                    BreakoutSignalUserInput();
+                } else {
+                    BreakoutNoteUserRelease(vk);
+                }
             }
         }
     }
@@ -117,6 +151,7 @@ inline LRESULT CALLBACK BreakoutKbProc(int code, WPARAM wp, LPARAM lp) {
 }
 
 inline LRESULT CALLBACK BreakoutMouseProc(int code, WPARAM wp, LPARAM lp) {
+    input_emergency::LlHookGuard llGuard;
     if (code >= 0 && BreakoutShouldMonitor()) {
         // VirtualHid 与 Interception 均走 LL：
         // - SetCursorPos 带 LLMHF_INJECTED，不会误脱离
@@ -137,16 +172,24 @@ inline LRESULT CALLBACK BreakoutMouseProc(int code, WPARAM wp, LPARAM lp) {
             btnVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
             down = (wp == WM_XBUTTONDOWN);
         }
-        const bool actionable = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN
-            || wp == WM_XBUTTONDOWN || wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL || wp == WM_MOUSEMOVE;
+        const bool buttonUp = wp == WM_LBUTTONUP || wp == WM_RBUTTONUP || wp == WM_MBUTTONUP
+            || wp == WM_XBUTTONUP;
+        const bool motion = wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL || wp == WM_MOUSEMOVE;
         bool synthetic = injected;
         if (!synthetic) {
             if (wp == WM_MOUSEMOVE) synthetic = synthetic_input::MatchesMouseMove();
             else if (wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL) synthetic = synthetic_input::MatchesMouseWheel();
             else if (btnVk) synthetic = synthetic_input::MatchesMouseButton(btnVk, down);
         }
-        if (actionable && !synthetic && !BreakoutShouldIgnoreInput(msg, btnVk)) {
-            BreakoutSignalUserInput();
+        if (!synthetic && !BreakoutShouldIgnoreInput(msg, btnVk)) {
+            if (down && btnVk) {
+                BreakoutNoteUserHold(btnVk);
+                BreakoutSignalUserInput();
+            } else if (buttonUp && btnVk) {
+                BreakoutNoteUserRelease(btnVk);
+            } else if (motion) {
+                BreakoutSignalUserInput();
+            }
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
@@ -170,6 +213,7 @@ inline void UninstallBreakoutHooks() {
         g_breakoutMouseHook = nullptr;
     }
     g_breakoutHookState = nullptr;
+    BreakoutClearUserHolds();
 }
 
 } // namespace breakout_input

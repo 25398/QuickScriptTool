@@ -2,13 +2,13 @@
 
 namespace quickscript {
 
-std::wstring AppBranding::appDisplayName_ = L"鼠大侠";
-std::wstring AppBranding::version_ = L"v1.0.0";
-std::wstring AppBranding::tagline_ = L"最多人用的鼠标连点器";
-std::wstring AppBranding::websiteUrl_;
-std::wstring AppBranding::contactInfo_;
-std::wstring AppBranding::qqGroup_;
-std::wstring AppBranding::copyrightText_ = L"Copyright (C) shudaxia.com Inc. All Right Reserved";
+std::wstring AppBranding::appDisplayName_ = L"键鼠工坊";
+std::wstring AppBranding::version_ = L"v1.1.10";
+std::wstring AppBranding::tagline_;
+std::wstring AppBranding::websiteUrl_ = L"https://www.quickscripttool.cloud/";
+std::wstring AppBranding::contactInfo_ = L"24353623@qq.com";
+std::wstring AppBranding::qqGroup_ = L"2163074732";
+std::wstring AppBranding::copyrightText_;
 
 const std::wstring& AppBranding::AppDisplayName() { return appDisplayName_; }
 const std::wstring& AppBranding::Version() { return version_; }

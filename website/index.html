@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>键鼠工坊 QuickScriptTool · Windows 键鼠脚本工具</title>
+<meta name="description" content="键鼠工坊（QuickScriptTool）是 Windows 上的键鼠脚本工具：连点、录制回放、可视化宏编辑、找图/OCR、AI 写脚本、后台窗口模式、定时任务与托盘。网页体验版可直接在线浏览完整界面。" />
+<link rel="icon" href="demo/app_icon.ico" />
+<link rel="stylesheet" href="css/site.css" />
+</head>
+<body>
+
+<nav class="site-nav">
+  <div class="wrap">
+    <a class="brand-logo" href="index.html">
+      <span class="mark" aria-hidden="true">
+        <img src="favicon.ico" alt="键鼠工坊" />
+      </span>
+      <span>
+        <span class="zh">键鼠工坊</span>
+        <span class="en">QUICKSCRIPTTOOL</span>
+      </span>
+    </a>
+    <button class="nav-toggle" aria-label="展开菜单" aria-expanded="false">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <div class="nav-links">
+      <a href="#demo">在线体验</a>
+      <a href="#features">功能</a>
+      <a href="#download">下载</a>
+      <a href="https://qm.qq.com/q/hCf5qI78By" target="_blank" rel="noopener">加入 QQ 群</a>
+      <a class="nav-cta" href="demo.html">立即体验</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div>
+      <h1>键鼠工坊</h1>
+      <p class="en-name">QUICKSCRIPTTOOL</p>
+      <p class="lead">Windows 上的键鼠脚本工具，一键连点到 AI 写脚本全都有。</p>
+      <p class="sub">
+        连点、录制回放、可视化宏编辑、找图 / OCR、AI 对话写宏、后台窗口模式、
+        定时任务与系统托盘——主界面四页直达，现代 Web 渲染界面，无需编程基础也能上手。
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="demo.html">立即体验</a>
+        <a class="btn btn-ghost" href="#features">查看功能</a>
+        <a class="btn btn-ghost" href="https://qm.qq.com/q/hCf5qI78By" target="_blank" rel="noopener">加入 QQ 群</a>
+      </div>
+      <ul class="hero-points">
+        <li>可视化宏编辑器</li>
+        <li>录制回放 · 精密时间轴</li>
+        <li>找图 / OCR</li>
+        <li>后台窗口模式</li>
+        <li>AI Agent 脚本定制</li>
+      </ul>
+    </div>
+
+  </div>
+</header>
+
+<section class="demo-band" id="demo">
+  <div class="wrap">
+    <div class="demo-frame">
+      <div class="demo-stage" data-demo-stage>
+        <iframe data-demo-frame src="demo/index.html" title="键鼠工坊在线体验" loading="lazy" allow="clipboard-write"></iframe>
+      </div>
+    </div>
+    <div class="demo-mobile-note">
+      手机端建议直接浏览介绍；完整可交互 Demo 请在电脑浏览器中打开。
+      <div style="margin-top:14px"><a class="btn btn-primary" href="demo.html">前往在线体验页</a></div>
+    </div>
+
+    <div class="demo-cta-row">
+      <a class="btn btn-primary" href="demo.html">进入全屏在线体验</a>
+      <a class="btn btn-ghost" href="#download">下载 Windows 版</a>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="eyebrow">核心能力</div>
+      <h2>从连点到 AI 写脚本，一套工具全搞定</h2>
+      <p>主界面四页（连点 / 录制 / 宏 / 脚本定制），背后是 WebView2 壳 + C++ 引擎的现代架构。</p>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 12h8M12 8v8"/><circle cx="12" cy="12" r="9"/></svg>
+        </div>
+        <h3>四页主界面</h3>
+        <p>连点 / 录制 / 宏 / 脚本定制四个主 Tab，常用操作一键直达；全局热键与托盘常驻，随时启停。</p>
+        <span class="fc-tag">主界面</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 7h10v4H7zM7 13h6v4H7z"/></svg>
+        </div>
+        <h3>可视化宏编辑</h3>
+        <p>动作树 + 拖拽嵌套，支持备注、批量编辑、变量与条件（If/Else、循环、goto），复杂逻辑也能看得清。</p>
+        <span class="fc-tag">宏编辑器</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 12h6"/></svg>
+        </div>
+        <h3>录制回放</h3>
+        <p>键鼠录制 + 精密时间轴（微秒级），录制后可优化整理、去抖合并，还能一键转为找图点击。</p>
+        <span class="fc-tag">录制器</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7l7-2 11 4-7 2z"/><path d="M3 7l11 4v9L3 16zM14 11l7-2v9l-7-2"/></svg>
+        </div>
+        <h3>找图 / OCR</h3>
+        <p>模板匹配（多引擎、阈值、缩放）、区域截图与匹配叠加层；PaddleOCR 文字识别，UI 内可视化调试。</p>
+        <span class="fc-tag">图像引擎</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M6 6h.01M9 6h.01"/></svg>
+        </div>
+        <h3>窗口模式</h3>
+        <p>绑定目标窗口后台执行宏，不抢用户焦点；支持虚拟桌面隔离、FakeFocus、浏览器类（CDP / Edge 扩展）输入。</p>
+        <span class="fc-tag">后台执行</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        </div>
+        <h3>定时任务与托盘</h3>
+        <p>录制 / 宏按小时、每日、每周或自定义时间自动运行；全局启停热键 + 系统托盘，关闭后仍在后台值守。</p>
+        <span class="fc-tag">自动化</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 18l4-8 3 4 3-6 4 10"/></svg>
+        </div>
+        <h3>AI Agent 脚本定制</h3>
+        <p>对话式描述需求，AI 直接生成或修改宏与定时任务，支持工具调用、变更撤销，看不懂的脚本也能问。</p>
+        <span class="fc-tag">AI Agent</span>
+      </div>
+
+      <div class="feature-card">
+        <div class="fc-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 21h8"/></svg>
+        </div>
+        <h3>Web 渲染 UI</h3>
+        <p>WebView2 壳 + Web 前端渲染，现代、可交互、主题可换；官网在线 Demo 就是真实产品前端本身。</p>
+        <span class="fc-tag">极光 Arctic</span>
+      </div>
+    </div>
+
+    <div class="flow">
+      <div class="flow-step">
+        <span class="fs-n">STEP 01</span>
+        <h4>录制或编写</h4>
+        <p>用录制器记下真实键鼠轨迹，或在宏编辑器里可视化搭建动作树，AI 助手也能帮你写。</p>
+      </div>
+      <div class="flow-step">
+        <span class="fs-n">STEP 02</span>
+        <h4>优化整理</h4>
+        <p>批量删减、等待时间调整、移动合并 / 压缩，必要时把点击升级为找图点击，脚本更稳。</p>
+      </div>
+      <div class="flow-step">
+        <span class="fs-n">STEP 03</span>
+        <h4>定时或手动运行</h4>
+        <p>设全局热键即启即停，或交给定时任务；窗口模式下绑定目标窗口后台执行，不打扰你操作。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="about" id="about">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="eyebrow">架构</div>
+      <h2>现代壳 + 原生引擎</h2>
+      <p>界面交给 Web，能力留在原生：两全其美，也不牺牲性能。</p>
+    </div>
+    <div class="about-grid">
+      <div class="about-card">
+        <h3><span class="dot"></span>WebView2 壳 + Web 前端</h3>
+        <p>主界面由 WebView2 承载 Web 前端渲染（与本站在线 Demo 同一套 UI），现代、可交互、易迭代。</p>
+        <ul>
+          <li>连点 / 录制 / 宏 / 脚本定制四页</li>
+          <li>可视化宏编辑器与主题系统</li>
+          <li>官网 Demo 即产品前端本身</li>
+        </ul>
+      </div>
+      <div class="about-card">
+        <h3><span class="dot"></span>C++ 引擎 + 原生模块</h3>
+        <p>脚本解析、执行调度、录制时间轴、找图 / OCR、窗口模式、输入后端等能力由 C++ 引擎提供。</p>
+        <ul>
+          <li>精密时间轴与宏变量 / 条件执行</li>
+          <li>模板匹配与文字识别引擎</li>
+          <li>窗口模式后台执行链路</li>
+        </ul>
+      </div>
+      <div class="about-card">
+        <h3><span class="dot"></span>DesktopTools 常驻原生</h3>
+        <p>选区、找图叠层、OCR 叠层、准星、全局热键捕获与托盘等必须贴近系统的能力，保持原生实现，不塞进 Web。</p>
+        <ul>
+          <li>全局热键与脚本热键</li>
+          <li>屏幕选区与匹配叠加层</li>
+          <li>系统托盘与后台值守</li>
+        </ul>
+      </div>
+    </div>
+    <p class="about-note">
+      <strong>声明：</strong>QuickScriptTool（键鼠工坊）为独立开源实现，仅供学习交流使用。
+      本软件与任何第三方商业软件无关，不构成其破解版或替代品；请勿将自动化能力用于违反法律法规、
+      平台规则或他人权益的场景。使用时请遵守相关软件的用户协议与当地法律。
+    </p>
+  </div>
+</section>
+
+<section class="download" id="download">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="eyebrow">下载</div>
+      <h2>下载 Windows 版</h2>
+      <p>支持 Windows 10 / 11（64 位），建议 1600×1000 以上的屏幕分辨率。</p>
+    </div>
+    <div class="dl-grid">
+      <div class="dl-card">
+        <div class="dl-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        </div>
+        <h3>安装包</h3>
+        <p class="dl-desc">标准安装流程，自动创建开始菜单与桌面快捷方式；适合大多数用户。</p>
+        <a class="btn btn-primary" href="downloads/QuickScriptTool-Setup.exe" download>下载安装包</a>
+      </div>
+      <div class="dl-card">
+        <div class="dl-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M12 3v18"/><path d="M9 8h2.5M9 12h2.5"/></svg>
+        </div>
+        <h3>便携版</h3>
+        <p class="dl-desc">解压即用、免安装，适合 U 盘携带与临时环境；固定版本运行时一并打包。</p>
+        <a class="btn btn-primary" href="downloads/QuickScriptTool-Release.zip" download>下载便携版</a>
+      </div>
+    </div>
+    <div class="dl-requirements">
+      <h4>系统要求</h4>
+      <ul class="req-list">
+        <li><b>系统</b>Windows 10 / 11（64 位）</li>
+        <li><b>运行时</b>安装包 / 便携版已内置 WebView2 Fixed 与 VC++ 运行库，无需另装</li>
+        <li><b>内存</b>4 GB 及以上</li>
+        <li><b>磁盘</b>安装约 200 MB；OCR / 截图等功能按需额外下载</li>
+        <li><b>屏幕</b>建议 1600×1000 以上</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="f-brand">
+      <a class="brand-logo" href="index.html">
+        <span class="mark" aria-hidden="true">
+          <img src="favicon.ico" alt="键鼠工坊" />
+        </span>
+        <span>
+          <span class="zh">键鼠工坊</span>
+          <span class="en">QUICKSCRIPTTOOL</span>
+        </span>
+      </a>
+      <p>Windows 上的键鼠脚本工具：连点、录制回放、可视化宏编辑、找图 / OCR、AI 写脚本、后台窗口模式、定时任务与托盘。</p>
+      <p style="color:#6f8698;font-size:12px">独立开源实现，仅供学习交流。</p>
+      <p style="color:#8da3b4;font-size:12px;margin-top:10px">点击链接加入群聊【<a href="https://qm.qq.com/q/hCf5qI78By" target="_blank" rel="noopener" style="color:var(--ice-300)">键鼠工坊</a>】</p>
+    </div>
+    <div>
+      <h5>快速入口</h5>
+      <div class="f-links">
+        <a href="demo.html">在线体验 Demo</a>
+        <a href="#features">功能介绍</a>
+        <a href="download.html">下载与系统要求</a>
+        <a href="https://qm.qq.com/q/hCf5qI78By" target="_blank" rel="noopener">加入 QQ 交流群</a>
+      </div>
+    </div>
+    <div>
+      <h5>关于</h5>
+      <div class="f-links">
+        <a href="#about">产品架构</a>
+        <a href="mailto:24353623@qq.com">联系我们</a>
+      </div>
+    </div>
+    <div class="f-bottom">
+      <span>© <span data-year>2026</span> 键鼠工坊 QuickScriptTool · https://www.quickscripttool.cloud/</span>
+      <span>沪ICP备XXXXXXXX号（备案信息占位）</span>
+    </div>
+  </div>
+</footer>
+
+<script src="js/site.js"></script>
+</body>
+</html>

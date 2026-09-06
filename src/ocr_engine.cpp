@@ -403,7 +403,8 @@ OcrEngineOutput ParseOcrJson(const std::string& jsonRaw) {
 
         OcrTextLine line;
         const size_t textValuePos = FindJsonStringValueAfterKey(json, "text", pos);
-        const size_t objEnd = json.find('}', pos);
+        const size_t objEnd = FindMatchingJsonBrace(json, pos);
+        if (objEnd == std::string::npos) break;
         if (textValuePos != std::string::npos && textValuePos < objEnd
             && textValuePos < json.size() && json[textValuePos] == '"') {
             std::string raw;
@@ -438,7 +439,6 @@ OcrEngineOutput ParseOcrJson(const std::string& jsonRaw) {
 
         if (!line.text.empty()) output.lines.push_back(line);
 
-        if (objEnd == std::string::npos) break;
         pos = objEnd + 1;
         if (pos < json.size() && json[pos] == ']') break;
     }

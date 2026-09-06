@@ -1,0 +1,391 @@
+/* ui/shell.css — product WebView: full-bleed .app
+ *
+ * UI 设计要求（用户确认）：
+ * - 主界面客户区 1552×960；鼠标宏编辑界面 1800×1230
+ * - 键鼠录制优化弹窗 1640×1140（壳 setMode opt 改客户区）
+ * - 动作详情对齐原生窄栏 218 / 找图 120+90，按 --qst-u 等比，勿拉满
+ * - 设置 / AI 助手组件与主界面同一倍率 --qst-u = 1.5（见 index.html）
+ * - #app 铺满 WebView；禁止再用 zoom 把界面缩成左上角小窗
+ */
+html, body {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--sky-100, #e8f4fc);
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+  /* 桌面壳：标签/按钮等默认不可拖选；输入与对话/调试输出见下方白名单 */
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* 允许选中：输入框、contenteditable、AI 气泡、宏调试日志 */
+input,
+textarea,
+select,
+[contenteditable="true"],
+.inp,
+.chat-box,
+#chatInput,
+.bubble,
+.bubble .think-body,
+.debug-log,
+#debugLog {
+  -webkit-user-select: text;
+  user-select: text;
+}
+html {
+  zoom: 1;
+}
+body {
+  display: block;
+  background-image: none !important;
+  padding: 0 !important;
+}
+body.editor-open {
+  padding: 0 !important;
+}
+body::before,
+body::after {
+  display: none !important;
+  content: none !important;
+}
+.stage {
+  padding: 0 !important;
+  margin: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden;
+}
+.app {
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-width: none !important;
+  max-height: none !important;
+  border-radius: 14px;
+  box-shadow: none !important;
+  margin: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden;
+  zoom: 1;
+}
+.app.editor-mode {
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-width: none !important;
+  max-height: none !important;
+}
+
+/* P0: titlebar / home-nav — 对齐设计稿 40/76，按 --qst-u 等比（勿写死 40/76） */
+.app > .titlebar {
+  display: flex !important;
+  align-items: center !important;
+  width: 100% !important;
+  height: calc(46px * var(--qst-u, 1.5)) !important;
+  min-height: calc(46px * var(--qst-u, 1.5)) !important;
+  flex-shrink: 0 !important;
+  z-index: 20 !important;
+  position: relative !important;
+  box-sizing: border-box !important;
+}
+.app > .titlebar .brand {
+  flex-shrink: 0;
+}
+.app > .titlebar .win-btns {
+  margin-left: auto !important;
+  display: flex !important;
+  height: 100% !important;
+  flex-shrink: 0 !important;
+  position: relative !important;
+  z-index: 21 !important;
+}
+.app > .titlebar .win-btn {
+  width: calc(42px * var(--qst-u, 1.5)) !important;
+  display: grid !important;
+  place-items: center !important;
+  flex-shrink: 0 !important;
+  cursor: pointer;
+}
+.app > .home-nav {
+  z-index: 2 !important;
+  position: relative;
+  height: calc(76px * var(--qst-u, 1.5)) !important;
+  min-height: calc(76px * var(--qst-u, 1.5)) !important;
+  flex-shrink: 0 !important;
+}
+/* Never park win-btns inside nav */
+.app > .home-nav .win-btns,
+.app > .home-nav .win-btn {
+  display: none !important;
+}
+
+.app.editor-mode .editor-chrome {
+  display: flex !important;
+  flex: 1 !important;
+  min-height: 0 !important;
+  width: 100% !important;
+}
+.app.editor-mode .editor-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 1fr calc(60px * var(--qst-u, 1.5));
+}
+.app.editor-mode .editor-main {
+  display: grid;
+  /* 动作详情：原生窄栏 ~218 等比，勿拉满 */
+  grid-template-columns: minmax(0, 1fr) minmax(calc(268px * var(--qst-u, 1.5)), calc(300px * var(--qst-u, 1.5)));
+  min-height: 0;
+}
+.app.editor-mode .bottom-bar {
+  height: calc(60px * var(--qst-u, 1.5));
+  min-height: calc(60px * var(--qst-u, 1.5));
+  box-sizing: border-box;
+}
+
+.app .editor-chrome .left-col {
+  min-height: 0;
+  overflow: hidden;
+}
+.app .editor-chrome .action-table {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.app .editor-chrome .col-headers {
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.app .editor-chrome .action-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.app .editor-chrome .add-bar {
+  flex-shrink: 0;
+}
+.app .fm-preview {
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  overflow: hidden;
+  padding: 0 !important;
+  background: repeating-conic-gradient(var(--sky-100, #e8f1f8) 0% 25%, var(--frost, #f7fbfe) 0% 50%)
+    50% / 12px 12px;
+}
+.app .fm-preview .fi-thumb {
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+  max-height: none !important;
+  object-fit: cover !important;
+  object-position: center;
+  display: block;
+}
+.app .fm-preview .fi-empty {
+  font-size: calc(11px * var(--qst-u, 1.5));
+  color: var(--text-3, #94a3b8);
+  padding: calc(6px * var(--qst-u, 1.5));
+  text-align: center;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.app .arow > span.op {
+  overflow: visible;
+}
+.app .col-headers > span:last-child {
+  text-align: center;
+}
+.app .action-list {
+  position: relative;
+}
+.app .action-insert-line {
+  display: none;
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 3px;
+  background: #f59e0b;
+  z-index: 20;
+  pointer-events: none;
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.55);
+}
+.app .action-insert-line::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: -5px;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 6px 0 6px 10px;
+  border-color: transparent transparent transparent #f59e0b;
+}
+.app .arow.dragging {
+  opacity: 0.45;
+  cursor: grabbing !important;
+}
+.app .arow > span,
+.app .arow .aname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app .arow .op-drag {
+  cursor: inherit;
+  user-select: none;
+  color: var(--mint-300, #5eead4);
+  font-weight: 600;
+  pointer-events: none;
+}
+.popup-menu {
+  z-index: 2147483000 !important;
+  pointer-events: auto !important;
+}
+.overlay .popup-menu {
+  /* 挂在 overlay 内时仍压过对话框内容 */
+  z-index: 2147483000 !important;
+}
+.popup-menu .mi {
+  pointer-events: auto;
+  position: relative;
+  z-index: 1;
+}
+.popup-menu .mi.on {
+  background: linear-gradient(90deg, rgba(26, 166, 214, 0.28), rgba(45, 212, 191, 0.18));
+  color: var(--ice-700, #0e7490);
+  font-weight: 600;
+}
+.app .home-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.app .home-main,
+.app .panel {
+  min-height: 0;
+}
+.app #view-ai .script-head {
+  flex-shrink: 0;
+}
+.app #view-ai .card-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.app .card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.app .card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 36px 16px;
+  color: var(--text-3, #7e95ab);
+  text-align: center;
+}
+.empty .ico {
+  font-size: 28px;
+  opacity: 0.55;
+}
+.param-block .pf-sec h4 {
+  font-size: calc(11px * var(--qst-u, 1.5));
+  margin: 0 0 calc(6px * var(--qst-u, 1.5));
+  color: var(--text-2, #4a6178);
+}
+.param-block .fline {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--qst-u, 1.5));
+  margin-bottom: calc(10px * var(--qst-u, 1.5));
+  flex-wrap: wrap;
+}
+/* 勾选框 + 紧邻附属字段（如逻辑转化块名）成组，放在动作详情底部 */
+.param-block .param-opt-group {
+  margin-top: calc(14px * var(--qst-u, 1.5));
+  padding-top: calc(10px * var(--qst-u, 1.5));
+  border-top: 1px solid var(--line, rgba(74, 97, 120, 0.16));
+}
+/* 流式输出：纯文本节点，结束前不做 markdown/KaTeX 渲染 */
+.bubble.ai .md-stream-plain { white-space: pre-wrap; word-break: break-word; }
+.param-block .param-opt-group > .fline.wrap {
+  margin-bottom: calc(6px * var(--qst-u, 1.5));
+}
+.param-block .param-opt-group > .fline-stack {
+  margin-bottom: 0;
+}
+/* 勿盖掉 index.html 的四列 grid，否则 X1Y1 / 最小最大 / X偏Y偏 会折成多排 */
+.param-block .fline.xy {
+  display: grid;
+  grid-template-columns: var(--qst-xy-cols, 2.75em minmax(0, 1fr) 2.75em minmax(0, 1fr));
+  gap: var(--qst-xy-gap, calc(6px * var(--qst-u, 1.5)));
+  align-items: center;
+  flex-wrap: nowrap;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.param-block .hint {
+  font-size: calc(13px * var(--qst-u, 1.5));
+  color: var(--text-3, #7e95ab);
+  margin: calc(6px * var(--qst-u, 1.5)) 0;
+}
+/*
+ * 动作详情单行输入：height=line-height 垂直居中（含光标）。
+ * 必须盖过 index.html 与其它 flex 规则；WebView2 下 flex 居中对 caret 无效。
+ */
+.param-block .inp[contenteditable="true"]:not(.ed-area),
+.param-block .fline .inp[contenteditable="true"]:not(.ed-area),
+.param-block .fline-stack .inp[contenteditable="true"]:not(.ed-area),
+.param-block .fline.xy .inp[contenteditable="true"]:not(.ed-area) {
+  display: block !important;
+  align-items: unset !important;
+  justify-content: unset !important;
+  box-sizing: border-box !important;
+  --qst-inp-h: calc(32px * var(--qst-u, 1.5));
+  height: var(--qst-inp-h) !important;
+  min-height: var(--qst-inp-h) !important;
+  max-height: var(--qst-inp-h) !important;
+  line-height: var(--qst-inp-h) !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  white-space: nowrap !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+}
+.param-block .inp[contenteditable="true"]:not(.ed-area) > div,
+.param-block .inp[contenteditable="true"]:not(.ed-area) > p {
+  display: inline !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  line-height: inherit !important;
+}
+/* 路径等长内容仍可拉满；短命名框走 fline-stack 的 φ 宽 */
+.param-block .fline > .inp.ed-full {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}

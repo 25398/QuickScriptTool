@@ -36,7 +36,8 @@ build\Release\ScheduledTaskSelfTest.exe --json
 1. Tick 由 1s `SetTimer` 驱动 — 按**秒**匹配，勿要求毫秒精确。  
 2. 同一秒内一次 Tick 须触发**所有**到期任务。  
 3. Agent create/update/delete 须持久化并通知主窗 `Reload`。  
-4. `createScheduledTask` 需要真实 `targetFile`；weekly 要 `weekDays`；custom 要日期字段。
+4. `createScheduledTask` 需要真实 `targetFile`；weekly 要 `weekDays`；custom 要日期字段；interval 要大于 0 的时长（`hour`/`minute`/`second`）。  
+5. **自检禁止写产品 `scheduled_tasks.json`**：`TickAt` 对 Custom 会 `Save()`；自检须 `SetScheduledTasksFilePathForTest` 隔离到 `scheduled_tasks.selftest.json`。
 
 ## 相关路径
 

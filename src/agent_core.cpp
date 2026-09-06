@@ -4,10 +4,15 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "agent_core.h"
+#include "agent_attachment.h"
+#include "agent_ai_actions.h"
+#include "macro_execute_tools.h"
 #include "utils.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cwctype>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -95,11 +100,14 @@ std::wstring WinHttpErrorText(DWORD err) {
 }
 
 constexpr DWORD kHttpBodyPollMs = 250;
-constexpr DWORD kHttpReceivePollMs = 30000;  // 30s，避免大图片请求触发 12019
+// 5s 轮询：等待期间可打心跳/响应取消；超时当临时错误重试（见 IsTransientHttpReceiveError）
+constexpr DWORD kHttpReceivePollMs = 5000;
 
 bool HttpSendJsonBody(HINTERNET hRequest, const std::wstring& headers, const std::string& body,
-                      const std::atomic_bool* cancelFlag, std::wstring* errorOut) {
+                      const std::atomic_bool* cancelFlag, std::wstring* errorOut,
+                      StatusCallback onStatus = nullptr) {
     const DWORD total = static_cast<DWORD>(body.size());
+    if (onStatus) onStatus(L"正在发送请求头…");
     if (!WinHttpSendRequest(
             hRequest, headers.c_str(), static_cast<DWORD>(-1),
             WINHTTP_NO_REQUEST_DATA, 0, total, 0)) {
@@ -108,6 +116,7 @@ bool HttpSendJsonBody(HINTERNET hRequest, const std::wstring& headers, const std
     }
     size_t sent = 0;
     constexpr size_t kChunk = 65536;
+    int lastPct = -1;
     while (sent < body.size()) {
         if (cancelFlag && cancelFlag->load()) {
             if (errorOut) *errorOut = L"已取消";
@@ -126,6 +135,14 @@ bool HttpSendJsonBody(HINTERNET hRequest, const std::wstring& headers, const std
         }
         if (written == 0) break;
         sent += written;
+        if (onStatus && total > 0) {
+            const int pct = static_cast<int>((sent * 100ull) / total);
+            if (pct >= lastPct + 10 || sent >= body.size()) {
+                lastPct = pct;
+                onStatus(L"上传中 " + std::to_wstring(pct) + L"%（"
+                    + std::to_wstring((body.size() + 1023) / 1024) + L" KB）…");
+            }
+        }
     }
     return true;
 }
@@ -140,19 +157,73 @@ bool IsTransientHttpReceiveError(DWORD err) {
         || err == 12119; // ERROR_WINHTTP_INVALID_OPERATION
 }
 
-// 思考模型首 token / 长输出可能远超默认 120s，按 max_tokens 放大等待上限
+// 调用方显式设置了 recvTimeoutMs 时必须尊重，禁止再用 maxTokens 抬到数分钟
+// （否则 locate 设 45s 会被 maxTokens≈10800 抬成 270s，表现为「点浏览卡死」）。
 int ComputeEffectiveRecvTimeoutMs(int recvTimeoutMs, int maxTokens) {
-    const int floorMs = 180000;  // 至少 3 分钟
+    if (recvTimeoutMs > 0)
+        return std::max(15000, recvTimeoutMs);
+    const int baseMs = 90000;
     const int scaledMs = maxTokens > 0 ? maxTokens * 25 : 0;
-    return std::max(recvTimeoutMs, std::max(floorMs, scaledMs));
+    return std::max(std::max(15000, baseMs), scaledMs);
 }
 
-// 各兼容 API 普遍可接受的 max_tokens 上限（DeepSeek 为 393216）
-int ClampApiMaxTokens(int value) {
-    constexpr int kMin = 1;
-    constexpr int kMax = 393216;
-    if (value < kMin) return 4096;
-    return std::min(value, kMax);
+// 按模型调整 max_tokens 上限：不同模型输出上限差异很大，
+// 用户配置超限时直接 clamp 到该模型常见上限，避免 400。
+int ClampApiMaxTokens(int value, const std::wstring& model) {
+    int maxCap = 393216;  // DeepSeek V3.1 等长输出模型
+    const std::wstring lower = Trim(model);
+    std::wstring low;
+    low.reserve(lower.size());
+    for (wchar_t c : lower) low.push_back(static_cast<wchar_t>(std::towlower(c)));
+    if (low.find(L"deepseek") != std::wstring::npos) maxCap = 32768;
+    else if (low.find(L"gpt-4o") != std::wstring::npos
+        || low.find(L"gpt-4.1") != std::wstring::npos) maxCap = 16384;
+    else if (low.find(L"o1") != std::wstring::npos
+        || low.find(L"o3") != std::wstring::npos
+        || low.find(L"o4") != std::wstring::npos) maxCap = 100000;
+    if (value < 1) return 4096;
+    return std::min(value, maxCap);
+}
+
+// 需要强制关闭默认深度思考的网关：DeepSeek 官方、火山方舟（豆包 seed/pro 等）。
+// 实测这些模型默认/显式 enabled 都会长思考（单轮数十秒~数分钟），
+// 而 thinking.type=disabled 可把单轮压到 1~3s 且保持正确流程。
+bool ShouldForceFastThinking(const std::wstring& apiUrl, const std::wstring& model) {
+    const std::wstring lowUrl = Trim(apiUrl);
+    std::wstring url;
+    url.reserve(lowUrl.size());
+    for (wchar_t c : lowUrl) url.push_back(static_cast<wchar_t>(std::towlower(c)));
+    if (url.find(L"deepseek") != std::wstring::npos) return true;
+    if (url.find(L"volces.com") == std::wstring::npos
+        && url.find(L"ark") == std::wstring::npos) {
+        return false;
+    }
+    // 方舟网关：只对思考型模型（seed/pro/max/ultra）下发，避免其它模型拒参。
+    const std::wstring lowModel = Trim(model);
+    std::wstring m;
+    m.reserve(lowModel.size());
+    for (wchar_t c : lowModel) m.push_back(static_cast<wchar_t>(std::towlower(c)));
+    return m.find(L"seed") != std::wstring::npos
+        || m.find(L"pro") != std::wstring::npos
+        || m.find(L"max") != std::wstring::npos
+        || m.find(L"ultra") != std::wstring::npos;
+}
+
+// 指定范围内的对话是否已调用过 readAgentSkill section=scriptStrategy。
+// 用于工具层强制「先读脚本生成规范，再构建/创建」，避免模型逐条翻参考绕圈。
+bool SkillScriptStrategyRead(const std::vector<ChatMessage>& history, size_t endIndex) {
+    const size_t limit = (std::min)(endIndex, history.size());
+    for (size_t i = 0; i < limit; ++i) {
+        const auto& m = history[i];
+        if (m.role != L"assistant") continue;
+        for (const auto& tc : m.tool_calls) {
+            if (tc.name == L"readAgentSkill"
+                && tc.arguments.find(L"scriptStrategy") != std::wstring::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool ReceiveResponseWithPolling(HINTERNET hRequest, const std::atomic_bool* cancelFlag,
@@ -173,8 +244,10 @@ bool ReceiveResponseWithPolling(HINTERNET hRequest, const std::atomic_bool* canc
         const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - waitStart).count());
         if (onStatus && waitedSec >= lastReportSec + 5) {
-            lastReportSec = waitedSec;
-            onStatus(L"等待响应 " + std::to_wstring(waitedSec) + L"s… (err=" + std::to_wstring(lastErr) + L")");
+            lastReportSec = waitedSec - (waitedSec % 5);
+            const int remainSec = std::max(0, maxWaitMs / 1000 - waitedSec);
+            onStatus(L"等待响应 " + std::to_wstring(waitedSec) + L"s（剩余约 "
+                + std::to_wstring(remainSec) + L"s）…");
         }
         if (WinHttpReceiveResponse(hRequest, nullptr)) return true;
         lastErr = GetLastError();
@@ -263,6 +336,24 @@ void FillAssistantFromApiMessage(ChatMessage& dst, const json& message) {
     }
 }
 
+// ── 工具循环治理辅助 ──────────────────────────────────────────────
+// 终态工具：脚本/录制创建保存、定时任务创建/更新。这些工具成功即代表
+// 用户目标达成，立即收尾，避免模型在「已创建」后仍反复查参考绕圈。
+bool IsTerminalToolName(const std::wstring& name) {
+    return name == L"createMacroScript" || name == L"writeScript"
+        || name == L"optimizeScript" || name == L"optimizeRecording"
+        || name == L"createScheduledTask" || name == L"updateScheduledTask";
+}
+
+// 判定工具结果是否表示成功（而非报错）。
+bool ToolResultIsSuccess(const std::wstring& result) {
+    if (result.find(L"[错误]") != std::wstring::npos) return false;
+    return result.find(L"✓") != std::wstring::npos
+        || result.find(L"已创建") != std::wstring::npos
+        || result.find(L"已保存") != std::wstring::npos
+        || result.find(L"已更新") != std::wstring::npos;
+}
+
 }  // namespace
 
 // ── 构造 / 析构 ───────────────────────────────────────────────────
@@ -284,6 +375,24 @@ void AgentCore::ClearHistory() {
 
 void AgentCore::SetFullHistory(std::vector<ChatMessage> messages) {
     messages_ = std::move(messages);
+}
+
+bool AgentCore::TruncateHistoryToUserRound(size_t userRoundIndex) {
+    size_t seen = 0;
+    size_t cut = messages_.size();
+    for (size_t i = 0; i < messages_.size(); ++i) {
+        // 内部引导消息（nudge/图片参考）不是真正的用户轮次，不计入序号
+        if (messages_[i].role == L"user" && !messages_[i].internal_nudge) {
+            if (seen == userRoundIndex) {
+                cut = i;
+                break;
+            }
+            ++seen;
+        }
+    }
+    if (cut == messages_.size()) return false;
+    messages_.resize(cut);
+    return true;
 }
 
 void AgentCore::ImportHistoryFrom(const AgentCore& other, size_t startIndex) {
@@ -313,26 +422,56 @@ void AgentCore::AbortActiveHttp() {
 }
 
 // ── 构建 API 请求 ─────────────────────────────────────────────────
-json AgentCore::BuildRequest(bool stripLastUserImages) {
+json AgentCore::BuildRequest(bool stripLastUserImages,
+                             const std::string& toolChoice) {
     json req;
     req["model"] = ToUtf8(config_.model);
-    req["temperature"] = config_.temperature;
-    req["max_tokens"] = ClampApiMaxTokens(config_.maxTokens);
+    // 推理模型（o1/o3/o4、DeepSeek R1/Reasoner 等）不接受 temperature 采样参数，
+    // 硬发会 400；非推理模型照常下发。
+    if (!ModelIsReasoningType(config_.model)) {
+        req["temperature"] = config_.temperature;
+    }
+    req["max_tokens"] = ClampApiMaxTokens(config_.maxTokens, config_.model);
 
-    size_t lastUserIdx = messages_.size();
-    for (size_t i = messages_.size(); i > 0; --i) {
-        if (messages_[i - 1].role == L"user") {
-            lastUserIdx = i - 1;
-            break;
+    // 上下文滑动窗口：只保留 system + 最近 kContextKeepRounds 个 user 轮
+    // （含随后的 tool/assistant），丢弃更早轮次，避免长对话撑爆上下文。
+    // 以 user 消息为轮次边界裁剪，保证 tool_call_id 配对完整、序列合法。
+    static constexpr size_t kContextKeepRounds = 10;
+    size_t startIdx = 0;
+    {
+        size_t userCount = 0;
+        for (const auto& m : messages_) {
+            if (m.role == L"user") ++userCount;
+        }
+        if (userCount > kContextKeepRounds) {
+            size_t toSkip = userCount - kContextKeepRounds;
+            for (size_t i = 1; i < messages_.size(); ++i) {
+                if (messages_[i].role == L"user") {
+                    if (toSkip > 0) {
+                        --toSkip;
+                        startIdx = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    // 构建 messages 数组
+    size_t lastUserIdx = messages_.size();
+    for (size_t mi = 0; mi < messages_.size(); ++mi) {
+        if (mi != 0 && mi < startIdx) continue;
+        if (messages_[mi].role == L"user") lastUserIdx = mi;
+    }
+
+    // 构建 messages 数组（system 恒保留；裁剪轮次跳过）
     json msgs = json::array();
     for (size_t mi = 0; mi < messages_.size(); ++mi) {
+        if (mi != 0 && mi < startIdx) continue;
         const auto& m = messages_[mi];
         const bool stripImages = (m.role == L"user" && mi != lastUserIdx)
             || (stripLastUserImages && m.role == L"user" && mi == lastUserIdx);
+        const bool stripThis = stripImages && !m.keep_images;
         json msg;
         msg["role"] = ToUtf8(m.role);
         if (!m.parts.empty()) {
@@ -341,7 +480,7 @@ json AgentCore::BuildRequest(bool stripLastUserImages) {
                 if (p.type == L"text") {
                     parts.push_back({{"type", "text"}, {"text", ToUtf8(p.text)}});
                 } else if (p.type == L"image_url") {
-                    if (stripImages) {
+                    if (stripThis) {
                         const char* hint = (stripLastUserImages && mi == lastUserIdx)
                             ? "(截图已在上一轮流式请求中发送，请根据文字描述直接调用工具完成脚本，勿重复长篇思考)"
                             : "(历史截图已省略)";
@@ -421,7 +560,20 @@ json AgentCore::BuildRequest(bool stripLastUserImages) {
             toolsArray.push_back(tool);
         }
         req["tools"] = toolsArray;
-        req["tool_choice"] = "auto";
+        // OpenAI/兼容网关：auto|required|none。未指定（auto）时不发字段——
+        // 缺省即 auto，且 DeepSeek 深度思考模式会对 tool_choice=required 报 400。
+        if (!toolChoice.empty() && toolChoice != "auto")
+            req["tool_choice"] = toolChoice;
+    }
+    // DeepSeek V4 / 豆包 seed 等思考型模型：默认就会长思考（单轮可达数分钟，
+    // 还受 max_tokens 预算放大），表现为「卡死」。助手流程的正确性由
+    // Skill + 工具校验保证（实测关思考后 3s 内正确调出 readAgentSkill →
+    // planScriptActions → createMacroScript），因此一律显式 disabled 走快速执行。
+    // 原生推理模型（R1/Reasoner、o 系列）不接受该开关，不发送避免 400；
+    // 其它网关（OpenAI 等）保持默认。
+    if (ShouldForceFastThinking(config_.apiUrl, config_.model)
+        && !ModelIsReasoningType(config_.model)) {
+        req["thinking"] = json::object({{"type", "disabled"}});
     }
 
     return req;
@@ -446,8 +598,14 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
     const std::string body = requestBody.dump();
     const int effectiveTimeoutMs = ComputeEffectiveRecvTimeoutMs(config_.recvTimeoutMs, config_.maxTokens);
     if (onStatus) {
-        onStatus(L"请求体 " + std::to_wstring((body.size() + 1023) / 1024)
-            + L" KB，上传中…");
+        std::wstring st = L"正在连接 API（请求体 "
+            + std::to_wstring((body.size() + 1023) / 1024) + L" KB）…";
+        if (requestBody.contains("thinking")
+            && requestBody["thinking"].is_object()
+            && requestBody["thinking"].value("type", "") == "enabled") {
+            st += L"（已开深度思考）";
+        }
+        onStatus(st);
     }
 
     WinHttpHandle hSession = WinHttpOpen(
@@ -499,47 +657,18 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
     if (!config_.apiKey.empty())
         headers += L"Authorization: Bearer " + config_.apiKey + L"\r\n";
 
-    if (!HttpSendJsonBody(hRequest, headers, body, cancelFlag, errorOut))
+    if (!HttpSendJsonBody(hRequest, headers, body, cancelFlag, errorOut, onStatus))
         return fail(errorOut ? *errorOut : L"发送请求失败");
 
     if (cancelFlag && cancelFlag->load()) return fail(L"已取消");
 
-    if (onStatus) onStatus(L"等待服务器响应…");
-
-    // 使用较长的每次轮询超时（30s），避免大图片请求触发 12019
-    DWORD pollTimeoutMs = 30000;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &pollTimeoutMs, sizeof(pollTimeoutMs));
-
-    const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds(std::max(30000, effectiveTimeoutMs));
-    const auto waitStart = std::chrono::steady_clock::now();
-    int lastReportSec = 0;
-    DWORD lastErr = 0;
-    bool received = false;
-    for (;;) {
-        if (cancelFlag && cancelFlag->load())
-            return fail(L"已取消");
-        const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - waitStart).count());
-        if (onStatus && waitedSec >= lastReportSec + 5) {
-            lastReportSec = waitedSec;
-            onStatus(L"等待响应 " + std::to_wstring(waitedSec) + L"s…");
-        }
-        if (WinHttpReceiveResponse(hRequest, nullptr)) {
-            received = true;
-            break;
-        }
-        lastErr = GetLastError();
-        if (cancelFlag && cancelFlag->load())
-            return fail(L"已取消");
-        if (std::chrono::steady_clock::now() >= deadline)
-            return fail(L"等待服务器响应超时（已超过 "
-                + std::to_wstring(std::max(30000, effectiveTimeoutMs)) + L"ms，"
-                + WinHttpErrorText(lastErr) + L" code=" + std::to_wstring(lastErr) + L"）");
+    if (onStatus) {
+        onStatus(L"等待服务器响应（最长 "
+            + std::to_wstring(std::max(30, effectiveTimeoutMs / 1000)) + L"s，推理模型可能较慢）…");
     }
-
-    if (!received)
-        return fail(L"接收响应失败：" + WinHttpErrorText(lastErr) + L" (code=" + std::to_wstring(lastErr) + L")");
+    std::wstring recvErr;
+    if (!ReceiveResponseWithPolling(hRequest, cancelFlag, effectiveTimeoutMs, &recvErr, onStatus))
+        return fail(recvErr.empty() ? L"等待服务器响应失败" : recvErr);
 
     if (onStatus) onStatus(L"已收到响应头，读取响应体…");
 
@@ -552,10 +681,33 @@ std::wstring AgentCore::CallApi(const json& requestBody, std::wstring* errorOut,
         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
 
+    // 读取响应体必须带总超时：推理模型生成可能长达数分钟，若服务器持续慢速吐数据，
+    // 无 deadline 的循环会无限等待（表现为“半天没响应”）。
+    const auto bodyStart = std::chrono::steady_clock::now();
+    const auto bodyDeadline = bodyStart + std::chrono::milliseconds(effectiveTimeoutMs);
     std::string responseBody;
     DWORD bytesAvailable = 0;
+    int lastBodyBeatSec = 0;
     for (;;) {
         if (cancelFlag && cancelFlag->load()) return fail(L"已取消");
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= bodyDeadline) {
+            if (onStatus)
+                onStatus(L"读取响应体超时（已超过 "
+                    + std::to_wstring(effectiveTimeoutMs / 1000)
+                    + L"s），中止等待…");
+            return fail(L"读取响应体超时（服务器长时间未完成响应）");
+        }
+        if (onStatus) {
+            const int waitedSec = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::seconds>(now - bodyStart).count());
+            if (waitedSec >= lastBodyBeatSec + 5) {
+                lastBodyBeatSec = waitedSec;
+                onStatus(L"等待响应体 " + std::to_wstring(waitedSec)
+                    + L"s（已接收 " + std::to_wstring(responseBody.size() / 1024)
+                    + L" KB）…");
+            }
+        }
         if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable)) {
             const DWORD err = GetLastError();
             if (IsTransientHttpReceiveError(err)) {
@@ -645,7 +797,8 @@ bool AssembleStreamMessage(const StreamAccumState& state, bool expectTools, Chat
     assembled["content"] = state.content.empty() ? json(nullptr) : json(state.content);
     if (!state.reasoning.empty())
         assembled["reasoning_content"] = state.reasoning;
-    if (!state.toolCallParts.empty()) {
+    // 只挂载参数已完整的 tool_calls，避免半截 JSON 阻断「改走强制调工具」路径
+    if (HasUsableStreamToolCalls(state)) {
         json tcs = json::array();
         for (const json& tc : state.toolCallParts) {
             if (!tc.is_null() && !tc.empty()) tcs.push_back(tc);
@@ -791,7 +944,17 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     requestBody["stream"] = true;
 
     const int effectiveTimeoutMs = ComputeEffectiveRecvTimeoutMs(config_.recvTimeoutMs, config_.maxTokens);
-    constexpr int kStreamIdleTimeoutMs = 180000;  // 思考模型 chunk 间隔可达数分钟
+    // 长等待只发生在流式路径：模型边想边吐工具 JSON 极慢时会「工具调用组装中」空挂满 51s，
+    // 再叠加完整响应重试共 ~100s。宿主对工具轮改用更短的组装/空闲上限，超时即走
+    // 完整响应兜底（日志显示兜底响应通常很快），把单轮最坏等待压到 ~30s。
+    constexpr int kStreamIdleTimeoutMs = 30000;
+    constexpr int kToolCallAssemblyCapMs = 30000;
+    // 兜底：仅在长时间空闲仍无 tool_calls 时收束（勿在数秒内打断，否则永远调不到工具）
+    constexpr int kReasoningOnlyForceMs = 90000;
+    constexpr int kReasoningPlateauIdleMs = 45000;
+    // 工具轮：已连上/已有字节但迟迟无思考/正文/工具（常见于 SSE keepalive 空挂）→ 尽快改完整响应
+    // 勿等满 API 超时（日志里会一直「流式等待 3s…42s」）
+    constexpr int kEmptyStreamCapMs = 15000;
 
     const std::wstring url = NormalizeChatCompletionsUrl(Trim(config_.apiUrl));
     const ParsedUrl parsed = ParseUrl(url);
@@ -799,9 +962,23 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
         return fail(L"API 地址格式无效，请检查是否包含完整的 https:// 地址。");
 
     const std::string body = requestBody.dump();
+    // 空流上限按请求体大小自适应：几十 KB 历史+工具 schema+截图时，
+    // 模型预填充阶段没有首包是正常的（可达 30~60s）；固定 15s 会误杀流式，
+    // 逼到更慢的完整响应（表现为「等待响应体 Ns（已接收 0 KB）」干等）。
+    int emptyStreamCapMs = kEmptyStreamCapMs;
+    if (body.size() > 20000) {
+        const int extra = static_cast<int>((body.size() - 20000) / 1024) * 600;
+        emptyStreamCapMs = std::min(60000, kEmptyStreamCapMs + extra);
+    }
     if (callbacks.onStatus) {
-        callbacks.onStatus(L"请求体 " + std::to_wstring((body.size() + 1023) / 1024)
-            + L" KB，上传中…");
+        std::wstring st = L"正在连接 API（请求体 "
+            + std::to_wstring((body.size() + 1023) / 1024) + L" KB）…";
+        if (requestBody.contains("thinking")
+            && requestBody["thinking"].is_object()
+            && requestBody["thinking"].value("type", "") == "enabled") {
+            st += L"（已开深度思考）";
+        }
+        callbacks.onStatus(st);
     }
 
     WinHttpHandle hSession = WinHttpOpen(
@@ -842,7 +1019,7 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
         headers += L"Authorization: Bearer " + config_.apiKey + L"\r\n";
 
     std::wstring sendErr;
-    if (!HttpSendJsonBody(hRequest, headers, body, callbacks.cancelFlag, &sendErr))
+    if (!HttpSendJsonBody(hRequest, headers, body, callbacks.cancelFlag, &sendErr, callbacks.onStatus))
         return fail(sendErr.empty() ? L"发送请求失败" : sendErr);
 
     if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
@@ -871,63 +1048,140 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     const auto streamStart = std::chrono::steady_clock::now();
     auto lastByteTime = streamStart;
     bool receivedAnyByte = false;
+    bool announcedStreamConnected = false;
     int lastBeatSec = 0;
+
+    // 必须在「QueryDataAvailable 超时 continue」路径也会跑：否则无数据时永久跳过心跳/强制收束
+    auto checkStreamProgress = [&]() -> bool {
+        const auto now = std::chrono::steady_clock::now();
+        const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+            now - streamStart).count());
+        if (callbacks.onStatus && waitedSec >= lastBeatSec + 3) {
+            lastBeatSec = waitedSec;
+            std::wstring beat = L"流式等待 " + std::to_wstring(waitedSec) + L"s";
+            if (!state.reasoning.empty())
+                beat += L"，思考 " + std::to_wstring(state.reasoning.size()) + L" 字节";
+            if (!state.content.empty())
+                beat += L"，回复 " + std::to_wstring(state.content.size()) + L" 字节";
+            if (state.hasToolCalls || !state.toolCallParts.empty())
+                beat += L"，工具调用组装中";
+            callbacks.onStatus(beat + L"…");
+        }
+        if (expectTools
+            && state.content.empty()
+            && !HasUsableStreamToolCalls(state)
+            && !state.reasoning.empty()) {
+            const bool hitAbs = now - streamStart >= std::chrono::milliseconds(kReasoningOnlyForceMs);
+            const bool hitPlateau = receivedAnyByte
+                && now - lastByteTime >= std::chrono::milliseconds(kReasoningPlateauIdleMs);
+            if (hitAbs || hitPlateau) {
+                if (callbacks.onStatus) {
+                    callbacks.onStatus(hitPlateau
+                        ? L"思考已停顿仍未调用工具，结束流式并强制调工具…"
+                        : L"思考过久未调用工具，结束流式并强制调工具…");
+                }
+                state.done = true;
+                return true;
+            }
+        }
+        // 工具轮：已在「工具调用组装中」但迟迟凑不齐完整 tool_calls → 放弃流式，
+        // 改走完整响应兜底（比继续空挂快）。
+        if (expectTools
+            && (state.hasToolCalls || !state.toolCallParts.empty())
+            && !HasUsableStreamToolCalls(state)
+            && now - streamStart >= std::chrono::milliseconds(kToolCallAssemblyCapMs)) {
+            if (callbacks.onStatus)
+                callbacks.onStatus(L"工具调用组装超时，改用完整响应…");
+            return false; // 调用方 fail → 上层改用完整响应
+        }
+        // 工具轮空流：无思考/正文/可用工具。含「已收到字节但只是 ping/空行」——原先只拦
+        // !receivedAnyByte，keepalive 会空挂到整段 API 超时。
+        if (expectTools
+            && !HasMeaningfulStreamPayload(state)
+            && now - streamStart >= std::chrono::milliseconds(emptyStreamCapMs)) {
+            if (callbacks.onStatus)
+                callbacks.onStatus(receivedAnyByte
+                    ? L"流式空闲无内容（可能仅 keepalive），改用完整响应…"
+                    : L"流式首包超时，改用完整响应…");
+            return false;
+        }
+        // 非工具轮：仍要求尽快有首包，避免无限空等
+        if (!expectTools && !receivedAnyByte
+            && now - streamStart >= std::chrono::milliseconds(45000)) {
+            if (callbacks.onStatus)
+                callbacks.onStatus(L"流式首包超时，结束等待…");
+            return false;
+        }
+        if (now >= streamDeadline) {
+            if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
+                state.done = true;
+                return true;
+            }
+            return false;
+        }
+        if (bytesAvailable == 0 && receivedAnyByte && HasMeaningfulStreamPayload(state)
+            && now - lastByteTime >= std::chrono::milliseconds(kStreamIdleTimeoutMs)) {
+            if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
+                state.done = true;
+                return true;
+            }
+            return false;
+        }
+        return true; // 继续读
+    };
+
     while (!state.done) {
         if (callbacks.cancelFlag && callbacks.cancelFlag->load())
             return fail(L"已取消");
         if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable)) {
             const DWORD err = GetLastError();
+            // 热键 StopRun → Abort 关句柄：优先按取消退出，勿干等超时
+            if (callbacks.cancelFlag && callbacks.cancelFlag->load())
+                return fail(L"已取消");
             if (ShouldFinalizeStream(state, expectTools)) break;
             if (IsTransientHttpReceiveError(err)) {
-                if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
+                const bool ok = checkStreamProgress();
+                if (state.done) break;
+                if (!ok) {
+                    return fail(L"流式接收超时（已超过 "
+                        + std::to_wstring(effectiveTimeoutMs) + L" ms / 首包或空闲）");
+                }
+                Sleep(50);
                 continue;
             }
             return fail(L"读取流失败：" + WinHttpErrorText(err)
                 + L" (code=" + std::to_wstring(err) + L")");
         }
-        const auto now = std::chrono::steady_clock::now();
-        if (bytesAvailable == 0) {
-            if (ShouldFinalizeStream(state, expectTools)) break;
-            if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
-            if (receivedAnyByte && HasMeaningfulStreamPayload(state)
-                && now - lastByteTime >= std::chrono::milliseconds(kStreamIdleTimeoutMs)) {
-                if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
-                    state.done = true;
-                    break;
-                }
-                return fail(L"流式连接空闲超时（"
-                    + std::to_wstring(kStreamIdleTimeoutMs) + L" ms 无新数据）");
-            }
-            if (now >= streamDeadline) {
-                if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
-                    state.done = true;
-                    break;
-                }
+        {
+            const bool ok = checkStreamProgress();
+            if (state.done) break;
+            if (!ok) {
                 return fail(L"流式接收超时（已超过 "
                     + std::to_wstring(effectiveTimeoutMs) + L" ms）");
             }
-            const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-                now - streamStart).count());
-            if (callbacks.onStatus && waitedSec >= lastBeatSec + 3) {
-                lastBeatSec = waitedSec;
-                std::wstring beat = L"流式等待 " + std::to_wstring(waitedSec) + L"s";
-                if (!state.reasoning.empty())
-                    beat += L"，思考 " + std::to_wstring(state.reasoning.size()) + L" 字节";
-                if (!state.content.empty())
-                    beat += L"，回复 " + std::to_wstring(state.content.size()) + L" 字节";
-                callbacks.onStatus(beat + L"…");
-            }
+        }
+        if (bytesAvailable == 0) {
+            if (ShouldFinalizeStream(state, expectTools)) break;
+            if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
             Sleep(50);
             continue;
         }
         receivedAnyByte = true;
-        lastByteTime = now;
-        if (callbacks.onStatus && lastBeatSec == 0)
+        lastByteTime = std::chrono::steady_clock::now();
+        if (callbacks.onStatus && !announcedStreamConnected) {
+            announcedStreamConnected = true;
             callbacks.onStatus(L"已连接，接收流式响应…");
+        }
         std::vector<char> buffer(bytesAvailable);
         DWORD bytesRead = 0;
         if (!WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead) || bytesRead == 0) {
             if (ShouldFinalizeStream(state, expectTools)) break;
+            const bool ok = checkStreamProgress();
+            if (state.done) break;
+            if (!ok) {
+                return fail(L"流式接收超时（已超过 "
+                    + std::to_wstring(effectiveTimeoutMs) + L" ms）");
+            }
             continue;
         }
         FeedStreamBytes(state, buffer.data(), bytesRead, callbacks);
@@ -992,14 +1246,50 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
     userMsg.role = L"user";
     messages_.push_back(userMsg);
 
-    static constexpr int kMaxToolLoops = 10;
+    static constexpr int kMaxToolLoops = 14;
+    // 工具循环治理：
+    // - lastToolName/lastToolResult/repeatToolCount：连续「同一工具+相同结果」计数；
+    // - repeatedPairCount：全轮次内相同「工具+结果」对出现次数（隔轮绕圈 A→B→A→B 也能识别）。
+    std::wstring lastToolName;
+    std::wstring lastToolResult;
+    int repeatToolCount = 0;
+    std::map<std::wstring, int> repeatedPairCount;
+    // 单轮内 readScriptReference 调用计数：超过阈值直接提示收束，防逐条翻参考
+    int referenceReadCount = 0;
+    // 单轮内「排查/探索」工具（搜索/浏览目录/读文件）计数：防止模型把轮次
+    // 全花在找文件上，导致构建/创建没有余量。
+    int reconToolCount = 0;
 
     for (int loop = 0; loop < kMaxToolLoops; ++loop) {
         if (callbacks.cancelFlag && callbacks.cancelFlag->load())
             return L"[错误] 用户取消";
 
+        // 接近上限：注入引导（不限制思考，只提示下一步方向，给模型收束机会）
+        if (loop >= kMaxToolLoops - 2) {
+            ChatMessage limitMsg;
+            limitMsg.role = L"user";
+            limitMsg.internal_nudge = true;
+            limitMsg.content = (loop == kMaxToolLoops - 1)
+                ? L"这是本轮最后一次工具调用机会：请直接给出最终回答，"
+                  L"或完成最后一个必要步骤后立即总结，不要再重复调用工具。"
+                : L"已接近本轮工具调用上限。若脚本已创建或已保存，请直接总结；"
+                  L"否则请在剩余轮次内完成必要步骤，不要重复调用工具。";
+            messages_.push_back(std::move(limitMsg));
+            if (callbacks.onStatus)
+                callbacks.onStatus(loop == kMaxToolLoops - 1
+                    ? L"最后一轮工具调用，已提示直接收尾…"
+                    : L"接近工具调用上限，已提示收束…");
+        }
+
         activeHttpAbort_ = callbacks.httpAbort;
-        json requestBody = BuildRequest();
+        // 一律 auto：DeepSeek 深度思考模式不支持 tool_choice=required（会 400），
+        // 且用户需要「先思考流程再实现」的分步规划，不该强制立刻调工具。
+        const std::string choiceThisCall = "auto";
+        // 工具续轮不再带截图（省大量 token），但仍走流式：
+        // 推理模型在工具轮后还会长思考，非流式会整段生成完才返回、期间无任何反馈，
+        // 前端表现像卡死；且「只思考不调工具」的纠偏只在流式路径生效。
+        const bool stripImagesThisCall = (loop > 0);
+        json requestBody = BuildRequest(stripImagesThisCall, choiceThisCall);
         if (callbacks.onStatus)
             callbacks.onStatus(loop == 0 ? L"正在连接…" : L"继续处理…");
 
@@ -1009,14 +1299,16 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
         ChatMessage assistantMsg;
         bool parsed = false;
         std::string finishReason;
-        bool nonStreamRetryStripImages = false;
+        bool nonStreamRetryStripImages = stripImagesThisCall;
 
         auto needsNonStreamRetry = [&](const StreamApiResult& s, const ChatMessage& msg) {
             if (!useStream || !s.ok || !expectTools || !msg.tool_calls.empty()) return false;
-            if (s.finishReason == "length") return true;
-            // 流式只收到思考、未产出正文/工具时，改用完整响应重试（省略已发送过的截图以加速）
-            if (msg.content.empty() && !msg.reasoning_content.empty()) return true;
-            return false;
+            return s.finishReason == "length";
+        };
+
+        auto needsForceToolAfterReasoning = [&](const StreamApiResult& s, const ChatMessage& msg) {
+            if (!useStream || !s.ok || !expectTools || !msg.tool_calls.empty()) return false;
+            return msg.content.empty() && !msg.reasoning_content.empty();
         };
 
         if (useStream) {
@@ -1025,11 +1317,24 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                 assistantMsg = streamed.message;
                 finishReason = streamed.finishReason;
                 parsed = true;
-                if (needsNonStreamRetry(streamed, assistantMsg)) {
+                if (needsForceToolAfterReasoning(streamed, assistantMsg)) {
+                    messages_.push_back(assistantMsg);
+                    ChatMessage nudge;
+                    nudge.role = L"user";
+                    nudge.internal_nudge = true;
+                    nudge.content =
+                        L"请继续推进任务：基于你的分析调用下一步工具"
+                        L"（如 buildScriptActions / createMacroScript）或给出最终回答；"
+                        L"不要重复查询同一参考，也不要把思考内容当作最终回答。";
+                    messages_.push_back(nudge);
+                    if (callbacks.onStatus)
+                        callbacks.onStatus(L"思考中未调工具，已提示继续推进…");
+                    continue;
+                } else if (needsNonStreamRetry(streamed, assistantMsg)) {
                     parsed = false;
                     nonStreamRetryStripImages = true;
                     if (callbacks.onStatus)
-                        callbacks.onStatus(L"思考完成但未调用工具，改用完整响应重试（省略截图）…");
+                        callbacks.onStatus(L"输出被截断，改用完整响应重试（省略截图）…");
                 }
             }
         }
@@ -1046,7 +1351,10 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                     callbacks.onStatus(L"正在等待完整响应…");
                 }
             }
-            json apiBody = nonStreamRetryStripImages ? BuildRequest(true) : requestBody;
+            // 流式失败/截断重试：一律省略截图，避免 80KB+ 再付一次
+            json apiBody = (nonStreamRetryStripImages || useStream)
+                ? BuildRequest(true, choiceThisCall)
+                : requestBody;
             apiBody["stream"] = false;
             std::wstring apiError;
             const std::wstring responseText = CallApi(
@@ -1076,6 +1384,7 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
             const json& message = choice.value("message", json::object());
             if (choice.contains("finish_reason") && !choice["finish_reason"].is_null())
                 finishReason = choice["finish_reason"].get<std::string>();
+            assistantMsg = ChatMessage{};
             assistantMsg.role = L"assistant";
             FillAssistantFromApiMessage(assistantMsg, message);
             parsed = true;
@@ -1098,24 +1407,98 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
             }
             messages_.push_back(assistantMsg);
 
+            // 收集本轮工具结果中带出的脚本图片（readScript 的 [[AGENT_IMG:...]] 标记）
+            std::vector<std::wstring> pendingImages;
+            bool terminalSucceeded = false;
+            std::wstring terminalResult;
             for (const auto& tc : assistantMsg.tool_calls) {
                 std::wstring toolResult;
                 bool found = false;
-                for (const auto& tool : tools_) {
-                    if (tool.name == tc.name) {
-                        toolResult = tool.execute(tc.arguments);
-                        found = true;
-                        break;
+                // 工具层流程强制：构建/创建/手写保存脚本前必须先读脚本生成规范
+                // （排除当前轮自身，避免同轮并行调用绕过约束）。
+                const bool needsScriptSkill = (tc.name == L"buildScriptActions"
+                    || tc.name == L"createMacroScript" || tc.name == L"writeScript"
+                    || tc.name == L"planScriptActions");
+                const bool scriptSkillRead = SkillScriptStrategyRead(
+                    messages_, messages_.size() - 1);
+                const bool isReconTool = tc.name == L"searchAgentFiles"
+                    || tc.name == L"listDirectory" || tc.name == L"readAgentFile";
+                if (needsScriptSkill && !scriptSkillRead) {
+                    toolResult = L"[错误] 规划/构建/创建/保存脚本前必须先调用 "
+                        L"readAgentSkill section=scriptStrategy 获取脚本生成规范；"
+                        L"请先读取该 Skill，再调用 " + tc.name
+                        + L"。不要用 readScriptReference 逐条翻阅代替。";
+                    found = true;
+                } else if (tc.name == L"readScriptReference"
+                    && ++referenceReadCount > 3) {
+                    toolResult = L"[提示] 你已多次翻阅脚本参考（超过 3 次），"
+                        L"请停止逐条查阅。先调用 readAgentSkill section=scriptStrategy "
+                        L"获取脚本生成规范，再 planScriptActions 核对动作树，"
+                        L"然后 buildScriptActions / createMacroScript。";
+                    found = true;
+                } else if (isReconTool && ++reconToolCount > 4) {
+                    toolResult = L"[提示] 你已多次浏览/搜索/读取文件（超过 4 次），"
+                        L"请停止排查。创建/修改脚本请先调用 readAgentSkill "
+                        L"section=scriptStrategy，再 planScriptActions → createMacroScript；"
+                        L"需要定位文件时一次读取目录即可。";
+                    found = true;
+                } else {
+                    for (const auto& tool : tools_) {
+                        if (tool.name == tc.name) {
+                            toolResult = tool.execute(tc.arguments);
+                            found = true;
+                            break;
+                        }
                     }
                 }
                 if (!found)
                     toolResult = L"[错误] 未知工具：" + tc.name;
 
-                // 大录制 readScript / 动作一览等若仍过长，截断后再入历史，避免下轮请求体膨胀卡死
-                constexpr size_t kMaxToolResultChars = 100000;
+                // 重复检测：仅「同一工具 + 完全相同返回」连续出现才计数；
+                // 同名但参数/结果不同（如 readScript 换脚本）不算重复。
+                if (tc.name == lastToolName && toolResult == lastToolResult) {
+                    ++repeatToolCount;
+                } else {
+                    lastToolName = tc.name;
+                    lastToolResult = toolResult;
+                    repeatToolCount = 1;
+                }
+                ++repeatedPairCount[tc.name + L"\x01" + toolResult];
+
+                // 脚本图片标记：多模态模型把图片编码为下一轮 user 图片消息；
+                // 非多模态模型降级为路径文本提示，不报错。
+                std::wstring toolText;
+                std::vector<std::wstring> imgPaths;
+                if (AgentExtractImageMarkers(toolResult, toolText, imgPaths)
+                    && !imgPaths.empty()) {
+                    toolResult = toolText;
+                    if (ModelSupportsVision(config_.model)) {
+                        for (size_t i = 0; i < imgPaths.size(); ++i) {
+                            toolResult += L"\n[脚本图片 " + std::to_wstring(i + 1)
+                                + L"] 已作为参考嵌入下一轮请求（" + imgPaths[i] + L"）";
+                            pendingImages.push_back(imgPaths[i]);
+                        }
+                    } else {
+                        for (const auto& p : imgPaths) {
+                            toolResult += L"\n[脚本图片: " + p
+                                + L"]（当前模型不支持视觉，未读取图片内容，请基于路径/文件名推断）";
+                        }
+                    }
+                }
+
+                // 入历史按工具分层预算（只读台账略宽，lookup/执行摘要宜短）
+                const size_t kMaxToolResultChars = AiToolResultBudgetChars(tc.name);
                 if (toolResult.size() > kMaxToolResultChars) {
                     toolResult.resize(kMaxToolResultChars);
-                    toolResult += L"\n...(工具结果过长已截断；优化请用 optimizeScript/optimizeRecording，勿再请求全文)";
+                    toolResult += L"\n…(工具结果已截断)";
+                }
+
+                // 终态工具成功标记：脚本/录制已保存、定时任务已创建/更新。
+                // 放在截断之后捕获，保证返回文本与入历史的内容一致。
+                if (!terminalSucceeded && IsTerminalToolName(tc.name)
+                    && ToolResultIsSuccess(toolResult)) {
+                    terminalSucceeded = true;
+                    terminalResult = toolResult;
                 }
 
                 if (callbacks.onToolResult)
@@ -1127,6 +1510,66 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                 toolMsg.tool_call_id = tc.id;
                 messages_.push_back(toolMsg);
             }
+            if (!pendingImages.empty()) {
+                std::vector<ChatContentPart> imgParts;
+                std::wstring skipped;
+                if (AgentBuildImageParts(pendingImages, imgParts, skipped)) {
+                    ChatMessage imgMsg;
+                    imgMsg.role = L"user";
+                    imgMsg.keep_images = true;
+                    imgMsg.internal_nudge = true;
+                    ChatContentPart textPart;
+                    textPart.type = L"text";
+                    textPart.text = L"以上为脚本引用的图片，请结合工具结果理解脚本意图。"
+                        + (skipped.empty() ? L"" : (L"\n" + skipped));
+                    imgMsg.parts.push_back(std::move(textPart));
+                    for (auto& p : imgParts) imgMsg.parts.push_back(std::move(p));
+                    messages_.push_back(std::move(imgMsg));
+                    if (callbacks.onStatus) {
+                        callbacks.onStatus(L"已嵌入 " + std::to_wstring(pendingImages.size())
+                            + L" 张脚本图片供理解");
+                    }
+                } else if (callbacks.onStatus) {
+                    callbacks.onStatus(L"脚本图片读取失败：" + skipped);
+                }
+            }
+            // 同一工具 + 相同结果：连续 2 次，或全轮出现 2 次（隔轮绕圈），注入收束引导
+            std::wstring repeatName = lastToolName;
+            bool repeatedPairDetected = false;
+            for (const auto& kv : repeatedPairCount) {
+                if (kv.second >= 2) {
+                    repeatedPairDetected = true;
+                    const size_t sep = kv.first.find(L'\x01');
+                    repeatName = (sep != std::wstring::npos)
+                        ? kv.first.substr(0, sep) : kv.first;
+                    break;
+                }
+            }
+            if (repeatToolCount >= 2 || repeatedPairDetected) {
+                ChatMessage nag;
+                nag.role = L"user";
+                nag.internal_nudge = true;
+                nag.content = L"注意：你已多次用相同参数调用同一工具并得到相同结果（"
+                    + repeatName + L"）。这通常说明在绕圈：请基于已有信息继续完成任务，"
+                    L"必要时换用其它工具，"
+                    + L"或直接给出最终脚本/回答。";
+                messages_.push_back(std::move(nag));
+                if (callbacks.onStatus)
+                    callbacks.onStatus(L"检测到重复工具调用（" + repeatName
+                        + L"），已提示停止…");
+                repeatToolCount = 0;
+                lastToolName.clear();
+                lastToolResult.clear();
+                repeatedPairCount.clear();
+            }
+            // 终态工具成功：脚本/录制已保存 → 直接收尾，不再发起下一轮 API
+            if (terminalSucceeded) {
+                if (callbacks.onContentDelta)
+                    callbacks.onContentDelta(terminalResult);
+                else if (callbacks.onChunk)
+                    callbacks.onChunk(terminalResult);
+                return terminalResult;
+            }
             if (callbacks.stopToolLoopAfterTools && callbacks.stopToolLoopAfterTools())
                 return L"";
             continue;
@@ -1134,7 +1577,10 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
 
         std::wstring finalContent = assistantMsg.content;
         if (finalContent.empty() && !assistantMsg.reasoning_content.empty())
-            finalContent = assistantMsg.reasoning_content;
+            finalContent = (loop > 0
+                ? L"[提示] 模型思考后未继续生成或调用工具，本次未产出结果。"
+                    L"可重试，或换用非推理模型。\n\n"
+                : L"") + assistantMsg.reasoning_content;
         messages_.push_back(assistantMsg);
 
         if (callbacks.onReasoning && !assistantMsg.reasoning_content.empty())
@@ -1153,5 +1599,10 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
         return finalContent;
     }
 
-    return L"[错误] 工具调用超过最大循环次数（" + std::to_wstring(kMaxToolLoops) + L"）。";
+    const std::wstring limitNote = L"本轮工具调用达到上限（" + std::to_wstring(kMaxToolLoops)
+        + L" 轮），已停止继续调用以避免绕圈。前面已完成的工具结果与思考内容均已保留；"
+        L"你可以直接重试，或将需求拆得更具体后再发一次。";
+    if (callbacks.onStatus)
+        callbacks.onStatus(L"已达到工具调用上限，本轮结束");
+    return limitNote;
 }

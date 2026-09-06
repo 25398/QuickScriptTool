@@ -132,7 +132,7 @@ void OcrOverlay::CaptureScreen() {
     if (screenBitmap_) DeleteObject(screenBitmap_);
     screenBitmap_ = CreateCompatibleBitmap(screenDc, screenW_, screenH_);
     HGDIOBJ oldBmp = SelectObject(memDc, screenBitmap_);
-    BitBlt(memDc, 0, 0, screenW_, screenH_, screenDc, screenX_, screenY_, SRCCOPY);
+    BitBlt(memDc, 0, 0, screenW_, screenH_, screenDc, screenX_, screenY_, SRCCOPY | CAPTUREBLT);
     SelectObject(memDc, oldBmp);
     DeleteDC(memDc);
     ReleaseDC(nullptr, screenDc);
@@ -226,7 +226,21 @@ OcrOverlay::ActionResult OcrOverlay::Show(int searchX1, int searchY1, int search
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
-    if (cancelled_) actionResult_.cancelled = true;
+    if (mode_ == OcrOverlayMode::Test) {
+        // 测试叠层：Esc 关闭不算失败；把识别结果带回给 DesktopTools / Web
+        actionResult_.cancelled = false;
+        actionResult_.ocrOk = ocrSuccess_;
+        if (ocrSuccess_) {
+            OcrEngineOutput tmp;
+            tmp.success = true;
+            tmp.lines = lines_;
+            actionResult_.text = ConcatOcrLines(tmp);
+        } else if (!errorMessage_.empty()) {
+            actionResult_.text = errorMessage_;
+        }
+    } else if (cancelled_) {
+        actionResult_.cancelled = true;
+    }
     return actionResult_;
 }
 

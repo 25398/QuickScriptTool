@@ -7,19 +7,9 @@
 #include "crosshair_drag.h"
 #include "drawing.h"
 #include "process_utils.h"
+#include "window_mode/window_pick_result.h"
 
 namespace windowmode {
-
-struct WindowPickResult {
-    bool accepted = false;
-    std::wstring windowTitle;
-    std::wstring windowClassName;
-    std::wstring childWindowClassName;
-    std::wstring processPath;
-    std::wstring documentPath;
-    int pickX = 0;
-    int pickY = 0;
-};
 
 /// 指定窗口类弹窗（拖动准星拾取窗口信息，并回填程序路径）
 class WindowPickDialog {

@@ -259,7 +259,8 @@ bool MacroVirtualDesktop::OpenOrCreate() {
             desktopIndex_ = g_macroDesktopCache.index;
             LoadMacroDesktopId(desktopIndex_, desktopId_);
             ready_ = true;
-            DebugLog(L"[WindowMode] MacroVirtualDesktop reuse cached desktop");
+            WindowModeLogEventf(L"[窗口模式] 复用已缓存「%s」桌面 idx=%d（未新建）",
+                kMacroDesktopDisplayName, desktopIndex_);
             restoreUserView();
             return true;
         }
@@ -268,8 +269,8 @@ bool MacroVirtualDesktop::OpenOrCreate() {
 
     if (RefreshDesktopList()) {
         ready_ = true;
-        DebugLog((L"[WindowMode] MacroVirtualDesktop found 「" + std::wstring(kMacroDesktopDisplayName)
-            + L"」via " + vda.LoadedDllName()).c_str());
+        WindowModeLogEventf(L"[窗口模式] 找到已存在「%s」桌面 idx=%d（未新建，via %s）",
+            kMacroDesktopDisplayName, desktopIndex_, vda.LoadedDllName().c_str());
         restoreUserView();
         return true;
     }
@@ -297,8 +298,8 @@ bool MacroVirtualDesktop::OpenOrCreate() {
     SaveMacroDesktopCache(desktopIndex_, desktopId_);
     ready_ = true;
     restoreUserView();
-    DebugLog((L"[WindowMode] MacroVirtualDesktop created 「" + std::wstring(kMacroDesktopDisplayName)
-        + L"」via " + vda.LoadedDllName()).c_str());
+    WindowModeLogEventf(L"[窗口模式] 新建了「%s」虚拟桌面 idx=%d（via %s）——只有窗口模式运行才会走到这里",
+        kMacroDesktopDisplayName, desktopIndex_, vda.LoadedDllName().c_str());
     return true;
 }
 
@@ -311,13 +312,15 @@ void MacroVirtualDesktop::Close() {
     ready_ = false;
 }
 
-void MacroVirtualDesktop::WarmupAtProcessStart() {
+namespace {
+
+void WarmupAtProcessStartBody() {
     auto& vda = VirtualDesktopAccessor::Instance();
     std::wstring err;
     if (!vda.EnsureLoaded(err)) return;
     const int index = vda.FindDesktopIndexByName(kMacroDesktopDisplayName);
     if (index < 0) {
-        WindowModeLog(L"[窗口模式] 预热：未找到「鼠标宏」桌面（创建推迟到绑窗）");
+        WindowModeLogEvent(L"[窗口模式] 预热：未找到「鼠标宏」桌面，本次进程不创建");
         return;
     }
     GUID id{};
@@ -327,7 +330,23 @@ void MacroVirtualDesktop::WarmupAtProcessStart() {
     if (!GuidIsEmpty(id)) {
         SaveMacroDesktopCache(index, id);
     }
-    WindowModeLog(L"[窗口模式] 预热：已缓存「鼠标宏」桌面（CreateDesktop+HoldView 未跑）");
+    WindowModeLogEventf(L"[窗口模式] 预热：检测到已存在「鼠标宏」桌面 idx=%d（上次窗口模式遗留；本次未创建）",
+        index);
+}
+
+void WarmupAtProcessStartSeh() {
+    __try {
+        WarmupAtProcessStartBody();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // 禁止在 __except 里构造 std::wstring（会触发 C2712）
+        OutputDebugStringW(L"[QST] VDA Warmup SEH swallowed\n");
+    }
+}
+
+}  // namespace
+
+void MacroVirtualDesktop::WarmupAtProcessStart() {
+    WarmupAtProcessStartSeh();
 }
 
 bool MacroVirtualDesktop::IsValid() const {
@@ -344,6 +363,11 @@ bool MacroVirtualDesktop::MoveWindowToMacroDesktop(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) {
         lastError_ = L"无效窗口句柄";
         return false;
+    }
+
+    if (LooksLikeFullscreenGameTarget(hwnd)) {
+        WindowModeLog(L"[窗口模式] 全屏游戏：不搬到「鼠标宏」桌面（避免拆 DXGI 独占）");
+        return true;
     }
 
     auto& vda = VirtualDesktopAccessor::Instance();

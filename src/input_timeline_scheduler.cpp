@@ -11,7 +11,14 @@ namespace {
 // FPS 相对包常见 ~8ms：整段自旋，避免 waitable timer 唤醒抖动导致每次回放相位不同。
 constexpr uint64_t kSpinRemainUs = 12000;
 constexpr uint64_t kTightSpinUs = 1500;
-constexpr uint64_t kMaxTimerSliceUs = 500;
+// 收尾接近 deadline 时用短切片；长等待若整段 500us 切片，4 秒会进内核近万次，自己把时间轴卡变形。
+constexpr uint64_t kNearTimerSliceUs = 500;
+constexpr uint64_t kLongTimerSliceUs = 10000;
+constexpr uint64_t kLongWaitRemainUs = 50000;
+// 小于此值：调度抖动，追赶（保持相对包相位）。
+// 大于此值：真实卡顿。若仍追赶，后面所有 2~8ms 等待会连发，键盘按住被压短。
+constexpr uint64_t kRebaseLateUs = 8000;
+constexpr uint64_t kRebaseKeepLateUs = 500;
 }
 
 PrecisionInputTimeline::PrecisionInputTimeline() {
@@ -43,16 +50,29 @@ int64_t PrecisionInputTimeline::UsToQpcDelta(uint64_t us) const {
         (static_cast<long double>(us) * frequency_.QuadPart) / 1000000.0L);
 }
 
-void PrecisionInputTimeline::Reset() {
+void PrecisionInputTimeline::Reset(size_t waitHint) {
     originQpc_ = NowQpc();
     elapsedUs_ = 0;
     lastLatenessUs_ = 0;
+    rebaseCount_ = 0;
     latenessUs_.clear();
+    const size_t want = (waitHint > 8192) ? waitHint : 8192;
+    if (latenessUs_.capacity() < want) latenessUs_.reserve(want);
 }
 
 void PrecisionInputTimeline::RecordLateness(int64_t deadlineQpc) {
     lastLatenessUs_ = QpcDeltaToUs(NowQpc() - deadlineQpc);
     latenessUs_.push_back(lastLatenessUs_);
+}
+
+void PrecisionInputTimeline::RebaseIfVeryLate() {
+    if (lastLatenessUs_ <= kRebaseLateUs) return;
+    const uint64_t absorb = lastLatenessUs_ - kRebaseKeepLateUs;
+    const int64_t shift = UsToQpcDelta(absorb);
+    if (shift > 0) {
+        originQpc_ += shift;
+        ++rebaseCount_;
+    }
 }
 
 bool PrecisionInputTimeline::WaitUntilDeadlineQpc(
@@ -64,8 +84,10 @@ bool PrecisionInputTimeline::WaitUntilDeadlineQpc(
         const uint64_t remainingUs = QpcDeltaToUs(deadlineQpc - now);
 
         if (timer_ && remainingUs > kSpinRemainUs) {
+            const uint64_t maxSlice = remainingUs > kLongWaitRemainUs
+                ? kLongTimerSliceUs : kNearTimerSliceUs;
             const uint64_t sliceUs = std::min<uint64_t>(
-                remainingUs - (kSpinRemainUs / 2), kMaxTimerSliceUs);
+                remainingUs - (kSpinRemainUs / 2), maxSlice);
             LARGE_INTEGER due{};
             due.QuadPart = -static_cast<LONGLONG>(sliceUs * 10);
             if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
@@ -94,6 +116,8 @@ bool PrecisionInputTimeline::WaitUntilDeadlineQpc(
             }
             YieldProcessor();
         }
+        // 12ms 自旋不得占死核：否则 UI/LL 钩子饿死，停止热键失灵、键鼠假死。
+        SwitchToThread();
     }
     RecordLateness(deadlineQpc);
     return true;
@@ -104,7 +128,9 @@ bool PrecisionInputTimeline::WaitUntilElapsedUs(
     if (originQpc_ == 0) Reset();
     if (targetElapsedUs > elapsedUs_) elapsedUs_ = targetElapsedUs;
     const int64_t deadline = originQpc_ + UsToQpcDelta(elapsedUs_);
-    return WaitUntilDeadlineQpc(deadline, cancelled);
+    const bool ok = WaitUntilDeadlineQpc(deadline, cancelled);
+    if (ok) RebaseIfVeryLate();
+    return ok;
 }
 
 bool PrecisionInputTimeline::WaitDeltaUs(
@@ -114,13 +140,15 @@ bool PrecisionInputTimeline::WaitDeltaUs(
     elapsedUs_ += deltaUs;
     const int64_t deadline = originQpc_ + UsToQpcDelta(elapsedUs_);
     const int64_t now = NowQpc();
-    if (now < deadline)
-        return WaitUntilDeadlineQpc(deadline, cancelled);
+    if (now < deadline) {
+        const bool ok = WaitUntilDeadlineQpc(deadline, cancelled);
+        if (ok) RebaseIfVeryLate();
+        return ok;
+    }
 
-    // 已过点：立刻追赶，不拉伸原点。
-    // 拉伸会让后续键鼠相对「开局时刻」永久偏相，FPS 开环下比偶发连发更伤还原。
     lastLatenessUs_ = QpcDeltaToUs(now - deadline);
     latenessUs_.push_back(lastLatenessUs_);
+    RebaseIfVeryLate();
     return !cancelled();
 }
 
@@ -143,6 +171,7 @@ bool PrecisionInputTimeline::WaitDeltaSeconds(
 InputTimelineStats PrecisionInputTimeline::Stats() const {
     InputTimelineStats out{};
     out.eventCount = latenessUs_.size();
+    out.rebaseCount = rebaseCount_;
     if (latenessUs_.empty()) return out;
     std::vector<uint64_t> sorted = latenessUs_;
     std::sort(sorted.begin(), sorted.end());

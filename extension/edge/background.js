@@ -1,5 +1,5 @@
-/* 鼠大侠网页键鼠桥 — MV3 service worker（WebSocket 直接连本机桥） */
-const BRIDGE_VERSION = "1.1.43";
+/* 键鼠工坊网页键鼠桥 — MV3 service worker（WebSocket 直接连本机桥） */
+const BRIDGE_VERSION = "1.0.0";
 const PORT_LO = 19228;
 const PORT_HI = 19240;
 const RECONNECT_MS = 1500;
@@ -2474,7 +2474,7 @@ async function tryDiscoverAndConnect() {
         /* next */
       }
     }
-    setStatus("waiting", "未发现鼠大侠桥（请先运行鼠大侠并启动窗口模式）");
+    setStatus("waiting", "未发现键鼠工坊桥（请先运行键鼠工坊并启动窗口模式）");
   } finally {
     discoverBusy = false;
   }

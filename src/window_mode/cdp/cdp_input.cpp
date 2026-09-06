@@ -6,6 +6,7 @@
 #include "window_mode/window_mode_log.h"
 #include "window_mode/window_mode_types.h"
 #include "window_mode/window_target.h"
+#include "utils.h"
 
 #include <UIAutomation.h>
 #include <dwmapi.h>
@@ -209,16 +210,8 @@ std::vector<CdpTarget> ParseTargetList(const std::string& json) {
     while (i < json.size()) {
         const size_t start = json.find('{', i);
         if (start == std::string::npos) break;
-        int depth = 0;
-        size_t end = start;
-        for (; end < json.size(); ++end) {
-            if (json[end] == '{') ++depth;
-            else if (json[end] == '}') {
-                --depth;
-                if (depth == 0) break;
-            }
-        }
-        if (end >= json.size()) break;
+        const size_t end = FindMatchingJsonBrace(json, start);
+        if (end == std::string::npos) break;
         const std::string obj = json.substr(start, end - start + 1);
         CdpTarget t;
         t.type = ExtractJsonStringValue(obj, "type");
@@ -781,7 +774,7 @@ bool TryHttpListOnPorts(int preferredPort, std::string& listBody, int& usedPort,
 }  // namespace
 
 bool IsChromiumBrowserExecutable(const std::wstring& imagePath) {
-    return LooksLikeEdgeProcess(imagePath) || LooksLikeChromeProcess(imagePath);
+    return LooksLikeChromiumBrowserExecutable(imagePath);
 }
 
 std::wstring QueryHwndProcessImagePath(HWND hwnd) {

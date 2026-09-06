@@ -127,7 +127,7 @@ async function tryDiscoverAndConnect() {
         /* next port */
       }
     }
-    setStatus("waiting", "未发现鼠大侠桥（请先运行鼠大侠并启动窗口模式）");
+    setStatus("waiting", "未发现键鼠工坊桥（请先运行键鼠工坊并启动窗口模式）");
   } finally {
     discoverBusy = false;
   }

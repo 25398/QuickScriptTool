@@ -23,7 +23,7 @@ struct ScriptFileData {
     CoordMeta coordMeta;
     bool coordsNormalized = false;  // JSON 中坐标是否为归一化格式
     double breakoutTimeSeconds = 0; // 默认模式脱离时间（秒），0 表示禁用
-    int recordingCaptureMode = -1;  // -1=旧文件/未知，0=自动，1=桌面绝对，2=FPS相对
+    int recordingCaptureMode = -1;  // -1=旧文件/未知，0=自动，1=绝对坐标，2=相对坐标，3=图片定位
     // 0/缺省=旧文件；1=微秒轴但仍可把前延迟挂在动作上；2=时间只在显式 Wait（及重复间隔）
     int inputTimingVersion = 0;
     std::vector<ScriptAction> actions;

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>宏调试信息输出窗口</title>
+<style>
+:root{
+  --navy-950:#061018; --navy-900:#0b1624; --navy-800:#122338; --navy-700:#1a3250;
+  --ice-400:#38bdf8; --mint-400:#2dd4bf; --mint-300:#5eead4; --aurora-b:#6366f1;
+  --frost:#fcfeff; --sky-100:#e8f4fc; --line:#c9d7e6; --rose:#fb7185;
+  --text:#0f1c2c; --mono:ui-monospace,Consolas,"Cascadia Mono",monospace;
+  --font:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{
+  height:100%;overflow:hidden;background:var(--sky-100);font-family:var(--font);color:var(--text);
+  -webkit-user-select:none;user-select:none;
+}
+body{display:flex;flex-direction:column;background:var(--frost)}
+.title{
+  height:40px;flex-shrink:0;display:flex;align-items:center;gap:8px;
+  padding:0 0 0 14px;
+  background:linear-gradient(90deg,var(--navy-950),var(--navy-800));
+  color:#e8f4fc;font-size:13px;font-weight:700;
+  user-select:none;cursor:default;position:relative;
+}
+.title::after{
+  content:"";position:absolute;left:0;right:0;bottom:0;height:2px;
+  background:linear-gradient(90deg,var(--ice-400),var(--mint-400),var(--aurora-b));
+}
+.title>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.win-btns{display:flex;height:100%;margin-left:auto}
+.win-btn{
+  width:42px;height:100%;display:grid;place-items:center;color:#a8b6c2;font-size:14px;cursor:pointer;
+}
+.win-btn:hover{background:rgba(255,255,255,.1);color:#fff}
+.win-btn.close:hover{background:var(--rose);color:#fff}
+.win-btn .win-ico{width:16px;height:16px;display:block;flex-shrink:0}
+.win-btn.close{font-size:0!important;line-height:0;color:#a8b6c2}
+.win-btn.close:hover{color:#fff}
+.win-btn.close::before{
+  content:"";width:16px;height:16px;display:block;background-color:currentColor;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' d='M7 7l10 10M17 7L7 17'/%3E%3C/svg%3E");
+  -webkit-mask-size:contain;-webkit-mask-repeat:no-repeat;-webkit-mask-position:center;
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' d='M7 7l10 10M17 7L7 17'/%3E%3C/svg%3E");
+  mask-size:contain;mask-repeat:no-repeat;mask-position:center;
+}
+.win-btn.close:has(.win-ico)::before{display:none}
+/* 置顶：彩色 📌；未置顶：同形灰度，提亮以免淹没在深色标题栏 */
+.win-btn.pin{font-size:15px;line-height:1;filter:grayscale(1) brightness(2.4) contrast(1.15);opacity:1}
+.win-btn.pin.on{filter:none;opacity:1}
+.win-btn.pin:hover{filter:grayscale(1) brightness(2.7) contrast(1.15)}
+.win-btn.pin.on:hover{filter:brightness(1.08)}
+.body{flex:1;min-height:0;padding:10px;background:var(--sky-100)}
+.log{
+  height:100%;width:100%;overflow:auto;margin:0;padding:12px;
+  border-radius:8px;border:1px solid var(--line);
+  background:var(--navy-950);color:#bae6fd;font-family:var(--mono);font-size:12px;line-height:1.65;
+  white-space:pre-wrap;word-break:break-word;
+  -webkit-user-select:text;user-select:text;
+}
+body.minimized .body{display:none}
+body.minimized{height:auto}
+</style>
+</head>
+<body>
+  <div class="title" id="titleBar">
+    <span>宏调试信息输出窗口</span>
+    <div class="win-btns">
+      <div class="win-btn pin on" id="btnPin">📌</div>
+      <div class="win-btn" id="btnMin" title="最小化" aria-label="最小化">
+        <svg class="win-ico" viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M6.5 12h11"/>
+        </svg>
+      </div>
+      <div class="win-btn close" id="btnClose" title="关闭" aria-label="关闭"></div>
+    </div>
+  </div>
+  <div class="body"><pre class="log" id="log"></pre></div>
+<script>
+/* 等样式首帧合成后再揭窗，避免宿主先露出半张 WebView 脏矩形 */
+(function () {
+  function ping() {
+    try {
+      var s = JSON.stringify({ type: "debugWindow.contentReady" });
+      if (window.chrome && chrome.webview) chrome.webview.postMessage(s);
+    } catch (e) {}
+  }
+  requestAnimationFrame(function () {
+    requestAnimationFrame(ping);
+  });
+})();
+</script>
+<script>
+(function () {
+  const LOG_MAX = 4000;
+  let pinned = true;
+  const logEl = document.getElementById("log");
+  const pinBtn = document.getElementById("btnPin");
+
+  document.addEventListener("contextmenu", (e) => e.preventDefault(), true);
+
+  function post(obj) {
+    const s = typeof obj === "string" ? obj : JSON.stringify(obj);
+    if (window.chrome && chrome.webview) chrome.webview.postMessage(s);
+  }
+
+  function applyThemeVars(vars) {
+    if (!vars || typeof vars !== "object") return;
+    const root = document.documentElement;
+    Object.keys(vars).forEach((k) => {
+      if (!k || vars[k] == null) return;
+      root.style.setProperty(k, String(vars[k]));
+    });
+  }
+
+  function appendLines(lines) {
+    if (!logEl || !lines || !lines.length) return;
+    const chunk = lines.map((t) => String(t || "")).join("\n");
+    if (!chunk) return;
+    logEl.textContent += (logEl.textContent ? "\n" : "") + chunk;
+    // 行数计数：仅超预算时整段裁剪，避免每条消息全量 split/join（O(n²)）
+    logEl._qstLineCount = (logEl._qstLineCount | 0) + lines.length;
+    if (logEl._qstLineCount > LOG_MAX + 200) {
+      const parts = logEl.textContent.split("\n");
+      logEl.textContent = parts.slice(Math.max(0, parts.length - LOG_MAX)).join("\n");
+      logEl._qstLineCount = LOG_MAX;
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function onMsg(msg) {
+    if (!msg || !msg.type) return;
+    if (msg.type === "themeCss.apply") {
+      applyThemeVars(msg.vars || {});
+      return;
+    }
+    if (msg.type === "debugWindow.clear") {
+      if (logEl) {
+        logEl.textContent = "";
+        logEl._qstLineCount = 0;
+      }
+      return;
+    }
+    if (msg.type === "debugWindow.append") {
+      appendLines([msg.text || ""]);
+      return;
+    }
+    if (msg.type === "debugWindow.appendBatch") {
+      appendLines(Array.isArray(msg.lines) ? msg.lines : []);
+      return;
+    }
+    if (msg.type === "debugWindow.show") {
+      return;
+    }
+    if (msg.type === "debugWindowSetTopmost.result") {
+      pinned = !!(msg.topmost | 0);
+      pinBtn?.classList.toggle("on", pinned);
+      return;
+    }
+  }
+
+  if (window.chrome && chrome.webview && chrome.webview.addEventListener) {
+    chrome.webview.addEventListener("message", (ev) => {
+      let data = ev.data;
+      if (typeof data === "string") {
+        try { data = JSON.parse(data); } catch (_) { return; }
+      }
+      onMsg(data);
+    });
+  }
+
+  document.getElementById("titleBar")?.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest(".win-btn")) return;
+    post({ type: "debugWindow.drag" });
+  });
+  // 按钮勿冒泡到标题栏拖拽
+  document.querySelectorAll(".win-btn").forEach((btn) => {
+    btn.addEventListener("mousedown", (e) => e.stopPropagation());
+  });
+  pinBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const next = !pinned;
+    // 先发壳再等回传；避免仅改 UI 却 HWND 未置顶
+    post({ type: "debugWindowSetTopmost", topmost: next ? 1 : 0 });
+  });
+  document.getElementById("btnMin")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    post({ type: "debugWindow.minimize" });
+  });
+  document.getElementById("btnClose")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    post({ type: "debugWindowClosed" });
+  });
+
+  post({ type: "debugWindow.ready" });
+})();
+</script>
+</body>
+</html>

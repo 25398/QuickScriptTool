@@ -3,20 +3,50 @@
 #include "app_theme.h"
 #include "utils.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 
 namespace {
 
+bool WriteUtf8File(const std::wstring& path, const std::string& utf8) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const BOOL ok = WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    CloseHandle(h);
+    return ok && written == utf8.size();
+}
+
 bool ParseBoolField(const std::wstring& src, const std::wstring& key, bool fallback) {
+    // 只认 key 冒号后的下一个 JSON token（true/false），避免误匹配其它字段字面量。
     const auto pos = src.find(L"\"" + key + L"\"");
     if (pos == std::wstring::npos) return fallback;
     const auto colon = src.find(L':', pos);
     if (colon == std::wstring::npos) return fallback;
-    const auto valPos = src.find(L"true", colon);
-    if (valPos != std::wstring::npos && valPos < colon + 12) return true;
-    const auto falsePos = src.find(L"false", colon);
-    if (falsePos != std::wstring::npos && falsePos < colon + 12) return false;
+    size_t i = colon + 1;
+    while (i < src.size() && (src[i] == L' ' || src[i] == L'\t' || src[i] == L'\r' || src[i] == L'\n')) {
+        ++i;
+    }
+    if (i + 4 <= src.size()
+        && src.compare(i, 4, L"true") == 0
+        && (i + 4 >= src.size()
+            || src[i + 4] == L',' || src[i + 4] == L'}' || src[i + 4] == L']'
+            || src[i + 4] == L' ' || src[i + 4] == L'\t'
+            || src[i + 4] == L'\r' || src[i + 4] == L'\n')) {
+        return true;
+    }
+    if (i + 5 <= src.size()
+        && src.compare(i, 5, L"false") == 0
+        && (i + 5 >= src.size()
+            || src[i + 5] == L',' || src[i + 5] == L'}' || src[i + 5] == L']'
+            || src[i + 5] == L' ' || src[i + 5] == L'\t'
+            || src[i + 5] == L'\r' || src[i + 5] == L'\n')) {
+        return false;
+    }
     return fallback;
 }
 
@@ -45,15 +75,9 @@ std::wstring ExtractObject(const std::wstring& src, const std::wstring& key) {
     if (pos == std::wstring::npos) return {};
     const auto brace = src.find(L'{', pos);
     if (brace == std::wstring::npos) return {};
-    int depth = 0;
-    for (size_t i = brace; i < src.size(); ++i) {
-        if (src[i] == L'{') ++depth;
-        else if (src[i] == L'}') {
-            --depth;
-            if (depth == 0) return src.substr(brace, i - brace + 1);
-        }
-    }
-    return {};
+    const auto braceEnd = FindMatchingJsonBrace(src, brace);
+    if (braceEnd == std::wstring::npos) return {};
+    return src.substr(brace, braceEnd - brace + 1);
 }
 
 void LoadClickSettings(const std::wstring& obj, quickscript::ClickTabSettings& out) {
@@ -85,6 +109,9 @@ void LoadPlaybackSettings(const std::wstring& obj, quickscript::PlaybackTabSetti
         out.recordingClickCaptureHalfSize);
     if (out.recordingClickCaptureHalfSize < 16) out.recordingClickCaptureHalfSize = 16;
     if (out.recordingClickCaptureHalfSize > 120) out.recordingClickCaptureHalfSize = 120;
+    out.enablePlaybackSpeed = ParseBoolField(obj, L"enablePlaybackSpeed", out.enablePlaybackSpeed);
+    out.playbackSpeed = ParseDoubleField(obj, L"playbackSpeed", out.playbackSpeed);
+    out.playbackSpeed = quickscript::ClampPlaybackSpeed(out.playbackSpeed);
     out.enableHidDriverSimulation = ParseBoolField(obj, L"enableHidDriverSimulation",
         out.enableHidDriverSimulation);
     if (obj.find(L"\"foregroundInputBackend\"") != std::wstring::npos) {
@@ -99,6 +126,12 @@ void LoadPlaybackSettings(const std::wstring& obj, quickscript::PlaybackTabSetti
     // Keep legacy bool in sync for Agent / old UI paths
     out.enableHidDriverSimulation =
         out.foregroundInputBackend != quickscript::ForegroundInputBackend::Software;
+    out.scheduledTaskConflictPolicy = ParseIntField(obj, L"scheduledTaskConflictPolicy",
+        out.scheduledTaskConflictPolicy);
+    if (out.scheduledTaskConflictPolicy < 0 || out.scheduledTaskConflictPolicy > 1)
+        out.scheduledTaskConflictPolicy = 0;
+    out.scheduledTaskAutoResume = ParseBoolField(obj, L"scheduledTaskAutoResume",
+        out.scheduledTaskAutoResume);
 }
 
 void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& out) {
@@ -117,6 +150,7 @@ void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& o
     out.customAccentColor = ParseIntField(obj, L"customAccentColor", out.customAccentColor);
     out.customMainColor = std::clamp(out.customMainColor, 0, 0xFFFFFF);
     out.customAccentColor = std::clamp(out.customAccentColor, 0, 0xFFFFFF);
+    out.preferDirect2D = ParseBoolField(obj, L"preferDirect2D", out.preferDirect2D);
 }
 
 void LoadWindowModeSettings(const std::wstring& obj, quickscript::WindowModeSettings& out) {
@@ -125,6 +159,11 @@ void LoadWindowModeSettings(const std::wstring& obj, quickscript::WindowModeSett
     out.blockRunWhenUnhealthy = ParseBoolField(obj, L"blockRunWhenUnhealthy", out.blockRunWhenUnhealthy);
     out.allowForegroundInputFallback = ParseBoolField(obj, L"allowForegroundInputFallback",
         out.allowForegroundInputFallback);
+    out.enableFakeFocusInjection = ParseBoolField(obj, L"enableFakeFocusInjection",
+        out.enableFakeFocusInjection);
+    out.injectionTechnique = ParseIntField(obj, L"injectionTechnique", out.injectionTechnique);
+    out.injectionTechnique = std::clamp(out.injectionTechnique, 0, 10);
+    out.hideInjectedModule = ParseBoolField(obj, L"hideInjectedModule", out.hideInjectedModule);
     out.previewRefreshMs = std::clamp(out.previewRefreshMs, 200, 5000);
 }
 
@@ -149,29 +188,37 @@ void LoadAiApiSettings(const std::wstring& obj, quickscript::AiApiSettings& out)
             ++pos;
         }
         if (pos >= obj.size() || obj[pos] == L']') break;
-        if (obj[pos] != L'{') { ++pos; continue; }
-        int depth = 0;
-        const size_t start = pos;
-        for (; pos < obj.size(); ++pos) {
-            if (obj[pos] == L'{') ++depth;
-            else if (obj[pos] == L'}') {
-                --depth;
-                if (depth == 0) {
-                    const std::wstring block = obj.substr(start, pos - start + 1);
-                    quickscript::AiModelProfile profile{};
-                    profile.apiUrl = ExtractString(block, L"apiUrl");
-                    if (profile.apiUrl.empty()) profile.apiUrl = L"https://api.openai.com/v1/chat/completions";
-                    profile.apiKey = ExtractString(block, L"apiKey");
-                    profile.modelName = ExtractString(block, L"modelName");
-                    if (profile.modelName.empty()) continue;
-                    profile.temperature = ParseDoubleField(block, L"temperature", profile.temperature);
-                    profile.maxTokens = ParseIntField(block, L"maxTokens", profile.maxTokens);
-                    out.savedModels.push_back(std::move(profile));
-                    ++pos;
-                    break;
+        if (obj[pos] != L'{') {
+            if (obj[pos] == L'"') {
+                // 跳过字符串字面量，避免把键名里的 { 当成对象起点
+                bool esc = false;
+                ++pos;
+                for (; pos < obj.size(); ++pos) {
+                    if (esc) { esc = false; continue; }
+                    if (obj[pos] == L'\\') { esc = true; continue; }
+                    if (obj[pos] == L'"') { ++pos; break; }
                 }
+            } else {
+                ++pos;
             }
+            continue;
         }
+        const auto objEnd = FindMatchingJsonBrace(obj, pos);
+        if (objEnd == std::wstring::npos) break;
+        const std::wstring block = obj.substr(pos, objEnd - pos + 1);
+        quickscript::AiModelProfile profile{};
+        profile.apiUrl = ExtractString(block, L"apiUrl");
+        if (profile.apiUrl.empty()) profile.apiUrl = L"https://api.openai.com/v1/chat/completions";
+        profile.apiKey = ExtractString(block, L"apiKey");
+        profile.modelName = ExtractString(block, L"modelName");
+        if (profile.modelName.empty()) {
+            pos = objEnd + 1;
+            continue;
+        }
+        profile.temperature = ParseDoubleField(block, L"temperature", profile.temperature);
+        profile.maxTokens = ParseIntField(block, L"maxTokens", profile.maxTokens);
+        out.savedModels.push_back(std::move(profile));
+        pos = objEnd + 1;
     }
 }
 
@@ -180,18 +227,29 @@ void LoadHomeState(const std::wstring& obj, quickscript::HomeState& out) {
     out.clickerButton = ParseIntField(obj, L"clickerButton", out.clickerButton);
     out.clickerIntervalMode = ParseIntField(obj, L"clickerIntervalMode", out.clickerIntervalMode);
     out.clickerCustomInterval = ParseDoubleField(obj, L"clickerCustomInterval", out.clickerCustomInterval);
-    out.recorderCaptureScope = ParseIntField(obj, L"recorderCaptureScope", out.recorderCaptureScope);
+    out.recorderCaptureScope = 1; // 固定全局；忽略旧配置中的窗口范围
     out.recorderInputMode = std::clamp(
-        ParseIntField(obj, L"recorderInputMode", out.recorderInputMode), 0, 2);
+        ParseIntField(obj, L"recorderInputMode", out.recorderInputMode), 0, 3);
+    out.recorderWindowMode = ParseIntField(obj, L"recorderWindowMode", 0) != 0 ? 1 : 0;
     out.selectedScriptPath = ExtractString(obj, L"selectedScriptPath");
     out.selectedRecordingPath = ExtractString(obj, L"selectedRecordingPath");
     out.clickerScrollOffset = ParseIntField(obj, L"clickerScrollOffset", out.clickerScrollOffset);
     out.recorderScrollOffset = ParseIntField(obj, L"recorderScrollOffset", out.recorderScrollOffset);
     out.macroScrollOffset = ParseIntField(obj, L"macroScrollOffset", out.macroScrollOffset);
     out.scriptCustomScrollOffset = ParseIntField(obj, L"scriptCustomScrollOffset", out.scriptCustomScrollOffset);
+    out.globalHotkeyText = ExtractString(obj, L"globalHotkeyText");
+    if (out.globalHotkeyText.empty()) out.globalHotkeyText = L"F8";
+    out.globalHotkeyVk = ParseIntField(obj, L"globalHotkeyVk", out.globalHotkeyVk);
+    if (out.globalHotkeyVk == 0) out.globalHotkeyVk = 0x77;
+    out.globalHotkeyModifiers = ParseIntField(obj, L"globalHotkeyModifiers", out.globalHotkeyModifiers);
+    out.globalHotkeyHold = ParseBoolField(obj, L"globalHotkeyHold", out.globalHotkeyHold);
+    {
+        const std::wstring mode = ExtractString(obj, L"uiMode");
+        if (!mode.empty()) out.uiMode = quickscript::NormalizeHomeUiMode(mode);
+    }
 }
 
-void WriteClickSettings(std::wofstream& file, const quickscript::ClickTabSettings& s) {
+void WriteClickSettings(std::wostream& file, const quickscript::ClickTabSettings& s) {
     file << L"    \"enableRandomInterval\": " << (s.enableRandomInterval ? L"true" : L"false") << L",\n";
     file << L"    \"randomIntervalMaxSeconds\": " << s.randomIntervalMaxSeconds << L",\n";
     file << L"    \"enablePressReleaseInterval\": " << (s.enablePressReleaseInterval ? L"true" : L"false") << L",\n";
@@ -206,7 +264,7 @@ void WriteClickSettings(std::wofstream& file, const quickscript::ClickTabSetting
     file << L"    \"clickCountLimit\": " << s.clickCountLimit << L"\n";
 }
 
-void WritePlaybackSettings(std::wofstream& file, const quickscript::PlaybackTabSettings& s) {
+void WritePlaybackSettings(std::wostream& file, const quickscript::PlaybackTabSettings& s) {
     file << L"    \"enablePlaybackCount\": " << (s.enablePlaybackCount ? L"true" : L"false") << L",\n";
     file << L"    \"playbackCount\": " << s.playbackCount << L",\n";
     file << L"    \"enablePlaybackInterval\": " << (s.enablePlaybackInterval ? L"true" : L"false") << L",\n";
@@ -216,13 +274,17 @@ void WritePlaybackSettings(std::wofstream& file, const quickscript::PlaybackTabS
     file << L"    \"autoOutputKeyFunctionDebug\": " << (s.autoOutputKeyFunctionDebug ? L"true" : L"false") << L",\n";
     file << L"    \"recordingClickCaptureEnabled\": " << (s.recordingClickCaptureEnabled ? L"true" : L"false") << L",\n";
     file << L"    \"recordingClickCaptureHalfSize\": " << s.recordingClickCaptureHalfSize << L",\n";
+    file << L"    \"enablePlaybackSpeed\": " << (s.enablePlaybackSpeed ? L"true" : L"false") << L",\n";
+    file << L"    \"playbackSpeed\": " << s.playbackSpeed << L",\n";
     file << L"    \"foregroundInputBackend\": " << static_cast<int>(s.foregroundInputBackend) << L",\n";
     file << L"    \"enableHidDriverSimulation\": "
         << ((s.foregroundInputBackend != quickscript::ForegroundInputBackend::Software) ? L"true" : L"false")
-        << L"\n";
+        << L",\n";
+    file << L"    \"scheduledTaskConflictPolicy\": " << s.scheduledTaskConflictPolicy << L",\n";
+    file << L"    \"scheduledTaskAutoResume\": " << (s.scheduledTaskAutoResume ? L"true" : L"false") << L"\n";
 }
 
-void WriteOtherSettings(std::wofstream& file, const quickscript::OtherTabSettings& s) {
+void WriteOtherSettings(std::wostream& file, const quickscript::OtherTabSettings& s) {
     file << L"    \"autoHideMainWindow\": " << (s.autoHideMainWindow ? L"true" : L"false") << L",\n";
     file << L"    \"playSoundOnStart\": " << (s.playSoundOnStart ? L"true" : L"false") << L",\n";
     file << L"    \"hideBottomRightTip\": " << (s.hideBottomRightTip ? L"true" : L"false") << L",\n";
@@ -233,18 +295,24 @@ void WriteOtherSettings(std::wofstream& file, const quickscript::OtherTabSetting
     file << L"    \"themeId\": " << s.themeId << L",\n";
     file << L"    \"useCustomTheme\": " << (s.useCustomTheme ? L"true" : L"false") << L",\n";
     file << L"    \"customMainColor\": " << s.customMainColor << L",\n";
-    file << L"    \"customAccentColor\": " << s.customAccentColor << L"\n";
+    file << L"    \"customAccentColor\": " << s.customAccentColor << L",\n";
+    file << L"    \"preferDirect2D\": " << (s.preferDirect2D ? L"true" : L"false") << L"\n";
 }
 
-void WriteWindowModeSettings(std::wofstream& file, const quickscript::WindowModeSettings& s) {
+void WriteWindowModeSettings(std::wostream& file, const quickscript::WindowModeSettings& s) {
     file << L"    \"showPreviewThumbnail\": " << (s.showPreviewThumbnail ? L"true" : L"false") << L",\n";
     file << L"    \"previewRefreshMs\": " << s.previewRefreshMs << L",\n";
     file << L"    \"blockRunWhenUnhealthy\": " << (s.blockRunWhenUnhealthy ? L"true" : L"false") << L",\n";
     file << L"    \"allowForegroundInputFallback\": "
-        << (s.allowForegroundInputFallback ? L"true" : L"false") << L"\n";
+        << (s.allowForegroundInputFallback ? L"true" : L"false") << L",\n";
+    file << L"    \"enableFakeFocusInjection\": "
+        << (s.enableFakeFocusInjection ? L"true" : L"false") << L",\n";
+    file << L"    \"injectionTechnique\": " << s.injectionTechnique << L",\n";
+    file << L"    \"hideInjectedModule\": "
+        << (s.hideInjectedModule ? L"true" : L"false") << L"\n";
 }
 
-void WriteAiApiSettings(std::wofstream& file, const quickscript::AiApiSettings& s) {
+void WriteAiApiSettings(std::wostream& file, const quickscript::AiApiSettings& s) {
     file << L"    \"enabled\": " << (s.enabled ? L"true" : L"false") << L",\n";
     file << L"    \"apiUrl\": \"" << EscapeJson(s.apiUrl) << L"\",\n";
     file << L"    \"apiKey\": \"" << EscapeJson(s.apiKey) << L"\",\n";
@@ -267,19 +335,25 @@ void WriteAiApiSettings(std::wofstream& file, const quickscript::AiApiSettings& 
     file << L"    ]\n";
 }
 
-void WriteHomeState(std::wofstream& file, const quickscript::HomeState& s) {
+void WriteHomeState(std::wostream& file, const quickscript::HomeState& s) {
     file << L"    \"activeTab\": " << s.activeTab << L",\n";
     file << L"    \"clickerButton\": " << s.clickerButton << L",\n";
     file << L"    \"clickerIntervalMode\": " << s.clickerIntervalMode << L",\n";
     file << L"    \"clickerCustomInterval\": " << s.clickerCustomInterval << L",\n";
     file << L"    \"recorderCaptureScope\": " << s.recorderCaptureScope << L",\n";
     file << L"    \"recorderInputMode\": " << s.recorderInputMode << L",\n";
+    file << L"    \"recorderWindowMode\": " << (s.recorderWindowMode ? 1 : 0) << L",\n";
     file << L"    \"selectedScriptPath\": \"" << EscapeJson(s.selectedScriptPath) << L"\",\n";
     file << L"    \"selectedRecordingPath\": \"" << EscapeJson(s.selectedRecordingPath) << L"\",\n";
     file << L"    \"clickerScrollOffset\": " << s.clickerScrollOffset << L",\n";
     file << L"    \"recorderScrollOffset\": " << s.recorderScrollOffset << L",\n";
     file << L"    \"macroScrollOffset\": " << s.macroScrollOffset << L",\n";
-    file << L"    \"scriptCustomScrollOffset\": " << s.scriptCustomScrollOffset << L"\n";
+    file << L"    \"scriptCustomScrollOffset\": " << s.scriptCustomScrollOffset << L",\n";
+    file << L"    \"globalHotkeyText\": \"" << EscapeJson(s.globalHotkeyText) << L"\",\n";
+    file << L"    \"globalHotkeyVk\": " << s.globalHotkeyVk << L",\n";
+    file << L"    \"globalHotkeyModifiers\": " << s.globalHotkeyModifiers << L",\n";
+    file << L"    \"globalHotkeyHold\": " << (s.globalHotkeyHold ? L"true" : L"false") << L",\n";
+    file << L"    \"uiMode\": \"" << EscapeJson(quickscript::NormalizeHomeUiMode(s.uiMode)) << L"\"\n";
 }
 
 }  // namespace
@@ -291,10 +365,8 @@ std::wstring AppSettingsFilePath() {
 bool LoadAppSettings(quickscript::AppSettings& out) {
     out = quickscript::DefaultAppSettings();
     const std::wstring path = AppSettingsFilePath();
-    std::wifstream file(path);
-    if (!file.is_open()) return false;
-    std::wstring content((std::istreambuf_iterator<wchar_t>(file)), std::istreambuf_iterator<wchar_t>());
-    file.close();
+    // 必须按 UTF-8 读：wofstream 旧写盘会截断中文路径，且 wifstream 默认 locale 会再读坏
+    const std::wstring content = ReadAll(path);
     if (content.empty()) return false;
 
     const std::wstring clickObj = ExtractObject(content, L"click");
@@ -314,30 +386,49 @@ bool LoadAppSettings(quickscript::AppSettings& out) {
 
 bool SaveAppSettings(const quickscript::AppSettings& settings) {
     const std::wstring path = AppSettingsFilePath();
-    std::wofstream file(path);
-    if (!file.is_open()) return false;
-    file << L"{\n";
-    file << L"  \"click\": {\n";
-    WriteClickSettings(file, settings.click);
-    file << L"  },\n";
-    file << L"  \"playback\": {\n";
-    WritePlaybackSettings(file, settings.playback);
-    file << L"  },\n";
-    file << L"  \"other\": {\n";
-    WriteOtherSettings(file, settings.other);
-    file << L"  },\n";
-    file << L"  \"windowMode\": {\n";
-    WriteWindowModeSettings(file, settings.windowMode);
-    file << L"  },\n";
-    file << L"  \"ai\": {\n";
-    WriteAiApiSettings(file, settings.ai);
-    file << L"  },\n";
-    file << L"  \"home\": {\n";
-    WriteHomeState(file, settings.home);
-    file << L"  }\n";
-    file << L"}\n";
-    file.flush();
-    if (!file.good()) return false;
-    file.close();
-    return true;
+    const std::wstring tmpPath = path + L".tmp";
+
+    auto buildUtf8 = [&]() -> std::string {
+        std::wostringstream file;
+        file << L"{\n";
+        file << L"  \"click\": {\n";
+        WriteClickSettings(file, settings.click);
+        file << L"  },\n";
+        file << L"  \"playback\": {\n";
+        WritePlaybackSettings(file, settings.playback);
+        file << L"  },\n";
+        file << L"  \"other\": {\n";
+        WriteOtherSettings(file, settings.other);
+        file << L"  },\n";
+        file << L"  \"windowMode\": {\n";
+        WriteWindowModeSettings(file, settings.windowMode);
+        file << L"  },\n";
+        file << L"  \"ai\": {\n";
+        WriteAiApiSettings(file, settings.ai);
+        file << L"  },\n";
+        file << L"  \"home\": {\n";
+        WriteHomeState(file, settings.home);
+        file << L"  }\n";
+        file << L"}\n";
+        return ToUtf8(file.str());
+    };
+
+    // 必须写 UTF-8：wofstream 默认 locale 遇中文路径会截断，导致 app_settings.json 损坏、热键/选中全坏
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const std::string utf8 = buildUtf8();
+        if (!WriteUtf8File(tmpPath, utf8)) {
+            Sleep(20u * static_cast<DWORD>(attempt + 1));
+            continue;
+        }
+        if (MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            return true;
+        }
+        Sleep(20u * static_cast<DWORD>(attempt + 1));
+    }
+    DeleteFileW(tmpPath.c_str());
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (WriteUtf8File(path, buildUtf8())) return true;
+        Sleep(30u * static_cast<DWORD>(attempt + 1));
+    }
+    return false;
 }

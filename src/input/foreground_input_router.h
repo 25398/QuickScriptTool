@@ -5,6 +5,7 @@
 #include "script_types.h"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 
 /// 会话级路由：BeginSession 时按后端打开；失败则整会话回退 SendInput。
@@ -17,13 +18,15 @@ public:
     /// 兼容旧调用：wantHid=true → Interception。
     void BeginSession(bool wantHid);
     void EndSession();
+    /// 异常/AV/看门狗路径：无论会话标志如何，强制抬起并关闭所有注入后端。
+    void ForceTeardown();
 
     bool IsHidActive() const;
     quickscript::ForegroundInputBackend ActiveBackend() const;
     bool DidFallback() const;
     std::wstring FallbackReason() const;
 
-    bool SendKey(unsigned short scanCode, bool down, bool extended);
+    bool SendKey(UINT vk, unsigned short scanCode, bool down, bool extended);
     bool MoveRelative(int dx, int dy);
     bool Button(MouseButtonType button, bool down);
     bool Wheel(int delta, bool horizontal);
@@ -37,5 +40,6 @@ private:
     std::atomic<bool> sessionActive_{false};
     std::atomic<int> active_{static_cast<int>(Active::None)};
     std::atomic<bool> didFallback_{false};
+    mutable std::mutex reasonMu_;
     std::wstring fallbackReason_;
 };

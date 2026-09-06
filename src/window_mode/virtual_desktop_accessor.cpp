@@ -1,8 +1,10 @@
 #include "virtual_desktop_accessor.h"
 
 #include "com_apartment.h"
+#include "window_mode_log.h"
 #include "window_mode_requirements.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <objbase.h>
 #include <vector>
@@ -19,11 +21,85 @@ struct VdaDllCandidate {
 };
 
 constexpr VdaDllCandidate kDllCandidates[] = {
-    {L"VirtualDesktopAccessor11.dll", 22000, UINT32_MAX},
-    {L"VirtualDesktopAccessor10.dll", 10240, 21999},
-    {L"VirtualDesktopAccessor.dll", 22000, UINT32_MAX},
+    // Ciantic VDA：Win11 各代 COM VTable 不兼容，必须按 build 拆开，禁止交叉回退。
+    {L"VirtualDesktopAccessor11.dll", 26100, UINT32_MAX},       // 24H2 / 25H2
+    {L"VirtualDesktopAccessor11_23h2.dll", 22000, 26099},       // 22H2 / 23H2
+    {L"VirtualDesktopAccessor10.dll", 10240, 21999},            // Windows 10
 };
 
+// VirtualDesktopAccessor 在错误系统版本 / COM 状态下会直接 AV（非返回 -1）。
+// 所有原生导出调用必须经 SEH，禁止让异常冒泡成启动期进程消失。
+int SehCallInt0(int(__stdcall* fn)()) {
+    if (!fn) return -1;
+    int r = -1;
+    __try { r = fn(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    return r;
+}
+
+int SehCallInt1Hwnd(int(__stdcall* fn)(HWND), HWND a) {
+    if (!fn || !a) return -1;
+    int r = -1;
+    __try { r = fn(a); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    return r;
+}
+
+int SehCallInt2HwndInt(int(__stdcall* fn)(HWND, int), HWND a, int b) {
+    if (!fn || !a) return -1;
+    int r = -1;
+    __try { r = fn(a, b); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    return r;
+}
+
+int SehCallInt1Int(int(__stdcall* fn)(int), int a) {
+    if (!fn) return -1;
+    int r = -1;
+    __try { r = fn(a); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    return r;
+}
+
+int SehCallGetDesktopName(int(__stdcall* fn)(int, char*, size_t), int n, char* buf, size_t sz) {
+    if (!fn || !buf || sz == 0) return -1;
+    int r = -1;
+    __try { r = fn(n, buf, sz); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    return r;
+}
+
+int SehCallSetDesktopName(int(__stdcall* fn)(int, const char*), int n, const char* name) {
+    if (!fn || !name) return -1;
+    int r = -1;
+    __try { r = fn(n, name); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    return r;
+}
+
+bool SehCallGuidByNumber(GUID(__stdcall* fn)(int), int n, GUID* out) {
+    if (!fn || !out || n < 0) return false;
+    GUID tmp{};
+    __try {
+        tmp = fn(n);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    *out = tmp;
+    return true;
+}
+
+bool SehCallGuidByHwnd(GUID(__stdcall* fn)(HWND), HWND hwnd, GUID* out) {
+    if (!fn || !hwnd || !out) return false;
+    GUID tmp{};
+    __try {
+        tmp = fn(hwnd);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    *out = tmp;
+    return true;
+}
 
 std::string WideToUtf8(const std::wstring& text) {
     if (text.empty()) return {};
@@ -146,9 +222,10 @@ bool VirtualDesktopAccessor::TryLoadDll(const std::wstring& path, std::wstring& 
         return false;
     }
 
-    const int count = getDesktopCount_();
+    // 错误版本的 VDA 常在此处 AV，而不是返回 -1
+    const int count = SehCallInt0(getDesktopCount_);
     if (count < 0) {
-        err = L"DLL 初始化失败 (GetDesktopCount=-1): " + path;
+        err = L"DLL 初始化失败/崩溃 (GetDesktopCount): " + path;
         Unload();
         return false;
     }
@@ -158,6 +235,7 @@ bool VirtualDesktopAccessor::TryLoadDll(const std::wstring& path, std::wstring& 
 }
 
 void VirtualDesktopAccessor::Unload() {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!module_) {
         getDesktopCount_ = nullptr;
         getDesktopName_ = nullptr;
@@ -229,6 +307,7 @@ void VirtualDesktopAccessor::ResolveFunctions() {
 }
 
 bool VirtualDesktopAccessor::EnsureLoaded(std::wstring& err) {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     // VDA caches COM desktop managers; apartment must stay alive for the thread.
     EnsureThreadComApartment();
 
@@ -239,57 +318,70 @@ bool VirtualDesktopAccessor::EnsureLoaded(std::wstring& err) {
     }();
     (void)kUnloadAtExit;
 
-    if (module_ && getDesktopCount_ && getDesktopCount_() >= 0) return true;
+    if (module_ && getDesktopCount_ && SehCallInt0(getDesktopCount_) >= 0) return true;
 
     const DWORD build = OsBuildNumber();
+    WindowModeLogEventf(L"[窗口模式] 虚拟桌面探测 OS build=%lu",
+        static_cast<unsigned long>(build));
     std::wstring lastErr;
 
     for (const VdaDllCandidate& cand : kDllCandidates) {
         if (build < cand.minBuild || build > cand.maxBuild) continue;
         const std::wstring path = BuildCandidatePath(cand.fileName);
-        if (TryLoadDll(path, lastErr)) return true;
+        std::wstring oneErr;
+        if (TryLoadDll(path, oneErr)) {
+            WindowModeLogEventf(L"[窗口模式] 虚拟桌面 DLL 已加载 %s", cand.fileName);
+            return true;
+        }
+        WindowModeLogEventf(L"[窗口模式] 虚拟桌面 DLL 不可用 %s: %s",
+            cand.fileName, oneErr.c_str());
+        if (lastErr.empty()) lastErr = oneErr;
     }
 
-    for (const VdaDllCandidate& cand : kDllCandidates) {
-        const std::wstring path = BuildCandidatePath(cand.fileName);
-        if (TryLoadDll(path, lastErr)) return true;
-    }
-
+    // 禁止跨系统回退：Win11 上加载 Win10 DLL 会在 GetDesktopCount 直接 AV，
+    // 并把 11.dll 缺失/被安全中心拦截的真正原因盖掉。
     err = lastErr.empty()
-        ? L"未找到可用的 VirtualDesktopAccessor DLL，请将 DLL 放在程序目录"
-        : lastErr;
+        ? (L"未找到匹配 OS build " + std::to_wstring(build)
+            + L" 的 VirtualDesktopAccessor DLL")
+        : (lastErr + L" (OS build " + std::to_wstring(build) + L")");
     return false;
 }
 
 int VirtualDesktopAccessor::GetDesktopCount() const {
-    return getDesktopCount_ ? getDesktopCount_() : -1;
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    return SehCallInt0(getDesktopCount_);
 }
 
 std::wstring VirtualDesktopAccessor::GetDesktopName(int desktopNumber) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!getDesktopName_ || desktopNumber < 0) return {};
     std::vector<char> buf(1024, '\0');
-    if (getDesktopName_(desktopNumber, buf.data(), buf.size()) < 0) return {};
+    if (SehCallGetDesktopName(getDesktopName_, desktopNumber, buf.data(), buf.size()) < 0) return {};
     const size_t len = strnlen(buf.data(), buf.size());
     return Utf8ToWide(buf.data(), len);
 }
 
 bool VirtualDesktopAccessor::SetDesktopName(int desktopNumber, const std::wstring& name) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!setDesktopName_ || desktopNumber < 0) return false;
     const std::string utf8 = WideToUtf8(name);
-    return setDesktopName_(desktopNumber, utf8.c_str()) >= 0;
+    return SehCallSetDesktopName(setDesktopName_, desktopNumber, utf8.c_str()) >= 0;
 }
 
 int VirtualDesktopAccessor::CreateDesktop() const {
-    return createDesktop_ ? createDesktop_() : -1;
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    return SehCallInt0(createDesktop_);
 }
 
 int VirtualDesktopAccessor::GetCurrentDesktopNumber() const {
-    return getCurrentDesktopNumber_ ? getCurrentDesktopNumber_() : -1;
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    return SehCallInt0(getCurrentDesktopNumber_);
 }
 
 bool VirtualDesktopAccessor::GoToDesktopNumber(int desktopNumber) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!goToDesktopNumber_ || desktopNumber < 0) return false;
-    return goToDesktopNumber_(desktopNumber) >= 0;
+    return SehCallInt1Int(goToDesktopNumber_, desktopNumber) >= 0;
 }
 
 int VirtualDesktopAccessor::CreateDesktopPreservingView() const {
@@ -308,8 +400,9 @@ int VirtualDesktopAccessor::CreateDesktopPreservingView() const {
 }
 
 bool VirtualDesktopAccessor::MoveWindowToDesktopNumber(HWND hwnd, int desktopNumber) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!moveWindowToDesktopNumber_ || desktopNumber < 0 || !hwnd) return false;
-    return moveWindowToDesktopNumber_(hwnd, desktopNumber) >= 0;
+    return SehCallInt2HwndInt(moveWindowToDesktopNumber_, hwnd, desktopNumber) >= 0;
 }
 
 bool VirtualDesktopAccessor::MoveWindowToDesktopNumberPreservingView(HWND hwnd,
@@ -328,9 +421,12 @@ void VirtualDesktopAccessor::HoldView(int preferredDesk, int durationMs) const {
     if (durationMs < 0) durationMs = 0;
     const DWORD deadline = GetTickCount() + static_cast<DWORD>(durationMs);
     for (;;) {
-        const int now = GetCurrentDesktopNumber();
-        if (now >= 0 && now != preferredDesk) {
-            GoToDesktopNumber(preferredDesk);
+        {
+            std::lock_guard<std::recursive_mutex> lock(mu_);
+            const int now = GetCurrentDesktopNumber();
+            if (now >= 0 && now != preferredDesk) {
+                GoToDesktopNumber(preferredDesk);
+            }
         }
         if (GetTickCount() >= deadline) break;
         Sleep(8);
@@ -338,34 +434,40 @@ void VirtualDesktopAccessor::HoldView(int preferredDesk, int durationMs) const {
 }
 
 int VirtualDesktopAccessor::GetWindowDesktopNumber(HWND hwnd) const {
-    return getWindowDesktopNumber_ ? getWindowDesktopNumber_(hwnd) : -1;
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    return SehCallInt1Hwnd(getWindowDesktopNumber_, hwnd);
 }
 
 bool VirtualDesktopAccessor::IsWindowOnDesktopNumber(HWND hwnd, int desktopNumber) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!isWindowOnDesktopNumber_ || desktopNumber < 0 || !hwnd) return false;
-    return isWindowOnDesktopNumber_(hwnd, desktopNumber) > 0;
+    return SehCallInt2HwndInt(isWindowOnDesktopNumber_, hwnd, desktopNumber) > 0;
 }
 
 int VirtualDesktopAccessor::IsWindowOnCurrentVirtualDesktop(HWND hwnd) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!isWindowOnCurrentVirtualDesktop_ || !hwnd) return -1;
-    return isWindowOnCurrentVirtualDesktop_(hwnd);
+    return SehCallInt1Hwnd(isWindowOnCurrentVirtualDesktop_, hwnd);
 }
 
 bool VirtualDesktopAccessor::GetDesktopIdByNumber(int desktopNumber, GUID& outId) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!getDesktopIdByNumber_ || desktopNumber < 0) return false;
-    outId = getDesktopIdByNumber_(desktopNumber);
+    if (!SehCallGuidByNumber(getDesktopIdByNumber_, desktopNumber, &outId)) return false;
     return !GuidIsEmpty(outId);
 }
 
 bool VirtualDesktopAccessor::GetWindowDesktopId(HWND hwnd, GUID& outId) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!getWindowDesktopId_ || !hwnd) return false;
-    outId = getWindowDesktopId_(hwnd);
+    if (!SehCallGuidByHwnd(getWindowDesktopId_, hwnd, &outId)) return false;
     return !GuidIsEmpty(outId);
 }
 
 bool VirtualDesktopAccessor::DesktopNameMatches(int desktopNumber,
     const std::wstring& expectedName) const {
     if (desktopNumber < 0 || expectedName.empty()) return false;
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     const std::wstring apiName = GetDesktopName(desktopNumber);
     if (!apiName.empty() && NamesEqual(apiName, expectedName)) return true;
 
@@ -404,6 +506,7 @@ bool VirtualDesktopAccessor::DesktopNameMatches(int desktopNumber,
 
 bool VirtualDesktopAccessor::FindDesktopIndexByGuid(const GUID& desktopId, int& outIndex) const {
     if (GuidIsEmpty(desktopId)) return false;
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     const int count = GetDesktopCount();
     for (int i = 0; i < count; ++i) {
         GUID id{};
@@ -417,7 +520,7 @@ bool VirtualDesktopAccessor::FindDesktopIndexByGuid(const GUID& desktopId, int& 
 
 int VirtualDesktopAccessor::FindDesktopIndexByName(const std::wstring& expectedName) const {
     if (expectedName.empty()) return -1;
-
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     const int count = GetDesktopCount();
     for (int i = 0; i < count; ++i) {
         const std::wstring apiName = GetDesktopName(i);
@@ -438,18 +541,21 @@ int VirtualDesktopAccessor::FindDesktopIndexByName(const std::wstring& expectedN
 }
 
 int VirtualDesktopAccessor::IsPinnedWindow(HWND hwnd) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!isPinnedWindow_ || !hwnd) return -1;
-    return isPinnedWindow_(hwnd);
+    return SehCallInt1Hwnd(isPinnedWindow_, hwnd);
 }
 
 bool VirtualDesktopAccessor::PinWindow(HWND hwnd) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!pinWindow_ || !hwnd) return false;
-    return pinWindow_(hwnd) >= 0;
+    return SehCallInt1Hwnd(pinWindow_, hwnd) >= 0;
 }
 
 bool VirtualDesktopAccessor::UnPinWindow(HWND hwnd) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
     if (!unPinWindow_ || !hwnd) return false;
-    return unPinWindow_(hwnd) >= 0;
+    return SehCallInt1Hwnd(unPinWindow_, hwnd) >= 0;
 }
 
 }  // namespace windowmode

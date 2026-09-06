@@ -569,16 +569,183 @@ WindowInfoFromPoint GetWindowInfoFromPoint(int x, int y) {
     return info;
 }
 
+namespace {
+
+std::wstring QueryAppPathsExe(const std::wstring& exeName) {
+    if (exeName.empty()) return {};
+    const wchar_t* roots[] = {
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\",
+        L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\",
+    };
+    for (const wchar_t* root : roots) {
+        const std::wstring keyPath = std::wstring(root) + exeName;
+        HKEY hkey = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_READ, &hkey)
+            != ERROR_SUCCESS) {
+            continue;
+        }
+        wchar_t buf[MAX_PATH]{};
+        DWORD typ = 0;
+        DWORD cb = sizeof(buf);
+        const LONG ok = RegQueryValueExW(hkey, nullptr, nullptr, &typ,
+            reinterpret_cast<LPBYTE>(buf), &cb);
+        RegCloseKey(hkey);
+        if (ok == ERROR_SUCCESS && (typ == REG_SZ || typ == REG_EXPAND_SZ) && buf[0]) {
+            wchar_t expanded[MAX_PATH]{};
+            if (typ == REG_EXPAND_SZ
+                && ExpandEnvironmentStringsW(buf, expanded, MAX_PATH) > 0
+                && expanded[0]) {
+                return expanded;
+            }
+            return buf;
+        }
+    }
+    return {};
+}
+
+std::wstring SearchPathExe(const std::wstring& name) {
+    wchar_t buf[MAX_PATH]{};
+    if (SearchPathW(nullptr, name.c_str(), L".exe", MAX_PATH, buf, nullptr) > 0 && buf[0])
+        return buf;
+    if (SearchPathW(nullptr, name.c_str(), nullptr, MAX_PATH, buf, nullptr) > 0 && buf[0])
+        return buf;
+    return {};
+}
+
+/// 裸名/别名 → 注册表 App Paths 里的 exe 文件名
+std::wstring CanonicalExeAlias(const std::wstring& rawLower) {
+    if (rawLower == L"edge" || rawLower == L"msedge" || rawLower == L"microsoftedge"
+        || rawLower == L"microsoft-edge") {
+        return L"msedge.exe";
+    }
+    if (rawLower == L"chrome" || rawLower == L"googlechrome") return L"chrome.exe";
+    if (rawLower == L"firefox" || rawLower == L"ff") return L"firefox.exe";
+    if (rawLower == L"excel") return L"EXCEL.EXE";
+    if (rawLower == L"word" || rawLower == L"winword") return L"WINWORD.EXE";
+    if (rawLower == L"powerpoint" || rawLower == L"powerpnt" || rawLower == L"ppt")
+        return L"POWERPNT.EXE";
+    if (rawLower == L"notepad") return L"notepad.exe";
+    if (rawLower == L"explorer") return L"explorer.exe";
+    if (rawLower == L"cmd") return L"cmd.exe";
+    if (rawLower == L"powershell" || rawLower == L"pwsh") return L"powershell.exe";
+    // 已是 xxx.exe
+    if (rawLower.size() > 4 && rawLower.rfind(L".exe") == rawLower.size() - 4)
+        return rawLower;
+    return {};
+}
+
+}  // namespace
+
+std::wstring ResolveProgramLaunchPath(const std::wstring& nameOrPath) {
+    const std::wstring trimmed = Trim(nameOrPath);
+    if (trimmed.empty()) return {};
+
+    // 已是存在的路径（含盘符或 UNC）直接用
+    if ((trimmed.size() >= 2 && trimmed[1] == L':')
+        || (trimmed.size() >= 2 && trimmed[0] == L'\\' && trimmed[1] == L'\\')) {
+        if (GetFileAttributesW(trimmed.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return trimmed;
+    }
+    if (trimmed.find(L'\\') != std::wstring::npos || trimmed.find(L'/') != std::wstring::npos) {
+        if (GetFileAttributesW(trimmed.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return trimmed;
+    }
+
+    const std::wstring lower = ToLowerCopy(trimmed);
+    std::wstring exe = CanonicalExeAlias(lower);
+    if (exe.empty()) {
+        // 无别名：当普通名试 App Paths / PATH（补 .exe）
+        exe = trimmed;
+        if (exe.size() < 4 || ToLowerCopy(exe.substr(exe.size() - 4)) != L".exe")
+            exe += L".exe";
+    }
+
+    if (std::wstring hit = QueryAppPathsExe(exe); !hit.empty()
+        && GetFileAttributesW(hit.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return hit;
+    }
+    if (std::wstring hit = SearchPathExe(exe); !hit.empty()) return hit;
+
+    // Edge 常见安装位兜底（注册表偶发缺失时避免 ShellExecute「edge」弹商店）
+    if (ToLowerCopy(exe) == L"msedge.exe") {
+        const wchar_t* fallbacks[] = {
+            L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            L"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        };
+        for (const wchar_t* p : fallbacks) {
+            if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) return p;
+        }
+    }
+    return trimmed;
+}
+
+bool IsBrowserLaunchTarget(const std::wstring& nameOrPath) {
+    const std::wstring lower = ToLowerCopy(Trim(nameOrPath));
+    if (lower.empty()) return false;
+    const std::wstring file = ToLowerCopy(FileNameFromPath(lower));
+    const std::wstring alias = CanonicalExeAlias(lower);
+    const std::wstring needle = !alias.empty() ? ToLowerCopy(alias) : file;
+    return needle == L"msedge.exe" || needle == L"chrome.exe" || needle == L"firefox.exe"
+        || needle.find(L"msedge") != std::wstring::npos
+        || needle.find(L"chrome") != std::wstring::npos
+        || needle.find(L"firefox") != std::wstring::npos
+        || lower == L"edge" || lower == L"chrome" || lower == L"firefox";
+}
+
+namespace {
+std::wstring g_lastLaunchProgramError;
+}  // namespace
+
+const std::wstring& LastLaunchProgramError() {
+    return g_lastLaunchProgramError;
+}
+
+bool ProgramLaunchPathExists(const std::wstring& path) {
+    const std::wstring p = Trim(path);
+    if (p.empty()) return false;
+    if (p.find(L"://") != std::wstring::npos) return true; // URL 交给 Shell
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 bool LaunchProgram(const std::wstring& path, const std::wstring& args) {
-    if (path.empty()) return false;
+    g_lastLaunchProgramError.clear();
+    if (path.empty()) {
+        g_lastLaunchProgramError = L"启动路径为空";
+        return false;
+    }
+    const std::wstring resolved = ResolveProgramLaunchPath(path);
+    // 拦截危险 URL scheme（ms-msdt / search-ms / javascript 等）
+    const auto schemeEnd = resolved.find(L"://");
+    if (schemeEnd != std::wstring::npos) {
+        std::wstring scheme = resolved.substr(0, schemeEnd);
+        for (auto& ch : scheme) {
+            if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+        }
+        if (scheme != L"http" && scheme != L"https" && scheme != L"file") {
+            g_lastLaunchProgramError = L"拒绝启动危险协议「" + scheme + L"」";
+            return false;
+        }
+    }
+    if (resolved.find(L"://") == std::wstring::npos
+        && GetFileAttributesW(resolved.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        g_lastLaunchProgramError = L"找不到文件「" + resolved
+            + L"」。请改用 openAppViaSearch(query=应用显示名) 走开始菜单搜索兜底。";
+        return false;
+    }
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
     info.lpVerb = L"open";
-    info.lpFile = path.c_str();
+    info.lpFile = resolved.c_str();
     if (!args.empty()) info.lpParameters = args.c_str();
     info.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&info)) return false;
+    if (!ShellExecuteExW(&info)) {
+        const DWORD err = GetLastError();
+        g_lastLaunchProgramError = L"ShellExecute 失败（" + resolved + L"，err="
+            + std::to_wstring(err)
+            + L"）。请改用 openAppViaSearch(query=应用显示名) 走开始菜单搜索兜底。";
+        return false;
+    }
     if (info.hProcess) CloseHandle(info.hProcess);
     return true;
 }

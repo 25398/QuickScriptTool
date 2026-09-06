@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>在线体验 · 键鼠工坊 QuickScriptTool</title>
+<meta name="description" content="键鼠工坊在线体验：无需安装，在浏览器里直接体验真实产品前端——连点、录制、宏编辑器、AI 对话演示，全部为网页演示态。" />
+<link rel="icon" href="demo/app_icon.ico" />
+<link rel="stylesheet" href="css/site.css" />
+</head>
+<body class="demo-page">
+
+<div class="demo-topbar">
+  <a class="back" href="index.html">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    返回官网
+  </a>
+  <span class="spacer"></span>
+  <button class="t-btn ghost" type="button" id="btnOpenWindow">新窗口打开</button>
+  <a class="t-btn" href="index.html#download">下载 Windows 版</a>
+</div>
+
+<main class="demo-main">
+  <div class="demo-guide">
+    <span>试试这些：</span>
+    <span><b>Tab 切换</b> 连点 / 录制 / 宏 / 脚本定制</span>
+    <span><b>设置</b> 右上角齿轮</span>
+    <span><b>宏编辑器</b> 宏页点击卡片「编辑」</span>
+    <span><b>AI 对话</b> 脚本定制页「开始 AI 对话」</span>
+  </div>
+
+  <div class="demo-shell">
+    <div class="demo-stage2" data-demo-stage>
+      <iframe data-demo-frame src="demo/index.html" title="键鼠工坊在线体验" allow="clipboard-write"></iframe>
+    </div>
+    <div class="demo-mobile">
+      <h3>建议在电脑上体验完整 Demo</h3>
+      <p>手机端可以浏览官网介绍；完整可交互的产品窗口请在电脑浏览器中打开。</p>
+      <p style="margin-top:14px">
+        <a class="btn btn-primary" href="index.html#demo">返回官网介绍</a>
+      </p>
+    </div>
+  </div>
+
+  <ul class="demo-hints" style="max-width:960px;margin:24px auto 0">
+    <li>宏编辑器会放大为 1800×1230 设计尺寸，页面会自动等比缩放</li>
+    <li>开始 / 录制 / 找图 / 热键捕获等按钮会弹出「体验版提示」</li>
+    <li>AI 对话为假对话流：描述需求后会演示流式回复，不调用真实模型</li>
+  </ul>
+</main>
+
+<div class="demo-float-hint" id="demoHint">
+  <i class="dfh-dot"></i>
+  <span>网页体验版仅演示界面，完整键鼠 / 录制 / 找图 / OCR / 窗口模式能力请下载 Windows 客户端。</span>
+  <a href="index.html#download" id="download-link">下载客户端 →</a>
+  <span class="dfh-x" id="demoHintClose" title="关闭" aria-label="关闭">×</span>
+</div>
+
+<script src="js/site.js"></script>
+<script>
+(function () {
+  var openBtn = document.getElementById("btnOpenWindow");
+  if (openBtn) {
+    openBtn.addEventListener("click", function () {
+      window.open("demo/index.html", "qst-demo-full");
+    });
+  }
+  var hintClose = document.getElementById("demoHintClose");
+  if (hintClose) {
+    hintClose.addEventListener("click", function () {
+      var h = document.getElementById("demoHint");
+      if (h) h.style.display = "none";
+    });
+  }
+})();
+</script>
+</body>
+</html>

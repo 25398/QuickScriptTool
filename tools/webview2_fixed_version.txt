@@ -1,0 +1,5 @@
+133.0.3065.92
+x64
+# Download URL for Microsoft.WebView2.FixedVersionRuntime.<ver>.x64.cab
+# Official site links rotate; pin a stable archive of the same Microsoft cab:
+https://github.com/westinyang/WebView2RuntimeArchive/releases/download/133.0.3065.92/Microsoft.WebView2.FixedVersionRuntime.133.0.3065.92.x64.cab

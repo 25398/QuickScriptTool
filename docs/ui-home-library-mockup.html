@@ -1,0 +1,1621 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QuickScript · 主页重构设计稿（资源管理器式脚本库）</title>
+<style>
+/* ═══════════════════════════════════════════════════════════
+   风格沿用「极光 Arctic」：navy/ice/mint 渐变、卡片、辉光
+   ═══════════════════════════════════════════════════════════ */
+:root{
+  --navy-950:#061018;--navy-900:#0b1624;--navy-800:#122338;--navy-700:#1a3250;--navy-600:#23466c;
+  --ice-500:#1aa6d6;--ice-400:#38bdf8;--ice-300:#7dd3fc;--ice-200:#bae6fd;
+  --mint-400:#2dd4bf;--mint-300:#5eead4;--mint-200:#99f6e4;
+  --sky-100:#e8f4fc;--sky-50:#f3f9fd;--frost:#fcfeff;
+  --aurora-b:#6366f1;--rose:#fb7185;--amber:#f59e0b;
+  --text:#0f1c2c;--text-2:#4a6178;--text-3:#7e95ab;--line:#c9d7e6;--line-strong:#9eb4cb;
+  --radius:10px;--font:"Microsoft YaHei UI","Microsoft YaHei","Segoe UI",sans-serif;
+  --mono:Consolas,"Courier New",ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--font);color:var(--text);
+  background:
+    radial-gradient(900px 500px at 8% -5%, rgba(26,166,214,.35), transparent 55%),
+    radial-gradient(700px 420px at 95% 10%, rgba(45,212,191,.28), transparent 50%),
+    radial-gradient(600px 400px at 50% 100%, rgba(99,102,241,.18), transparent 55%),
+    linear-gradient(160deg,#9eb8d4 0%,#7a9cbc 45%,#6a8aaa 100%);
+  min-height:100vh;display:flex;flex-direction:column;align-items:center;
+  padding:16px 14px 28px;overflow-x:hidden;position:relative;
+}
+.app{
+  width:min(1380px,98vw);height:min(960px,calc(100vh - 52px));
+  min-height:min(700px,calc(100vh - 52px));
+  border-radius:14px;overflow:hidden;position:relative;
+  background:var(--sky-50);
+  box-shadow:0 24px 64px rgba(6,16,24,.35),0 0 0 1px rgba(255,255,255,.25) inset;
+  display:flex;flex-direction:column;z-index:1;
+}
+.app::before{
+  content:"";position:absolute;inset:40px 0 0 0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(420px 180px at 12% 8%, rgba(26,166,214,.14), transparent 65%),
+    radial-gradient(380px 160px at 92% 18%, rgba(45,212,191,.12), transparent 60%),
+    radial-gradient(520px 220px at 50% 100%, rgba(99,102,241,.08), transparent 55%);
+}
+.app>*{position:relative;z-index:1}
+
+/* ── 标题栏 ── */
+.titlebar{
+  height:40px;flex-shrink:0;display:flex;align-items:center;padding:0 4px 0 14px;
+  background:linear-gradient(90deg,var(--navy-950),var(--navy-800) 40%,var(--navy-700));
+  color:#e8f4fc;user-select:none;
+}
+.titlebar::after{
+  content:"";position:absolute;left:0;right:0;bottom:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--ice-400),var(--mint-400),var(--aurora-b),var(--ice-400),transparent);
+}
+.brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13px}
+.brand-mark{
+  width:16px;height:16px;border-radius:4px;
+  background:linear-gradient(135deg,var(--ice-400),var(--mint-400) 50%,var(--aurora-b));
+  box-shadow:0 0 14px var(--glow-ice);
+}
+.win-btns{margin-left:auto;display:flex;height:100%}
+.win-btn{width:42px;display:grid;place-items:center;color:#a8b6c2;font-size:14px;cursor:pointer;transition:background .15s}
+.win-btn:hover{background:rgba(255,255,255,.1);color:#fff}
+.win-btn.close:hover{background:var(--rose);color:#fff}
+
+/* ── 顶部 Tab ── */
+.top-strip{
+  height:52px;flex-shrink:0;display:flex;align-items:center;gap:4px;padding:0 14px;
+  background:linear-gradient(180deg,var(--navy-800),var(--navy-900));border-bottom:1px solid rgba(255,255,255,.06);
+}
+.seg{
+  display:flex;align-items:center;gap:7px;padding:7px 13px;border-radius:8px;
+  color:#8fa0ae;font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;
+}
+.seg svg{width:15px;height:15px;opacity:.7}
+.seg:hover{color:#dbe7f0;background:rgba(255,255,255,.06)}
+.seg.on{color:#fff;background:linear-gradient(180deg,var(--navy-600),var(--navy-800));box-shadow:0 0 0 1px rgba(56,189,248,.35) inset}
+.seg.on svg{opacity:1;color:var(--ice-300)}
+.top-spacer{flex:1}
+.btn-new{
+  display:flex;align-items:center;gap:7px;padding:8px 15px;border-radius:9px;border:none;cursor:pointer;
+  font:inherit;font-size:12.5px;font-weight:700;color:#06222b;
+  background:linear-gradient(135deg,var(--ice-400),var(--mint-400));
+  box-shadow:0 4px 14px rgba(26,166,214,.35);transition:transform .15s,box-shadow .15s;
+}
+.btn-new:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(26,166,214,.45)}
+.btn-new svg{width:14px;height:14px}
+
+/* ── 页面容器 ── */
+.tabpage{display:none;flex:1;min-height:0}
+.tabpage.on{display:flex}
+.plain{flex-direction:column;gap:12px;padding:12px 14px 12px}
+.plain .panel{flex:1;min-height:0}
+.home-main{flex:1;min-height:0;display:grid;grid-template-columns:318px 1fr;gap:12px;padding:12px 14px 12px}
+.panel{
+  background:linear-gradient(165deg,var(--frost),var(--sky-50));
+  border:1px solid var(--line);border-radius:var(--radius);
+  box-shadow:0 1px 0 rgba(255,255,255,.9) inset,0 10px 28px rgba(11,22,36,.06);
+  position:relative;overflow:hidden;display:flex;flex-direction:column;min-height:0;
+}
+.pane-head{padding:15px 18px 10px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.pane-head h3{font-size:14px;font-weight:700}
+.pane-head .cnt{margin-left:auto;font-size:11px;font-weight:600;color:var(--text-3);background:var(--sky-100);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+.pane-body{flex:1;min-height:0;overflow:auto;padding:0 18px 16px}
+
+/* ── 左：目录树 ── */
+.lib-head{padding:13px 14px 8px;flex-shrink:0}
+.lib-title-row{display:flex;align-items:center;gap:7px}
+.lib-title{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700}
+.lib-title svg{width:15px;height:15px;color:var(--ice-500)}
+.lib-title .cnt{margin-left:auto;font-size:11px;font-weight:600;color:var(--text-3);background:var(--sky-100);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+.mini-btn{
+  display:inline-flex;align-items:center;gap:4px;padding:4px 9px;border-radius:7px;border:1px solid var(--line);
+  background:var(--frost);font:inherit;font-size:11px;font-weight:600;color:var(--text-2);cursor:pointer;transition:all .15s;white-space:nowrap;
+}
+.mini-btn:hover{border-color:var(--ice-400);color:var(--text);background:var(--sky-50)}
+.mini-btn svg{width:11px;height:11px}
+.search-wrap{position:relative;margin-top:9px}
+.search-wrap svg{position:absolute;left:11px;top:50%;transform:translateY(-50%);width:15px;height:15px;color:var(--text-3);pointer-events:none}
+.search-wrap kbd{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  font-family:var(--mono);font-size:10px;color:var(--text-3);background:var(--sky-100);
+  border:1px solid var(--line);border-radius:5px;padding:1px 6px;pointer-events:none;
+}
+.search-input{
+  width:100%;padding:9px 52px 9px 34px;border-radius:9px;border:1.5px solid var(--line);
+  background:var(--frost);font:inherit;font-size:12.5px;color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s;
+}
+.search-input:focus{border-color:var(--ice-500);box-shadow:0 0 0 3px rgba(26,166,214,.16)}
+.search-input::placeholder{color:var(--text-3)}
+.chips{display:flex;gap:6px;margin-top:9px;flex-wrap:wrap}
+.chip{
+  padding:4px 11px;border-radius:999px;border:1px solid var(--line);background:var(--frost);
+  font-size:11px;font-weight:600;color:var(--text-2);cursor:pointer;transition:all .15s;
+}
+.chip:hover{border-color:var(--ice-400);color:var(--text)}
+.chip.on{background:linear-gradient(135deg,var(--navy-700),var(--navy-800));color:#fff;border-color:var(--navy-700)}
+
+.tree{flex:1;min-height:0;overflow:auto;padding:4px 8px 12px}
+.tnode{display:flex;align-items:center;gap:6px;padding:6px 7px;border-radius:8px;cursor:pointer;position:relative;user-select:none}
+.tnode:hover{background:var(--sky-100)}
+.tnode.on{background:linear-gradient(120deg,var(--sky-100),var(--frost));box-shadow:0 0 0 1px var(--ice-400) inset}
+.twist{width:15px;height:15px;flex-shrink:0;display:grid;place-items:center;color:var(--text-3);transition:transform .15s;font-size:9px}
+.twist.open{transform:rotate(90deg)}
+.twist.leaf{visibility:hidden}
+.t-ico{width:24px;height:24px;border-radius:7px;flex-shrink:0;display:grid;place-items:center;background:linear-gradient(135deg,var(--navy-700),var(--navy-900));color:var(--ice-300)}
+.t-ico svg{width:13px;height:13px}
+.t-ico.fav{background:linear-gradient(135deg,#7a5b12,#4a3608);color:var(--amber)}
+.t-ico.folder{background:linear-gradient(135deg,var(--navy-600),var(--navy-800));color:var(--ice-200)}
+.t-name{font-size:12.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t-count{margin-left:auto;font-size:10.5px;color:var(--text-3);background:var(--sky-100);border:1px solid var(--line);border-radius:999px;padding:1px 7px;flex-shrink:0}
+.t-kids{margin-left:20px}
+
+/* ── 右：文件列表 ── */
+.explorer{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.crumb-bar{
+  padding:11px 16px 9px;display:flex;align-items:center;gap:8px;flex-shrink:0;border-bottom:1px solid var(--line);
+}
+.crumb{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-2);cursor:pointer;padding:3px 7px;border-radius:6px;white-space:nowrap}
+.crumb:hover{background:var(--sky-100);color:var(--text)}
+.crumb.on{color:var(--text);font-weight:700}
+.crumb .sep{color:var(--text-3);margin:0 2px;cursor:default}
+.crumb-acts{margin-left:auto;display:flex;gap:7px;align-items:center}
+.run-sm{
+  display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:8px;border:none;cursor:pointer;
+  font:inherit;font-size:12px;font-weight:700;color:#041a20;
+  background:linear-gradient(135deg,var(--mint-300),var(--mint-400) 55%,var(--ice-400));
+  box-shadow:0 3px 12px rgba(45,212,191,.4);transition:transform .15s;
+}
+.run-sm:hover{transform:translateY(-1px)}
+.run-sm svg{width:13px;height:13px}
+.flist{flex:1;min-height:0;overflow:auto;padding:6px 8px 10px}
+.fgroup-label{
+  display:flex;align-items:center;gap:6px;padding:7px 10px 4px;font-size:10.5px;font-weight:700;color:var(--text-3);letter-spacing:.04em;
+}
+.fgroup-label svg{width:11px;height:11px}
+.frow{
+  display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;cursor:pointer;position:relative;
+  border:1px solid transparent;transition:background .1s,border-color .1s;
+}
+.frow:hover{background:var(--sky-100)}
+.frow.on{background:linear-gradient(120deg,var(--sky-100),var(--frost));border-color:var(--ice-400)}
+.frow .f-ico{width:26px;height:26px;border-radius:7px;flex-shrink:0;display:grid;place-items:center;background:linear-gradient(135deg,var(--navy-600),var(--navy-800));color:var(--ice-200)}
+.frow .f-ico svg{width:13px;height:13px}
+.frow-main{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
+.frow-name{font-size:12.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hk-pill{
+  font-family:var(--mono);font-size:10.5px;font-weight:600;color:var(--navy-800);
+  background:var(--mint-200);border:1px solid rgba(45,212,191,.5);border-radius:5px;padding:1px 6px;flex-shrink:0;
+}
+.frow-meta{font-size:11px;color:var(--text-3);white-space:nowrap;flex-shrink:0}
+.row-acts{display:flex;gap:4px;opacity:0;transition:opacity .12s;flex-shrink:0}
+.frow:hover .row-acts{opacity:1}
+.ra{
+  width:24px;height:24px;border-radius:6px;display:grid;place-items:center;color:var(--text-3);cursor:pointer;transition:all .12s;
+}
+.ra:hover{background:var(--sky-100);color:var(--text)}
+.ra.star:hover{color:var(--amber)}
+.ra.star.on{color:var(--amber)}
+.ra.del:hover{color:var(--rose);background:#fff1f2}
+.ra svg{width:13px;height:13px}
+.frow.empty{display:flex;justify-content:center;color:var(--text-3);font-size:12px;cursor:default;padding:22px 8px;border:1px dashed var(--line)}
+.frow.empty:hover{background:transparent}
+.fstatus{
+  flex-shrink:0;padding:7px 16px;border-top:1px solid var(--line);font-size:11px;color:var(--text-3);
+  display:flex;align-items:center;gap:8px;
+}
+
+/* ── 目录树脚本叶子 ── */
+.tnode.item{cursor:pointer}
+.tnode.item .t-name{font-size:12px;font-weight:500;color:var(--text-2)}
+.tnode.item.on .t-name{color:var(--text);font-weight:700}
+.tnode.item .hk-pill{font-size:9.5px;padding:1px 5px;margin-left:auto}
+.tnode.item .t-ico{width:22px;height:22px;border-radius:6px}
+.tnode.item .t-ico svg{width:12px;height:12px}
+.tnode.dragging{opacity:.4}
+.tnode.drop-on{background:var(--sky-100);box-shadow:0 0 0 1px var(--ice-400) inset}
+.tnode.cut,.frow.cut{opacity:.55;outline:1px dashed var(--line-strong);outline-offset:-2px;border-radius:8px}
+.hk-pill.set{cursor:pointer;transition:all .15s}
+.hk-pill.set:hover{background:var(--ice-200);border-color:var(--ice-500);box-shadow:0 0 0 2px rgba(26,166,214,.18)}
+.crumb-bar .cnt{
+  font-size:11px;font-weight:600;color:var(--text-3);background:var(--sky-100);
+  border:1px solid var(--line);border-radius:999px;padding:2px 9px;white-space:nowrap;
+}
+
+/* ── 右侧：脚本详情（完整 UI） ── */
+.detail{flex:1;min-height:0;overflow:auto;padding:18px 22px}
+.d-top{display:flex;align-items:center;gap:13px}
+.d-ico{
+  width:42px;height:42px;border-radius:12px;flex-shrink:0;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--navy-700),var(--navy-900));color:var(--ice-300);
+}
+.d-ico.rec{background:linear-gradient(135deg,#0e4a4a,#063636);color:var(--mint-300)}
+.d-ico.sched{background:linear-gradient(135deg,#4a3a0e,#362b08);color:var(--amber)}
+.d-ico.ai{background:linear-gradient(135deg,#33306b,#1c1a4a);color:#a5b4fc}
+.d-ico svg{width:20px;height:20px}
+.d-name{font-size:18px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.d-sub{font-size:11.5px;color:var(--text-3);margin-top:3px}
+.d-info{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:16px}
+.d-cell{border:1px solid var(--line);border-radius:9px;background:var(--frost);padding:10px 12px}
+.d-cell .k{font-size:10.5px;color:var(--text-3);font-weight:600}
+.d-cell .v{font-size:13px;font-weight:700;color:var(--text);margin-top:4px}
+.d-cell .v small{font-size:10px;font-weight:500;color:var(--text-3);margin-left:2px}
+.d-actions{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.act-btn{
+  display:inline-flex;align-items:center;gap:5px;padding:7px 13px;border-radius:8px;border:1px solid var(--line);
+  background:var(--frost);font:inherit;font-size:12px;font-weight:600;color:var(--text-2);cursor:pointer;transition:all .15s;
+}
+.act-btn:hover{border-color:var(--ice-400);color:var(--text);background:var(--sky-50)}
+.act-btn.danger:hover{border-color:var(--rose);color:var(--rose);background:#fff1f2}
+.act-btn svg{width:12px;height:12px}
+.btn-p{
+  display:inline-flex;align-items:center;gap:6px;padding:8px 17px;border-radius:8px;border:none;cursor:pointer;
+  font:inherit;font-size:12.5px;font-weight:700;color:#06222b;
+  background:linear-gradient(135deg,var(--ice-400),var(--mint-400));
+  box-shadow:0 3px 10px rgba(26,166,214,.3);transition:transform .15s;
+}
+.btn-p:hover{transform:translateY(-1px)}
+.btn-p svg{width:13px;height:13px}
+.d-preview{margin-top:18px;border:1px solid var(--line);border-radius:9px;background:var(--frost);overflow:hidden}
+.d-sec{display:flex;align-items:center;gap:8px;padding:10px 14px;font-size:12px;font-weight:700;color:var(--text);border-bottom:1px solid var(--line)}
+.d-sec .n{margin-left:auto;font-size:10.5px;font-weight:600;color:var(--text-3)}
+.pv-row{display:flex;align-items:center;gap:10px;padding:8px 14px;font-size:12px;color:var(--text-2);border-bottom:1px solid var(--sky-100);font-family:var(--mono)}
+.pv-row:last-child{border-bottom:none}
+.pv-row .i{
+  width:18px;height:18px;border-radius:5px;background:var(--sky-100);display:grid;place-items:center;color:var(--ice-500);flex-shrink:0;
+  font-family:var(--font);font-size:9px;font-weight:800;
+}
+.d-summary{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;
+  color:var(--text-3);font-size:12.5px;text-align:center;
+}
+.d-summary .d-sname{font-size:16px;font-weight:700;color:var(--text)}
+.d-summary .d-shint{font-size:11.5px;color:var(--text-3)}
+.d-fname{font-size:16px;font-weight:700;color:var(--text)}
+.d-fcount{font-size:11.5px;color:var(--text-3);margin-top:3px}
+.d-flist{margin-top:14px;display:flex;flex-direction:column;gap:4px}
+
+/* ── 右键菜单 ── */
+.ctx{
+  position:fixed;z-index:200;min-width:150px;padding:5px;border-radius:9px;
+  background:var(--frost);border:1px solid var(--line);
+  box-shadow:0 14px 34px rgba(6,16,24,.22);display:none;
+}
+.ctx.show{display:block}
+.ctx-item{
+  display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:6px;font-size:12px;color:var(--text);cursor:pointer;white-space:nowrap;
+}
+.ctx-item:hover{background:var(--sky-100)}
+.ctx-item.danger{color:var(--rose)}
+.ctx-item svg{width:13px;height:13px;color:var(--text-3)}
+.ctx-item.danger svg{color:var(--rose)}
+.ctx-sep{height:1px;background:var(--line);margin:4px 6px}
+
+/* ── 普通页（连点/录制/宏/定时/脚本定制/设置） ── */
+.field-grid{padding:4px 18px 16px;display:flex;flex-direction:column;gap:14px}
+.field label{display:block;font-size:12px;color:var(--text-2);margin-bottom:7px}
+.radios{display:flex;gap:10px;flex-wrap:wrap}
+.radio{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2);cursor:pointer}
+.radio.on{color:var(--text);font-weight:600}
+.radio i{width:15px;height:15px;border-radius:50%;border:1.5px solid var(--line-strong);display:inline-block}
+.radio.on i{border-color:var(--mint-400);background:radial-gradient(circle at center,var(--mint-400) 40%,transparent 45%)}
+.combo{
+  border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--frost);
+  font-size:12.5px;color:var(--text-2);cursor:pointer;display:flex;justify-content:space-between;gap:8px;
+}
+.combo b{color:var(--text);font-weight:600}
+.combo .arr{color:var(--text-3)}
+.cta-bar{
+  flex-shrink:0;min-height:72px;padding:13px 22px;border-radius:var(--radius);
+  background:linear-gradient(115deg,var(--navy-950),var(--navy-800) 45%,var(--cta-mid,#0e3a4a) 70%,var(--cta-end,#134e4a));
+  color:#fff;display:grid;grid-template-columns:1fr auto;align-items:center;gap:14px;
+}
+.cta-bar h2{font-size:16px;font-weight:700}
+.cta-bar p{margin-top:4px;font-size:12px;color:rgba(255,255,255,.62)}
+.cta-key{
+  font-family:var(--mono);font-size:14px;font-weight:600;
+  background:rgba(255,255,255,.06);border:1px solid rgba(56,189,248,.55);color:var(--mint-300);
+  padding:9px 13px;border-radius:8px;text-align:center;min-width:58px;
+}
+.srow{
+  display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+  background:var(--frost);font-size:12.5px;color:var(--text);
+}
+.srow + .srow{margin-top:8px}
+.srow .s-label{font-weight:600}
+.srow .s-val{margin-left:auto;color:var(--text-2)}
+.toggle{width:34px;height:19px;border-radius:999px;background:var(--mint-400);position:relative;flex-shrink:0;cursor:pointer}
+.toggle::after{content:"";position:absolute;top:2px;right:2px;width:15px;height:15px;border-radius:50%;background:#fff}
+.toggle.off{background:var(--line)}
+.toggle.off::after{right:auto;left:2px}
+
+.footer-hint{
+  flex-shrink:0;min-height:38px;padding:8px 20px;display:flex;align-items:center;justify-content:center;gap:14px;
+  background:linear-gradient(90deg,var(--navy-950),var(--navy-800) 40%,var(--navy-700));
+  color:#9eb0bd;font-size:11.5px;flex-wrap:wrap;
+}
+.footer-hint a{color:var(--ice-400);cursor:pointer;text-decoration:none}
+.footer-hint a:hover{text-decoration:underline}
+
+.hk-ov{position:absolute;inset:0;background:rgba(6,16,24,.45);display:none;align-items:center;justify-content:center;z-index:40;backdrop-filter:blur(4px)}
+.hk-ov.show{display:flex}
+.hk-dlg{width:min(420px,86%);background:var(--frost);border-radius:12px;overflow:hidden;box-shadow:0 18px 48px rgba(6,16,24,.35);border:1px solid var(--line)}
+.hk-dlg .hd{height:42px;display:flex;align-items:center;padding:0 14px;background:linear-gradient(90deg,var(--navy-950),var(--navy-800));color:#e8f4fc;font-size:13px;font-weight:700}
+.hk-dlg .hd .x{margin-left:auto;width:36px;height:100%;display:grid;place-items:center;cursor:pointer;color:#a8b6c2}
+.hk-dlg .bd{text-align:center;padding:28px 16px}
+.hk-dlg .bd p{font-size:14px;margin-bottom:14px}
+.hk-dlg .bd .sub{font-size:12px;color:var(--text-3)}
+.hk-dlg .val{font-family:var(--mono);font-size:26px;font-weight:700;color:#0369a1}
+.hk-dlg .ft{display:flex;justify-content:center;gap:8px;padding:12px 14px 16px;flex-wrap:wrap}
+.hk-dlg .ft button{padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.hk-dlg .ft .primary{border:none;background:linear-gradient(135deg,var(--ice-400),var(--mint-400));color:#06222b}
+.hk-dlg .ft .danger{color:#e11d48}
+
+.toast{
+  position:absolute;left:50%;bottom:52px;transform:translateX(-50%) translateY(12px);
+  background:linear-gradient(115deg,var(--navy-950),var(--navy-800));
+  color:#e8f4fc;font-size:12.5px;font-weight:600;padding:10px 18px;border-radius:10px;
+  box-shadow:0 12px 30px rgba(6,16,24,.35),0 0 0 1px rgba(56,189,248,.35) inset;
+  opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:250;white-space:nowrap;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast b{color:var(--mint-300)}
+
+.note-strip{
+  width:min(1380px,98vw);margin-top:10px;color:rgba(15,28,44,.8);font-size:12px;line-height:1.55;
+  background:rgba(252,254,255,.55);border:1px solid rgba(255,255,255,.4);border-radius:10px;padding:9px 14px;
+}
+.note-strip b{color:var(--navy-800)}
+</style>
+</head>
+<body>
+
+<div class="app" id="app">
+  <!-- 标题栏 -->
+  <div class="titlebar">
+    <div class="brand"><span class="brand-mark"></span>QuickScript</div>
+    <div class="win-btns">
+      <div class="win-btn" title="最小化">─</div>
+      <div class="win-btn" title="最大化">□</div>
+      <div class="win-btn close" title="关闭">×</div>
+    </div>
+  </div>
+
+  <!-- 顶部 Tab -->
+  <div class="top-strip">
+    <div class="seg on" data-page="library"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>脚本库</div>
+    <div class="seg" data-page="clicker"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/></svg>连点</div>
+    <div class="seg" data-page="recorder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M8 3h8M6 6h12"/></svg>录制</div>
+    <div class="seg" data-page="macro"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h12v5H6zM6 11h8v10H6z"/></svg>宏</div>
+    <div class="seg" data-page="sched"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>定时</div>
+    <div class="seg" data-page="ai"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 18l4-8 3 4 3-6 4 10"/></svg>脚本定制</div>
+    <div class="seg" data-page="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-2-1.2L14 3h-4l-.4 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6A7 7 0 0 0 5 12c0 .4 0 .8.1 1.2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 2 1.2L10 21h4l.4-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6c.1-.4.1-.8.1-1.2z"/></svg>设置</div>
+    <div class="top-spacer"></div>
+  </div>
+
+  <!-- 脚本库（资源管理器式） -->
+  <div class="tabpage on" id="page-library">
+    <div class="home-main">
+      <div class="panel">
+        <div class="lib-head">
+          <div class="lib-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>脚本库<span class="cnt" id="libCount">0 项</span></div>
+          <div class="search-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+            <input class="search-input" id="searchInput" type="text" placeholder="搜索名称或热键" autocomplete="off" />
+            <kbd>Ctrl K</kbd>
+          </div>
+          <div class="chips" id="chips">
+            <span class="chip on" data-f="all">全部</span>
+            <span class="chip" data-f="macro">宏</span>
+            <span class="chip" data-f="rec">录制</span>
+          </div>
+        </div>
+        <div class="tree" id="tree"></div>
+      </div>
+
+      <div class="panel explorer">
+        <div class="crumb-bar" id="crumbBar"></div>
+        <div class="detail" id="detailPane"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 连点 -->
+  <div class="tabpage plain" id="page-clicker">
+    <div class="panel">
+      <div class="pane-head"><h3>连点参数</h3></div>
+      <div class="field-grid">
+        <div class="field"><label>点击类型</label>
+          <div class="radios">
+            <span class="radio on"><i></i>鼠标左键</span>
+            <span class="radio"><i></i>鼠标中键</span>
+            <span class="radio"><i></i>鼠标右键</span>
+          </div>
+        </div>
+        <div class="field"><label>点击间隔</label>
+          <div class="combo"><span>高效模式 · <b>100 ms</b></span><span class="arr">▾</span></div>
+        </div>
+        <div class="field"><label>启停热键</label>
+          <div class="combo"><span><b>F8</b></span><span class="arr">▾</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="cta-bar">
+      <div><h2>按 F8 开始左键连点</h2><p>左键 · 间隔 100ms · 热键 F8</p></div>
+      <div class="cta-key">F8</div>
+    </div>
+  </div>
+
+  <!-- 录制 -->
+  <div class="tabpage plain" id="page-recorder">
+    <div class="panel">
+      <div class="crumb-bar" id="crumb-rec"></div>
+      <div class="tree" id="tree-rec"></div>
+    </div>
+    <div class="cta-bar">
+      <div><h2>按 F8 开始录制</h2><p>未选中录制时开始新录制</p></div>
+      <div class="cta-key">F8</div>
+    </div>
+  </div>
+
+  <!-- 宏 -->
+  <div class="tabpage plain" id="page-macro">
+    <div class="panel">
+      <div class="crumb-bar" id="crumb-macro"></div>
+      <div class="tree" id="tree-macro"></div>
+    </div>
+    <div class="cta-bar">
+      <div><h2>点击创建鼠标宏</h2><p>或选中后按热键运行</p></div>
+      <div class="cta-key">+</div>
+    </div>
+  </div>
+
+  <!-- 定时 -->
+  <div class="tabpage plain" id="page-sched">
+    <div class="panel">
+      <div class="crumb-bar" id="crumb-sched"></div>
+      <div class="tree" id="tree-sched"></div>
+    </div>
+    <div class="cta-bar">
+      <div><h2>新建定时任务</h2><p>选择脚本并设置执行时间</p></div>
+      <div class="cta-key">+</div>
+    </div>
+  </div>
+
+  <!-- 脚本定制（AI 助手对话） -->
+  <div class="tabpage plain" id="page-ai">
+    <div class="panel">
+      <div class="crumb-bar" id="crumb-ai"></div>
+      <div class="tree" id="tree-ai"></div>
+    </div>
+    <div class="cta-bar">
+      <div><h2>开始 AI 对话</h2><p>用自然语言描述需求，AI 生成或修改脚本</p></div>
+      <div class="cta-key">✦</div>
+    </div>
+  </div>
+
+  <!-- 设置 -->
+  <div class="tabpage plain" id="page-settings">
+    <div class="panel">
+      <div class="pane-head"><h3>设置</h3></div>
+      <div class="pane-body">
+        <div class="srow"><span class="s-label">全局启停热键</span><span class="s-val">F8</span></div>
+        <div class="srow"><span class="s-label">启动时最小化到托盘</span><span class="toggle"></span></div>
+        <div class="srow"><span class="s-label">主题</span><span class="s-val">极光 Arctic</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer-hint"><span><a id="footHk">修改全局启停热键</a></span></div>
+  <div class="toast" id="toast"></div>
+  <div class="hk-ov" id="hkOv">
+    <div class="hk-dlg">
+      <div class="hd">启停热键 <span class="x" id="hkClose">×</span></div>
+      <div class="bd">
+        <p>请按下要设置的热键<br><span class="sub">（按住设为启停，按住 0.2 秒算按住）</span></p>
+        <div class="val" id="hkVal">F8</div>
+      </div>
+      <div class="ft">
+        <button type="button" id="hkReset">重置热键</button>
+        <button type="button" class="danger" id="hkClear">清除热键</button>
+        <button type="button" id="hkCancel">取消</button>
+        <button type="button" class="primary" id="hkOk">确定</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 右键菜单 -->
+<div class="ctx" id="ctx"></div>
+
+<div class="note-strip">
+  <b>设计稿要点：</b>① 脚本库 = 资源管理器：左侧文件夹树 + 右侧内容区　② 录制 / 宏 / 定时 / 脚本定制 = 整行目录：双击文件夹进入其目录（内容随之切换），面包屑可回退　③ 文件夹无选中态，只能展开 / 收起 / 打开；单击文件夹取消脚本选中　④ 右键文件夹：打开 / 剪切 / 复制 / 粘贴 / 重命名 / 删除　⑤ 右键脚本：运行 / 收藏 / 编辑·优化·对话 / 设置热键 / 导入 / 导出 / 重命名 / 删除；脚本定制右键为「新建对话」，定时为「新建定时任务」。
+</div>
+
+<script>
+/* ── 演示数据 ─────────────────────────────────────────────── */
+const ITEMS = [
+  { id:"m1", name:"农场自动收菜",  type:"macro", hotkey:"F6", meta:"24 动作 · 08-01",  pinned:true,  steps:24 },
+  { id:"m2", name:"一键搬砖连招",  type:"macro", hotkey:"F7", meta:"18 动作 · 07-30",  pinned:true,  steps:18 },
+  { id:"m3", name:"挂机巡逻",      type:"macro", hotkey:"F9", meta:"31 动作 · 07-28",  pinned:false, steps:31 },
+  { id:"m4", name:"批量改名整理",  type:"macro", hotkey:"",   meta:"15 动作 · 07-24",  pinned:false, steps:15 },
+  { id:"m5", name:"弹窗自动关闭",  type:"macro", hotkey:"",   meta:"6 动作 · 07-20",   pinned:false, steps:6 },
+  { id:"r1", name:"自动签到",      type:"rec",   hotkey:"",   meta:"12 动作 · 07-29",  pinned:false, steps:12 },
+  { id:"r2", name:"连续翻页截图",  type:"rec",   hotkey:"",   meta:"8 动作 · 07-26",   pinned:false, steps:8 },
+  { id:"r3", name:"表格数据录入",  type:"rec",   hotkey:"F3", meta:"26 动作 · 07-22",  pinned:false, steps:26 },
+  { id:"r4", name:"窗口整理布局",  type:"rec",   hotkey:"",   meta:"14 动作 · 07-18",  pinned:false, steps:14 },
+  { id:"s1", name:"每天 08:00 · 农场自动收菜", type:"sched", hotkey:"", meta:"每天 08:00",  pinned:false, steps:0 },
+  { id:"s2", name:"工作日 09:30 · 自动签到",   type:"sched", hotkey:"", meta:"工作日 09:30", pinned:false, steps:0 },
+  { id:"a1", name:"帮我写一个自动登录脚本", type:"ai", hotkey:"", meta:"昨天 · 6 条消息",  pinned:false, steps:0 },
+  { id:"a2", name:"优化农场收菜脚本",       type:"ai", hotkey:"", meta:"3 天前 · 4 条消息", pinned:false, steps:0 },
+];
+const FOLDERS = [
+  { id:"f1", name:"游戏", items:["m2","m3"], subs:[
+    { id:"f2", name:"农场", items:["m1","r1"], subs:[] },
+  ]},
+  { id:"f3", name:"办公", items:["m4"], subs:[
+    { id:"f4", name:"表格", items:["r2","r3"], subs:[] },
+  ]},
+];
+const ROOT_ITEMS = ["m5","r4"];
+
+/* 各 Tab 的示范文件夹（录制 / 宏 / 定时 / 脚本定制） */
+const TYPE_TREES = {
+  rec: [
+    { id:"tr1", name:"游戏", items:["r1"], subs:[] },
+    { id:"tr2", name:"办公", items:["r2","r3"], subs:[] },
+  ],
+  macro: [
+    { id:"tm1", name:"游戏", items:["m2","m3"], subs:[
+      { id:"tm2", name:"农场", items:["m1"], subs:[] },
+    ]},
+    { id:"tm3", name:"办公", items:["m4"], subs:[] },
+  ],
+  sched: [
+    { id:"ts1", name:"每日任务", items:["s1"], subs:[] },
+    { id:"ts2", name:"工作日", items:["s2"], subs:[] },
+  ],
+  ai: [
+    { id:"ta1", name:"自动化", items:["a1"], subs:[] },
+    { id:"ta2", name:"脚本优化", items:["a2"], subs:[] },
+  ],
+};
+const TYPE_ROOT_ITEMS = { rec:["r4"], macro:["m5"], sched:[], ai:[] };
+
+const TYPE_META = {
+  macro: { label:"宏",  icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h12v5H6zM6 11h8v10H6z"/></svg>', cls:"" },
+  rec:   { label:"录制", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M8 3h8M6 6h12"/></svg>', cls:"rec" },
+  sched: { label:"定时", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>', cls:"sched" },
+  ai:    { label:"AI 对话", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 18l4-8 3 4 3-6 4 10"/></svg>', cls:"ai" },
+};
+
+let filter = "all";
+let query = "";
+let selected = null; // {kind:"item"|"folder", id}
+let view = { kind:"all" }; // all | fav | folder(id)
+const expanded = new Set(["fav", "all"]);
+(function collectAll(list) {
+  list.forEach(f => { expanded.add(f.id); collectAll(f.subs || []); });
+})(FOLDERS);
+Object.keys(TYPE_TREES).forEach(kind => {
+  expanded.add("t:" + kind + ":all");
+  (function walk(list) {
+    list.forEach(f => { expanded.add("t:" + kind + ":" + f.id); walk(f.subs || []); });
+  })(TYPE_TREES[kind]);
+});
+
+/* ── 工具 ─────────────────────────────────────────────────── */
+function itemById(id) { return ITEMS.find(x => x.id === id); }
+function scriptItems() { return ITEMS.filter(x => x.type === "macro" || x.type === "rec"); }
+function folderById(id) {
+  function walk(list) { for (const f of list) { if (f.id === id) return f; const r = walk(f.subs || []); if (r) return r; } return null; }
+  return walk(FOLDERS);
+}
+function folderChain(id) {
+  const chain = [];
+  function walk(list, path) {
+    for (const f of list) {
+      const p = path.concat(f);
+      if (f.id === id) { chain.push(...p); return true; }
+      if (walk(f.subs || [], p)) return true;
+    }
+    return false;
+  }
+  walk(FOLDERS, []);
+  return chain;
+}
+function folderItems(folder) { return (folder.items || []).map(itemById).filter(Boolean); }
+function allItems() { return ITEMS.slice(); }
+function countFolder(folder) {
+  let n = (folder.items || []).length;
+  (folder.subs || []).forEach(s => n += countFolder(s));
+  return n;
+}
+function typeLabel(t) { return TYPE_META[t].label; }
+
+/* ── 左侧目录树（资源管理器：文件夹 + 脚本叶子） ── */
+function itemVisible(item) {
+  if (filter !== "all" && item.type !== filter) return false;
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return item.name.toLowerCase().includes(q) ||
+    (item.hotkey && item.hotkey.toLowerCase().includes(q)) ||
+    typeLabel(item.type).includes(q);
+}
+
+function treeItemRow(item, depth) {
+  const tm = TYPE_META[item.type];
+  const on = selected && selected.kind === "item" && selected.id === item.id;
+  const cut = clipboard && clipboard.mode === "cut" && clipboard.id === item.id;
+  const hk = item.hotkey ? '<span class="hk-pill">' + item.hotkey + '</span>' : "";
+  return '<div class="tnode item ' + (on ? "on" : "") + (cut ? " cut" : "") + '" data-item="' + item.id + '" draggable="true" title="单击选中 · 双击打开 · 可拖拽移动" style="padding-left:' + (14 + depth * 18) + 'px">' +
+    '<span class="twist leaf">▶</span>' +
+    '<span class="t-ico ' + tm.cls + '">' + tm.icon + '</span>' +
+    '<span class="t-name">' + item.name + '</span>' + hk +
+  '</div>';
+}
+
+function treeRow(f, depth) {
+  const forceOpen = !!query.trim();
+  const isOpen = forceOpen || expanded.has(f.id);
+  const hasKids = (f.subs || []).length > 0 || (f.items || []).length > 0;
+  const cut = clipboard && clipboard.mode === "cut" && clipboard.id === f.id;
+  const kids = [];
+  if (isOpen) {
+    (f.subs || []).forEach(s => kids.push(treeRow(s, depth + 1)));
+    (f.items || []).forEach(id => {
+      const it = itemById(id);
+      if (it && itemVisible(it)) kids.push(treeItemRow(it, depth + 1));
+    });
+  }
+  return '<div class="tnode' + (cut ? " cut" : "") + '" data-folder="' + f.id + '" style="padding-left:' + (14 + depth * 18) + 'px">' +
+    '<span class="twist ' + (isOpen ? "open" : "") + (hasKids ? "" : " leaf") + '">▶</span>' +
+    '<span class="t-ico folder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h6l2 2h10v11H3z"/></svg></span>' +
+    '<span class="t-name">' + f.name + '</span>' +
+    '<span class="t-count">' + countFolder(f) + '</span>' +
+  '</div>' + kids.join("");
+}
+
+function viewNode(key, name, count, open, on, items) {
+  const ico = key === "fav"
+    ? '<span class="t-ico fav"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z"/></svg></span>'
+    : '<span class="t-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg></span>';
+  return '<div class="tnode ' + (on ? "on" : "") + '" data-view="' + key + '">' +
+    '<span class="twist ' + (open ? "open" : "") + '">▶</span>' +
+    ico +
+    '<span class="t-name">' + name + '</span><span class="t-count">' + count + '</span>' +
+  '</div>' + (open ? items.map(it => treeItemRow(it, 1)).join("") : "");
+}
+
+function renderTree() {
+  const favItems = scriptItems().filter(x => x.pinned).filter(itemVisible);
+  const favOn = selected && selected.kind === "view" && selected.id === "fav";
+  const rootItems = ROOT_ITEMS.map(itemById).filter(Boolean).filter(itemVisible);
+  const html =
+    viewNode("fav", "常用", scriptItems().filter(x => x.pinned).length, expanded.has("fav"), favOn, favItems) +
+    '<div class="fgroup-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h6l2 2h10v11H3z"/></svg>文件夹</div>' +
+    FOLDERS.map(f => treeRow(f, 0)).join("") +
+    (rootItems.length ? '<div class="fgroup-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>未分类</div>' + rootItems.map(it => treeItemRow(it, 0)).join("") : "") +
+    (FOLDERS.length || rootItems.length ? "" : '<div class="frow empty">右键此处新建文件夹</div>');
+  document.getElementById("tree").innerHTML = html;
+}
+
+/* ── 右侧：脚本详情 / 文件夹摘要 ── */
+function infoCells(item) {
+  if (item.type === "sched") {
+    const target = item.name.split("·").pop().trim();
+    return [["执行时间", item.meta, ""], ["关联脚本", target, ""], ["状态", "已启用", ""]];
+  }
+  if (item.type === "ai") {
+    return [["消息数", item.meta.split("·")[0].trim().split(" ")[0], "条"], ["最近", item.recent || "—", ""], ["状态", "就绪", ""]];
+  }
+  const hk = item.hotkey ? item.hotkey : "通用热键：F8";
+  return [
+    ["动作数", item.steps, "步"],
+    ["类型", item.type === "macro" ? "鼠标宏" : "录制", ""],
+    ["热键", hk, ""],
+  ];
+}
+
+function previewRows(item) {
+  if (item.type === "sched") {
+    const target = item.name.split("·").pop().trim();
+    return [
+      { i:"⏱", t: item.meta + " 运行「" + target + "」" },
+      { i:"✓", t:"上次执行：昨天 08:00 · 成功" },
+      { i:"▶", t:"下次执行：明天 08:00" },
+    ];
+  }
+  if (item.type === "ai") {
+    return [
+      { i:"你", t: item.name },
+      { i:"AI", t:"已根据需求生成脚本，等待你的确认…" },
+    ];
+  }
+  return [
+    { i:"1", t:"点击 (320, 240)" },
+    { i:"2", t:"等待 500ms" },
+    { i:"3", t:"移动 (480, 360)" },
+    { i:"4", t:"点击 (520, 300)" },
+    { i:"5", t:"按键 F" },
+    { i:"6", t:"等待 200ms" },
+  ];
+}
+
+function itemDetail(item) {
+  const tm = TYPE_META[item.type];
+  const star = (item.type === "macro" || item.type === "rec")
+    ? '<span class="ra star ' + (item.pinned ? "on" : "") + '" data-act="pin" title="收藏" style="opacity:1;position:static">' +
+      (item.pinned
+        ? '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z"/></svg>') +
+      '</span>'
+    : "";
+  const hk = (item.type === "macro" || item.type === "rec")
+    ? (item.hotkey
+        ? '<span class="hk-pill set" data-act="setHk" title="点击修改热键" style="font-size:12px;padding:3px 9px">' + item.hotkey + '</span>'
+        : '<button class="act-btn" data-act="setHk">设置热键</button>')
+    : "";
+  const sub = item.type === "macro" ? "鼠标宏 · " + item.meta
+    : item.type === "rec" ? "录制 · " + item.meta
+    : item.type === "sched" ? "定时任务 · " + item.meta
+    : "AI 对话 · " + item.meta;
+  const isSched = item.type === "sched";
+  const isAi = item.type === "ai";
+  const primary = isAi || isSched
+    ? { act:"open", label: isAi ? "打开对话" : "编辑定时" }
+    : { act:"run", label:"运行" };
+  const openBtn = (isAi || isSched) ? "" :
+    '<button class="act-btn" data-act="open">' + (item.type === "macro" ? "编辑" : "优化") + '</button>';
+  const extraRun = isSched ? '<button class="act-btn" data-act="run">立即执行</button>' : "";
+  const previewTitle = isAi ? "对话" : "动作预览";
+  return '<div class="d-top">' +
+      '<div class="d-ico ' + tm.cls + '">' + tm.icon + '</div>' +
+      '<div style="flex:1;min-width:0"><div class="d-name">' + item.name + star + hk + '</div>' +
+      '<div class="d-sub">' + sub + '</div></div>' +
+    '</div>' +
+    '<div class="d-info">' + infoCells(item).map(c => '<div class="d-cell"><div class="k">' + c[0] + '</div><div class="v">' + c[1] + (c[2] ? '<small>' + c[2] + '</small>' : "") + '</div></div>').join("") + '</div>' +
+    '<div class="d-actions">' +
+      '<button class="btn-p" data-act="' + primary.act + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 4.5v15l13-7.5z"/></svg>' + primary.label + '</button>' +
+      openBtn + extraRun +
+      '<button class="act-btn" data-act="rename">重命名</button>' +
+      '<button class="act-btn danger" data-act="del">删除</button>' +
+    '</div>' +
+    '<div class="d-preview"><div class="d-sec">' + previewTitle + '<span class="n">' + (isAi ? "" : item.steps + " 步") + '</span></div>' +
+      previewRows(item).map(r => '<div class="pv-row"><span class="i">' + r.i + '</span>' + r.t + '</div>').join("") +
+    '</div>';
+}
+
+function summaryHtml(name, line, hint) {
+  return '<div class="d-summary"><div class="d-sname">' + name + '</div>' +
+    '<div>' + line + '</div><div class="d-shint">' + hint + '</div></div>';
+}
+
+function itemRow(item) {
+  const tm = TYPE_META[item.type];
+  const hk = item.hotkey ? '<span class="hk-pill">' + item.hotkey + '</span>' : "";
+  const star = (item.type === "macro" || item.type === "rec")
+    ? '<span class="ra star ' + (item.pinned ? "on" : "") + '" data-act="pin" data-id="' + item.id + '" title="收藏">' +
+      (item.pinned
+        ? '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z"/></svg>') +
+      '</span>'
+    : "";
+  const setHk = (item.type === "macro" || item.type === "rec") && !item.hotkey
+    ? '<span class="ra" data-act="setHk" data-id="' + item.id + '" title="设置热键"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M8 11v2M12 11v2M16 11v2"/></svg></span>'
+    : "";
+  const openLabel = item.type === "macro" ? "编辑" : item.type === "rec" ? "优化" : item.type === "sched" ? "编辑" : "对话";
+  const openIcon = item.type === "ai"
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 18l4-8 3 4 3-6 4 10"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>';
+  const on = selected && selected.kind === "item" && selected.id === item.id;
+  return '<div class="frow ' + (on ? "on" : "") + '" data-item="' + item.id + '" title="单击查看详情 · 双击打开">' +
+    '<span class="f-ico ' + tm.cls + '">' + tm.icon + '</span>' +
+    '<div class="frow-main"><span class="frow-name">' + item.name + '</span>' + hk + '</div>' +
+    '<span class="frow-meta">' + item.meta + '</span>' +
+    '<span class="row-acts">' + star + setHk +
+      '<span class="ra" data-act="open" data-id="' + item.id + '" title="' + openLabel + '">' + openIcon + '</span>' +
+      '<span class="ra del" data-act="del" data-id="' + item.id + '" title="删除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></span>' +
+    '</span>' +
+  '</div>';
+}
+
+function folderContentsHtml(name, items) {
+  return '<div class="d-fname">' + name + '</div>' +
+    '<div class="d-fcount">共 ' + items.length + ' 项</div>' +
+    '<div class="d-flist">' +
+      (items.length ? items.map(itemRow).join("") : '<div class="frow empty">此文件夹为空</div>') +
+    '</div>';
+}
+
+function renderDetail() {
+  const pane = document.getElementById("detailPane");
+  if (selected && selected.kind === "item") {
+    const item = itemById(selected.id);
+    pane.innerHTML = item && (item.type === "macro" || item.type === "rec")
+      ? itemDetail(item)
+      : summaryHtml("脚本库", scriptItems().length + " 项", "单击脚本查看详情 · 双击打开");
+    return;
+  }
+  if (view.kind === "folder") {
+    const f = folderById(view.id);
+    if (!f) { pane.innerHTML = summaryHtml("脚本库", "", ""); return; }
+    const items = folderItems(f);
+    pane.innerHTML = folderContentsHtml(f.name, items);
+    return;
+  }
+  if (view.kind === "fav") {
+    const items = scriptItems().filter(x => x.pinned);
+    pane.innerHTML = folderContentsHtml("常用", items);
+    return;
+  }
+  else pane.innerHTML = summaryHtml("脚本库", scriptItems().length + " 项", "单击脚本查看详情 · 双击打开");
+}
+
+function renderBreadcrumb() {
+  let parts;
+  if (view.kind === "fav") parts = [{ id:"fav", name:"常用" }];
+  else if (view.kind === "all") parts = [];
+  else {
+    const chain = folderChain(view.id);
+    parts = chain.map(f => ({ id:f.id, name:f.name }));
+  }
+  const html = '<span class="crumb" data-jump="home">脚本库</span>' +
+    parts.map((p, i) => '<span class="sep">/</span><span class="crumb" data-jump="' + p.id + '">' + p.name + '</span>').join("");
+  document.getElementById("crumbBar").innerHTML = html;
+}
+
+function renderExplorer() {
+  renderTree();
+  renderBreadcrumb();
+  renderDetail();
+  document.getElementById("libCount").textContent = scriptItems().length + " 项";
+}
+
+/* ── Tab 页文件夹树（录制 / 宏 / 定时 / 脚本定制） ── */
+const tabFolderSel = {}; // kind -> folderId | null（null = 全部）
+const TYPE_TITLES = { rec:"录制", macro:"宏", sched:"定时", ai:"脚本定制" };
+const TYPE_PAGE = { rec:"recorder", macro:"macro", sched:"sched", ai:"ai" };
+const PAGE_KIND = { recorder:"rec", macro:"macro", sched:"sched", ai:"ai" };
+
+function countTypeFolder(kind, f) {
+  let n = (f.items || []).length;
+  (f.subs || []).forEach(s => n += countTypeFolder(kind, s));
+  return n;
+}
+function findTypeFolder(kind, id) {
+  function walk(list) { for (const f of list) { if (f.id === id) return f; const r = walk(f.subs || []); if (r) return r; } return null; }
+  return walk(TYPE_TREES[kind]);
+}
+
+function typeTreeRow(kind, f, depth) {
+  const key = "t:" + kind + ":" + f.id;
+  const isOpen = expanded.has(key);
+  const hasKids = (f.subs || []).length > 0 || (f.items || []).length > 0;
+  const cut = clipboard && clipboard.mode === "cut" && clipboard.id === f.id;
+  const kids = [];
+  if (isOpen) {
+    (f.subs || []).forEach(s => kids.push(typeTreeRow(kind, s, depth + 1)));
+    (f.items || []).forEach(id => { const it = itemById(id); if (it && itemVisible(it)) kids.push(treeItemRow(it, depth + 1)); });
+  }
+  return '<div class="tnode' + (cut ? " cut" : "") + '" data-folder="' + f.id + '" style="padding-left:' + (14 + depth * 18) + 'px">' +
+    '<span class="twist ' + (isOpen ? "open" : "") + (hasKids ? "" : " leaf") + '">▶</span>' +
+    '<span class="t-ico folder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h6l2 2h10v11H3z"/></svg></span>' +
+    '<span class="t-name">' + f.name + '</span><span class="t-count">' + countTypeFolder(kind, f) + '</span>' +
+  '</div>' + kids.join("");
+}
+
+function renderTypeTree(kind) {
+  const curId = tabFolderSel[kind];
+  const cur = curId ? findTypeFolder(kind, curId) : null;
+  const folders = cur ? (cur.subs || []) : TYPE_TREES[kind];
+  const items = (cur ? (cur.items || []) : TYPE_ROOT_ITEMS[kind]).map(itemById).filter(Boolean).filter(itemVisible);
+  const html =
+    (folders.length ? '<div class="fgroup-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h6l2 2h10v11H3z"/></svg>文件夹</div>' + folders.map(f => typeTreeRow(kind, f, 0)).join("") : "") +
+    (items.length ? '<div class="fgroup-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>' + (cur ? "项目" : "未分类") + '</div>' + items.map(it => treeItemRow(it, 0)).join("") : "") +
+    ((!folders.length && !items.length) ? '<div class="frow empty">此文件夹为空</div>' : "");
+  document.getElementById("tree-" + kind).innerHTML = html;
+}
+
+function typeFolderChain(kind, id) {
+  const chain = [];
+  (function walk(list, path) {
+    for (const f of list) {
+      const p = path.concat(f);
+      if (f.id === id) { chain.push(...p); return true; }
+      if (walk(f.subs || [], p)) return true;
+    }
+    return false;
+  })(TYPE_TREES[kind], []);
+  return chain;
+}
+
+function renderTypeBreadcrumb(kind) {
+  const parts = [{ label: TYPE_TITLES[kind], jump: "type-" + kind }];
+  const selF = tabFolderSel[kind];
+  if (selF) {
+    typeFolderChain(kind, selF).forEach(f => parts.push({ label: f.name, jump: "folder:" + kind + ":" + f.id }));
+  }
+  const html = '<span class="crumb" data-jump="home">脚本库</span>' +
+    parts.map((p, i) => '<span class="sep">/</span><span class="crumb' + (i === parts.length - 1 ? " on" : "") + '" data-jump="' + p.jump + '">' + p.label + '</span>').join("") +
+    '<span class="crumb-acts"><span class="cnt">' + ITEMS.filter(x => x.type === kind).length + ' 个</span></span>';
+  document.getElementById("crumb-" + kind).innerHTML = html;
+}
+
+function refresh() {
+  renderExplorer();
+  Object.keys(TYPE_TREES).forEach(renderTypeTree);
+  Object.keys(TYPE_TREES).forEach(renderTypeBreadcrumb);
+}
+
+function updateTreeSelectionUi() {
+  document.querySelectorAll("#tree .tnode").forEach(n => {
+    let on = false;
+    if (selected && n.dataset.item && selected.kind === "item" && n.dataset.item === selected.id) on = true;
+    if (selected && n.dataset.view && selected.kind === "view" && n.dataset.view === selected.id) on = true;
+    n.classList.toggle("on", on);
+  });
+}
+
+function updateTypeTreeSelectionUi(kind) {
+  const itemOn = selected && selected.kind === "item";
+  document.querySelectorAll("#tree-" + kind + " .tnode").forEach(n => {
+    let on = false;
+    if (itemOn && n.dataset.item && n.dataset.item === selected.id) on = true;
+    n.classList.toggle("on", on);
+  });
+}
+
+/* ── 右键菜单 ─────────────────────────────────────────────── */
+const ctxEl = document.getElementById("ctx");
+function showMenu(x, y, items, payload) {
+  ctxEl.innerHTML = items.map(it =>
+    (it.sep ? '<div class="ctx-sep"></div>' :
+      '<div class="ctx-item ' + (it.danger ? "danger" : "") + '" data-act="' + it.act + '">' + (it.icon || "") + it.label + '</div>')
+  ).join("");
+  ctxEl.classList.add("show");
+  const r = ctxEl.getBoundingClientRect();
+  const appR = document.getElementById("app").getBoundingClientRect();
+  let left = x, top = y;
+  if (left + r.width > appR.right - 6) left = appR.right - r.width - 6;
+  if (top + r.height > appR.bottom - 6) top = appR.bottom - r.height - 6;
+  left = Math.max(appR.left + 6, left);
+  top = Math.max(appR.top + 6, top);
+  ctxEl.style.left = left + "px";
+  ctxEl.style.top = top + "px";
+  ctxEl._payload = payload || {};
+}
+function hideMenu() { ctxEl.classList.remove("show"); ctxEl._payload = null; }
+
+function itemMenu(item) {
+  const m = [];
+  const isScript = item.type === "macro" || item.type === "rec";
+  if (isScript) {
+    m.push({ act:"run", label:"运行", icon:'<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 4.5v15l13-7.5z"/></svg>' });
+    m.push({ act:"pin", label: item.pinned ? "取消收藏" : "收藏", icon:'<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z"/></svg>' });
+  }
+  m.push({ act:"open", label: item.type === "macro" ? "编辑" : item.type === "rec" ? "优化" : item.type === "sched" ? "编辑" : "对话",
+           icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>' });
+  if (isScript) {
+    m.push({ act:"setHk", label:"设置热键", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M8 11v2M12 11v2M16 11v2"/></svg>' });
+    m.push({ sep:true });
+    m.push({ act:"import", label:"导入", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v3h16v-3"/></svg>' });
+    m.push({ act:"export", label:"导出", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 17v3h16v-3"/></svg>' });
+  }
+  m.push({ sep:true });
+  m.push({ act:"rename", label:"重命名", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h16M6 16l6-11 6 11"/></svg>' });
+  m.push({ act:"del", label:"删除", danger:true, icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>' });
+  return m;
+}
+function folderMenu(f) {
+  const m = [
+    { act:"openFolder", label:"打开", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h6l2 2h10v11H3z"/></svg>' },
+    { sep:true },
+    { act:"cutFolder", label:"剪切", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M8.5 8.5L20 19M8.5 15.5L20 5"/></svg>' },
+    { act:"copyFolder", label:"复制", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>' },
+  ];
+  if (clipboard) m.push({ act:"paste", label:"粘贴", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v3h16v-3"/></svg>' });
+  m.push({ sep:true });
+  m.push({ act:"renameFolder", label:"重命名", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h16M6 16l6-11 6 11"/></svg>' });
+  m.push({ act:"delFolder", label:"删除", danger:true, icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>' });
+  return m;
+}
+function blankMenu(parentFolderId, kind) {
+  const m = [];
+  if (clipboard) m.push({ act:"paste", label:"粘贴", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v3h16v-3"/></svg>' });
+  m.push({ act:"newFolderIn", label:"新建文件夹", icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h6l2 2h10v11H3z"/><path d="M12 12v6M9 15h6"/></svg>' });
+  const newLabel = kind === "ai" ? "新建对话" : kind === "sched" ? "新建定时任务" : kind === "rec" ? "新建录制" : kind === "macro" ? "新建宏" : "新建脚本";
+  m.push({ act:"newScript", label:newLabel, icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>' });
+  return m;
+}
+
+document.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const appR = document.getElementById("app").getBoundingClientRect();
+  const inApp = e.clientX >= appR.left && e.clientX <= appR.right && e.clientY >= appR.top && e.clientY <= appR.bottom;
+  if (!inApp) { hideMenu(); return; }
+  const typeTreeEl = e.target.closest("#tree-rec,#tree-macro,#tree-sched,#tree-ai");
+  const kind = typeTreeEl ? typeTreeEl.id.slice(5) : "lib";
+  const itemEl = e.target.closest("[data-item]");
+  const folderEl = e.target.closest("[data-folder]");
+  if (itemEl) {
+    const item = itemById(itemEl.dataset.item);
+    if (!item) return;
+    selected = { kind:"item", id:item.id };
+    refresh();
+    showMenu(e.clientX, e.clientY, itemMenu(item), { target:item, kind });
+  } else if (folderEl) {
+    const f = kind === "lib" ? folderById(folderEl.dataset.folder) : findTypeFolder(kind, folderEl.dataset.folder);
+    if (!f) return;
+    selected = null;
+    refresh();
+    showMenu(e.clientX, e.clientY, folderMenu(f), { target:f, kind, folderId:f.id });
+  } else {
+    const pageEl = document.querySelector(".tabpage.on");
+    let parent = null;
+    let k = "lib";
+    if (pageEl && pageEl.id === "page-library") {
+      if (view.kind === "folder") parent = view.id;
+    } else if (pageEl) {
+      k = PAGE_KIND[pageEl.id.slice(5)] || "lib";
+      parent = tabFolderSel[k] || null;
+    }
+    showMenu(e.clientX, e.clientY, blankMenu(parent, k), { kind:k, parentId:parent, folderId:parent });
+  }
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#ctx")) hideMenu();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu(); });
+
+ctxEl.addEventListener("click", (e) => {
+  const it = e.target.closest(".ctx-item");
+  if (!it) return;
+  const payload = ctxEl._payload || {};
+  hideMenu();
+  doAction(it.dataset.act, payload);
+});
+
+/* ── 动作 ─────────────────────────────────────────────────── */
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.innerHTML = msg;
+  t.classList.add("show");
+  clearTimeout(t._t);
+  t._t = setTimeout(() => t.classList.remove("show"), 1800);
+}
+function runAction(item) { toast("开始运行 <b>" + item.name + "</b>（演示）"); }
+function openAction(item) {
+  const label = item.type === "macro" ? "编辑器" : item.type === "rec" ? "优化器" : item.type === "sched" ? "定时设置" : "AI 对话";
+  toast("打开" + label + "（演示）");
+}
+
+/* ── 剪贴板：剪切 / 复制 / 粘贴（资源管理器式） ── */
+let clipboard = null; // { mode:"cut"|"copy", kind, id, isFolder }
+
+function folderParentList(kind, id) {
+  const src = kind === "lib" ? FOLDERS : TYPE_TREES[kind];
+  const res = { list: src, idx: -1 };
+  (function walk(list) {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === id) { res.list = list; res.idx = i; return true; }
+      if (walk(list[i].subs || [])) return true;
+    }
+    return false;
+  })(src);
+  return res;
+}
+function folderAncestors(kind, id) {
+  const chain = [];
+  const src = kind === "lib" ? FOLDERS : TYPE_TREES[kind];
+  (function walk(list, path) {
+    for (const f of list) {
+      if (f.id === id) { chain.push(...path); return true; }
+      if (walk(f.subs || [], path.concat(f))) return true;
+    }
+    return false;
+  })(src, []);
+  return chain;
+}
+function insertFolder(kind, f, targetFolderId) {
+  if (targetFolderId == null) {
+    if (kind === "lib") FOLDERS.push(f); else TYPE_TREES[kind].push(f);
+  } else {
+    const t = kind === "lib" ? folderById(targetFolderId) : findTypeFolder(kind, targetFolderId);
+    if (t) { (t.subs = t.subs || []).push(f); expanded.add(targetFolderId); }
+  }
+  expanded.add(f.id);
+}
+function cloneFolder(f) {
+  const cp = JSON.parse(JSON.stringify(f));
+  const stamp = Date.now();
+  cp.id = "f" + stamp;
+  (function walk(list, seed) {
+    (list || []).forEach((x, i) => { x.id = "f" + stamp + "-" + seed + "-" + i; walk(x.subs, seed + "-" + i); });
+  })(cp.subs, "s");
+  return cp;
+}
+function pasteClipboard(payload) {
+  const kb = clipboard;
+  if (!kb) return;
+  if (kb.kind !== (payload.kind || "lib")) { toast("不能跨目录粘贴"); return; }
+  const targetFolder = payload.folderId || null;
+  if (!kb.isFolder) return;
+  if (kb.mode === "cut") {
+    if (folderAncestors(kb.kind, targetFolder).some(f => f.id === kb.id)) { toast("不能移动到自身内部"); return; }
+    const p = folderParentList(kb.kind, kb.id);
+    if (p.idx < 0) return;
+    const f = p.list[p.idx];
+    p.list.splice(p.idx, 1);
+    insertFolder(kb.kind, f, targetFolder);
+    toast("已移动文件夹");
+  } else {
+    const src = kb.kind === "lib" ? folderById(kb.id) : findTypeFolder(kb.kind, kb.id);
+    if (!src) return;
+    insertFolder(kb.kind, cloneFolder(src), targetFolder);
+    toast("已复制文件夹");
+  }
+  clipboard = null;
+  refresh();
+}
+function openFolder(payload) {
+  const k = payload.kind || "lib";
+  const id = payload.folderId;
+  if (!id) return;
+  if (k === "lib") {
+    view = { kind:"folder", id };
+    selected = null;
+    renderExplorer();
+  } else {
+    setPage(TYPE_PAGE[k]);
+    tabFolderSel[k] = id;
+    selected = null;
+    renderTypeTree(k);
+    renderTypeBreadcrumb(k);
+    renderDetail();
+  }
+}
+function createTypeFolder(kind, parentId) {
+  const v = prompt("文件夹名称", "新建文件夹");
+  if (!v || !v.trim()) return;
+  const f = { id:"tf" + Date.now(), name:v.trim(), items:[], subs:[] };
+  if (parentId) {
+    const p = findTypeFolder(kind, parentId);
+    if (p) { (p.subs = p.subs || []).push(f); expanded.add("t:" + kind + ":" + parentId); }
+  } else {
+    TYPE_TREES[kind].push(f);
+  }
+  expanded.add("t:" + kind + ":" + f.id);
+  renderTypeTree(kind);
+  renderTypeBreadcrumb(kind);
+}
+function removeTypeFolder(kind, id) {
+  function walk(list) {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === id) { list.splice(i, 1); return true; }
+      if (walk(list[i].subs || [])) return true;
+    }
+    return false;
+  }
+  walk(TYPE_TREES[kind]);
+  if (tabFolderSel[kind] === id) tabFolderSel[kind] = null;
+}
+
+function doAction(act, payload) {
+  payload = payload || {};
+  const target = payload.target;
+  const kind = payload.kind || "lib";
+  if (act === "newScript") {
+    const label = kind === "ai" ? "新建对话" : kind === "sched" ? "新建定时任务" : kind === "rec" ? "新建录制" : kind === "macro" ? "新建宏" : "新建脚本";
+    toast(label + "（演示）");
+    return;
+  }
+  if (act === "newFolder" || act === "newFolderIn") {
+    const parentId = payload.parentId || payload.folderId || null;
+    if (kind !== "lib") createTypeFolder(kind, parentId);
+    else createFolder(parentId);
+    return;
+  }
+  if (act === "import") { toast("导入脚本（演示）"); return; }
+  if (act === "export") { if (target) toast("导出「" + target.name + "」（演示）"); return; }
+  if (act === "openFolder") { openFolder(payload); return; }
+  if (act === "cutFolder") { clipboard = { mode:"cut", kind, id:target.id, isFolder:true }; toast("已剪切「" + target.name + "」"); refresh(); return; }
+  if (act === "copyFolder") { clipboard = { mode:"copy", kind, id:target.id, isFolder:true }; toast("已复制「" + target.name + "」"); refresh(); return; }
+  if (act === "paste") { pasteClipboard(payload); return; }
+  if (act === "delFolder") {
+    if (kind !== "lib") { removeTypeFolder(kind, target.id); toast("已删除文件夹"); renderTypeTree(kind); renderTypeBreadcrumb(kind); }
+    else { removeFolder(target.id); toast("已删除文件夹"); refresh(); }
+    return;
+  }
+  if (!target) return;
+  if (act === "pin") { target.pinned = !target.pinned; toast(target.pinned ? "已收藏" : "已取消收藏"); refresh(); }
+  else if (act === "run") runAction(target);
+  else if (act === "open") openAction(target);
+  else if (act === "setHk") {
+    const v = prompt("设置热键（如 F6）", target.hotkey || "F6");
+    if (v) { target.hotkey = v.trim(); toast("热键已设为 " + v.trim()); refresh(); }
+  } else if (act === "rename") {
+    const v = prompt("重命名", target.name);
+    if (v && v.trim()) { target.name = v.trim(); refresh(); }
+  } else if (act === "del") {
+    const i = ITEMS.indexOf(target);
+    if (i >= 0) { ITEMS.splice(i, 1); toast("已删除"); refresh(); }
+  } else if (act === "renameFolder") {
+    const v = prompt("重命名文件夹", target.name);
+    if (v && v.trim()) { target.name = v.trim(); refresh(); }
+  }
+}
+
+function createFolder(parentId) {
+  const v = prompt("文件夹名称", "新建文件夹");
+  if (!v || !v.trim()) return;
+  const f = { id:"f" + Date.now(), name:v.trim(), items:[], subs:[] };
+  if (parentId) {
+    const p = folderById(parentId);
+    if (p) { (p.subs = p.subs || []).push(f); expanded.add(parentId); }
+  } else {
+    FOLDERS.push(f);
+  }
+  expanded.add(f.id);
+  refresh();
+}
+function removeFolder(id) {
+  function walk(list) {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === id) { list.splice(i, 1); return true; }
+      if (walk(list[i].subs || [])) return true;
+    }
+    return false;
+  }
+  walk(FOLDERS);
+  if (view.kind === "folder" && view.id === id) view = { kind:"all" };
+}
+
+/* ── 事件绑定 ─────────────────────────────────────────────── */
+function setPage(name) {
+  document.querySelectorAll(".tabpage").forEach(p => p.classList.remove("on"));
+  document.querySelectorAll(".seg").forEach(s => s.classList.remove("on"));
+  const page = document.getElementById("page-" + name);
+  if (page) page.classList.add("on");
+  const seg = document.querySelector('.seg[data-page="' + name + '"]');
+  if (seg) seg.classList.add("on");
+}
+
+document.getElementById("tree").addEventListener("click", (e) => {
+  const viewEl = e.target.closest("[data-view]");
+  const folderEl = e.target.closest("[data-folder]");
+  const itemEl = e.target.closest("[data-item]");
+  const twist = e.target.closest(".twist");
+  if (viewEl) {
+    if (twist) {
+      const k = viewEl.dataset.view;
+      if (expanded.has(k)) expanded.delete(k); else expanded.add(k);
+      renderTree();
+      return;
+    }
+    view = { kind:viewEl.dataset.view };
+    selected = { kind:"view", id:viewEl.dataset.view };
+    renderBreadcrumb();
+    updateTreeSelectionUi();
+    renderDetail();
+    return;
+  }
+  if (folderEl) {
+    if (twist) {
+      const id = folderEl.dataset.folder;
+      if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+      renderTree();
+      return;
+    }
+    const id = folderEl.dataset.folder;
+    view = { kind:"folder", id };
+    selected = null;
+    renderExplorer();
+    return;
+  }
+  if (itemEl) {
+    const id = itemEl.dataset.item;
+    selected = (selected && selected.kind === "item" && selected.id === id) ? null : { kind:"item", id };
+    updateTreeSelectionUi();
+    renderDetail();
+  }
+});
+
+document.getElementById("tree").addEventListener("dblclick", (e) => {
+  const folderEl = e.target.closest("[data-folder]");
+  const itemEl = e.target.closest("[data-item]");
+  if (folderEl) {
+    const id = folderEl.dataset.folder;
+    expanded.add(id);
+    view = { kind:"folder", id };
+    selected = null;
+    renderExplorer();
+    const row = document.querySelector('#tree .tnode[data-folder="' + id + '"]');
+    if (row) row.scrollIntoView({ block:"nearest" });
+  } else if (itemEl) {
+    const item = itemById(itemEl.dataset.item);
+    if (item) openAction(item);
+  }
+});
+
+function bindTypeTree(kind) {
+  const el = document.getElementById("tree-" + kind);
+  el.addEventListener("click", (e) => {
+    const twist = e.target.closest(".twist");
+    const folderEl = e.target.closest("[data-folder]");
+    const itemEl = e.target.closest("[data-item]");
+    if (folderEl) {
+      if (twist) {
+        const k = "t:" + kind + ":" + folderEl.dataset.folder;
+        if (expanded.has(k)) expanded.delete(k); else expanded.add(k);
+        renderTypeTree(kind);
+        return;
+      }
+      selected = null;
+      updateTypeTreeSelectionUi(kind);
+      updateTreeSelectionUi();
+      renderDetail();
+      return;
+    }
+    if (itemEl) {
+      const id = itemEl.dataset.item;
+      selected = (selected && selected.kind === "item" && selected.id === id) ? null : { kind:"item", id };
+      updateTypeTreeSelectionUi(kind);
+      updateTreeSelectionUi();
+      renderDetail();
+    }
+  });
+  el.addEventListener("dblclick", (e) => {
+    const folderEl = e.target.closest("[data-folder]");
+    const itemEl = e.target.closest("[data-item]");
+    if (folderEl) {
+      expanded.add("t:" + kind + ":" + folderEl.dataset.folder);
+      tabFolderSel[kind] = folderEl.dataset.folder;
+      selected = null;
+      renderTypeTree(kind);
+      renderTypeBreadcrumb(kind);
+      document.getElementById("tree-" + kind).scrollTop = 0;
+    } else if (itemEl) {
+      const item = itemById(itemEl.dataset.item);
+      if (item) openAction(item);
+    }
+  });
+}
+Object.keys(TYPE_TREES).forEach(bindTypeTree);
+
+/* ── 拖拽：移动 / 排序 / 移入移出文件夹（资源管理器式） ── */
+let dragInfo = null;
+function clearDropHighlights() {
+  document.querySelectorAll(".drop-on").forEach(n => n.classList.remove("drop-on"));
+}
+function itemFolderId(kind, id) {
+  const src = kind === "lib" ? FOLDERS : TYPE_TREES[kind];
+  let found = null;
+  (function walk(list) {
+    for (const f of list) {
+      if ((f.items || []).indexOf(id) >= 0) { found = f.id; return true; }
+      if (walk(f.subs || [])) return true;
+    }
+    return false;
+  })(src);
+  return found;
+}
+function removeFromContainer(kind, id) {
+  const src = kind === "lib" ? FOLDERS : TYPE_TREES[kind];
+  (function walk(list) {
+    for (const f of list) {
+      const i = (f.items || []).indexOf(id);
+      if (i >= 0) { f.items.splice(i, 1); return true; }
+      if (walk(f.subs || [])) return true;
+    }
+    return false;
+  })(src);
+  const root = kind === "lib" ? ROOT_ITEMS : TYPE_ROOT_ITEMS[kind];
+  const ri = root.indexOf(id);
+  if (ri >= 0) root.splice(ri, 1);
+}
+function insertInto(kind, id, folderId, beforeId) {
+  let arr;
+  if (folderId == null) {
+    arr = kind === "lib" ? ROOT_ITEMS : TYPE_ROOT_ITEMS[kind];
+  } else {
+    const f = kind === "lib" ? folderById(folderId) : findTypeFolder(kind, folderId);
+    if (!f) return;
+    arr = f.items = f.items || [];
+  }
+  const bi = beforeId ? arr.indexOf(beforeId) : -1;
+  if (bi >= 0) arr.splice(bi, 0, id); else arr.push(id);
+}
+function performMove(kind, id, folderId, beforeId) {
+  if (beforeId === id) return;
+  if (beforeId === undefined && itemFolderId(kind, id) === folderId) return;
+  removeFromContainer(kind, id);
+  insertInto(kind, id, folderId, beforeId);
+  refresh();
+}
+function initDragTree(treeEl, kind) {
+  treeEl.addEventListener("dragstart", (e) => {
+    const itemEl = e.target.closest("[data-item]");
+    if (!itemEl) return;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", itemEl.dataset.item);
+    dragInfo = { id: itemEl.dataset.item, kind: kind || "lib" };
+    itemEl.classList.add("dragging");
+  });
+  treeEl.addEventListener("dragend", () => {
+    dragInfo = null;
+    clearDropHighlights();
+    document.querySelectorAll(".dragging").forEach(n => n.classList.remove("dragging"));
+  });
+  treeEl.addEventListener("dragover", (e) => {
+    if (!dragInfo || dragInfo.kind !== (kind || "lib")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    clearDropHighlights();
+    const target = e.target.closest("[data-folder]") || e.target.closest("[data-item]") || treeEl;
+    target.classList.add("drop-on");
+  });
+  treeEl.addEventListener("drop", (e) => {
+    if (!dragInfo || dragInfo.kind !== (kind || "lib")) return;
+    e.preventDefault();
+    const k = kind || "lib";
+    const folderEl = e.target.closest("[data-folder]");
+    const itemEl = e.target.closest("[data-item]");
+    if (folderEl) performMove(k, dragInfo.id, folderEl.dataset.folder, undefined);
+    else if (itemEl) performMove(k, dragInfo.id, itemFolderId(k, itemEl.dataset.item), itemEl.dataset.item);
+    else {
+      const curFolder = k === "lib" ? (view.kind === "folder" ? view.id : null) : (tabFolderSel[k] || null);
+      performMove(k, dragInfo.id, curFolder, undefined);
+    }
+    dragInfo = null;
+    clearDropHighlights();
+  });
+}
+initDragTree(document.getElementById("tree"), "lib");
+Object.keys(TYPE_TREES).forEach(kind => initDragTree(document.getElementById("tree-" + kind), kind));
+
+function crumbClick(e) {
+  const jump = e.target.closest("[data-jump]");
+  if (!jump) return;
+  const id = jump.dataset.jump;
+  if (id === "home") {
+    setPage("library");
+    view = { kind:"all" };
+    selected = { kind:"view", id:"all" };
+    refresh();
+    return;
+  }
+  if (id.indexOf("type-") === 0) {
+    const kind = id.slice(5);
+    setPage(TYPE_PAGE[kind]);
+    tabFolderSel[kind] = null;
+    renderTypeTree(kind);
+    renderTypeBreadcrumb(kind);
+    return;
+  }
+  if (id.indexOf("folder:") === 0) {
+    const bits = id.split(":");
+    const kind = bits[1];
+    setPage(TYPE_PAGE[kind]);
+    tabFolderSel[kind] = bits[2];
+    renderTypeTree(kind);
+    renderTypeBreadcrumb(kind);
+    return;
+  }
+  if (id === "all" || id === "fav") { view = { kind:id }; selected = { kind:"view", id }; }
+  else { view = { kind:"folder", id }; selected = { kind:"folder", id }; }
+  refresh();
+}
+document.querySelectorAll(".crumb-bar").forEach(bar => bar.addEventListener("click", crumbClick));
+
+document.getElementById("detailPane").addEventListener("click", (e) => {
+  const actEl = e.target.closest("[data-act]");
+  if (actEl) {
+    const item = itemById(actEl.dataset.id) || (selected && selected.kind === "item" ? itemById(selected.id) : null);
+    if (!item) return;
+    if (actEl.dataset.act === "pin") { item.pinned = !item.pinned; refresh(); }
+    else if (actEl.dataset.act === "run") { if (item.type === "ai") openAction(item); else runAction(item); }
+    else if (actEl.dataset.act === "open") openAction(item);
+    else if (actEl.dataset.act === "setHk") {
+      const v = prompt("设置热键（如 F6）", item.hotkey || "F6");
+      if (v) { item.hotkey = v.trim(); refresh(); }
+    } else if (actEl.dataset.act === "rename") {
+      const v = prompt("重命名", item.name);
+      if (v && v.trim()) { item.name = v.trim(); refresh(); }
+    } else if (actEl.dataset.act === "del") {
+      const i = ITEMS.indexOf(item);
+      if (i >= 0) { ITEMS.splice(i, 1); refresh(); }
+    }
+    return;
+  }
+  const itemEl = e.target.closest("[data-item]");
+  if (!itemEl) return;
+  selected = { kind:"item", id:itemEl.dataset.item };
+  renderDetail();
+  updateTreeSelectionUi();
+});
+
+document.getElementById("detailPane").addEventListener("dblclick", (e) => {
+  const itemEl = e.target.closest("[data-item]");
+  if (!itemEl) return;
+  const item = itemById(itemEl.dataset.item);
+  if (item) openAction(item);
+});
+
+document.getElementById("chips").addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  document.querySelectorAll("#chips .chip").forEach(c => c.classList.remove("on"));
+  chip.classList.add("on");
+  filter = chip.dataset.f;
+  renderTree();
+});
+
+const searchInput = document.getElementById("searchInput");
+searchInput.addEventListener("input", () => { query = searchInput.value; renderTree(); renderDetail(); });
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    searchInput.focus();
+    searchInput.select();
+  }
+});
+
+document.querySelectorAll(".seg").forEach(seg => {
+  seg.addEventListener("click", () => {
+    setPage(seg.dataset.page);
+    if (seg.dataset.page === "library") {
+      view = { kind:"all" };
+      selected = { kind:"view", id:"all" };
+      refresh();
+    }
+  });
+});
+
+document.querySelectorAll(".srow .toggle").forEach(t => t.addEventListener("click", () => t.classList.toggle("off")));
+document.querySelectorAll("#page-clicker .radio, #page-clicker .combo").forEach(el =>
+  el.addEventListener("click", () => {
+    if (el.classList.contains("radio")) {
+      document.querySelectorAll("#page-clicker .radio").forEach(r => r.classList.remove("on"));
+      el.classList.add("on");
+    }
+    toast("已选择（演示）");
+  })
+);
+
+(function () {
+  const ov = document.getElementById("hkOv");
+  const val = document.getElementById("hkVal");
+  const open = () => { if (ov) ov.classList.add("show"); };
+  const close = () => { if (ov) ov.classList.remove("show"); };
+  document.getElementById("footHk")?.addEventListener("click", open);
+  document.getElementById("hkClose")?.addEventListener("click", close);
+  document.getElementById("hkCancel")?.addEventListener("click", close);
+  document.getElementById("hkOk")?.addEventListener("click", () => { toast("启停热键已更新"); close(); });
+  document.getElementById("hkReset")?.addEventListener("click", () => { if (val) val.textContent = "F8"; toast("已重置"); });
+  document.getElementById("hkClear")?.addEventListener("click", () => { if (val) val.textContent = "无"; toast("已清除热键"); });
+  ov?.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  window.addEventListener("keydown", (e) => {
+    if (!ov || !ov.classList.contains("show")) return;
+    if (e.key === "Escape") { close(); return; }
+    if (e.key === "F8" || /^F\d{1,2}$/.test(e.key) || (e.key.length === 1 && /[A-Za-z0-9]/.test(e.key))) {
+      e.preventDefault();
+      if (val) val.textContent = e.key.toUpperCase();
+    }
+  });
+})();
+
+/* 初始渲染 */
+selected = { kind:"view", id:"all" };
+view = { kind:"all" };
+Object.keys(TYPE_TREES).forEach(k => { tabFolderSel[k] = null; });
+refresh();
+</script>
+</body>
+</html>

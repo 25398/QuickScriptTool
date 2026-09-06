@@ -9,7 +9,7 @@
 
 #include "image_match.h"
 
-enum class MatchOverlayMode { Test, OffsetPick, RelativeRegionPick };
+enum class MatchOverlayMode { Test, OffsetPick, RelativeRegionPick, SyntheticAnchorRegionPick };
 
 class MatchOverlay {
 public:
@@ -18,7 +18,7 @@ public:
 
     struct ActionResult {
         bool cancelled = false;
-        int offsetX = 0;
+        int offsetX = 0; // OffsetPick：相对匹配中心的像素偏移（非屏幕绝对坐标）
         int offsetY = 0;
         bool regionValid = false;
         int regionX1 = 0;
@@ -36,6 +36,9 @@ public:
                       int searchX1, int searchY1, int searchX2, int searchY2,
                       const ImageMatchOptions& matchOptions,
                       MatchOverlayMode mode);
+
+    /// 变量模式：按宽高在屏幕中央放合成锚框，框选相对区域（不做内容匹配）。
+    ActionResult ShowSyntheticAnchor(int anchorW, int anchorH);
 
     bool matchDone_ = false;
     ImageMatchResult matchResult_;
@@ -74,6 +77,8 @@ private:
     bool useCustomMatchOptions_ = false;
     ImageMatchOptions customMatchOptions_{};
     MatchOverlayMode mode_ = MatchOverlayMode::Test;
+    int syntheticW_ = 0;
+    int syntheticH_ = 0;
 
     bool cancelled_ = false;
     bool pendingCancel_ = false;

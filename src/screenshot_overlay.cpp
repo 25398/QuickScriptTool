@@ -336,7 +336,7 @@ void ScreenshotOverlay::CaptureVirtualScreen() {
     HDC memDc = CreateCompatibleDC(screenDc);
     screenBitmap_ = CreateCompatibleBitmap(screenDc, screenW_, screenH_);
     HGDIOBJ oldBmp = SelectObject(memDc, screenBitmap_);
-    BitBlt(memDc, 0, 0, screenW_, screenH_, screenDc, screenX_, screenY_, SRCCOPY);
+    BitBlt(memDc, 0, 0, screenW_, screenH_, screenDc, screenX_, screenY_, SRCCOPY | CAPTUREBLT);
     SelectObject(memDc, oldBmp);
 
     // Pre-render the dim overlay (solid black) — reused every frame

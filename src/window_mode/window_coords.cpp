@@ -1,6 +1,7 @@
 #include "window_coords.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace windowmode {
 
@@ -17,6 +18,20 @@ bool ScreenToClientPoint(HWND hwnd, int sx, int sy, int& cx, int& cy) {
     if (!hwnd || !IsWindow(hwnd)) return false;
     POINT pt{sx, sy};
     if (!ScreenToClient(hwnd, &pt)) return false;
+    cx = pt.x;
+    cy = pt.y;
+    return true;
+}
+
+bool ScreenPointToClientWithin(HWND hwnd, int sx, int sy, int& cx, int& cy) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    RECT client{};
+    if (!GetClientRect(hwnd, &client)) return false;
+    POINT pt{sx, sy};
+    if (!ScreenToClient(hwnd, &pt)) return false;
+    if (pt.x < 0 || pt.y < 0 || pt.x >= client.right || pt.y >= client.bottom) {
+        return false;
+    }
     cx = pt.x;
     cy = pt.y;
     return true;
@@ -50,6 +65,22 @@ bool ScreenSearchRectToClientRect(HWND hwnd, int sx1, int sy1, int sx2, int sy2,
     cx2 = std::max(cL, cR);
     cy2 = std::max(cT, cB);
     return cx2 > cx1 && cy2 > cy1;
+}
+
+bool ScaleWindowClientPoint(int recordW, int recordH, int liveW, int liveH, int& x, int& y) {
+    if (recordW <= 0 || recordH <= 0 || liveW <= 0 || liveH <= 0) return false;
+    const double sx = static_cast<double>(liveW) / static_cast<double>(recordW);
+    const double sy = static_cast<double>(liveH) / static_cast<double>(recordH);
+    if (std::fabs(sx - 1.0) < 0.02 && std::fabs(sy - 1.0) < 0.02) return false;
+    x = static_cast<int>(std::lround(x * sx));
+    y = static_cast<int>(std::lround(y * sy));
+    return true;
+}
+
+void ScaleWindowClientRect(int recordW, int recordH, int liveW, int liveH,
+    int& x1, int& y1, int& x2, int& y2) {
+    ScaleWindowClientPoint(recordW, recordH, liveW, liveH, x1, y1);
+    ScaleWindowClientPoint(recordW, recordH, liveW, liveH, x2, y2);
 }
 
 }  // namespace windowmode

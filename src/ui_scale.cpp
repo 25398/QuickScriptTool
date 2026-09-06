@@ -10,7 +10,7 @@
 
 namespace {
 
-// 设计基准分辨率：2560×1440 下首页 720×540、编辑器 1200×1080（100% 缩放）
+// 设计基准分辨率：2560×1440 下首页 720×540、设置 720×540、编辑器 1200×1080（100% 缩放）
 constexpr int kUiRefScreenW = 2560;
 constexpr int kUiRefScreenH = 1440;
 
@@ -100,6 +100,14 @@ int UiHomeHeight() {
     return UiLen(kHomeHeight);
 }
 
+int UiSettingsWidth() {
+    return UiLen(kSettingsWidth);
+}
+
+int UiSettingsHeight() {
+    return UiLen(kSettingsHeight);
+}
+
 int UiEditorWidth() {
     return UiLen(kEditorWidth);
 }
@@ -133,6 +141,10 @@ void UiResizeWindowClient(HWND hwnd, int clientW, int clientH, bool force) {
 
 void UiResizeHwndToHome(HWND hwnd) {
     UiResizeWindowClient(hwnd, UiHomeWidth(), UiHomeHeight());
+}
+
+void UiResizeHwndToSettings(HWND hwnd) {
+    UiResizeWindowClient(hwnd, UiSettingsWidth(), UiSettingsHeight());
 }
 
 void UiResizeHwndToEditor(HWND hwnd) {

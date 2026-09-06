@@ -1,9 +1,8 @@
 #Requires -RunAsAdministrator
 <#
-  Install QstVHid with fake-signed driver (expired cert + fake 2011 timestamp).
-  Run as Administrator: right-click PowerShell -> Run as Administrator, then:
-    cd D:\other\software\driver\qst_vhid
-    powershell -ExecutionPolicy Bypass -File ".\install_fake_driver.ps1"
+  LAB ONLY — do not run from the product settings UI.
+  This script is a signing-bypass experiment. The product installer
+  (_elevate_install.ps1) never uses this path.
 #>
 $ErrorActionPreference = "Stop"
 

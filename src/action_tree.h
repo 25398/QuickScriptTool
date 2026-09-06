@@ -63,6 +63,31 @@ inline bool HasLoopParentAt(const std::vector<ScriptAction>& actions, size_t ind
 
 inline constexpr const wchar_t* kEndLoopNeedsLoopParentMsg = L"请将结束循环放在循环内";
 
+inline const wchar_t* ContainerTypeLabel(ActionType type) {
+    if (type == ActionType::Loop) return L"循环";
+    if (type == ActionType::If) return L"条件-如果";
+    if (type == ActionType::Else) return L"条件-否则";
+    if (type == ActionType::DefineBlock) return L"定义宏指令块";
+    return L"容器";
+}
+
+// 循环/条件/定义块必须至少有一个子动作（indent > 容器）。
+// 空容器 = 后面的动作都是同级，循环体不会执行——这是 AI 把循环体写在循环外的典型错误。
+inline std::wstring ValidateContainerBodies(const std::vector<ScriptAction>& actions) {
+    for (size_t i = 0; i < actions.size(); ++i) {
+        if (!IsSubtreeContainer(actions[i].type)) continue;
+        const int bodyEnd = ContainerBodyEnd(actions, static_cast<int>(i));
+        if (bodyEnd <= static_cast<int>(i) + 1) {
+            return std::wstring(L"第 ") + std::to_wstring(i + 1) + L" 个动作（"
+                + ContainerTypeLabel(actions[i].type)
+                + L"）没有子动作。块内动作必须写在 children 数组里（推荐，像写代码一样嵌套），"
+                L"或设 indent=父级+1。不要把循环/条件体放在容器后面当同级。"
+                L"示例：{\"type\":\"loop\",\"loopCount\":-1,\"children\":[{\"type\":\"wait\",\"duration\":1}]}";
+        }
+    }
+    return L"";
+}
+
 // 校验动作列表中所有 endLoop 是否均有循环父节点；通过返回空字符串
 inline std::wstring ValidateEndLoopPlacements(const std::vector<ScriptAction>& actions) {
     for (size_t i = 0; i < actions.size(); ++i) {
@@ -156,8 +181,16 @@ inline std::set<int> RemapCollapsedAfterMove(
             continue;
         }
         int mapped = idx;
-        if (mapped >= dragEnd && mapped < insertIndex) mapped -= blockSize;
-        else if (mapped >= insertIndex && mapped < dragStart) mapped += blockSize;
+        if (insertIndex < dragStart) {
+            // 向前拖（插到更靠前）：中间区间 [insertIndex, dragStart) 整体右移 blockSize
+            if (mapped >= insertIndex && mapped < dragStart) mapped += blockSize;
+        } else {
+            // 向后拖：insertIndex 是移除后的插入点；中间区间
+            // [dragEnd, insertIndex + blockSize) 整体左移 blockSize。
+            // 旧逻辑只处理 [dragEnd, insertIndex)，漏掉与插入窗口重叠的 blockSize 个元素，
+            // 导致折叠状态映射到错误的动作上。
+            if (mapped >= dragEnd && mapped < insertIndex + blockSize) mapped -= blockSize;
+        }
         updated.insert(mapped);
     }
     return updated;

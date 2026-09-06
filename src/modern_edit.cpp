@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "drawing.h"
+#include "ui_scale.h"
 
 #include <windowsx.h>
 #include <commctrl.h>
@@ -256,7 +257,7 @@ HWND MakeModernMultiLineEdit(HWND parent, const wchar_t* text, int id,
 }
 
 void DrawModernEditBorder(HDC hdc, const RECT& rc) {
-    DrawBorderRect(hdc, rc, kComboBorderGray);
+    DrawBorderRoundRect(hdc, rc, kComboBorderGray, UiLen(kEditorFieldRadius));
 }
 
 void DrawEditControlBorder(HDC hdc, HWND dialog, HWND edit, COLORREF color) {
@@ -264,7 +265,7 @@ void DrawEditControlBorder(HDC hdc, HWND dialog, HWND edit, COLORREF color) {
     RECT rc{};
     GetWindowRect(edit, &rc);
     MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT*>(&rc), 2);
-    DrawBorderRect(hdc, rc, color);
+    DrawBorderRoundRect(hdc, rc, color, UiLen(kEditorFieldRadius));
 }
 
 void PositionEditInBorderFrame(HWND edit, int outerX, int outerY, int outerW, int outerH) {
@@ -283,5 +284,5 @@ void DrawEditOuterBorder(HDC hdc, HWND dialog, HWND edit, COLORREF color) {
     rc.top -= 1;
     rc.right += 1;
     rc.bottom += 1;
-    DrawBorderRect(hdc, rc, color);
+    DrawBorderRoundRect(hdc, rc, color, UiLen(kEditorFieldRadius));
 }

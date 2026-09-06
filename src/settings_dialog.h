@@ -96,6 +96,8 @@ private:
     RECT OtherHoldUnitRect() const;
     RECT OtherThemeLabelRect() const;
     RECT OtherThemeComboRect() const;
+    RECT OtherDirect2DCheckboxRect() const;
+    RECT OtherDirect2DLabelRect() const;
     int OtherColWidth() const;
     int OtherRightColLeft() const;
 
@@ -146,8 +148,8 @@ private:
         int fixedYEditX = 0;
     };
 
-    static constexpr int kDialogW = kHomeWidth;
-    static constexpr int kDialogH = kHomeHeight;
+    static constexpr int kDialogW = kSettingsWidth;
+    static constexpr int kDialogH = kSettingsHeight;
     static constexpr int kNavH = 44;
     static constexpr int kAiLabelW = 108;
     static constexpr int kContentTop = kTitleH + kNavH;
@@ -155,6 +157,7 @@ private:
     static constexpr int kFooterTop = kDialogH - kFooterH;
     static constexpr int kTabW = kDialogW / 5;
     static constexpr int kContentPad = 16;
+    static constexpr int kContentPadX = 16;
     static constexpr int kCheckboxSize = 32;
     static constexpr int kMargin = 24;
     static constexpr int kRowH = 52;

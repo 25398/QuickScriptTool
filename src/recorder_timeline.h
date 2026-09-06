@@ -19,7 +19,8 @@ void SortRecordedEvents(std::vector<RecordedEvent>& events);
 
 /// 将录制事件转为动作：间隔为显式 Wait；键鼠瞬时动作 timingUs/duration=0。
 RecordingConversionResult ConvertRecordedEventsToActions(
-    std::vector<RecordedEvent> events, const Hotkey& stopHotkey);
+    std::vector<RecordedEvent> events, const Hotkey& stopHotkey,
+    bool windowRelative = false);
 
 struct TimedInputEvent {
     uint64_t deadlineUs = 0;

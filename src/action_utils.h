@@ -55,6 +55,9 @@ bool IsValidBlockName(const std::wstring& name);
 /// 脚本是否包含文字识别动作（用于运行期按需启用 OCR 变量上下文）
 bool ScriptUsesTextRecognition(const std::vector<ScriptAction>& actions);
 
+/// 脚本是否包含 AI 相关动作（文本分析/识图分析/AI 动作执行）
+bool ScriptUsesAiAction(const std::vector<ScriptAction>& actions);
+
 /// 脚本是否仅包含键鼠时序动作（可用于绝对时间轴精密回放）
 bool ScriptIsTimedInputSequence(const std::vector<ScriptAction>& actions);
 

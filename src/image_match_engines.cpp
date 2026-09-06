@@ -46,6 +46,9 @@ struct PatchVerifierContext {
     cv::Mat tplEdge;
     cv::Mat tplHsvHist;
     bool hasColor = false;
+    // 模板边缘总能量：低纹理（纯色/近纯色）模板边缘验证无判别力，
+    // 直接中性化，避免共识把真实匹配误拒（见 ComputePatchEdgeSimilarity）。
+    double tplEdgeEnergy = 0.0;
 
     static cv::Mat ComputeEdgeMap(const cv::Mat& gray) {
         cv::Mat gx;
@@ -78,6 +81,7 @@ struct PatchVerifierContext {
         PatchVerifierContext ctx;
         if (tplGray.empty()) return ctx;
         ctx.tplEdge = ComputeEdgeMap(tplGray);
+        ctx.tplEdgeEnergy = cv::norm(ctx.tplEdge, cv::NORM_L2);
         if (!tplBgr.empty() && tplBgr.size() == tplGray.size()) {
             ctx.tplHsvHist = ComputeHsvHist(tplBgr);
             ctx.hasColor = !ctx.tplHsvHist.empty();
@@ -107,6 +111,9 @@ double ComputeNormedCorrelation32F(const cv::Mat& a, const cv::Mat& b) {
 double ComputePatchEdgeSimilarity(const cv::Mat& srcGray, const PatchVerifierContext& ctx,
                                   int topLeftX, int topLeftY) {
     if (srcGray.empty() || ctx.tplEdge.empty()) return 0.0;
+    // 模板本身几乎没有边缘（纯色按钮内部、色块选区等）：边缘相关性无判别力，
+    // 返回中性 100 分（不参与拒绝），否则正确位置会因边缘能量≈0 被误判为不匹配。
+    if (ctx.tplEdgeEnergy < 0.5) return 100.0;
     const int tplW = ctx.tplEdge.cols;
     const int tplH = ctx.tplEdge.rows;
     if (topLeftX < 0 || topLeftY < 0 ||
@@ -418,10 +425,176 @@ double ComputePatchSadSimilarity(const cv::Mat& srcGray, const cv::Mat& tplGray,
     return std::clamp((1.0 - static_cast<double>(sad) / maxSad) * 100.0, 0.0, 100.0);
 }
 
+/// 逐像素终审：每个通道 |Δ| ≤ tol 才算通过（tol=1 吸收截图 1LSB 抖动）
+bool PatchPixelsNearEqual(const cv::Mat& srcBgr, const cv::Mat& tplBgr,
+                          int topLeftX, int topLeftY, int channelTol) {
+    if (srcBgr.empty() || tplBgr.empty() || srcBgr.type() != CV_8UC3 || tplBgr.type() != CV_8UC3) {
+        return false;
+    }
+    const int tw = tplBgr.cols;
+    const int th = tplBgr.rows;
+    if (topLeftX < 0 || topLeftY < 0 || topLeftX + tw > srcBgr.cols || topLeftY + th > srcBgr.rows) {
+        return false;
+    }
+    const int tol = std::max(0, channelTol);
+    for (int y = 0; y < th; ++y) {
+        const cv::Vec3b* sp = srcBgr.ptr<cv::Vec3b>(topLeftY + y) + topLeftX;
+        const cv::Vec3b* tp = tplBgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < tw; ++x) {
+            const cv::Vec3b& a = sp[x];
+            const cv::Vec3b& b = tp[x];
+            if (std::abs(static_cast<int>(a[0]) - static_cast<int>(b[0])) > tol
+                || std::abs(static_cast<int>(a[1]) - static_cast<int>(b[1])) > tol
+                || std::abs(static_cast<int>(a[2]) - static_cast<int>(b[2])) > tol) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool PatchGrayNearEqual(const cv::Mat& srcGray, const cv::Mat& tplGray,
+                        int topLeftX, int topLeftY, int channelTol) {
+    if (srcGray.empty() || tplGray.empty()) return false;
+    const int tw = tplGray.cols;
+    const int th = tplGray.rows;
+    if (topLeftX < 0 || topLeftY < 0 || topLeftX + tw > srcGray.cols || topLeftY + th > srcGray.rows) {
+        return false;
+    }
+    const int tol = std::max(0, channelTol);
+    for (int y = 0; y < th; ++y) {
+        const uint8_t* sp = srcGray.ptr<uint8_t>(topLeftY + y) + topLeftX;
+        const uint8_t* tp = tplGray.ptr<uint8_t>(y);
+        for (int x = 0; x < tw; ++x) {
+            if (std::abs(static_cast<int>(sp[x]) - static_cast<int>(tp[x])) > tol) return false;
+        }
+    }
+    return true;
+}
+
+/// 完美匹配：NCC 粗定位（低阈值只为捞候选）→ 邻域精修 → 像素终审
+ImageMatchOutput MatchPerfectPixel(
+    const cv::Mat& srcGray, const cv::Mat& tplGray,
+    const cv::Mat& srcBgr, const cv::Mat& tplBgr,
+    const ImageMatchOptions& optIn, int offsetX, int offsetY) {
+    ImageMatchOutput out{};
+    const auto t0 = std::chrono::steady_clock::now();
+    if (srcGray.empty() || tplGray.empty()) return out;
+    if (tplGray.cols > srcGray.cols || tplGray.rows > srcGray.rows) return out;
+
+    ImageMatchOptions coarse = optIn;
+    coarse.perfectMatch = false;
+    coarse.scaleMin = coarse.scaleMax = 1.0;
+    coarse.scaleStep = 1.0;
+    coarse.disablePyramid = true;
+    coarse.crossResolutionMatch = false;
+    // 粗定位门槛刻意放低：只负责找候选，通过与否由像素终审决定
+    coarse.thresholdPercent = 50.0;
+    coarse.maxMatches = std::clamp(optIn.maxMatches, 1, 30);
+    coarse.maxOverlap = std::clamp(optIn.maxOverlap, 0.0, 0.95);
+
+    const int channelTol = std::max(0, optIn.perfectMatchChannelTol);
+    const int refineR = AutoConsensusTolerancePx(tplGray.cols, tplGray.rows);
+
+    std::vector<ImageMatchResult> seeds;
+    seeds.reserve(16);
+
+    // 主定位用 SQDIFF：对近纯色模板也稳定（CCOEFF 在零方差模板上不可靠）
+    {
+        cv::Mat result;
+        cv::matchTemplate(srcGray, tplGray, result, cv::TM_SQDIFF_NORMED);
+        double minVal = 1.0;
+        cv::Point minLoc;
+        cv::minMaxLoc(result, &minVal, nullptr, &minLoc, nullptr);
+        const double sim = std::clamp((1.0 - minVal) * 100.0, 0.0, 100.0);
+        out.debugBestNccPercent = sim;
+        if (minLoc.x >= 0 && minLoc.y >= 0) {
+            seeds.push_back(MakeResult(minLoc, tplGray.cols, tplGray.rows, sim, 1.0));
+        }
+    }
+
+    double peakNcc = 0.0;
+    auto nccSeeds =
+        RunEngineAllScales(srcGray, tplGray, coarse, cv::TM_CCOEFF_NORMED, &peakNcc);
+    out.debugBestNccPercent = std::max(out.debugBestNccPercent, peakNcc);
+    for (auto& s : nccSeeds) seeds.push_back(std::move(s));
+
+    {
+        ImageMatchResult recovered = RecoverGlobalNccPeak(srcGray, tplGray, coarse);
+        out.debugBestNccPercent = std::max(out.debugBestNccPercent, recovered.score);
+        if (recovered.found) seeds.push_back(recovered);
+    }
+    out.debugRawCandidates = static_cast<int>(seeds.size());
+
+    // 按相似度分排序，优先精修高分候选
+    std::sort(seeds.begin(), seeds.end(),
+              [](const ImageMatchResult& a, const ImageMatchResult& b) { return a.score > b.score; });
+
+    // 去重：相近 topLeft 只留最高分
+    {
+        std::vector<ImageMatchResult> uniq;
+        uniq.reserve(seeds.size());
+        for (const auto& s : seeds) {
+            bool dup = false;
+            for (const auto& u : uniq) {
+                if (std::abs(u.topLeftX - s.topLeftX) <= 1 && std::abs(u.topLeftY - s.topLeftY) <= 1) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) uniq.push_back(s);
+        }
+        seeds = std::move(uniq);
+    }
+
+    const bool useBgr = !srcBgr.empty() && !tplBgr.empty()
+        && srcBgr.size() == srcGray.size() && tplBgr.size() == tplGray.size();
+
+    auto trySeed = [&](const ImageMatchResult& seed) -> bool {
+        const int baseX = seed.topLeftX;
+        const int baseY = seed.topLeftY;
+        for (int dy = -refineR; dy <= refineR; ++dy) {
+            for (int dx = -refineR; dx <= refineR; ++dx) {
+                const int x = baseX + dx;
+                const int y = baseY + dy;
+                const bool ok = useBgr
+                    ? PatchPixelsNearEqual(srcBgr, tplBgr, x, y, channelTol)
+                    : PatchGrayNearEqual(srcGray, tplGray, x, y, channelTol);
+                if (!ok) continue;
+
+                ImageMatchResult hit = MakeResult(
+                    cv::Point(x, y), tplGray.cols, tplGray.rows, 100.0, 1.0);
+                hit.topLeftX += offsetX;
+                hit.topLeftY += offsetY;
+                hit.bottomRightX += offsetX;
+                hit.bottomRightY += offsetY;
+                hit.x += offsetX;
+                hit.y += offsetY;
+                out.matches.push_back(hit);
+                out.found = true;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const auto& seed : seeds) {
+        if (trySeed(seed)) break;
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    out.elapsedMs = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return out;
+}
+
 ImageMatchOutput MatchInGrayMatsMultiVerify(
     const cv::Mat& srcGray, const cv::Mat& tplGray,
     const cv::Mat& srcBgr, const cv::Mat& tplBgr,
     const ImageMatchOptions& opt, int offsetX, int offsetY) {
+    if (opt.perfectMatch) {
+        return MatchPerfectPixel(srcGray, tplGray, srcBgr, tplBgr, opt, offsetX, offsetY);
+    }
     ImageMatchOutput out{};
     const auto t0 = std::chrono::steady_clock::now();
 

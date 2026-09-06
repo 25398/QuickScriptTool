@@ -20,6 +20,9 @@ public:
         bool anchorValid = false;
         int offsetX = 0;
         int offsetY = 0;
+        /// Test 模式：叠层关闭后带回拼接识别文本（供 Web toast）
+        std::wstring text;
+        bool ocrOk = false;
     };
 
     ActionResult Show(int searchX1, int searchY1, int searchX2, int searchY2,

@@ -13,8 +13,29 @@
 
 namespace {
 
+// 长跑窗口模式会持续灌日志；不设上限会撑爆 EDIT 与 pending 队列。
+constexpr size_t kMaxPendingLogs = 2000;
+constexpr int kMaxEditChars = 400000; // ~800KB wchar，超则截掉头部
+
 int FormatMatchPercent(double score) {
     return static_cast<int>(std::lround(std::clamp(score, 0.0, 100.0)));
+}
+
+void CapPendingLogs(std::vector<std::wstring>& pending) {
+    if (pending.size() <= kMaxPendingLogs) return;
+    const size_t drop = pending.size() - kMaxPendingLogs;
+    pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(drop));
+}
+
+void TrimEditIfOversized(HWND edit) {
+    if (!edit) return;
+    const int len = GetWindowTextLengthW(edit);
+    if (len <= kMaxEditChars) return;
+    const int keep = kMaxEditChars / 2;
+    const int cut = len - keep;
+    SendMessageW(edit, EM_SETSEL, 0, cut);
+    SendMessageW(edit, EM_REPLACESEL, FALSE,
+        reinterpret_cast<LPARAM>(L"[...日志过长已截断...]\r\n"));
 }
 
 std::wstring BracketIndex(const ScriptAction& action) {
@@ -69,6 +90,9 @@ std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchRe
     if (action.findImageFollowUp == 2) {
         return prefix + L"匹配度" + std::to_wstring(pct) + L"%，保存到变量" + varName;
     }
+    if (action.findImageFollowUp == 3) {
+        return prefix + L"匹配度" + std::to_wstring(pct) + L"%，保存图片到" + varName;
+    }
 
     const std::wstring pctText = L"匹配度为" + std::to_wstring(pct) + L"%";
     if (!rawMatch.found) {
@@ -121,7 +145,7 @@ void MacroDebugWindow::Create(HFONT bodyFont, HFONT titleFont, HFONT closeFont,
     onClosed_ = std::move(onClosed);
 
     static bool registered = false;
-    const wchar_t* clsName = L"QuickScriptMacroDebugWnd";
+    const wchar_t* clsName = L"KeyMouseDebugWnd";
     if (!registered) {
         WNDCLASSW wc{};
         wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -143,7 +167,7 @@ void MacroDebugWindow::Create(HFONT bodyFont, HFONT titleFont, HFONT closeFont,
         nullptr, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return;
 
-    ApplyTaskbarWindowStyle(hwnd_, L"宏调试信息输出窗口", true);
+    ApplyTaskbarWindowStyle(hwnd_, L"调试信息输出窗口", true);
 
     // 不用 WS_EX_CLIENTEDGE：经典凹陷边在父窗口 BitBlt 时会闪；改为父窗口画 1px 灰边
     const RECT frame = ContentFrameRect();
@@ -194,6 +218,7 @@ void MacroDebugWindow::AppendLog(const std::wstring& text) {
         // 已有待刷日志时只入队，避免洪水 PostMessage 拖垮 UI/调度。
         needPost = pendingLogs_.empty();
         pendingLogs_.push_back(text);
+        CapPendingLogs(pendingLogs_);
     }
     if (needPost) PostMessageW(hwnd_, WM_DEBUG_APPEND, 0, 0);
 }
@@ -205,6 +230,7 @@ void MacroDebugWindow::AppendLogBatch(const std::vector<std::wstring>& lines) {
         std::lock_guard<std::mutex> lock(logMutex_);
         needPost = pendingLogs_.empty();
         pendingLogs_.insert(pendingLogs_.end(), lines.begin(), lines.end());
+        CapPendingLogs(pendingLogs_);
     }
     if (needPost) PostMessageW(hwnd_, WM_DEBUG_APPEND, 0, 0);
 }
@@ -230,6 +256,7 @@ void MacroDebugWindow::ClearLogDirect() {
 
 void MacroDebugWindow::AppendLogDirect(const std::wstring& text) {
     if (!edit_) return;
+    TrimEditIfOversized(edit_);
     std::wstring line = text + L"\r\n";
     const int len = GetWindowTextLengthW(edit_);
     SendMessageW(edit_, EM_SETSEL, len, len);
@@ -249,6 +276,7 @@ void MacroDebugWindow::FlushPendingLogs() {
         std::lock_guard<std::mutex> lock(logMutex_);
         if (clearEpoch_ != epoch) return;
     }
+    TrimEditIfOversized(edit_);
     // 多行合并为一次 EM_REPLACESEL，避免千次 Edit 更新卡 UI。
     size_t totalChars = 0;
     for (const auto& line : batch) totalChars += line.size() + 2;
@@ -432,7 +460,7 @@ void MacroDebugWindow::Paint() {
 }
 
 void MacroDebugWindow::CleanupGdi() {
-    // 字体由 MainWindow 拥有，不在此释放
+    // 字体由 EngineHost 拥有，不在此释放
     bodyFont_ = titleFont_ = closeFont_ = nullptr;
 }
 

@@ -180,8 +180,15 @@ void SortRecordedEvents(std::vector<RecordedEvent>& events) {
 }
 
 RecordingConversionResult ConvertRecordedEventsToActions(
-    std::vector<RecordedEvent> events, const Hotkey& stopHotkey) {
+    std::vector<RecordedEvent> events, const Hotkey& stopHotkey,
+    bool windowRelative) {
     RecordingConversionResult out{};
+    auto applyWindowRelative = [&](ScriptAction& action) {
+        if (!windowRelative) return;
+        // 窗口相对录制：x/y 已是目标窗口客户区像素；禁止屏幕归一化。
+        action.windowRelative = true;
+        action.coordsAreNormalized = false;
+    };
     SortRecordedEvents(events);
     while (!events.empty() && RecordedEventMatchesHotkey(events.back(), stopHotkey))
         events.pop_back();
@@ -208,6 +215,7 @@ RecordingConversionResult ConvertRecordedEventsToActions(
             action.x = e.x;
             action.y = e.y;
             action.randomX = action.randomY = 0;
+            applyWindowRelative(action);
             emitInstant(action, e.timeOffsetUs);
             ++out.absoluteMoveCount;
         } else if (e.msg == kWmRecordedRelativeMove) {
@@ -262,6 +270,7 @@ RecordingConversionResult ConvertRecordedEventsToActions(
             action.button = RecordedButton(e.vkOrButton);
             action.x = e.x;
             action.y = e.y;
+            applyWindowRelative(action);
             if (down) {
                 action.recordedCapturePath = e.capturePath;
                 action.captureOffsetX = e.captureOffsetX;

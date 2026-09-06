@@ -58,10 +58,16 @@ private:
 
     void DrawBtn(HDC hdc, const RECT& rc, const wchar_t* text, bool green, bool hover);
 
+    void InstallActionKeyLlHook();
+    void UninstallActionKeyLlHook();
+    static LRESULT CALLBACK ActionKeyLlProc(int code, WPARAM wp, LPARAM lp);
+
     static constexpr UINT_PTR kHoldCaptureTimerId = 1;
 
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
+    HHOOK actionKeyLlHook_ = nullptr;
+    static HotkeyCapture* s_actionKeyCapture_;
     HFONT font_ = nullptr;
     HFONT valueFont_ = nullptr;
     Hotkey old_{};

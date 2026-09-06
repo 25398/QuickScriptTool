@@ -14,12 +14,6 @@
 namespace windowmode {
 namespace {
 
-std::wstring FileNameOnly(const std::wstring& path) {
-    const auto slash = path.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) return path;
-    return path.substr(slash + 1);
-}
-
 std::wstring ModuleDirectory() {
     wchar_t path[MAX_PATH]{};
     const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -112,7 +106,17 @@ std::vector<DWORD> FakeFocusInjector::CollectInjectPids(DWORD windowPid, HWND ta
         pids.insert(grand.begin(), grand.end());
     }
 
-    return std::vector<DWORD>(pids.begin(), pids.end());
+    // 窗口 PID 必须先注入：子进程（Java helper 等）没有消息泵时
+    // setwindowshook 会先失败，日志还把主进程误记成「子进程跳过」。
+    std::vector<DWORD> ordered;
+    ordered.reserve(pids.size());
+    if (windowPid != 0 && pids.count(windowPid)) {
+        ordered.push_back(windowPid);
+    }
+    for (DWORD p : pids) {
+        if (p != windowPid) ordered.push_back(p);
+    }
+    return ordered;
 }
 
 FakeFocusInjector::~FakeFocusInjector() {
@@ -153,124 +157,19 @@ bool FakeFocusInjector::ResolveDllPathForPid(DWORD pid, std::wstring& outPath, s
     return true;
 }
 
-HMODULE FakeFocusInjector::FindRemoteModule(DWORD pid, HANDLE process,
-    const std::wstring& dllPath) const {
-    (void)process;
-    if (pid == 0) return nullptr;
-    const std::wstring want = FileNameOnly(dllPath);
-    std::wstring wantLower = want;
-    std::transform(wantLower.begin(), wantLower.end(), wantLower.begin(), ::towlower);
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return nullptr;
-
-    MODULEENTRY32W me{};
-    me.dwSize = sizeof(me);
-    HMODULE found = nullptr;
-    if (Module32FirstW(snap, &me)) {
-        do {
-            std::wstring name = me.szModule;
-            std::transform(name.begin(), name.end(), name.begin(), ::towlower);
-            if (name == wantLower) {
-                found = me.hModule;
-                break;
-            }
-        } while (Module32NextW(snap, &me));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
-bool FakeFocusInjector::RemoteLoadLibrary(Target& t, const std::wstring& dllPath, std::wstring& err) {
-    t.remoteModule = FindRemoteModule(t.pid, t.process, dllPath);
-    if (t.remoteModule) return true;
-
-    const size_t bytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    void* remoteBuf = VirtualAllocEx(t.process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteBuf) {
-        err = L"VirtualAllocEx 失败: " + FormatWinError(GetLastError());
-        return false;
-    }
-
-    SIZE_T written = 0;
-    if (!WriteProcessMemory(t.process, remoteBuf, dllPath.c_str(), bytes, &written)) {
-        VirtualFreeEx(t.process, remoteBuf, 0, MEM_RELEASE);
-        err = L"WriteProcessMemory 失败: " + FormatWinError(GetLastError());
-        return false;
-    }
-
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    auto* loadLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        GetProcAddress(k32, "LoadLibraryW"));
-    if (!loadLib) {
-        VirtualFreeEx(t.process, remoteBuf, 0, MEM_RELEASE);
-        err = L"GetProcAddress(LoadLibraryW) 失败";
-        return false;
-    }
-
-    HANDLE thread = CreateRemoteThread(t.process, nullptr, 0, loadLib, remoteBuf, 0, nullptr);
-    if (!thread) {
-        VirtualFreeEx(t.process, remoteBuf, 0, MEM_RELEASE);
-        const DWORD code = GetLastError();
-        err = L"CreateRemoteThread(LoadLibraryW) 失败: " + FormatWinError(code);
-        if (code == ERROR_ACCESS_DENIED) {
-            err += L"（权限不足；若目标更高完整性级别请以管理员运行）";
-        }
-        return false;
-    }
-
-    WaitForSingleObject(thread, 15000);
-    CloseHandle(thread);
-    VirtualFreeEx(t.process, remoteBuf, 0, MEM_RELEASE);
-
-    t.remoteModule = FindRemoteModule(t.pid, t.process, dllPath);
-    if (!t.remoteModule) {
-        err = L"LoadLibraryW 注入后未找到模块（可能架构不匹配或 DLL 依赖缺失）";
-        return false;
-    }
-    return true;
-}
-
 bool FakeFocusInjector::RemoteCallExport(Target& t, const char* exportName, HWND arg,
     std::wstring& err) {
     if (!t.process || !t.remoteModule || !exportName) {
         err = L"假焦点远程调用未就绪";
         return false;
     }
-
-    HMODULE local = LoadLibraryW(dllPath_.c_str());
-    if (!local) {
-        err = L"本地加载假焦点 DLL 失败: " + FormatWinError(GetLastError());
-        return false;
-    }
-
-    FARPROC localProc = GetProcAddress(local, exportName);
-    if (!localProc) {
-        FreeLibrary(local);
-        err = std::wstring(L"假焦点 DLL 缺少导出: ")
-            + std::wstring(exportName, exportName + std::strlen(exportName));
-        return false;
-    }
-
-    const auto localBase = reinterpret_cast<BYTE*>(local);
-    const auto localFn = reinterpret_cast<BYTE*>(localProc);
-    const ptrdiff_t rva = localFn - localBase;
-    FreeLibrary(local);
-
-    auto* remoteFn = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        reinterpret_cast<BYTE*>(t.remoteModule) + rva);
-
-    HANDLE thread = CreateRemoteThread(t.process, nullptr, 0, remoteFn,
-        reinterpret_cast<LPVOID>(arg), 0, nullptr);
-    if (!thread) {
-        err = L"CreateRemoteThread(假焦点导出) 失败: " + FormatWinError(GetLastError());
-        return false;
-    }
-    WaitForSingleObject(thread, 10000);
     DWORD exitCode = 0;
-    GetExitCodeThread(thread, &exitCode);
-    CloseHandle(thread);
-
+    const std::wstring& path = !t.dllPath.empty() ? t.dllPath : dllPath_;
+    if (!inject::CallRemoteExport(t.process, t.pid, t.remoteModule, path,
+                                  exportName, reinterpret_cast<void*>(arg),
+                                  10000, &exitCode, err)) {
+        return false;
+    }
     if (exitCode == 0) {
         err = std::wstring(L"假焦点导出返回失败: ")
             + std::wstring(exportName, exportName + std::strlen(exportName));
@@ -280,7 +179,7 @@ bool FakeFocusInjector::RemoteCallExport(Target& t, const char* exportName, HWND
 }
 
 bool FakeFocusInjector::InjectOne(DWORD pid, HWND targetTop, const std::wstring& dllPath,
-    std::wstring& err) {
+    std::wstring& err, bool lite) {
     Target t{};
     t.pid = pid;
     t.process = OpenProcess(
@@ -301,27 +200,80 @@ bool FakeFocusInjector::InjectOne(DWORD pid, HWND targetTop, const std::wstring&
         return false;
     }
 
-    if (!RemoteLoadLibrary(t, path, err)) {
-        CloseHandle(t.process);
-        return false;
+    inject::InjectOptions opts;
+    opts.hideModule = hideModule_;
+    opts.targetTop = targetTop;
+    opts.hookProcName = "FakeFocus_HookProc";
+    inject::InjectResult injectResult;
+    if (!inject::InjectDll(pid, path, technique_, opts, injectResult)) {
+        const std::wstring firstErr = injectResult.detail;
+        inject::Technique used = technique_;
+        bool recovered = false;
+        // GLFW/Minecraft 等失焦后不泵消息：setwindowshook 等不到 DLL，改走远程线程。
+        if (technique_ == inject::Technique::SetWindowsHook) {
+            WindowModeLogf(
+                L"[窗口模式] setwindowshook 未装入 DLL（%s），改试 classic",
+                firstErr.c_str());
+            used = inject::Technique::ClassicRemoteThread;
+            recovered = inject::InjectDll(pid, path, used, opts, injectResult);
+            if (!recovered) {
+                DWORD procCode = 0;
+                const bool dead = t.process
+                    && GetExitCodeProcess(t.process, &procCode)
+                    && procCode != STILL_ACTIVE;
+                if (dead || (targetTop && !IsWindow(targetTop))) {
+                    err = injectResult.detail.empty() ? firstErr
+                        : (injectResult.detail + L"（目标已退出，停止继续注入）");
+                    CloseHandle(t.process);
+                    return false;
+                }
+                WindowModeLogf(
+                    L"[窗口模式] classic 仍失败（%s），改试 ntcreatethreadex",
+                    injectResult.detail.c_str());
+                used = inject::Technique::NtCreateThreadEx;
+                recovered = inject::InjectDll(pid, path, used, opts, injectResult);
+            }
+        }
+        if (!recovered) {
+            err = firstErr.empty() ? injectResult.detail : firstErr;
+            CloseHandle(t.process);
+            return false;
+        }
+        WindowModeLogf(L"[窗口模式] 假焦点注入已回退 tech=%s pid=%lu",
+            inject::TechniqueName(used), static_cast<unsigned long>(pid));
     }
+    t.remoteModule = injectResult.remoteModule;
+    t.moduleHidden = injectResult.moduleHidden;
+    t.hideState = injectResult.hideState;
+    t.dllPath = path;
 
     HWND top = GetAncestor(targetTop, GA_ROOT);
     if (!top) top = targetTop;
-    if (!RemoteCallExport(t, "FakeFocus_Install", top, err)) {
-        // 尽力卸载已加载模块
-        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-        auto* freeLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-            GetProcAddress(k32, "FreeLibrary"));
-        if (freeLib && t.remoteModule) {
-            HANDLE thread = CreateRemoteThread(t.process, nullptr, 0, freeLib, t.remoteModule, 0, nullptr);
-            if (thread) {
-                WaitForSingleObject(thread, 5000);
-                CloseHandle(thread);
+    const char* primary = lite ? "FakeFocus_InstallLite" : "FakeFocus_Install";
+    const char* fallback = lite ? "FakeFocus_Install" : "FakeFocus_InstallLite";
+    if (!RemoteCallExport(t, primary, top, err)) {
+        std::wstring fbErr;
+        if (RemoteCallExport(t, fallback, top, fbErr)) {
+            WindowModeLogf(
+                L"[窗口模式] 假焦点导出 %hs 失败（%s），已改用 %hs",
+                primary, err.c_str(), fallback);
+            err.clear();
+        } else {
+            // 尽力卸载已加载模块
+            HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+            auto* freeLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+                GetProcAddress(k32, "FreeLibrary"));
+            if (freeLib && t.remoteModule) {
+                HANDLE thread = CreateRemoteThread(t.process, nullptr, 0, freeLib,
+                    t.remoteModule, 0, nullptr);
+                if (thread) {
+                    WaitForSingleObject(thread, 5000);
+                    CloseHandle(thread);
+                }
             }
+            CloseHandle(t.process);
+            return false;
         }
-        CloseHandle(t.process);
-        return false;
     }
     t.installed = true;
     dllPath_ = path;
@@ -332,6 +284,11 @@ bool FakeFocusInjector::InjectOne(DWORD pid, HWND targetTop, const std::wstring&
 void FakeFocusInjector::UnloadOne(Target& t) {
     if (!t.process) return;
     std::wstring ignore;
+    if (t.moduleHidden && t.remoteModule) {
+        inject::RestoreModuleFromPeb(t.process, t.pid, t.remoteModule,
+                                     t.hideState, ignore);
+        t.moduleHidden = false;
+    }
     if (t.installed && t.remoteModule) {
         RemoteCallExport(t, "FakeFocus_Uninstall", nullptr, ignore);
         t.installed = false;
@@ -353,7 +310,8 @@ void FakeFocusInjector::UnloadOne(Target& t) {
     t.process = nullptr;
 }
 
-bool FakeFocusInjector::InjectAndInstall(DWORD windowPid, HWND targetTop, std::wstring& err) {
+bool FakeFocusInjector::InjectAndInstall(DWORD windowPid, HWND targetTop, std::wstring& err,
+    bool lite, bool windowPidOnly) {
     Unload();
     err.clear();
     lastError_.clear();
@@ -378,15 +336,21 @@ bool FakeFocusInjector::InjectAndInstall(DWORD windowPid, HWND targetTop, std::w
         return false;
     }
 
-    const std::vector<DWORD> pids = CollectInjectPids(windowPid, targetTop);
+    WindowModeLogf(L"[窗口模式] 假焦点注入技术=%s hideModule=%d windowPidOnly=%d lite=%d",
+        inject::TechniqueName(technique_), hideModule_ ? 1 : 0,
+        windowPidOnly ? 1 : 0, lite ? 1 : 0);
+
+    const std::vector<DWORD> pids = windowPidOnly
+        ? std::vector<DWORD>{windowPid}
+        : CollectInjectPids(windowPid, targetTop);
     std::wstring firstErr;
     int okCount = 0;
     for (DWORD pid : pids) {
         std::wstring oneErr;
-        if (InjectOne(pid, targetTop, dllPath_, oneErr)) {
+        if (InjectOne(pid, targetTop, dllPath_, oneErr, lite)) {
             ++okCount;
-            WindowModeLogf(L"[窗口模式] 假焦点已注入 pid=%lu hwnd=0x%p",
-                static_cast<unsigned long>(pid), targetTop);
+            WindowModeLogf(L"[窗口模式] 假焦点已注入 pid=%lu hwnd=0x%p lite=%d",
+                static_cast<unsigned long>(pid), targetTop, lite ? 1 : 0);
         } else if (firstErr.empty()) {
             firstErr = oneErr;
         } else {
@@ -419,9 +383,66 @@ bool FakeFocusInjector::InjectAndInstall(DWORD windowPid, HWND targetTop, std::w
         return false;
     }
 
-    WindowModeLogf(L"[窗口模式] 假焦点注入完成 processes=%d windowPid=%lu dll=%s",
-        okCount, static_cast<unsigned long>(windowPid), dllPath_.c_str());
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(dllPath_.c_str(), GetFileExInfoStandard, &fad)) {
+        const ULONGLONG bytes =
+            (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        SYSTEMTIME utc{}, local{};
+        FileTimeToSystemTime(&fad.ftLastWriteTime, &utc);
+        if (!SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) {
+            local = utc;
+        }
+        WindowModeLogf(
+            L"[窗口模式] 假焦点注入完成 processes=%d windowPid=%lu dll=%s size=%llu "
+            L"time=%04u-%02u-%02u %02u:%02u:%02u tech=%s",
+            okCount, static_cast<unsigned long>(windowPid), dllPath_.c_str(),
+            bytes,
+            static_cast<unsigned>(local.wYear), static_cast<unsigned>(local.wMonth),
+            static_cast<unsigned>(local.wDay), static_cast<unsigned>(local.wHour),
+            static_cast<unsigned>(local.wMinute), static_cast<unsigned>(local.wSecond),
+            inject::TechniqueName(technique_));
+    } else {
+        WindowModeLogf(L"[窗口模式] 假焦点注入完成 processes=%d windowPid=%lu dll=%s tech=%s",
+            okCount, static_cast<unsigned long>(windowPid), dllPath_.c_str(),
+            inject::TechniqueName(technique_));
+    }
     return true;
+}
+
+bool FakeFocusInjector::QueryMapleIatCount(DWORD& count, std::wstring& err) {
+    count = 0;
+    err.clear();
+    for (auto& t : targets_) {
+        if (!t.installed || !t.process || !t.remoteModule) continue;
+        const std::wstring& path = !t.dllPath.empty() ? t.dllPath : dllPath_;
+        DWORD exitCode = 0;
+        if (inject::CallRemoteExport(t.process, t.pid, t.remoteModule, path,
+                "FakeFocus_MapleIatCount", nullptr, 5000, &exitCode, err)) {
+            count = exitCode;
+            err.clear();
+            return true;
+        }
+    }
+    if (err.empty()) err = L"假焦点 MapleIatCount 不可用";
+    return false;
+}
+
+bool FakeFocusInjector::QueryMapleHookHits(DWORD& hits, std::wstring& err) {
+    hits = 0;
+    err.clear();
+    for (auto& t : targets_) {
+        if (!t.installed || !t.process || !t.remoteModule) continue;
+        const std::wstring& path = !t.dllPath.empty() ? t.dllPath : dllPath_;
+        DWORD exitCode = 0;
+        if (inject::CallRemoteExport(t.process, t.pid, t.remoteModule, path,
+                "FakeFocus_MapleHookHits", nullptr, 5000, &exitCode, err)) {
+            hits = exitCode;
+            err.clear();
+            return true;
+        }
+    }
+    if (err.empty()) err = L"假焦点 MapleHookHits 不可用";
+    return false;
 }
 
 bool FakeFocusInjector::UpdateTarget(HWND targetTop, std::wstring& err) {

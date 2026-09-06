@@ -43,8 +43,12 @@ enum class ActionType {
     CloseProgram,
     OpenWebpage,
     OpenFile,
+    ActivateWindow,  // 按标题/进程子串切到前台（逻辑转化写回；等价于「切到目标窗」）
     TimerRecordTime,
     GetCursorPos,      // 获取当前光标位置
+    GetColor,          // 获取坐标颜色
+    FindColor,         // 区域找色
+    ColorMatch,        // 坐标颜色匹配
     CustomText,
     AiTextAnalysis,    // AI文字分析
     AiImageAnalysis,   // AI图片分析
@@ -69,9 +73,9 @@ struct ScriptAction {
     std::wstring moveVarExprX;                 // X 坐标变量表达式
     std::wstring moveVarExprY;                 // Y 坐标变量表达式
     MouseButtonType button = MouseButtonType::Left;  // 鼠标按键类型
-    int clickCount = 1;                       // 重复执行次数（点击/回放/滚动等）
-    UINT keyVk = '7';                         // 虚拟键码
-    std::wstring keyText = L"7";               // 按键显示名
+    int clickCount = 1;                       // 重复执行次数（点击/回放/运行宏/运行块/滚动等）
+    UINT keyVk = 0;                            // 虚拟键码（仅按键类动作使用）
+    std::wstring keyText;                      // 按键显示名（仅按键类动作使用）
     // ── 修饰键按下状态 (左右分别控制) ──
     bool holdLeftWin = false;
     bool holdRightWin = false;
@@ -81,8 +85,8 @@ struct ScriptAction {
     bool holdRightAlt = false;
     bool holdLeftShift = false;
     bool holdRightShift = false;
-    // Wait: 等待秒数。mouseClick/keyClick/hotkeyShortcut/quickInput/scrollWheel/mousePlayback:
-    //   相邻两次重复之间的间隔（clickCount=1 时不生效；首前/末后不等待）
+    // Wait: 等待秒数。mouseClick/keyClick/hotkeyShortcut/quickInput/scrollWheel/
+    //   mousePlayback/runMacro/runBlock: 相邻两次重复之间的间隔（clickCount=1 时不生效；首前/末后不等待）
     // 默认 0：瞬时类（Move*/Down/Up/KeyDown/Up/FindImage）必须为 0；Wait/重复间隔类构建时显式设默认。
     double duration = 0.0;
     // Wait: 随机附加等待。上列重复类动作: 重复间隔上的随机附加秒数
@@ -95,9 +99,12 @@ struct ScriptAction {
     std::wstring loopVarExpr;                  // 循环次数变量表达式
     std::wstring blockName;                    // 宏指令块名称 (DefineBlock/RunBlock/RunMacro)
     std::wstring targetPath;                   // 目标脚本路径 (RunMacro/MousePlayback)
+    /// mousePlayback：嵌套录制回放倍速（0.25~4，缺省 1）。只用本字段，不叠加设置全局倍速
+    double playbackSpeed = 1.0;
     int shortcutPreset = 0;                   // 快捷按键预设索引
     std::wstring inputText;                    // 快捷输入文本内容
     double charInterval = 0.01;              // 字符输入间隔 (秒)
+    bool parseEscapes = false;              // 快捷输入：1=解析 \n \r \t \\；缺省 0=按字面输出
     bool scrollVertical = true;               // 垂直滚动
     bool scrollHorizontal = false;            // 水平滚动
     int scrollSteps = 1;                     // 滚动步数
@@ -108,19 +115,26 @@ struct ScriptAction {
     int searchX2 = 0;                        // 搜索区域右下 X
     int searchY2 = 0;                        // 搜索区域右下 Y
     bool searchFullScreen = true;             // 是否搜索整个屏幕
-    std::wstring imagePath;                   // 图片路径
+    std::wstring imagePath;                   // 图片路径；imageUseVar 时为变量名或路径字符串
+    bool imageUseVar = false;                 // 找图/OCR：「要查找的图」使用变量/路径输入
     double matchThreshold = 65.0;            // 匹配阈值 (百分比)
+    bool perfectMatch = false;               // 完美匹配：像素级终审（忽略 matchThreshold）
     double imageScale = 1.0;                // 缩放比例
     double imageScaleMin = 1.0;             // 最小缩放
     double imageScaleMax = 1.0;             // 最大缩放
-    int findImageFollowUp = 0;              // 0=点击, 1=移动, 2=保存变量
+    int findImageFollowUp = 0;              // 0=点击, 1=移动, 2=保存匹配度, 3=保存图片
     int offsetX = 0;                         // 点击偏移 X
     int offsetY = 0;                         // 点击偏移 Y
     bool findUntilFound = false;             // OCR 文字查找：是否循环直到找到
     std::wstring findTimeExpr = L"0";        // 找图时限（秒，可小数；0=只找一次；-1=直到找到；支持变量名）
-    std::wstring matchVarName = L"matchRet";  // 匹配结果变量名
+    std::wstring matchVarName = L"matchRet";  // 匹配结果/图片保存目标变量名或路径
+    // ── 颜色动作 ──
+    int colorR = 0;
+    int colorG = 0;
+    int colorB = 0;
+    int colorTolerance = 16;                 // 单通道最大差 0~255
     // ── 文字识别相关 ──
-    bool ocrRegionByImage = false;           // 获取文字：根据找图结果选取相对 OCR 区域
+    bool ocrRegionByImage = false;           // 根据找图锚点 + imageRegion 相对偏移确定 OCR 区域
     bool ocrDigitsOnly = false;              // 纯数字识别（PaddleOCR 数字模式，失败时回退通用识别）
     int ocrResultMode = 0;                   // 0=获取文字, 1=文字查找
     std::wstring ocrSearchText;              // 文字查找目标（可含变量）
@@ -128,6 +142,11 @@ struct ScriptAction {
     std::wstring conditionExpr;               // 条件表达式 (If 动作)
     std::wstring gotoStepExpr;                // 跳转目标序号（支持变量表达式）
     bool matchFileNameOnly = false;           // 关闭程序时仅匹配文件名
+    // ── 根据图片选取区域：匹配框内相对偏移（OCR / AI 共用；与 search/aiSearch 绝对识别区分离）──
+    int imageRegionX1 = 0;
+    int imageRegionY1 = 0;
+    int imageRegionX2 = 0;
+    int imageRegionY2 = 0;
     // ── AI 动作通用 ──
     std::wstring aiPrompt;              // 用户 prompt（支持 {变量}）
     std::wstring aiOutputVarName;       // 输出变量名
@@ -137,32 +156,56 @@ struct ScriptAction {
     int aiTimeoutSec = 30;            // API超时秒数
     // ── AI图片分析专用 ──
     double aiImageScale = 0.5;         // 截屏缩放比例（0.1-1.0），大图还会自动限边
-    bool aiRegionByImage = false;       // 根据找图锚点确定 AI 分析区域
-    std::wstring aiTargetImagePath;     // 锚定找图用的图片（aiRegionByImage=1 时）
+    bool aiRegionByImage = false;       // 在绝对识别区域内找图，再按 imageRegion 收窄截屏区
+    std::wstring aiTargetImagePath;     // 锚定找图用的图片（aiRegionByImage=1 时）；aiImageUseVar 时为变量名或路径
+    bool aiImageUseVar = false;         // AI：「要查找的图」使用变量/路径输入
     int aiSearchRegion = 0;           // 搜索区域：0=全屏,1=约左上,2=约右上,3=约左下,4=约右下,5=约中央,6=自定义
-    int aiSearchX1 = 0;               // 自定义搜索区域 X1
-    int aiSearchY1 = 0;               // 自定义搜索区域 Y1
-    int aiSearchX2 = 0;               // 自定义搜索区域 X2
-    int aiSearchY2 = 0;               // 自定义搜索区域 Y2
+    int aiSearchX1 = 0;               // 识别区域 X1（屏幕绝对坐标）
+    int aiSearchY1 = 0;               // 识别区域 Y1（屏幕绝对坐标）
+    int aiSearchX2 = 0;               // 识别区域 X2（屏幕绝对坐标）
+    int aiSearchY2 = 0;               // 识别区域 Y2（屏幕绝对坐标）
     // ── AI动作执行专用 ──
     bool aiWithImage = false;          // 是否附带截图调用 API
+    bool aiLogicConvert = false;       // 逻辑转化：段末固化为指令块+条件回退
+    std::wstring aiLogicBlockName;     // 关联 DefineBlock 名（空则自动生成）
     int aiMaxSteps = 10;               // 最大执行步骤数（-1=不限制）
     std::wstring aiFallbackValue;        // API失败降级值
-    bool aiConfirmExecute = false;       // AI动作执行：确认后执行
     // ── 归一化坐标（方案 C：跨分辨率适配）─────────────────────
     // 当 coordsAreNormalized=true 时，nx/ny/nSearchX1 等存储归一化 0.0–1.0 值
     // 此时 x/y/searchX1 等 int 字段由 denormalize 填充为当前环境像素，供编辑器/执行器使用
     bool coordsAreNormalized = false;
+    /// 窗口相对坐标（仅「窗口模式录制」生成）：x/y 是目标窗口客户区像素，
+    /// 不参与屏幕归一化；执行时窗口模式直接投递，不做屏幕→客户区映射。
+    bool windowRelative = false;
     double nx = 0.0, ny = 0.0;
     double nRandomX = 0.0, nRandomY = 0.0;
     double nSearchX1 = 0.0, nSearchY1 = 0.0, nSearchX2 = 0.0, nSearchY2 = 0.0;
     double nOffsetX = 0.0, nOffsetY = 0.0;
     double nAiSearchX1 = 0.0, nAiSearchY1 = 0.0, nAiSearchX2 = 0.0, nAiSearchY2 = 0.0;
+    double nImageRegionX1 = 0.0, nImageRegionY1 = 0.0, nImageRegionX2 = 0.0, nImageRegionY2 = 0.0;
     // ── 录制点击自动截模板（升级为 findImage 前）──
     std::wstring recordedCapturePath;  // JSON: recordedCapturePath；仅 MouseDown 有意义
     int captureOffsetX = 0;            // JSON: captureOffsetX
     int captureOffsetY = 0;            // JSON: captureOffsetY
 };
+
+/// 将「根据图片」的相对偏移应用到匹配框；imageRegion 无效时退回整个匹配框。
+inline bool ApplyImageRegionToMatch(const ScriptAction& a,
+    int matchL, int matchT, int matchR, int matchB,
+    int& outX1, int& outY1, int& outX2, int& outY2) {
+    if (a.imageRegionX2 > a.imageRegionX1 && a.imageRegionY2 > a.imageRegionY1) {
+        outX1 = matchL + a.imageRegionX1;
+        outY1 = matchT + a.imageRegionY1;
+        outX2 = matchL + a.imageRegionX2;
+        outY2 = matchT + a.imageRegionY2;
+    } else {
+        outX1 = matchL;
+        outY1 = matchT;
+        outX2 = matchR;
+        outY2 = matchB;
+    }
+    return outX2 > outX1 && outY2 > outY1;
+}
 
 // ── 容器动作判断辅助函数 ────────────────────────────────────────
 // 判断动作类型是否包含子动作 (可展开/折叠)

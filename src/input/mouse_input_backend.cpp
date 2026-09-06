@@ -1,6 +1,7 @@
 #include "mouse_input_backend.h"
 #include "mouse_rel_split.h"
 #include "foreground_input_router.h"
+#include "synthetic_input_filter.h"
 
 #include <windows.h>
 
@@ -19,12 +20,23 @@ constexpr uint64_t kLatePaceThresholdUs = 600;
 // 默认第一加速阈值约 6；取 4 保证未关加速时也不会被加倍。
 constexpr int kSubThresholdMaxStep = 4;
 
+// 单步相对位移上限：防止畸形脚本/损坏录制给 INT_MIN 级增量，
+// 导致亚阈值拆分产生数百万次 SendInput 的系统 DoS。
+constexpr int kMaxSingleMoveDelta = 32767;
+
+int ClampDelta(int v) {
+    if (v > kMaxSingleMoveDelta) return kMaxSingleMoveDelta;
+    if (v < -kMaxSingleMoveDelta) return -kMaxSingleMoveDelta;
+    return v;
+}
+
 void FillMoveInput(INPUT& input, int dx, int dy) {
     input = {};
     input.type = INPUT_MOUSE;
     input.mi.dx = dx;
     input.mi.dy = dy;
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+    input.mi.dwExtraInfo = synthetic_input::kSyntheticExtraInfo;
 }
 
 }  // namespace
@@ -158,10 +170,19 @@ bool MouseInputRouter::SendInputMoveLocked(int dx, int dy) {
 bool MouseInputRouter::SendInputMoveBatchLocked(
     const std::vector<std::pair<int, int>>& deltas) {
     if (deltas.empty()) return true;
+    // 单步位移上限：畸形脚本的 INT_MIN 增量会在拆分阶段放大成 DoS。
+    std::vector<std::pair<int, int>> clamped;
+    clamped.reserve(deltas.size());
+    for (const auto& d : deltas) {
+        const int cx = ClampDelta(d.first);
+        const int cy = ClampDelta(d.second);
+        if (cx != 0 || cy != 0) clamped.emplace_back(cx, cy);
+    }
+    if (clamped.empty()) return true;
     // 批量一次提交会挤掉时间信息；迟到追赶时改逐条+限速更稳。
     if (lastWaitLateUs_ >= kLatePaceThresholdUs) {
         bool allOk = true;
-        for (const auto& d : deltas) {
+        for (const auto& d : clamped) {
             if (!SendInputMoveLocked(d.first, d.second)) allOk = false;
         }
         if (allOk) ++stats_.batchedSubmits;
@@ -171,13 +192,13 @@ bool MouseInputRouter::SendInputMoveBatchLocked(
     if (ForegroundInputRouter::Instance().IsHidActive()) {
         std::vector<std::pair<int, int>> steps;
         if (splitLargeMoves_) {
-            steps.reserve(deltas.size() * 2);
-            for (const auto& d : deltas) {
+            steps.reserve(clamped.size() * 2);
+            for (const auto& d : clamped) {
                 AppendSubThresholdRelativeSteps(
                     d.first, d.second, kSubThresholdMaxStep, steps);
             }
         } else {
-            steps = deltas;
+            steps = clamped;
         }
         bool allOk = true;
         for (const auto& s : steps) {
@@ -196,13 +217,13 @@ bool MouseInputRouter::SendInputMoveBatchLocked(
     }
     std::vector<std::pair<int, int>> steps;
     if (splitLargeMoves_) {
-        steps.reserve(deltas.size() * 2);
-        for (const auto& d : deltas) {
+        steps.reserve(clamped.size() * 2);
+        for (const auto& d : clamped) {
             AppendSubThresholdRelativeSteps(
                 d.first, d.second, kSubThresholdMaxStep, steps);
         }
     } else {
-        steps = deltas;
+        steps = clamped;
     }
     if (steps.empty()) return true;
     std::vector<INPUT> inputs(steps.size());
@@ -247,6 +268,7 @@ bool MouseInputRouter::SendInputButtonLocked(MouseButtonType button, bool down) 
     default:
         input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP; break;
     }
+    input.mi.dwExtraInfo = synthetic_input::kSyntheticExtraInfo;
     const bool ok = SendInput(1, &input, sizeof(input)) == 1;
     ok ? ++stats_.sentEvents : ++stats_.failedEvents;
     if (!ok) lastError_ = L"SendInput mouse button failed";
@@ -265,6 +287,7 @@ bool MouseInputRouter::SendInputWheelLocked(int delta, bool horizontal) {
     input.type = INPUT_MOUSE;
     input.mi.dwFlags = horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
     input.mi.mouseData = static_cast<DWORD>(delta);
+    input.mi.dwExtraInfo = synthetic_input::kSyntheticExtraInfo;
     const bool ok = SendInput(1, &input, sizeof(input)) == 1;
     ok ? ++stats_.sentEvents : ++stats_.failedEvents;
     if (!ok) lastError_ = L"SendInput wheel failed";
@@ -272,6 +295,8 @@ bool MouseInputRouter::SendInputWheelLocked(int delta, bool horizontal) {
 }
 
 bool MouseInputRouter::MoveRelative(int dx, int dy) {
+    dx = ClampDelta(dx);
+    dy = ClampDelta(dy);
     if (dx == 0 && dy == 0) return true;
     std::lock_guard<std::mutex> lock(mutex_);
     return SendInputMoveLocked(dx, dy);

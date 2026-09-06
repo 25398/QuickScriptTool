@@ -44,6 +44,18 @@ struct RecordedEvent {
     int captureOffsetY = 0;
 };
 
+/// 窗口相对录制目标：开启后鼠标事件坐标按目标窗口客户区记录（跟随窗口回放）。
+struct RecordingWindowTarget {
+    bool enabled = false;
+    HWND hwnd = nullptr;
+    int clientW = 0;
+    int clientH = 0;
+    std::wstring exePath;
+    std::wstring windowTitle;
+    std::wstring windowClassName;
+    std::wstring childWindowClassName;
+};
+
 // ── 全局录制状态 ──────────────────────────────────────────────────
 
 extern std::vector<RecordedEvent> g_recordedEvents;
@@ -70,7 +82,22 @@ bool IsRelativeMouseCaptureActive();
 void SetRecordingCaptureMode(RecordingCaptureMode mode);
 RecordingCaptureMode GetRecordingCaptureMode();
 
-/// 设置录制时需忽略的全局停止热键（避免终止键被录入脚本）
+/// 设置窗口相对录制目标（窗口模式录制）；enabled=false 恢复屏幕绝对录制。
+void SetRecordingWindowTarget(const RecordingWindowTarget& target);
+/// 当前窗口相对录制目标（快照拷贝）。
+RecordingWindowTarget GetRecordingWindowTarget();
+/// 窗口相对录制开启且目标点落在目标窗口内：屏幕坐标 → 客户区坐标，返回 true。
+bool MapRecordingPointToClientIfWindowRelative(int& x, int& y);
+
+/// 设置录制时需忽略的启停热键（全局/脚本/录制），避免误录入
+struct RecordingIgnoreChord {
+    UINT modifiers = 0;
+    UINT vk = 0;
+};
+/// 图片定位模式：相对采集阶段跳过点击截图（找图转换仅对绝对事件有意义）
+void SetRecordingClickCaptureSkipRelative(bool skip);
+void SetRecordingIgnoreHotkeys(const RecordingIgnoreChord* items, int count);
+/// 兼容：单热键忽略（enabled=false 或 vk=0 清空）
 void SetRecordingIgnoreHotkey(UINT modifiers, UINT vk, bool enabled);
 
 /// 录制调试输出（钩子线程可调；空 sink 关闭）。主窗在启停录制时接入宏调试窗。
@@ -89,7 +116,7 @@ struct RecordingDebugStats {
 };
 RecordingDebugStats GetRecordingDebugStats();
 
-/// 录制点击自动截模板：StartRecording 注入；钩子内仅入队
+/// 录制点击自动截模板：StartRecording 注入；钩子内在 CallNextHookEx 前截像素，worker 只写盘
 void SetRecordingClickCaptureConfig(bool enabled, int halfSize);
 /// Stop 时在 Convert 前调用；超时后仍返回（缺 path 视为无模板）
 void FlushClickCaptures(DWORD timeoutMs = 3000);
@@ -109,3 +136,46 @@ LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp);
 /// 安装钩子并等待 Raw Input sink 注册完成；false 表示相对录制不可用。
 bool InstallRecordingHooks();
 void UninstallRecordingHooks();
+
+/// 录制捕获范围：0=当前窗口过滤，1=全局（与 AppSettings.home.recorderCaptureScope 一致）
+void SetRecordingCaptureScope(int scope);
+int GetRecordingCaptureScope();
+/// StartRecording：按 scope 锁定过滤根窗；ownProcessId 用于避免把自己锁成目标。
+void BeginRecordingScopeSession(HWND preferredForeground, DWORD ownProcessId);
+void EndRecordingScopeSession();
+
+/// 纯逻辑（selftest / 钩子共用）：scope 0 时仅接受目标树；root 空且 armOnExternal 时用 candidate 上锁（candidate 不可为 own）。
+struct RecordingScopeEval {
+    bool accept = false;
+    HWND newRoot = nullptr; // 非空表示应写入 session root
+};
+inline RecordingScopeEval EvaluateRecordingScopeFilter(
+    int scope,
+    HWND currentRoot,
+    bool armOnExternal,
+    HWND candidateRoot,
+    bool candidateIsOwnProcess) {
+    RecordingScopeEval ev{};
+    if (scope != 0) {
+        ev.accept = true;
+        return ev;
+    }
+    if (currentRoot) {
+        ev.accept = candidateRoot && candidateRoot == currentRoot;
+        return ev;
+    }
+    if (!armOnExternal) {
+        ev.accept = false;
+        return ev;
+    }
+    if (!candidateRoot || candidateIsOwnProcess) {
+        ev.accept = false;
+        return ev;
+    }
+    ev.accept = true;
+    ev.newRoot = candidateRoot;
+    return ev;
+}
+
+/// 钩子内：键盘用前台窗；鼠标用命中窗。scope=全局恒 true。
+bool RecordingScopeAllowsEvent(bool isKeyboard, int screenX, int screenY);

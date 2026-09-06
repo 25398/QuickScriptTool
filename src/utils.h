@@ -23,11 +23,32 @@ std::wstring AppDir();
 std::wstring ScriptsDir();
 std::wstring RecordingsDir();
 std::wstring FindImagesDir();
+/// 专业模式逻辑目录根：sched / ai 的空文件夹落在 AppDir()/library/<kind>
+std::wstring LibraryKindDir(const std::wstring& kind);
 void        EnsureScriptsDir();
 void        EnsureFindImagesDir();
+void        EnsureLibraryKindDir(const std::wstring& kind);
+
+/// 脚本/录制 JSON 枚举项（支持子目录；folder 用 / 分隔的相对路径）
+struct ScriptFileEntry {
+    std::wstring path;
+    std::wstring fileName;
+    std::wstring folder;
+};
+/// 递归枚举 rootDir 下所有 .json（跳过 images 等保留名）
+void EnumerateScriptJsonFiles(const std::wstring& rootDir, std::vector<ScriptFileEntry>& out);
+/// 递归枚举 rootDir 下所有子目录（相对路径，/ 分隔；不含 root 自身）
+void EnumerateRelativeFolders(const std::wstring& rootDir, std::vector<std::wstring>& out);
+/// 校验相对文件夹路径：禁止 ..、绝对路径、非法字符
+bool IsSafeRelativeFolder(const std::wstring& folder);
+std::wstring NormalizeRelativeFolder(std::wstring folder);
+/// 确保 rootDir\\folder 整条路径存在
+bool EnsureRelativeFolder(const std::wstring& rootDir, const std::wstring& folder);
 std::wstring NowText();
 /// 当前 Unix 秒时间戳字符串（无业务前缀；前缀由调用方拼接）
 std::wstring TimestampName();
+/// 去掉末尾 `.json`（大小写不敏感），用于列表显示名 / 无 HWND 时从文件名回退
+std::wstring StripJsonExtension(std::wstring name);
 
 // ── 窗口文本操作 ──────────────────────────────────────────────────
 std::wstring GetText(HWND hwnd);
@@ -44,6 +65,10 @@ std::wstring F3(double value);
 std::wstring EscapeJson(const std::wstring& value);
 std::wstring UnescapeJson(const std::wstring& value);
 std::vector<std::wstring> ExtractJsonActionBlocks(const std::wstring& content);
+/// 字符串感知的配对括号查找（跳过引号内内容与转义）；openPos 须指向开括号。
+size_t FindMatchingJsonBrace(const std::wstring& src, size_t openPos);
+size_t FindMatchingJsonBrace(const std::string& src, size_t openPos);
+size_t FindMatchingJsonBracket(const std::string& src, size_t openPos);
 
 // ── 文件操作 ──────────────────────────────────────────────────────
 std::wstring ReadAll(const std::wstring& path);
@@ -70,6 +95,10 @@ std::wstring EnsureImageInLibrary(const std::wstring& path);
 std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& jsonContent);
 /// 扫描所有脚本和录制文件，收集所有被引用的图片路径
 std::unordered_set<std::wstring> CollectAllReferencedImages();
+/// ZIP 导入后：按条目文件名重写 script JSON 中的 imagePath / aiTargetImagePath / recordedCapturePath。
+void RemapImportedImagePathInScriptJson(std::wstring& content,
+    const std::wstring& zipEntryFileName,
+    const std::wstring& newRelPath);
 /// 删除 images 目录下没有被任何脚本引用的孤立图片
 int CleanOrphanImages();
 /// 删除指定 JSON 文件所引用的图片（如果这些图片不被其他脚本引用）
@@ -93,6 +122,9 @@ std::string ReadTextFromZip(const std::wstring& zipPath, const std::string& arch
 // ── 热键与按键名称 ────────────────────────────────────────────────
 std::wstring VkName(UINT vk);
 std::wstring HotkeyText(UINT modifiers, UINT vk);
+/// 展开文本中的 %环境变量%（如 %USERPROFILE%）；未定义变量保持原样。
+/// 用于动作路径等字段，让脚本可用 %USERPROFILE%\Desktop 这类写法。
+std::wstring ExpandEnvironmentVars(const std::wstring& text);
 /// holdMode：按下/松开各触发一次（与鼠标左键启停同语义）
 std::wstring HotkeyText(UINT modifiers, UINT vk, bool holdMode);
 
@@ -116,6 +148,7 @@ std::wstring FormatHoldThresholdLabel(double seconds);
 struct ScriptMeta {
     std::wstring name;
     std::wstring path;
+    std::wstring folder;  // 相对 ScriptsDir/RecordingsDir，空=根
     std::wstring recordTime;
     int actionCount = 0;
     double durationSeconds = 0;
@@ -125,6 +158,6 @@ struct ScriptMeta {
 /// 格式化秒数为 分'秒" 格式
 std::wstring FormatDuration(double sec);
 
-/// 开机自动启动（HKCU\\...\\Run，值名「鼠大侠」）
+/// 开机自动启动（HKCU\\...\\Run，值名「键鼠工坊」）
 bool SetAutoStartOnBoot(bool enabled);
 bool IsAutoStartOnBootEnabled();

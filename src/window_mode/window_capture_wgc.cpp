@@ -1,4 +1,5 @@
 #include "window_capture_wgc.h"
+#include "window_target.h"
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
@@ -184,6 +185,79 @@ HBITMAP CaptureWindowWgcOnThread(HWND hwnd, int& outW, int& outH) {
     }
 }
 
+HBITMAP CaptureMonitorWgcOnThread(HMONITOR hMon, int& outW, int& outH) {
+    outW = 0;
+    outH = 0;
+    if (!hMon) return nullptr;
+    if (!IsWgcCaptureAvailableOnThread()) return nullptr;
+
+    MONITORINFO mi{ sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) return nullptr;
+    const int expectW = mi.rcMonitor.right - mi.rcMonitor.left;
+    const int expectH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    if (expectW <= 0 || expectH <= 0) return nullptr;
+
+    try {
+        EnsureWinRtApartment();
+
+        const winrt::com_ptr<ID3D11Device> d3d = CreateD3DDevice();
+        if (!d3d) return nullptr;
+
+        winrt::com_ptr<ID3D11DeviceContext> context;
+        d3d->GetImmediateContext(context.put());
+
+        auto factory = winrt::get_activation_factory<wgc::GraphicsCaptureItem,
+            IGraphicsCaptureItemInterop>();
+        wgc::GraphicsCaptureItem item{ nullptr };
+        winrt::check_hresult(factory->CreateForMonitor(
+            hMon, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+            reinterpret_cast<void**>(winrt::put_abi(item))));
+        auto size = item.Size();
+        if (size.Width <= 0 || size.Height <= 0) return nullptr;
+
+        const wgd3d::IDirect3DDevice device = CreateWinRtDevice(d3d);
+        auto framePool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            device, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        auto session = framePool.CreateCaptureSession(item);
+        session.IsCursorCaptureEnabled(false);
+        try {
+            session.IsBorderRequired(false);
+        } catch (...) {
+        }
+        session.StartCapture();
+
+        wgc::Direct3D11CaptureFrame frame{ nullptr };
+        for (int attempt = 0; attempt < 80; ++attempt) {
+            frame = framePool.TryGetNextFrame();
+            if (frame) {
+                size = frame.ContentSize();
+                if (size.Width >= expectW / 2 && size.Height >= expectH / 2) {
+                    break;
+                }
+                frame = nullptr;
+            }
+            if (!frame) Sleep(25);
+        }
+
+        session.Close();
+        framePool.Close();
+        if (!frame) return nullptr;
+
+        const auto surface = frame.Surface();
+        auto access = surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        winrt::com_ptr<ID3D11Texture2D> texture;
+        winrt::check_hresult(access->GetInterface(
+            winrt::guid_of<ID3D11Texture2D>(), texture.put_void()));
+
+        outW = static_cast<int>(size.Width);
+        outH = static_cast<int>(size.Height);
+        return CopyTextureToBitmap(context.get(), texture.get(),
+            static_cast<UINT>(size.Width), static_cast<UINT>(size.Height));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 template <typename Fn>
 auto RunOnWgcWorker(Fn&& fn) -> decltype(fn()) {
     using R = decltype(fn());
@@ -196,6 +270,28 @@ auto RunOnWgcWorker(Fn&& fn) -> decltype(fn()) {
 }
 
 }  // namespace
+
+HBITMAP CaptureMonitorWgc(HMONITOR hMon, int& outW, int& outH) {
+    outW = 0;
+    outH = 0;
+    if (!hMon) hMon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+
+    struct Result {
+        HBITMAP bmp = nullptr;
+        int w = 0;
+        int h = 0;
+    };
+
+    const Result result = RunOnWgcWorker([hMon] {
+        Result local{};
+        local.bmp = CaptureMonitorWgcOnThread(hMon, local.w, local.h);
+        return local;
+    });
+
+    outW = result.w;
+    outH = result.h;
+    return result.bmp;
+}
 
 bool IsWgcCaptureAvailable() {
     static std::once_flag once;
@@ -211,6 +307,7 @@ HBITMAP CaptureWindowWgc(HWND hwnd, int& outW, int& outH) {
     outW = 0;
     outH = 0;
     if (!hwnd || !IsWindow(hwnd)) return nullptr;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return nullptr;
 
     struct Result {
         HBITMAP bmp = nullptr;

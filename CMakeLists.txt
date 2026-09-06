@@ -1,10 +1,15 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 
 project(QuickScriptTool LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# ── WebView2 壳（产品）────────────────────────────────────────────
+option(QST_BUILD_WEBVIEW_SHELL "Build QstWebViewShell (WebView UI + full engine)" ON)
+option(QST_WEBVIEW_BUNDLE_FIXED "Copy WebView2Fixed next to QstWebViewShell (portable)" ON)
+option(QST_WEBVIEW_ALLOW_EVERGREEN "Allow system Evergreen if WebView2Fixed missing (dev only)" OFF)
 
 # ── OpenCV ────────────────────────────────────────────────────────
 if(NOT OpenCV_DIR)
@@ -33,13 +38,25 @@ set(WINDOW_MODE_CORE_SOURCES
     src/window_mode/window_mode_session.cpp
     src/window_mode/window_mode_executor.cpp
     src/window_mode/background_window_input.cpp
+    src/window_mode/background_input_target.cpp
     src/window_mode/background_uia_input.cpp
+    src/window_mode/ui_element_probe.cpp
+    src/window_mode/window_list.cpp
     src/window_mode/window_mode_permission.cpp
     src/window_mode/fake_focus/fake_focus_injector.cpp
     src/window_mode/fake_focus/fake_focus_soft_input_host.cpp
     src/window_mode/cdp/cdp_input.cpp
     src/window_mode/ext_bridge/ext_bridge_server.cpp
     src/window_mode/ext_bridge/ext_input.cpp
+    # 注入技术库（对抗性测试框架，见 docs/anticheat-injection-testing.md）
+    src/window_mode/injection/inject_common.cpp
+    src/window_mode/injection/inject_technique.cpp
+    src/window_mode/injection/inject_remote_thread.cpp
+    src/window_mode/injection/inject_apc.cpp
+    src/window_mode/injection/inject_thread_hijack.cpp
+    src/window_mode/injection/inject_manual_map.cpp
+    src/window_mode/injection/inject_peb_hide.cpp
+    src/window_mode/injection/inject_hook.cpp
 )
 
 add_library(window_mode_core OBJECT ${WINDOW_MODE_CORE_SOURCES})
@@ -83,6 +100,11 @@ target_include_directories(FakeFocus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(FakeFocus PRIVATE user32 dwmapi)
+set(_FAKEFOCUS_DEF "${CMAKE_CURRENT_SOURCE_DIR}/src/window_mode/fake_focus/fake_focus.def")
+if(MSVC)
+    target_link_options(FakeFocus PRIVATE "/DEF:${_FAKEFOCUS_DEF}")
+    set_property(TARGET FakeFocus APPEND PROPERTY LINK_DEPENDS "${_FAKEFOCUS_DEF}")
+endif()
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set_target_properties(FakeFocus PROPERTIES OUTPUT_NAME FakeFocus64)
 else()
@@ -90,6 +112,8 @@ else()
 endif()
 if(MSVC)
     target_compile_options(FakeFocus PRIVATE /W4 /permissive- /utf-8)
+    # javaw/GLFW 进程通常没有旁路 VCRUNTIME140；/MD 注入会 LoadLibrary 失败甚至在游戏线程崩。
+    set_property(TARGET FakeFocus PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # ── CdpEnable DLL（已停用注入路径；保留目标供归档，默认不编入 ALL）──
@@ -110,7 +134,7 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(_FAKEFOCUS32_SCRIPT "${CMAKE_SOURCE_DIR}/src/window_mode/fake_focus/build_fakefocus32.cmd")
     add_custom_target(FakeFocus32 ALL
         COMMAND "${_FAKEFOCUS32_SCRIPT}" "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/$<CONFIG>"
-        DEPENDS ${FAKEFOCUS_DLL_SOURCES} ${_FAKEFOCUS32_SCRIPT}
+        DEPENDS ${FAKEFOCUS_DLL_SOURCES} ${_FAKEFOCUS32_SCRIPT} ${_FAKEFOCUS_DEF}
         COMMENT "Building FakeFocus32.dll (x86)"
         VERBATIM
     )
@@ -124,10 +148,13 @@ set(SCRIPT_CORE_COMMON_SOURCES
     src/input/virtual_hid.cpp
     src/input/foreground_input_router.cpp
     src/input/synthetic_input_filter.cpp
+    src/input/input_emergency_teardown.cpp
     src/coord_space.cpp
     src/findimage_template_crop.cpp
     src/image_match.cpp
     src/image_match_engines.cpp
+    src/image_var_util.cpp
+    src/color_match.cpp
     src/ocr_engine.cpp
     src/utils.cpp
 )
@@ -144,115 +171,32 @@ if(MSVC)
     target_compile_options(script_core_common PRIVATE /W4 /permissive- /utf-8)
 endif()
 
-add_executable(QuickScriptTool WIN32
-    resources/QuickScriptTool.rc
-    src/main.cpp
-    src/clicker.cpp
-    src/controls.cpp
-    src/drawing.cpp
-    src/render_device.cpp
-    src/render_context_gdi.cpp
-    src/render_context_d2d.cpp
-    src/render_font.cpp
-    src/editor_paint.cpp
-    src/editor_dropdown.cpp
-    src/hotkey_dialog.cpp
-    src/macro_variables.cpp
-    src/macro_debug_window.cpp
-    src/ocr_install_dialog.cpp
-    src/ocr_overlay.cpp
-    src/process_utils.cpp
-    src/crosshair_drag.cpp
-    src/find_image_ui_debug.cpp
-    src/match_overlay.cpp
-    src/findimage_crop_editor.cpp
-    src/popup_combo.cpp
-    src/prompt_modal.cpp
-    src/panel_popup_combo.cpp
-    src/recorder.cpp
-    src/recorder_timeline.cpp
-    src/recording_to_findimage.cpp
-    src/input_timeline_scheduler.cpp
-    src/recording_optimize_dialog.cpp
-    src/app_settings_store.cpp
-    src/app_branding.cpp
-    src/app_theme.cpp
-    src/theme_custom_dialog.cpp
-    src/settings_dialog.cpp
-    src/modern_edit.cpp
-    src/agent_attachment.cpp
-    src/ai_action_service.cpp
-    src/ai_action_runtime.cpp
-    src/ai_action_router.cpp
-    src/tray_menu.cpp
-    src/themed_popup_menu.cpp
-    src/taskbar_iconic_preview.cpp
-    src/scheduled_task_types.cpp
-    src/scheduled_task_store.cpp
-    src/scheduled_task_scheduler.cpp
-    src/scheduled_task_datetime_picker.cpp
-    src/scheduled_task_dialog.cpp
-    src/script_io.cpp
-    src/script_action_builder.cpp
-    src/agent_ui_notify.cpp
-    src/agent_script_ops.cpp
-    src/screenshot_overlay.cpp
-    src/agent_core.cpp
-    src/agent_reference.cpp
-    src/agent_system_prompt.cpp
-    src/agent_dialog.cpp
-    src/agent_conversation_store.cpp
-    src/agent_tools.cpp
-    src/agent_ai_actions.cpp
-    src/macro_execute_tools.cpp
-    src/ui_component.cpp
-    src/ui_scale.cpp
-    src/window_mode/window_mode_json.cpp
-    src/window_mode/window_mode_preview.cpp
-    src/window_mode/window_pick_dialog.cpp
+# ── 产品分层库（WebView 壳 + Engine）──────────────────────────────
+include(cmake/QstProductLibs.cmake)
+include(cmake/WebView2.cmake)
+
+list(APPEND QST_ENGINE_SOURCES ${QST_ENGINE_UI_STUB_SOURCES})
+
+add_library(qst_desktop_tools OBJECT ${QST_DESKTOP_TOOLS_SOURCES})
+qst_configure_product_lib(qst_desktop_tools)
+
+add_library(qst_engine_ui_stubs OBJECT ${QST_ENGINE_DIALOG_STUB_SOURCES})
+qst_configure_product_lib(qst_engine_ui_stubs)
+target_compile_definitions(qst_engine_ui_stubs PUBLIC QST_GDI_LEGACY=0)
+
+add_library(qst_engine OBJECT ${QST_ENGINE_SOURCES})
+qst_configure_product_lib(qst_engine)
+target_compile_definitions(qst_engine PUBLIC
+    QST_GDI_LEGACY=0
+    QST_WEBVIEW_WITH_ENGINE=1
+    QST_WEBVIEW_SHELL=1
 )
-
-target_compile_definitions(QuickScriptTool PRIVATE UNICODE _UNICODE NOMINMAX)
-
-target_include_directories(QuickScriptTool PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/resources
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${OpenCV_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/DuiLib_Ultimate
-    ${CMAKE_CURRENT_SOURCE_DIR}/DuiLib_Ultimate/DuiLib
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party
+target_link_libraries(qst_engine PUBLIC
+    qst_desktop_tools
+    qst_engine_ui_stubs
+    ${QST_COMMON_LINK_LIBS}
 )
-
-target_link_libraries(QuickScriptTool PRIVATE
-    window_mode_core
-    script_core_common
-    ${OpenCV_LIBS}
-    user32
-    gdi32
-    dwmapi
-    d2d1
-    dwrite
-    comdlg32
-    shell32
-    comctl32
-    imm32
-    msimg32
-    uxtheme
-    ole32
-    oleaut32
-    propsys
-    UIAutomationCore
-    urlmon
-    winhttp
-    d3d11
-    dxgi
-    windowsapp
-    winmm
-)
-
-if(MSVC)
-    target_compile_options(QuickScriptTool PRIVATE /W4 /permissive- /utf-8)
-endif()
+qst_link_webview2(qst_engine)
 
 # ── Agent SelfTest harness helper ─────────────────────────────────
 # Usage: qst_add_selftest(Name sources... [LIBS lib1 lib2 ...])
@@ -301,6 +245,7 @@ target_include_directories(macro_variables_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${OpenCV_INCLUDE_DIRS}
 )
+target_link_libraries(macro_variables_core PUBLIC user32 gdi32 shell32 advapi32)
 if(MSVC)
     target_compile_options(macro_variables_core PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -340,11 +285,9 @@ qst_add_selftest(WindowModeSelfTest
         ${OpenCV_LIBS}
         user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
 )
-add_dependencies(QuickScriptTool FakeFocus)
 add_dependencies(WindowModeSelfTest FakeFocus)
 if(TARGET FakeFocus32)
     add_dependencies(WindowModeSelfTest FakeFocus32)
-    add_dependencies(QuickScriptTool FakeFocus32)
 endif()
 
 qst_add_selftest(ScheduledTaskSelfTest
@@ -352,13 +295,15 @@ qst_add_selftest(ScheduledTaskSelfTest
     LIBS scheduled_task_core user32 shell32 shlwapi
 )
 
+
 qst_add_selftest(MacroVariablesSelfTest
     tools/macro_variables_selftest.cpp
-    LIBS macro_variables_core
+    LIBS macro_variables_core user32 gdi32 shell32 advapi32
 )
 
 qst_add_selftest(ScriptActionBuilderSelfTest
     tools/script_action_builder_selftest.cpp
+    tools/window_mode_link_stubs.cpp
     LIBS
         script_action_builder_core
         script_core_common
@@ -389,6 +334,7 @@ qst_add_selftest(CoordSpaceSelfTest
 
 qst_add_selftest(ScriptIoSelfTest
     tools/script_io_selftest.cpp
+    tools/window_mode_link_stubs.cpp
     LIBS
         script_action_builder_core
         script_core_common
@@ -406,12 +352,67 @@ qst_add_selftest(ImageMatchSelfTest
 
 qst_add_selftest(AiActionRouterSelfTest
     tools/ai_action_router_selftest.cpp
+    tools/window_mode_link_stubs.cpp
+    src/macro_execute_tools.cpp
+    src/process_utils.cpp
+    src/ai_action_lookahead.cpp
+    src/ai_logic_convert.cpp
+    src/recording_to_findimage.cpp
     LIBS
         script_action_builder_core
         script_core_common
         ${OpenCV_LIBS}
-        user32 gdi32 shell32 shlwapi
+        user32 gdi32 shell32 shlwapi advapi32 ole32 imm32
 )
+
+qst_add_selftest(AgentAssistantSelfTest
+    tools/agent_assistant_selftest.cpp
+    tools/window_mode_link_stubs.cpp
+    src/agent_attachment.cpp
+    src/agent_conversation_store.cpp
+    src/agent_script_ops.cpp
+    src/recording_optimize_ops.cpp
+    src/agent_shell.cpp
+    src/agent_web.cpp
+    src/agent_webview.cpp
+    src/agent_undo.cpp
+    src/agent_ui_notify.cpp
+    src/agent_reference.cpp
+    src/agent_core.cpp
+    src/agent_tools.cpp
+    src/macro_execute_tools.cpp
+    src/process_utils.cpp
+    src/ai_action_lookahead.cpp
+    src/ai_logic_convert.cpp
+    src/recording_to_findimage.cpp
+    src/scheduled_task_store.cpp
+    src/scheduled_task_types.cpp
+    LIBS
+        script_action_builder_core
+        script_core_common
+        Qst::WebView2
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi advapi32 ole32 oleaut32 imm32
+)
+
+add_custom_command(TARGET AgentAssistantSelfTest POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-conversation/SKILL.md"
+        "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/conversation.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-revert/SKILL.md"
+        "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/revert.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-shell/SKILL.md"
+        "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/shell.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-script/SKILL.md"
+        "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/scriptstrategy.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-optimize/SKILL.md"
+        "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/optimize.md"
+    COMMENT "Copy Agent skills for AgentAssistantSelfTest")
 
 qst_add_selftest(AppSettingsStoreSelfTest
     tools/app_settings_store_selftest.cpp
@@ -432,6 +433,14 @@ qst_add_selftest(ThemeUiSelfTest
     src/ui_scale.cpp
     LIBS
         user32 gdi32 shell32
+)
+
+qst_add_selftest(BreakoutCooldownSelfTest
+    tools/breakout_cooldown_selftest.cpp
+)
+
+qst_add_selftest(HotkeyStopSelfTest
+    tools/hotkey_stop_selftest.cpp
 )
 
 # 录制时间轴自检：不要链 script_core_common（含 SendInput/找图），否则易被 360 HEUR 误删。
@@ -457,8 +466,47 @@ qst_add_selftest(WindowModeDiag
         user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
 )
 
-# Copy OpenCV runtime DLL next to the executable (Debug/Release matched per config)
-if(WIN32)
+# ── 注入技术库自测 / 对抗测试驱动 ─────────────────────────────
+add_library(InjectionTestPayload SHARED tools/injection_test_payload.cpp)
+target_compile_definitions(InjectionTestPayload PRIVATE UNICODE _UNICODE NOMINMAX)
+target_link_libraries(InjectionTestPayload PRIVATE kernel32 user32)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(InjectionTestPayload PROPERTIES OUTPUT_NAME InjectionTestPayload64)
+else()
+    set_target_properties(InjectionTestPayload PROPERTIES OUTPUT_NAME InjectionTestPayload32)
+endif()
+if(MSVC)
+    target_compile_options(InjectionTestPayload PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(InjectionTestPayload PRIVATE /NODEFAULTLIB /ENTRY:DllMain)
+endif()
+
+add_executable(InjectionTestTarget tools/injection_test_target.cpp)
+target_compile_definitions(InjectionTestTarget PRIVATE UNICODE _UNICODE NOMINMAX)
+target_link_libraries(InjectionTestTarget PRIVATE user32)
+if(MSVC)
+    target_compile_options(InjectionTestTarget PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(InjectionTestTarget PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+endif()
+
+qst_add_selftest(InjectionSelfTest
+    tools/injection_selftest.cpp
+    LIBS
+        window_mode_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
+)
+add_dependencies(InjectionSelfTest InjectionTestTarget InjectionTestPayload)
+if(TARGET FakeFocus)
+    add_dependencies(InjectionSelfTest FakeFocus)
+endif()
+
+# ── POST_BUILD：OpenCV / 图标 / OCR helper / 扩展 / VDA / Interception ─
+function(qst_copy_product_runtime target)
+    if(NOT WIN32)
+        return()
+    endif()
+
     set(_opencv_bin_dirs "")
     foreach(_subdir IN ITEMS "x64/vc16/bin" "x64/vc17/bin" "x64/vc18/bin" "x64/vc15/bin" "bin")
         if(EXISTS "${OpenCV_DIR}/${_subdir}")
@@ -470,75 +518,209 @@ if(WIN32)
         file(GLOB _opencv_rel "${_bin_dir}/opencv_world[0-9]*.dll")
         list(FILTER _opencv_rel EXCLUDE REGEX "d\\.dll$")
         if(_opencv_dbg)
-            add_custom_command(TARGET QuickScriptTool POST_BUILD
+            add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${_opencv_dbg}"
-                    "$<TARGET_FILE_DIR:QuickScriptTool>"
-                COMMENT "Copying OpenCV debug runtime DLL"
+                    "$<TARGET_FILE_DIR:${target}>"
+                COMMENT "Copying OpenCV debug runtime DLL for ${target}"
                 CONFIGURATIONS Debug)
         endif()
         if(_opencv_rel)
-            add_custom_command(TARGET QuickScriptTool POST_BUILD
+            add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${_opencv_rel}"
-                    "$<TARGET_FILE_DIR:QuickScriptTool>"
-                COMMENT "Copying OpenCV release runtime DLL"
+                    "$<TARGET_FILE_DIR:${target}>"
+                COMMENT "Copying OpenCV release runtime DLL for ${target}"
                 CONFIGURATIONS Release RelWithDebInfo MinSizeRel)
         endif()
     endforeach()
-    add_custom_command(TARGET QuickScriptTool POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/tools"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:QuickScriptTool>/extension/edge/icons"
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/tools"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/resources/breakout_pause.ico"
-            "$<TARGET_FILE_DIR:QuickScriptTool>/breakout_pause.ico"
+            "$<TARGET_FILE_DIR:${target}>/breakout_pause.ico"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/resources/tray_running.ico"
-            "$<TARGET_FILE_DIR:QuickScriptTool>/tray_running.ico"
+            "$<TARGET_FILE_DIR:${target}>/tray_running.ico"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/resources/app_icon.ico"
-            "$<TARGET_FILE_DIR:QuickScriptTool>/app_icon.ico"
+            "$<TARGET_FILE_DIR:${target}>/app_icon.ico"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/paddle_ocr_helper.py"
-            "$<TARGET_FILE_DIR:QuickScriptTool>/tools/paddle_ocr_helper.py"
+            "$<TARGET_FILE_DIR:${target}>/tools/paddle_ocr_helper.py"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/requirements-ocr.txt"
-            "$<TARGET_FILE_DIR:QuickScriptTool>/tools/requirements-ocr.txt"
+            "$<TARGET_FILE_DIR:${target}>/tools/requirements-ocr.txt"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/extension/edge"
-            "$<TARGET_FILE_DIR:QuickScriptTool>/extension/edge"
-        COMMENT "Copying PaddleOCR helper, icons, and Edge extension")
+            "$<TARGET_FILE_DIR:${target}>/extension/edge"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/skills/agent"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-conversation/SKILL.md"
+            "$<TARGET_FILE_DIR:${target}>/skills/agent/conversation.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-revert/SKILL.md"
+            "$<TARGET_FILE_DIR:${target}>/skills/agent/revert.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-shell/SKILL.md"
+            "$<TARGET_FILE_DIR:${target}>/skills/agent/shell.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-script/SKILL.md"
+            "$<TARGET_FILE_DIR:${target}>/skills/agent/scriptstrategy.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-optimize/SKILL.md"
+            "$<TARGET_FILE_DIR:${target}>/skills/agent/optimize.md"
+        COMMENT "Copying icons, OCR helpers, Edge extension, and Agent skills for ${target}")
+
     foreach(_vda_dll IN ITEMS
         "VirtualDesktopAccessor11.dll"
+        "VirtualDesktopAccessor11_23h2.dll"
         "VirtualDesktopAccessor10.dll")
         if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/VirtualDesktopAccessor/${_vda_dll}")
-            add_custom_command(TARGET QuickScriptTool POST_BUILD
+            add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${CMAKE_SOURCE_DIR}/third_party/VirtualDesktopAccessor/${_vda_dll}"
-                    "$<TARGET_FILE_DIR:QuickScriptTool>/${_vda_dll}"
-                COMMENT "Copying VirtualDesktopAccessor ${_vda_dll}")
+                    "$<TARGET_FILE_DIR:${target}>/${_vda_dll}"
+                COMMENT "Copying VirtualDesktopAccessor ${_vda_dll} for ${target}")
         endif()
     endforeach()
-    # Interception 用户态 DLL（驱动需用户自行安装，见 third_party/interception/README.md）
+
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         set(_INTERCEPTION_DLL "${CMAKE_SOURCE_DIR}/third_party/interception/x64/interception.dll")
     else()
         set(_INTERCEPTION_DLL "${CMAKE_SOURCE_DIR}/third_party/interception/x86/interception.dll")
     endif()
     if(EXISTS "${_INTERCEPTION_DLL}")
-        add_custom_command(TARGET QuickScriptTool POST_BUILD
+        add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_INTERCEPTION_DLL}"
-                "$<TARGET_FILE_DIR:QuickScriptTool>/interception.dll"
-            COMMENT "Copying interception.dll")
+                "$<TARGET_FILE_DIR:${target}>/interception.dll"
+            COMMENT "Copying interception.dll for ${target}")
     endif()
     set(_INTERCEPTION_INSTALLER "${CMAKE_SOURCE_DIR}/third_party/interception/install-interception.exe")
     if(EXISTS "${_INTERCEPTION_INSTALLER}")
-        add_custom_command(TARGET QuickScriptTool POST_BUILD
+        add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_INTERCEPTION_INSTALLER}"
-                "$<TARGET_FILE_DIR:QuickScriptTool>/install-interception.exe"
-            COMMENT "Copying install-interception.exe")
+                "$<TARGET_FILE_DIR:${target}>/install-interception.exe"
+            COMMENT "Copying install-interception.exe for ${target}")
     endif()
-    # FakeFocus DLL 已由 OUTPUT 目录与 FakeFocus/FakeFocus32 目标写入 build/$<CONFIG>/
+endfunction()
+
+function(qst_copy_webview_ui target)
+    if(NOT WIN32)
+        return()
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/ui"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/index.html"
+            "$<TARGET_FILE_DIR:${target}>/ui/index.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/agent.html"
+            "$<TARGET_FILE_DIR:${target}>/ui/agent.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/agent.css"
+            "$<TARGET_FILE_DIR:${target}>/ui/agent.css"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/shell.css"
+            "$<TARGET_FILE_DIR:${target}>/ui/shell.css"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/bridge.js"
+            "$<TARGET_FILE_DIR:${target}>/ui/bridge.js"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/app.js"
+            "$<TARGET_FILE_DIR:${target}>/ui/app.js"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/pro-mode.js"
+            "$<TARGET_FILE_DIR:${target}>/ui/pro-mode.js"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/pro-mode.css"
+            "$<TARGET_FILE_DIR:${target}>/ui/pro-mode.css"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/app_icon.ico"
+            "$<TARGET_FILE_DIR:${target}>/ui/app_icon.ico"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ui/debug.html"
+            "$<TARGET_FILE_DIR:${target}>/ui/debug.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/ui/vendor"
+            "$<TARGET_FILE_DIR:${target}>/ui/vendor"
+        COMMENT "Copying WebView ui/ for ${target}")
+endfunction()
+
+function(qst_bundle_webview2_fixed target)
+    if(NOT WIN32 OR NOT QST_WEBVIEW_BUNDLE_FIXED)
+        return()
+    endif()
+    file(READ "${CMAKE_SOURCE_DIR}/tools/webview2_fixed_version.txt" _wv2_ver_file)
+    string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+" _wv2_ver "${_wv2_ver_file}")
+    if(NOT _wv2_ver)
+        message(WARNING "webview2_fixed_version.txt: no version line — skip WebView2Fixed bundle for ${target}")
+        return()
+    endif()
+    set(_fixed_src "${CMAKE_SOURCE_DIR}/third_party/webview2_fixed/${_wv2_ver}/WebView2Fixed")
+    if(NOT EXISTS "${_fixed_src}/msedgewebview2.exe")
+        message(WARNING "WebView2Fixed missing at ${_fixed_src} — run tools/fetch_webview2_fixed.ps1")
+        return()
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "$<TARGET_FILE_DIR:${target}>/WebView2Fixed"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${_fixed_src}"
+            "$<TARGET_FILE_DIR:${target}>/WebView2Fixed"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/WebView2UserData"
+        COMMENT "Bundling WebView2Fixed ${_wv2_ver} for ${target}")
+endfunction()
+
+# ── QstWebViewShell（产品 exe）────────────────────────────────────
+if(QST_BUILD_WEBVIEW_SHELL)
+    add_executable(QstWebViewShell WIN32
+        resources/QuickScriptTool.rc
+        src/webview/qst_webview_shell.cpp
+        src/webview/webview_bridge_backend.cpp
+    )
+    target_compile_definitions(QstWebViewShell PRIVATE
+        UNICODE _UNICODE NOMINMAX
+        QST_WEBVIEW_SHELL=1
+        QST_WEBVIEW_USE_FIXED=1
+        QST_WEBVIEW_WITH_ENGINE=1
+        QST_GDI_LEGACY=0
+    )
+    if(QST_WEBVIEW_ALLOW_EVERGREEN)
+        target_compile_definitions(QstWebViewShell PRIVATE QST_WEBVIEW_ALLOW_EVERGREEN=1)
+    else()
+        target_compile_definitions(QstWebViewShell PRIVATE QST_WEBVIEW_ALLOW_EVERGREEN=0)
+    endif()
+    target_include_directories(QstWebViewShell PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/resources
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party
+        ${CMAKE_CURRENT_SOURCE_DIR}/driver/qst_vhid
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(QstWebViewShell PRIVATE
+        qst_engine
+        qst_desktop_tools
+        qst_engine_ui_stubs
+        ${QST_COMMON_LINK_LIBS}
+    )
+    qst_link_webview2(QstWebViewShell)
+    if(MSVC)
+        target_compile_options(QstWebViewShell PRIVATE /W4 /permissive- /utf-8)
+        # OpenCV 在加载期硬依赖；缺 DLL / Win N 缺 MFPlat 时进程进不了 wWinMain、无日志无弹窗。
+        # 延迟加载后由壳自行检测并提示。
+        target_link_libraries(QstWebViewShell PRIVATE delayimp)
+        target_link_options(QstWebViewShell PRIVATE "/DELAYLOAD:opencv_world4100.dll")
+    endif()
+
+    add_dependencies(QstWebViewShell FakeFocus)
+    if(TARGET FakeFocus32)
+        add_dependencies(QstWebViewShell FakeFocus32)
+    endif()
+
+    qst_copy_webview_ui(QstWebViewShell)
+    qst_copy_product_runtime(QstWebViewShell)
+    qst_bundle_webview2_fixed(QstWebViewShell)
 endif()

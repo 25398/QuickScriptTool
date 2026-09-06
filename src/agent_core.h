@@ -37,6 +37,11 @@ struct ChatMessage {
     std::wstring content;
     std::wstring reasoning_content;  // DeepSeek 等思考模型需在后续请求中回传
     bool requires_reasoning_content = false;
+    /// 工具轮内嵌入的脚本图片参考消息：即使非最后一条 user 也保留图片不剥离
+    bool keep_images = false;
+    /// 内部引导消息（重复提示/接近上限/继续推进/图片参考）：
+    /// 不显示给用户、不计入用户轮次序号，但照常发给模型。
+    bool internal_nudge = false;
     std::vector<ChatContentPart> parts;
     std::vector<ToolCallRecord> tool_calls;
     std::wstring tool_call_id;  // tool 消息专用
@@ -96,6 +101,9 @@ struct AgentSendCallbacks {
     std::function<bool()> stopToolLoopAfterTools = nullptr;
     // 宏回放中的 AI 调用：直接用完整 HTTP 响应，避免流式读流不稳定
     bool preferNonStream = false;
+    /// 本轮 SendMessage 首次 API 请求的 tool_choice（如 L"required"）；空=auto。
+    /// 工具循环续轮强制 auto，避免 required 死循环（对齐 OpenAI Agents forcing_tool_use）。
+    std::wstring toolChoice;
 };
 
 // ── Agent 核心引擎 ────────────────────────────────────────────────
@@ -128,6 +136,10 @@ public:
     /// 用完整历史替换当前消息（用于恢复已保存对话）
     void SetFullHistory(std::vector<ChatMessage> messages);
 
+    /// 编辑重发：按 user 消息序号（0 起）截断历史，保留该条消息之前的内容
+    /// （不含该条消息）。序号越界返回 false。
+    bool TruncateHistoryToUserRound(size_t userRoundIndex);
+
     /// 从 other 追加非 system 消息（startIndex 起，通常传 1 或追加起点）
     void ImportHistoryFrom(const AgentCore& other, size_t startIndex = 1);
 
@@ -140,6 +152,8 @@ public:
     void SetRecvTimeoutMs(int recvTimeoutMs) {
         config_.recvTimeoutMs = std::max(5000, recvTimeoutMs);
     }
+
+    const AgentConfig& GetConfig() const { return config_; }
 
     // 强制中断进行中的 HTTP 请求（配合 AiHttpAbortSlot）
     void AbortActiveHttp();
@@ -157,7 +171,8 @@ private:
                          AiHttpAbortSlot* httpAbort = nullptr,
                          StatusCallback onStatus = nullptr);
     StreamApiResult CallApiStream(const json& requestBody, const AgentSendCallbacks& callbacks);
-    json BuildRequest(bool stripLastUserImages = false);
+    json BuildRequest(bool stripLastUserImages = false,
+                      const std::string& toolChoice = "auto");
 
     AgentConfig config_;
     std::vector<ChatMessage> messages_;

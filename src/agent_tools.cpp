@@ -7,6 +7,7 @@
 #include "agent_tools.h"
 
 #include "action_utils.h"
+#include "ai_logic_convert.h"
 #include "app_settings_store.h"
 #include "scheduled_task_store.h"
 #include "scheduled_task_types.h"
@@ -14,6 +15,9 @@
 #include "agent_reference.h"
 #include "agent_ai_actions.h"
 #include "agent_ui_notify.h"
+#include "agent_undo.h"
+#include "agent_shell.h"
+#include "agent_web.h"
 #include "recorder_timeline.h"
 #include "script_action_builder.h"
 #include "script_io.h"
@@ -27,6 +31,30 @@
 #include <vector>
 
 namespace {
+
+// 整文件级撤销快照（settings / scheduled_tasks.json）。
+struct AgentFileUndo {
+    std::wstring id;
+    std::wstring path;
+    bool done = false;
+
+    AgentFileUndo(const std::wstring& tool, const std::wstring& title,
+                  const std::wstring& filePath) {
+        path = filePath;
+        id = AgentUndoBegin(tool, title, path, ReadAll(path),
+                            GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES);
+    }
+
+    ~AgentFileUndo() {
+        if (!done) AgentUndoFinish(id, L"", false);
+    }
+
+    void Success() {
+        if (done) return;
+        done = true;
+        AgentUndoFinish(id, ReadAll(path), true);
+    }
+};
 
 // ── 路径安全 + 双目录查找 ─────────────────────────────────────────
 
@@ -260,13 +288,16 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
     }
     flushSegment(data.actions.size());
 
-    if (segmentIdx == 0) ss << L"  (无可压缩分段)\n";
+    if (segmentIdx == 0) ss << L"  (无可合并分段)\n";
     else {
         if (segmentIdx > kMaxListedSegments) {
             ss << L"  ...（另有 " << (segmentIdx - kMaxListedSegments)
                << L" 个分段未列出）\n";
         }
-        ss << L"\n共 " << segmentIdx << L" 个可压缩分段，使用 optimizeScript / optimizeRecording 工具进行压缩。\n";
+        ss << L"\n共 " << segmentIdx << L" 个可合并分段。"
+            L"用户要优化时请调用 optimizeRecording / optimizeScript，mergeMode=merge"
+            L"（与产品「鼠标移动合并」相同，通常大幅减少动作数）。"
+            L"不要用 compressPath，除非用户明确要求压缩路径/去掉过密移动点（动作数只会略减）。\n";
     }
 }
 
@@ -319,10 +350,13 @@ AgentTool MakeReadScriptTool() {
     AgentTool tool;
     tool.name = L"readScript";
     tool.description =
-        L"读取指定脚本或录制的内容摘要（自动在 scripts 和 recordings 目录下查找）。"
-        L"大文件（非 Wait 实质动作 >250 或 JSON 过长）只返回统计与动作一览摘要，不会返回完整 JSON。"
-        L"录制轨迹的间隔为显式 wait，不计入实质动作配额。";
-        L"若只需优化路径/合并等待，请直接用 optimizeScript 或 optimizeRecording，不要先 read 全文。";
+        L"读取脚本/录制的【两级说明】（自动在 scripts 和 recordings 目录下查找）："
+        L"默认只输出动作概览（每步=动作名+类型语义+备注，不含坐标/时长/阈值等数值），"
+        L"先让 AI 模糊理解脚本意图；需要具体参数分析时传 detail=true 查详细说明"
+        L"（含图片/坐标/条件/间隔/修饰键/容差/AI 超时等），或 raw=true 看原始 JSON（单次 ≤32KB）。"
+        L"按 startIndex/maxActions 分页（每页 ≤60 步），不返回完整 JSON，避免长输入卡死 AI。"
+        L"脚本引用图片输出 [[AGENT_IMG:路径]] 标记（多模态自动嵌入，非多模态降级为路径提示）。"
+        L"优化路径请直接用 optimizeScript / optimizeRecording，不必先 read 全文。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -335,6 +369,26 @@ AgentTool MakeReadScriptTool() {
                 "type": "string",
                 "enum": ["scripts", "recordings"],
                 "description": "限定目录：scripts=脚本宏, recordings=键鼠录制。省略则自动查找"
+            },
+            "includeImages": {
+                "type": "boolean",
+                "description": "是否输出脚本引用图片（找图/OCR/截图模板）的 [[AGENT_IMG:路径]] 标记，默认 true；多模态模型会自动嵌入图片，非多模态降级为路径文本"
+            },
+            "raw": {
+                "type": "boolean",
+                "description": "false=返回说明（默认）；true=返回原始 JSON（单次 ≤32KB，超长截断并提示改读摘要）"
+            },
+            "detail": {
+                "type": "boolean",
+                "description": "false=动作概览（动作名+备注，默认，先模糊理解）；true=详细说明（含坐标/时长/阈值等具体参数，需要分析时再查）"
+            },
+            "startIndex": {
+                "type": "integer",
+                "description": "动作分页偏移（0 起），大脚本逐页读取，默认 0"
+            },
+            "maxActions": {
+                "type": "integer",
+                "description": "本页最多展示多少步，默认 60（建议 ≤60 防止长输入）"
             }
         },
         "required": ["fileName"]
@@ -344,6 +398,24 @@ AgentTool MakeReadScriptTool() {
         auto p = ParseCommonParams(paramsJson);
         if (p.parseError) return L"[错误] 参数 JSON 解析失败。";
         if (p.fileName.empty()) return L"[错误] 缺少 fileName 参数。";
+        bool includeImages = true;
+        bool raw = false;
+        bool detail = false;
+        size_t startIndex = 0;
+        size_t maxActions = 60;
+        try {
+            const json params = json::parse(ToUtf8(paramsJson));
+            if (params.contains("includeImages") && params["includeImages"].is_boolean())
+                includeImages = params["includeImages"].get<bool>();
+            if (params.contains("raw") && params["raw"].is_boolean())
+                raw = params["raw"].get<bool>();
+            if (params.contains("detail") && params["detail"].is_boolean())
+                detail = params["detail"].get<bool>();
+            if (params.contains("startIndex") && params["startIndex"].is_number_integer())
+                startIndex = static_cast<size_t>(params["startIndex"].get<int>());
+            if (params.contains("maxActions") && params["maxActions"].is_number_integer())
+                maxActions = static_cast<size_t>(params["maxActions"].get<int>());
+        } catch (...) {}
 
         auto found = FindScriptFile(p.fileName, p.dir);
         if (!found.found) return found.path;
@@ -352,38 +424,52 @@ AgentTool MakeReadScriptTool() {
         if (content.empty()) return L"[提示] 文件内容为空：" + p.fileName;
 
         ScriptFileData data = LoadScriptFileData(found.path);
-        constexpr size_t kMaxFullJsonChars = 48 * 1024;
-        constexpr size_t kMaxOutlineActions = 80;
-        const size_t substantiveCount = static_cast<size_t>(std::count_if(
-            data.actions.begin(), data.actions.end(),
-            [](const ScriptAction& a) { return a.type != ActionType::Wait; }));
-        const bool tooLarge = content.size() > kMaxFullJsonChars || substantiveCount > 250;
 
         std::wstring out;
-        if (tooLarge) {
-            out = L"[大文件摘要 — 未返回完整 JSON，避免对话过长导致请求卡住]\n";
-            out += L"文件: " + p.fileName + L"\n";
-            out += L"原始字符约: " + std::to_wstring(content.size()) + L"\n";
-            out += L"动作数: " + std::to_wstring(data.actions.size()) + L"\n";
-            out += L"优化请直接调用 optimizeScript / optimizeRecording（可选先 getScriptStats）。\n";
-        } else {
-            out = content;
-        }
-
-        if (content.find(L"\"windowMode\"") == std::wstring::npos) {
-            out += L"\n\n[提示] 该文件缺少 windowMode 字段，运行时将按默认模式执行。"
-                L" 保存或 writeScript 后会自动补全。\n";
-        }
-        if (!data.windowMode.enabled && content.find(L"\"breakoutTimeSeconds\"") == std::wstring::npos) {
-            out += L"[提示] 未写 breakoutTimeSeconds，视为 0（脱离时间禁用）。\n";
-        }
-        out += L"\n[脚本模式] " + windowmode::WindowModeConfigSummary(data.windowMode) + L"\n";
+        // 默认输出「泛化精炼说明」：把每个动作翻译成一句中文（含关键参数），
+        // 省略默认字段，按 startIndex/maxActions 分页，防止长 JSON 输入卡死 AI。
+        // 确需原始 JSON 时才传 raw=true（仍限制单次大小，超长提示改读摘要）。
+        out += L"文件: " + p.fileName + L"\n";
+        out += L"动作数: " + std::to_wstring(data.actions.size()) + L"\n";
+        out += L"[脚本模式] " + windowmode::WindowModeConfigSummary(data.windowMode) + L"\n";
         if (!data.windowMode.enabled) {
             out += L"[脱离时间] " + std::to_wstring(
                 static_cast<int>(EffectiveBreakoutTimeSeconds(data))) + L" 秒（0=禁用）\n";
         }
-        if (!data.actions.empty()) {
-            out += L"\n\n" + FormatScriptActionsOutline(data.actions, kMaxOutlineActions);
+        if (raw) {
+            constexpr size_t kMaxRawJsonChars = 32 * 1024;
+            if (content.size() > kMaxRawJsonChars) {
+                out += L"\n[原始 JSON 过长（" + std::to_wstring(content.size())
+                    + L" 字符，上限 32KB）— 建议使用默认精炼说明并按 startIndex 分页，"
+                    + L"或用 getScriptStats 看统计。前 16KB 预览：\n";
+                out += content.substr(0, 16 * 1024);
+                out += L"\n…(截断)";
+            } else {
+                out += L"\n" + content;
+            }
+        } else {
+            size_t shown = 0;
+            out += L"\n" + (detail
+                ? DescribeScriptActionsDetail(data.actions, startIndex, maxActions, shown)
+                : DescribeScriptActionsBrief(data.actions, startIndex, maxActions, shown));
+            out += L"[提示] 概览按“动作名+备注”理解意图；需要坐标/时长/阈值等具体参数时"
+                L" 传 detail=true（或 raw=true 看原始 JSON），每次只读关键片段。\n";
+        }
+        if (includeImages) {
+            const auto imgPaths = CollectImagePathsFromJson(content);
+            if (!imgPaths.empty()) {
+                out += L"\n[脚本引用图片]";
+                int idx = 1;
+                for (const auto& img : imgPaths) {
+                    out += L"\n" + std::to_wstring(idx++) + L". ";
+                    if (GetFileAttributesW(img.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        out += L"[[AGENT_IMG:" + img + L"]]";
+                    } else {
+                        out += L"[缺失图片] " + img;
+                    }
+                }
+                out += L"\n多模态模型会自动读取图片内容；非多模态会降级为路径提示，不会报错。";
+            }
         }
         return out;
     };
@@ -417,21 +503,25 @@ std::wstring ExecuteBuildScriptActionsParams(const json& params, bool executionF
 
     if (executionFormat) return jsonArray;
 
-    std::wstring summary = L"✓ 已构建 " + std::to_wstring(items.size()) + L" 个动作。\n";
-    summary += L"将下方 JSON 数组嵌入脚本的 actions 字段即可：\n\n";
-    summary += jsonArray;
-
+    std::vector<json> flat;
+    std::wstring flattenErr;
+    FlattenNestedActionParamList(items, flat, flattenErr);
     std::vector<ScriptAction> built;
-    built.reserve(items.size());
-    for (const auto& item : items) {
+    built.reserve(flat.size());
+    for (const auto& item : flat) {
         auto builtOne = BuildScriptActionFromJson(item);
         if (builtOne.ok) built.push_back(std::move(builtOne.action));
     }
     if (!built.empty()) {
         EnsureStopMacroOnActions(built);
         NormalizeScriptActionList(built);
-        summary += L"\n\n" + FormatScriptActionsOutline(built);
     }
+    std::wstring summary = L"✓ 已构建 " + std::to_wstring(built.empty() ? items.size() : built.size())
+        + L" 个动作。\n";
+    summary += L"将下方 JSON 数组嵌入脚本的 actions 字段即可：\n\n";
+    summary += jsonArray;
+    if (!built.empty())
+        summary += L"\n\n" + FormatScriptActionsOutline(built);
     return summary;
 }
 
@@ -488,6 +578,9 @@ AgentTool MakeSubmitMacroActionsTool() {
         L"【AI 动作执行必用】提交本批次要立刻执行的宏动作。禁止在文字回复中手写 JSON。"
         L"传入 actions 数组，每项含 type 及该类型参数，与编辑器手动添加动作完全一致。"
         L"返回经校验的动作 JSON 数组，程序将立即执行。"
+        L"必填参数：keyClick/keyDown/keyUp→keyText；quickInput→inputText；wait→duration；"
+        L"findImage→imagePath；if→conditionExpr；goto→gotoStepExpr；runMacro→targetPath；"
+        L"openFile/runProgram/openWebpage→targetPath；AI 动作→aiPrompt。缺必填会被拒绝。"
         L"不确定参数时先 showSchema=true 查看字段说明。";
 
     tool.parameters_json = LR"({
@@ -535,24 +628,36 @@ AgentTool MakeBuildScriptActionsTool() {
         L"步骤说明写 remark；禁止 customText 与 text/no 字段（工具自动分配序号与标准动作名）。"
         L"非无限循环脚本末尾会自动追加 stopMacro（结束宏运行）。"
         L"传入 actions 数组，每项含 type 及该类型参数；返回可直接嵌入脚本的 JSON 数组文本。"
+        L"★ loop/if/else/defineBlock 必须用 children 嵌套子动作（像写代码的花括号），"
+        L"循环体放在 loop.children 里，不要写成循环后面的同级动作；空循环会构建失败。"
+        L"含循环/条件时先 planScriptActions 核对动作树，再调用本工具。"
         L"支持全部编辑器动作（不含 AI 专用动作）。"
         L"AI 相关请用 buildGetCursorPosAction、buildAiTextAnalysisAction、"
         L"buildAiImageAnalysisAction（尽量少用）；buildAiActionExecuteAction 仅当用户明确要求 AI 动作执行时使用。"
         L"找图/OCR 保存变量用 followUp:\"saveVar\"；等待用 type:wait,duration；按键用 keyClick/keyDown/keyUp。"
-        L"mouseClick/keyClick 等含 clickCount 的动作：duration 是两次重复之间的间隔，"
+        L"mouseClick/keyClick/runMacro/runBlock/mousePlayback 等含 clickCount 的动作：duration 是两次重复之间的间隔，"
         L"count=1 时不等待，也不在首前/末后插入等待。"
-        L"endLoop 必须是 loop 的子节点（indent=loop.indent+1），否则构建失败。";
+        L"endLoop 必须放在 loop 的 children 里，否则构建失败。"
+        L"必填参数（缺了会构建失败）：keyClick/keyDown/keyUp→keyText；quickInput→inputText；"
+        L"wait→duration；findImage→imagePath；textRecognition→imagePath 或 ocrSearchText；"
+        L"if→conditionExpr；goto→gotoStepExpr；defineBlock/runBlock→blockName；"
+        L"runMacro/mousePlayback→targetPath；openFile/runProgram/openWebpage/closeProgram/"
+        L"activateWindow→targetPath；AI 动作→aiPrompt。禁止省略必填参数或用默认值凑数。";
 
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
             "actions": {
                 "type": "array",
-                "description": "动作参数对象数组，每项至少含 type 字段",
+                "description": "动作参数对象数组。loop/if/else/defineBlock 用 children 嵌套子动作，不要把循环体写成后面的同级项",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "type": { "type": "string" }
+                        "type": { "type": "string" },
+                        "children": {
+                            "type": "array",
+                            "description": "容器的子动作（仅 loop/if/else/defineBlock）"
+                        }
                     },
                     "required": ["type"]
                 }
@@ -578,12 +683,67 @@ AgentTool MakeBuildScriptActionsTool() {
     return tool;
 }
 
+// ── planScriptActions ─────────────────────────────────────────────
+AgentTool MakePlanScriptActionsTool() {
+    AgentTool tool;
+    tool.name = L"planScriptActions";
+    tool.description =
+        L"规划脚本动作树（不保存、不校验坐标/路径等必填细节）。"
+        L"像写代码一样传入嵌套 actions：loop/if/else/defineBlock 用 children 包住循环体/分支。"
+        L"返回带缩进的中文动作树，供核对父子关系。空循环（循环后面的动作都是同级）会报错。"
+        L"含循环/条件/挂机刷任务时必须先调本工具确认树正确，再补齐参数调用 createMacroScript。"
+        L"本步只需 type、remark、children、loopCount/conditionExpr；imagePath 等可留到下一步。";
+    tool.parameters_json = LR"({
+        "type": "object",
+        "properties": {
+            "actions": {
+                "type": "array",
+                "description": "动作树。容器用 children 嵌套；不必填齐必填参数",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string" },
+                        "remark": { "type": "string" },
+                        "loopCount": { "type": "integer" },
+                        "conditionExpr": { "type": "string" },
+                        "children": { "type": "array" }
+                    },
+                    "required": ["type"]
+                }
+            }
+        },
+        "required": ["actions"]
+    })";
+    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
+        json params;
+        try {
+            params = json::parse(ToUtf8(paramsJson));
+        } catch (const json::parse_error&) {
+            return L"[错误] 参数 JSON 解析失败。";
+        }
+        std::vector<json> items;
+        if (params.contains("actions") && params["actions"].is_array()) {
+            for (const auto& item : params["actions"]) {
+                if (item.is_object()) items.push_back(item);
+            }
+        } else if (params.contains("type") && params["type"].is_string()) {
+            items.push_back(params);
+        }
+        std::wstring error;
+        const std::wstring outline = PlanScriptActionsOutline(items, error);
+        if (!error.empty()) return L"[错误] " + error;
+        return outline;
+    };
+    return tool;
+}
+
 // ── writeScript ───────────────────────────────────────────────────
 AgentTool MakeWriteScriptTool() {
     AgentTool tool;
     tool.name = L"writeScript";
     tool.description = L"将内容写入指定脚本或录制文件（覆盖已有内容）。"
         L"内容会解析并规范化动作（序号 1..n、清除误写的 text 显示名），禁止绕过 buildScriptActions 手写动作对象。"
+        L"空循环/空条件（循环体写成同级）会被拒绝；含循环/条件应走 planScriptActions → createMacroScript。"
         L"脚本宏必须包含 windowMode 字段（默认模式 enabled=0）；默认模式可含 breakoutTimeSeconds（0=禁用脱离）；"
         L"键鼠录制始终强制默认模式且 breakoutTimeSeconds=0。";
 
@@ -670,7 +830,10 @@ AgentTool MakeGetScriptStatsTool() {
 AgentTool MakeOptimizeScriptTool() {
     AgentTool tool;
     tool.name = L"optimizeScript";
-    tool.description = L"优化脚本或录制：合并关键操作之间的连续 MouseMove 和 Wait 为一组动作，或压缩鼠标移动路径中过密的点。自动在 scripts 和 recordings 目录下查找";
+    tool.description = L"优化脚本或录制：与产品录制优化对话框同一套算法。"
+        L"用户说「优化」时 mergeMode 必须为 merge（鼠标移动合并，按关键动作分段，通常能把上百步收成十几步）。"
+        L"禁止擅自 compressPath（鼠标移动压缩只去过密点，动作数几乎不降；仅用户明确要求时才用）。"
+        L"禁止为优化去 readScript 拉全文或手写 JSON。自动在 scripts 和 recordings 目录下查找";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -696,12 +859,16 @@ AgentTool MakeOptimizeScriptTool() {
             "mergeMode": {
                 "type": "string",
                 "enum": ["merge", "compressPath"],
-                "description": "优化模式：merge = 合并关键操作之间的移动和等待；compressPath = 按像素距离压缩路径"
+                "description": "默认 merge。用户说优化时必须 merge（鼠标移动合并）。compressPath 仅当用户明确要求压缩路径/去掉过密点"
             },
             "waitCalculation": {
                 "type": "string",
-                "enum": ["sum", "average", "first", "last"],
-                "description": "合并后等待时间计算方式（仅 merge 模式）：sum=累加, average=平均, first=第一个, last=最后一个。默认 sum"
+                "enum": ["sum", "average", "first", "last", "fixed"],
+                "description": "合并后等待时间（仅 merge，按每段独立计算）：sum=累加, average=平均, first=该段第一个, last=该段最后一个, fixed=指定秒数。默认 sum"
+            },
+            "mergeWaitValue": {
+                "type": "number",
+                "description": "waitCalculation=fixed 时每段使用的等待秒数，默认 0.1"
             },
             "distanceThreshold": {
                 "type": "number",
@@ -727,6 +894,7 @@ AgentTool MakeOptimizeScriptTool() {
         opts.outputDir = FromUtf8(params.value("outputDir", ""));
         opts.mergeMode = FromUtf8(params.value("mergeMode", "merge"));
         opts.waitCalculation = FromUtf8(params.value("waitCalculation", "sum"));
+        opts.mergeWaitValue = params.value("mergeWaitValue", 0.1);
         opts.distanceThreshold = params.value("distanceThreshold", 5.0);
         opts.compressWait = params.value("compressWait", 0.05);
         if (opts.distanceThreshold < 0.1) opts.distanceThreshold = 0.1;
@@ -746,16 +914,26 @@ AgentTool MakeCreateMacroScriptTool() {
     tool.description =
         L"一步创建鼠标宏：构建动作并保存到 scripts 目录。"
         L"禁止 customText；说明写 remark；末尾自动追加 stopMacro（除非顶层无限 loop）。"
+        L"★ loop/if/else/defineBlock 必须用 children 嵌套子动作（像写代码）；"
+        L"循环体放在 loop.children，不要写成循环后面的同级。含循环/条件时先 planScriptActions。"
         L"含 AI 动作时无需手写 aiModelName，保存时会自动从已添加模型中选取（图片分析优先识图模型）。"
         L"默认效率优先：优先 findImage/OCR，少调用 AI 分析；aiActionExecute 仅用户明确要求时使用。"
         L"准确度优先时 readAgentSkill section=scriptStrategy。"
         L"需窗口/后台模式时传 scriptMode 或 windowMode（见 readScriptReference section=windowMode）。"
-        L"默认模式可传 breakoutTimeSeconds（秒，0=禁用；用户中途操作键鼠会暂停宏并在该秒数后恢复）。";
+        L"默认模式可传 breakoutTimeSeconds（秒，0=禁用；用户中途操作键鼠会暂停宏，松开后空闲该秒数再恢复）。"
+        L"默认保存到 scripts 根目录（不分类）；用户指明分类/目录时传 folder 保存到 scripts/<folder>。"
+        L"必填参数：keyClick/keyDown/keyUp→keyText；quickInput→inputText；wait→duration；"
+        L"findImage→imagePath；if→conditionExpr；goto→gotoStepExpr；runMacro→targetPath；"
+        L"openFile/runProgram/openWebpage→targetPath；AI 动作→aiPrompt。缺必填会构建失败。";
 
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
             "fileName": { "type": "string", "description": "文件名，如 mymacro.json" },
+            "folder": {
+                "type": "string",
+                "description": "目标子目录（相对 scripts，默认空=根目录不分类；用户指明分类/目录时传，如“工作”）"
+            },
             "scriptName": { "type": "string", "description": "宏显示名称" },
             "scriptMode": {
                 "type": "string",
@@ -764,7 +942,7 @@ AgentTool MakeCreateMacroScriptTool() {
             },
             "breakoutTimeSeconds": {
                 "type": "number",
-                "description": "脱离时间（秒，仅默认模式生效）。0 或未填=禁用；用户中途操作键鼠会暂停宏，等待该秒数后从当前步骤重试"
+                "description": "脱离时间（秒，仅默认模式生效）。0 或未填=禁用；用户中途操作键鼠会暂停宏，按住期间不计时，松开后空闲该秒数再从当前步骤重试"
             },
             "windowMode": {
                 "type": "object",
@@ -772,7 +950,7 @@ AgentTool MakeCreateMacroScriptTool() {
             },
             "actions": {
                 "type": "array",
-                "description": "动作参数数组，每项含 type 及字段（同 buildScriptActions）",
+                "description": "动作参数数组。loop/if/else/defineBlock 用 children 嵌套子动作（同 buildScriptActions）",
                 "items": { "type": "object" }
             }
         },
@@ -804,8 +982,10 @@ AgentTool MakeOptimizeRecordingTool() {
     AgentTool tool;
     tool.name = L"optimizeRecording";
     tool.description =
-        L"优化键鼠录制：默认在 recordings 目录查找并合并移动/等待或压缩路径。"
-        L"参数同 optimizeScript，但 dir 默认为 recordings；完成后自动刷新主界面。";
+        L"优化键鼠录制：与产品「鼠标移动合并」同一算法。用户说「优化」时 mergeMode 必须为 merge"
+        L"（按关键动作分段合并，通常能把上百步收成十几步）。"
+        L"禁止擅自 compressPath（只去过密点，动作数几乎不降）。"
+        L"默认 recordings 目录；禁止 readScript 拉全文手改。完成后自动刷新主界面。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -815,14 +995,25 @@ AgentTool MakeOptimizeRecordingTool() {
             "mergeMode": {
                 "type": "string",
                 "enum": ["merge", "compressPath"],
-                "description": "merge=合并等待移动, compressPath=路径压缩"
+                "description": "默认 merge。用户说优化时必须 merge（鼠标移动合并）。compressPath 仅当用户明确要求压缩路径/去掉过密点"
             },
             "waitCalculation": {
                 "type": "string",
-                "enum": ["sum", "average", "first", "last"]
+                "enum": ["sum", "average", "first", "last", "fixed"],
+                "description": "合并后等待时间（仅 merge，按每段独立计算）：sum=累加, average=平均, first=该段第一个, last=该段最后一个, fixed=指定秒数。默认 sum"
             },
-            "distanceThreshold": { "type": "number" },
-            "compressWait": { "type": "number" }
+            "mergeWaitValue": {
+                "type": "number",
+                "description": "waitCalculation=fixed 时每段使用的等待秒数，默认 0.1"
+            },
+            "distanceThreshold": {
+                "type": "number",
+                "description": "路径压缩时相邻移动点最小保留距离（像素），默认 5"
+            },
+            "compressWait": {
+                "type": "number",
+                "description": "路径压缩时移动点之间的等待时间（秒），默认 0.05"
+            }
         },
         "required": ["fileName"]
     })";
@@ -838,6 +1029,7 @@ AgentTool MakeOptimizeRecordingTool() {
         opts.outputFileName = FromUtf8(params.value("outputFileName", ""));
         opts.mergeMode = FromUtf8(params.value("mergeMode", "merge"));
         opts.waitCalculation = FromUtf8(params.value("waitCalculation", "sum"));
+        opts.mergeWaitValue = params.value("mergeWaitValue", 0.1);
         opts.distanceThreshold = params.value("distanceThreshold", 5.0);
         opts.compressWait = params.value("compressWait", 0.05);
         if (opts.distanceThreshold < 0.1) opts.distanceThreshold = 0.1;
@@ -915,6 +1107,7 @@ AgentTool MakeListScheduledTasksTool() {
             case ScheduledFrequency::Hourly: freqLabel = L"每小时"; break;
             case ScheduledFrequency::Daily: freqLabel = L"每天"; break;
             case ScheduledFrequency::Weekly: freqLabel = L"每周"; break;
+            case ScheduledFrequency::Interval: freqLabel = L"间隔"; break;
             default: freqLabel = L"单次"; break;
             }
             std::wstring timeStr = FormatScheduledRunTime(t);
@@ -961,15 +1154,15 @@ AgentTool MakeCreateScheduledTaskTool() {
             },
             "frequency": {
                 "type": "string",
-                "enum": ["custom", "daily", "weekly", "hourly"],
-                "description": "执行频率：custom=单次, daily=每天, weekly=每周, hourly=每小时。默认 custom"
+                "enum": ["custom", "daily", "weekly", "hourly", "interval"],
+                "description": "执行频率：custom=单次, daily=每天, weekly=每周, hourly=每小时, interval=从保存/软件启动起计时、到达间隔后执行、关闭软件后重置。默认 custom"
             },
             "year": { "type": "integer", "description": "年份（custom 必填，如 2026）" },
             "month": { "type": "integer", "description": "月份（custom 必填，1-12）" },
             "day": { "type": "integer", "description": "日（custom 必填，1-31）" },
-            "hour": { "type": "integer", "description": "小时（0-23）。daily/weekly/custom 需要。默认 9" },
-            "minute": { "type": "integer", "description": "分钟（0-59）。默认 0" },
-            "second": { "type": "integer", "description": "秒（0-59）。默认 0" },
+            "hour": { "type": "integer", "description": "小时。daily/weekly/custom 为钟点 0-23；interval 为间隔时长的小时部分。hourly 忽略。默认 9（interval 默认 0）" },
+            "minute": { "type": "integer", "description": "分钟（0-59）。interval 为间隔时长的分钟。默认 0" },
+            "second": { "type": "integer", "description": "秒（0-59）。interval 为间隔时长的秒。默认 0" },
             "weekDays": {
                 "type": "array", "items": { "type": "string" },
                 "description": "星期数组（weekly 必填）：[\"Mon\",\"Tue\",\"Wed\",\"Thu\",\"Fri\",\"Sat\",\"Sun\"]"
@@ -1009,12 +1202,14 @@ AgentTool MakeCreateScheduledTaskTool() {
         if (freqStr == L"hourly") task.frequency = ScheduledFrequency::Hourly;
         else if (freqStr == L"daily") task.frequency = ScheduledFrequency::Daily;
         else if (freqStr == L"weekly") task.frequency = ScheduledFrequency::Weekly;
+        else if (freqStr == L"interval") task.frequency = ScheduledFrequency::Interval;
         else task.frequency = ScheduledFrequency::Custom;
 
         task.time.year = params.value("year", 0);
         task.time.month = params.value("month", 0);
         task.time.day = params.value("day", 0);
-        task.time.hour = params.value("hour", 9);
+        task.time.hour = params.value("hour",
+            task.frequency == ScheduledFrequency::Interval ? 0 : 9);
         task.time.minute = params.value("minute", 0);
         task.time.second = params.value("second", 0);
 
@@ -1035,6 +1230,10 @@ AgentTool MakeCreateScheduledTaskTool() {
         if (task.frequency == ScheduledFrequency::Weekly && task.time.weekDays == 0) {
             return L"[错误] weekly 频率必须提供 weekDays（至少一个星期）。";
         }
+        if (task.frequency == ScheduledFrequency::Interval
+            && ScheduledIntervalDurationMs(task.time) <= 0) {
+            return L"[错误] interval 频率必须提供大于 0 的 hour/minute/second 间隔。";
+        }
         if (task.frequency == ScheduledFrequency::Custom) {
             if (task.time.year < 1970 || task.time.month < 1 || task.time.month > 12
                 || task.time.day < 1 || task.time.day > 31) {
@@ -1050,8 +1249,10 @@ AgentTool MakeCreateScheduledTaskTool() {
         LoadScheduledTasks(tasks, &globalDisabled);
         tasks.push_back(task);
 
+        AgentFileUndo undo(L"createScheduledTask", L"创建定时任务", ScheduledTasksFilePath());
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
+        undo.Success();
         NotifyAgentScriptLibraryChanged();
 
         std::wstringstream ss;
@@ -1084,7 +1285,7 @@ AgentTool MakeUpdateScheduledTaskTool() {
             "name": { "type": "string", "description": "新的任务名称" },
             "targetFile": { "type": "string", "description": "新的目标文件名" },
             "kind": { "type": "string", "enum": ["macro", "recording"], "description": "新的任务类型" },
-            "frequency": { "type": "string", "enum": ["custom", "daily", "weekly", "hourly"], "description": "新执行频率" },
+            "frequency": { "type": "string", "enum": ["custom", "daily", "weekly", "hourly", "interval"], "description": "新执行频率" },
             "year": { "type": "integer" }, "month": { "type": "integer" }, "day": { "type": "integer" },
             "hour": { "type": "integer" }, "minute": { "type": "integer" }, "second": { "type": "integer" },
             "weekDays": { "type": "array", "items": { "type": "string" }, "description": "新的星期数组" },
@@ -1123,6 +1324,7 @@ AgentTool MakeUpdateScheduledTaskTool() {
             if (f == L"hourly") target->frequency = ScheduledFrequency::Hourly;
             else if (f == L"daily") target->frequency = ScheduledFrequency::Daily;
             else if (f == L"weekly") target->frequency = ScheduledFrequency::Weekly;
+            else if (f == L"interval") target->frequency = ScheduledFrequency::Interval;
             else target->frequency = ScheduledFrequency::Custom;
         }
         if (params.contains("year")) target->time.year = params["year"].get<int>();
@@ -1157,15 +1359,22 @@ AgentTool MakeUpdateScheduledTaskTool() {
             return L"[错误] 任务缺少有效目标文件；请传入 targetFile。";
         if (target->frequency == ScheduledFrequency::Weekly && target->time.weekDays == 0)
             return L"[错误] weekly 频率必须至少选择一个星期（weekDays）。";
+        if (target->frequency == ScheduledFrequency::Interval
+            && ScheduledIntervalDurationMs(target->time) <= 0)
+            return L"[错误] interval 频率必须提供大于 0 的 hour/minute/second 间隔。";
         if (target->frequency == ScheduledFrequency::Custom) {
             if (target->time.year < 1970 || target->time.month < 1 || target->time.month > 12
                 || target->time.day < 1 || target->time.day > 31) {
                 return L"[错误] custom 频率需要有效的 year/month/day。";
             }
+            // 与 Web 保存路径一致：Custom 任务更新后允许再次触发
+            target->customFired = false;
         }
 
+        AgentFileUndo undo(L"updateScheduledTask", L"更新定时任务", ScheduledTasksFilePath());
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
+        undo.Success();
         NotifyAgentScriptLibraryChanged();
 
         return L"定时任务已更新：" + target->name + L"\n"
@@ -1213,8 +1422,10 @@ AgentTool MakeDeleteScheduledTaskTool() {
         if (it == tasks.end()) return L"[错误] 未找到 ID 为 " + taskId + L" 的任务。";
         tasks.erase(it, tasks.end());
 
+        AgentFileUndo undo(L"deleteScheduledTask", L"删除定时任务", ScheduledTasksFilePath());
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
+        undo.Success();
         NotifyAgentScriptLibraryChanged();
 
         return L"已删除定时任务：" + deletedName;
@@ -1259,10 +1470,22 @@ AgentTool MakeListSettingsTool() {
            << (settings.playback.enablePlaybackCount ? L"（" + std::to_wstring(settings.playback.playbackCount) + L" 次）" : L"") << L"\n";
         ss << L"  回放间隔: " << (settings.playback.enablePlaybackInterval ? L"启用" : L"禁用")
            << (settings.playback.enablePlaybackInterval ? L"（" + std::to_wstring(settings.playback.playbackIntervalMinSeconds) + L"~" + std::to_wstring(settings.playback.playbackIntervalMaxSeconds) + L" 秒）" : L"") << L"\n";
+        ss << L"  回放倍速: " << (settings.playback.enablePlaybackSpeed ? L"启用" : L"禁用")
+           << L"（" << std::to_wstring(settings.playback.playbackSpeed)
+           << L" 倍；仅录制页直接播放；"
+           << (quickscript::HomeUiModeIsPro(settings.home)
+               ? L"专业模式看勾选" : L"极简模式始终启用")
+           << L"；嵌套运行录制回放用动作自身倍速）\n";
         ss << L"  调试输出窗口: " << (settings.playback.enableDebugOutputWindow ? L"启用" : L"禁用") << L"\n";
         ss << L"  关键函数调试: " << (settings.playback.autoOutputKeyFunctionDebug ? L"启用" : L"禁用") << L"\n";
         ss << L"  前台注入后端: "
-           << quickscript::ForegroundInputBackendName(settings.playback.foregroundInputBackend) << L"\n\n";
+           << quickscript::ForegroundInputBackendName(settings.playback.foregroundInputBackend) << L"\n";
+        ss << L"  定时任务优先级: "
+           << ScheduledTaskConflictPolicyLabel(ClampScheduledTaskConflictPolicy(
+                  settings.playback.scheduledTaskConflictPolicy))
+           << L"（0=执行脚本优先 1=定时脚本优先）\n";
+        ss << L"  脚本中断后自动恢复: "
+           << (settings.playback.scheduledTaskAutoResume ? L"启用" : L"禁用") << L"\n\n";
 
         ss << L"【其他设置】\n";
         ss << L"  宏执行后自动隐藏主窗口: " << (settings.other.autoHideMainWindow ? L"是" : L"否") << L"\n";
@@ -1311,16 +1534,20 @@ AgentTool MakeUpdateSettingsTool() {
             "enablePlaybackInterval": { "type": "boolean", "description": "启用回放间隔" },
             "playbackIntervalMinSeconds": { "type": "number", "description": "回放间隔最小值（秒）" },
             "playbackIntervalMaxSeconds": { "type": "number", "description": "回放间隔最大值（秒）" },
+            "enablePlaybackSpeed": { "type": "boolean", "description": "专业模式：录制页直接播放是否启用倍速；极简模式无视此勾选（视为已启用）。鼠标宏顶层不缩放" },
+            "playbackSpeed": { "type": "number", "description": "录制页直接播放倍速 0.25~4，1=原速；与极简工具栏共用。嵌套「运行录制回放」用动作 playbackSpeed，不叠加" },
             "enableDebugOutputWindow": { "type": "boolean", "description": "启用调试输出窗口" },
             "autoOutputKeyFunctionDebug": { "type": "boolean", "description": "自动输出关键函数调试信息" },
             "enableHidDriverSimulation": { "type": "boolean", "description": "兼容旧字段：true≈Interception，false≈Software；优先用 foregroundInputBackend" },
             "foregroundInputBackend": { "type": "integer", "description": "前台注入后端：0=Software 1=Interception 2=VirtualHid" },
+            "scheduledTaskConflictPolicy": { "type": "integer", "description": "定时任务优先级：0=执行脚本优先 1=定时脚本优先。未勾选自动恢复时 0=忙则跳过、1=打断不恢复；勾选时 0=结束后再跑、1=插入后从原步骤继续" },
+            "scheduledTaskAutoResume": { "type": "boolean", "description": "脚本中断后自动恢复。false=跳过或打断不恢复；true=结束后再跑或插入后从原步骤继续" },
             "autoHideMainWindow": { "type": "boolean", "description": "宏执行后自动隐藏主窗口" },
             "playSoundOnStart": { "type": "boolean", "description": "宏启动时播放提示音" },
             "hideBottomRightTip": { "type": "boolean", "description": "隐藏右下角弹窗提示" },
             "closeToTray": { "type": "boolean", "description": "关闭按钮最小化到托盘" },
             "autoStartOnBoot": { "type": "boolean", "description": "开机自动启动" },
-            "resolveImeConflict": { "type": "boolean", "description": "中文输入法开启/组字时不触发鼠标宏热键" },
+            "resolveImeConflict": { "type": "boolean", "description": "中文输入法正在组字时不触发鼠标宏热键（空闲中文模式仍可触发）" },
             "holdThresholdSeconds": { "type": "number", "description": "长按判定秒数（>0，热键按住启停与捕获共用）" }
         },
         "required": ["category"]
@@ -1366,6 +1593,11 @@ AgentTool MakeUpdateSettingsTool() {
             setBool("enablePlaybackInterval", settings.playback.enablePlaybackInterval);
             setDouble("playbackIntervalMinSeconds", settings.playback.playbackIntervalMinSeconds);
             setDouble("playbackIntervalMaxSeconds", settings.playback.playbackIntervalMaxSeconds);
+            setBool("enablePlaybackSpeed", settings.playback.enablePlaybackSpeed);
+            if (params.contains("playbackSpeed")) {
+                settings.playback.playbackSpeed = quickscript::ClampPlaybackSpeed(
+                    params["playbackSpeed"].get<double>());
+            }
             setBool("enableDebugOutputWindow", settings.playback.enableDebugOutputWindow);
             setBool("autoOutputKeyFunctionDebug", settings.playback.autoOutputKeyFunctionDebug);
             if (params.contains("foregroundInputBackend")) {
@@ -1381,6 +1613,12 @@ AgentTool MakeUpdateSettingsTool() {
                     ? quickscript::ForegroundInputBackend::Interception
                     : quickscript::ForegroundInputBackend::Software;
             }
+            if (params.contains("scheduledTaskConflictPolicy")) {
+                settings.playback.scheduledTaskConflictPolicy = static_cast<int>(
+                    ClampScheduledTaskConflictPolicy(
+                        params["scheduledTaskConflictPolicy"].get<int>()));
+            }
+            setBool("scheduledTaskAutoResume", settings.playback.scheduledTaskAutoResume);
         } else if (category == L"other") {
             setBool("autoHideMainWindow", settings.other.autoHideMainWindow);
             setBool("playSoundOnStart", settings.other.playSoundOnStart);
@@ -1396,8 +1634,10 @@ AgentTool MakeUpdateSettingsTool() {
             return L"[错误] 无效的 category：" + category + L"。可选值：click, playback, other";
         }
 
+        AgentFileUndo undo(L"updateSettings", L"修改应用设置", AppSettingsFilePath());
         if (!SaveAppSettings(settings))
             return L"[错误] 保存设置失败。";
+        undo.Success();
 
         return L"设置已更新（" + category + L" 分类）。\n"
                L"回放类设置会在当前宏的下一轮循环自动生效；其他设置在下次启动宏时生效。";
@@ -1429,7 +1669,7 @@ AgentTool MakeBuildGetCursorPosActionTool() {
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
-            "matchVarName": { "type": "string", "description": "变量名，默认 cursor" },
+            "matchVarName": { "type": "string", "description": "变量名，默认 a" },
             "remark": { "type": "string" },
             "no": { "type": "integer" },
             "indent": { "type": "integer" }
@@ -1499,7 +1739,7 @@ AgentTool MakeBuildAiImageAnalysisActionTool() {
             "aiOutputVarName": { "type": "string", "description": "默认 aiImgResult" },
             "aiOutputType": { "type": "integer", "description": "0=文本 1=数字" },
             "aiImageScale": { "type": "number", "description": "截屏缩放 0.1~1" },
-            "aiRegionByImage": { "type": "boolean", "description": "是否按找图区域截屏" },
+            "aiRegionByImage": { "type": "boolean", "description": "在绝对识别区域内找图并用匹配框截屏" },
             "aiTargetImagePath": { "type": "string" },
             "aiSearchX1": { "type": "integer" },
             "aiSearchY1": { "type": "integer" },
@@ -1534,13 +1774,16 @@ AgentTool MakeBuildAiActionExecuteActionTool() {
     tool.name = L"buildAiActionExecuteAction";
     tool.description =
         L"构建「AI 动作执行」动作。★极低优先级★：仅当用户明确要求「AI动作执行/让AI自动操作桌面」时使用；"
-        L"禁止用其替代 findImage+键鼠 常规动作链。aiPrompt 为任务描述；可设置最大步数、超时等。";
+        L"禁止用其替代 findImage+键鼠 常规动作链。aiPrompt 为任务描述；可设置最大步数、超时等。"
+        L"aiLogicConvert（逻辑转化）仅当用户明确要求「逻辑转化/自愈脚本」时才可置 true。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
             "aiPrompt": { "type": "string", "description": "任务描述（必填）" },
             "aiModelName": { "type": "string", "description": "可选；省略时自动选择" },
             "aiWithImage": { "type": "boolean", "description": "是否带截图，默认 true" },
+            "aiLogicConvert": { "type": "boolean", "description": "逻辑转化；默认 false；须用户明确要求" },
+            "aiLogicBlockName": { "type": "string", "description": "关联指令块名，可空" },
             "aiRegionByImage": { "type": "boolean" },
             "aiTargetImagePath": { "type": "string" },
             "aiSearchX1": { "type": "integer" },
@@ -1549,7 +1792,6 @@ AgentTool MakeBuildAiActionExecuteActionTool() {
             "aiSearchY2": { "type": "integer" },
             "aiMaxSteps": { "type": "integer", "description": "默认 10，-1 不限" },
             "aiTimeoutSec": { "type": "integer" },
-            "aiConfirmExecute": { "type": "boolean" },
             "aiContextMode": { "type": "integer" },
             "aiFallbackValue": { "type": "string" },
             "remark": { "type": "string" },
@@ -1564,6 +1806,27 @@ AgentTool MakeBuildAiActionExecuteActionTool() {
         if (!parseError.empty()) return parseError;
         if (!params.contains("aiPrompt") || Trim(FromUtf8(params["aiPrompt"].get<std::string>())).empty())
             return L"[错误] 缺少 aiPrompt（任务描述）。";
+        const std::wstring userCtx = GetAgentToolUserContext();
+        // 「逻辑转化」可单独解锁 aiActionExecute（否则只能生成宏动作链）
+        if (!UserExplicitlyRequestsAiActionExecute(userCtx)
+            && !UserExplicitlyRequestsLogicConvert(userCtx)) {
+            return L"[错误] 用户未明确要求「AI动作执行」或「逻辑转化」，禁止生成 aiActionExecute。"
+                   L"请改用 findImage + 键鼠动作链。";
+        }
+        const bool wantLogic = [&]() {
+            if (!params.contains("aiLogicConvert")) return false;
+            if (params["aiLogicConvert"].is_boolean()) return params["aiLogicConvert"].get<bool>();
+            if (params["aiLogicConvert"].is_number_integer())
+                return params["aiLogicConvert"].get<int>() != 0;
+            return false;
+        }();
+        if (wantLogic && !UserExplicitlyRequestsLogicConvert(userCtx)) {
+            return L"[错误] 用户未明确要求「逻辑转化/自愈脚本」，禁止 aiLogicConvert=true。";
+        }
+        if (!wantLogic) {
+            params["aiLogicConvert"] = false;
+            params.erase("aiLogicBlockName");
+        }
         const bool withImage = [&]() {
             if (!params.contains("aiWithImage")) return true;
             if (params["aiWithImage"].is_boolean()) return params["aiWithImage"].get<bool>();
@@ -1578,6 +1841,61 @@ AgentTool MakeBuildAiActionExecuteActionTool() {
     return tool;
 }
 
+// ─────────────────────────────────────────────────────────────
+// listAgentChanges / revertAgentChange — 变更撤销
+// ─────────────────────────────────────────────────────────────
+
+AgentTool MakeListAgentChangesTool() {
+    AgentTool tool;
+    tool.name = L"listAgentChanges";
+    tool.description =
+        L"列出助手最近修改过的文件（写脚本/建宏/优化/删除/定时任务/设置等），"
+        L"含时间、工具、目标路径与状态（已应用/已恢复）。配合 revertAgentChange 使用。";
+    tool.parameters_json = LR"({
+        "type": "object",
+        "properties": {
+            "maxEntries": { "type": "integer", "description": "最多条数，默认 50" }
+        },
+        "required": []
+    })";
+    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
+        size_t maxEntries = 50;
+        try {
+            const json p = json::parse(ToUtf8(paramsJson));
+            if (p.contains("maxEntries") && p["maxEntries"].is_number_integer())
+                maxEntries = static_cast<size_t>(p["maxEntries"].get<int>());
+        } catch (...) {}
+        return ListAgentChangesText(maxEntries);
+    };
+    return tool;
+}
+
+AgentTool MakeRevertAgentChangeTool() {
+    AgentTool tool;
+    tool.name = L"revertAgentChange";
+    tool.description =
+        L"恢复指定助手修改：把目标文件恢复为该次修改前的内容；若修改前文件不存在则删除。"
+        L"id 来自 listAgentChanges；已恢复的记录不能再次恢复。";
+    tool.parameters_json = LR"({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "变更记录 id" }
+        },
+        "required": ["id"]
+    })";
+    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
+        json params;
+        try { params = json::parse(ToUtf8(paramsJson)); }
+        catch (const json::parse_error&) { return L"[错误] 参数 JSON 解析失败。"; }
+        const std::wstring id = FromUtf8(params.value("id", ""));
+        if (id.empty()) return L"[错误] 缺少 id 参数。";
+        std::wstring err;
+        if (!RevertAgentChange(id, err)) return L"[错误] " + err;
+        return L"已恢复变更 " + id + L"。目标文件已回到修改前状态。";
+    };
+    return tool;
+}
+
 std::vector<AgentTool> BuildDefaultAgentTools() {
     std::vector<AgentTool> tools;
     tools.push_back(MakeListScriptsTool());
@@ -1585,6 +1903,17 @@ std::vector<AgentTool> BuildDefaultAgentTools() {
     tools.push_back(MakeWriteScriptTool());
     tools.push_back(MakeReadScriptReferenceTool());
     tools.push_back(MakeReadAgentSkillTool());
+    tools.push_back(MakeFetchWebPageTool());
+    tools.push_back(MakeRunAgentCommandTool());
+    tools.push_back(MakeListAgentDirectoryTool());
+    tools.push_back(MakeReadAgentFileTool());
+    tools.push_back(MakeSearchAgentFilesTool());
+    tools.push_back(MakeWriteAgentFileTool());
+    tools.push_back(MakeCopyAgentTextToClipboardTool());
+    tools.push_back(MakePasteAgentClipboardTextTool());
+    tools.push_back(MakeListAgentChangesTool());
+    tools.push_back(MakeRevertAgentChangeTool());
+    tools.push_back(MakePlanScriptActionsTool());
     tools.push_back(MakeBuildScriptActionsTool());
     tools.push_back(MakeListAiModelsTool());
     tools.push_back(MakeBuildGetCursorPosActionTool());

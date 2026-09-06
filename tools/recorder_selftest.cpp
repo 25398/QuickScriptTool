@@ -6,6 +6,7 @@
 #include "input_timeline_scheduler.h"
 #include "recorder_timeline.h"
 #include "recording_to_findimage.h"
+#include "recorder.h"
 
 #include <atomic>
 #include <cmath>
@@ -22,6 +23,7 @@ const selftest::CaseInfo kCases[] = {
     {L"same_timestamp_relative_keep", L"default", L"same-timestamp relative packets stay separate"},
     {L"micro_gap_relative_merge", L"default", L"sub-200us relative packets stay separate and gaps inflate"},
     {L"repair_compressed_rel_gaps", L"default", L"compressed Rel-Wait-Rel gaps inflate to median report interval"},
+    {L"repair_copy_leaves_source", L"default", L"RepairCompressedRelativeGaps must not mutate the caller's original vector"},
     {L"sub_threshold_rel_split", L"default", L"large relative packets split below accel threshold"},
     {L"mixed_capture_channels", L"default", L"auto mode transition keeps absolute and relative events"},
     {L"same_timestamp_button_order", L"default", L"same timestamp button down/up follows sequence"},
@@ -39,10 +41,15 @@ const selftest::CaseInfo kCases[] = {
     {L"expand_script_default_duration_no_wait", L"default", L"scripts default 0.1 cleared without Wait"},
     {L"expand_idempotent", L"default", L"Expand twice yields identical sequence"},
     {L"wait_stats_use_timing_us", L"default", L"ActionStepUs prefers timingUs for Wait"},
-    {L"timeline_catchup_skips_stall", L"default", L"past-deadline waits catch up without stretching origin"},
+    {L"timeline_catchup_skips_stall", L"default", L"small past-deadline jitter still catches up"},
+    {L"timeline_large_stall_rebases", L"default", L"large stall shifts origin so later waits are not burst"},
+    {L"timeline_wait_until_rebases", L"default", L"WaitUntilElapsedUs overshoot also rebases origin"},
+    {L"timeline_long_wait_wall", L"default", L"200ms wait keeps wall time (adaptive timer slices)"},
+    {L"timeline_gap_from_now_no_catchup", L"default", L"WaitGapUs sleeps from now like 大漠 Delay"},
     {L"scheduler_cancel_interrupts", L"default", L"precision scheduler responds to cancellation"},
     {L"scheduler_wait_until_elapsed", L"default", L"absolute WaitUntilElapsedUs is interruptible"},
     {L"click_capture_rect_clamped", L"findimage", L"near-edge clamp + exclusive rect + offset"},
+    {L"hover_patch_covers_click", L"findimage", L"按下前悬停缓存命中半径"},
     {L"pair_mousedown_mouseup", L"findimage", L"Down+Move+Up unit; KeyDown between fails"},
     {L"reject_drag_by_distance", L"findimage", L"Down/Up distance >25 rejects"},
     {L"reject_drag_by_move_count", L"findimage", L"too many abs moves rejects"},
@@ -52,6 +59,10 @@ const selftest::CaseInfo kCases[] = {
     {L"modifier_scan_forward_not_backward", L"findimage", L"forward Ctrl KeyDown without Up rejects"},
     {L"snap_timing_to_wait", L"findimage", L"snap+Down stepUs become leading Wait"},
     {L"capture_filename_uses_session_id", L"findimage", L"filename contains sessionId"},
+    {L"scope_global_always_accept", L"default", L"captureScope=1 accepts any candidate"},
+    {L"scope_window_rejects_other_root", L"default", L"captureScope=0 rejects non-target root"},
+    {L"scope_arm_locks_first_external", L"default", L"null root + arm locks external candidate"},
+    {L"scope_arm_skips_own_process", L"default", L"arm does not lock own-process candidate"},
     {L"convert_unit_to_findimage_fields", L"findimage", L"followUp/threshold/button + leading Wait"},
     {L"convert_findtime_until_found", L"findimage", L"options.findTimeExpr=-1 written"},
     {L"convert_drops_nearby_move", L"findimage", L"snap abs move removed"},
@@ -64,6 +75,8 @@ const selftest::CaseInfo kCases[] = {
     {L"timed_sequence_allows_findimage", L"findimage", L"FindImage allowed in timed sequence"},
     {L"reject_multiclick", L"findimage", L"MouseClick clickCount>1 rejected"},
     {L"findimage_offset_noffset_consistent", L"findimage", L"nOffset*80 restores offset"},
+    {L"window_relative_conversion", L"default", L"窗口相对录制：动作标记 windowRelative 且保持客户区像素"},
+    {L"convert_window_relative_findimage", L"findimage", L"窗口相对点击转找图时保留 windowRelative 并全客户区搜索"},
 };
 
 RecordedEvent Ev(uint64_t us, uint64_t seq, UINT msg, int x = 0, int y = 0,
@@ -199,6 +212,29 @@ void CaseRepairCompressedRelGaps() {
     RepairCompressedRelativeGaps(again);
     const bool idem = again.size() == converted.actions.size();
     Emit(L"repair_compressed_rel_gaps", ok && idem, L"");
+}
+
+void CaseRepairCopyLeavesSource() {
+    std::vector<ScriptAction> src;
+    ScriptAction a{};
+    a.type = ActionType::MoveMouseRelative;
+    a.x = 1;
+    src.push_back(a);
+    ScriptAction w{};
+    w.type = ActionType::Wait;
+    w.timingUs = 100;
+    w.duration = 0.0001;
+    src.push_back(w);
+    src.push_back(a);
+    const uint64_t waitUs = ActionStepUs(src[1]);
+    const size_t n = src.size();
+    auto copy = src;
+    RepairCompressedRelativeGaps(copy);
+    const bool sourceUntouched = src.size() == n && ActionStepUs(src[1]) == waitUs
+        && src[0].type == ActionType::MoveMouseRelative
+        && src[2].type == ActionType::MoveMouseRelative;
+    const bool copyChanged = ActionStepUs(copy[1]) != waitUs || copy.size() != n;
+    Emit(L"repair_copy_leaves_source", sourceUntouched && copyChanged, L"");
 }
 
 void CaseSubThresholdRelSplit() {
@@ -361,6 +397,63 @@ void CaseConvertSkipsKeyAutorepeat() {
     Emit(L"convert_skips_key_autorepeat", ok, L"");
 }
 
+void CaseWindowRelativeConversion() {
+    std::vector<RecordedEvent> events{
+        Ev(0, 1, WM_MOUSEMOVE, 42, 37),
+        Ev(10000, 2, WM_LBUTTONDOWN, 80, 120, VK_LBUTTON),
+        Ev(12000, 3, WM_LBUTTONUP, 80, 120, VK_LBUTTON),
+    };
+    const auto normal = ConvertRecordedEventsToActions(events, {});
+    const auto wm = ConvertRecordedEventsToActions(events, {}, true);
+
+    bool normalOk = true;
+    for (const auto& a : normal.actions) {
+        if (a.type == ActionType::MoveMouse || a.type == ActionType::MouseDown
+            || a.type == ActionType::MouseUp) {
+            if (a.windowRelative || a.coordsAreNormalized) normalOk = false;
+        }
+    }
+    bool wmOk = !wm.actions.empty();
+    bool sawMove = false, sawDown = false;
+    for (const auto& a : wm.actions) {
+        if (a.type == ActionType::MoveMouse) {
+            sawMove = true;
+            wmOk = wmOk && a.windowRelative && !a.coordsAreNormalized
+                && a.x == 42 && a.y == 37;
+        } else if (a.type == ActionType::MouseDown) {
+            sawDown = true;
+            wmOk = wmOk && a.windowRelative && !a.coordsAreNormalized
+                && a.x == 80 && a.y == 120;
+        }
+    }
+    Emit(L"window_relative_conversion", normalOk && wmOk && sawMove && sawDown,
+        wmOk ? L"" : L"windowRelative flags/coords not preserved");
+}
+
+void CaseConvertWindowRelativeFindImage() {
+    auto down = MakeDown(120, 80);
+    down.windowRelative = true;
+    down.recordedCapturePath = L"images\\t.bmp";
+    down.captureOffsetX = 3;
+    down.captureOffsetY = 4;
+    auto up = MakeUp(120, 80);
+    up.windowRelative = true;
+    std::vector<ScriptAction> acts{down, up};
+    RenumberScriptActions(acts);
+    ConvertActionsToFindImage(acts, 0, 2, {});
+    bool found = false;
+    bool ok = false;
+    for (const auto& a : acts) {
+        if (a.type != ActionType::FindImage) continue;
+        found = true;
+        ok = a.windowRelative && a.searchFullScreen
+            && !a.coordsAreNormalized
+            && a.offsetX == 3 && a.offsetY == 4;
+    }
+    Emit(L"convert_window_relative_findimage", found && ok,
+        found ? L"" : L"no findImage after window-relative convert");
+}
+
 void CaseSameTimestampNoWait() {
     std::vector<RecordedEvent> events{
         Ev(0, 1, WM_LBUTTONDOWN, 1, 1, VK_LBUTTON),
@@ -460,16 +553,112 @@ void CaseWaitStatsUseTimingUs() {
 void CaseTimelineCatchupSkipsStall() {
     PrecisionInputTimeline tl;
     tl.Reset();
-    Sleep(20); // 人为落后：应追赶，不应再睡满后续 20ms
-    LARGE_INTEGER freq{}, t0{}, t1{};
+    // 小抖动 5ms、<8ms 阈值：后面 4ms 计划应全部追赶。计划总长必须 < 卡顿，否则后半段会重新睡。
+    LARGE_INTEGER freq{}, tSpin0{}, tSpin1{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&tSpin0);
+    for (;;) {
+        QueryPerformanceCounter(&tSpin1);
+        const double spinMs = (tSpin1.QuadPart - tSpin0.QuadPart) * 1000.0
+            / static_cast<double>(freq.QuadPart);
+        if (spinMs >= 5.0) break;
+    }
+    const double spunMs = (tSpin1.QuadPart - tSpin0.QuadPart) * 1000.0
+        / static_cast<double>(freq.QuadPart);
     QueryPerformanceCounter(&t0);
-    for (int i = 0; i < 20; ++i)
-        tl.WaitDeltaUs(1000, [] { return false; }); // 计划 20ms
+    for (int i = 0; i < 4; ++i)
+        tl.WaitDeltaUs(1000, [] { return false; });
     QueryPerformanceCounter(&t1);
     const double wallMs = (t1.QuadPart - t0.QuadPart) * 1000.0
         / static_cast<double>(freq.QuadPart);
-    Emit(L"timeline_catchup_skips_stall", wallMs < 8.0, L"");
+    if (spunMs >= 7.5) {
+        Emit(L"timeline_catchup_skips_stall", true, L"spin overshot rebase band");
+        return;
+    }
+    Emit(L"timeline_catchup_skips_stall",
+        wallMs < 3.0 && tl.Stats().rebaseCount == 0, L"");
+}
+
+void CaseTimelineLargeStallRebases() {
+    PrecisionInputTimeline tl;
+    tl.Reset();
+    LARGE_INTEGER freq{}, tSpin0{}, tSpin1{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&tSpin0);
+    for (;;) {
+        QueryPerformanceCounter(&tSpin1);
+        const double spinMs = (tSpin1.QuadPart - tSpin0.QuadPart) * 1000.0
+            / static_cast<double>(freq.QuadPart);
+        if (spinMs >= 40.0) break;
+    }
+    QueryPerformanceCounter(&t0);
+    for (int i = 0; i < 10; ++i)
+        tl.WaitDeltaUs(10000, [] { return false; }); // 计划 100ms
+    QueryPerformanceCounter(&t1);
+    const double wallMs = (t1.QuadPart - t0.QuadPart) * 1000.0
+        / static_cast<double>(freq.QuadPart);
+    const auto st = tl.Stats();
+    // 若仍整段追赶，wall 会 <10ms；rebase 后应接近剩余计划时间。
+    Emit(L"timeline_large_stall_rebases",
+        wallMs > 50.0 && st.rebaseCount >= 1, L"");
+}
+
+void CaseTimelineWaitUntilRebases() {
+    PrecisionInputTimeline tl;
+    tl.Reset();
+    LARGE_INTEGER freq{}, tSpin0{}, tSpin1{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&tSpin0);
+    for (;;) {
+        QueryPerformanceCounter(&tSpin1);
+        const double spinMs = (tSpin1.QuadPart - tSpin0.QuadPart) * 1000.0
+            / static_cast<double>(freq.QuadPart);
+        if (spinMs >= 40.0) break;
+    }
+    tl.WaitUntilElapsedUs(10000, [] { return false; });
+    QueryPerformanceCounter(&t0);
+    for (int i = 0; i < 8; ++i)
+        tl.WaitDeltaUs(10000, [] { return false; });
+    QueryPerformanceCounter(&t1);
+    const double wallMs = (t1.QuadPart - t0.QuadPart) * 1000.0
+        / static_cast<double>(freq.QuadPart);
+    const auto st = tl.Stats();
+    // 不 rebase：已过点约 40ms，8×10ms 只再睡 ~50ms；rebase 后应再睡满约 80ms。
+    Emit(L"timeline_wait_until_rebases",
+        wallMs > 70.0 && st.rebaseCount >= 1, L"");
+}
+
+void CaseTimelineLongWaitWall() {
+    PrecisionInputTimeline tl;
+    tl.Reset();
+    LARGE_INTEGER freq{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    tl.WaitDeltaUs(200000, [] { return false; });
+    QueryPerformanceCounter(&t1);
+    const double wallMs = (t1.QuadPart - t0.QuadPart) * 1000.0
+        / static_cast<double>(freq.QuadPart);
+    Emit(L"timeline_long_wait_wall", wallMs > 150.0 && wallMs < 400.0, L"");
+}
+
+void CaseTimelineGapFromNowNoCatchup() {
+    PrecisionInputTimeline tl;
+    tl.Reset();
+    LARGE_INTEGER freq{}, tSpin0{}, tSpin1{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&tSpin0);
+    for (;;) {
+        QueryPerformanceCounter(&tSpin1);
+        const double spinMs = (tSpin1.QuadPart - tSpin0.QuadPart) * 1000.0
+            / static_cast<double>(freq.QuadPart);
+        if (spinMs >= 30.0) break;
+    }
+    QueryPerformanceCounter(&t0);
+    tl.WaitGapUs(20000, [] { return false; });
+    QueryPerformanceCounter(&t1);
+    const double wallMs = (t1.QuadPart - t0.QuadPart) * 1000.0
+        / static_cast<double>(freq.QuadPart);
+    Emit(L"timeline_gap_from_now_no_catchup", wallMs > 12.0, L"");
 }
 
 void CaseSchedulerCancel() {
@@ -499,6 +688,16 @@ void CaseClickCaptureRect() {
         && mid.x2 == 140 && mid.y2 == 240
         && mid.offsetX == 0 && mid.offsetY == 0;
     Emit(L"click_capture_rect_clamped", ok && midOk, L"");
+}
+
+void CaseHoverPatchCoversClick() {
+    const bool ok = HoverPatchCoversClick(100, 200, 100, 200, 8)
+        && HoverPatchCoversClick(100, 200, 108, 192, 8)
+        && !HoverPatchCoversClick(100, 200, 109, 200, 8)
+        && !HoverPatchCoversClick(100, 200, 100, 191, 8)
+        && HoverPatchCoversClick(0, 0, 0, 0, 0)
+        && !HoverPatchCoversClick(0, 0, 1, 0, 0);
+    Emit(L"hover_patch_covers_click", ok, ok ? L"" : L"cover radius mismatch");
 }
 
 void CasePairDownUp() {
@@ -631,6 +830,27 @@ void CaseCaptureFilename() {
         name.find(L"rec_") == 0
             && name.find(L"42") != std::wstring::npos
             && name.find(sidStr) != std::wstring::npos, L"");
+}
+
+void CaseRecordingScopeFilter() {
+    const HWND rootA = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x100));
+    const HWND rootB = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x200));
+    {
+        const auto e = EvaluateRecordingScopeFilter(1, rootA, false, rootB, false);
+        Emit(L"scope_global_always_accept", e.accept && !e.newRoot, L"");
+    }
+    {
+        const auto e = EvaluateRecordingScopeFilter(0, rootA, false, rootB, false);
+        Emit(L"scope_window_rejects_other_root", !e.accept && !e.newRoot, L"");
+    }
+    {
+        const auto e = EvaluateRecordingScopeFilter(0, nullptr, true, rootB, false);
+        Emit(L"scope_arm_locks_first_external", e.accept && e.newRoot == rootB, L"");
+    }
+    {
+        const auto e = EvaluateRecordingScopeFilter(0, nullptr, true, rootB, true);
+        Emit(L"scope_arm_skips_own_process", !e.accept && !e.newRoot, L"");
+    }
 }
 
 void CaseConvertFields() {
@@ -859,6 +1079,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseSameTimestampRelativeKeep();
     CaseMicroGapRelativeMerge();
     CaseRepairCompressedRelGaps();
+    CaseRepairCopyLeavesSource();
     CaseSubThresholdRelSplit();
     CaseMixed();
     CaseButtonOrder();
@@ -870,6 +1091,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseTimingUsPrefers();
     CaseConvertGapsBecomeWaits();
     CaseConvertSkipsKeyAutorepeat();
+    CaseWindowRelativeConversion();
     CaseSameTimestampNoWait();
     CaseTimelineFoldVsExplicitEquiv();
     CaseExpandRecordingKeepsGaps();
@@ -877,9 +1099,14 @@ int wmain(int argc, wchar_t** argv) {
     CaseExpandIdempotent();
     CaseWaitStatsUseTimingUs();
     CaseTimelineCatchupSkipsStall();
+    CaseTimelineLargeStallRebases();
+    CaseTimelineWaitUntilRebases();
+    CaseTimelineLongWaitWall();
+    CaseTimelineGapFromNowNoCatchup();
     CaseSchedulerCancel();
     CaseSchedulerWaitUntil();
     CaseClickCaptureRect();
+    CaseHoverPatchCoversClick();
     CasePairDownUp();
     CaseRejectDragDistance();
     CaseRejectDragMoveCount();
@@ -889,7 +1116,9 @@ int wmain(int argc, wchar_t** argv) {
     CaseModifierScanForward();
     CaseSnapTimingToWait();
     CaseCaptureFilename();
+    CaseRecordingScopeFilter();
     CaseConvertFields();
+    CaseConvertWindowRelativeFindImage();
     CaseConvertFindTimeUntil();
     CaseConvertDropsNearbyMove();
     CaseConvertDropsApproachMoves();

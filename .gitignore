@@ -1,12 +1,13 @@
 # Build output
 build/
 out/
+dist/
 driver/qst_vhid/bin/
 driver/qst_vhid/obj/
 driver/qst_vhid/package/
 driver/qst_vhid/certs/
 driver/qst_vhid/install_log.txt
-driver/qst_vhid/_elevate_install.ps1
+# _elevate_install.ps1 is shipped with the product (tracked)
 *.obj
 *.exe
 *.pdb
@@ -39,3 +40,7 @@ QuickScript/
 
 # Temp source files
 *.tmp
+
+# Website download binaries (generated; upload with site deploy)
+website/downloads/*.exe
+website/downloads/*.zip

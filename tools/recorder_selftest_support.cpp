@@ -13,6 +13,8 @@ bool ActionUsesInterRepeatInterval(ActionType type) {
     case ActionType::QuickInput:
     case ActionType::ScrollWheel:
     case ActionType::MousePlayback:
+    case ActionType::RunMacro:
+    case ActionType::RunBlock:
         return true;
     default:
         return false;

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "鼠大侠",
-  "version": "1.1.43",
-  "description": "配合鼠大侠窗口模式，在已打开的 Edge/Chrome 标签页后台投递键鼠（无需 remote-debugging-port）。",
+  "name": "键鼠工坊",
+  "version": "1.0.0",
+  "description": "配合键鼠工坊窗口模式，在已打开的 Edge/Chrome 标签页后台投递键鼠（无需 remote-debugging-port）。",
   "permissions": ["debugger", "tabs", "windows", "storage", "alarms", "scripting"],
   "host_permissions": [
     "http://127.0.0.1/*",
@@ -19,7 +19,7 @@
     "open_in_tab": true
   },
   "action": {
-    "default_title": "鼠大侠",
+    "default_title": "键鼠工坊",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

@@ -9,7 +9,7 @@ function labelFor(state) {
   const map = {
     idle: "空闲",
     installed: "已安装",
-    waiting: "等待鼠大侠",
+    waiting: "等待键鼠工坊",
     connecting: "正在连接",
     connected: "已连接桥",
     ready: "就绪",

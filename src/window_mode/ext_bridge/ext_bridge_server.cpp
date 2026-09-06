@@ -704,7 +704,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         static std::atomic<int> statusHits{0};
         const int n = ++statusHits;
         if (n == 1 || (n % 8) == 0) {
-            WindowModeLogf(L"[窗口模式] 扩展桥被探测 status×%d（扩展进程活着）", n);
+            WindowModeLogVerbosef(L"[窗口模式] 扩展桥被探测 status×%d（扩展进程活着）", n);
         }
         return false;
     }
@@ -788,7 +788,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
     }
 
     if (!stop_.load() && !abort_.load()) {
-        WindowModeLog(L"[窗口模式] 扩展桥收到 WebSocket 升级请求");
+        WindowModeLogVerbose(L"[窗口模式] 扩展桥收到 WebSocket 升级请求");
     }
     const std::string upgrade = ExtractHeader(headers, "Upgrade");
     const std::string wsKey = ExtractHeader(headers, "Sec-WebSocket-Key");
@@ -832,7 +832,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         cv_.notify_all();
     }
     if (!stop_.load() && !abort_.load()) {
-        WindowModeLogf(L"[窗口模式] 配套扩展已连接本机桥（当前 %d 路）", clientCount);
+        WindowModeLogVerbosef(L"[窗口模式] 配套扩展已连接本机桥（当前 %d 路）", clientCount);
     }
 
     while (!stop_.load()) {
@@ -867,7 +867,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         clientCount = static_cast<int>(extSocks_.size());
     }
     if (!stop_.load() && !abort_.load()) {
-        WindowModeLogf(L"[窗口模式] 配套扩展已断开本机桥（剩余 %d 路）", clientCount);
+        WindowModeLogVerbosef(L"[窗口模式] 配套扩展已断开本机桥（剩余 %d 路）", clientCount);
     }
     return true;
 }

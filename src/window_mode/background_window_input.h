@@ -23,5 +23,7 @@ bool GetLastSoftMouseClientPos(HWND hwnd, int& cx, int& cy);
 void ResetSoftMouseState();
 /// CDP/扩展：Move 后记住客户区坐标，供后续「点击当前位置」(0,0) 使用。
 void RememberSoftMouseClientPos(HWND hwnd, int cx, int cy);
+/// 桌面模拟器拖拽：按下期间须发 MOVE（DeSmuME 靠 MK_LBUTTON+MOVE 更新触摸）。
+bool SoftMouseButtonHeld();
 
 }  // namespace windowmode

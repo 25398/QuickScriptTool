@@ -51,7 +51,11 @@ void CrosshairDragController::Begin(const CrosshairDragBinding& binding) {
     savedCursor_ = SetClassLongPtrW(owner_, GCLP_HCURSOR, reinterpret_cast<LONG_PTR>(dragCursor_));
     SetCursor(dragCursor_);
     GetWindowRect(owner_, &savedWindowRect_);
-    SetWindowPos(owner_, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    // 捕获需要窗口「可见」（可在屏外）；SW_HIDE 会导致 SetCapture 收不到鼠标
+    if (!IsWindowVisible(owner_)) {
+        ShowWindow(owner_, SW_SHOWNA);
+    }
+    SetWindowPos(owner_, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
     SetCapture(owner_);
     InvalidateButtons();
 }
@@ -92,6 +96,8 @@ bool CrosshairDragController::HandleMessage(UINT msg, WPARAM wp, LPARAM lp,
     case WM_LBUTTONUP: {
         POINT pt{};
         GetCursorPos(&pt);
+        // 所有模式都回调松手坐标，便于宿主统一落点
+        if (onCoordinate) onCoordinate(pt.x, pt.y);
         if (mode_ == CrosshairDragMode::WindowTarget) {
             const WindowInfoFromPoint info = GetWindowInfoFromPoint(pt.x, pt.y);
             if (onWindowTarget_) onWindowTarget_(info);
@@ -100,10 +106,8 @@ bool CrosshairDragController::HandleMessage(UINT msg, WPARAM wp, LPARAM lp,
             }
         } else if (mode_ == CrosshairDragMode::ProgramPath) {
             const std::wstring path = GetProcessPathFromPoint(pt.x, pt.y);
-            if (!path.empty()) {
-                if (onProgramPath) onProgramPath(path);
-                else if (targetEdit_) SetWindowTextW(targetEdit_, path.c_str());
-            }
+            if (onProgramPath) onProgramPath(path);
+            else if (!path.empty() && targetEdit_) SetWindowTextW(targetEdit_, path.c_str());
         }
         End();
         return true;

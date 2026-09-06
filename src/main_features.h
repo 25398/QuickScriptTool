@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────────────────────────
 // main_features.h — 功能模块抽象接口
 // 定义连点击 (Clicker) 和录制 (Recorder) 功能的接口与设置结构体。
-// MainWindow 实现 IClickerFeature 和 IRecorderFeature 接口。
+// EngineHost 实现 IClickerFeature 和 IRecorderFeature 接口。
 // ──────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -41,6 +41,7 @@ enum class RecorderInputMode {
     Auto = 0,
     DesktopAbsolute = 1,
     FpsRelative = 2,
+    ImageLocate = 3,   // 图片定位：录制时默认开启点击截图（找图转换素材），相对事件不截图
 };
 
 // ── 连点击设置 ───────────────────────────────────────────────────
@@ -52,7 +53,7 @@ struct ClickerSettings {
 
 // ── 录制器设置 ───────────────────────────────────────────────────
 struct RecorderSettings {
-    RecordCaptureScope captureScope = RecordCaptureScope::Window;  // 捕获范围
+    RecordCaptureScope captureScope = RecordCaptureScope::Global;  // 固定全局；窗口范围入口已移除
     RecorderInputMode inputMode = RecorderInputMode::Auto;
 };
 

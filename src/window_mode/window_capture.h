@@ -15,6 +15,8 @@ struct WindowCaptureResult {
 
 WindowCaptureResult CaptureWindowClientGdi(HWND hwnd);
 WindowCaptureResult CaptureWindowClient(HWND hwnd);
+/// 找图用：优先 WGC 合成表面（D3D/游戏），失败再 GDI。与前台桌面截模板更接近。
+WindowCaptureResult CaptureWindowClientForVision(HWND hwnd);
 WindowCaptureResult CaptureWindowRegion(HWND hwnd, int cx1, int cy1, int cx2, int cy2);
 HBITMAP CropBitmapScreenRegion(HBITMAP src, int srcOriginX, int srcOriginY,
     int regionX1, int regionY1, int regionX2, int regionY2);

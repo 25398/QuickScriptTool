@@ -38,6 +38,12 @@ const selftest::CaseInfo kCases[] = {
         L"foregroundInputBackend VirtualHid roundtrip"},
     {L"save_load_recording_click_capture", L"default",
         L"recordingClickCapture enabled/halfSize roundtrip + clamp"},
+    {L"save_load_playback_speed", L"default",
+        L"enablePlaybackSpeed + playbackSpeed roundtrip + clamp"},
+    {L"save_load_scheduled_conflict_policy", L"default",
+        L"scheduledTaskConflictPolicy roundtrip + clamp 0..1; scheduledTaskAutoResume roundtrip"},
+    {L"playback_speed_scale_math", L"default",
+        L"ScalePlaybackTimeSeconds: disabled identity; 2x halves; 0.25x *4; wait 0 stays"},
     {L"theme_id_clamped", L"default",
         L"themeId=99 clamps to kThemeCount-1"},
     {L"custom_theme_roundtrip", L"default",
@@ -48,8 +54,14 @@ const selftest::CaseInfo kCases[] = {
         L"ai.savedModels modelName roundtrip"},
     {L"save_load_home_tab", L"default",
         L"home.activeTab + selectedScriptPath roundtrip"},
+    {L"save_load_home_ui_mode", L"default",
+        L"home.uiMode simple/pro roundtrip; other values normalize to simple"},
+    {L"save_load_global_hotkey", L"default",
+        L"home.globalHotkeyText/Vk/Modifiers/Hold roundtrip"},
     {L"save_load_other_os_flags", L"default",
         L"autoStartOnBoot + resolveImeConflict roundtrip"},
+    {L"save_load_prefer_direct2d", L"default",
+        L"preferDirect2D default false; roundtrip true"},
     {L"load_garbage_partial_safe", L"default",
         L"Garbage JSON does not crash; defaults remain usable"},
 };
@@ -90,7 +102,12 @@ void CaseDefaults() {
     const bool ok = d.other.themeId == 0
         && d.ai.modelName == L"gpt-4o"
         && d.ai.apiUrl.find(L"openai.com") != std::wstring::npos
-        && d.windowMode.previewRefreshMs == 500;
+        && d.windowMode.previewRefreshMs == 500
+        && !d.playback.enablePlaybackSpeed
+        && d.playback.playbackSpeed == 1.0
+        && d.playback.scheduledTaskConflictPolicy == 0
+        && !d.playback.scheduledTaskAutoResume
+        && d.home.uiMode == L"simple";
     Emit(L"default_settings_baseline", ok, ok ? L"" : L"defaults mismatch");
 }
 
@@ -189,6 +206,96 @@ void CaseRecordingClickCapture(SettingsFileGuard& /*g*/) {
     Emit(L"save_load_recording_click_capture", ok, ok ? L"" : L"capture settings/clamp failed");
 }
 
+void CasePlaybackSpeed(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.playback.enablePlaybackSpeed = true;
+    s.playback.playbackSpeed = 2.0;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    bool ok = loaded.playback.enablePlaybackSpeed
+        && std::abs(loaded.playback.playbackSpeed - 2.0) < 1e-9;
+    s.playback.playbackSpeed = 9.0;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && std::abs(loaded.playback.playbackSpeed - 4.0) < 1e-9;
+    s.playback.playbackSpeed = 0.05;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && std::abs(loaded.playback.playbackSpeed - 0.25) < 1e-9;
+    Emit(L"save_load_playback_speed", ok, ok ? L"" : L"playbackSpeed roundtrip/clamp failed");
+}
+
+void CaseScheduledConflictPolicy(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.playback.scheduledTaskConflictPolicy = 1;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    bool ok = loaded.playback.scheduledTaskConflictPolicy == 1;
+    s.playback.scheduledTaskConflictPolicy = 2;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && loaded.playback.scheduledTaskConflictPolicy == 0;
+    s.playback.scheduledTaskConflictPolicy = 9;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && loaded.playback.scheduledTaskConflictPolicy == 0;
+    s.playback.scheduledTaskConflictPolicy = -1;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && loaded.playback.scheduledTaskConflictPolicy == 0;
+    s.playback.scheduledTaskAutoResume = true;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && loaded.playback.scheduledTaskAutoResume;
+    s.playback.scheduledTaskAutoResume = false;
+    SaveAppSettings(s);
+    LoadAppSettings(loaded);
+    ok = ok && !loaded.playback.scheduledTaskAutoResume;
+    Emit(L"save_load_scheduled_conflict_policy", ok,
+        ok ? L"" : L"scheduledTaskConflictPolicy/autoResume roundtrip/clamp failed");
+}
+
+void CasePlaybackSpeedMath(SettingsFileGuard& /*g*/) {
+    using quickscript::PlaybackTabSettings;
+    using quickscript::ScalePlaybackTimeSeconds;
+    using quickscript::ScalePlaybackTimeUs;
+    using quickscript::RecordingPlaybackTimeScale;
+    using quickscript::PlaybackTimeScaleAlways;
+    PlaybackTabSettings off{};
+    off.enablePlaybackSpeed = false;
+    off.playbackSpeed = 4.0;
+    PlaybackTabSettings x2{};
+    x2.enablePlaybackSpeed = true;
+    x2.playbackSpeed = 2.0;
+    PlaybackTabSettings slow{};
+    slow.enablePlaybackSpeed = true;
+    slow.playbackSpeed = 0.25;
+    const bool ok = std::abs(ScalePlaybackTimeSeconds(1.0, off) - 1.0) < 1e-12
+        && std::abs(ScalePlaybackTimeSeconds(1.0, x2) - 0.5) < 1e-12
+        && std::abs(ScalePlaybackTimeSeconds(0.8, x2) - 0.4) < 1e-12
+        && std::abs(ScalePlaybackTimeSeconds(1.0, slow) - 4.0) < 1e-12
+        && ScalePlaybackTimeSeconds(0.0, x2) == 0.0
+        && ScalePlaybackTimeSeconds(-1.0, x2) == -1.0
+        && ScalePlaybackTimeUs(1000, off) == 1000
+        && ScalePlaybackTimeUs(1000, x2) == 500;
+    AppSettings simpleRec = DefaultAppSettings();
+    simpleRec.home.uiMode = L"simple";
+    simpleRec.playback.enablePlaybackSpeed = false;
+    simpleRec.playback.playbackSpeed = 2.0;
+    AppSettings proOff = simpleRec;
+    proOff.home.uiMode = L"pro";
+    AppSettings proOn = proOff;
+    proOn.playback.enablePlaybackSpeed = true;
+    const bool recOk = std::abs(RecordingPlaybackTimeScale(simpleRec) - 0.5) < 1e-12
+        && std::abs(RecordingPlaybackTimeScale(proOff) - 1.0) < 1e-12
+        && std::abs(RecordingPlaybackTimeScale(proOn) - 0.5) < 1e-12
+        && std::abs(PlaybackTimeScaleAlways(2.0) - 0.5) < 1e-12
+        && std::abs(ScalePlaybackTimeSeconds(1.0, PlaybackTimeScaleAlways(2.0)) - 0.5) < 1e-12;
+    Emit(L"playback_speed_scale_math", ok && recOk, ok && recOk ? L"" : L"scale helper mismatch");
+}
+
 void CaseThemeClamp(SettingsFileGuard& /*g*/) {
     WriteRawSettings(AppSettingsFilePath(),
         u8"{\"other\":{\"themeId\":99}}");
@@ -242,15 +349,49 @@ void CaseAiModels(SettingsFileGuard& /*g*/) {
 void CaseHomeTab(SettingsFileGuard& /*g*/) {
     AppSettings s = DefaultAppSettings();
     s.home.activeTab = 2;
-    s.home.selectedScriptPath = L"scripts\\demo.json";
+    // 中文路径：旧 wofstream 会截断 JSON，必须 UTF-8 落盘
+    s.home.selectedScriptPath = L"D:\\other\\software\\build\\Release\\scripts\\定时功能测试.json";
     s.home.recorderInputMode = 2;
     SaveAppSettings(s);
     AppSettings loaded{};
     LoadAppSettings(loaded);
     const bool ok = loaded.home.activeTab == 2
-        && loaded.home.selectedScriptPath == L"scripts\\demo.json"
+        && loaded.home.selectedScriptPath == s.home.selectedScriptPath
         && loaded.home.recorderInputMode == 2;
-    Emit(L"save_load_home_tab", ok, ok ? L"" : L"home state lost");
+    Emit(L"save_load_home_tab", ok, ok ? L"" : L"home state lost (check UTF-8 Chinese path)");
+}
+
+void CaseHomeUiMode(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.home.uiMode = L"pro";
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    const bool roundtrip = loaded.home.uiMode == L"pro";
+    AppSettings s2 = DefaultAppSettings();
+    s2.home.uiMode = L"weird";
+    SaveAppSettings(s2);
+    AppSettings loaded2{};
+    LoadAppSettings(loaded2);
+    const bool clamp = loaded2.home.uiMode == L"simple";
+    Emit(L"save_load_home_ui_mode", roundtrip && clamp,
+        roundtrip && clamp ? L"" : L"home.uiMode roundtrip/normalize failed");
+}
+
+void CaseGlobalHotkey(SettingsFileGuard& /*g*/) {
+    AppSettings s = DefaultAppSettings();
+    s.home.globalHotkeyText = L"F9";
+    s.home.globalHotkeyVk = 0x78;
+    s.home.globalHotkeyModifiers = 0;
+    s.home.globalHotkeyHold = true;
+    SaveAppSettings(s);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    const bool ok = loaded.home.globalHotkeyText == L"F9"
+        && loaded.home.globalHotkeyVk == 0x78
+        && loaded.home.globalHotkeyModifiers == 0
+        && loaded.home.globalHotkeyHold;
+    Emit(L"save_load_global_hotkey", ok, ok ? L"" : L"global hotkey home fields lost");
 }
 
 void CaseOtherOsFlags(SettingsFileGuard& /*g*/) {
@@ -264,6 +405,18 @@ void CaseOtherOsFlags(SettingsFileGuard& /*g*/) {
     const bool ok = loaded.other.autoStartOnBoot && loaded.other.resolveImeConflict
         && std::abs(loaded.other.holdThresholdSeconds - 0.35) < 1e-9;
     Emit(L"save_load_other_os_flags", ok, ok ? L"" : L"other OS flags lost");
+}
+
+void CasePreferDirect2D(SettingsFileGuard& /*g*/) {
+    AppSettings baseline = DefaultAppSettings();
+    const bool defaultOff = !baseline.other.preferDirect2D;
+    baseline.other.preferDirect2D = true;
+    SaveAppSettings(baseline);
+    AppSettings loaded{};
+    LoadAppSettings(loaded);
+    const bool ok = defaultOff && loaded.other.preferDirect2D;
+    Emit(L"save_load_prefer_direct2d", ok,
+        ok ? L"" : L"preferDirect2D default/roundtrip mismatch");
 }
 
 void CaseGarbage(SettingsFileGuard& /*g*/) {
@@ -311,12 +464,18 @@ int wmain(int argc, wchar_t** argv) {
         CaseHidDriverFlag(guard);
         CaseForegroundInputBackend(guard);
         CaseRecordingClickCapture(guard);
+        CasePlaybackSpeed(guard);
+        CaseScheduledConflictPolicy(guard);
+        CasePlaybackSpeedMath(guard);
         CaseThemeClamp(guard);
         CaseCustomTheme(guard);
         CaseWmPreviewClamp(guard);
         CaseAiModels(guard);
         CaseHomeTab(guard);
+        CaseHomeUiMode(guard);
+        CaseGlobalHotkey(guard);
         CaseOtherOsFlags(guard);
+        CasePreferDirect2D(guard);
         CaseGarbage(guard);
     }
 

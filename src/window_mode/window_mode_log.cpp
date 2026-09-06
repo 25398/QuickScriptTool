@@ -46,6 +46,57 @@ void WindowModeLogf(const wchar_t* fmt, ...) {
     Emit(buf);
 }
 
+void WindowModeLogVerbose(const std::wstring& line) {
+    OutputDebugStringW(line.c_str());
+    OutputDebugStringW(L"\n");
+}
+
+void WindowModeLogVerbosef(const wchar_t* fmt, ...) {
+    if (!fmt) return;
+    wchar_t buf[1024]{};
+    va_list args;
+    va_start(args, fmt);
+    vswprintf_s(buf, fmt, args);
+    va_end(args);
+    WindowModeLogVerbose(buf);
+}
+
+namespace {
+
+void AppendPersistentEvent(const std::wstring& line) {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash - path), L"window_mode_debug.log");
+
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path, L"a, ccs=UTF-8") != 0 || !fp) return;
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fwprintf(fp, L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] %s\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        line.c_str());
+    fclose(fp);
+}
+
+}  // namespace
+
+void WindowModeLogEvent(const std::wstring& line) {
+    Emit(line);
+    AppendPersistentEvent(line);
+}
+
+void WindowModeLogEventf(const wchar_t* fmt, ...) {
+    if (!fmt) return;
+    wchar_t buf[1024]{};
+    va_list args;
+    va_start(args, fmt);
+    vswprintf_s(buf, fmt, args);
+    va_end(args);
+    WindowModeLogEvent(buf);
+}
+
 void WindowModeLogDesktopSnap(const wchar_t* tag, HWND hwnd) {
     HWND root = TopLevelTargetWindow(hwnd);
     if (!root) root = hwnd;

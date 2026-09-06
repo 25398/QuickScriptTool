@@ -253,15 +253,19 @@ bool VirtualHidBackend::Open(std::wstring* errorOut) {
 
 void VirtualHidBackend::Close() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // 关句柄前尽量抬起；进程被杀时仍依赖驱动 FileCleanup 发空报告。
+    modifiers_ = 0;
+    std::memset(keys_, 0, sizeof(keys_));
+    mouseButtons_ = 0;
     if (device_ && device_ != INVALID_HANDLE_VALUE) {
+        lastSentModifiers_ = 0xFF; // force submit even if last sent was already zero
+        (void)SubmitKeyboardLocked();
+        (void)SubmitMouseButtonsLocked();
         CloseHandle(static_cast<HANDLE>(device_));
     }
     device_ = nullptr;
-    modifiers_ = 0;
-    std::memset(keys_, 0, sizeof(keys_));
     std::memset(lastSentKeys_, 0, sizeof(lastSentKeys_));
     lastSentModifiers_ = 0;
-    mouseButtons_ = 0;
     pointerMode_ = PointerMode::Relative;
     lastAbsX_ = 0;
     lastAbsY_ = 0;
@@ -315,6 +319,12 @@ bool VirtualHidBackend::SendKey(unsigned short scanCode, bool down, bool extende
 bool VirtualHidBackend::MoveRelative(int dx, int dy) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (dx == 0 && dy == 0) return true;
+    // 单步位移上限：畸形脚本给 INT_MIN 时下方 while 会循环数百万次 DeviceIoControl。
+    constexpr int kMaxDelta = 32767;
+    if (dx > kMaxDelta) dx = kMaxDelta;
+    if (dx < -kMaxDelta) dx = -kMaxDelta;
+    if (dy > kMaxDelta) dy = kMaxDelta;
+    if (dy < -kMaxDelta) dy = -kMaxDelta;
     pointerMode_ = PointerMode::Relative;
     while (dx != 0 || dy != 0) {
         const char sx = ClampI8(dx);

@@ -8,65 +8,85 @@
 - 普通用户电脑没有这些 DLL
 - **不要把 `build\Debug` 发给别人**
 
-请始终分发 **`Release` 构建**（`build\Release` 或本目录脚本生成的 `dist`）。
+请始终分发 **`Release` 构建**（`tools\package_release.ps1` 生成的 `dist`）。
 
 ---
 
-## 方式一：ZIP 绿色包（最简单）
+## 发版依赖策略
 
-在项目根目录执行：
+`tools\package_release.ps1` 会把**运行主程序所需依赖**全部打进 `dist\QuickScriptTool`（再打 zip / 供 Inno 安装）：
+
+| 随包（解压/安装即可用） | 软件内按钮 / 运行时再装 |
+|-------------------------|-------------------------|
+| `WebView2Fixed\` | Interception / 虚拟 HID **内核驱动**（设置里安装） |
+| MSVC x64 CRT（`vcruntime140*.dll` / `msvcp140*.dll` 旁路） | Python + PaddleOCR（OCR 一键安装） |
+| OpenCV / FakeFocus / VirtualDesktopAccessor | |
+| `extension\edge`、`ui\`、VHID **安装脚本与 package** | |
+| `interception.dll` | |
+
+版本号以 `tools\product_version.txt` 为准，须与 `installer\QuickScriptTool.iss` 的 `MyAppVersion`、`src\app_branding.cpp` 一致。
+
+---
+
+## 方式一：ZIP 绿色包
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\package_release.ps1
 ```
 
-会生成：
+产物：
 
 - `dist\QuickScriptTool\` — 可直接拷贝的文件夹
-- `dist\QuickScriptTool-Release.zip` — 可发给他人的压缩包
+- `dist\QuickScriptTool-Release-<ver>.zip`（及同内容别名 `QuickScriptTool-Release.zip`）
 
-若对方提示缺少 `VCRUNTIME140.dll`（注意没有 D），让对方安装微软官方运行库：
-
-https://aka.ms/vs/17/release/vc_redist.x64.exe
+用户**无需**再安装 `vc_redist.x64.exe`（CRT 已在 exe 旁）。
 
 ---
 
-## 方式二：Inno Setup 安装包（推荐）
+## 方式二：Inno Setup 安装包
 
 1. 安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)
-2. 执行上面的 `package_release.ps1` 生成 `dist\QuickScriptTool`
-3. （推荐）下载 [vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe) 放到 `installer\redist\`
+2. 确认 `tools\product_version.txt` == `installer\QuickScriptTool.iss` 里 `MyAppVersion`
+3. 执行 `package_release.ps1` 生成 `dist\QuickScriptTool`
 4. 编译安装脚本：
 
 ```powershell
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\QuickScriptTool.iss
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\QuickScriptTool.iss
+# 产物：dist\QuickScriptTool-<ver>.exe（官网主下载名；另同步 QuickScriptTool-Setup-<ver>.exe 别名）
 ```
 
-输出：`dist\QuickScriptTool-Setup-1.0.0.exe`
+5. 再跑一次同步官网下载目录：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package_release.ps1 -SkipBuild
+```
+
+输出：`dist\QuickScriptTool-Setup-<ver>.exe`（当前 **1.1.2**）
 
 安装包会：
 
 - 安装到 `C:\Program Files\QuickScriptTool`
+- 递归装入整个 dist（含 MSVC CRT 旁路 DLL 与 WebView2Fixed）
 - 创建开始菜单快捷方式（可选桌面图标）
-- 若包含 `redist\vc_redist.x64.exe`，安装时自动安装 VC++ 运行库
 
 ---
 
-## 发布目录应包含的文件
+## 发布目录应包含的文件（摘要）
 
 ```
 QuickScriptTool.exe
-opencv_world4100.dll      （Release，不要带 d 的 Debug 版）
-tools\
-  paddle_ocr_helper.py
-  requirements-ocr.txt
-scripts\                    （用户数据，可为空）
-recordings\                 （用户数据，可为空）
+vcruntime140.dll / vcruntime140_1.dll / msvcp140*.dll   （MSVC CRT 旁路）
+opencv_world4100.dll
+FakeFocus64.dll / FakeFocus32.dll
+VirtualDesktopAccessor10.dll / VirtualDesktopAccessor11.dll / VirtualDesktopAccessor11_23h2.dll
+interception.dll
+WebView2Fixed\
+ui\
+extension\edge\
+driver\qst_vhid\
+skills\agent\
+tools\                      （OCR helper；可选 python 离线包）
+scripts\ / recordings\      （用户数据，可为空）
 ```
 
-OCR 功能依赖 Python 3.12 与 PaddleOCR，安装到 `C:\paddle_env`。点击软件内「一键安装」即可自动完成（无需用户预先安装 Python）：
-
-1. 自动下载并安装 Python 3.12（若 `tools\python-3.12.10-amd64.exe` 或 `tools\python312\` 已随包附带，则离线安装）
-2. 创建虚拟环境并 pip 安装 PaddleOCR 等依赖
-
-打包时可选执行 `tools\download_python312.ps1`，将 Python 安装包放入 `tools\`，便于无网络环境分发。
+OCR：点击软件内「一键安装」即可（无需用户预先装 Python）。打包机可先跑 `tools\download_python312.ps1` 预置离线安装包。

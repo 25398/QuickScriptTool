@@ -19,6 +19,8 @@ json SerializeMessage(const ChatMessage& m) {
         j["reasoning_content"] = ToUtf8(m.reasoning_content);
     if (m.requires_reasoning_content)
         j["requires_reasoning_content"] = true;
+    if (m.internal_nudge)
+        j["internal_nudge"] = true;
     if (!m.tool_call_id.empty())
         j["tool_call_id"] = ToUtf8(m.tool_call_id);
     if (!m.tool_name.empty())
@@ -47,6 +49,8 @@ ChatMessage DeserializeMessage(const json& j) {
         m.reasoning_content = FromUtf8(j["reasoning_content"].get<std::string>());
     if (j.contains("requires_reasoning_content"))
         m.requires_reasoning_content = j["requires_reasoning_content"].get<bool>();
+    if (j.contains("internal_nudge"))
+        m.internal_nudge = j["internal_nudge"].get<bool>();
     if (j.contains("tool_call_id"))
         m.tool_call_id = FromUtf8(j["tool_call_id"].get<std::string>());
     if (j.contains("tool_name"))
@@ -69,9 +73,25 @@ std::wstring ConversationFilePath(const std::wstring& id) {
     return AgentConversationsDir() + L"\\" + id + L".json";
 }
 
+// 会话 id 会直接拼进文件路径：只允许安全字符，从存储层兜底防路径穿越
+// （bridge 各分支的校验不一致，peek/busy 分支曾漏检）。
+bool IsSafeConversationId(const std::wstring& id) {
+    if (id.empty() || id.size() > 64) return false;
+    for (wchar_t c : id) {
+        if ((c >= L'0' && c <= L'9')
+            || (c >= L'a' && c <= L'z')
+            || (c >= L'A' && c <= L'Z')
+            || c == L'-' || c == L'_') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 std::wstring ExtractFirstUserPrompt(const std::vector<ChatMessage>& messages) {
     for (const auto& m : messages) {
-        if (m.role != L"user") continue;
+        if (m.role != L"user" || m.internal_nudge) continue;
         std::wstring text = Trim(m.content);
         if (text.empty() && !m.parts.empty()) {
             for (const auto& p : m.parts) {
@@ -156,7 +176,7 @@ void EnsureAgentConversationsDir() {
 int CountConversationRounds(const std::vector<ChatMessage>& messages) {
     int rounds = 0;
     for (const auto& m : messages) {
-        if (m.role == L"user") ++rounds;
+        if (m.role == L"user" && !m.internal_nudge) ++rounds;
     }
     return rounds;
 }
@@ -179,6 +199,8 @@ bool LoadAgentConversationList(std::vector<AgentConversationMeta>& out) {
                 meta.createdTime = FromUtf8(item["createdTime"].get<std::string>());
             if (item.contains("roundCount")) meta.roundCount = item["roundCount"].get<int>();
             if (item.contains("file")) meta.filePath = FromUtf8(item["file"].get<std::string>());
+            if (item.contains("folder"))
+                meta.folder = NormalizeRelativeFolder(FromUtf8(item["folder"].get<std::string>()));
             if (meta.id.empty()) continue;
             if (meta.filePath.empty()) meta.filePath = ConversationFilePath(meta.id);
             out.push_back(std::move(meta));
@@ -194,7 +216,7 @@ bool LoadAgentConversationList(std::vector<AgentConversationMeta>& out) {
 
 bool LoadAgentConversationRecord(const std::wstring& id, AgentConversationRecord& out) {
     out = {};
-    if (id.empty()) return false;
+    if (!IsSafeConversationId(id)) return false;
     const std::wstring path = ConversationFilePath(id);
     const std::wstring content = ReadAll(path);
     if (content.empty()) return false;
@@ -214,6 +236,16 @@ bool LoadAgentConversationRecord(const std::wstring& id, AgentConversationRecord
                 out.messages.push_back(DeserializeMessage(jm));
             }
         }
+        if (root.contains("draft"))
+            out.draft = FromUtf8(root["draft"].get<std::string>());
+        if (root.contains("attachments") && root["attachments"].is_array()) {
+            for (const auto& p : root["attachments"]) {
+                if (p.is_string())
+                    out.attachmentPaths.push_back(FromUtf8(p.get<std::string>()));
+            }
+        }
+        if (root.contains("editIndex") && root["editIndex"].is_number_integer())
+            out.editIndex = root["editIndex"].get<int>();
         return true;
     } catch (...) {
         return false;
@@ -221,33 +253,29 @@ bool LoadAgentConversationRecord(const std::wstring& id, AgentConversationRecord
 }
 
 bool SaveAgentConversation(const AgentConversationSavePayload& payload) {
-    if (!payload.shouldSave || payload.id.empty()) return false;
+    if (!payload.shouldSave || !IsSafeConversationId(payload.id)) return false;
     EnsureAgentConversationsDir();
 
-    std::wstring title = payload.name;
+    std::wstring title = payload.name.empty() ? L"新对话" : payload.name;
     const std::wstring path = ConversationFilePath(payload.id);
-    {
-        const std::wstring existing = ReadAll(path);
-        if (!existing.empty()) {
-            try {
-                const json prev = json::parse(ToUtf8(existing));
-                if (prev.contains("name")) {
-                    const std::wstring prevName = FromUtf8(prev["name"].get<std::string>());
-                    if (!prevName.empty()) title = prevName;
-                }
-            } catch (...) {}
-        }
-    }
+    const int rounds = payload.roundCount > 0
+        ? payload.roundCount
+        : CountConversationRounds(payload.messages);
 
     json root;
     root["id"] = ToUtf8(payload.id);
     root["name"] = ToUtf8(title);
     root["createdTime"] = ToUtf8(payload.createdTime);
-    root["roundCount"] = payload.roundCount;
+    root["roundCount"] = rounds;
     root["chatDisplay"] = ToUtf8(payload.chatDisplay);
     json msgs = json::array();
     for (const auto& m : payload.messages) msgs.push_back(SerializeMessage(m));
     root["messages"] = msgs;
+    root["draft"] = ToUtf8(payload.draft);
+    root["editIndex"] = payload.editIndex;
+    json atts = json::array();
+    for (const auto& p : payload.attachmentPaths) atts.push_back(ToUtf8(p));
+    root["attachments"] = atts;
 
     {
         std::ofstream file(path, std::ios::binary);
@@ -258,30 +286,35 @@ bool SaveAgentConversation(const AgentConversationSavePayload& payload) {
 
     std::vector<AgentConversationMeta> list;
     LoadAgentConversationList(list);
-    bool found = false;
-    for (auto& item : list) {
+    std::wstring keepFolder;
+    for (const auto& item : list) {
         if (item.id == payload.id) {
-            if (item.name.empty()) item.name = title;
-            item.createdTime = payload.createdTime;
-            item.roundCount = payload.roundCount;
-            item.filePath = path;
-            found = true;
+            keepFolder = item.folder;
             break;
         }
     }
-    if (!found) {
+    list.erase(std::remove_if(list.begin(), list.end(),
+        [&](const AgentConversationMeta& m) { return m.id == payload.id; }), list.end());
+    // 尚无用户轮次：只留磁盘草稿，不进对话列表（开了窗却没说话不应出现「新对话」）
+    if (rounds > 0) {
         AgentConversationMeta meta;
         meta.id = payload.id;
         meta.name = title;
         meta.createdTime = payload.createdTime;
-        meta.roundCount = payload.roundCount;
+        meta.roundCount = rounds;
         meta.filePath = path;
+        meta.folder = keepFolder;
         list.push_back(std::move(meta));
+        std::sort(list.begin(), list.end(), [](const AgentConversationMeta& a, const AgentConversationMeta& b) {
+            return a.createdTime > b.createdTime;
+        });
     }
-    std::sort(list.begin(), list.end(), [](const AgentConversationMeta& a, const AgentConversationMeta& b) {
-        return a.createdTime > b.createdTime;
-    });
 
+    return SaveAgentConversationIndex(list);
+}
+
+bool SaveAgentConversationIndex(const std::vector<AgentConversationMeta>& list) {
+    EnsureAgentConversationsDir();
     json index;
     json arr = json::array();
     for (const auto& item : list) {
@@ -290,11 +323,11 @@ bool SaveAgentConversation(const AgentConversationSavePayload& payload) {
             {"name", ToUtf8(item.name)},
             {"createdTime", ToUtf8(item.createdTime)},
             {"roundCount", item.roundCount},
-            {"file", ToUtf8(item.filePath)}
+            {"file", ToUtf8(item.filePath)},
+            {"folder", ToUtf8(item.folder)}
         });
     }
     index["conversations"] = arr;
-
     const std::wstring indexPath = AgentConversationsDir() + L"\\index.json";
     std::ofstream indexFile(indexPath, std::ios::binary);
     if (!indexFile) return false;
@@ -303,8 +336,63 @@ bool SaveAgentConversation(const AgentConversationSavePayload& payload) {
     return true;
 }
 
+bool SetAgentConversationName(const std::wstring& id, const std::wstring& name) {
+    if (!IsSafeConversationId(id) || name.empty()) return false;
+    AgentConversationRecord rec;
+    if (!LoadAgentConversationRecord(id, rec)) return false;
+    AgentConversationSavePayload payload;
+    payload.shouldSave = true;
+    payload.id = id;
+    payload.name = name;
+    payload.createdTime = rec.meta.createdTime;
+    payload.roundCount = rec.meta.roundCount > 0
+        ? rec.meta.roundCount
+        : CountConversationRounds(rec.messages);
+    payload.messages = std::move(rec.messages);
+    payload.chatDisplay = rec.chatDisplay;
+    payload.draft = rec.draft;
+    payload.attachmentPaths = rec.attachmentPaths;
+    payload.editIndex = rec.editIndex;
+    return SaveAgentConversation(payload);
+}
+
+bool SaveAgentConversationDraft(const std::wstring& id, const std::wstring& draft,
+    const std::vector<std::wstring>& attachmentPaths, int editIndex) {
+    if (!IsSafeConversationId(id)) return false;
+    AgentConversationRecord rec;
+    const bool loaded = LoadAgentConversationRecord(id, rec);
+    const int rounds = loaded
+        ? (rec.meta.roundCount > 0 ? rec.meta.roundCount : CountConversationRounds(rec.messages))
+        : CountConversationRounds(rec.messages);
+    bool draftBlank = true;
+    for (wchar_t c : draft) {
+        if (c != L' ' && c != L'\t' && c != L'\r' && c != L'\n') {
+            draftBlank = false;
+            break;
+        }
+    }
+    const bool emptyDraft = draftBlank && attachmentPaths.empty() && editIndex < 0;
+    if (rounds <= 0 && emptyDraft) {
+        DeleteAgentConversation(id);
+        return true;
+    }
+    AgentConversationSavePayload payload;
+    payload.shouldSave = true;
+    payload.id = id;
+    payload.name = loaded && !rec.meta.name.empty() ? rec.meta.name : L"新对话";
+    payload.createdTime = loaded && !rec.meta.createdTime.empty()
+        ? rec.meta.createdTime : NowText();
+    payload.roundCount = rounds;
+    payload.messages = std::move(rec.messages);
+    payload.chatDisplay = rec.chatDisplay;
+    payload.draft = draft;
+    payload.attachmentPaths = attachmentPaths;
+    payload.editIndex = editIndex;
+    return SaveAgentConversation(payload);
+}
+
 bool DeleteAgentConversation(const std::wstring& id) {
-    if (id.empty()) return false;
+    if (!IsSafeConversationId(id)) return false;
     DeleteFileW(ConversationFilePath(id).c_str());
 
     std::vector<AgentConversationMeta> list;
@@ -320,7 +408,8 @@ bool DeleteAgentConversation(const std::wstring& id) {
             {"name", ToUtf8(item.name)},
             {"createdTime", ToUtf8(item.createdTime)},
             {"roundCount", item.roundCount},
-            {"file", ToUtf8(item.filePath)}
+            {"file", ToUtf8(item.filePath)},
+            {"folder", ToUtf8(item.folder)}
         });
     }
     index["conversations"] = arr;
@@ -330,4 +419,23 @@ bool DeleteAgentConversation(const std::wstring& id) {
     const std::string indexUtf8 = index.dump(2);
     indexFile.write(indexUtf8.data(), static_cast<std::streamsize>(indexUtf8.size()));
     return true;
+}
+
+bool SetAgentConversationFolder(const std::wstring& id, const std::wstring& folder) {
+    if (!IsSafeConversationId(id) || !IsSafeRelativeFolder(folder)) return false;
+    std::vector<AgentConversationMeta> list;
+    if (!LoadAgentConversationList(list)) return false;
+    bool found = false;
+    const std::wstring norm = NormalizeRelativeFolder(folder);
+    for (auto& m : list) {
+        if (m.id == id) {
+            m.folder = norm;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+    EnsureLibraryKindDir(L"ai");
+    if (!norm.empty() && !EnsureRelativeFolder(LibraryKindDir(L"ai"), norm)) return false;
+    return SaveAgentConversationIndex(list);
 }

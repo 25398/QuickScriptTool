@@ -156,6 +156,23 @@ WindowCaptureResult CaptureWindowClientGdi(HWND captureHwnd) {
     HBITMAP bmp = CreateCompatibleBitmap(screenDc, w, h);
     HGDIOBJ oldBmp = SelectObject(memDc, bmp);
 
+    HWND fsRoot = TopLevelTargetWindow(captureHwnd);
+    if (LooksLikeFullscreenGameTarget(fsRoot ? fsRoot : captureHwnd)) {
+        // DXGI 独占全屏：PrintWindow/WGC 会 PresentInternal(80004004) 崩溃。
+        // 画面已铺满监视器，从桌面 DC 拷贝可见像素。
+        BitBlt(memDc, 0, 0, w, h, screenDc, origin.x, origin.y, SRCCOPY);
+        SelectObject(memDc, oldBmp);
+        DeleteDC(memDc);
+        ReleaseDC(nullptr, screenDc);
+        result.bitmap = bmp;
+        result.x = origin.x;
+        result.y = origin.y;
+        result.w = w;
+        result.h = h;
+        result.fromPrintWindow = false;
+        return result;
+    }
+
     BOOL printed = PrintWindow(captureHwnd, memDc, PW_RENDERFULLCONTENT);
     // PrintWindow(PW_RENDERFULLCONTENT) 成功时不要再 WM_PRINT：
     // Chrome/Electron 的 WM_PRINT 常会覆盖成错误/空内容。
@@ -202,6 +219,7 @@ WindowCaptureResult CaptureWindowClientGdi(HWND captureHwnd) {
 WindowCaptureResult CaptureWindowClientWgc(HWND hwnd, HWND captureHwnd) {
     WindowCaptureResult result{};
     if (!captureHwnd || !IsWindow(captureHwnd)) return result;
+    if (LooksLikeFullscreenGameTarget(ResolveWgcRoot(captureHwnd))) return result;
 
     const HWND wgcRoot = ResolveWgcRoot(captureHwnd);
     int wgcW = 0;
@@ -329,8 +347,31 @@ WindowCaptureResult CaptureWindowClient(HWND hwnd) {
     return gdi;
 }
 
+WindowCaptureResult CaptureWindowClientForVision(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return {};
+    HWND captureHwnd = hwnd;
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    if (root && root != hwnd) {
+        RECT childRc{};
+        const bool childEmpty = !GetClientRect(hwnd, &childRc)
+            || (childRc.right - childRc.left) <= 0
+            || (childRc.bottom - childRc.top) <= 0;
+        if (childEmpty || IsIconic(root)) captureHwnd = root;
+    }
+    const HWND wgcRoot = ResolveWgcRoot(captureHwnd);
+    if (LooksLikeFullscreenGameTarget(wgcRoot)) {
+        return CaptureWindowClient(hwnd);
+    }
+    if (IsWgcCaptureAvailable() && !IsIconic(wgcRoot)) {
+        WindowCaptureResult wgc = CaptureWindowClientWgc(hwnd, captureHwnd);
+        if (wgc.bitmap && !IsCaptureLikelyBlank(wgc.bitmap)) return wgc;
+        if (wgc.bitmap) DeleteObject(wgc.bitmap);
+    }
+    return CaptureWindowClient(hwnd);
+}
+
 WindowCaptureResult CaptureWindowRegion(HWND hwnd, int cx1, int cy1, int cx2, int cy2) {
-    WindowCaptureResult full = CaptureWindowClient(hwnd);
+    WindowCaptureResult full = CaptureWindowClientForVision(hwnd);
     if (!full.bitmap) return full;
 
     const int L = std::min(cx1, cx2);
@@ -419,17 +460,26 @@ bool IsCaptureLikelyBlank(HBITMAP bmp) {
 
     uint64_t sum = 0;
     size_t count = 0;
+    int minCh = 255;
+    int maxCh = 0;
+    // 抽样 + 全量均值：近黑、或近乎纯色灰底（Electron 空壳）都视为空白。
     for (size_t i = 0; i + 3 < data.pixels.size(); i += 4) {
         const uint8_t b = data.pixels[i];
         const uint8_t g = data.pixels[i + 1];
         const uint8_t r = data.pixels[i + 2];
+        const int lum = (static_cast<int>(r) + g + b) / 3;
+        if (lum < minCh) minCh = lum;
+        if (lum > maxCh) maxCh = lum;
         sum += r + g + b;
         ++count;
     }
     if (count == 0) return true;
 
     const double avg = static_cast<double>(sum) / static_cast<double>(count * 3);
-    return avg < 2.0;
+    if (avg < 2.0) return true;
+    // 均匀浅灰/白底空壳：动态范围极小且非整黑。
+    if ((maxCh - minCh) <= 6 && avg >= 8.0) return true;
+    return false;
 }
 
 }  // namespace windowmode

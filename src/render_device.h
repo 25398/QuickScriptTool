@@ -25,6 +25,8 @@ bool IsDirectWriteAvailable();
 /// 获取/设置首选后端（Direct2D 不可用时自动回退 GDI）
 RenderBackend GetPreferredRenderBackend();
 void SetPreferredRenderBackend(RenderBackend backend);
+/// 按设置 preferDirect2D 应用首选后端；D2D 不可用时静默回退并最多记一次调试日志
+void ApplyPreferredRenderBackend(bool preferDirect2D);
 
 ID2D1Factory* GetD2DFactory();
 IDWriteFactory* GetDWriteFactory();

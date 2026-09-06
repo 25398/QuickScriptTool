@@ -2,19 +2,28 @@
 
 #include <windows.h>
 
+#include <mutex>
 #include <string>
 
 namespace windowmode {
 
 /// Loads VirtualDesktopAccessor.dll (bundled, version-selected) and exposes its API.
+/// 线程安全：VDA.dll 会按线程缓存 COM 桌面管理器，跨线程并发调用会 RPC_E_WRONG_THREAD/AV，
+/// 所有 DLL 调用统一走本类的递归互斥锁串行化（CDP watch-pump 线程与脚本线程可能并发进入）。
 class VirtualDesktopAccessor {
 public:
     static VirtualDesktopAccessor& Instance();
 
     bool EnsureLoaded(std::wstring& err);
     void Unload();
-    bool IsLoaded() const { return module_ != nullptr; }
-    const std::wstring& LoadedDllName() const { return loadedDllName_; }
+    bool IsLoaded() const {
+        std::lock_guard<std::recursive_mutex> lock(mu_);
+        return module_ != nullptr;
+    }
+    std::wstring LoadedDllName() const {
+        std::lock_guard<std::recursive_mutex> lock(mu_);
+        return loadedDllName_;
+    }
 
     int GetDesktopCount() const;
     std::wstring GetDesktopName(int desktopNumber) const;
@@ -51,6 +60,7 @@ private:
     void ResolveFunctions();
     std::wstring BuildCandidatePath(const wchar_t* fileName) const;
 
+    mutable std::recursive_mutex mu_;
     HMODULE module_ = nullptr;
     std::wstring loadedDllName_;
 

@@ -1,4 +1,4 @@
-/* 鼠大侠工具栏弹窗 — 列出/运行/停止本机 scripts\*.json（按当前标签过滤同类） */
+/* 键鼠工坊工具栏弹窗 — 列出/运行/停止本机 scripts\*.json（按当前标签过滤同类） */
 const PORT_LO = 19228;
 const PORT_HI = 19240;
 const VERSION = chrome.runtime.getManifest().version;
@@ -237,7 +237,7 @@ async function runScript(pathOrFile) {
     setStatus("已开始运行", "ok");
     await refreshState();
   } catch (e) {
-    setStatus("无法连接鼠大侠", "err");
+    setStatus("无法连接键鼠工坊", "err");
   } finally {
     busy = false;
   }
@@ -260,7 +260,7 @@ async function stopScript() {
     setStatus("已发送停止", "ok");
     await refreshState();
   } catch (_) {
-    setStatus("无法连接鼠大侠", "err");
+    setStatus("无法连接键鼠工坊", "err");
   } finally {
     busy = false;
   }
@@ -276,7 +276,7 @@ function renderList() {
   if (!list.length) {
     el.empty.style.display = "";
     if (!bridge) {
-      el.empty.textContent = "请先启动鼠大侠";
+      el.empty.textContent = "请先启动键鼠工坊";
     } else if (!scripts.length) {
       el.empty.textContent = "暂无脚本";
     } else {
@@ -380,12 +380,12 @@ async function refreshState() {
     visibleScripts = [];
     syncToggle();
     renderList();
-    setStatus("请先启动鼠大侠", "err");
+    setStatus("请先启动键鼠工坊", "err");
   }
 }
 
 async function refreshAll() {
-  setStatus("正在连接鼠大侠…");
+  setStatus("正在连接键鼠工坊…");
   await loadEnabled();
   bridge = await discoverBridge();
   if (!bridge) {
@@ -393,7 +393,7 @@ async function refreshAll() {
     visibleScripts = [];
     syncToggle();
     renderList();
-    setStatus("请先启动鼠大侠", "err");
+    setStatus("请先启动键鼠工坊", "err");
     return;
   }
   try {

@@ -1,7 +1,9 @@
 // ── 脚本动作辅助函数实现 ────────────────────────────────────
 #include "action_utils.h"
+#include "color_match.h"
 #include "input/foreground_input_router.h"
 #include "input/mouse_input_backend.h"
+#include "input/synthetic_input_filter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -123,9 +125,15 @@ std::wstring ActionName(const ScriptAction& action) {
     }
     case ActionType::MouseClick: {
         const auto holds = HoldText(action);
-        return L"鼠标点击"
+        std::wstring s = L"鼠标点击"
             + (holds.empty() ? L"" : holds + L"+")
-            + ButtonText(action.button) + RepeatInfo(action);
+            + ButtonText(action.button);
+        if (action.moveFromVar) {
+            s += L"到(" + action.moveVarExprX + L"," + action.moveVarExprY + L")";
+        } else {
+            s += L"@" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y);
+        }
+        return s + RepeatInfo(action);
     }
     case ActionType::KeyDown: {
         const auto holds = HoldText(action);
@@ -162,12 +170,12 @@ std::wstring ActionName(const ScriptAction& action) {
             + (action.blockName.empty() ? L"未命名" : action.blockName) + L"]";
     case ActionType::RunBlock:
         return L"运行宏指令块["
-            + (action.blockName.empty() ? L"未命名" : action.blockName) + L"]";
+            + (action.blockName.empty() ? L"未命名" : action.blockName) + L"]" + RepeatInfo(action);
     case ActionType::RunMacro:
         return L"运行鼠标宏["
-            + (action.blockName.empty() ? L"未选择" : action.blockName) + L"]";
+            + (action.blockName.empty() ? L"未选择" : action.blockName) + L"]" + RepeatInfo(action);
     case ActionType::MousePlayback:
-        return L"鼠标回放["
+        return L"运行录制回放["
             + (action.blockName.empty() ? L"未选择" : action.blockName) + L"]" + RepeatInfo(action);
     case ActionType::HotkeyShortcut: {
         const int idx = std::clamp(action.shortcutPreset, 0, ShortcutPresetCount() - 1);
@@ -192,11 +200,14 @@ std::wstring ActionName(const ScriptAction& action) {
     }
     case ActionType::FindImage: {
         const wchar_t* follow = action.findImageFollowUp == 1 ? L"移动到"
-            : action.findImageFollowUp == 2 ? L"保存变量" : L"点击";
+            : action.findImageFollowUp == 2 ? L"保存匹配度"
+            : action.findImageFollowUp == 3 ? L"保存图片" : L"点击";
         std::wstring scaleText = F3(action.imageScaleMin) + L"-" + F3(action.imageScaleMax);
-        return std::wstring(L"找图(返回最匹配的)[") + follow + L",匹配>"
-            + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%,缩放"
-            + scaleText + L"]";
+        return std::wstring(L"找图[") + follow + L","
+            + (action.perfectMatch
+                ? L"完美匹配"
+                : (L"匹配>" + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%"))
+            + L",缩放" + scaleText + L"]";
     }
     case ActionType::TextRecognition: {
         const wchar_t* mode = action.ocrResultMode == 1 ? L"文字查找" : L"获取文字";
@@ -242,6 +253,11 @@ std::wstring ActionName(const ScriptAction& action) {
         if (path.size() > 36) path = path.substr(0, 36) + L"...";
         return L"打开文件[" + (path.empty() ? L"未选择" : path) + L"]";
     }
+    case ActionType::ActivateWindow: {
+        std::wstring m = action.targetPath;
+        if (m.size() > 36) m = m.substr(0, 36) + L"...";
+        return L"激活窗口[" + (m.empty() ? L"未填写" : m) + L"]";
+    }
     case ActionType::TimerRecordTime:
         return L"计时器记录时间["
             + (action.loopVarName.empty() ? L"未命名" : action.loopVarName) + L"]";
@@ -265,6 +281,15 @@ std::wstring ActionName(const ScriptAction& action) {
     }
     case ActionType::GetCursorPos:
         return L"获取当前光标位置→[" + (action.matchVarName.empty() ? L"未命名" : action.matchVarName) + L"]";
+    case ActionType::GetColor:
+        return L"获取颜色@" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y)
+            + L"→[" + action.matchVarName + L"]";
+    case ActionType::FindColor:
+        return L"找色" + FormatColorHex(action.colorR, action.colorG, action.colorB)
+            + L"容差" + std::to_wstring(action.colorTolerance);
+    case ActionType::ColorMatch:
+        return L"颜色匹配" + FormatColorHex(action.colorR, action.colorG, action.colorB)
+            + L"@" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y);
     case ActionType::CustomText:
         return action.customText;
     }
@@ -279,7 +304,7 @@ std::wstring ActionTypeBriefLabel(ActionType type) {
     case ActionType::MouseClick: return L"鼠标点击";
     case ActionType::MouseDown: return L"鼠标按下";
     case ActionType::MouseUp: return L"鼠标松开";
-    case ActionType::MousePlayback: return L"鼠标回放";
+    case ActionType::MousePlayback: return L"运行录制回放";
     case ActionType::RunMacro: return L"运行鼠标宏";
     case ActionType::KeyClick: return L"按键点击";
     case ActionType::KeyDown: return L"键盘按下";
@@ -291,7 +316,7 @@ std::wstring ActionTypeBriefLabel(ActionType type) {
     case ActionType::EndLoop: return L"跳出循环";
     case ActionType::DefineBlock: return L"定义宏指令块";
     case ActionType::RunBlock: return L"运行宏指令块";
-    case ActionType::FindImage: return L"找图(返回最匹配的)";
+    case ActionType::FindImage: return L"找图";
     case ActionType::TextRecognition: return L"文字识别";
     case ActionType::If: return L"条件-如果";
     case ActionType::Else: return L"条件-否则";
@@ -303,8 +328,12 @@ std::wstring ActionTypeBriefLabel(ActionType type) {
     case ActionType::CloseProgram: return L"关闭程序";
     case ActionType::OpenWebpage: return L"打开网页";
     case ActionType::OpenFile: return L"打开文件";
+    case ActionType::ActivateWindow: return L"激活窗口";
     case ActionType::TimerRecordTime: return L"计时器记录时间";
     case ActionType::GetCursorPos: return L"获取当前光标位置";
+    case ActionType::GetColor: return L"获取颜色";
+    case ActionType::FindColor: return L"找色";
+    case ActionType::ColorMatch: return L"颜色匹配";
     case ActionType::AiTextAnalysis: return L"AI文字分析";
     case ActionType::AiImageAnalysis: return L"AI图片分析";
     case ActionType::AiActionExecute: return L"AI动作执行";
@@ -331,8 +360,13 @@ std::wstring JsonTypeBriefLabel(const std::wstring& jsonType) {
         {L"unlockScreenshot", ActionType::UnlockScreenshot}, {L"stopMacro", ActionType::StopMacro},
         {L"goto", ActionType::Goto}, {L"runProgram", ActionType::RunProgram},
         {L"closeProgram", ActionType::CloseProgram}, {L"openWebpage", ActionType::OpenWebpage},
-        {L"openFile", ActionType::OpenFile}, {L"timerRecordTime", ActionType::TimerRecordTime},
-        {L"getCursorPos", ActionType::GetCursorPos}, {L"customText", ActionType::CustomText},
+        {L"openFile", ActionType::OpenFile}, {L"activateWindow", ActionType::ActivateWindow},
+        {L"timerRecordTime", ActionType::TimerRecordTime},
+        {L"getCursorPos", ActionType::GetCursorPos},
+        {L"getColor", ActionType::GetColor},
+        {L"findColor", ActionType::FindColor},
+        {L"colorMatch", ActionType::ColorMatch},
+        {L"customText", ActionType::CustomText},
         {L"aiTextAnalysis", ActionType::AiTextAnalysis},
         {L"aiImageAnalysis", ActionType::AiImageAnalysis},
         {L"aiActionExecute", ActionType::AiActionExecute},
@@ -347,14 +381,14 @@ std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions
     size_t maxLines) {
     if (actions.empty()) return L"";
     std::wstring out =
-        L"【动作一览 — 对用户说明时必须用下列名称（与编辑器动作列一致），禁止说英文 type】\n";
+        L"【动作一览 — 缩进表示父子（循环/条件体内）；对用户说明时必须用下列名称（与编辑器动作列一致），禁止说英文 type】\n";
 
     auto appendOne = [&](size_t i) {
         const int no = actions[i].originalNo > 0
             ? actions[i].originalNo : static_cast<int>(i + 1);
-        out += L"第" + std::to_wstring(no) + L"步 " + ActionName(actions[i]);
         if (actions[i].indent > 0)
-            out += L"（缩进" + std::to_wstring(actions[i].indent) + L"）";
+            out.append(static_cast<size_t>(actions[i].indent) * 2, L' ');
+        out += L"第" + std::to_wstring(no) + L"步 " + ActionName(actions[i]);
         if (!actions[i].remark.empty())
             out += L" 备注:" + actions[i].remark;
         out += L"\n";
@@ -378,7 +412,7 @@ std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions
 std::wstring ActionTypeReplyCatalog() {
     return LR"(【动作 type 对用户的中文说法 — 与编辑器一致，禁止在回复中出现英文 type】
 wait→等待  moveMouse→移动鼠标到  moveMouseRelative→相对移动鼠标  mouseClick→鼠标点击  mouseDown→鼠标按下  mouseUp→鼠标松开
-mousePlayback→鼠标回放  runMacro→运行鼠标宏  keyClick→按键点击  keyDown→键盘按下  keyUp→键盘松开
+mousePlayback→运行录制回放  runMacro→运行鼠标宏  keyClick→按键点击  keyDown→键盘按下  keyUp→键盘松开
 hotkeyShortcut→快捷按键  quickInput→快捷输入  scrollWheel→滚动滚轮
 loop→循环  endLoop→跳出循环  defineBlock→定义宏指令块  runBlock→运行宏指令块
 if→条件-如果  else→条件-否则  goto→跳转  stopMacro→结束宏运行
@@ -455,6 +489,8 @@ bool ActionUsesInterRepeatInterval(ActionType type) {
     case ActionType::QuickInput:
     case ActionType::ScrollWheel:
     case ActionType::MousePlayback:
+    case ActionType::RunMacro:
+    case ActionType::RunBlock:
         return true;
     default:
         return false;
@@ -499,8 +535,12 @@ std::wstring JsonType(ActionType type) {
     case ActionType::CloseProgram:   return L"closeProgram";
     case ActionType::OpenWebpage:    return L"openWebpage";
     case ActionType::OpenFile:       return L"openFile";
+    case ActionType::ActivateWindow: return L"activateWindow";
     case ActionType::TimerRecordTime: return L"timerRecordTime";
     case ActionType::GetCursorPos:    return L"getCursorPos";
+    case ActionType::GetColor:        return L"getColor";
+    case ActionType::FindColor:       return L"findColor";
+    case ActionType::ColorMatch:      return L"colorMatch";
     case ActionType::CustomText:     return L"customText";
     case ActionType::AiTextAnalysis:  return L"aiTextAnalysis";
     case ActionType::AiImageAnalysis: return L"aiImageAnalysis";
@@ -579,8 +619,12 @@ void SendKeyboardKey(UINT vk, bool down) {
     if (scan == 0) return;
 
     if (ForegroundInputRouter::Instance().IsHidActive()) {
-        if (ForegroundInputRouter::Instance().SendKey(scan, down, extended)) return;
+        if (ForegroundInputRouter::Instance().SendKey(vk, scan, down, extended)) return;
     }
+
+    // 软件模拟：ExtraInfo + INJECTED 足够区分注入；勿再 Expect——
+    // 长按热键同键连点会刷满信用，真人松手被误判为注入。
+    synthetic_input::NoteKey(vk, scan, extended, down);
 
     INPUT input{};
     input.type = INPUT_KEYBOARD;
@@ -588,6 +632,7 @@ void SendKeyboardKey(UINT vk, bool down) {
     input.ki.dwFlags = KEYEVENTF_SCANCODE;
     if (extended) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     if (!down) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    input.ki.dwExtraInfo = synthetic_input::kSyntheticExtraInfo;
     SendInput(1, &input, sizeof(INPUT));
 }
 
@@ -718,9 +763,12 @@ const ShortcutPreset kShortcutPresets[] = {
     {L"Ctrl+S(保存)", 'S', true, false, false, false},
     {L"Ctrl+F(查找)", 'F', true, false, false, false},
     {L"Alt+F4(关闭窗口)", VK_F4, false, true, false, false},
-    {L"Win+D(所有最小化)", 'D', false, false, false, true},
+    {L"Win+D(显示桌面)", 'D', false, false, false, true},
     {L"Win+R(打开运行)", 'R', false, false, false, true},
     {L"Ctrl+Alt+Delete", VK_DELETE, true, true, false, false},
+    {L"Alt+Tab(切换窗口)", VK_TAB, false, true, false, false},
+    {L"Win+Down(最小化窗口)", VK_DOWN, false, false, false, true},
+    {L"Win+Up(最大化/还原)", VK_UP, false, false, false, true},
 };
 } // namespace
 

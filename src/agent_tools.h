@@ -20,11 +20,14 @@ AgentTool MakeWriteScriptTool();
 /// 获取脚本的详细统计信息（动作分类、分段结构等）
 AgentTool MakeGetScriptStatsTool();
 
-/// 优化脚本：合并关键操作之间的移动和等待，或压缩鼠标移动路径
+/// 优化脚本：与产品录制优化同一套按关键动作分段的合并/压缩
 AgentTool MakeOptimizeScriptTool();
 
 /// 按手动编辑逻辑构建规范格式的脚本动作 JSON（禁止 AI 手写动作对象）
 AgentTool MakeBuildScriptActionsTool();
+
+/// 规划脚本动作树（嵌套 children），不保存；含循环/条件时先核对父子再构建
+AgentTool MakePlanScriptActionsTool();
 
 /// AI 动作执行专用：提交本批次要执行的宏动作（返回纯 JSON 数组，与 buildScriptActions 构建逻辑一致）
 AgentTool MakeSubmitMacroActionsTool();

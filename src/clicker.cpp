@@ -1,13 +1,13 @@
 // ── 连点器功能实现 ──────────────────────────────────────────
-#include "main_window.h"
+#include "engine/engine_host_window.h"
 
 // --------------------------------------------------
-    void MainWindow::ToggleClicker() {
+    void EngineHost::ToggleClicker() {
         if (clicking_) { StopClicking(); } else { StartClicking(); }
     }
 
 // --------------------------------------------------
-    void MainWindow::StopClickerCleanup() {
+    void EngineHost::StopClickerCleanup() {
         clicking_ = false;
         if (!clickerThread_.joinable()) return;
         // 禁止无限 join：最多等 300ms，否则 detach（退出场景由 ExitProcess 回收）。

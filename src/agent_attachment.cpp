@@ -91,20 +91,26 @@ cv::Mat MatFromBitmap(HBITMAP hbmp) {
     BITMAP bm{};
     if (!GetObject(hbmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) return {};
 
+    // 32bpp：避免 24bpp GetDIBits 与 CV_8UC3 行对齐不一致写越界
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = bm.bmWidth;
     bmi.bmiHeader.biHeight = -bm.bmHeight;
     bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 24;
+    bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    cv::Mat mat(bm.bmHeight, bm.bmWidth, CV_8UC3);
+    cv::Mat bgra(bm.bmHeight, bm.bmWidth, CV_8UC4);
     HDC hdc = GetDC(nullptr);
     if (!hdc) return {};
-    GetDIBits(hdc, hbmp, 0, bm.bmHeight, mat.data, &bmi, DIB_RGB_COLORS);
+    const int lines = GetDIBits(hdc, hbmp, 0, static_cast<UINT>(bm.bmHeight),
+        bgra.ptr(), &bmi, DIB_RGB_COLORS);
     ReleaseDC(nullptr, hdc);
-    return mat;
+    if (lines <= 0) return {};
+
+    cv::Mat bgr;
+    cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+    return bgr;
 }
 
 cv::Mat MatFromDib(HGLOBAL hMem) {
@@ -375,4 +381,64 @@ ChatMessage AgentBuildUserMessage(const std::wstring& text,
 
     if (msg.parts.empty()) msg.content = text;
     return msg;
+}
+
+bool AgentExtractImageMarkers(const std::wstring& text, std::wstring& textOut,
+                              std::vector<std::wstring>& paths) {
+    textOut = text;
+    paths.clear();
+    const std::wstring open = L"[[AGENT_IMG:";
+    const std::wstring close = L"]]";
+    bool found = false;
+    for (;;) {
+        const size_t start = textOut.find(open);
+        if (start == std::wstring::npos) break;
+        const size_t end = textOut.find(close, start + open.size());
+        if (end == std::wstring::npos) break;
+        std::wstring path = Trim(textOut.substr(start + open.size(),
+            end - start - open.size()));
+        textOut.erase(start, end + close.size() - start);
+        if (!path.empty()) {
+            paths.push_back(path);
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool AgentBuildImageParts(const std::vector<std::wstring>& paths,
+                          std::vector<ChatContentPart>& parts,
+                          std::wstring& skipped,
+                          size_t maxCount) {
+    if (paths.empty()) return false;
+    if (maxCount == 0) maxCount = 8;
+    size_t embedded = 0;
+    for (const auto& path : paths) {
+        if (embedded >= maxCount) {
+            if (!skipped.empty()) skipped += L"\n";
+            skipped += L"[已跳过] 图片超过单轮嵌入上限（" + std::to_wstring(maxCount)
+                + L"）：" + path;
+            continue;
+        }
+        AgentPendingAttachment item;
+        std::wstring error;
+        if (!AgentLoadAttachmentFromPath(path, item, error)) {
+            if (!skipped.empty()) skipped += L"\n";
+            skipped += L"[读取失败] " + path + L"（" + error + L"）";
+            continue;
+        }
+        if (!item.isImage || item.base64.empty()) {
+            AgentReleaseAttachmentBitmap(item);
+            if (!skipped.empty()) skipped += L"\n";
+            skipped += L"[跳过] 非图片或编码失败：" + path;
+            continue;
+        }
+        ChatContentPart part;
+        part.type = L"image_url";
+        part.image_url = L"data:" + item.mime + L";base64," + FromUtf8(item.base64);
+        AgentReleaseAttachmentBitmap(item);
+        parts.push_back(std::move(part));
+        ++embedded;
+    }
+    return embedded > 0;
 }

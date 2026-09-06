@@ -5,8 +5,16 @@
 #include "match_overlay.h"
 #include "drawing.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <windowsx.h>
+
+namespace {
+bool IsRegionPickMode(MatchOverlayMode m) {
+    return m == MatchOverlayMode::RelativeRegionPick
+        || m == MatchOverlayMode::SyntheticAnchorRegionPick;
+}
+}  // namespace
 
 bool MatchOverlay::classRegistered_ = false;
 
@@ -43,7 +51,7 @@ void MatchOverlay::CaptureScreen() {
     if (screenBitmap_) DeleteObject(screenBitmap_);
     screenBitmap_ = CreateCompatibleBitmap(screenDc, screenW_, screenH_);
     HGDIOBJ oldBmp = SelectObject(memDc, screenBitmap_);
-    BitBlt(memDc, 0, 0, screenW_, screenH_, screenDc, screenX_, screenY_, SRCCOPY);
+    BitBlt(memDc, 0, 0, screenW_, screenH_, screenDc, screenX_, screenY_, SRCCOPY | CAPTUREBLT);
     SelectObject(memDc, oldBmp);
     DeleteDC(memDc);
     ReleaseDC(nullptr, screenDc);
@@ -51,6 +59,31 @@ void MatchOverlay::CaptureScreen() {
 
 void MatchOverlay::RunMatch() {
     if (matchDone_) return;
+
+    if (mode_ == MatchOverlayMode::SyntheticAnchorRegionPick) {
+        const int w = (std::max)(8, syntheticW_);
+        const int h = (std::max)(8, syntheticH_);
+        const int cx = screenX_ + screenW_ / 2;
+        const int cy = screenY_ + screenH_ / 2;
+        ImageMatchResult syn{};
+        syn.found = true;
+        syn.score = 100.0;
+        syn.scale = 1.0;
+        syn.topLeftX = cx - w / 2;
+        syn.topLeftY = cy - h / 2;
+        syn.bottomRightX = syn.topLeftX + w;
+        syn.bottomRightY = syn.topLeftY + h;
+        syn.x = cx;
+        syn.y = cy;
+        matchResults_.clear();
+        matchResults_.push_back(syn);
+        matchResult_ = syn;
+        matchMs_ = 0;
+        matchCount_ = 1;
+        matchDone_ = true;
+        loadFailed_ = false;
+        return;
+    }
 
     HBITMAP tmpl = LoadBitmapFromFile(imagePath_);
     if (!tmpl) {
@@ -184,7 +217,9 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     ar.cancelled = cancelled_;
     ar.offsetX = clickX_;
     ar.offsetY = clickY_;
-    if (mode_ == MatchOverlayMode::RelativeRegionPick && !cancelled_ && IsValidRegionSelection()) {
+    if ((mode_ == MatchOverlayMode::RelativeRegionPick
+            || mode_ == MatchOverlayMode::SyntheticAnchorRegionPick)
+        && !cancelled_ && IsValidRegionSelection()) {
         ar.regionValid = true;
         ar.regionX1 = regionSelection_.left;
         ar.regionY1 = regionSelection_.top;
@@ -192,6 +227,16 @@ MatchOverlay::ActionResult MatchOverlay::Show(
         ar.regionY2 = regionSelection_.bottom;
     }
     return ar;
+}
+
+MatchOverlay::ActionResult MatchOverlay::ShowSyntheticAnchor(int anchorW, int anchorH) {
+    syntheticW_ = (std::max)(8, anchorW);
+    syntheticH_ = (std::max)(8, anchorH);
+    ImageMatchOptions opt{};
+    opt.thresholdPercent = 1.0;
+    opt.scaleMin = 1.0;
+    opt.scaleMax = 1.0;
+    return Show(L"", 0, 0, 0, 0, opt, MatchOverlayMode::SyntheticAnchorRegionPick);
 }
 
 LRESULT CALLBACK MatchOverlay::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -230,7 +275,7 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         cursorX_ = GET_X_LPARAM(lp) + screenX_;
         cursorY_ = GET_Y_LPARAM(lp) + screenY_;
         cursorValid_ = true;
-        if (mode_ == MatchOverlayMode::RelativeRegionPick && regionDragging_ && (wp & MK_LBUTTON)) {
+        if (IsRegionPickMode(mode_) && regionDragging_ && (wp & MK_LBUTTON)) {
             regionDragEnd_.x = GET_X_LPARAM(lp);
             regionDragEnd_.y = GET_Y_LPARAM(lp);
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -240,7 +285,7 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_SETCURSOR:
-        if ((mode_ == MatchOverlayMode::OffsetPick || mode_ == MatchOverlayMode::RelativeRegionPick)
+        if ((mode_ == MatchOverlayMode::OffsetPick || IsRegionPickMode(mode_))
             && matchDone_ && matchResult_.found) {
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         } else {
@@ -274,7 +319,7 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_LBUTTONDOWN:
-        if (mode_ == MatchOverlayMode::RelativeRegionPick && matchDone_ && matchResult_.found) {
+        if (IsRegionPickMode(mode_) && matchDone_ && matchResult_.found) {
             regionDragging_ = true;
             regionDragStart_.x = GET_X_LPARAM(lp);
             regionDragStart_.y = GET_Y_LPARAM(lp);
@@ -285,8 +330,9 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (mode_ == MatchOverlayMode::OffsetPick && matchDone_ && matchResult_.found) {
-            clickX_ = GET_X_LPARAM(lp) + screenX_;
-            clickY_ = GET_Y_LPARAM(lp) + screenY_;
+            const int absX = GET_X_LPARAM(lp) + screenX_;
+            const int absY = GET_Y_LPARAM(lp) + screenY_;
+            FindImageRelativeClickOffset(matchResult_, absX, absY, clickX_, clickY_);
             cancelled_ = false;
             PostQuitMessage(0);
             return 0;
@@ -294,7 +340,7 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_LBUTTONUP:
-        if (mode_ == MatchOverlayMode::RelativeRegionPick && regionDragging_) {
+        if (IsRegionPickMode(mode_) && regionDragging_) {
             regionDragging_ = false;
             regionDragEnd_.x = GET_X_LPARAM(lp);
             regionDragEnd_.y = GET_Y_LPARAM(lp);
@@ -350,7 +396,7 @@ bool MatchOverlay::IsValidRegionSelection() const {
 }
 
 void MatchOverlay::DrawRegionSelection(HDC hdc) {
-    if (mode_ != MatchOverlayMode::RelativeRegionPick) return;
+    if (!IsRegionPickMode(mode_)) return;
     RECT drawRc = regionSelection_;
     if (regionDragging_) {
         drawRc.left = std::min(regionDragStart_.x, regionDragEnd_.x) + screenX_;
@@ -378,6 +424,11 @@ void MatchOverlay::DrawStatusBar(HDC hdc) {
     wchar_t status[256];
     if (loadFailed_) {
         swprintf_s(status, L"[按ESC退出] 错误：找不到图片路径(文件不存在或已删除)");
+    } else if (mode_ == MatchOverlayMode::SyntheticAnchorRegionPick && matchCount_ > 0) {
+        swprintf_s(status, L"[按ESC退出] 合成锚框 %dx%d，请框选相对区域",
+                   syntheticW_, syntheticH_);
+    } else if (mode_ == MatchOverlayMode::SyntheticAnchorRegionPick) {
+        swprintf_s(status, L"[按ESC退出] 无法显示合成锚框");
     } else if (mode_ == MatchOverlayMode::RelativeRegionPick && matchCount_ > 0) {
         swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到%d个, 请框选识别区域",
                    matchMs_, matchCount_);

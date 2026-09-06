@@ -43,6 +43,16 @@ ClickCaptureRectResult ComputeClickCaptureRect(
     int cx, int cy, int half,
     int vsLeft, int vsTop, int vsRight, int vsBottom);
 
+/// 悬停缓存是否覆盖本次点击（光标几乎没动，可用按下前的画面）。
+inline bool HoverPatchCoversClick(int patchCx, int patchCy, int clickCx, int clickCy, int maxDeltaPx) {
+    if (maxDeltaPx < 0) maxDeltaPx = 0;
+    const int dx = patchCx - clickCx;
+    const int dy = patchCy - clickCy;
+    const int adx = dx < 0 ? -dx : dx;
+    const int ady = dy < 0 ? -dy : dy;
+    return adx <= maxDeltaPx && ady <= maxDeltaPx;
+}
+
 /// 模板文件名：rec_{sessionId}_{sequence}.bmp
 std::wstring MakeRecordingClickCaptureFileName(uint64_t sessionId, uint64_t sequence);
 

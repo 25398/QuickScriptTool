@@ -81,6 +81,22 @@ void SetPreferredRenderBackend(RenderBackend backend) {
     g_preferredBackend = backend;
 }
 
+void ApplyPreferredRenderBackend(bool preferDirect2D) {
+    if (!preferDirect2D) {
+        g_preferredBackend = RenderBackend::Gdi;
+        return;
+    }
+    g_preferredBackend = RenderBackend::Direct2D;
+    if (GetPreferredRenderBackend() == RenderBackend::Gdi) {
+        static bool logged = false;
+        if (!logged) {
+            OutputDebugStringW(
+                L"[render] prefer Direct2D but factory unavailable; using GDI fallback\n");
+            logged = true;
+        }
+    }
+}
+
 ID2D1Factory* GetD2DFactory() {
     return g_d2dFactory;
 }

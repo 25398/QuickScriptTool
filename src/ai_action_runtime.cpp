@@ -1,5 +1,6 @@
 ﻿#include "ai_action_runtime.h"
 
+#include "agent_ai_actions.h"
 #include "ai_action_service.h"
 #include "ai_action_router.h"
 #include "macro_execute_tools.h"
@@ -49,10 +50,15 @@ AgentCore* EnsureSlotCore(
     cfg.apiKey = profile.apiKey;
     cfg.model = profile.modelName;
     cfg.temperature = profile.temperature;
-    cfg.maxTokens = profile.maxTokens;
+    if (withTools)
+        cfg.maxTokens = profile.maxTokens > 0 ? std::min(profile.maxTokens, 2048) : 2048;
+    else
+        cfg.maxTokens = maxTokens > 0 ? maxTokens : profile.maxTokens;
     cfg.recvTimeoutMs = std::max(5000, recvTimeoutMs);
     slot.core->UpdateConfig(cfg, systemPrompt);
     if (withTools) {
+        // Prepare 挂无 hooks 占位工具；ExecuteAiActionExecute 入口立刻 UpdateTools(带 hooks)。
+        // SendMessage 前已替换，时序安全（勿在 Prepare↔Execute 之间触发 tool-call）。
         slot.core->UpdateTools(BuildAiActionExecuteTools());
     } else {
         slot.core->UpdateTools({});
@@ -151,6 +157,8 @@ ScriptAction InheritAiActionFields(const ScriptAction& child, const ScriptAction
     if (r.aiModelName.empty()) r.aiModelName = parent.aiModelName;
     if (r.aiContextMode == 0) r.aiContextMode = parent.aiContextMode;
     if (r.aiTimeoutSec <= 0) r.aiTimeoutSec = parent.aiTimeoutSec;
+    // 嵌套 AI / Agent 产出动作与父共用步数语义（含 -1=不限）
+    r.aiMaxSteps = parent.aiMaxSteps;
     if (r.aiSearchX2 <= r.aiSearchX1 || r.aiSearchY2 <= r.aiSearchY1) {
         r.aiSearchX1 = parent.aiSearchX1;
         r.aiSearchY1 = parent.aiSearchY1;
@@ -229,6 +237,18 @@ std::unique_ptr<AgentCore> PrepareAiActionExecuteCore(
     const bool useTools = (route == AiActionRouteKind::ToolExecute
         || route == AiActionRouteKind::MultiTurnTools);
 
+    // 带图执行：
+    // · VisionQuery / CompositeClick：必须用多模态（主模型非 VL 则改用列表识图模型）
+    // · ToolExecute / MultiTurn：规划轮保持用户所选文本模型；识图由 locateAndClick 子模型承担
+    //   （勿整段改用 VL，否则每轮规划都烧多模态且打乱「文本+识图」分工）
+    std::wstring effModel = action.aiModelName;
+    const bool toolAgent = (route == AiActionRouteKind::ToolExecute
+        || route == AiActionRouteKind::MultiTurnTools);
+    if (withImage && !ModelSupportsVision(effModel) && !toolAgent) {
+        const std::wstring visionModel = ResolveVisionSubtaskModelName(settings.ai, effModel);
+        if (!visionModel.empty()) effModel = visionModel;
+    }
+
     std::wstring sysPrompt;
     if (route == AiActionRouteKind::VisionQuery || route == AiActionRouteKind::CompositeClick) {
         sysPrompt = BuildAiActionVisionQuerySystemPrompt(apiWidth, apiHeight);
@@ -241,20 +261,22 @@ std::unique_ptr<AgentCore> PrepareAiActionExecuteCore(
     }
 
     if (sessions && action.aiContextMode != 0) {
+        ScriptAction routedAction = action;
+        routedAction.aiModelName = effModel;
         coreOut = ResolveAiContextCore(
-            *sessions, action, loopDepth, sysPrompt, settings, timeoutMs, useTools, 1024);
+            *sessions, routedAction, loopDepth, sysPrompt, settings, timeoutMs, useTools, 2048);
         return nullptr;
     }
 
     if (useTools) {
         return CreateAiActionExecuteCore(
-            action.aiModelName, settings.ai.savedModels,
+            effModel, settings.ai.savedModels,
             settings.ai.apiUrl, settings.ai.apiKey,
             sysPrompt, timeoutMs);
     }
 
     return CreateAiActionCore(
-        action.aiModelName, settings.ai.savedModels,
+        effModel, settings.ai.savedModels,
         settings.ai.apiUrl, settings.ai.apiKey,
         sysPrompt, timeoutMs, -1.0, 1024);
 }

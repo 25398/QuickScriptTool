@@ -165,12 +165,214 @@ void BuildFlatTipCogPoints(float cx, float cy, float outerR, float innerR, int t
 
 }  // namespace
 
+namespace {
+
+float g_chromePulsePhase = 0.0f;
+
+COLORREF BlendThemeColors(COLORREF from, COLORREF to, float t) {
+    const float u = 1.0f - t;
+    return RGB(
+        static_cast<int>(GetRValue(from) * u + GetRValue(to) * t),
+        static_cast<int>(GetGValue(from) * u + GetGValue(to) * t),
+        static_cast<int>(GetBValue(from) * u + GetBValue(to) * t));
+}
+
+}  // namespace
+
+void SetChromePulsePhase(float phaseRadians) {
+    g_chromePulsePhase = phaseRadians;
+}
+
+float ChromePulsePhase() {
+    return g_chromePulsePhase;
+}
+
 void FillRectColor(HDC hdc, const RECT& rc, COLORREF color) {
     ResolveRenderContext(hdc).FillRect(rc, color);
 }
 
 void FillGradientRect(HDC hdc, const RECT& rc, COLORREF start, COLORREF end, bool vertical) {
     ResolveRenderContext(hdc).FillGradientRect(rc, start, end, vertical);
+}
+
+void DrawTitleAccentLine(HDC hdc, int clientWidth) {
+    if (!hdc || clientWidth <= 0) return;
+    const int h = (std::max)(1, UiLen(kTitleAccentLineH));
+    const int y = UiLen(kTitleH) - h;
+    RECT line{0, y, clientWidth, y + h};
+    // 低振幅相位平移：main↔accent 渐变端点随 sin 轻移
+    const float shift = 0.18f * std::sin(g_chromePulsePhase);
+    const float t0 = (std::max)(0.0f, (std::min)(1.0f, 0.0f + shift));
+    const float t1 = (std::max)(0.0f, (std::min)(1.0f, 1.0f + shift));
+    const COLORREF c0 = BlendThemeColors(kMainGreen, kOrange, t0);
+    const COLORREF c1 = BlendThemeColors(kMainGreen, kOrange, t1);
+    FillGradientRect(hdc, line, c0, c1, /*vertical=*/false);
+}
+
+void DrawTitleChrome(HDC hdc, int clientWidth, COLORREF fill) {
+    if (!hdc || clientWidth <= 0) return;
+    RECT title{0, 0, clientWidth, UiLen(kTitleH)};
+    FillRectColor(hdc, title, fill);
+    DrawTitleAccentLine(hdc, clientWidth);
+}
+
+void DrawTabActiveUnderline(HDC hdc, const RECT& tabRc) {
+    if (!hdc) return;
+    const int w = tabRc.right - tabRc.left;
+    if (w <= 0) return;
+    const int h = (std::max)(2, UiLen(kTabUnderlineH));
+    // 宽度呼吸：inset 在约 14%～22% 间微变
+    const float breathe = 0.5f + 0.5f * std::sin(g_chromePulsePhase);
+    const int inset = static_cast<int>(w * (0.22f - 0.08f * breathe));
+    RECT u{tabRc.left + inset, tabRc.bottom - h, tabRc.right - inset, tabRc.bottom};
+    if (u.right <= u.left) return;
+    const float bright = 0.12f * breathe;
+    const COLORREF c0 = BlendThemeColors(kMainGreen, kOrange, bright);
+    const COLORREF c1 = BlendThemeColors(kMainGreen, kOrange, 1.0f - bright * 0.5f);
+    FillGradientRect(hdc, u, c0, c1, /*vertical=*/false);
+}
+
+void DrawNavTabButton(HDC hdc, const RECT& tabRc, const wchar_t* text, int iconType,
+    bool selected, HFONT tabFont) {
+    if (!hdc || !text) return;
+    if (selected) {
+        FillRectColor(hdc, tabRc, kTabActiveGreen);
+    }
+    DrawNavIcon(hdc, tabRc, iconType, tabFont);
+    if (tabFont) SelectObject(hdc, tabFont);
+    DrawTextIn(hdc, text,
+        RECT{tabRc.left + UiLen(kHomeNavTabTextInset), tabRc.top,
+            tabRc.right - UiLen(6), tabRc.bottom},
+        kWhite, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (selected) {
+        DrawTabActiveUnderline(hdc, tabRc);
+    }
+}
+
+RECT HomeFooterBandRect(int clientWidth, int clientHeight) {
+    return RECT{0, UiLen(kHomeFooterTop), clientWidth, clientHeight};
+}
+
+void DrawHomeFooterBand(HDC hdc, int clientWidth, int clientHeight) {
+    if (!hdc) return;
+    FillRectColor(hdc, HomeFooterBandRect(clientWidth, clientHeight), kNavStripGreen);
+}
+
+RECT HomeFooterHintRect() {
+    return UiRect4(36, 468, 700, 492);
+}
+
+void DrawHomeFooterHint(HDC hdc, const wchar_t* text, HFONT font) {
+    if (!hdc || !text) return;
+    if (font) SelectObject(hdc, font);
+    DrawTextIn(hdc, text, HomeFooterHintRect(), kFooterHint,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+void DrawEditorActionRowBg(HDC hdc, const RECT& rowRc, bool selected, bool hovered,
+    bool batchMode, bool batchChecked) {
+    if (!hdc) return;
+    COLORREF bg = batchMode
+        ? (batchChecked ? kBatchSelectedRow : (hovered ? kHoverGray : kWhite))
+        : (selected ? kNavStripGreen : (hovered ? RGB(0xe8, 0xf4, 0xfc) : kWhite));
+    const int rowRadius = UiLen(kEditorRowRadius);
+    if (selected && !batchMode) {
+        FillGradientRect(hdc, rowRc, kNavStripGreen, kTabGradientStart, /*vertical=*/false);
+        DrawBorderRoundRect(hdc, rowRc, kNavStripGreen, rowRadius);
+    } else if (selected || (batchMode && batchChecked) || hovered) {
+        FillRoundRectColor(hdc, rowRc, bg, rowRadius);
+        if (batchMode && batchChecked) {
+            RECT rail{rowRc.left, rowRc.top + 1,
+                rowRc.left + (std::max)(2, UiLen(3)), rowRc.bottom - 1};
+            FillGradientRect(hdc, rail, kMainGreen, kOrange, /*vertical=*/true);
+            DrawBorderRoundRect(hdc, rowRc, kMainGreen, rowRadius);
+        }
+    } else {
+        FillRectColor(hdc, rowRc, bg);
+    }
+}
+
+void DrawHomeCardRail(HDC hdc, const RECT& cardRc, bool selected, bool hovered) {
+    if (!hdc || (!selected && !hovered)) return;
+    const int railW = (std::max)(3, UiLen(kHomeCardRailW));
+    const int inset = (std::max)(1, UiLen(1));
+    RECT rail{cardRc.left, cardRc.top + inset, cardRc.left + railW, cardRc.bottom - inset};
+    if (rail.bottom <= rail.top) return;
+    if (selected) {
+        FillGradientRect(hdc, rail, kMainGreen, kOrange, /*vertical=*/true);
+    } else {
+        FillRectColor(hdc, rail, BlendThemeColors(kMainGreen, kLineGreen, 0.45f));
+    }
+}
+
+void DrawHomeCard(HDC hdc, const RECT& cardRc, bool selected, bool hovered) {
+    if (!hdc) return;
+    const int radius = (std::max)(1, UiLen(kHomeCardRadius));
+    const COLORREF fill = (hovered && !selected) ? kCardHoverGreen : kCardGreen;
+    RECT soft = cardRc;
+    OffsetRect(&soft, UiLen(1), UiLen(2));
+    FillAlphaRect(hdc, soft, RGB(0, 0, 0), selected ? 22 : 14);
+    soft = cardRc;
+    OffsetRect(&soft, UiLen(2), UiLen(4));
+    FillAlphaRect(hdc, soft, RGB(0, 0, 0), selected ? 12 : 8);
+    FillRoundRectColor(hdc, cardRc, fill, radius);
+    DrawHomeCardRail(hdc, cardRc, selected, hovered);
+    if (selected) {
+        DrawBorderRoundRect(hdc, cardRc, kMainGreen, radius);
+    } else if (hovered) {
+        DrawBorderRoundRect(hdc, cardRc, BlendThemeColors(kMainGreen, kLineGreen, 0.35f), radius);
+    } else {
+        DrawBorderRoundRect(hdc, cardRc, kLineGreen, radius);
+    }
+}
+
+void DrawHomeContentPanel(HDC hdc, const RECT& rc) {
+    if (!hdc || rc.right <= rc.left || rc.bottom <= rc.top) return;
+    const int radius = (std::max)(1, UiLen(kHomePanelRadius));
+    RECT soft = rc;
+    OffsetRect(&soft, UiLen(1), UiLen(3));
+    FillAlphaRect(hdc, soft, RGB(0, 0, 0), 12);
+    FillRoundRectColor(hdc, rc, kCardGreen, radius);
+    DrawBorderRoundRect(hdc, rc, kLineGreen, radius);
+    RECT bar{rc.left + 1, rc.top + 1, rc.right - 1, rc.top + (std::max)(2, UiLen(kHomePanelAccentH))};
+    FillGradientRect(hdc, bar, kMainGreen, kOrange, /*vertical=*/false);
+}
+
+void DrawHomeCtaBar(HDC hdc, const RECT& rc, bool alert) {
+    if (!hdc || rc.right <= rc.left || rc.bottom <= rc.top) return;
+    const auto& theme = quickscript::CurrentTheme();
+    const COLORREF main = theme.mainColor;
+    const COLORREF accent = theme.accentColor;
+    COLORREF c0 = theme.darkColor;
+    COLORREF c1 = BlendThemeColors(theme.navStripColor, main, 0.38f);
+    if (alert) {
+        c0 = BlendThemeColors(theme.darkColor, accent, 0.22f);
+        c1 = BlendThemeColors(theme.navStripColor, accent, 0.35f);
+    }
+    FillGradientRect(hdc, rc, c0, c1, /*vertical=*/false);
+    const int railW = (std::max)(3, UiLen(kHomeCardRailW));
+    RECT rail{rc.left, rc.top, rc.left + railW, rc.bottom};
+    FillGradientRect(hdc, rail, main, accent, /*vertical=*/true);
+}
+
+RECT CtaKeycapRect(const RECT& ctaRc) {
+    const int keyW = UiLen((std::max)(72, kHomeCtaSideMinW - 40));
+    const int keyH = UiLen(40);
+    const int padX = UiLen(kHomeCtaPadX);
+    const int midY = (ctaRc.top + ctaRc.bottom) / 2;
+    return RECT{ctaRc.right - padX - keyW, midY - keyH / 2,
+        ctaRc.right - padX, midY + keyH / 2};
+}
+
+void DrawCtaKeycap(HDC hdc, const RECT& keyRc, const wchar_t* text, bool alert) {
+    if (!hdc || !text || keyRc.right <= keyRc.left) return;
+    const int radius = UiLen(8);
+    const COLORREF fill = BlendThemeColors(kNavStripGreen, kWhite, 0.08f);
+    FillRoundRectColor(hdc, keyRc, fill, radius);
+    const COLORREF border = alert ? RGB(240, 120, 120) : BlendThemeColors(kMainGreen, kOrange, 0.35f);
+    DrawBorderRoundRect(hdc, keyRc, border, radius);
+    DrawTextIn(hdc, text, keyRc, alert ? RGB(255, 200, 200) : kOrange,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 void FillAlphaRect(HDC hdc, const RECT& rc, COLORREF color, BYTE alpha) {
@@ -219,25 +421,29 @@ void DrawComboDownArrow(HDC hdc, int centerX, int centerY, COLORREF color) {
 }
 
 void DrawTopActionGlyph(HDC hdc, const RECT& rc, int iconType) {
+    DrawTopActionGlyph(hdc, rc, iconType, kHomeMutedText);
+}
+
+void DrawTopActionGlyph(HDC hdc, const RECT& rc, int iconType, COLORREF color) {
     IRenderContext& ctx = ResolveRenderContext(hdc);
     const int x = rc.left + UiLen(8);
     const int y = rc.top + UiLen(9);
     if (iconType == 0 || iconType == 1) {
         const float sw = static_cast<float>(std::max(1, UiLen(2)));
-        ctx.DrawLine(x + UiLen(2), y + UiLen(18), x + UiLen(18), y + UiLen(18), kWhite, sw);
-        ctx.DrawLine(x + UiLen(2), y + UiLen(14), x + UiLen(2), y + UiLen(18), kWhite, sw);
-        ctx.DrawLine(x + UiLen(18), y + UiLen(14), x + UiLen(18), y + UiLen(18), kWhite, sw);
+        ctx.DrawLine(x + UiLen(2), y + UiLen(18), x + UiLen(18), y + UiLen(18), color, sw);
+        ctx.DrawLine(x + UiLen(2), y + UiLen(14), x + UiLen(2), y + UiLen(18), color, sw);
+        ctx.DrawLine(x + UiLen(18), y + UiLen(14), x + UiLen(18), y + UiLen(18), color, sw);
         if (iconType == 0) {
-            ctx.DrawLine(x + UiLen(10), y + UiLen(3), x + UiLen(10), y + UiLen(13), kWhite, sw);
-            ctx.DrawLine(x + UiLen(10), y + UiLen(13), x + UiLen(6), y + UiLen(9), kWhite, sw);
-            ctx.DrawLine(x + UiLen(10), y + UiLen(13), x + UiLen(14), y + UiLen(9), kWhite, sw);
+            ctx.DrawLine(x + UiLen(10), y + UiLen(3), x + UiLen(10), y + UiLen(13), color, sw);
+            ctx.DrawLine(x + UiLen(10), y + UiLen(13), x + UiLen(6), y + UiLen(9), color, sw);
+            ctx.DrawLine(x + UiLen(10), y + UiLen(13), x + UiLen(14), y + UiLen(9), color, sw);
         } else {
-            ctx.DrawLine(x + UiLen(10), y + UiLen(16), x + UiLen(10), y + UiLen(6), kWhite, sw);
-            ctx.DrawLine(x + UiLen(10), y + UiLen(6), x + UiLen(6), y + UiLen(10), kWhite, sw);
-            ctx.DrawLine(x + UiLen(10), y + UiLen(6), x + UiLen(14), y + UiLen(10), kWhite, sw);
+            ctx.DrawLine(x + UiLen(10), y + UiLen(16), x + UiLen(10), y + UiLen(6), color, sw);
+            ctx.DrawLine(x + UiLen(10), y + UiLen(6), x + UiLen(6), y + UiLen(10), color, sw);
+            ctx.DrawLine(x + UiLen(10), y + UiLen(6), x + UiLen(14), y + UiLen(10), color, sw);
         }
     } else {
-        DrawClockGlyph(hdc, x + UiLen(11), y + UiLen(11), UiLen(18), kWhite, std::max(1, UiLen(2)));
+        DrawClockGlyph(hdc, x + UiLen(11), y + UiLen(11), UiLen(18), color, std::max(1, UiLen(2)));
     }
 }
 
@@ -277,12 +483,13 @@ void DrawNavIcon(HDC hdc, const RECT& rc, int iconType, HFONT homeTabFont) {
 
 void DrawHomeRadio(HDC hdc, const RECT& rc, bool checked) {
     IRenderContext& ctx = ResolveRenderContext(hdc);
-    ctx.DrawEllipse(rc.left, rc.top, rc.right, rc.bottom, kMainGreen, 1.0f, true);
-    ctx.DrawEllipse(rc.left, rc.top, rc.right, rc.bottom, kWhite, 2.0f, false);
+    ctx.DrawEllipse(rc.left, rc.top, rc.right, rc.bottom, kWhite, 1.0f, true);
+    const COLORREF ring = checked ? kMainGreen : BlendThemeColors(kLineGreen, kHomeMutedText, 0.35f);
+    ctx.DrawEllipse(rc.left, rc.top, rc.right, rc.bottom, ring, 2.0f, false);
     if (checked) {
-        const int inset = UiLen(6);
+        const int inset = UiLen(5);
         const RECT inner{rc.left + inset, rc.top + inset, rc.right - inset, rc.bottom - inset};
-        ctx.DrawEllipse(inner.left, inner.top, inner.right, inner.bottom, kWhite, 1.0f, true);
+        ctx.DrawEllipse(inner.left, inner.top, inner.right, inner.bottom, kOrange, 1.0f, true);
     }
 }
 
@@ -295,14 +502,14 @@ void DrawRecorderEmptyIcon(HDC hdc) {
     const int dotR = UiLen(12);
     const RECT dot{centerX - dotR, centerY - dotR, centerX + dotR, centerY + dotR};
     HDC native = ctx.nativeHdc();
-    HPEN pen = CreatePen(PS_SOLID, std::max(1, UiLen(8)), kWhite);
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, UiLen(8)), kHomeMetaText);
     HGDIOBJ oldPen = SelectObject(native, pen);
     HGDIOBJ oldBrush = SelectObject(native, GetStockObject(NULL_BRUSH));
     RoundRect(native, outer.left, outer.top, outer.right, outer.bottom, UiLen(14), UiLen(14));
     SelectObject(native, oldBrush);
     SelectObject(native, oldPen);
     DeleteObject(pen);
-    ctx.DrawEllipse(dot.left, dot.top, dot.right, dot.bottom, kSecondaryText, 1.0f, true);
+    ctx.DrawEllipse(dot.left, dot.top, dot.right, dot.bottom, kHomeMetaText, 1.0f, true);
 }
 
 void FillRoundRectColor(HDC hdc, const RECT& rc, COLORREF color, int cornerRadius) {

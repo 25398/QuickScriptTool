@@ -40,7 +40,7 @@ foreach ($t in @(
 |-------|--------|--------|----------|
 | 窗口模式 | `WindowModeSelfTest` | 9（含 1 个 `--macro`） | 引号剥除、IME 过滤、找窗、后台绑子控件、快捷输入与取消、宏桌面启动绑定 |
 | 定时任务 | `ScheduledTaskSelfTest` | 11 | 秒级匹配、小时/周、门禁、自定义一次性、Tick 批量、解析 |
-| 宏变量 | `MacroVariablesSelfTest` | 8 | 匹配变量、`CurLoops`、转义、找图时限、条件、goto/loop、未知变量 |
+| 宏变量 | `MacroVariablesSelfTest` | 17 | 匹配变量、`CurLoops`、时分、`ctrl:Clipboard()`、`ctrl:Random()`、固定变量列表、转义、找图时限、条件、goto/loop、未知变量 |
 | 动作构建 | `ScriptActionBuilderSelfTest` | 10 | wait 构建、禁 customText、编号、补 stopMacro、endLoop、数组 JSON、相对移动、重复间隔语义 |
 | 坐标 | `CoordSpaceSelfTest` | 12 | 标准 meta、存读 capture、JSON roundtrip、n* 归一化/迁移、找图 scale 选项、落点 |
 | 脚本 IO | `ScriptIoSelfTest` | 12 | 录制路径、脱离时间、动作解析、存读 roundtrip、坏 meta/半截 JSON |
@@ -183,6 +183,10 @@ foreach ($t in @(
 |----|--------|------|------|
 | VAR-01 | P0 | 跑过自检后，在宏里用 `{matchRet.x}` `{matchRet.cx}` | 与自检一致 |
 | VAR-02 | P0 | loop 内 `{ctrl:CurLoops()}` 显示/参与条件 | 次数递增正确 |
+| VAR-07 | P0 | 空脚本与任意脚本的变量下拉含 `ctrl:CurLoops()`、`ctrl:Random()`、`ctrl:Hour()`、`ctrl:Minute()`、`ctrl:Clipboard()`；不含 `Now`/`clipboard`/`cursor.x` 等 | 固定变量始终可插入；魔法变量仅手写 `{Now}` 等 |
+| VAR-08 | P0 | `{ctrl:Random()}` 在输入/条件中展开为 1~100 整数；每次引用重新随机 | 条件随机分支（如 `ctrl:Random() > 50`）可执行 |
+| VAR-09 | P0 | `ctrl:Hour()`/`ctrl:Minute()` 参与条件 | 本地时小时 0–23、分钟 0–59 |
+| VAR-10 | P0 | `ctrl:Clipboard()`：条件非空为 1；输入展开文字或路径；AI 提示词里图片变为「见附图」且可额外附图 | 手写 `{clipboard}` 仍只取纯文本 |
 | VAR-03 | P0 | 未知 `{no_such}` | 变空串，不卡死/递归爆栈 |
 | VAR-04 | P1 | `loop` 最大次数来自变量表达式 | 与 `ResolveLoopMaxCount` 行为一致 |
 | VAR-05 | P0 | 条件 `a == b` 与 `>`，多行 and/or | 分支正确 |

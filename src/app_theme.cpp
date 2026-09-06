@@ -1,5 +1,7 @@
 #include "app_theme.h"
 
+
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -104,8 +106,44 @@ AppTheme MakeTheme(const wchar_t* name, COLORREF main, COLORREF light, COLORREF 
     t.promptOkHover = t.buttonHoverColor;
     t.promptOkText = RGB(255, 255, 255);
     t.promptCancelBorder = BlendColors(main, RGB(180, 180, 180), 0.35f);
+
+    t.workspaceBg = light;
+    t.homeText = RGB(255, 255, 255);
+    t.homeMuted = t.secondaryText;
+    t.homeMeta = t.secondaryText;
+    t.ctaText = t.bannerText;
+    t.ctaMuted = BlendColors(t.secondaryText, RGB(255, 255, 255), 0.35f);
     return t;
 }
+
+
+#ifdef QST_WEBVIEW_SHELL
+AppTheme MakeArcticTheme() {
+    AppTheme t = MakeTheme(L"极光 Arctic",
+        RGB(0x1a, 0xa6, 0xd6),
+        RGB(0xe8, 0xf4, 0xfc),
+        RGB(0x2d, 0xd4, 0xbf),
+        false);
+    t.darkColor = RGB(0x0b, 0x16, 0x24);
+    t.navStripColor = RGB(0x12, 0x23, 0x38);
+    t.tabGradientStart = RGB(0x1a, 0x32, 0x50);
+    t.tabGradientEnd = RGB(0x0b, 0x16, 0x24);
+    t.tabActiveColor = RGB(0x23, 0x46, 0x6c);
+    t.closeHover = RGB(0x1a, 0xa6, 0xd6);
+    t.buttonColor = RGB(0x1a, 0xa6, 0xd6);
+    t.lineColor = RGB(0xc9, 0xd7, 0xe6);
+    t.workspaceBg = RGB(0xe8, 0xf4, 0xfc);
+    t.cardHoverColor = RGB(0xf3, 0xf9, 0xfd);
+    t.bannerBg = t.navStripColor;
+    t.bannerText = RGB(255, 255, 255);
+    t.bannerTag = t.accentColor;
+    t.selectedTagBg = BlendColors(t.lightBg, t.mainColor, 0.22f);
+    t.ctaText = RGB(255, 255, 255);
+    t.ctaMuted = RGB(0x9e, 0xb0, 0xbd);
+    t.footerHint = RGB(0x9e, 0xb0, 0xbd);
+    return t;
+}
+#endif
 
 const AppTheme kThemes[] = {
     MakeTheme(L"经典绿橙", RGB(64, 168, 99), RGB(232, 248, 239), RGB(255, 154, 72), true),
@@ -115,8 +153,10 @@ const AppTheme kThemes[] = {
     MakeTheme(L"梦幻紫", RGB(171, 71, 188), RGB(243, 229, 245), RGB(255, 183, 77), true),
     MakeTheme(L"青柠薄荷", RGB(38, 166, 154), RGB(224, 247, 250), RGB(255, 152, 0), true),
     MakeTheme(L"樱花粉", RGB(236, 64, 122), RGB(252, 228, 236), RGB(255, 193, 7), true),
+#ifdef QST_WEBVIEW_SHELL
+    MakeArcticTheme(),
+#endif
 };
-
 AppTheme gResolvedTheme = kThemes[0];
 int gCurrentThemeId = 0;
 bool gRandSeeded = false;

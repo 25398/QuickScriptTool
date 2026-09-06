@@ -27,6 +27,7 @@
 | **Pin+屏外但观看只 SetPlacement** | 非 iconic 屏外窗不挪位；刷假成功日志 | **已证伪**；须 SetWindowPos；成功须验 GetWindowRect/UnPin |
 | **startFp 空仍标 contentMoved** | 假新帧 / 沿用旧 JPEG；bestNcc 恒定 | **已证伪**；须基线指纹；宿主比对 JPEG 哈希 |
 | **长期最小化避切屏** | WebGL 静帧 | **已证伪作唯一策略** |
+| **Chromium 壳安静 ShowWindow/置底「还原」** | 空壳灰窗；找图 bestNcc≈0；键仍无效 | **已证伪**；须保持已还原可被遮挡 |
 | **屏外缩窗** | iframe 点偏（675→820） | 屏外保持工作区尺寸 |
 | **CDP 运行期 GoTo「钉用户桌」泵** | 违反「只搬窗」；反复切虚拟桌面 | `视图被带走→已钉回` |
 | **ScheduleCdpParkViewPin 持续 GoTo** | 同上 | 绑窗后桌面来回跳 |
@@ -82,7 +83,12 @@ MapCanvas：**独立 sx/sy**；http-mirror 须 **iframe 矩形映射**（禁整�
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
-| 一点鼠标就进宏桌面 | 异桌裸还原 | Pin+屏外 |
+| 回放零操作；日志「等待配套扩展」后立刻 EndRun；目标 QQ/Discord 等 | `Chrome_WidgetWin` 误判 CDP，扩展无法 attach Electron | **已证伪「凡 Chrome_ 类都走扩展」**；按 `targetExe` 非真浏览器 → softMessage 策略名 + **本机 SendInput**（PostMessage 对 Chromium 无效） |
+| Chromium 壳（QQ/微信/Discord）后台键鼠 | 外部 PostMessage 无效；假前台会抢焦点；多进程钩易崩 | 统一 `LooksLikeChromiumShellTarget`：单 PID 注入 + 焦点欺骗 + 进程内键鼠滚轮队列；真浏览器仍走 CDP |
+| Chromium 壳最小化后找图/键无效；安静 ShowWindow 唤出灰窗 | GPU 合成已停；无激活还原只有空白壳（bestNcc≈0~3%） | **已证伪「安静还原」**；禁止对 Chromium 壳 Win32 ShowWindow；须保持已还原且可被遮挡；`IsCaptureLikelyBlank` 拒纯色空壳 |
+| 后台窗口模式按键无效（快捷输入 OK、鼠标点 OK） | 只发 WM_KEYDOWN、无 WM_CHAR；或键打到顶层而非点击子控件 | PostKeyToWindow：KEYDOWN 后补 WM_CHAR；目标与软鼠标落点子控件对齐 |
+| 后台 Shift+字符 / Ctrl+点击无效 | 软修饰未进 ToUnicode / MK_*（仍读物理 GetKeyState） | SoftSetVkDown 同步 VK_SHIFT；ModifierKeyFlags 读 g_softVkDown |
+| 侧键 X1/X2 变成左键；双击无 DBLCLK；滚轮一步过大 | soft 消息表缺 XBUTTON/DBLCLK；steps*delta 挤一条 | 补 WM_XBUTTON* / DBLCLK；每步一个 WHEEL_DELTA |
 | 无法展开 | Pin 未揭开 / 只 SetPlacement 不挪屏外窗 | dwell 后 UnPin+SetWindowPos；看「展开未完成」日志 |
 | 点击漂 | 屏外缩窗 / surface=215×28 | 保持工作区尺寸；日志须见 `找图表面: pageCss×1.5` 且 surface≈page×1.5 |
 | 展开很慢 | 观看泵确认过长 | dwell≈0.3s（非 4s） |

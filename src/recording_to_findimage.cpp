@@ -103,12 +103,19 @@ ScriptAction MakeFindImageFromDown(const ScriptAction& down,
     fi.imagePath = EnsureImageInLibrary(capturePath);
     if (fi.imagePath.empty()) fi.imagePath = ResolveImagePath(capturePath);
     fi.matchThreshold = 65.0;
-    fi.searchFullScreen = !preferLocalSearch;
-    if (preferLocalSearch) {
-        fi.searchX1 = clickX - 200;
-        fi.searchY1 = clickY - 200;
-        fi.searchX2 = clickX + 200;
-        fi.searchY2 = clickY + 200;
+    fi.windowRelative = down.windowRelative;
+    if (down.windowRelative) {
+        fi.coordsAreNormalized = false;
+        // 窗口相对：在目标客户区全图匹配；尺寸变化靠模板等比缩放（与点击坐标同一套）。
+        fi.searchFullScreen = true;
+    } else {
+        fi.searchFullScreen = !preferLocalSearch;
+        if (preferLocalSearch) {
+            fi.searchX1 = clickX - 200;
+            fi.searchY1 = clickY - 200;
+            fi.searchX2 = clickX + 200;
+            fi.searchY2 = clickY + 200;
+        }
     }
     fi.imageScale = 1.0;
     fi.imageScaleMin = 1.0;

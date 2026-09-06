@@ -307,6 +307,12 @@ std::unique_ptr<IRenderContext> CreateRenderContext(HDC hdc, const RECT* bindRec
         if (auto d2d = CreateD2dRenderContext(hdc, rect)) {
             return d2d;
         }
+        static bool loggedCreateFail = false;
+        if (!loggedCreateFail) {
+            OutputDebugStringW(
+                L"[render] Direct2D context create failed; falling back to GDI\n");
+            loggedCreateFail = true;
+        }
     }
     return CreateGdiRenderContext(hdc);
 }

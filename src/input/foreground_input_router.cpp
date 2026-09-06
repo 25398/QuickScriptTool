@@ -44,49 +44,77 @@ void ForegroundInputRouter::BeginSession(quickscript::ForegroundInputBackend bac
     sessionActive_.store(true, std::memory_order_release);
     active_.store(static_cast<int>(Active::None), std::memory_order_release);
     didFallback_.store(false, std::memory_order_release);
-    fallbackReason_.clear();
+    {
+        std::lock_guard<std::mutex> lock(reasonMu_);
+        fallbackReason_.clear();
+    }
 
-    if (backend == quickscript::ForegroundInputBackend::Software) return;
+    // 软件模拟也要开指纹会话：长按热键=脚本同键时靠 NoteKey/ExtraInfo 滤假抬起
+    if (backend == quickscript::ForegroundInputBackend::Software) {
+        synthetic_input::BeginSession();
+        return;
+    }
 
     std::wstring err;
     if (backend == quickscript::ForegroundInputBackend::VirtualHid) {
         if (!VirtualHidBackend::Instance().Open(&err)) {
             didFallback_.store(true, std::memory_order_release);
-            fallbackReason_ = err.empty()
-                ? L"【警告】虚拟 HID 未就绪，本会话已回退系统模拟（非驱动级注入）。请先在设置中安装驱动。"
-                : (L"【警告】虚拟 HID 未就绪，本会话已回退系统模拟（非驱动级注入）：" + err);
+            {
+                std::lock_guard<std::mutex> lock(reasonMu_);
+                fallbackReason_ = err.empty()
+                    ? L"【警告】虚拟 HID 未就绪，本会话已回退系统模拟（非驱动级注入）。请先在设置中安装驱动。"
+                    : (L"【警告】虚拟 HID 未就绪，本会话已回退系统模拟（非驱动级注入）：" + err);
+            }
+            synthetic_input::BeginSession();
             return;
         }
         active_.store(static_cast<int>(Active::VirtualHid), std::memory_order_release);
         synthetic_input::BeginSession();
+        synthetic_input::RefreshVirtualHidRawDevices();
         return;
     }
 
     // Interception
     if (!HidInterceptionBackend::Instance().Open(&err)) {
         didFallback_.store(true, std::memory_order_release);
-        fallbackReason_ = err.empty()
-            ? L"【警告】Interception 未就绪，本会话已回退系统模拟（非驱动级注入）。请先安装驱动并重启。"
-            : (L"【警告】Interception 未就绪，本会话已回退系统模拟（非驱动级注入）：" + err);
+        {
+            std::lock_guard<std::mutex> lock(reasonMu_);
+            fallbackReason_ = err.empty()
+                ? L"【警告】Interception 未就绪，本会话已回退系统模拟（非驱动级注入）。请先安装驱动并重启。"
+                : (L"【警告】Interception 未就绪，本会话已回退系统模拟（非驱动级注入）：" + err);
+        }
+        synthetic_input::BeginSession();
         return;
     }
     active_.store(static_cast<int>(Active::Interception), std::memory_order_release);
     synthetic_input::BeginSession();
+    synthetic_input::RefreshVirtualHidRawDevices();
 }
 
 void ForegroundInputRouter::EndSession() {
     const Active a = static_cast<Active>(active_.load(std::memory_order_acquire));
     if (a == Active::VirtualHid) {
-        // ReleaseAll 会抬起残留键鼠；先开 teardown 窗，避免异步 LL 当成真人输入。
+        // Close 内含抬起；先开 teardown 窗，避免异步 LL 当成真人输入。
         synthetic_input::NoteSessionTeardown();
-        VirtualHidBackend::Instance().ReleaseAll();
         VirtualHidBackend::Instance().Close();
         synthetic_input::EndSession();
     } else if (a == Active::Interception) {
         synthetic_input::NoteSessionTeardown();
         HidInterceptionBackend::Instance().Close();
         synthetic_input::EndSession();
+    } else if (sessionActive_.load(std::memory_order_acquire)) {
+        synthetic_input::NoteSessionTeardown();
+        synthetic_input::EndSession();
     }
+    active_.store(static_cast<int>(Active::None), std::memory_order_release);
+    sessionActive_.store(false, std::memory_order_release);
+}
+
+void ForegroundInputRouter::ForceTeardown() {
+    EndSession();
+    // 会话标志可能已乱：再强制收一次，避免虚拟键鼠残留按下。
+    VirtualHidBackend::Instance().Close();
+    HidInterceptionBackend::Instance().Close();
     active_.store(static_cast<int>(Active::None), std::memory_order_release);
     sessionActive_.store(false, std::memory_order_release);
 }
@@ -109,21 +137,35 @@ bool ForegroundInputRouter::DidFallback() const {
 }
 
 std::wstring ForegroundInputRouter::FallbackReason() const {
+    std::lock_guard<std::mutex> lock(reasonMu_);
     return fallbackReason_;
 }
 
-bool ForegroundInputRouter::SendKey(unsigned short scanCode, bool down, bool extended) {
+bool ForegroundInputRouter::SendKey(UINT vk, unsigned short scanCode, bool down, bool extended) {
     const Active a = static_cast<Active>(active_.load(std::memory_order_acquire));
     if (a == Active::None) return false;
-    // 先记指纹再注入，缩小 LL 钩子竞态窗。
-    synthetic_input::NoteKey(ScanToVk(scanCode, extended), scanCode, extended, down);
+    // 优先用调用方 VK（与脚本/LL vkCode 一致）；ScanToVk 仅作回退，避免 Expect 对不上长按同键
+    if (vk == 0) vk = ScanToVk(scanCode, extended);
+    synthetic_input::NoteKey(vk, scanCode, extended, down);
+    // 仅 VirtualHid 需要 Expect（无 INJECTED/ExtraInfo）。
+    // Software/Interception 打 ExtraInfo；若再 Expect，同键连点会刷满 TTL，
+    // 真人松手在 LL 被当成注入 → 脚本不停、打字插键（bian→bani）。
+    const bool needExpect = (a == Active::VirtualHid);
+    if (needExpect) {
+        if (down) synthetic_input::ExpectSyntheticKeyDown(vk);
+        else synthetic_input::ExpectSyntheticKeyUp(vk);
+    }
+    bool ok = false;
     if (a == Active::VirtualHid) {
-        return VirtualHidBackend::Instance().SendKey(scanCode, down, extended);
+        ok = VirtualHidBackend::Instance().SendKey(scanCode, down, extended);
+    } else if (a == Active::Interception) {
+        ok = HidInterceptionBackend::Instance().SendKey(scanCode, down, extended);
     }
-    if (a == Active::Interception) {
-        return HidInterceptionBackend::Instance().SendKey(scanCode, down, extended);
+    if (!ok && needExpect) {
+        if (down) synthetic_input::ConsumeSyntheticKeyDown(vk);
+        else synthetic_input::ConsumeSyntheticKeyUp(vk);
     }
-    return false;
+    return ok;
 }
 
 bool ForegroundInputRouter::MoveRelative(int dx, int dy) {

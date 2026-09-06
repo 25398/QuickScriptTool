@@ -26,7 +26,7 @@ struct ExtRunState {
     std::string currentScript;
 };
 
-/// UI 线程注册：桥线程只调用这些回调，不直接依赖 MainWindow。
+/// UI 线程注册：桥线程只调用这些回调，不直接依赖 EngineHost。
 struct ExtScriptApiHandlers {
     std::function<std::vector<ExtScriptInfo>()> listScripts;
     /// 投递运行请求；busy/非法路径时返回 false 并写 err（英文短码：busy/bad_path/post_failed）。

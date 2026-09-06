@@ -56,9 +56,22 @@ struct AppTheme {
     COLORREF promptOkHover = RGB(255, 174, 95);
     COLORREF promptOkText = RGB(255, 255, 255);
     COLORREF promptCancelBorder = RGB(180, 180, 180);
+
+    // Optional fields (WebView bridge / macros; GDI uses classic colors above)
+    COLORREF workspaceBg = RGB(232, 248, 239);
+    COLORREF homeText = RGB(255, 255, 255);
+    COLORREF homeMuted = RGB(220, 245, 225);
+    COLORREF homeMeta = RGB(220, 245, 225);
+    COLORREF ctaText = RGB(60, 60, 60);
+    COLORREF ctaMuted = RGB(210, 245, 215);
 };
 
-constexpr int kThemeCount = 7;
+#ifdef QST_WEBVIEW_SHELL
+constexpr int kThemeCount = 8;  // 7 classic + Arctic
+#else
+constexpr int kThemeCount = 7;  // GDI：经典主题；Arctic 仅 Web
+#endif
+
 /// 设置下拉里「自定义」固定为第 0 项，其后才是预设主题
 constexpr int kCustomThemeComboIndex = 0;
 

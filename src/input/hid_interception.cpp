@@ -1,4 +1,5 @@
 #include "hid_interception.h"
+#include "synthetic_input_filter.h"
 
 #include <windows.h>
 
@@ -204,7 +205,7 @@ bool HidInterceptionBackend::ProbeAvailable(std::wstring* errorOut) {
     if (!EnsureApiLoaded(errorOut)) return false;
     InterceptionContext ctx = g_api.create_context();
     if (!ctx) {
-        lastError_ = L"Interception 驱动未就绪（请以管理员运行 install-interception.exe 后重启）";
+        lastError_ = L"Interception 驱动未就绪。请在设置中安装（失败会回滚，不会改启动配置）。当前系统若拒载该签名，请使用系统模拟。";
         if (errorOut) *errorOut = lastError_;
         return false;
     }
@@ -224,7 +225,7 @@ bool HidInterceptionBackend::Open(std::wstring* errorOut) {
     if (!EnsureApiLoaded(errorOut)) return false;
     context_ = g_api.create_context();
     if (!context_) {
-        lastError_ = L"Interception 驱动未就绪（请以管理员运行 install-interception.exe 后重启）";
+        lastError_ = L"Interception 驱动未就绪。请在设置中安装（失败会回滚，不会改启动配置）。当前系统若拒载该签名，请使用系统模拟。";
         if (errorOut) *errorOut = lastError_;
         return false;
     }
@@ -241,6 +242,19 @@ bool HidInterceptionBackend::Open(std::wstring* errorOut) {
 
 void HidInterceptionBackend::Close() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // 进程异常退出前尽量抬起；避免过滤驱动路径上残留按下。
+    if (context_ && mouseDevice_ != 0 && g_api.send) {
+        const unsigned short ups[] = {
+            INTERCEPTION_MOUSE_LEFT_BUTTON_UP,
+            INTERCEPTION_MOUSE_RIGHT_BUTTON_UP,
+            INTERCEPTION_MOUSE_MIDDLE_BUTTON_UP,
+            INTERCEPTION_MOUSE_BUTTON_4_UP,
+            INTERCEPTION_MOUSE_BUTTON_5_UP,
+        };
+        for (unsigned short state : ups) {
+            (void)SendMouseStrokeLocked(state, INTERCEPTION_MOUSE_MOVE_RELATIVE, 0, 0, 0);
+        }
+    }
     if (context_ && g_api.destroy_context) {
         g_api.destroy_context(context_);
     }
@@ -264,6 +278,8 @@ bool HidInterceptionBackend::SendKey(unsigned short scanCode, bool down, bool ex
     key.code = scanCode;
     key.state = down ? INTERCEPTION_KEY_DOWN : INTERCEPTION_KEY_UP;
     if (extended) key.state |= INTERCEPTION_KEY_E0;
+    // 与 SendInput.dwExtraInfo 同源，供 Raw/LL 区分脚本注入与真人键
+    key.information = static_cast<unsigned int>(synthetic_input::kSyntheticExtraInfo);
     InterceptionStroke stroke{};
     std::memcpy(stroke, &key, sizeof(key));
     const int n = g_api.send(context_, keyboardDevice_, &stroke, 1);
@@ -286,6 +302,7 @@ bool HidInterceptionBackend::SendMouseStrokeLocked(unsigned short state, unsigne
     mouse.rolling = rolling;
     mouse.x = x;
     mouse.y = y;
+    mouse.information = static_cast<unsigned int>(synthetic_input::kSyntheticExtraInfo);
     InterceptionStroke stroke{};
     std::memcpy(stroke, &mouse, sizeof(mouse));
     const int n = g_api.send(context_, mouseDevice_, &stroke, 1);

@@ -1,0 +1,10 @@
+EXPORTS
+    FakeFocus_Install
+    FakeFocus_InstallLite
+    FakeFocus_UpdateTarget
+    FakeFocus_Uninstall
+    FakeFocus_IsInstalled
+    FakeFocus_HasSoftInput
+    FakeFocus_MapleIatCount
+    FakeFocus_MapleHookHits
+    FakeFocus_HookProc

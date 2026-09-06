@@ -1,7 +1,7 @@
 #pragma once
 // ──────────────────────────────────────────────────────────────────
 // ui_scale.h — 统一 UI 分辨率缩放
-// 设计基准：2560×1440 屏幕下首页 720×540、编辑器 1200×1080（缩放 100%）
+// 设计基准：2560×1440 屏幕下首页 720×540、设置 720×540、编辑器 1200×1080（缩放 100%）
 // 较小分辨率等比缩小；不随 Windows DPI 百分比放大（避免与标准布局不一致）
 // ──────────────────────────────────────────────────────────────────
 
@@ -22,15 +22,18 @@ int UiLen(int designPx);
 
 int UiHomeWidth();
 int UiHomeHeight();
+int UiSettingsWidth();
+int UiSettingsHeight();
 int UiEditorWidth();
 int UiEditorHeight();
 
 RECT UiRect4(int left, int top, int right, int bottom);
 int UiFontHeight(int designHeight);
 
-// 将窗口客户区调整为当前缩放下的首页/编辑器设计尺寸
+// 将窗口客户区调整为当前缩放下的首页/设置/编辑器设计尺寸
 void UiResizeWindowClient(HWND hwnd, int clientW, int clientH, bool force = false);
 void UiResizeHwndToHome(HWND hwnd);
+void UiResizeHwndToSettings(HWND hwnd);
 void UiResizeHwndToEditor(HWND hwnd);
 
 // 在已缩放容器内再按设计稿 inset（用于卡片、横幅等内部布局）

@@ -83,12 +83,12 @@ ISS 要求 `{app}\extension\...` **必须存在**，缺扩展会编不过。
 | `mouse` / `cdp` | 键鼠（surface→iframe） |
 | `layout` | iframe/pageCss 几何 |
 
-版本：`manifest.json` == `BRIDGE_VERSION` == **1.1.35**（或更新）。
+版本：`manifest.json` == `BRIDGE_VERSION` == **1.0.0**。
 
 
 ## 顶栏弹窗与脚本 API（v1.0.22+）
 
-鼠大侠进程启动后本机桥常开（端口 19228–19240）。工具栏弹窗通过 HTTP：
+键鼠工坊进程启动后本机桥常开（端口 19228–19240）。工具栏弹窗通过 HTTP：
 
 - `GET /qst/status` — 发现桥与运行状态
 - `GET /qst/scripts?token=` — 列出 `scripts\*.json`

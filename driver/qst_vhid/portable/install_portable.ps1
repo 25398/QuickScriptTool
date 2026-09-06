@@ -1,8 +1,8 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Portable QstVHid driver installer for cross-machine security testing.
-  No WDK/SDK required - works on any Windows 10/11 x64 machine.
+  LAB ONLY — portable QstVHid installer for security testing. Do not ship or run from product UI.
+  Imports Root CAs and is unsafe on personal machines. Use _elevate_install.ps1 instead.
 #>
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

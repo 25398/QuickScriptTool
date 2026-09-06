@@ -55,11 +55,20 @@ bool MainWindowHasChildClass(HWND hwnd, const std::wstring& childClassName);
 HWND TopLevelTargetWindow(HWND hwnd);
 bool IsWindowOnUserCurrentDesktop(HWND hwnd);
 bool IsTargetWindowMinimized(HWND hwnd);
+/// 最小化 / 托盘隐藏 / DWM Cloak / 空客户区：后台回放与找图前须安静展开（不抢前台）。
+bool TargetNeedsQuietPlaybackRestore(HWND hwnd);
 /// 输入法状态条/过小工具窗，不能当作脚本目标主窗。
 bool IsLikelyImeOrToolWindow(HWND hwnd);
 /// Restores a minimized target without stealing focus on the user's current desktop.
 /// skipVisibleZOrder: 后台模式已可见窗口时不改 Z 序/尺寸，避免闪屏与 WGC 游戏区空白。
 bool RestoreWindowQuiet(HWND hwnd, bool skipVisibleZOrder = false);
+/// 窗口铺满当前监视器且无标题框：独占全屏 / 无边框全屏游戏。假焦点钩 PeekMessage 会冻住 DXGI 画面。
+bool LooksLikeMonitorCoveringFullscreen(HWND hwnd);
+/// 外框或客户区铺满最近监视器（忽略标题框）。供全屏游戏判定复用。
+bool WindowCoversNearestMonitor(HWND hwnd);
+/// 游戏类名 + 铺满监视器。禁止假焦点、迁桌面、SetCursorPos、PrintWindow/WGC、置底/Cloak。
+/// UE5 `UnrealWindow`：无论是否铺满一律按此处理（假焦点会冻 Present）。
+bool LooksLikeFullscreenGameTarget(HWND hwnd);
 /// 当前用户桌面：置底展开。keepCloaked=true 时保持 DWM Cloak（供截图/点击，避免露脸）。
 /// 若 keepCloaked 且 out* 非空，调用方须在最小化后再 EndQuietBottomCloak。
 bool RestoreOnUserDesktopBottom(HWND hwnd, HWND preserveFg, bool keepCloaked = false,
@@ -92,6 +101,18 @@ bool RestoreMinimizedQuietPreferMax(HWND hwnd);
 bool WindowFillsWorkArea(HWND hwnd, int slackPx = 48);
 /// Chrome/Edge 顶层不支持假焦点注入。
 bool IsBrowserFakeFocusUnsupported(HWND hwnd);
+/// 远程桌面（mstsc）顶层：假焦点注入会搞挂客户端；后台 PostMessage 也无法驱动远程会话。
+bool IsRemoteDesktopWindow(HWND hwnd);
+/// 浏览器或远程桌面：禁止假焦点 DLL 注入。
+bool IsFakeFocusInjectionUnsupported(HWND hwnd);
+
+/// 窗口化 UE5 / 远程桌面：可挪到屏外并顶置，仍保持前台以便 SendInput。
+/// 真铺满监视器（独占 DXGI）禁止挪窗。
+bool CanParkHardwareInputTargetOffscreen(HWND hwnd);
+/// 保持客户区尺寸挪到屏外并 HWND_TOPMOST。savedWp/savedTopmost 供结束时还原。
+bool ParkHardwareInputTargetOffscreen(HWND hwnd, WINDOWPLACEMENT* savedWp, bool* savedTopmost);
+/// 去掉我们加的顶置并还原 placement（不抢前台）。
+bool RestoreHardwareInputTargetOffscreen(HWND hwnd, const WINDOWPLACEMENT& savedWp, bool savedTopmost);
 
 /// CDP：Pin+屏外出帧；用户在宏桌面且仍需揭开时再 UnPin。
 bool EnsureCdpBrowserLiveFrames(HWND hwnd);

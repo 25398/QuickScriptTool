@@ -72,11 +72,13 @@ set "SRC1=%SRCROOT%\src\window_mode\fake_focus\fake_focus_dll.cpp"
 set "SRC2=%SRCROOT%\src\window_mode\fake_focus\fake_focus_hook.cpp"
 set "INC=%SRCROOT%\src\window_mode\fake_focus"
 
-cl /nologo /LD /O2 /W3 /EHsc /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DFAKEFOCUS_EXPORTS ^
+set "DEF=%INC%\fake_focus.def"
+
+cl /nologo /LD /O2 /W3 /EHsc /MT /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DFAKEFOCUS_EXPORTS ^
   /I"%INC%" /I"%SRCROOT%\src" ^
   "%SRC1%" "%SRC2%" ^
   /Fe"%OUTDIR%\FakeFocus32.dll" /Fo"%OUTDIR%\\" /Fd"%OUTDIR%\FakeFocus32.pdb" ^
-  /link /DLL user32.lib dwmapi.lib
+  /link /DLL /DEF:"%DEF%" user32.lib dwmapi.lib
 
 if errorlevel 1 (
   echo [FakeFocus32] build failed

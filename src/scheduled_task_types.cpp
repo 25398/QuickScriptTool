@@ -3,7 +3,9 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <random>
 
 std::wstring ScheduledTaskKindLabel(ScheduledTaskKind kind) {
     return kind == ScheduledTaskKind::Recording ? L"鼠标录制" : L"鼠标宏";
@@ -14,6 +16,7 @@ std::wstring ScheduledFrequencyLabel(ScheduledFrequency freq) {
     case ScheduledFrequency::Hourly: return L"每小时";
     case ScheduledFrequency::Daily: return L"每日";
     case ScheduledFrequency::Weekly: return L"每周";
+    case ScheduledFrequency::Interval: return L"间隔";
     default: return L"自定义";
     }
 }
@@ -42,6 +45,9 @@ std::wstring FormatScheduledRunTime(const ScheduledTask& task) {
     case ScheduledFrequency::Daily:
     case ScheduledFrequency::Weekly:
         return FormatTimeParts(t.hour, t.minute, t.second, t.millisecond, true, false, 0, 0, 0);
+    case ScheduledFrequency::Interval:
+        return L"每" + FormatTimeParts(t.hour, t.minute, t.second, t.millisecond,
+            true, false, 0, 0, 0);
     default:
         {
             wchar_t buf[160]{};
@@ -57,7 +63,16 @@ std::wstring DefaultScheduledTaskName() {
 }
 
 std::wstring GenerateScheduledTaskId() {
-    return TimestampName();
+    // 时间戳只有秒级精度：同一秒内创建多个任务会撞 ID，
+    // 而调度器按 id 去重（lastFireKey_[id]），撞 ID 会让其中一单永不触发。
+    // 追加毫秒 + 随机后缀保证唯一。
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const auto ms = duration_cast<milliseconds>(now.time_since_epoch()).count();
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<unsigned> dist(0, 9999u);
+    return std::to_wstring(ms) + L"-" + std::to_wstring(dist(gen));
 }
 
 bool WeekDaySelected(uint8_t mask, int dayIndex) {
@@ -107,7 +122,27 @@ bool ScheduledTaskShouldRun(const ScheduledTask& task, const SYSTEMTIME& now,
     case ScheduledFrequency::Weekly:
         if (!WeekDaySelected(task.time.weekDays, SystemTimeWeekDayBit(now))) return false;
         return TimeMatches(task.time, now, true, false);
+    case ScheduledFrequency::Interval:
+        // 按启动/保存后的累计时长触发，不对照钟点；由调度器 IntervalDue 判定。
+        return false;
     default:
         return TimeMatches(task.time, now, true, true);
     }
+}
+
+int64_t ScheduledIntervalDurationMs(const ScheduledTaskTime& t) {
+    const int64_t hour = t.hour < 0 ? 0 : t.hour;
+    const int64_t minute = t.minute < 0 ? 0 : t.minute;
+    const int64_t second = t.second < 0 ? 0 : t.second;
+    const int64_t millisecond = t.millisecond < 0 ? 0 : t.millisecond;
+    return hour * 3600000 + minute * 60000 + second * 1000 + millisecond;
+}
+
+bool ScheduledIntervalPeriodDue(int64_t elapsedMs, int64_t intervalMs,
+                                int64_t lastPeriod, int64_t* outPeriod) {
+    if (intervalMs <= 0 || elapsedMs <= 0) return false;
+    const int64_t period = elapsedMs / intervalMs;
+    if (period < 1 || period <= lastPeriod) return false;
+    if (outPeriod) *outPeriod = period;
+    return true;
 }

@@ -21,7 +21,9 @@ std::wstring CoordSpaceToJson(WindowModeCoordinateSpace space) {
 
 WindowModeCoordinateSpace CoordSpaceFromJson(const std::wstring& text) {
     if (text == L"screenAbsolute") return WindowModeCoordinateSpace::ScreenAbsolute;
-    return WindowModeCoordinateSpace::WindowClient;
+    if (text == L"windowClient") return WindowModeCoordinateSpace::WindowClient;
+    // 旧脚本未写 coordSpace：存的是屏幕绝对坐标（编辑器/录制默认），按 screenAbsolute 处理。
+    return WindowModeCoordinateSpace::ScreenAbsolute;
 }
 
 std::wstring ExecutionKindToJson(WindowModeExecutionKind kind) {
@@ -34,8 +36,7 @@ WindowModeExecutionKind ExecutionKindFromJson(const std::wstring& text) {
 }
 
 std::wstring SelectMethodToJson(WindowSelectMethod method) {
-    switch (method) {
-    case WindowSelectMethod::MousePositionOnStartup: return L"mousePositionOnStartup";
+    switch (NormalizeSelectMethod(method)) {
     case WindowSelectMethod::UseEditorWindowClass: return L"useEditorWindowClass";
     case WindowSelectMethod::NoSelect: return L"noSelect";
     default: return L"selectOnStartup";
@@ -58,19 +59,15 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block) {
     cfg.targetExePath = ExtractString(block, L"targetExePath");
     cfg.targetWindowTitle = ExtractString(block, L"targetWindowTitle");
     cfg.coordSpace = CoordSpaceFromJson(ExtractString(block, L"coordSpace"));
+    cfg.windowRelativeCoordinates = ParseBool01(block, L"windowRelativeCoordinates", false);
+    cfg.recordClientWidth = static_cast<int>(ExtractNumber(block, L"recordClientWidth", 0.0));
+    cfg.recordClientHeight = static_cast<int>(ExtractNumber(block, L"recordClientHeight", 0.0));
+    if (cfg.recordClientWidth < 0) cfg.recordClientWidth = 0;
+    if (cfg.recordClientHeight < 0) cfg.recordClientHeight = 0;
     cfg.autoLaunchTarget = ParseBool01(block, L"autoLaunchTarget", false);
     cfg.launchArgs = ExtractString(block, L"launchArgs");
 
-    const std::wstring selectMethod = ExtractString(block, L"selectMethod");
-    if (selectMethod == L"mousePositionOnStartup") {
-        cfg.selectMethod = WindowSelectMethod::MousePositionOnStartup;
-    } else if (selectMethod == L"useEditorWindowClass") {
-        cfg.selectMethod = WindowSelectMethod::UseEditorWindowClass;
-    } else if (selectMethod == L"noSelect") {
-        cfg.selectMethod = WindowSelectMethod::NoSelect;
-    } else {
-        cfg.selectMethod = WindowSelectMethod::SelectOnStartup;
-    }
+    cfg.selectMethod = SelectMethodFromJson(ExtractString(block, L"selectMethod"));
     cfg.windowName = ExtractString(block, L"windowName");
     cfg.windowClassName = ExtractString(block, L"windowClassName");
     cfg.childWindowClassName = ExtractString(block, L"childWindowClassName");
@@ -102,7 +99,8 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block) {
         }
     }
     // 关闭窗口模式时清掉目标身份，避免残留误绑。
-    if (enabledKeyPresent && !cfg.enabled) {
+    // 窗口相对脚本除外：编辑器默认模式可能把 enabled 写成 0，身份留给 Finalize 复活。
+    if (enabledKeyPresent && !cfg.enabled && !cfg.windowRelativeCoordinates) {
         cfg.targetExePath.clear();
         cfg.targetWindowTitle.clear();
         cfg.windowName.clear();
@@ -130,24 +128,33 @@ WindowModeScriptConfig ParseWindowModeJson(const std::wstring& content) {
 
     const auto brace = content.find(L'{', pos);
     if (brace == std::wstring::npos) return cfg;
-    int depth = 0;
-    std::wstring block;
-    for (size_t i = brace; i < content.size(); ++i) {
-        if (content[i] == L'{') ++depth;
-        else if (content[i] == L'}') {
-            --depth;
-            block = content.substr(brace, i - brace + 1);
-            if (depth == 0) break;
-        }
-    }
-    if (block.empty()) return cfg;
+    const auto braceEnd = FindMatchingJsonBrace(content, brace);
+    if (braceEnd == std::wstring::npos) return cfg;
+    return ParseWindowModeConfigObject(content.substr(brace, braceEnd - brace + 1));
+}
 
-    return ParseWindowModeConfigObject(block);
+void FinalizeWindowModeForPlayback(WindowModeScriptConfig& cfg,
+    bool anyWindowRelativeAction, bool reviveEnabled) {
+    if (anyWindowRelativeAction) cfg.windowRelativeCoordinates = true;
+    if (!cfg.windowRelativeCoordinates) return;
+
+    cfg.coordSpace = WindowModeCoordinateSpace::WindowClient;
+    const bool hasIdentity = !cfg.targetExePath.empty()
+        || !cfg.windowClassName.empty()
+        || !cfg.windowName.empty()
+        || !cfg.targetWindowTitle.empty();
+    if (reviveEnabled && hasIdentity) cfg.enabled = true;
+    if (cfg.enabled && cfg.executionKind == WindowModeExecutionKind::HiddenDesktop) {
+        cfg.executionKind = WindowModeExecutionKind::BackgroundWindow;
+    }
+    if (cfg.enabled) cfg.autoLaunchTarget = ShouldAutoLaunchTarget(cfg);
 }
 
 void WriteWindowModeJson(std::wstring& out, const WindowModeScriptConfig& cfg, bool trailingComma) {
     WindowModeScriptConfig w = cfg;
-    if (!w.enabled) {
+    w.selectMethod = NormalizeSelectMethod(w.selectMethod);
+    StripRuntimeOnlySelectTarget(w);
+    if (!w.enabled && !w.windowRelativeCoordinates) {
         w.targetExePath.clear();
         w.targetWindowTitle.clear();
         w.windowName.clear();
@@ -163,6 +170,10 @@ void WriteWindowModeJson(std::wstring& out, const WindowModeScriptConfig& cfg, b
     out += L"    \"targetExePath\": \"" + EscapeJson(w.targetExePath) + L"\",\n";
     out += L"    \"targetWindowTitle\": \"" + EscapeJson(w.targetWindowTitle) + L"\",\n";
     out += L"    \"coordSpace\": \"" + CoordSpaceToJson(w.coordSpace) + L"\",\n";
+    out += std::wstring(L"    \"windowRelativeCoordinates\": ")
+        + (w.windowRelativeCoordinates ? L"1" : L"0") + L",\n";
+    out += L"    \"recordClientWidth\": " + std::to_wstring(w.recordClientWidth) + L",\n";
+    out += L"    \"recordClientHeight\": " + std::to_wstring(w.recordClientHeight) + L",\n";
     out += L"    \"autoLaunchTarget\": " + std::to_wstring(w.autoLaunchTarget ? 1 : 0) + L",\n";
     out += L"    \"launchArgs\": \"" + EscapeJson(w.launchArgs) + L"\",\n";
     out += L"    \"selectMethod\": \"" + SelectMethodToJson(w.selectMethod) + L"\",\n";

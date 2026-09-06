@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="agent-shell agent-booting">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI 脚本助手</title>
+<!-- 同一套真 DOM：标题+输入先绘；对话区原位补血肉，禁止另套假界面 -->
+<style>
+:root{--qst-u:1.5;--navy-950:#061018;--navy-800:#122636;--sky-100:#e8f4fc;--sky-50:#f0f9ff;--frost:#fcfeff;--line:#d7e6f0;--ice-400:#38bdf8;--mint-400:#2dd4bf;--aurora-b:#818cf8;--text:#0f172a;--text-3:#64748b}
+html,body{height:100%;width:100%;margin:0;overflow:hidden;background:var(--sky-100);font-family:"Microsoft YaHei UI","Microsoft YaHei","Segoe UI",sans-serif}
+#ov-agent{position:fixed;inset:0;display:flex;background:transparent;margin:0;padding:0}
+#ov-agent .dlg{
+  flex:1;display:flex;flex-direction:column;min-height:0;margin:0;padding:0;
+  background:var(--frost);border:none;border-radius:0;box-shadow:none;overflow:hidden;
+}
+.dlg-title{
+  height:calc(40px * var(--qst-u));flex-shrink:0;display:flex;align-items:center;
+  padding:0 0 0 calc(14px * var(--qst-u));
+  background:linear-gradient(90deg,var(--navy-950),var(--navy-800));
+  color:#e8f4fc;font-size:calc(13px * var(--qst-u));font-weight:700;
+  position:relative;z-index:2;
+  box-shadow:0 -4px 0 0 var(--navy-950);
+}
+.dlg-title::after{
+  content:"";position:absolute;left:0;right:0;bottom:0;height:calc(2px * var(--qst-u));
+  background:linear-gradient(90deg,var(--ice-400),var(--mint-400),var(--aurora-b));
+}
+.dlg-title .win-btns{margin-left:auto;display:flex;height:100%}
+.dlg-title .win-btn{width:calc(42px * var(--qst-u));height:100%;display:grid;place-items:center;color:#a8b6c2;cursor:pointer;font-size:calc(14px * var(--qst-u))}
+.agent-tabs{display:flex;gap:calc(4px * var(--qst-u));padding:calc(6px * var(--qst-u)) calc(10px * var(--qst-u)) 0;background:var(--sky-50);border-bottom:1px solid var(--line);flex-shrink:0;min-height:calc(34px * var(--qst-u))}
+.agent-tab{padding:calc(6px * var(--qst-u)) calc(10px * var(--qst-u));border-radius:calc(8px * var(--qst-u)) calc(8px * var(--qst-u)) 0 0;font-size:calc(12px * var(--qst-u));color:var(--text-3);border:1px solid var(--line);border-bottom-color:var(--frost);background:var(--frost);color:var(--text)}
+.dlg-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u));background:var(--sky-100)}
+.chat{flex:1;min-height:0;background:var(--frost);border:1px solid var(--line);border-radius:calc(8px * var(--qst-u));padding:calc(12px * var(--qst-u));display:flex;flex-direction:column;gap:calc(10px * var(--qst-u));overflow:auto}
+.chat-composer{margin-top:calc(10px * var(--qst-u));border:1.5px solid var(--line);border-radius:calc(14px * var(--qst-u));background:var(--frost);padding:calc(10px * var(--qst-u)) calc(12px * var(--qst-u));min-height:calc(48px * var(--qst-u));display:flex;flex-direction:column;gap:8px}
+.chat-box{min-height:calc(24px * var(--qst-u));color:var(--text-3);font-size:calc(13px * var(--qst-u))}
+.chat-composer-bar{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.chat-model{font-size:calc(12px * var(--qst-u));color:var(--text-3);padding:4px 8px;border:1px solid var(--line);border-radius:8px}
+/* 标题/页签/对话区/输入：同一套模块依次显现 */
+@keyframes qstAgentIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+html.agent-booting .dlg-title{animation:qstAgentIn .28s ease both}
+html.agent-booting .agent-tabs{animation:qstAgentIn .28s .06s ease both}
+html.agent-booting #chatLog{animation:qstAgentIn .32s .12s ease both}
+html.agent-booting .chat-composer{animation:qstAgentIn .32s .18s ease both}
+html.agent-ready #chatLog{animation:none}
+</style>
+<link rel="stylesheet" href="agent.css" />
+<link rel="stylesheet" href="vendor/katex/katex.min.css" />
+</head>
+<body>
+  <div class="overlay show" id="ov-agent">
+    <div class="dlg home-size">
+      <div class="dlg-title"><span id="agentDlgTitle">AI 脚本助手</span>
+        <div class="win-btns" style="margin-left:auto">
+          <div class="win-btn" id="btnAgentMin" title="最小化" aria-label="最小化">
+            <svg class="win-ico" viewBox="0 0 24 24" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M6.5 12h11"/>
+            </svg>
+          </div>
+          <div class="win-btn close" id="btnAgentClose" title="关闭" aria-label="关闭"></div>
+        </div>
+      </div>
+      <div class="agent-tabs" id="agentTabs"><div class="agent-tab active">对话</div></div>
+      <div class="dlg-body" style="display:flex;flex-direction:column">
+        <div class="chat" id="chatLog"></div>
+        <div class="chat-composer" id="chatComposer">
+          <div id="agentAttachList" class="agent-attach-list" hidden></div>
+          <div id="agentEditBar" class="agent-edit-bar" hidden>
+            <span id="agentEditBarText"></span>
+            <button type="button" id="agentEditBarClose" class="agent-edit-bar-x" title="取消编辑" aria-label="取消编辑">×</button>
+          </div>
+          <div class="chat-box" id="chatInput" contenteditable="true" data-placeholder="输入消息…"></div>
+          <div class="chat-composer-bar">
+            <div class="combo chat-model" id="agentModelCombo">模型</div>
+            <div class="chat-composer-actions">
+              <button type="button" class="chat-icon-btn changes" id="btnAgentChanges" title="撤销助手修改" aria-label="撤销助手修改">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 109-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+              </button>
+              <button type="button" class="chat-icon-btn attach" id="btnAgentAttach" title="添加附件" aria-label="添加附件">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-8.49 8.49a5.25 5.25 0 01-7.42-7.42l8.84-8.84a3.5 3.5 0 014.95 4.95l-8.84 8.84a1.75 1.75 0 01-2.47-2.47l7.78-7.78"/></svg>
+              </button>
+              <button type="button" class="chat-send-btn" id="btnSend" title="发送" aria-label="发送">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+  /* chrome 入 DOM 立刻 ping，勿等 paint/双 rAF（预热后首次打开要快） */
+  (function () {
+    document.documentElement.classList.add("agent-shell", "agent-booting");
+    var done = false;
+    function pingReady() {
+      if (done) return;
+      done = true;
+      try {
+        var s = JSON.stringify({ type: "agentWindow.contentReady" });
+        if (window.chrome && chrome.webview) chrome.webview.postMessage(s);
+        else if (window.qstBridge && typeof qstBridge.post === "function") qstBridge.post(s);
+      } catch (e) {}
+    }
+    pingReady();
+    requestAnimationFrame(pingReady);
+  })();
+  </script>
+  <div id="agentMinDock" class="agent-min-dock" hidden>AI 助手</div>
+  <div id="agentImgViewer" class="agent-img-viewer" hidden aria-hidden="true">
+    <button type="button" class="aiv-nav prev" id="aivPrev" aria-label="上一张" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+    </button>
+    <button type="button" class="aiv-nav next" id="aivNext" aria-label="下一张" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+    </button>
+    <div class="aiv-stage" id="aivStage">
+      <div class="aiv-frame">
+        <img id="aivImg" alt="预览" draggable="false" />
+      </div>
+    </div>
+    <div class="aiv-footer">
+      <div class="aiv-counter" id="aivCounter" hidden></div>
+      <div class="aiv-toolbar">
+        <button type="button" id="aivDownload">下载</button>
+        <button type="button" id="aivCopy">复制</button>
+        <button type="button" id="aivZoomOut" title="缩小">−</button>
+        <label class="aiv-zoom-wrap" title="输入缩放百分比">
+          <input type="text" id="aivZoomInput" inputmode="decimal" autocomplete="off" spellcheck="false" value="100" aria-label="缩放百分比" />
+          <span class="aiv-zoom-unit">%</span>
+        </label>
+        <button type="button" id="aivZoomIn" title="放大">+</button>
+        <button type="button" id="aivZoomReset">适应</button>
+        <button type="button" id="aivClose">关闭</button>
+      </div>
+    </div>
+  </div>
+  <div id="popupRoot"></div>
+  <div class="toast" id="toast"></div>
+
+    <script src="bridge.stub.js?v=20260831b"></script>
+<script src="bridge.js?v=20260831b"></script>
+  <script src="app.js?v=20260831c"></script>
+  <script src="vendor/katex/katex.min.js" defer></script>
+</body>
+</html>

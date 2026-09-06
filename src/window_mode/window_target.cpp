@@ -1,9 +1,12 @@
 #include "window_target.h"
 
+#include "cdp/cdp_input.h"
 #include "macro_virtual_desktop.h"
 #include "window_mode_log.h"
+#include "window_mode_permission.h"
 #include "virtual_desktop_accessor.h"
 #include "window_capture.h"
+#include "window_mode_types.h"
 
 #include <algorithm>
 #include <atomic>
@@ -19,6 +22,9 @@
 
 #ifndef DWMWA_CLOAK
 #define DWMWA_CLOAK 13
+#endif
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
 #endif
 
 namespace windowmode {
@@ -493,6 +499,13 @@ WindowTargetQuery BuildTargetQuery(const WindowModeScriptConfig& config) {
     query.pickY = config.targetPickY;
     const std::wstring& title = !config.windowName.empty() ? config.windowName : config.targetWindowTitle;
     query.titleContains = title;
+    // MuMu 等：模拟器换位置后旧 pick 点会落在窗外，导致找不到新窗。
+    if (LooksLikeAndroidEmulatorWindowTitle(query.titleContains)
+        || LooksLikeQtRenderWindowClass(query.className)
+        || LooksLikeAndroidEmulatorExecutable(query.exePath)) {
+        query.pickX = 0;
+        query.pickY = 0;
+    }
     SanitizeWindowTargetQuery(query);
     return query;
 }
@@ -847,6 +860,7 @@ struct ScopedThreadInputAttach {
 
 void DropTopmost(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
     if ((GetWindowLongPtr(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -854,6 +868,7 @@ void DropTopmost(HWND hwnd) {
 }
 
 void InsertWindowJustAboveShell(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd) || LooksLikeFullscreenGameTarget(hwnd)) return;
     HWND shell = FindWindowW(L"Progman", nullptr);
     if (!shell) shell = FindWindowW(L"WorkerW", nullptr);
     if (!shell || shell == hwnd) return;
@@ -866,6 +881,7 @@ void DebugLogTarget(const wchar_t* msg) {
 }
 
 void EnsureWindowAtSavedNormalRect(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd) || LooksLikeFullscreenGameTarget(hwnd)) return;
     WINDOWPLACEMENT wp{};
     wp.length = sizeof(WINDOWPLACEMENT);
     if (!GetWindowPlacement(hwnd, &wp)) return;
@@ -895,6 +911,7 @@ bool BeginBottomRestoreCloak(HWND hwnd, LONG& savedExStyle, bool& layeredTouched
     savedLayeredAlpha = 255;
     savedLayeredFlags = 0;
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return false;
 
     savedExStyle = static_cast<LONG>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
 
@@ -963,6 +980,7 @@ struct ScopedMinAnimateOff {
 /// Soft restore without SW_RESTORE / activation. Window must already be cloaked or at bottom.
 bool RestoreMinimizedAtBottom(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd) || !IsIconic(hwnd)) return !IsIconic(hwnd);
+    if (LooksLikeFullscreenGameTarget(hwnd)) return false;
 
     SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -993,20 +1011,18 @@ bool RestoreMinimizedAtBottom(HWND hwnd) {
 
 void PlaceWindowAtBottomOfStack(HWND hwnd, HWND preserveFg) {
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
 
     const bool onUserDesktop = IsWindowOnUserCurrentDesktop(hwnd);
 
-    ScopedThreadInputAttach attach;
-    attach.Attach(hwnd);
-    if (onUserDesktop) {
-        attach.Attach(preserveFg);
-    }
-
     DropTopmost(hwnd);
 
+    // AttachThreadInput + SWP_SHOWWINDOW 是后台模式抢前台的常见来源
+    //（AHK ControlClick / 后台键鼠都避免在投递前改 Z 序或附加前台线程）。
+    const bool alreadyVisible = IsWindowVisible(hwnd) != FALSE && !IsIconic(hwnd);
     for (int i = 0; i < 3; ++i) {
         DWORD flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-        if (onUserDesktop) flags |= SWP_SHOWWINDOW;
+        if (onUserDesktop && !alreadyVisible) flags |= SWP_SHOWWINDOW;
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
         if (onUserDesktop) {
             InsertWindowJustAboveShell(hwnd);
@@ -1026,6 +1042,7 @@ void PlaceWindowAtBottomOfStack(HWND hwnd, HWND preserveFg) {
 void EnsureTargetBelowUserWindows(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd) || IsRemoteDesktopWindow(hwnd)) return;
     if (!IsWindowOnUserCurrentDesktop(hwnd)) return;
     PlaceWindowAtBottomOfStack(hwnd, GetForegroundWindow());
 }
@@ -1039,6 +1056,7 @@ void EnsureTargetAtBottomOfStack(HWND hwnd) {
 void ForceHideLaunchedWindowQuiet(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd) || IsRemoteDesktopWindow(hwnd)) return;
 
     HWND preserveFg = GetForegroundWindow();
     // 注意：工作线程上调用 DwmSetWindowAttribute / RedrawWindow 可能与 Store/ WinUI 应用死锁。
@@ -1253,6 +1271,36 @@ bool IsTargetWindowMinimized(HWND hwnd) {
     return IsIconic(hwnd) == TRUE;
 }
 
+bool TargetNeedsQuietPlaybackRestore(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return true;
+    if (IsIconic(hwnd)) return true;
+    if (!IsWindowVisible(hwnd)) return true;
+
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(wp);
+    if (GetWindowPlacement(hwnd, &wp)) {
+        if (wp.showCmd == SW_SHOWMINIMIZED || wp.showCmd == SW_MINIMIZE
+            || wp.showCmd == SW_SHOWMINNOACTIVE) {
+            return true;
+        }
+    }
+
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))
+        && cloaked) {
+        return true;
+    }
+
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc)
+        || (rc.right - rc.left) <= 0
+        || (rc.bottom - rc.top) <= 0) {
+        return true;
+    }
+    return false;
+}
+
 void EndQuietBottomCloak(HWND hwnd, LONG savedExStyle, bool layeredTouched,
     BYTE savedLayeredAlpha, DWORD savedLayeredFlags) {
     EndBottomRestoreCloak(hwnd, savedExStyle, layeredTouched,
@@ -1264,6 +1312,7 @@ bool RestoreOnUserDesktopBottom(HWND hwnd, HWND preserveFg, bool keepCloaked,
     BYTE* outSavedLayeredAlpha, DWORD* outSavedLayeredFlags) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return true;
 
     ScopedThreadInputAttach attach;
     attach.Attach(hwnd);
@@ -1285,9 +1334,21 @@ bool RestoreOnUserDesktopBottom(HWND hwnd, HWND preserveFg, bool keepCloaked,
 
     if (IsIconic(hwnd)) {
         RestoreMinimizedAtBottom(hwnd);
+    } else if (!IsWindowVisible(hwnd)) {
+        // QQ/微信等「最小化到托盘」常是 SW_HIDE，不是 IsIconic；须无激活显示。
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        if (!IsWindowVisible(hwnd)) {
+            ShowWindow(hwnd, SW_SHOWNA);
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
     }
 
-    if (!IsIconic(hwnd)) {
+    if (!IsIconic(hwnd) && IsWindowVisible(hwnd)) {
         EnsureWindowAtSavedNormalRect(hwnd);
     }
 
@@ -1320,9 +1381,9 @@ bool RestoreOnUserDesktopBottom(HWND hwnd, HWND preserveFg, bool keepCloaked,
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
     PlaceWindowAtBottomOfStack(hwnd, preserveFg);
 
-    const bool ok = !IsIconic(hwnd);
+    const bool ok = !IsIconic(hwnd) && IsWindowVisible(hwnd);
     if (!ok) {
-        DebugLogTarget(L"RestoreOnUserDesktopBottom: still iconic after restore");
+        DebugLogTarget(L"RestoreOnUserDesktopBottom: still iconic/hidden after restore");
     }
     return ok;
 }
@@ -1330,6 +1391,7 @@ bool RestoreOnUserDesktopBottom(HWND hwnd, HWND preserveFg, bool keepCloaked,
 void PinMacroDesktopWindowBottom(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
 
     DropTopmost(hwnd);
     for (int i = 0; i < 3; ++i) {
@@ -1341,6 +1403,7 @@ void PinMacroDesktopWindowBottom(HWND hwnd) {
 void MinimizeForQuietDesktopMove(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
     // 跨虚拟桌面移动前先最小化，避免可见窗口被抽走时乱跳（与「不选择窗口」启动路径一致）。
     ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
 }
@@ -1349,6 +1412,10 @@ ScopedVisionCapturePrep::ScopedVisionCapturePrep(HWND hwnd, bool backgroundMode)
     : background_(backgroundMode) {
     root_ = TopLevelTargetWindow(hwnd);
     if (!root_ || !IsWindow(root_)) return;
+    if (LooksLikeFullscreenGameTarget(root_)) {
+        ready_ = true;
+        return;
+    }
 
     const bool onUserDesktop = IsWindowOnUserCurrentDesktop(root_);
     const bool macroWindowMode = !background_ && !onUserDesktop;
@@ -1473,6 +1540,7 @@ ScopedVisionCapturePrep::~ScopedVisionCapturePrep() {
 bool RestoreWindowQuiet(HWND hwnd, bool skipVisibleZOrder) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return true;
 
     const bool onUserDesktop = IsWindowOnUserCurrentDesktop(hwnd);
     HWND preserveFg = GetForegroundWindow();
@@ -1491,6 +1559,71 @@ bool RestoreWindowQuiet(HWND hwnd, bool skipVisibleZOrder) {
     // 目标在其它虚拟桌面（如「鼠标宏」）：保持最小化，避免 ShowWindow(SW_RESTORE)
     // 触发系统切换到该桌面。找图用 PrintWindow，输入用 PostMessage。
     return true;
+}
+
+namespace {
+constexpr int kHardwareOffscreenOrigin = -32000;
+}
+
+bool CanParkHardwareInputTargetOffscreen(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (IsIconic(hwnd)) return false;
+    // 独占/无边框铺满：SetWindowPos 会拆 DXGI。
+    if (LooksLikeMonitorCoveringFullscreen(hwnd)) return false;
+    // UE5 任意尺寸都禁止搬窗/屏外（会冻 Present）；用户正在玩时更不能把游戏挪走。
+    if (LooksLikeFullscreenGameTarget(hwnd)) return false;
+    return true;
+}
+
+bool ParkHardwareInputTargetOffscreen(HWND hwnd, WINDOWPLACEMENT* savedWp, bool* savedTopmost) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!savedWp || !savedTopmost) return false;
+    if (!CanParkHardwareInputTargetOffscreen(hwnd)) return false;
+
+    RECT wr{};
+    if (!GetWindowRect(hwnd, &wr)) return false;
+    const int w = std::max(64, static_cast<int>(wr.right - wr.left));
+    const int h = std::max(64, static_cast<int>(wr.bottom - wr.top));
+    const bool alreadyOff = wr.left <= -10000;
+
+    savedWp->length = sizeof(WINDOWPLACEMENT);
+    if (!GetWindowPlacement(hwnd, savedWp)) return false;
+    *savedTopmost = (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+
+    if (!alreadyOff) {
+        WINDOWPLACEMENT wp = *savedWp;
+        wp.length = sizeof(WINDOWPLACEMENT);
+        wp.showCmd = SW_SHOWNOACTIVATE;
+        wp.rcNormalPosition = RECT{
+            kHardwareOffscreenOrigin, kHardwareOffscreenOrigin,
+            kHardwareOffscreenOrigin + w, kHardwareOffscreenOrigin + h};
+        SetWindowPlacement(hwnd, &wp);
+    }
+
+    const int x = alreadyOff ? wr.left : kHardwareOffscreenOrigin;
+    const int y = alreadyOff ? wr.top : kHardwareOffscreenOrigin;
+    // 顶置只保证 Z 序；SendInput 仍要求该窗是前台。尺寸不得缩小（客户区坐标会偏）。
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    RECT after{};
+    if (!GetWindowRect(hwnd, &after) || after.left > -10000) return false;
+    return true;
+}
+
+bool RestoreHardwareInputTargetOffscreen(HWND hwnd, const WINDOWPLACEMENT& savedWp,
+    bool savedTopmost) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    SetWindowPos(hwnd, savedTopmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+        0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    WINDOWPLACEMENT wp = savedWp;
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (wp.showCmd == SW_SHOWNORMAL || wp.showCmd == SW_SHOW || wp.showCmd == 0) {
+        wp.showCmd = SW_SHOWNOACTIVATE;
+    }
+    return SetWindowPlacement(hwnd, &wp) != FALSE;
 }
 
 void RestoreBoundTargetTopWindow(HWND hwnd, const WINDOWPLACEMENT& wp) {
@@ -1560,11 +1693,9 @@ WindowModeHealth EvaluateTargetHealth(HWND hwnd, HDC /*probeDc*/) {
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process && pid != 0) {
+    if (pid != 0 && !CheckPermissionMatch(pid)) {
         return WindowModeHealth::PermissionMismatch;
     }
-    if (process) CloseHandle(process);
 
     if (!IsWindowOnUserCurrentDesktop(root)) {
         return WindowModeHealth::Ok;
@@ -1632,6 +1763,21 @@ std::atomic_bool g_watchStop{true};
 std::thread g_watchThread;
 std::mutex g_watchMu;
 
+template <typename MapT>
+void EraseDeadHwndKeys(MapT& map) {
+    for (auto it = map.begin(); it != map.end(); ) {
+        if (!it->first || !IsWindow(it->first)) it = map.erase(it);
+        else ++it;
+    }
+}
+
+void PruneDeadCdpParkEntriesLocked() {
+    EraseDeadHwndKeys(g_peekSuppressed);
+    EraseDeadHwndKeys(g_cdpPinned);
+    EraseDeadHwndKeys(g_cdpParkPlacement);
+    EraseDeadHwndKeys(g_cdpParkSize);
+}
+
 bool PlacementLooksOnScreen(const RECT& rc) {
     return rc.left > -10000 && rc.top > -10000
         && rc.right > rc.left + 64 && rc.bottom > rc.top + 64;
@@ -1673,6 +1819,7 @@ void RememberCdpParkPlacement(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return;
     std::lock_guard<std::mutex> lock(g_cdpParkMu);
+    PruneDeadCdpParkEntriesLocked();
 
     WINDOWPLACEMENT wp{};
     wp.length = sizeof(WINDOWPLACEMENT);
@@ -1999,6 +2146,7 @@ bool IsAppCloakedOrNearInvisible(HWND hwnd, BYTE* alphaOut = nullptr) {
 void StripCloakAndNearInvisibleAlpha(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
 
     BOOL cloak = FALSE;
     DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
@@ -2020,6 +2168,7 @@ void StripCloakAndNearInvisibleAlpha(HWND hwnd) {
 bool SoftRestoreNonActivating(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return !IsIconic(hwnd);
     if (!IsIconic(hwnd)) return true;
 
     // 同桌面允许 ShowWindow；异桌面 Show 会把用户视图拽到该窗所在桌面（已证伪）。
@@ -2092,9 +2241,71 @@ bool WindowFillsWorkArea(HWND hwnd, int slackPx) {
         && wr.bottom >= wa.bottom - slack;
 }
 
+namespace {
+
+bool RectCoversMonitor(const RECT& wr, const RECT& mr, int slackPx) {
+    const int slack = std::max(0, slackPx);
+    return wr.left <= mr.left + slack
+        && wr.top <= mr.top + slack
+        && wr.right >= mr.right - slack
+        && wr.bottom >= mr.bottom - slack;
+}
+
+}  // namespace
+
+bool WindowCoversNearestMonitor(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return false;
+    RECT wr{};
+    if (!GetWindowRect(hwnd, &wr)) return false;
+    if ((wr.right - wr.left) < 640 || (wr.bottom - wr.top) < 480) return false;
+
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    if (RectCoversMonitor(wr, mi.rcMonitor, 16)) return true;
+
+    RECT cr{};
+    if (!GetClientRect(hwnd, &cr)) return false;
+    POINT tl{0, 0};
+    POINT br{cr.right, cr.bottom};
+    if (!ClientToScreen(hwnd, &tl) || !ClientToScreen(hwnd, &br)) return false;
+    const RECT clientScreen{tl.x, tl.y, br.x, br.y};
+    return RectCoversMonitor(clientScreen, mi.rcMonitor, 16);
+}
+
+bool LooksLikeMonitorCoveringFullscreen(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!WindowCoversNearestMonitor(hwnd)) return false;
+
+    const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    const bool popup = (style & WS_POPUP) != 0;
+    const bool caption = (style & WS_CAPTION) == WS_CAPTION;
+    // 普通最大化窗有标题框且通常只铺工作区；独占/无边框全屏多为 WS_POPUP。
+    if (caption && !popup) return false;
+    return true;
+}
+
+bool LooksLikeFullscreenGameTarget(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    // UE5：任意尺寸（含最小化）都禁止假焦点 / SetCursorPos / 置底改 HWND。
+    // 《国王大道》等窗口化或判定未铺满时若仍注入，DXGI 会冻在启动那一帧。
+    if (LooksLikeUnrealEngineWindowClass(cls)) return true;
+    if (IsIconic(hwnd)) return false;
+    // 传奇 Delphi 窗口化/铺满仍走假焦点 GetCursorPos，不当成 DXGI 独占全屏。
+    if (LooksLikeDelphiVclGameWindowClass(cls)) return false;
+    if (!LooksLikeGameWindowClass(cls)) return false;
+    return WindowCoversNearestMonitor(hwnd);
+}
+
 bool RestoreMinimizedQuietPreferMax(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return !IsIconic(hwnd);
 
     WINDOWPLACEMENT wp{};
     wp.length = sizeof(WINDOWPLACEMENT);
@@ -2125,12 +2336,40 @@ bool IsBrowserFakeFocusUnsupported(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return false;
     wchar_t cls[256]{};
     GetClassNameW(hwnd, cls, 256);
-    return LooksLikeChromiumBrowserClass(cls);
+    if (!LooksLikeChromiumBrowserClass(cls)) return false;
+    // 真浏览器禁止假焦点（应用配套扩展）；Electron 壳（QQ 等）允许注入配合本机输入。
+    const std::wstring path = QueryHwndProcessImagePath(hwnd);
+    if (!path.empty() && !LooksLikeChromiumBrowserExecutable(path)) return false;
+    return true;
+}
+
+bool IsRemoteDesktopWindow(HWND hwnd) {
+    hwnd = TopLevelTargetWindow(hwnd);
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    if (LooksLikeRemoteDesktopWindowClass(cls)) return true;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+    wchar_t path[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    const BOOL ok = QueryFullProcessImageNameW(process, 0, path, &size);
+    CloseHandle(process);
+    return ok && LooksLikeRemoteDesktopExePath(path);
+}
+
+bool IsFakeFocusInjectionUnsupported(HWND hwnd) {
+    return IsBrowserFakeFocusUnsupported(hwnd) || IsRemoteDesktopWindow(hwnd);
 }
 
 void SuppressMacroDesktopTaskbarPreview(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
     BOOL on = TRUE;
     DwmSetWindowAttribute(hwnd, DWMWA_DISALLOW_PEEK, &on, sizeof(on));
     DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &on, sizeof(on));
@@ -2150,6 +2389,7 @@ bool IsMacroDesktopTaskbarPreviewSuppressed(HWND hwnd) {
 void ClearMacroDesktopTaskbarPreviewSuppression(HWND hwnd) {
     auto clearOne = [](HWND h) {
         if (!h || !IsWindow(h)) return;
+        if (LooksLikeFullscreenGameTarget(h)) return;
         BOOL off = FALSE;
         DwmSetWindowAttribute(h, DWMWA_DISALLOW_PEEK, &off, sizeof(off));
         DwmSetWindowAttribute(h, DWMWA_FORCE_ICONIC_REPRESENTATION, &off, sizeof(off));
@@ -2205,6 +2445,7 @@ void ReleaseMacroDesktopVisionLatch(HWND hwnd) {
 void RestoreMacroDesktopWindowAfterRun(HWND hwnd) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return;
     ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
     if (RestoreCdpParkPlacementThenMinimize(hwnd)) {
         WindowModeLog(L"[窗口模式] 会话结束: 已 UnPin/恢复坐标并最小化（禁 GoTo）");
@@ -2322,6 +2563,7 @@ bool EnsureCdpBrowserLiveFrames(HWND hwnd) {
 bool EnsureTargetOnMacroDesktop(HWND hwnd, bool minimizeIfMoved) {
     hwnd = TopLevelTargetWindow(hwnd);
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeFullscreenGameTarget(hwnd)) return true;
 
     // Pin+屏外：已在宏桌面工作面；VDA 常报 desk=-1。再 Move/SoftRestore 会拆停放并切屏。
     if (IsCdpLiveOffscreenParked(hwnd)) return true;
