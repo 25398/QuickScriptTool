@@ -39,6 +39,9 @@ fetched_*.cpp
 # Garbled / backup doc variants (e.g. *.md.fixed)
 *.md.fixed
 
+# WorkBuddy AI project data (local notes / memory; not for the public repo)
+.workbuddy-ai/
+
 # Legacy stub
 QuickScript/
 
