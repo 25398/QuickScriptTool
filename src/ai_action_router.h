@@ -124,6 +124,9 @@ enum class CoarseLocateSkipReason {
     CompactPixel,
     CompactRemapped,
     WideControlRemapped,
+    /// 「小标签/小卡片」：单独看边长不「紧凑」（比观察区 8% 宽、或比 56 高），
+    /// 但相对整屏面积很小（≤1%）→ 中心可点，不值得再烧一轮 Zoom。
+    SmallLabel,
     /// 0~1000 / 原图像素换算后的单点（无框）：模型已给可点中心
     PointRemapped,
 };
@@ -159,6 +162,18 @@ std::wstring MacroActionUsageSkill();
 /// 分步 Agent Skill（lookupMacroAction section=agent）：观察→规划→执行→验收
 std::wstring MacroActionAgentSkill();
 
+/// 命令行路线 Skill（lookupMacroAction section=command）：
+/// 不需要看界面的活（写文件/批量/统计/注册表/取数）一律 runCommand 一步做完。
+std::wstring MacroActionCommandSkill();
+
+/// 办公文档 Skill（lookupMacroAction section=office）：readDocument 读、runCommand 写，
+/// 覆盖 Excel/Word/PPT/PDF/CSV（产品文件 skills/agent/office.md）。
+std::wstring MacroActionOfficeSkill();
+
+/// 实时游戏/动态画面 Skill（lookupMacroAction section=game）：本地优先感知、
+/// 颜色/找图跟手、keyDown 长按、相对鼠标、反作弊风险（产品文件 skills/agent/game.md）。
+std::wstring MacroActionGameSkill();
+
 std::wstring BuildAiActionHybridSystemPrompt(int imageWidth, int imageHeight);
 
 /// ToolExecute 路由的短 system（与 Hybrid 共享硬规则，Skill 全文仍走 lookup）
@@ -169,9 +184,16 @@ std::wstring BuildAiActionToolExecuteSystemPrompt(
 std::wstring BuildCompositeLocatePrompt(const std::wstring& userTask,
     int imageWidth = 0, int imageHeight = 0);
 
-/// 放大区精确点 prompt
+/// 放大区精确点 prompt。prevPredictionMarked=true 时图上已画「上一轮预测点」红叉，
+/// prompt 会说明这个参考物（但仍要求绝对坐标）。
 std::wstring BuildCompositeRefinePointPrompt(const std::wstring& userTask, int levelIndex,
-    int imageWidth = 0, int imageHeight = 0);
+    int imageWidth = 0, int imageHeight = 0, bool prevPredictionMarked = false);
+
+/// 「错点自纠」prompt（备用项）：第一次点击没有任何反应时，把**刚点的那个错点**
+/// 当红叉锚点画在放大图上，让识图模型重新给出目标的绝对坐标。
+/// ★仍要绝对坐标、不要偏移量（依据见 ai_action_service.h 的 DrawPredictionCrossOnBitmap）。
+std::wstring BuildMissSelfCorrectPrompt(const std::wstring& userTask,
+    int imageWidth = 0, int imageHeight = 0, int failedX = 0, int failedY = 0);
 
 /// 全图纠偏：告知上一轮候选框，要求重新框选真正目标（避免 Zoom 围着错误粗点打转）
 std::wstring BuildCompositeCorrectLocatePrompt(const std::wstring& userTask,

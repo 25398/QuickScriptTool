@@ -13,6 +13,7 @@
 
 #include "agent_core.h"
 #include "ai_action_router.h"
+#include "ai_locate_verify.h"
 #include "app_settings.h"
 #include "macro_execute_tools.h"
 #include "macro_variables.h"
@@ -45,6 +46,16 @@ std::vector<std::string> EncodeClipboardSnapshotImages(const MacroClipboardSnaps
 
 /// Zoom/ReGround 裁剪图上传：可将小图上采样到 targetLongEdge（对齐 ZoomClick in_min_crop）
 AiImageEncodeResult EncodeBitmapForAiZoomUpload(HBITMAP hBitmap, int targetLongEdge = 768);
+
+/// 在图上标注「上一轮预测点」——红色十字（本机 GDI 绘制，<1ms）。
+/// 依据：PrecisionCUA（arXiv 2604.13019）在**干净图**上于上一轮预测点画红叉，
+/// 并要求模型「看红叉与目标的相对位置，仍输出**绝对坐标**」——前沿模型命中率
+/// T1→T5 翻倍（Claude Opus 4.7 21%→45.4%，GPT-5.4-Pro 13.5%→41.0%）。
+/// 两个反面教训（同一论文/同一批开源项目）：
+///  ① 别改成「回答偏移量(dx,dy)」：`visual_anchor` 变体把 GPT-5.4-Pro 从 41.0% 打到 18.5%；
+///  ② 别用**真鼠标光标**当锚点：开源界零实现，且 32px 光标在 960 宽上传图里只剩 ~12px。
+/// 返回 false 表示没画上（调用方就不能在 prompt 里提红叉）。
+bool DrawPredictionCrossOnBitmap(HBITMAP bmp, int cx, int cy, int armPx, int lineWidth = 3);
 
 using AiMacroLogFn = std::function<void(const std::wstring& line)>;
 
@@ -102,6 +113,21 @@ std::unique_ptr<AgentCore> CreateAiActionExecuteCore(
     double temperatureOverride = -1.0);
 
 // 执行 AI 文字分析（contextMode=0 时清空历史；≠0 时复用会话保留上下文）
+
+/// 一次性识图问答：自建 core（无工具、无历史），发**一张图 + 一条 prompt**，返回模型原文。
+/// 供「错点自纠」这类单发子任务用：调用方自己裁剪/标注图片，这里只负责发一次请求。
+AiActionResult RunAiOneShotVisionQuery(
+    const std::wstring& modelName,
+    const std::vector<quickscript::AiModelProfile>& savedModels,
+    const std::wstring& fallbackApiUrl,
+    const std::wstring& fallbackApiKey,
+    const std::wstring& systemPrompt,
+    const std::wstring& userPrompt,
+    const std::string& imageBase64,
+    int recvTimeoutMs,
+    const std::atomic_bool& stopFlag,
+    AiHttpAbortSlot* httpAbort = nullptr);
+
 AiActionResult ExecuteAiTextAnalysis(
     AgentCore* core,
     const std::wstring& resolvedPrompt,
@@ -196,10 +222,15 @@ struct ZoomRefineLocateResult {
     double findImageScore = -1.0;
     /// 一级粗框判定可点、跳过二级
     bool skippedRefine = false;
+    /// 本地校验定级（可用/可疑/需精炼）；由 ExecuteZoomRefineLocate 填入
+    AiLocateVerdict verdict = AiLocateVerdict::Suspect;
     std::wstring errorMessage;
 };
 
 /// 多级放大定位：粗框/粗点 → 裁剪放大 → 精点 → 屏幕坐标
+/// uiAnchors 可选：调用方（引擎）传入的 UIA 控件框（屏幕坐标），用于「UIA+视觉融合」——
+/// 视觉候选与控件框重合时直接用控件的精确矩形。窗口模式下前台往往不是目标窗口，
+/// 调用方应传 nullptr（由引擎判断），避免张冠李戴。
 ZoomRefineLocateResult ExecuteZoomRefineLocate(
     AgentCore* core,
     const std::wstring& userTask,
@@ -210,7 +241,21 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
     const std::atomic_bool& stopFlag,
     AiMacroLogFn logFn = nullptr,
     AiHttpAbortSlot* httpAbort = nullptr,
-    ZoomRefineLocateOptions opts = {});
+    ZoomRefineLocateOptions opts = {},
+    const std::vector<AiUiAnchor>* uiAnchors = nullptr,
+    /// 出参：定位判决（可用/可疑/需精炼）与说明；调用方可据此提示模型或调整策略
+    AiLocateVerdict* outVerdict = nullptr,
+    std::wstring* outVerdictWhy = nullptr);
+
+/// 本地校验定级（快路径与末级共用，不依赖 OCR）：
+/// UIA 命中 / 框内特征密度 / 候选一致性 / 落点是否压在可交互控件上 →
+/// 可用（Accept）/ 可疑（Suspect）/ 需精炼（Refine）。
+/// ★「紧凑即点」「UIA 确认」这类提前返回的快路径也必须调用它：否则 verdict 会停在默认
+/// 的 Suspect，把已经确认的点击也标成「可疑」，模型会为此白烧一轮重新确认。
+AiLocateVerdict ComputeLocateVerdictAtPoint(int screenX, int screenY,
+    int boxW, int boxH, double clusterAgreement,
+    const std::vector<AiUiAnchor>& anchors,
+    AiLocateVerdict* outVerdict, std::wstring* outWhy);
 
 /// 点击后 ROI 取色校验：采样点颜色相对点击前变化则认为可能生效
 bool VerifyClickEffectByColorSample(
@@ -235,4 +280,7 @@ AiActionResult ExecuteAiActionExecute(
     const AiCaptureMapping* captureMapping = nullptr,
     AiActionHostHooks* hostHooks = nullptr,
     int maxAgentRounds = 10,
-    const std::vector<std::string>* extraImageJpegBase64 = nullptr);
+    const std::vector<std::string>* extraImageJpegBase64 = nullptr,
+    /// 宿主已判定路由时传入（如：本地定位点击自带截屏，首帧截图纯属白烧，
+    /// 但路由分类依赖 withImage，必须显式覆盖）：非空则跳过 ClassifyAiActionRoute。
+    const AiActionRouteKind* routeOverride = nullptr);

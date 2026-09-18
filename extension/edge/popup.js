@@ -99,9 +99,65 @@ el.toggle.addEventListener("change", async () => {
   toggleUserChanging = false;
 });
 
-async function discoverBridge() {
-  for (let port = PORT_LO; port <= PORT_HI; ++port) {
+async function loadBridgeRuntimeFromNative() {
+  return await new Promise((resolve) => {
+    let port;
     try {
+      port = chrome.runtime.connectNative("com.quickscripttool.bridge");
+    } catch (_) {
+      resolve(null);
+      return;
+    }
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try {
+        port.disconnect();
+      } catch (_) {
+        /* ignore */
+      }
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(null), 1500);
+    port.onMessage.addListener((msg) => {
+      clearTimeout(timer);
+      if (msg && msg.ok && msg.token && msg.port) finish(msg);
+      else finish(null);
+    });
+    port.onDisconnect.addListener(() => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    try {
+      port.postMessage({ type: "getBridge" });
+    } catch (_) {
+      finish(null);
+    }
+  });
+}
+
+async function loadBridgeRuntime() {
+  try {
+    const res = await fetch(chrome.runtime.getURL("bridge_runtime.json"), {
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const info = await res.json();
+      if (info && info.ok && info.token && info.port) return info;
+    }
+  } catch (_) {
+    /* packed CRX has no host-written json */
+  }
+  return loadBridgeRuntimeFromNative();
+}
+
+async function discoverBridge() {
+  const runtime = await loadBridgeRuntime();
+  if (!runtime) return null;
+  const port = Number(runtime.port);
+  if (port < PORT_LO || port > PORT_HI) return null;
+  try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 350);
       const res = await fetch(`http://127.0.0.1:${port}/qst/status`, {
@@ -109,20 +165,18 @@ async function discoverBridge() {
         cache: "no-store",
       });
       clearTimeout(timer);
-      if (!res.ok) continue;
+      if (!res.ok) return null;
       const info = await res.json();
-      if (!info || !info.ok || !info.token) continue;
+      if (!info || !info.ok) return null;
       return {
         port,
-        token: String(info.token),
+        token: String(runtime.token),
         running: !!info.running,
         currentScript: info.currentScript ? String(info.currentScript) : "",
       };
-    } catch (_) {
-      /* next */
-    }
+  } catch (_) {
+    return null;
   }
-  return null;
 }
 
 async function fetchScripts(b) {
@@ -353,7 +407,6 @@ async function refreshState() {
     if (!info || !info.ok) throw new Error("bad");
     bridge.running = !!info.running;
     bridge.currentScript = info.currentScript ? String(info.currentScript) : "";
-    if (info.token) bridge.token = String(info.token);
     await applyTabFilter();
     syncToggle();
     renderList();

@@ -52,6 +52,8 @@ public:
     bool IsRunning() const { return running_.load(); }
     bool IsExtensionConnected() const { return extConnected_.load(); }
     int Port() const { return port_.load(); }
+    int HttpProbeCount() const { return httpProbeCount_.load(); }
+    int WsHandshakeFailCount() const { return wsHandshakeFailCount_.load(); }
     std::string Token() const;
     int ExtensionClientCount() const;
 
@@ -63,6 +65,9 @@ public:
         std::string& resultJson, std::wstring& err, int timeoutMs = 8000);
 
     bool WaitForExtension(int timeoutMs, std::wstring& err);
+
+    /// 重写 bridge_runtime.json / Native Messaging 清单，便于休眠的扩展重新发现桥。
+    void RefreshDiscovery();
 
     /// 扩展 POST /qst/shot 写入的最近一帧 JPEG（找图用，避免 WS 大包弄死 MV3）。
     bool TakeLastShotJpeg(std::vector<uint8_t>& out);
@@ -85,7 +90,8 @@ private:
         std::wstring& err, int timeoutMs);
     void RemoveSockLocked(uintptr_t sock);
     bool TokenMatches(const std::string& got) const;
-    void SendHttpJson(uintptr_t clientSock, int status, const std::string& body);
+    void SendHttpJson(uintptr_t clientSock, int status, const std::string& body,
+        const std::string& origin, bool publicOk = false);
 
     std::thread thread_;
     std::atomic<bool> stop_{false};
@@ -93,6 +99,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> extConnected_{false};
     std::atomic<int> port_{0};
+    std::atomic<int> httpProbeCount_{0};
+    std::atomic<int> wsHandshakeFailCount_{0};
     std::string token_;
     uintptr_t listenSock_ = 0;
 
@@ -115,6 +123,10 @@ void OpenExtensionInstallGuide();
 
 /// 扩展目录（exe 旁 extension\\edge）。
 std::wstring ExtensionEdgeDirectory();
+
+/// Chrome/Edge Native Messaging：把本机桥 token 交给打包 CRX（读不到 bridge_runtime.json）。
+int RunExtNativeMessagingHost();
+void RegisterExtNativeMessagingHost();
 
 /// 解析桥配置 JSON（自检用）。
 bool ParseExtBridgeConfigJson(const std::string& json, int& port, std::string& token);

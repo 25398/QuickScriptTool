@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 namespace recopt {
@@ -47,6 +48,25 @@ double ComputeMergeWaitSeconds(const std::vector<double>& waits, const std::stri
     return sum;
 }
 
+void AppendWaitSeconds(double sec, std::vector<ScriptAction>& out) {
+    if (sec <= 0.0005) return;
+    ScriptAction wa{};
+    wa.type = ActionType::Wait;
+    wa.duration = sec;
+    const long double us = static_cast<long double>(wa.duration) * 1000000.0L;
+    wa.timingUs = static_cast<uint64_t>(std::llround(us));
+    out.push_back(wa);
+}
+
+std::vector<double> ConcatGapWaits(const std::vector<std::vector<double>>& gapWaits,
+    size_t from, size_t toExclusive) {
+    std::vector<double> out;
+    const size_t n = gapWaits.size();
+    for (size_t g = from; g < toExclusive && g < n; ++g)
+        out.insert(out.end(), gapWaits[g].begin(), gapWaits[g].end());
+    return out;
+}
+
 enum class RangeApply {
     Applied,
     SkipRelative,
@@ -74,69 +94,59 @@ RangeApply BuildMergeReplacement(const std::vector<ScriptAction>& actions, int f
     lastMove.duration = 0.0;
     lastMove.timingUs = 0;
     lastMove.randomDuration = 0.0;
-    if (mergedWait > 0.0005) {
-        ScriptAction wa{};
-        wa.type = ActionType::Wait;
-        wa.duration = mergedWait;
-        const long double us = static_cast<long double>(wa.duration) * 1000000.0L;
-        wa.timingUs = static_cast<uint64_t>(std::llround(us));
-        out.push_back(wa);
-    }
+    AppendWaitSeconds(mergedWait, out);
     out.push_back(lastMove);
     return RangeApply::Applied;
 }
 
 RangeApply BuildCompressReplacement(const std::vector<ScriptAction>& actions, int first, int last,
-    double thr, double cw, std::vector<ScriptAction>& out) {
+    double thr, const std::string& waitCalc, double fixedWait, std::vector<ScriptAction>& out) {
     out.clear();
     if (RangeHasRelativeMove(actions, first, last)) return RangeApply::SkipRelative;
     struct Point { int x; int y; };
     std::vector<Point> points;
-    std::vector<uint64_t> gapBefore;
-    uint64_t pending = 0;
+    std::vector<std::vector<double>> gapWaits;
+    std::vector<double> prefixWaits;
+    std::vector<double> pending;
     bool seenMove = false;
     for (int idx = first; idx <= last; ++idx) {
         const auto& a = actions[static_cast<size_t>(idx)];
         if (a.type == ActionType::Wait) {
-            if (seenMove) pending += ActionStepUs(a);
+            pending.push_back(ActionStepUs(a) / 1000000.0);
             continue;
         }
         if (a.type == ActionType::MoveMouse) {
             if (!seenMove) {
+                prefixWaits = pending;
+                pending.clear();
                 seenMove = true;
                 points.push_back({a.x, a.y});
-                pending = ActionStepUs(a);
             } else {
-                gapBefore.push_back(pending + ActionStepUs(a));
-                pending = 0;
+                gapWaits.push_back(pending);
+                pending.clear();
                 points.push_back({a.x, a.y});
             }
         }
     }
+    const std::vector<double> trailingWaits = pending;
     if (points.size() < 2) return RangeApply::SkipTooFewPoints;
     auto dist = [](const Point& a, const Point& b) {
         const double dx = static_cast<double>(a.x - b.x), dy = static_cast<double>(a.y - b.y);
         return std::sqrt(dx * dx + dy * dy);
     };
     std::vector<Point> compressed;
-    std::vector<uint64_t> compressedGaps;
+    std::vector<std::vector<double>> compressedGapWaits;
     compressed.push_back(points.front());
     size_t lastKept = 0;
     for (size_t i = 1; i + 1 < points.size(); ++i) {
         if (dist(compressed.back(), points[i]) < thr) continue;
-        uint64_t gapSum = 0;
-        for (size_t g = lastKept; g < i; ++g) gapSum += gapBefore[g];
-        compressedGaps.push_back(gapSum);
+        compressedGapWaits.push_back(ConcatGapWaits(gapWaits, lastKept, i));
         compressed.push_back(points[i]);
         lastKept = i;
     }
-    {
-        uint64_t gapSum = 0;
-        for (size_t g = lastKept; g < gapBefore.size(); ++g) gapSum += gapBefore[g];
-        if (compressed.back().x != points.back().x || compressed.back().y != points.back().y) {
-            compressedGaps.push_back(gapSum);
-            compressed.push_back(points.back());
-        }
+    if (compressed.back().x != points.back().x || compressed.back().y != points.back().y) {
+        compressedGapWaits.push_back(ConcatGapWaits(gapWaits, lastKept, gapWaits.size()));
+        compressed.push_back(points.back());
     }
     bool keepWindowRelative = false;
     for (int idx = first; idx <= last; ++idx) {
@@ -146,19 +156,16 @@ RangeApply BuildCompressReplacement(const std::vector<ScriptAction>& actions, in
             break;
         }
     }
+    // 段前/段后等待：有原等待才按 waitCalc 计算，空列表不因 fixed 凭空插入。
+    // 留下的移动点之间：与合并同一套 waitCalc（空间隔 + fixed 则用指定时间）。
+    AppendWaitSeconds(prefixWaits.empty()
+        ? 0.0 : ComputeMergeWaitSeconds(prefixWaits, waitCalc, fixedWait), out);
     for (size_t i = 0; i < compressed.size(); ++i) {
         if (i > 0) {
-            const uint64_t gap = (i - 1 < compressedGaps.size()) ? compressedGaps[i - 1] : 0;
-            if (gap > 0) {
-                out.push_back(MakeExplicitWaitUs(gap));
-            } else if (cw > 0.0005) {
-                ScriptAction wa{};
-                wa.type = ActionType::Wait;
-                wa.duration = cw;
-                const long double us = static_cast<long double>(wa.duration) * 1000000.0L;
-                wa.timingUs = static_cast<uint64_t>(std::llround(us));
-                out.push_back(wa);
-            }
+            const std::vector<double> empty;
+            const auto& gap = (i - 1 < compressedGapWaits.size())
+                ? compressedGapWaits[i - 1] : empty;
+            AppendWaitSeconds(ComputeMergeWaitSeconds(gap, waitCalc, fixedWait), out);
         }
         ScriptAction mv{};
         mv.type = ActionType::MoveMouse;
@@ -172,6 +179,8 @@ RangeApply BuildCompressReplacement(const std::vector<ScriptAction>& actions, in
         }
         out.push_back(mv);
     }
+    AppendWaitSeconds(trailingWaits.empty()
+        ? 0.0 : ComputeMergeWaitSeconds(trailingWaits, waitCalc, fixedWait), out);
     return RangeApply::Applied;
 }
 
@@ -201,14 +210,14 @@ void ApplyRangeReplacements(std::vector<ScriptAction>& actions,
 
 OptimizeApplyResult ApplyOnRanges(std::vector<ScriptAction>& actions,
     const std::vector<IndexRange>& ranges, bool forMerge,
-    const std::string& waitCalc, double mergeWait, double thr, double cw) {
+    const std::string& waitCalc, double mergeWait, double thr) {
     OptimizeApplyResult result;
     std::vector<RangeReplacement> reps;
     for (const auto& rg : ranges) {
         std::vector<ScriptAction> built;
         const RangeApply st = forMerge
             ? BuildMergeReplacement(actions, rg.first, rg.last, waitCalc, mergeWait, built)
-            : BuildCompressReplacement(actions, rg.first, rg.last, thr, cw, built);
+            : BuildCompressReplacement(actions, rg.first, rg.last, thr, waitCalc, mergeWait, built);
         if (st == RangeApply::Applied) {
             reps.push_back({rg.first, rg.last, std::move(built)});
             ++result.applied;
@@ -297,18 +306,19 @@ OptimizeApplyResult MergeSelected(std::vector<ScriptAction>& actions,
         result.collectOk = false;
         return result;
     }
-    return ApplyOnRanges(actions, ranges, true, waitCalc, fixedWait, 0.0, 0.0);
+    return ApplyOnRanges(actions, ranges, true, waitCalc, fixedWait, 0.0);
 }
 
 OptimizeApplyResult CompressSelected(std::vector<ScriptAction>& actions,
-    const std::vector<char>& selected, double distanceThreshold, double compressWait) {
+    const std::vector<char>& selected, double distanceThreshold,
+    const std::string& waitCalc, double fixedWait) {
     std::vector<IndexRange> ranges;
     OptimizeApplyResult result;
     if (!CollectMoveWaitRanges(actions, selected, false, ranges, result.collectErr)) {
         result.collectOk = false;
         return result;
     }
-    return ApplyOnRanges(actions, ranges, false, "", 0.0, distanceThreshold, compressWait);
+    return ApplyOnRanges(actions, ranges, false, waitCalc, fixedWait, distanceThreshold);
 }
 
 OptimizeApplyResult MergeAllKeySplit(std::vector<ScriptAction>& actions,
@@ -318,9 +328,9 @@ OptimizeApplyResult MergeAllKeySplit(std::vector<ScriptAction>& actions,
 }
 
 OptimizeApplyResult CompressAllKeySplit(std::vector<ScriptAction>& actions,
-    double distanceThreshold, double compressWait) {
+    double distanceThreshold, const std::string& waitCalc, double fixedWait) {
     std::vector<char> selected(actions.size(), 1);
-    return CompressSelected(actions, selected, distanceThreshold, compressWait);
+    return CompressSelected(actions, selected, distanceThreshold, waitCalc, fixedWait);
 }
 
 }  // namespace recopt

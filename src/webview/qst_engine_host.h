@@ -30,6 +30,7 @@ bool IsDebugging();
 bool DebugPaused();
 bool DebugStepMode();
 int ExecutedSteps();
+void PlaybackProgress(int& current, int& total);
 std::string RunningScriptNameUtf8();
 /// 正在运行脚本的模式 0/1/2（非运行时 0）；真值来自引擎当前脚本，非 Web 缓存。
 int RunningMode();
@@ -73,6 +74,7 @@ bool CanOpenNativeScheduledTasks();
 void ReloadScheduledTasks();
 /// 间隔任务刚保存：重锚该任务的运行时计时（不写盘）。
 void TouchScheduledIntervalClock(const std::wstring& id);
+void TickScheduledTasks();
 void SetUiHost(HWND hwnd);
 std::wstring GlobalHotkeyText();
 void SetGlobalHotkey(const Hotkey& hk);

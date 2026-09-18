@@ -1,9 +1,10 @@
-﻿# QstProductLibs.cmake — qst_desktop_tools / qst_engine 源列表
+# QstProductLibs.cmake — qst_desktop_tools / qst_engine 源列表
 # 由顶层 CMakeLists.txt include。产品 Engine 宿主：`src/engine/engine_host_window.h`。
 
 set(QST_DESKTOP_TOOLS_SOURCES
     src/desktop_tools/desktop_tools.cpp
     src/screenshot_overlay.cpp
+    src/drag_pick_overlay.cpp
     src/match_overlay.cpp
     src/ocr_overlay.cpp
     src/crosshair_drag.cpp
@@ -11,6 +12,7 @@ set(QST_DESKTOP_TOOLS_SOURCES
     src/macro_debug_window.cpp
     src/tray_menu.cpp
     src/themed_popup_menu.cpp
+    src/desktop_tools/float_ball.cpp
     src/process_utils.cpp
     src/drawing.cpp
     src/render_device.cpp
@@ -36,6 +38,7 @@ set(QST_ENGINE_SOURCES
     src/clicker.cpp
     src/win32_ui_util.cpp
     src/macro_variables.cpp
+    src/var_compute.cpp
     src/find_image_ui_debug.cpp
     src/recorder.cpp
     src/recorder_timeline.cpp
@@ -46,6 +49,10 @@ set(QST_ENGINE_SOURCES
     src/app_theme.cpp
     src/agent_attachment.cpp
     src/ai_action_service.cpp
+    src/ai_locate_cache.cpp
+    src/ai_locate_verify.cpp
+    src/office_doc.cpp
+    src/mcp_server.cpp
     src/ai_action_lookahead.cpp
     src/ai_action_runtime.cpp
     src/ai_action_router.cpp
@@ -69,6 +76,7 @@ set(QST_ENGINE_SOURCES
     src/agent_web.cpp
     src/agent_webview.cpp
     src/macro_execute_tools.cpp
+    src/page_snapshot.cpp
     src/window_mode/window_mode_json.cpp
     src/window_mode/window_mode_preview.cpp
     src/engine/engine_runtime.cpp
@@ -84,7 +92,7 @@ set(QST_COMMON_LINK_LIBS
     window_mode_core
     script_core_common
     ${OpenCV_LIBS}
-    user32 gdi32 dwmapi d2d1 dwrite comdlg32 shell32 comctl32 imm32 msimg32
+    user32 gdi32 gdiplus dwmapi d2d1 dwrite comdlg32 shell32 comctl32 imm32 msimg32
     uxtheme ole32 oleaut32 propsys UIAutomationCore urlmon winhttp crypt32
     d3d11 dxgi windowsapp winmm
 )

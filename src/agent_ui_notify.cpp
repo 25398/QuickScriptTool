@@ -8,6 +8,8 @@ namespace {
 
 HWND g_mainWindow = nullptr;
 std::mutex g_logicMu;
+std::mutex g_touchMu;
+std::wstring g_intervalTouchId;
 std::function<void(const std::wstring&, const std::wstring&)> g_logicConvertNotify;
 
 }  // namespace
@@ -19,6 +21,22 @@ void SetAgentUiNotifyHwnd(HWND mainWindow) {
 void NotifyAgentScriptLibraryChanged() {
     if (g_mainWindow && IsWindow(g_mainWindow))
         PostMessageW(g_mainWindow, WM_AGENT_SCRIPT_LIBRARY_CHANGED, 0, 0);
+}
+
+void NotifyAgentScheduledTasksChanged(const std::wstring& touchIntervalId) {
+    {
+        std::lock_guard<std::mutex> lock(g_touchMu);
+        g_intervalTouchId = touchIntervalId;
+    }
+    if (g_mainWindow && IsWindow(g_mainWindow))
+        PostMessageW(g_mainWindow, WM_AGENT_SCRIPT_LIBRARY_CHANGED, 1, 0);
+}
+
+std::wstring ConsumeAgentIntervalTouchId() {
+    std::lock_guard<std::mutex> lock(g_touchMu);
+    std::wstring id;
+    id.swap(g_intervalTouchId);
+    return id;
 }
 
 void SetLogicConvertUiNotify(

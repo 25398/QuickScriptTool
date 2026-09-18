@@ -33,11 +33,12 @@ build\Release\ScheduledTaskSelfTest.exe --json
 
 ## 硬性约定
 
-1. Tick 由 1s `SetTimer` 驱动 — 按**秒**匹配，勿要求毫秒精确。  
+1. Tick 由 1s 定时驱动 — 按**秒**匹配，勿要求毫秒精确。产品 Web 壳里 headless 引擎窗是隐藏的，**不能只靠该窗 `SetTimer`/`WM_TIMER`**（会被 coalescing 饿死，间隔任务表现为启用了却永远不跑）。实际 Tick 来自可见主窗 `kStatusTimerId` + Timer Queue 投递 `WM_APP_SCHEDULED_TICK`。  
 2. 同一秒内一次 Tick 须触发**所有**到期任务。  
 3. Agent create/update/delete 须持久化并通知主窗 `Reload`。  
 4. `createScheduledTask` 需要真实 `targetFile`；weekly 要 `weekDays`；custom 要日期字段；interval 要大于 0 的时长（`hour`/`minute`/`second`）。  
 5. **自检禁止写产品 `scheduled_tasks.json`**：`TickAt` 对 Custom 会 `Save()`；自检须 `SetScheduledTasksFilePathForTest` 隔离到 `scheduled_tasks.selftest.json`。
+6. 专业模式把脚本拖进子文件夹后，任务 `filePath` 仍可能是旧根路径。运行时须 `ResolveLibraryScriptPath`（按文件名在 `scripts/` / `recordings/` 子树找回）；`Reload` 会改写并落盘；拖拽当时应 `RetargetScheduledTaskFilePaths`。中文文件夹名须用 Win32 完整路径判定（勿只用 `std::filesystem::weakly_canonical`，可能带 `\\?\` 前缀导致“文件在库外”）。嵌套 `runMacro` / `mousePlayback` 同理。
 
 ## 相关路径
 

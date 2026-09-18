@@ -65,7 +65,7 @@ AI 生成时至少必须写出 type 及该类型所需字段，其余可填默�
 
   remark      备注（步骤说明、测试提示写这里；禁止用 text 覆盖动作名）
 
-  indent      缩进层级：0=顶层；if/loop/defineBlock 的子动作 = 父级 indent+1
+  indent      缩进层级：0=顶层；if/loop/defineBlock/watchImage 的子动作 = 父级 indent+1
 
   no / text   由 buildScriptActions / createMacroScript 自动生成，禁止手写
 
@@ -73,7 +73,7 @@ AI 生成时至少必须写出 type 及该类型所需字段，其余可填默�
 
 缩进规则：
 
-  loop / if / else / defineBlock 是容器，其内部动作 indent 比容器大 1。
+  loop / if / else / defineBlock / watchImage 是容器，其内部动作 indent 比容器大 1。
 
   推荐用 children 嵌套子动作（像写代码），buildScriptActions 会展开为 indent。
 
@@ -123,9 +123,11 @@ type 必须为 "findImage"。
 
   perfectMatch      1=完美匹配（粗定位+邻域精修+每通道≤1 像素终审；通过 score=100）
 
-  searchFullScreen  1=全屏搜索，0=区域搜索（此时需 searchX1/Y1/X2/Y2）
+  searchFullScreen  1=全屏搜索，0=区域搜索（此时需 searchX1/Y1/X2/Y2）。
+                    窗口/后台窗口模式忽略此项，始终在整个目标窗口内搜索。
 
-  searchX1/Y1/X2/Y2 搜索区域坐标（searchFullScreen=0 时有效）；followUp=3 无模板时为截图区域
+  searchX1/Y1/X2/Y2 搜索区域坐标（searchFullScreen=0 时有效）；followUp=3 无模板时为截图区域。
+                    窗口/后台窗口模式忽略绝对选取区；根据图片选取区域用 imageRegionX1~Y2。
 
   imageScaleMin     最小缩放，默认 1.0
 
@@ -137,7 +139,8 @@ type 必须为 "findImage"。
 
   offsetX, offsetY  点击/移动时的偏移（followUp=0或1 时有效）
 
-  findTimeExpr      找图时限（秒，可小数）。0=只找一次；负数（如 -1）=直到找到；可填变量名；followUp=2/3 强制 0
+  findTimeExpr      找图时限（秒，可小数）。0=只找一次；负数（如 -1）=直到找到；可填变量名。
+                    点击/移动/保存匹配度，以及「保存图片且有模板」都生效；保存图片无模板（纯截屏）忽略。
 
   findUntilFound    OCR 文字查找：1=循环直到找到（找图动作请用 findTimeExpr）
 
@@ -229,9 +232,20 @@ type 必须为 "findImage"。
 
   mouseClick
 
+★ 找图监视是独立顶层容器 type=watchImage（主流程跳过；参数见 section=flow 或 lookupMacroAction type=watchImage），不要改成 findImage。
+
 )";
 
-
+const wchar_t* kRefMultiMatch = LR"(【多图匹配 multiMatch】
+type 必须为 "multiMatch"。独立叶子动作，不要改成 findImage，也不要用 children。
+imagePaths[] 必填（最多 8 张）；imagePath 镜像首张。每张可 imageUseVar / imageUseVars[]（与找图相同的变量图）。
+multiMatchMode：0=多图择一（按列表顺序，第一张过阈值即停）；1=一图多处（只用第一张，NMS 多匹配，最多 multiMatchMax 处，默认 20）。
+切模式不删图。第一版不做「每张图都找齐所有点」。
+followUp：0 点击（一图多处=依次点击，间隔 duration 默认 0.05）；1 移动到第一处；2 保存匹配度。无保存图片。
+findTimeExpr 与找图一样：等到至少一处；等待中会触发找图监视。
+变量：{matchRet[0]} 第一处是否命中；{matchRet[0].x} 左上角 X（还有 .y/.x1/.y1/.cx/.cy/.matchData/.hit/.hitName）；{matchRet.count} 命中个数。
+{matchRet[n]} 是下拉代指，运行时字面 n 不解析。
+)";
 
 const wchar_t* kRefTextRecognition = LR"(【文字识别 textRecognition】
 
@@ -269,7 +283,7 @@ ocrFollowUp（后续操作，与找图同理）：
 
   ocrRegionByImage  1=根据找图锚点确定 OCR 区域（需 imagePath + imageRegionX1~Y2）
 
-  ocrDigitsOnly     1=纯数字模式
+  ocrDigitsOnly     1=纯数字（小框整行识别；全图缩小检测 + 英文数字识别头，跳过方向分类）
 
   searchFullScreen  找图/OCR 搜索区是否全屏（绝对坐标）
 
@@ -363,7 +377,8 @@ createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow
 注意：
   · 窗口模式在独立宏桌面执行，用户桌面光标/焦点不受影响
   · 后台窗口模式在用户桌面操作已绑定窗口，不抢焦点
-  · 坐标 x/y、searchX1..Y2 在窗口模式下为客户区坐标
+  · 坐标 x/y 在窗口模式下为客户区坐标；searchX1..Y2 在窗口/后台窗口模式忽略（整窗搜索）
+  · 「根据图片选取区域」在窗口内命中后再按 imageRegion 二次筛选
   · writeScript / createMacroScript 创建脚本宏时必须写入 windowMode（可为 enabled=0）
   · 默认模式脚本应写入 breakoutTimeSeconds（0 表示禁用）；未写视为 0
 
@@ -429,6 +444,28 @@ mouseClick / mouseDown / mouseUp:
 
 
 
+mouseDrag:
+
+  button            left(默认) / right / middle / x1 / x2
+
+  x, y              起点（绝对屏幕坐标；找图定位时为相对图中心偏移，可负）
+
+  endX, endY        终点（同上）
+
+  randomX/Y / randomEndX/Y  起点/终点随机像素
+
+  duration          拖拽时长（按下到松开），默认 0.3；不是点击的重复间隔
+
+  randomDuration    拖拽时长上的随机附加秒数
+
+  holdLeftCtrl 等   修饰键 0/1
+
+  imageLocate       1=找图定位：先找图，起点/终点相对图中心；未找到则跳过本步
+
+  找图定位时还需 imagePath、searchFullScreen/searchX1~Y2、matchThreshold、findTimeExpr、缩放
+
+
+
 scrollWheel:
 
   scrollVertical    1=垂直（默认）
@@ -481,7 +518,7 @@ hotkeyShortcut:
 quickInput:
 
   inputText         要输入的文本
-  parseEscapes      1=解析 \n \r \t \\；缺省 0=按字面输出（Windows 路径无需再关）
+  parseEscapes      1=解析文本和变量中的 \n \r \t \\；缺省 0=按字面（变量里的换行/Tab 丢掉）
   charInterval      字符间隔秒数，默认 0.01
 
   clickCount/duration/randomDuration  整段输入的重复间隔（非字间；字间用 charInterval）
@@ -532,6 +569,40 @@ defineBlock / runBlock:
 
 
 
+watchImage:
+
+  imagePath         监视用图（主流程跳过本容器）
+
+  resumeAfterWatch  1=中断后从原处重跑该次找图；0=跳到本监视容器后的主流程
+
+  watchMode         0/action=动作监视（任意找图等待时顺带搜索）；1/time=时间监视（按间隔轮询）
+
+  watchPollSeconds  时间监视间隔秒，默认 1，最小 0.05
+
+  children[]        命中后执行。子树里若执行了跳转（pending goto）则以跳转为准
+
+
+
+varCompute:
+
+  computeCode       类 C 源码（int/double/string、if/else、for/while）
+
+  行末分号可省略（换行即新语句）
+
+  字符串用 "+" 或 '+'（裸写 + 是加法，不能拿来和 OCR 符号比较）
+
+  split(s, "/") 按分隔符拆成数组；parts[0] / parts[-1] / parts.count（或 .length）
+
+  split(s, "/", 2) 最多 2 段，最后一段保留剩余内容；split(s, "") 按字符拆
+
+  toInt("123") / toString(x) / trim(s)
+
+  局部变量默认销毁；末尾 return a, b 导出给后续动作
+
+  ctrl:Clipboard()  为剪贴板文本或文件路径字符串（不是条件里的 0/1）
+
+
+
 runMacro / mousePlayback:
 
   blockName         目标脚本显示名（mousePlayback 界面名=运行录制回放）
@@ -540,6 +611,9 @@ runMacro / mousePlayback:
 
   clickCount/duration/randomDuration  整段重复次数与两遍之间的间隔（count=1 不等待）
   playbackSpeed     仅 mousePlayback：嵌套录制回放倍速 0.25~4，缺省 1；不叠加设置全局倍速
+  useMode           0默认 / 1窗口 / 2后台窗口 / 3继承（缺省 3，跟当前主宏模式走）
+  breakoutTimeSeconds  仅默认模式脱离时间（秒，0=禁用）
+  nestedWindowMode  窗口/后台窗口绑窗配置（selectMethod/targetExePath/windowClassName 等）
 
 
 
@@ -833,6 +907,14 @@ AI 输出（aiTextAnalysis / aiImageAnalysis）：
 
 
 
+变量运算（varCompute 的 return a, b）：
+
+  {a} / {b} → 导出的脚本变量（未 return 的局部名不可用）
+
+  运算源码里写裸名 a，不要写成 {a}
+
+
+
 内置：
 
   ${ctrl:CurLoops()} → 宏从头执行的第几次
@@ -1001,15 +1083,16 @@ const wchar_t* kRefMistakes = LR"(【常见 AI 生成错误 — 务必避免】
 
 const wchar_t* kRefActions = LR"(【动作类型索引】
 
-基础：wait, moveMouse, moveMouseRelative, mouseClick, mouseDown, mouseUp,
+基础：wait, moveMouse, moveMouseRelative, mouseClick, mouseDrag, mouseDown, mouseUp,
 
       keyClick, keyDown, keyUp, quickInput, hotkeyShortcut,
 
       scrollWheel
 
-流程：loop, endLoop, defineBlock, runBlock, if, else, stopMacro, goto
+流程：loop, endLoop, defineBlock, runBlock, if, else, stopMacro, goto, varCompute
 
-识别：findImage, textRecognition
+识别：findImage, multiMatch（多图择一 / 一图多处）, watchImage（watchMode=动作监视/时间监视 + watchPollSeconds）, textRecognition,
+      getColor, findColor, colorMatch（均可 imageLocate=找图定位）
 
 系统：openWebpage, openFile, runProgram, closeProgram,
 
@@ -1073,6 +1156,9 @@ runMacro / mousePlayback（运行另一个脚本/录制；mousePlayback 界面�
   blockName       显示名（可选）
   clickCount/duration/randomDuration  整段重复与两遍之间的间隔（count=1 不等待）
   playbackSpeed   仅 mousePlayback：0.25~4 缺省 1；嵌套录制只用此字段，不叠加设置全局倍速
+  useMode         0默认/1窗口/2后台窗口/3继承（缺省3=跟主宏走）
+  breakoutTimeSeconds 仅默认模式脱离秒数
+  nestedWindowMode 窗口/后台窗口绑窗对象（同脚本级 windowMode 字段）
 
 runBlock（运行宏指令块）:
   blockName       块名
@@ -1104,7 +1190,7 @@ std::wstring BuildFullReference() {
 
     return std::wstring(L"【脚本助手技术参考 — 完整版】\n")
 
-        + kRefFormat + kRefActions + kRefFindImage + kRefTextRecognition + kRefWindowMode
+        + kRefFormat + kRefActions + kRefFindImage + kRefMultiMatch + kRefTextRecognition + kRefWindowMode
 
         + kRefMouseKeyboard + kRefFlow + kRefAi + kRefConditions + kRefVariables
 
@@ -1125,7 +1211,7 @@ std::wstring AgentReferenceGet(const std::wstring& section) {
     if (key.empty() || key == L"catalog" || key == L"index" || key == L"list")
 
         return std::wstring(L"## Script Reference 目录（请指定 section，勿一次 all）\n")
-            + L"- format / actions / findImage / ocr / windowMode / breakoutTime\n"
+            + L"- format / actions / findImage / multiMatch / ocr / windowMode / breakoutTime\n"
             + L"- mouse / system / flow / ai / conditions / variables / patterns / mistakes\n"
             + L"调用：readScriptReference({section:\"findImage\"})";
 
@@ -1154,6 +1240,10 @@ std::wstring AgentReferenceGet(const std::wstring& section) {
 
         return kRefFindImage;
 
+    if (key == L"multiMatch" || key == L"多图匹配" || key == L"multimatch")
+
+        return kRefMultiMatch;
+
     if (key == L"ocr" || key == L"textRecognition" || key == L"文字识别")
 
         return kRefTextRecognition;
@@ -1170,7 +1260,9 @@ std::wstring AgentReferenceGet(const std::wstring& section) {
 
         return kRefMouseKeyboard;
 
-    if (key == L"flow" || key == L"流程")
+    if (key == L"flow" || key == L"流程"
+        || key == L"watchImage" || key == L"找图监视"
+        || key == L"varCompute" || key == L"变量运算")
 
         return kRefFlow;
 
@@ -1265,15 +1357,22 @@ const wchar_t* kSkillScriptStrategy = LR"(【脚本生成策略 — readAgentSki
    再用 createMacroScript 保存到 scripts（默认不分类，用户指明目录时传 folder）；
    禁止直接在 writeScript 或回复里手写动作 JSON。
 2. 必填参数（缺了会构建失败）：keyClick/keyDown/keyUp→keyText；quickInput→inputText；
-   wait→duration；findImage→imagePath；textRecognition→imagePath 或 ocrSearchText；
+  wait→duration；findImage/watchImage→imagePath；textRecognition→imagePath 或 ocrSearchText；
    if→conditionExpr；goto→gotoStepExpr；defineBlock/runBlock→blockName；
-   runMacro/mousePlayback→targetPath；openFile/runProgram/openWebpage/closeProgram/
+   varCompute→computeCode；runMacro/mousePlayback→targetPath；openFile/runProgram/openWebpage/closeProgram/
    activateWindow→targetPath；AI 动作→aiPrompt。
    runMacro/runBlock/mousePlayback 可选 clickCount/duration/randomDuration（整段重复；
    间隔为两遍之间；count=1 不等待）。mousePlayback 另可选 playbackSpeed（0.25~4，缺省 1；
-   嵌套录制只用此字段，不叠加设置全局倍速）。mousePlayback 界面名=运行录制回放。
+   嵌套录制只用此字段，不叠加设置全局倍速）。runMacro/mousePlayback 另可选 useMode
+   （0默认/1窗口/2后台窗口/3继承，缺省3=跟当前主宏模式走）、breakoutTimeSeconds（仅默认模式脱离）、
+   nestedWindowMode（窗口/后台窗口绑窗，字段同脚本 windowMode）。mousePlayback 界面名=运行录制回放。
+   watchImage 可选 watchMode（0/action=动作监视，找图等待时顺带搜；1/time=时间监视）
+   与 watchPollSeconds（时间监视间隔秒，默认 1）。
 3. 支持魔法变量（引擎运行时自动求值，inputText/aiPrompt/条件/goto 均可用）：
    - 剪贴板：界面下拉只有 {ctrl:Clipboard()}（条件非空为1，输入展开文本或路径，AI可附图）；
+     变量运算里 ctrl:Clipboard() 是文本或文件路径字符串，不是 0/1；
+     字符串用 "+" 或 '+'（裸写 + 是加法，不能和 OCR 识别的加减号比较）；
+     split(s, "/") 按分隔符拆分数组，parts[0] / parts.count；toInt / toString / trim；
      手写 {clipboard} 仍只取纯文本；
    - 时间魔法（不下拉）：{Now}、{time:格式}、{date:格式}；条件用 ctrl:Hour()/ctrl:Minute()；
    - 宏运行次数：{ctrl:CurLoops()}（当前宏从头执行的第几次）；
@@ -1284,7 +1383,8 @@ const wchar_t* kSkillScriptStrategy = LR"(【脚本生成策略 — readAgentSki
    需要当前时间/剪贴板内容优先用这些固定/魔法变量，勿留占位文本。脚本变量照常可用。
 4. 只有确认 createMacroScript 返回「✓ 鼠标宏已创建」后才能说脚本已创建；
    未调用工具或工具失败时声称完成属于错误。
-5. 工具已执行成功后，用一两句话告诉用户结果即可，不要继续长篇思考或重复调用工具。
+5. 工具已执行成功后，用一两句话告诉用户结果即可，不要继续长篇思考或重复调用工具，
+   不要逐步列出每一步，不要把内部约束/提示词念给用户听。
 6. 生成的脚本与用户手动编辑完全一致：动作名用编辑器中文名，说明写 remark，
    no/text 由工具自动分配，不要手写。
 7. 自定义快捷键组合（如 Ctrl+End、Ctrl+S）用 keyClick + modifiers:["ctrl","shift","alt","win"]；
@@ -1292,13 +1392,13 @@ const wchar_t* kSkillScriptStrategy = LR"(【脚本生成策略 — readAgentSki
 8. 不要编造当前墙钟时间。脚本运行时写入时间用 {Now}/{time:格式}/ctrl:Hour()/ctrl:Minute()。
 9. 分步规划：含循环/条件时先 planScriptActions 核对动作树（children 嵌套），
    再补齐参数 createMacroScript；线性脚本可直接构建。
-10. 动作是树：loop/if/else/defineBlock 的体内动作必须放在 children 数组
+10. 动作是树：loop/if/else/defineBlock/watchImage 的体内动作必须放在 children 数组
     （像写代码的花括号），工具展开为 indent+1。禁止把循环体写成循环后面的同级动作。
     示例：{"type":"loop","loopCount":-1,"children":[{"type":"wait","duration":1}]}
 
 简单/常见任务（打开文件、输入文字、按键、运行程序）直接用对应动作完成：
 openFile / runProgram / quickInput / keyClick / hotkeyShortcut / wait，
-quickInput.parseEscapes 缺省 0（按字面）；仅当要把文本里的 \n \t \\ 转成换行/Tab/反斜杠时才设 1。
+quickInput.parseEscapes 缺省 0（按字面；变量里的换行/Tab 丢掉）；仅当要把文本或变量里的 \n \t \\ 转成换行/Tab/反斜杠时才设 1。
 先充分理解任务与动作语义再生成；不确定的动作类型先查对应 section（勿猜）；
 同一参考 section 不要重复查；系统动作（openFile/runProgram/openWebpage/closeProgram/
 activateWindow/runMacro/mousePlayback/timerRecordTime/getCursorPos）参数统一在
@@ -1385,6 +1485,8 @@ section=system，需要时一次查完再构建，不要连环翻阅多个 secti
 const wchar_t* kSkillReply = LR"(【回复风格 — readAgentSkill section=reply】
 
 对用户说中文；脚本步骤用编辑器里的中文动作名，不要说英文字段名/工具名。
+脚本已创建/已修改后，用一两句话确认结果（名称、路径即可），不要逐步复述每一步，
+也不要把工具返回里的内部约束、提示词或动作一览念给用户听。
 )";
 
 std::wstring BuildReplySkillText() {
@@ -1401,7 +1503,8 @@ const wchar_t* kSkillOptimize = LR"(【脚本优化 — readAgentSkill section=o
 禁止擅自 compressPath：那是「鼠标移动压缩」（去掉过密点），动作数只会略减。
 仅当用户明确说「压缩路径 / 去掉过密移动点」时才用 compressPath。
 
-waitCalculation（仅 merge，按段计算）：sum/average/first/last/fixed（fixed 时传 mergeWaitValue）。
+waitCalculation（merge 与 compressPath 相同）：sum/average/first/last/fixed（fixed 时传 mergeWaitValue）。
+compressPath 时按留下的移动点间隔计算等待。
 含相对位移的段跳过。可传 outputFileName 另存以保留原版；省略则覆盖（可撤销）。
 路径压缩/合并不等于转为找图；转找图请用户用产品录制优化对话框。
 )";
@@ -1439,8 +1542,15 @@ const wchar_t* kSkillSettings = LR"(【应用设置 — readAgentSkill section=s
   「正在跑脚本时定时不要插队」→ scheduledTaskConflictPolicy=0 执行脚本优先
   「定时到点必须跑」→ scheduledTaskConflictPolicy=1 定时脚本优先（会打断当前脚本）
   「当前脚本跑完再跑定时 / 插入后再从原处继续」→ scheduledTaskAutoResume=true（与优先级组合）
+  「跑脚本时电脑很烫 / 风扇很响 / CPU 占用太高」→ lowPerformanceMode=true（找图限 1 线程、
+      回放不提优先级也不抬全系统定时器分辨率、减少注入自旋；代价是节奏可有 ~1ms 抖动、单帧找图变慢）
+  「脚本是不是找全屏太慢了」→ 先看能不能把 findImage 的搜索区域从全屏收成目标附近的小区域
+      （全屏单次找图约 60~90ms，区域找图通常几毫秒），再考虑 lowPerformanceMode
+  「找图还是太慢 / 想要更快」→ findImageGpuAccel=true：面积 ≥500k 像素（约 900×560 以上）的找图
+      走显卡 OpenCL，实测约快 3 倍；小区域找图自动仍走 CPU（实测打平，不白付传输开销）；
+      机器没有 OpenCL 设备时自动忽略、不会报错。注意它与 lowPerformanceMode 冲突时后者优先
 
-生效：回放类下轮循环生效；其他下次启动宏生效。
+生效：回放类下轮循环生效；其他下次启动宏生效。lowPerformanceMode 保存后立即生效（无需重启）。
 )";
 
 const wchar_t* kSkillConversation = LR"(【对话编辑与重发 — readAgentSkill section=conversation】

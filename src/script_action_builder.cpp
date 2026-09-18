@@ -64,6 +64,18 @@ double JsonDouble(const json& p, const char* key, double def = 0.0) {
     return def;
 }
 
+int ParseWatchModeJson(const json& p) {
+    const std::wstring modeStr = JsonWString(p, "watchMode");
+    if (modeStr == L"time" || modeStr == L"timed" || modeStr == L"interval"
+        || modeStr == L"1" || modeStr == L"true") {
+        return 1;
+    }
+    if (modeStr == L"action" || modeStr == L"0" || modeStr == L"false") {
+        return 0;
+    }
+    return JsonInt(p, "watchMode", 0) != 0 ? 1 : 0;
+}
+
 bool ParseActionType(const std::wstring& type, ActionType& out) {
     static const struct { const wchar_t* name; ActionType t; } kMap[] = {
         {L"moveMouse", ActionType::MoveMouse},
@@ -73,6 +85,7 @@ bool ParseActionType(const std::wstring& type, ActionType& out) {
         {L"relativeMouseMove", ActionType::MoveMouseRelative},
         {L"wait", ActionType::Wait},
         {L"mouseClick", ActionType::MouseClick},
+        {L"mouseDrag", ActionType::MouseDrag},
         {L"mouseDown", ActionType::MouseDown},
         {L"mouseUp", ActionType::MouseUp},
         {L"keyClick", ActionType::KeyClick},
@@ -88,6 +101,9 @@ bool ParseActionType(const std::wstring& type, ActionType& out) {
         {L"runMacro", ActionType::RunMacro},
         {L"mousePlayback", ActionType::MousePlayback},
         {L"findImage", ActionType::FindImage},
+        {L"multiMatch", ActionType::MultiMatch},
+        {L"watchImage", ActionType::WatchImage},
+        {L"varCompute", ActionType::VarCompute},
         {L"textRecognition", ActionType::TextRecognition},
         {L"if", ActionType::If},
         {L"else", ActionType::Else},
@@ -132,10 +148,11 @@ int ParseFollowUpValue(const json& p, const char* intKey, int def = 0) {
     if (p.contains("followUp")) {
         if (p["followUp"].is_string()) {
             const std::wstring s = FromUtf8(p["followUp"].get<std::string>());
-            if (s == L"click") return 0;
-            if (s == L"move") return 1;
+            if (s == L"click" || s == L"clickEach" || s == L"clickAll") return 0;
+            if (s == L"move" || s == L"moveFirst") return 1;
             if (s == L"saveVar" || s == L"saveVariable" || s == L"save"
-                || s == L"saveMatch" || s == L"saveMatchScore") return 2;
+                || s == L"saveMatch" || s == L"saveMatchScore"
+                || s == L"saveAll" || s == L"saveMatches") return 2;
             if (s == L"saveImage" || s == L"saveImg") return 3;
         } else if (p["followUp"].is_number_integer()) {
             return std::clamp(p["followUp"].get<int>(), 0, 3);
@@ -144,6 +161,29 @@ int ParseFollowUpValue(const json& p, const char* intKey, int def = 0) {
     if (intKey && p.contains(intKey))
         return std::clamp(JsonInt(p, intKey, def), 0, 3);
     return def;
+}
+
+void ApplyImageLocateFields(ScriptAction& action, const json& p, bool includeSearchRegion) {
+    action.imageLocate = JsonBool(p, "imageLocate");
+    if (!action.imageLocate) return;
+    if (includeSearchRegion) {
+        action.searchX1 = JsonInt(p, "searchX1");
+        action.searchY1 = JsonInt(p, "searchY1");
+        action.searchX2 = JsonInt(p, "searchX2");
+        action.searchY2 = JsonInt(p, "searchY2");
+        action.searchFullScreen = JsonBool(p, "searchFullScreen", true);
+    }
+    action.imageUseVar = JsonBool(p, "imageUseVar");
+    action.imagePath = Trim(JsonWString(p, "imagePath"));
+    action.matchThreshold = std::clamp(JsonDouble(p, "matchThreshold", 65.0), 1.0, 100.0);
+    action.perfectMatch = JsonBool(p, "perfectMatch");
+    action.imageScaleMin = std::max(0.1, JsonDouble(p, "imageScaleMin", 1.0));
+    action.imageScaleMax = std::max(action.imageScaleMin,
+        JsonDouble(p, "imageScaleMax", action.imageScaleMin));
+    action.imageScale = JsonDouble(p, "imageScale",
+        (action.imageScaleMin + action.imageScaleMax) * 0.5);
+    action.findTimeExpr = JsonWString(p, "findTimeExpr", L"0");
+    if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
 }
 
 void ApplyModifierFields(ScriptAction& action, const json& p) {
@@ -173,10 +213,18 @@ void ApplyModifierFields(ScriptAction& action, const json& p) {
 UINT ResolveKeyVk(const json& p, const std::wstring& keyText) {
     if (p.contains("keyVk") && p["keyVk"].is_number_integer()) {
         const int v = static_cast<int>(p["keyVk"].get<int64_t>());
-        return v > 0 ? static_cast<UINT>(v) : 0;
+        const UINT raw = v > 0 ? static_cast<UINT>(v) : 0;
+        const UINT normalized = NormalizeScriptKeyVk(raw, keyText);
+        if (normalized) return normalized;
+        if (raw && raw < 256) return raw;
+        // keyVk=0 或误存的超范围码：继续按 keyText 解析
     }
     if (keyText.empty()) return 0;
-    if (keyText.size() == 1) return static_cast<UINT>(towupper(keyText[0]));
+    if (keyText.size() == 1) {
+        if (const UINT named = VirtualKeyFromKeyText(keyText)) return named;
+        const UINT ch = static_cast<UINT>(towupper(keyText[0]));
+        return ch < 256 ? ch : 0;
+    }
 
     std::wstring upper = keyText;
     for (auto& c : upper) {
@@ -355,6 +403,24 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         ApplyRepeatTiming(action, p, 1, 0.01);
         break;
 
+    case ActionType::MouseDrag:
+        action.button = ParseButton(p);
+        action.x = JsonInt(p, "x");
+        action.y = JsonInt(p, "y");
+        action.endX = JsonInt(p, "endX");
+        action.endY = JsonInt(p, "endY");
+        action.randomX = std::max(0, JsonInt(p, "randomX"));
+        action.randomY = std::max(0, JsonInt(p, "randomY"));
+        action.randomEndX = std::max(0, JsonInt(p, "randomEndX"));
+        action.randomEndY = std::max(0, JsonInt(p, "randomEndY"));
+        ApplyModifierFields(action, p);
+        action.duration = std::max(0.0, JsonDouble(p, "duration", 0.3));
+        action.randomDuration = std::max(0.0, JsonDouble(p, "randomDuration", 0.0));
+        action.timingUs = 0;
+        action.clickCount = 1;
+        ApplyImageLocateFields(action, p, true);
+        break;
+
     case ActionType::MouseDown:
     case ActionType::MouseUp:
         action.button = ParseButton(p);
@@ -457,6 +523,25 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
             action.playbackSpeed = quickscript::ClampPlaybackSpeed(
                 JsonDouble(p, "playbackSpeed", 1.0));
         }
+        if (p.contains("useMode") && p["useMode"].is_string()) {
+            action.useMode = NestedUseModeFromText(FromUtf8(p["useMode"].get<std::string>()));
+        } else if (p.contains("useMode")) {
+            action.useMode = NormalizeNestedUseMode(JsonInt(p, "useMode", kNestedUseModeInherit));
+        } else {
+            action.useMode = kNestedUseModeInherit;
+        }
+        action.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
+            JsonDouble(p, "breakoutTimeSeconds", 0.0));
+        if (p.contains("nestedWindowMode") && p["nestedWindowMode"].is_object()) {
+            action.nestedWindowMode = windowmode::ParseWindowModeConfigObject(
+                FromUtf8(p["nestedWindowMode"].dump()), false);
+        }
+        if (action.useMode == kNestedUseModeWindow || action.useMode == kNestedUseModeBackground) {
+            action.nestedWindowMode.enabled = true;
+            action.nestedWindowMode.executionKind = (action.useMode == kNestedUseModeBackground)
+                ? windowmode::WindowModeExecutionKind::BackgroundWindow
+                : windowmode::WindowModeExecutionKind::HiddenDesktop;
+        }
         break;
 
     case ActionType::FindImage: {
@@ -488,17 +573,113 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
             action.findImageFollowUp == 3 ? L"image" : L"matchRet";
         action.matchVarName = Trim(JsonWString(p, "matchVarName", defaultMatchVar));
         if (action.matchVarName.empty()) action.matchVarName = defaultMatchVar;
-        if (action.findImageFollowUp == 2 || action.findImageFollowUp == 3) {
+        action.findTimeExpr = JsonWString(p, "findTimeExpr", L"0");
+        if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
+        if (action.findImageFollowUp == 3 && action.imagePath.empty()) {
             action.findTimeExpr = L"0";
-        } else {
-            action.findTimeExpr = JsonWString(p, "findTimeExpr", L"0");
-            if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
         }
         action.duration = 0.0;
         action.timingUs = 0;
         action.randomDuration = 0.0;
         break;
     }
+
+    case ActionType::MultiMatch: {
+        action.searchX1 = JsonInt(p, "searchX1");
+        action.searchY1 = JsonInt(p, "searchY1");
+        action.searchX2 = JsonInt(p, "searchX2");
+        action.searchY2 = JsonInt(p, "searchY2");
+        action.searchFullScreen = JsonBool(p, "searchFullScreen", true);
+        action.imageUseVar = JsonBool(p, "imageUseVar");
+        action.imagePaths.clear();
+        action.imageUseVars.clear();
+        if (p.contains("imagePaths") && p["imagePaths"].is_array()) {
+            for (const auto& item : p["imagePaths"]) {
+                if (!item.is_string()) continue;
+                action.imagePaths.push_back(Trim(FromUtf8(item.get<std::string>())));
+            }
+        }
+        if (action.imagePaths.empty()) {
+            const std::wstring one = Trim(JsonWString(p, "imagePath"));
+            if (!one.empty()) action.imagePaths.push_back(one);
+        }
+        if (p.contains("imageUseVars") && p["imageUseVars"].is_array()) {
+            for (const auto& item : p["imageUseVars"]) {
+                int flag = 0;
+                if (item.is_boolean()) flag = item.get<bool>() ? 1 : 0;
+                else if (item.is_number()) flag = item.get<int>() != 0 ? 1 : 0;
+                action.imageUseVars.push_back(static_cast<char>(flag));
+            }
+        }
+        action.multiMatchMode = std::clamp(JsonInt(p, "multiMatchMode", 0), 0, 1);
+        action.multiMatchMax = std::clamp(JsonInt(p, "multiMatchMax", kMultiMatchMaxHits),
+            1, kMultiMatchMaxHits);
+        action.multiMatchSort = std::clamp(JsonInt(p, "multiMatchSort", 0), 0, 1);
+        action.matchThreshold = std::clamp(JsonDouble(p, "matchThreshold", 65.0), 1.0, 100.0);
+        action.perfectMatch = JsonBool(p, "perfectMatch");
+        action.imageScaleMin = std::max(0.1, JsonDouble(p, "imageScaleMin", 1.0));
+        action.imageScaleMax = std::max(action.imageScaleMin,
+            JsonDouble(p, "imageScaleMax", action.imageScaleMin));
+        action.imageScale = JsonDouble(p, "imageScale",
+            (action.imageScaleMin + action.imageScaleMax) * 0.5);
+        action.findImageFollowUp = ParseFollowUpValue(p, "findImageFollowUp", 0);
+        if (action.findImageFollowUp > 2) action.findImageFollowUp = 2;
+        action.offsetX = JsonInt(p, "offsetX");
+        action.offsetY = JsonInt(p, "offsetY");
+        action.matchVarName = Trim(JsonWString(p, "matchVarName", L"matchRet"));
+        if (action.matchVarName.empty()) action.matchVarName = L"matchRet";
+        action.findTimeExpr = JsonWString(p, "findTimeExpr", L"0");
+        if (action.findTimeExpr.empty()) action.findTimeExpr = L"0";
+        action.button = ParseButton(p);
+        action.duration = JsonDouble(p, "duration", 0.05);
+        if (action.duration < 0.0) action.duration = 0.0;
+        action.randomDuration = JsonDouble(p, "randomDuration", 0.0);
+        if (action.randomDuration < 0.0) action.randomDuration = 0.0;
+        action.timingUs = 0;
+        NormalizeMultiMatchFields(action);
+        break;
+    }
+
+    case ActionType::WatchImage: {
+        action.searchX1 = JsonInt(p, "searchX1");
+        action.searchY1 = JsonInt(p, "searchY1");
+        action.searchX2 = JsonInt(p, "searchX2");
+        action.searchY2 = JsonInt(p, "searchY2");
+        action.searchFullScreen = JsonBool(p, "searchFullScreen", true);
+        action.imageUseVar = JsonBool(p, "imageUseVar");
+        action.imagePath = Trim(JsonWString(p, "imagePath"));
+        action.matchThreshold = std::clamp(JsonDouble(p, "matchThreshold", 65.0), 1.0, 100.0);
+        action.perfectMatch = JsonBool(p, "perfectMatch");
+        action.imageScaleMin = std::max(0.1, JsonDouble(p, "imageScaleMin", 1.0));
+        action.imageScaleMax = std::max(action.imageScaleMin,
+            JsonDouble(p, "imageScaleMax", action.imageScaleMin));
+        action.imageScale = JsonDouble(p, "imageScale",
+            (action.imageScaleMin + action.imageScaleMax) * 0.5);
+        action.resumeAfterWatch = JsonBool(p, "resumeAfterWatch", true);
+        {
+            action.watchMode = ParseWatchModeJson(p);
+            double poll = JsonDouble(p, "watchPollSeconds", 0.0);
+            if (!(poll > 0.0)) poll = JsonDouble(p, "watchPollInterval", 1.0);
+            if (!(poll > 0.0)) poll = 1.0;
+            if (poll < 0.05) poll = 0.05;
+            if (poll > 3600.0) poll = 3600.0;
+            action.watchPollSeconds = poll;
+        }
+        action.indent = 0;
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
+        break;
+    }
+
+    case ActionType::VarCompute:
+        action.computeCode = JsonWString(p, "computeCode");
+        if (action.computeCode.empty())
+            action.computeCode = JsonWString(p, "inputText");
+        action.duration = 0.0;
+        action.timingUs = 0;
+        action.randomDuration = 0.0;
+        break;
 
     case ActionType::TextRecognition: {
         action.ocrRegionByImage = JsonBool(p, "ocrRegionByImage");
@@ -587,6 +768,7 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         action.moveVarExprY = JsonWString(p, "moveVarExprY");
         action.matchVarName = Trim(JsonWString(p, "matchVarName", L"colorRet"));
         if (action.matchVarName.empty()) action.matchVarName = L"colorRet";
+        ApplyImageLocateFields(action, p, true);
         break;
     }
 
@@ -614,6 +796,7 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
             action.moveFromVar = JsonBool(p, "moveFromVar");
             action.moveVarExprX = JsonWString(p, "moveVarExprX");
             action.moveVarExprY = JsonWString(p, "moveVarExprY");
+            ApplyImageLocateFields(action, p, true);
         } else {
             action.searchFullScreen = JsonBool(p, "searchFullScreen", true);
             action.searchX1 = JsonInt(p, "searchX1");
@@ -624,6 +807,7 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
             if (action.findImageFollowUp > 2) action.findImageFollowUp = 2;
             action.offsetX = JsonInt(p, "offsetX");
             action.offsetY = JsonInt(p, "offsetY");
+            ApplyImageLocateFields(action, p, false);
         }
         action.matchVarName = Trim(JsonWString(p, "matchVarName", L"colorRet"));
         if (action.matchVarName.empty()) action.matchVarName = L"colorRet";
@@ -682,6 +866,33 @@ bool ValidateActionRequiredFields(const ScriptAction& a, std::wstring& err) {
     case ActionType::FindImage:
         if (a.findImageFollowUp != 3 && Trim(a.imagePath).empty()) {
             err = L"findImage 缺少 imagePath（要找的图；imageUseVar 时填变量名/路径，不能为空）。";
+            return false;
+        }
+        break;
+    case ActionType::MultiMatch:
+        if (a.imagePaths.empty() && Trim(a.imagePath).empty()) {
+            err = L"multiMatch 缺少 imagePaths（至少一张模板图）。";
+            return false;
+        }
+        break;
+    case ActionType::WatchImage:
+        if (Trim(a.imagePath).empty()) {
+            err = L"watchImage 缺少 imagePath（监视用图；imageUseVar 时填变量名/路径，不能为空）。";
+            return false;
+        }
+        break;
+    case ActionType::MouseDrag:
+    case ActionType::GetColor:
+    case ActionType::ColorMatch:
+    case ActionType::FindColor:
+        if (a.imageLocate && Trim(a.imagePath).empty()) {
+            err = JsonType(a.type) + L" 找图定位缺少 imagePath（要查找的图；imageUseVar 时填变量名/路径）。";
+            return false;
+        }
+        break;
+    case ActionType::VarCompute:
+        if (Trim(a.computeCode).empty()) {
+            err = L"varCompute 缺少 computeCode（变量运算源码）。";
             return false;
         }
         break;
@@ -770,6 +981,11 @@ bool FlattenOneActionParam(const json& node, int indent, int depth,
         error = path + L" 禁止 customText。说明写 remark。";
         return false;
     }
+    if (SkipsInMainFlow(type) && indent != 0) {
+        error = path + L"（" + typeStr
+            + L"）必须放在顶层，不能写在循环/条件的 children 里。";
+        return false;
+    }
 
     const bool hasChildrenKey = node.contains("children");
     json children = json::array();
@@ -781,7 +997,7 @@ bool FlattenOneActionParam(const json& node, int indent, int depth,
         children = node["children"];
         if (!IsSubtreeContainer(type)) {
             error = path + L"（" + typeStr
-                + L"）不是容器，不能有 children。只有 loop/if/else/defineBlock 可嵌套子动作。";
+                + L"）不是容器，不能有 children。只有 loop/if/else/defineBlock/watchImage 可嵌套子动作。";
             return false;
         }
         if (children.empty()) {
@@ -852,7 +1068,8 @@ ScriptActionBuildResult BuildScriptActionFromJson(const json& params) {
             return result;
         }
     }
-    if (type == ActionType::FindImage || type == ActionType::TextRecognition) {
+    if (type == ActionType::FindImage || type == ActionType::TextRecognition
+        || type == ActionType::MultiMatch) {
         if (type == ActionType::FindImage && result.action.findImageFollowUp == 3
             && LooksLikeFilePath(result.action.matchVarName)) {
             // 持久化路径：跳过变量名校验
@@ -930,6 +1147,7 @@ std::wstring PlanScriptActionsOutline(const std::vector<json>& nested, std::wstr
         a.loopCount = JsonInt(flat[i], "loopCount", -1);
         a.loopFromVar = JsonBool(flat[i], "loopFromVar");
         a.conditionExpr = JsonWString(flat[i], "conditionExpr");
+        if (type == ActionType::WatchImage) a.watchMode = ParseWatchModeJson(flat[i]);
         skeleton.push_back(a);
     }
     if (const std::wstring bodyErr = ValidateContainerBodies(skeleton); !bodyErr.empty()) {
@@ -952,6 +1170,8 @@ std::wstring PlanScriptActionsOutline(const std::vector<json>& nested, std::wstr
         out += L"第" + std::to_wstring(i + 1) + L"步 " + label;
         if (skeleton[i].type == ActionType::If && !Trim(skeleton[i].conditionExpr).empty())
             out += L"  条件:" + Trim(skeleton[i].conditionExpr);
+        if (skeleton[i].type == ActionType::WatchImage)
+            out += skeleton[i].watchMode != 0 ? L"  时间监视" : L"  动作监视";
         if (!Trim(skeleton[i].remark).empty())
             out += L"  备注:" + Trim(skeleton[i].remark);
         out += L"\n";
@@ -1014,14 +1234,16 @@ std::wstring ScriptActionBuilderSchema() {
 通用字段（每个动作可选）：
   type      动作类型（必填）
   indent    缩进层级，默认 0；用 children 时由工具自动写成父级+1，不必手写
-  children  仅 loop/if/else/defineBlock：子动作数组（推荐，像写代码的花括号）。
+  children  仅 loop/if/else/defineBlock/watchImage：子动作数组（推荐，像写代码的花括号）。
             循环体必须放这里，不要写成循环后面的同级动作。
   remark    备注（步骤说明、待确认提示写这里，禁止用 text 改动作名）
   no / text 由工具自动分配，不要手写
 
-followUp 语义别名（findImage / textRecognition）：
+followUp 语义别名（findImage / multiMatch / textRecognition）：
   "click"=点击(0)  "move"=移动(1)  "saveVar"=保存匹配度(2)  "saveImage"=保存图片(3)
   也可写 findImageFollowUp / ocrFollowUp 整数；findImage 为 0~3，ocrFollowUp 为 0~2
+  multiMatch 仅 0点击 / 1移动 / 2保存匹配度（无保存图片；>2 钳到 2）
+  findColor 仅 0点击 / 1移动 / 2保存到变量（无保存图片；>2 钳到 2）
 
 ── 基础动作 ──
 wait:           duration, randomDuration（整段等待，与下面「重复间隔」不同）
@@ -1032,11 +1254,14 @@ moveMouseRelative: x/dx, y/dy（像素相对位移，可负；FPS 视角等）, 
   clickCount=执行次数；duration/randomDuration=相邻两次之间的间隔；
   count=1 时完全不等待；不在第一次之前、最后一次之后插入等待。
 mouseClick:     button(left/right/middle/x1/x2), clickCount, duration, randomDuration, modifiers/hold*
+mouseDrag:      button, x/y 起点, endX/endY 终点, duration=拖拽时长（不是重复间隔）, randomDuration,
+                randomX/Y, randomEndX/Y, modifiers/hold*, imageLocate(1=找图定位：起点/终点相对图中心；
+                此时还需 imagePath、searchFullScreen/searchX1~Y2、matchThreshold、findTimeExpr、缩放)
 mouseDown/Up:   button, modifiers/hold*
 keyClick:       keyText, keyVk, clickCount, duration, randomDuration, modifiers
 keyDown/Up:     keyText, keyVk, modifiers
 hotkeyShortcut: shortcutPreset(0~11), clickCount, duration, randomDuration
-quickInput:     inputText, charInterval(字间), parseEscapes(1=解析\\n\\r\\t\\\\，缺省0), clickCount, duration(整段重复间隔), randomDuration
+quickInput:     inputText, charInterval(字间), parseEscapes(1=解析文本和变量中的\\n\\r\\t\\\\，缺省0=变量内换行/Tab丢掉), clickCount, duration(整段重复间隔), randomDuration
 scrollWheel:    scrollVertical, scrollHorizontal, scrollDirection(0|1|"up"|"down"), scrollSteps, clickCount, duration
 
 ── 流程 ──
@@ -1044,6 +1269,14 @@ loop:           loopCount(-1=无限), loopFromVar, loopVarExpr, loopVarName,
                 children[]=循环体（必填；空循环会构建失败）
 endLoop:        （无额外字段，自动生成「跳出循环」；必须放在某 loop 的 children 里）
 defineBlock:    blockName, children[]=块体
+watchImage:     imagePath, matchThreshold, searchFullScreen, searchX1~Y2, imageScaleMin/Max,
+                resumeAfterWatch(1=中断后从原处重跑该次找图；0=跳到监视容器后的主流程),
+                watchMode(0或action=动作监视：找图等待时顺带搜；1或time=时间监视：按 watchPollSeconds 轮询),
+                watchPollSeconds(时间监视间隔秒，默认1，最小0.05),
+                children[]=命中监视图后执行（主流程跳过本容器；子树里若执行了跳转则以跳转为准）
+varCompute:     computeCode（类 C：赋值/if/for/while；行末分号可省略；局部变量默认销毁；return a,b 导出脚本变量）
+                字符串用 "+" 或 '+'（裸写 + 是加法）；split(s, "/")、parts[0]、parts.count；toInt/toString/trim
+                ctrl:Clipboard() 为剪贴板文本或文件路径字符串（不是条件里的 0/1）
 runBlock:       blockName, clickCount, duration(重复间隔，仅 count>1), randomDuration
 if:             conditionExpr, children[]=成立时执行
 else:           children[]=否则执行；与 if 同级（同一层 children 里紧跟 if）
@@ -1053,8 +1286,26 @@ goto:           gotoStepExpr（目标序号；跳入循环体=第1次迭代从�
 findImage:      imagePath, imageUseVar(1=变量/路径模式), matchThreshold, perfectMatch(1=像素级终审),
                 searchFullScreen, searchX1~Y2,
                 followUp/saveVar→2 保存匹配度, saveImage→3 保存图片, matchVarName,
-                offsetX/Y, findTimeExpr, imageScaleMin/Max, imageRegionX1~Y2(保存图片有模板时)
+                offsetX/Y, findTimeExpr(有模板时等图；0=只找一次；-1=直到找到；保存图片无模板时忽略),
+                imageScaleMin/Max, imageRegionX1~Y2(保存图片有模板时)
                 变量: {name}.matchData/.x/.y/.cx/.cy/.x1/.y1；保存图片时 matchVarName 为变量名或持久路径
+multiMatch:     imagePaths[]（必填，最多8张；imagePath 可作首张镜像）,
+                imageUseVar / imageUseVars[]（每张可勾选变量图，与找图相同）,
+                multiMatchMode(0=多图择一：按列表顺序找，第一张过阈值即停；1=一图多处：只用第一张做 NMS 多匹配),
+                multiMatchMax(一图多处最多处数 1~20), multiMatchSort(0=先左后上 1=匹配度高到低),
+                matchThreshold, perfectMatch, searchFullScreen, searchX1~Y2, imageScaleMin/Max,
+                followUp(0点击 1移动 2保存匹配度), matchVarName(默认 matchRet),
+                offsetX/Y, findTimeExpr(等到至少一处；0=只找一次；-1=直到找到),
+                duration(一图多处依次点击的间隔，默认0.05；择一/移动/保存不用)
+                变量: {name.count} 命中个数；{name[0]} 第一处是否命中；{name[0].x/.y/.x1/.y1/.cx/.cy/.matchData}
+                {name[0].hit} 模板序号从1计；{name[n]} 是下拉代指，运行时字面 n 不解析
+getColor:       x, y, matchVarName(默认colorRet), imageLocate(1=找图定位：x/y 相对图中心；未找到则跳过)
+                找图定位时还需 imagePath、searchFullScreen/searchX1~Y2、matchThreshold、findTimeExpr、缩放
+findColor:      color/#RRGGBB, colorTolerance, searchFullScreen/searchX1~Y2,
+                findImageFollowUp(0点击 1移动 2保存到变量；无保存图片),
+                offsetX/Y(点击/移动时相对色点), matchVarName,
+                imageLocate(1=先找图，再在命中图范围内找色；需 imagePath、matchThreshold、缩放、findTimeExpr)
+colorMatch:     x, y, color/#RRGGBB, colorTolerance, matchVarName, imageLocate(同 getColor)
 textRecognition: ocrResultMode(0文字/1查找), ocrFollowUp/followUp,
                 matchVarName, ocrSearchText, ocrRegionByImage, ocrDigitsOnly, imageUseVar,
                 searchFullScreen, searchX1~Y2(绝对识别/找图区),
@@ -1066,9 +1317,13 @@ closeProgram:   targetPath, matchFileNameOnly
 openWebpage:    targetPath(URL)
 openFile:       targetPath
 timerRecordTime: loopVarName 或 timerVarName
-runMacro:       blockName, targetPath, clickCount, duration(重复间隔，仅 count>1), randomDuration
+runMacro:       blockName, targetPath, clickCount, duration(重复间隔，仅 count>1), randomDuration,
+                useMode(0默认/1窗口/2后台窗口/3继承，缺省3；目标脚本若是窗口类可填 1/2 并带 nestedWindowMode),
+                breakoutTimeSeconds(仅默认模式脱离时间，秒；0=禁用),
+                nestedWindowMode(窗口/后台窗口绑窗对象，字段同脚本级 windowMode)
 mousePlayback:  blockName, targetPath, clickCount, duration(重复间隔，仅 count>1), randomDuration,
-                playbackSpeed(0.25~4，缺省 1；嵌套录制只用此字段，不叠加设置全局倍速)
+                playbackSpeed(0.25~4，缺省 1；嵌套录制只用此字段，不叠加设置全局倍速),
+                useMode/breakoutTimeSeconds/nestedWindowMode 同 runMacro
                 （界面显示名=运行录制回放；type 仍为 mousePlayback）
 lockScreenshot / unlockScreenshot / stopMacro
   ★ 禁止 customText（说明写 remark，勿伪造动作名）
@@ -1102,11 +1357,11 @@ modifiers 示例: ["ctrl","shift"] 或 holdLeftCtrl 等 0/1
 
 std::wstring ScriptActionCatalog() {
     return LR"(【宏动作目录 — 参数用 lookupMacroAction(type)；场景用法用 section=usage】
-通用可选字段：type(必填), remark, indent 或 children（loop/if/else/defineBlock 推荐 children）
-鼠标: moveMouse, moveMouseRelative, mouseClick, mouseDown, mouseUp, scrollWheel
+通用可选字段：type(必填), remark, indent 或 children（loop/if/else/defineBlock/watchImage 推荐 children）
+鼠标: moveMouse, moveMouseRelative, mouseClick, mouseDrag, mouseDown, mouseUp, scrollWheel
 键盘: keyClick, keyDown, keyUp, hotkeyShortcut, quickInput
-流程: loop, endLoop, if, else, defineBlock, runBlock, stopMacro, goto
-识别: findImage(找图点击), textRecognition(OCR)
+流程: loop, endLoop, if, else, defineBlock, runBlock, stopMacro, goto, varCompute
+识别: findImage(找图点击), multiMatch(多图匹配), watchImage(找图监视), textRecognition(OCR), getColor, findColor, colorMatch
 系统: runProgram, closeProgram, openWebpage, openFile, lockScreenshot, unlockScreenshot
 其它: runMacro, mousePlayback, timerRecordTime, getCursorPos
 AI: aiTextAnalysis, aiImageAnalysis, aiActionExecute
@@ -1139,24 +1394,37 @@ std::wstring SchemaTypeDetail(const std::wstring& typeName) {
     std::wstringstream out;
     out << L"【" << typeName << L" 参数】\n";
     bool found = false;
+    bool capturing = false;
     size_t pos = 0;
     while (pos < schema.size()) {
         const size_t lineEnd = schema.find(L'\n', pos);
         const std::wstring line = schema.substr(pos,
             lineEnd == std::wstring::npos ? std::wstring::npos : lineEnd - pos);
+        const bool indented = !line.empty() && (line[0] == L' ' || line[0] == L'\t');
         const size_t trimStart = line.find_first_not_of(L" \t");
-        if (trimStart != std::wstring::npos) {
+        if (trimStart == std::wstring::npos) {
+            capturing = false;
+        } else {
             const std::wstring trimmed = line.substr(trimStart);
-            if (trimmed.rfind(prefix, 0) == 0
-                || (typeName == L"textRecognition" && trimmed.rfind(L"textRecognition:", 0) == 0)) {
+            const bool isHead = trimmed.rfind(prefix, 0) == 0
+                || (typeName == L"textRecognition" && trimmed.rfind(L"textRecognition:", 0) == 0);
+            if (isHead) {
                 out << trimmed << L"\n";
                 found = true;
+                capturing = true;
+            } else if (capturing && indented) {
+                out << trimmed << L"\n";
+            } else {
+                capturing = false;
             }
         }
         if (lineEnd == std::wstring::npos) break;
         pos = lineEnd + 1;
     }
     if (!found) return L"";
+    if (typeName == L"mouseDrag") {
+        out << L"\n★ duration/randomDuration = 拖拽时长（按下到松开的插值时间），不是重复间隔。\n";
+    }
     if (typeName == L"mouseClick" || typeName == L"keyClick"
         || typeName == L"hotkeyShortcut" || typeName == L"quickInput"
         || typeName == L"scrollWheel" || typeName == L"mousePlayback"
@@ -1165,7 +1433,7 @@ std::wstring SchemaTypeDetail(const std::wstring& typeName) {
             L"count=1 完全不等待；不在首前/末后插入等待（与 wait 不同）。\n";
     }
     out << L"\n通用可选: remark, indent；容器可用 children 嵌套子动作（序号与显示名由工具自动生成）\n";
-    out << L"followUp: click|move|saveVar（findImage/textRecognition 适用）\n";
+    out << L"followUp: click|move|saveVar（findImage/multiMatch/textRecognition 适用）\n";
     return out.str();
 }
 
@@ -1210,12 +1478,26 @@ std::wstring LookupMacroActionSchema(const std::wstring& typeOrSection) {
     if (q == L"agent" || q == L"plan" || q == L"loop" || q == L"分步" || q == L"闭环") {
         return MacroActionAgentSkill();
     }
+    if (q == L"command" || q == L"cli" || q == L"shell" || q == L"powershell"
+        || q == L"命令行" || q == L"命令") {
+        return MacroActionCommandSkill();
+    }
+    if (q == L"office" || q == L"excel" || q == L"word" || q == L"ppt" || q == L"powerpoint"
+        || q == L"pdf" || q == L"docx" || q == L"xlsx" || q == L"办公" || q == L"文档"
+        || q == L"表格" || q == L"readdocument") {
+        return MacroActionOfficeSkill();
+    }
+    if (q == L"game" || q == L"gaming" || q == L"游戏" || q == L"实时" || q == L"动态画面"
+        || q == L"fps" || q == L"挂机") {
+        return MacroActionGameSkill();
+    }
 
     static const wchar_t* kTypes[] = {
-        L"wait", L"moveMouse", L"moveMouseRelative", L"mouseClick", L"mouseDown", L"mouseUp",
+        L"wait", L"moveMouse", L"moveMouseRelative", L"mouseClick", L"mouseDrag", L"mouseDown", L"mouseUp",
         L"keyClick", L"keyDown", L"keyUp", L"hotkeyShortcut", L"quickInput", L"scrollWheel",
         L"loop", L"endLoop", L"defineBlock", L"runBlock", L"if", L"else", L"goto",
-        L"findImage", L"textRecognition",
+        L"findImage", L"multiMatch", L"watchImage", L"varCompute", L"textRecognition",
+        L"getColor", L"findColor", L"colorMatch",
         L"lockScreenshot", L"unlockScreenshot", L"stopMacro",
         L"runProgram", L"closeProgram", L"openWebpage", L"openFile",
         L"timerRecordTime", L"runMacro", L"mousePlayback", L"getCursorPos",

@@ -1,5 +1,6 @@
 #include "agent_attachment.h"
 
+#include "opencv_runtime.h"
 #include "utils.h"
 
 #include <opencv2/opencv.hpp>
@@ -73,6 +74,7 @@ HBITMAP CreateBitmapFromMatBGR(const cv::Mat& bgr, int size) {
 }
 
 cv::Mat DecodeImageFile(const std::wstring& path) {
+    if (!OpenCvAvailable()) return {};
     const auto bytes = ReadBinaryFile(path);
     if (bytes.empty()) return {};
     return cv::imdecode(bytes, cv::IMREAD_COLOR);
@@ -87,7 +89,7 @@ const uint8_t* DibPixelBytes(const BITMAPINFOHEADER* hdr) {
 }
 
 cv::Mat MatFromBitmap(HBITMAP hbmp) {
-    if (!hbmp) return {};
+    if (!hbmp || !OpenCvAvailable()) return {};
     BITMAP bm{};
     if (!GetObject(hbmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) return {};
 
@@ -114,7 +116,7 @@ cv::Mat MatFromBitmap(HBITMAP hbmp) {
 }
 
 cv::Mat MatFromDib(HGLOBAL hMem) {
-    if (!hMem) return {};
+    if (!hMem || !OpenCvAvailable()) return {};
     const void* locked = GlobalLock(hMem);
     if (!locked) return {};
     const auto* hdr = static_cast<const BITMAPINFOHEADER*>(locked);

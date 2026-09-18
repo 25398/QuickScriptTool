@@ -2,6 +2,7 @@
 #include "fake_focus_soft_input.h"
 
 #include <cstring>
+#include <sddl.h>
 
 namespace windowmode {
 namespace {
@@ -39,18 +40,22 @@ bool FakeFocusSoftInput_Attach(DWORD targetPid, std::wstring& err) {
     wchar_t name[128]{};
     fakefocus::SoftInputMappingName(targetPid, name, 128);
 
-    // 宿主可能是管理员、游戏是中完整性：默认 DACL 会让目标 OpenFileMapping 失败，
-    // 表现为宿主一直写软按键、游戏完全没反应。NULL DACL 仅限本会话 Local\ 映射。
-    SECURITY_DESCRIPTOR sd{};
+    // 宿主可能是管理员、游戏是中完整性：允许同用户 Interactive + Medium IL，禁止 Everyone。
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)",
+            SDDL_REVISION_1, &sd, nullptr)) {
+        err = L"假焦点软输入：构造安全描述符失败";
+        return false;
+    }
     SECURITY_ATTRIBUTES sa{};
-    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
     sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = &sd;
+    sa.lpSecurityDescriptor = sd;
     sa.bInheritHandle = FALSE;
 
     const DWORD bytes = static_cast<DWORD>(sizeof(fakefocus::SoftInputState));
     g_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, bytes, name);
+    LocalFree(sd);
     if (!g_mapping) {
         err = L"CreateFileMapping(假焦点软输入) 失败";
         return false;
@@ -105,9 +110,7 @@ void FakeFocusSoftInput_SetMouseButtonVk(UINT vk, bool down) {
     if (!g_view || vk >= 256) return;
     g_view->down[vk] = down ? 0x80 : 0;
     g_view->flags |= fakefocus::kSoftFlagKeysValid;
-    if (g_view->flags & fakefocus::kSoftFlagPostKeyEvents) {
-        PushKeyEvent(vk, down);
-    }
+    PushKeyEvent(vk, down);
     TouchSeq();
 }
 
@@ -128,9 +131,7 @@ void FakeFocusSoftInput_SetKey(UINT vk, bool down) {
     sync(VK_LMENU, VK_RMENU, VK_MENU);
     MemoryBarrier();
     g_view->flags |= fakefocus::kSoftFlagKeysValid;
-    if (g_view->flags & fakefocus::kSoftFlagPostKeyEvents) {
-        PushKeyEvent(vk, down);
-    }
+    PushKeyEvent(vk, down);
     TouchSeq();
 }
 
@@ -142,6 +143,11 @@ void FakeFocusSoftInput_SetPostKeyEvents(bool enabled) {
         g_view->flags &= ~fakefocus::kSoftFlagPostKeyEvents;
     }
     TouchSeq();
+}
+
+bool FakeFocusSoftInput_PostKeyEventsEnabled() {
+    return g_view != nullptr
+        && (g_view->flags & fakefocus::kSoftFlagPostKeyEvents) != 0;
 }
 
 void FakeFocusSoftInput_PushWheel(bool vertical, bool positive, int steps) {
@@ -191,6 +197,20 @@ bool FakeFocusSoftInput_ReadMapleHits(DWORD& gaks, DWORD& diState, DWORD& diData
     hitReady = g_view->hitReady;
     gfw = g_view->hitGfw;
     focus = g_view->hitFocus;
+    return true;
+}
+
+bool FakeFocusSoftInput_ReadMapleInstall(DWORD& diag, DWORD& iatPoll, DWORD& diVt) {
+    diag = 0;
+    iatPoll = 0;
+    diVt = 0;
+    if (!g_view || g_view->magic != fakefocus::kSoftInputMagic
+        || g_view->version != fakefocus::kSoftInputVersion) {
+        return false;
+    }
+    diag = g_view->mapleDiag;
+    iatPoll = g_view->mapleIatPoll;
+    diVt = g_view->mapleDiVt;
     return true;
 }
 

@@ -111,6 +111,9 @@ void AiActionLookahead::JoinWorker_() {
 
 void AiActionLookahead::Cancel() {
     cancelWorker_.store(true);
+    // 真正中断在途预取：只置标志位的话，SendMessage 里的 WinHttpReceiveResponse
+    // 仍会阻塞到 recv 超时，join 就把主链路一起拖住（旧实现最长可达 25s）。
+    ownAbort_.Abort();
     JoinWorker_();
     running_.store(false);
     cancelWorker_.store(false);
@@ -153,8 +156,10 @@ void AiActionLookahead::BeginAfterTools(
         cached_ = {};
     }
     cancelWorker_.store(true);
+    ownAbort_.Abort();
     JoinWorker_();
     cancelWorker_.store(false);
+    ownAbort_.Clear();
     if (stopFlag.load()) {
         std::lock_guard<std::mutex> lock(mu_);
         inFlightPrefetch_ = false;
@@ -162,6 +167,9 @@ void AiActionLookahead::BeginAfterTools(
     }
 
     const std::wstring userPrompt = BuildLookaheadUserPrompt(memoText, toolBatchSummary);
+    // httpAbort 保留在签名里（调用方/自检兼容），但预取一律走 ownAbort_：
+    // 复用主链路的槽会在丢弃预取时把主请求一起中断。
+    (void)httpAbort;
     AiLookaheadFetchFn overrideFn;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -171,13 +179,16 @@ void AiActionLookahead::BeginAfterTools(
 
     const std::atomic_bool* stopPtr = &stopFlag;
     running_.store(true);
-    worker_ = std::thread([this, config, userPrompt, stopPtr, httpAbort, overrideFn, defaultFn]() {
+    // 注意：这里刻意用预取自己的 ownAbort_，不用调用方传入的 httpAbort
+    //（那个槽属于主链路在途请求，复用会把主请求一起掐掉）。
+    AiHttpAbortSlot* prefetchAbort = &ownAbort_;
+    worker_ = std::thread([this, config, userPrompt, stopPtr, prefetchAbort, overrideFn, defaultFn]() {
         std::vector<ToolCallRecord> calls;
         try {
             if (overrideFn) {
                 calls = overrideFn(userPrompt, *stopPtr);
             } else if (defaultFn) {
-                calls = defaultFn(config, userPrompt, *stopPtr, httpAbort, cancelWorker_);
+                calls = defaultFn(config, userPrompt, *stopPtr, prefetchAbort, cancelWorker_);
             }
         } catch (...) {
             calls.clear();

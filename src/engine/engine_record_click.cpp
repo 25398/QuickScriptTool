@@ -1,5 +1,6 @@
 // engine_record_click.cpp — F2 slice extracted from engine_host_window.h
 #include "engine/engine_host_window.h"
+#include "clicker_timing.h"
 #include "window_mode/window_target.h"
 
 // was engine_host_window.h:14652-14654
@@ -198,7 +199,7 @@ void EngineHost::StartRecording() {
             recordingWasVisible_ = (IsWindowVisible(face) == TRUE);
         }
         CloseEditorPopup(); CancelQuickInputTip();
-        if (appSettings_.other.playSoundOnStart) MessageBeep(MB_OK);
+        if (appSettings_.other.playSoundOnStart) PlayAppStartupSound();
         if (appSettings_.other.autoHideMainWindow) {
             AddTray();
             HideUserFacingMainWindow(false);
@@ -291,7 +292,7 @@ void EngineHost::StartClicking() {
         ghEmergencyStop.store(false, std::memory_order_release);
         EnsureHotkeyAuxTimers();
         clickCountDone_ = 0;
-        if (appSettings_.other.playSoundOnStart) MessageBeep(MB_OK);
+        if (appSettings_.other.playSoundOnStart) PlayAppStartupSound();
         if (appSettings_.other.autoHideMainWindow) {
             AddTray();
             HideUserFacingMainWindow(false);
@@ -307,8 +308,12 @@ void EngineHost::StartClicking() {
         const auto clickCfg = appSettings_.click;
         clickerThread_ = std::thread([this, clickBackend, clickerCfg, clickCfg]() {
             ForegroundInputRouter::Instance().BeginSession(clickBackend);
+            BeginHighResTimer();
             struct SessionGuard {
-                ~SessionGuard() { ForegroundInputRouter::Instance().EndSession(); }
+                ~SessionGuard() {
+                    EndHighResTimer();
+                    ForegroundInputRouter::Instance().EndSession();
+                }
             } sessionGuard;
 
             MouseButtonType button = MouseButtonType::Left;
@@ -319,6 +324,12 @@ void EngineHost::StartClicking() {
             }
 
             const auto& cs = clickCfg;
+            const uint64_t holdUs = ClickerHoldUs(
+                cs.enablePressReleaseInterval, cs.pressReleaseIntervalSeconds);
+            PrecisionInputTimeline clock;
+            const auto cancelled = [this] {
+                return !clicking_ || ghEmergencyStop.load(std::memory_order_relaxed);
+            };
             // 只用 clicking_ 控制启停。勿读 stopFlag_：那是脚本取消闩锁，
             // stopMacro / StopRun 后常保持 true，会导致「界面显示连点中但从不点」。
             while (clicking_ && !ghEmergencyStop.load(std::memory_order_relaxed)) {
@@ -335,35 +346,30 @@ void EngineHost::StartClicking() {
                     break;
                 }
                 if (cs.enableRandomInterval) interval += RandomDelay(cs.randomIntervalMaxSeconds);
+                const uint64_t gapUs = ClickerGapUs(interval);
 
-                int clickX = 0, clickY = 0;
-                if (cs.enableFixedCoordinates) {
-                    clickX = cs.fixedX;
-                    clickY = cs.fixedY;
-                } else {
-                    POINT pt{}; GetCursorPos(&pt);
-                    clickX = pt.x;
-                    clickY = pt.y;
+                if (cs.enableFixedCoordinates || cs.enableCoordinateJitter) {
+                    int clickX = 0, clickY = 0;
+                    if (cs.enableFixedCoordinates) {
+                        clickX = cs.fixedX;
+                        clickY = cs.fixedY;
+                    } else {
+                        POINT pt{}; GetCursorPos(&pt);
+                        clickX = pt.x;
+                        clickY = pt.y;
+                    }
+                    if (cs.enableCoordinateJitter) {
+                        clickX += RandomInt(cs.jitterX);
+                        clickY += RandomInt(cs.jitterY);
+                    }
+                    SetCursorScreenPos(clickX, clickY);
                 }
-                if (cs.enableCoordinateJitter) {
-                    clickX += RandomInt(cs.jitterX);
-                    clickY += RandomInt(cs.jitterY);
-                }
-                SetCursorScreenPos(clickX, clickY);
 
                 MouseButtonEvent(button, true);
-
-                if (cs.enablePressReleaseInterval && cs.pressReleaseIntervalSeconds > 0.0) {
-                    // 与脚本 SleepInterruptible 隔离：后者读 stopFlag_，宏结束后常为 true。
-                    const auto pressEnd = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(static_cast<int>(
-                            cs.pressReleaseIntervalSeconds * 1000.0));
-                    while (clicking_ && !ghEmergencyStop.load(std::memory_order_relaxed)
-                        && std::chrono::steady_clock::now() < pressEnd) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    }
-                }
-
+                // 与脚本 SleepInterruptible 隔离：后者读 stopFlag_，宏结束后常为 true。
+                // 必须先撑满 hold 再抬起：旧实现 int(秒*1000)+sleep(5ms) 会把 0.001s 截成 0ms，
+                // down/up 粘在同一时刻，目标程序看不到一次完整点击。
+                clock.WaitGapUs(holdUs, cancelled);
                 MouseButtonEvent(button, false);
 
                 ++clickCountDone_;
@@ -372,12 +378,7 @@ void EngineHost::StartClicking() {
                     break;
                 }
 
-                const auto end = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(static_cast<int>(interval * 1000.0));
-                while (clicking_ && !ghEmergencyStop.load(std::memory_order_relaxed)
-                    && std::chrono::steady_clock::now() < end) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                }
+                if (!clock.WaitGapUs(gapUs, cancelled)) break;
             }
         });
     }
@@ -390,12 +391,16 @@ void EngineHost::StopClicking() {
         EnsureHotkeyAuxTimers();
         ghHotkeyPending = false;
         if (clickerThread_.joinable()) {
-            // 禁止无限 join 冻结 UI：驱动挂死时最多等 300ms 再 detach（退出由 ExitProcess 回收）。
             HANDLE h = reinterpret_cast<HANDLE>(clickerThread_.native_handle());
-            if (h && WaitForSingleObject(h, 300) == WAIT_OBJECT_0) {
+            if (h && WaitForSingleObject(h, 800) == WAIT_OBJECT_0) {
                 clickerThread_.join();
             } else {
-                clickerThread_.detach();
+                ForegroundInputRouter::Instance().ForceTeardown();
+                if (h && WaitForSingleObject(h, 400) == WAIT_OBJECT_0) {
+                    clickerThread_.join();
+                } else {
+                    clickerThread_.detach();
+                }
             }
         }
         ClearEmergencyStopIfIdle(false, recording_, running_);

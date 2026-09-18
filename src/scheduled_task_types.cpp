@@ -8,7 +8,7 @@
 #include <random>
 
 std::wstring ScheduledTaskKindLabel(ScheduledTaskKind kind) {
-    return kind == ScheduledTaskKind::Recording ? L"鼠标录制" : L"鼠标宏";
+    return kind == ScheduledTaskKind::Recording ? L"键鼠录制" : L"鼠标宏";
 }
 
 std::wstring ScheduledFrequencyLabel(ScheduledFrequency freq) {

@@ -159,6 +159,18 @@ std::wstring DeriveConversationTitleFromPrompt(const std::wstring& prompt) {
     return TruncateConversationTitle(std::move(text), kConversationTitleMaxChars);
 }
 
+bool IsUsableConversationTitle(const std::wstring& name) {
+    const std::wstring t = Trim(name);
+    if (t.empty() || t == L"新对话") return false;
+    if (t.find(L"[错误]") != std::wstring::npos) return false;
+    if (t.find(L"[提示]") != std::wstring::npos) return false;
+    if (t.find(L"API 请求失败") != std::wstring::npos) return false;
+    if (t.find(L"API请求失败") != std::wstring::npos) return false;
+    if (t.find(L"请求异常") != std::wstring::npos) return false;
+    if (t.find(L"无响应") != std::wstring::npos) return false;
+    return true;
+}
+
 std::wstring SummarizeConversationName(const std::vector<ChatMessage>& messages) {
     const std::wstring prompt = ExtractFirstUserPrompt(messages);
     if (prompt.empty()) return L"新对话";
@@ -203,6 +215,13 @@ bool LoadAgentConversationList(std::vector<AgentConversationMeta>& out) {
                 meta.folder = NormalizeRelativeFolder(FromUtf8(item["folder"].get<std::string>()));
             if (meta.id.empty()) continue;
             if (meta.filePath.empty()) meta.filePath = ConversationFilePath(meta.id);
+            if (!IsUsableConversationTitle(meta.name)) {
+                AgentConversationRecord rec;
+                if (LoadAgentConversationRecord(meta.id, rec)
+                    && IsUsableConversationTitle(rec.meta.name)) {
+                    meta.name = rec.meta.name;
+                }
+            }
             out.push_back(std::move(meta));
         }
     } catch (...) {
@@ -246,6 +265,13 @@ bool LoadAgentConversationRecord(const std::wstring& id, AgentConversationRecord
         }
         if (root.contains("editIndex") && root["editIndex"].is_number_integer())
             out.editIndex = root["editIndex"].get<int>();
+        if (!IsUsableConversationTitle(out.meta.name)) {
+            const std::wstring derived = SummarizeConversationName(out.messages);
+            if (IsUsableConversationTitle(derived))
+                out.meta.name = derived;
+            else if (out.meta.name.empty())
+                out.meta.name = L"新对话";
+        }
         return true;
     } catch (...) {
         return false;
@@ -361,6 +387,13 @@ bool SaveAgentConversationDraft(const std::wstring& id, const std::wstring& draf
     if (!IsSafeConversationId(id)) return false;
     AgentConversationRecord rec;
     const bool loaded = LoadAgentConversationRecord(id, rec);
+    if (!loaded) {
+        const std::wstring path = AgentConversationsDir() + L"\\" + id + L".json";
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            // 文件在但读失败（可能正在被另一线程写入）：不要当空会话删掉
+            return true;
+        }
+    }
     const int rounds = loaded
         ? (rec.meta.roundCount > 0 ? rec.meta.roundCount : CountConversationRounds(rec.messages))
         : CountConversationRounds(rec.messages);

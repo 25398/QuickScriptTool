@@ -4,8 +4,10 @@
 
 #include "match_overlay.h"
 #include "drawing.h"
+#include "ui_scale.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <windowsx.h>
 
@@ -13,6 +15,21 @@ namespace {
 bool IsRegionPickMode(MatchOverlayMode m) {
     return m == MatchOverlayMode::RelativeRegionPick
         || m == MatchOverlayMode::SyntheticAnchorRegionPick;
+}
+
+bool NeedsSingleAnchor(MatchOverlayMode m) {
+    return m == MatchOverlayMode::OffsetPick
+        || m == MatchOverlayMode::RelativeRegionPick;
+}
+
+bool IsSyntheticAnchorMode(MatchOverlayMode m) {
+    return m == MatchOverlayMode::SyntheticAnchorRegionPick
+        || m == MatchOverlayMode::SyntheticAnchorOffsetPick;
+}
+
+bool IsOffsetPickMode(MatchOverlayMode m) {
+    return m == MatchOverlayMode::OffsetPick
+        || m == MatchOverlayMode::SyntheticAnchorOffsetPick;
 }
 }  // namespace
 
@@ -60,26 +77,20 @@ void MatchOverlay::CaptureScreen() {
 void MatchOverlay::RunMatch() {
     if (matchDone_) return;
 
-    if (mode_ == MatchOverlayMode::SyntheticAnchorRegionPick) {
-        const int w = (std::max)(8, syntheticW_);
-        const int h = (std::max)(8, syntheticH_);
-        const int cx = screenX_ + screenW_ / 2;
-        const int cy = screenY_ + screenH_ / 2;
-        ImageMatchResult syn{};
-        syn.found = true;
-        syn.score = 100.0;
-        syn.scale = 1.0;
-        syn.topLeftX = cx - w / 2;
-        syn.topLeftY = cy - h / 2;
-        syn.bottomRightX = syn.topLeftX + w;
-        syn.bottomRightY = syn.topLeftY + h;
-        syn.x = cx;
-        syn.y = cy;
+    if (IsSyntheticAnchorMode(mode_)) {
+        const ImageMatchResult syn = SynthesizeSearchRectCenterMatch(
+            screenX_, screenY_, screenX_ + screenW_, screenY_ + screenH_,
+            (std::max)(8, syntheticW_), (std::max)(8, syntheticH_));
         matchResults_.clear();
-        matchResults_.push_back(syn);
-        matchResult_ = syn;
+        if (syn.found) {
+            matchResults_.push_back(syn);
+            matchResult_ = syn;
+            matchCount_ = 1;
+        } else {
+            matchResult_ = {};
+            matchCount_ = 0;
+        }
         matchMs_ = 0;
-        matchCount_ = 1;
         matchDone_ = true;
         loadFailed_ = false;
         return;
@@ -103,6 +114,28 @@ void MatchOverlay::RunMatch() {
         opt.maxMatches = 20;
         opt.maxOverlap = 0.5;
     }
+    // 偏移点 / 相对搜索区域都以唯一红框为基准；多结果时相对坐标无法确定。
+    // 回放同样 maxMatches=1 且关金字塔，避免拾取中心和点击落在不同实例上。
+    if (NeedsSingleAnchor(mode_))
+        RestrictFindImageToSingleAnchor(opt);
+
+    // 搜索框小于模板时 matchTemplate 必失败（常见于误把「相对图内框」写成找图区域）。
+    // 测试/偏移/相对区域拾取自动扩到虚拟屏，避免点「测试」直接 0 个。
+    BITMAP bm{};
+    if (GetObjectW(tmpl, sizeof(bm), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0
+        && (mode_ == MatchOverlayMode::Test || NeedsSingleAnchor(mode_))) {
+        const double sMin = opt.scaleMin > 0.0 ? opt.scaleMin : 1.0;
+        const int needW = (std::max)(1, static_cast<int>(std::ceil(bm.bmWidth * sMin)));
+        const int needH = (std::max)(1, static_cast<int>(std::ceil(bm.bmHeight * sMin)));
+        const int sw = std::abs(searchX2_ - searchX1_);
+        const int sh = std::abs(searchY2_ - searchY1_);
+        if (allowExpandSearchToVirtualScreen_ && (sw < needW || sh < needH)) {
+            searchX1_ = screenX_;
+            searchY1_ = screenY_;
+            searchX2_ = screenX_ + screenW_;
+            searchY2_ = screenY_ + screenH_;
+        }
+    }
 
     ImageMatchOutput output = FindTemplateInFrozenScreenMulti(
         screenBitmap_, screenX_, screenY_,
@@ -112,6 +145,8 @@ void MatchOverlay::RunMatch() {
     DeleteBitmapHandle(tmpl);
 
     matchResults_ = output.matches;
+    if (NeedsSingleAnchor(mode_) && matchResults_.size() > 1)
+        matchResults_.resize(1);
     matchResult_ = matchResults_.empty() ? ImageMatchResult{} : matchResults_.front();
     matchMs_ = output.elapsedMs;
     matchCount_ = static_cast<int>(matchResults_.size());
@@ -167,17 +202,17 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     if (!classRegistered_) RegisterWindowClass();
 
     if (!statusFont_) {
-        statusFont_ = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        statusFont_ = CreateFontW(UiFontHeight(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
     }
     if (!labelFont_) {
-        labelFont_ = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        labelFont_ = CreateFontW(UiFontHeight(16), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
     }
     if (!magnifierFont_) {
-        magnifierFont_ = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        magnifierFont_ = CreateFontW(UiFontHeight(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     }
@@ -239,6 +274,16 @@ MatchOverlay::ActionResult MatchOverlay::ShowSyntheticAnchor(int anchorW, int an
     return Show(L"", 0, 0, 0, 0, opt, MatchOverlayMode::SyntheticAnchorRegionPick);
 }
 
+MatchOverlay::ActionResult MatchOverlay::ShowSyntheticAnchorOffset(int anchorW, int anchorH) {
+    syntheticW_ = (std::max)(8, anchorW);
+    syntheticH_ = (std::max)(8, anchorH);
+    ImageMatchOptions opt{};
+    opt.thresholdPercent = 1.0;
+    opt.scaleMin = 1.0;
+    opt.scaleMax = 1.0;
+    return Show(L"", 0, 0, 0, 0, opt, MatchOverlayMode::SyntheticAnchorOffsetPick);
+}
+
 LRESULT CALLBACK MatchOverlay::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     MatchOverlay* self = nullptr;
     if (msg == WM_NCCREATE) {
@@ -285,7 +330,7 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_SETCURSOR:
-        if ((mode_ == MatchOverlayMode::OffsetPick || IsRegionPickMode(mode_))
+        if ((IsOffsetPickMode(mode_) || IsRegionPickMode(mode_))
             && matchDone_ && matchResult_.found) {
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         } else {
@@ -312,7 +357,9 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
-            cancelled_ = true;
+            // 测试叠层用 ESC 看完退出，应带回 found/count；不要当成取消，否则前端吞掉结果。
+            if (mode_ == MatchOverlayMode::Test && matchDone_) cancelled_ = false;
+            else cancelled_ = true;
             PostQuitMessage(0);
             return 0;
         }
@@ -329,10 +376,13 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
-        if (mode_ == MatchOverlayMode::OffsetPick && matchDone_ && matchResult_.found) {
+        if (IsOffsetPickMode(mode_) && matchDone_) {
             const int absX = GET_X_LPARAM(lp) + screenX_;
             const int absY = GET_Y_LPARAM(lp) + screenY_;
-            FindImageRelativeClickOffset(matchResult_, absX, absY, clickX_, clickY_);
+            const ImageMatchResult* anchor = FindNearestImageMatch(matchResults_, absX, absY);
+            if (!anchor) break;
+            matchResult_ = *anchor;
+            FindImageRelativeClickOffset(*anchor, absX, absY, clickX_, clickY_);
             cancelled_ = false;
             PostQuitMessage(0);
             return 0;
@@ -347,6 +397,10 @@ LRESULT MatchOverlay::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             NormalizeRegionSelection();
             ReleaseCapture();
             if (IsValidRegionSelection()) {
+                const int cx = (regionSelection_.left + regionSelection_.right) / 2;
+                const int cy = (regionSelection_.top + regionSelection_.bottom) / 2;
+                if (const ImageMatchResult* anchor = FindNearestImageMatch(matchResults_, cx, cy))
+                    matchResult_ = *anchor;
                 cancelled_ = false;
                 PostQuitMessage(0);
             } else {
@@ -429,9 +483,19 @@ void MatchOverlay::DrawStatusBar(HDC hdc) {
                    syntheticW_, syntheticH_);
     } else if (mode_ == MatchOverlayMode::SyntheticAnchorRegionPick) {
         swprintf_s(status, L"[按ESC退出] 无法显示合成锚框");
+    } else if (mode_ == MatchOverlayMode::SyntheticAnchorOffsetPick && matchCount_ > 0) {
+        swprintf_s(status, L"[按ESC退出] 合成锚框 %dx%d 已置于屏幕中心，请相对红框点击偏移点",
+                   syntheticW_, syntheticH_);
+    } else if (mode_ == MatchOverlayMode::SyntheticAnchorOffsetPick) {
+        swprintf_s(status, L"[按ESC退出] 无法显示合成锚框");
+    } else if (mode_ == MatchOverlayMode::OffsetPick && matchCount_ > 0) {
+        swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 已定位1处, 请相对红框点击偏移点",
+                   matchMs_);
+    } else if (mode_ == MatchOverlayMode::OffsetPick) {
+        swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到0个, 无法选择偏移点", matchMs_);
     } else if (mode_ == MatchOverlayMode::RelativeRegionPick && matchCount_ > 0) {
-        swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到%d个, 请框选识别区域",
-                   matchMs_, matchCount_);
+        swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 已定位1处, 请框选识别区域",
+                   matchMs_);
     } else if (mode_ == MatchOverlayMode::RelativeRegionPick) {
         swprintf_s(status, L"[按ESC退出] 找图用时: %d毫秒, 找到0个, 无法框选区域", matchMs_);
     } else if (matchCount_ > 0) {

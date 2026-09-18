@@ -1,0 +1,5 @@
+finish.wav — Kenney Interface Sounds, close_002
+Source: https://kenney.nl/assets/interface-sounds
+License: CC0 1.0 Universal (public domain)
+https://creativecommons.org/publicdomain/zero/1.0/
+Attribution is optional; Kenney.nl appreciated.

@@ -153,10 +153,22 @@
       useCustomTheme: 0,
       autoHideMainWindow: true,
       playSoundOnStart: true,
+      playSoundOnEnd: true,
       hideBottomRightTip: false,
       closeToTray: true,
+      showFloatBall: true,
       autoStartOnBoot: false,
       resolveImeConflict: true,
+      editorDefaultView: "code",
+      visualLoopWrap: true,
+      visualBlockCallWires: true,
+      visualIfWrap: true,
+      visualBlockWrap: true,
+      visualJumpWires: true,
+      visualShowGrid: true,
+      visualShowCardId: true,
+      editorActionOrder: [],
+      editorHiddenActions: [],
       holdThresholdSeconds: 0.12,
     },
     windowMode: {
@@ -204,7 +216,7 @@
 
   /* 与产品 app_theme.cpp kThemes[] 一致：7 个经典主题 + 极光 Arctic（id 0-7） */
   var themes = [
-    { id: 0, name: "经典绿橙", main: "#40a863", accent: "#ff9a48", light: "#e8f8ef" },
+    { id: 0, name: "翠绿暖橙", main: "#40a863", accent: "#ff9a48", light: "#e8f8ef" },
     { id: 1, name: "晴空蓝", main: "#4e94d2", accent: "#eb9428", light: "#e6f0f8" },
     { id: 2, name: "活力橙", main: "#e69134", accent: "#14a8bc", light: "#fff4e4" },
     { id: 3, name: "珊瑚橙", main: "#e47658", accent: "#f0c448", light: "#faece8" },
@@ -479,21 +491,74 @@
   }
 
   function scriptForPath(path) {
-    var m = findMacro(path);
-    if (m) {
+    var p = String(path || "");
+    var rec = recordings.find(function (r) {
+      return String(r.path) === p || String(r.id) === p;
+    });
+    if (rec) {
       return {
-        path: m.path,
-        name: m.name,
-        mode: 0,
-        windowMode: {
+        path: rec.path,
+        name: rec.name,
+        mode: rec.mode || 0,
+        windowMode: rec.windowMode || {
           enabled: 0,
           executionKind: "hiddenDesktop",
-          selectMethod: "useEditorWindowClass",
+          selectMethod: "selectOnStartup",
           targetExePath: "",
           fakeFocusEnabled: 0,
         },
-        breakoutTimeSeconds: 0,
-        actions: sampleActions(),
+        breakoutTimeSeconds: rec.breakoutTimeSeconds != null ? rec.breakoutTimeSeconds : 1.5,
+        actions: rec.actions || sampleOptRecording(rec.path).actions,
+      };
+    }
+    var m = findMacro(path);
+    if (m) {
+      var mode = m.mode;
+      if (mode == null) {
+        if (/循环刷图/.test(p)) mode = 1;
+        else if (/表格录入/.test(p)) mode = 2;
+        else mode = 0;
+      }
+      var wm = m.windowMode;
+      if (!wm) {
+        if (mode === 1) {
+          wm = {
+            enabled: 1,
+            executionKind: "hiddenDesktop",
+            selectMethod: "useEditorWindowClass",
+            targetExePath: "C:\\Game\\game.exe",
+            windowName: "游戏窗口",
+            windowClassName: "UnityWndClass",
+            fakeFocusEnabled: 0,
+          };
+        } else if (mode === 2) {
+          wm = {
+            enabled: 1,
+            executionKind: "backgroundWindow",
+            selectMethod: "useEditorWindowClass",
+            targetExePath: "C:\\Office\\EXCEL.EXE",
+            windowName: "工作簿",
+            windowClassName: "XLMAIN",
+            fakeFocusEnabled: 1,
+          };
+        } else {
+          wm = {
+            enabled: 0,
+            executionKind: "hiddenDesktop",
+            selectMethod: "selectOnStartup",
+            targetExePath: "",
+            fakeFocusEnabled: 0,
+          };
+        }
+      }
+      return {
+        path: m.path,
+        name: m.name,
+        mode: mode,
+        windowMode: wm,
+        breakoutTimeSeconds:
+          m.breakoutTimeSeconds != null ? m.breakoutTimeSeconds : mode === 0 ? 2 : 0,
+        actions: m.actions || sampleActions(),
       };
     }
     return {
@@ -503,7 +568,7 @@
       windowMode: {
         enabled: 0,
         executionKind: "hiddenDesktop",
-        selectMethod: "useEditorWindowClass",
+        selectMethod: "selectOnStartup",
         targetExePath: "",
         fakeFocusEnabled: 0,
       },
@@ -521,6 +586,11 @@
       existing.actionCount = Array.isArray(payload.actions) ? payload.actions.length : 0;
       existing.meta =
         existing.actionCount + " 动作 · " + new Date().toLocaleDateString("zh-CN");
+      if (Array.isArray(payload.actions)) existing.actions = payload.actions;
+      if (payload.mode != null) existing.mode = payload.mode;
+      if (payload.windowMode) existing.windowMode = payload.windowMode;
+      if (payload.breakoutTimeSeconds != null)
+        existing.breakoutTimeSeconds = payload.breakoutTimeSeconds;
       return existing;
     }
     var folder = "";
@@ -528,7 +598,7 @@
     if (idx > 0) folder = p.slice(0, idx);
     var item = {
       id: "demo-macro-new-" + fakeState.newMacroSeq++,
-      path: p || "新建宏/新建宏.json",
+      path: p || ("新建宏/" + name),
       name: name,
       folder: folder,
       hotkey: "",
@@ -537,6 +607,17 @@
         (Array.isArray(payload.actions) ? payload.actions.length : 0) +
         " 动作 · " +
         new Date().toLocaleDateString("zh-CN"),
+      actions: Array.isArray(payload.actions) ? payload.actions : [],
+      mode: payload.mode != null ? payload.mode : 0,
+      windowMode: payload.windowMode || {
+        enabled: 0,
+        executionKind: "hiddenDesktop",
+        selectMethod: "selectOnStartup",
+        targetExePath: "",
+        fakeFocusEnabled: 0,
+      },
+      breakoutTimeSeconds:
+        payload.breakoutTimeSeconds != null ? payload.breakoutTimeSeconds : 0,
     };
     macros.unshift(item);
     return item;
@@ -659,6 +740,19 @@
 
       case "openEditor":
         ok("openEditor", { script: scriptForPath(msg.path) });
+        return;
+
+      case "peekScriptActions":
+        {
+          var peek = scriptForPath(msg.path);
+          ok("peekScriptActions", {
+            reqId: msg.reqId || "",
+            actions: peek.actions || [],
+            mode: peek.mode || 0,
+            breakoutTimeSeconds: peek.breakoutTimeSeconds || 0,
+            windowMode: peek.windowMode || {},
+          });
+        }
         return;
 
       case "saveEditor":
@@ -1059,6 +1153,37 @@
         });
       }
     });
+    // 产品 saveSettings / 编辑器设置保存是扁平字段，需写回 other（否则再 openSettingsData 会冲掉）
+    var otherFlat = [
+      "themeId",
+      "useCustomTheme",
+      "customMainColor",
+      "customAccentColor",
+      "preferDirect2D",
+      "holdThresholdSeconds",
+      "autoHideMainWindow",
+      "playSoundOnStart",
+      "playSoundOnEnd",
+      "hideBottomRightTip",
+      "closeToTray",
+      "showFloatBall",
+      "autoStartOnBoot",
+      "resolveImeConflict",
+      "editorDefaultView",
+      "visualLoopWrap",
+      "visualBlockCallWires",
+      "visualIfWrap",
+      "visualBlockWrap",
+      "visualJumpWires",
+      "visualShowGrid",
+      "visualShowCardId",
+      "editorActionOrder",
+      "editorHiddenActions",
+    ];
+    if (!settings.other) settings.other = {};
+    otherFlat.forEach(function (k) {
+      if (Object.prototype.hasOwnProperty.call(next, k)) settings.other[k] = next[k];
+    });
   }
 
   function applyThemeMsg(msg) {
@@ -1121,10 +1246,22 @@
           useCustomTheme: 0,
           autoHideMainWindow: true,
           playSoundOnStart: true,
+          playSoundOnEnd: true,
           hideBottomRightTip: true,
           closeToTray: true,
+          showFloatBall: true,
           autoStartOnBoot: false,
           resolveImeConflict: true,
+          editorDefaultView: "code",
+          visualLoopWrap: true,
+          visualBlockCallWires: true,
+          visualIfWrap: true,
+          visualBlockWrap: true,
+          visualJumpWires: true,
+          visualShowGrid: true,
+          visualShowCardId: true,
+          editorActionOrder: [],
+          editorHiddenActions: [],
           holdThresholdSeconds: 0.12,
         },
         windowMode: {

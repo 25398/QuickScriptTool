@@ -11,7 +11,7 @@
 namespace fakefocus {
 
 constexpr uint32_t kSoftInputMagic = 0x51465349u;  // 'QFSI'
-constexpr uint32_t kSoftInputVersion = 6;
+constexpr uint32_t kSoftInputVersion = 7;
 
 constexpr uint32_t kSoftFlagCursorValid = 1u << 0;
 constexpr uint32_t kSoftFlagKeysValid = 1u << 1;
@@ -48,12 +48,17 @@ struct SoftInputState {
     uint32_t hitReady = 0;  // DLL 可写映射成功
     uint32_t hitGfw = 0;
     uint32_t hitFocus = 0;
+    /// 安装诊断（DLL 写）。禁止再 CreateRemoteThread 读 MapleIatCount。
+    uint32_t mapleDiag = 0;
+    uint32_t mapleIatPoll = 0;
+    /// foundVt | patchedSlot<<8 | heapVt<<16
+    uint32_t mapleDiVt = 0;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(SoftKeyEvent) == 4, "SoftKeyEvent size");
 static_assert(sizeof(SoftInputState)
-        == 4 + 4 + 4 + 4 + 4 + 256 + 4 + 4 + (kSoftKeyEventCap * 4) + 4 + 16 + 12,
+        == 4 + 4 + 4 + 4 + 4 + 256 + 4 + 4 + (kSoftKeyEventCap * 4) + 4 + 16 + 12 + 12,
     "SoftInputState size");
 
 inline void SoftInputMappingName(DWORD targetPid, wchar_t* out, size_t cch) {

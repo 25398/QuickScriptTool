@@ -84,7 +84,14 @@ MapCanvas：**独立 sx/sy**；http-mirror 须 **iframe 矩形映射**（禁整�
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | 回放零操作；日志「等待配套扩展」后立刻 EndRun；目标 QQ/Discord 等 | `Chrome_WidgetWin` 误判 CDP，扩展无法 attach Electron | **已证伪「凡 Chrome_ 类都走扩展」**；按 `targetExe` 非真浏览器 → softMessage 策略名 + **本机 SendInput**（PostMessage 对 Chromium 无效） |
-| Chromium 壳（QQ/微信/Discord）后台键鼠 | 外部 PostMessage 无效；假前台会抢焦点；多进程钩易崩 | 统一 `LooksLikeChromiumShellTarget`：单 PID 注入 + 焦点欺骗 + 进程内键鼠滚轮队列；真浏览器仍走 CDP |
+| Chromium 壳（QQ/Discord）后台键鼠 | 外部 PostMessage 无效；假前台会抢焦点；多进程钩易崩 | 统一 `LooksLikeChromiumShellTarget`：单 PID 注入 + 焦点欺骗 + 进程内键鼠滚轮队列；真浏览器仍走 CDP |
+| 微信 4.x（`Weixin.exe` / `Qt51514QWindowIcon`）后台键鼠无效 | `Qt*QWindowIcon` 误判 MuMu，只 PostMessage、不注入；Qt 查 `GetForegroundWindow` 丢键 | **已证伪「微信=Chromium 壳 / LCA 纯消息」**；AIR 式精简假焦点 + 宿主 PostMessage；禁止 Chromium 灌键线程 |
+| 微信后台仍抢前台、一次按键两次；日志「设置未启用假焦点注入」 | 全局关掉注入后走软消息：`PrimeWindowSoftFocus` 对 Qt 发 `WM_ACTIVATE` 抢前台；`KEYDOWN`+`WM_CHAR` 叠字 | 微信**忽略关闭注入设置**仍精简 FakeFocus；禁止 `WM_ACTIVATE`/`WM_CHAR`（只 `KEY*`）；后台不回退假前台 SendInput |
+| 微信按键 OK、找图点击/快捷输入没反应 | lite 只钩前景查询：Qt 用 `GetCursorPos`/`GetAsyncKeyState(LBUTTON)` 对点击；快捷输入 `WM_PASTE` 对 QWindow 假成功 | 微信再钩软光标+键态（禁 RawInput/子类化/灌键）；快捷输入走 `KEY*`，禁止 `WM_PASTE` |
+| 其它非 Edit 窗快捷输入没反应（AIR/Qt/游戏/Chromium 壳） | `SendQuickInputViaClipboard` 对任意 HWND 发 `WM_PASTE` 后直接 `return true` | 仅 Edit/RichEdit 等算粘贴成功；Qt/AIR/游戏/壳走 KEY*/Ctrl+V；普通自定义控件才 `WM_CHAR` |
+| 天龙八部找图命中、点击无反应 | `TianLongBaBuHJ WndClass` 被 `ClassLooksLikeLcaUnknownGame` 当成未登记游戏，只 PostMessage；客户端读 `GetCursorPos`/`GetAsyncKeyState` | **已证伪「凡未知游戏都走 LCA」**；天龙走精简假焦点（光标+键态），禁止 LCA 纯消息 |
+| Chromium 壳里脚本 `Ctrl+V` **只出 `v` 不粘贴**（日志「假焦点软按键 vk=0xA2/0x56」正常） | electronSafe 分支只做焦点欺骗 + 灌键线程，**没装软光标/软键态钩**：CEF 的按键预检 `IsKeyDown(GetKeyboardState(), KEY_CONTROL)` 读到系统键态（本机 Ctrl 抬起）→ 组合键降级成普通字符；`GetCursorPos` 读到本机真光标 → 点击命中判定错位（表现「鼠标移到某处不动、点了没反应」） | electronSafe 必须 `InstallWeixinMouseStateHooks()`（软光标 + 三键态钩，均为只读软状态）；`Hook_GetCursorPos` 在 electronSafe 下走静默分支（禁假 WM_INPUT）；回归 `chromium_shell_soft_input` |
+| 假焦点卸载后 `LoadLibrary` 卡死 / 进程崩溃 | 灌键线程忙等里不查停止位，`StopSoftKeyDrainThread` 超时放行 → DLL 已被 `FreeLibrary` 解除映射，线程接着跑 | `DrainSoftKeyEventsPost` 的 `while (g_keyEventRead < write)` 每轮查 `g_drainStop`；停止等待 1s；灌键线程 `THREAD_PRIORITY_BELOW_NORMAL` |
 | Chromium 壳最小化后找图/键无效；安静 ShowWindow 唤出灰窗 | GPU 合成已停；无激活还原只有空白壳（bestNcc≈0~3%） | **已证伪「安静还原」**；禁止对 Chromium 壳 Win32 ShowWindow；须保持已还原且可被遮挡；`IsCaptureLikelyBlank` 拒纯色空壳 |
 | 后台窗口模式按键无效（快捷输入 OK、鼠标点 OK） | 只发 WM_KEYDOWN、无 WM_CHAR；或键打到顶层而非点击子控件 | PostKeyToWindow：KEYDOWN 后补 WM_CHAR；目标与软鼠标落点子控件对齐 |
 | 后台 Shift+字符 / Ctrl+点击无效 | 软修饰未进 ToUnicode / MK_*（仍读物理 GetKeyState） | SoftSetVkDown 同步 VK_SHIFT；ModifierKeyFlags 读 g_softVkDown |

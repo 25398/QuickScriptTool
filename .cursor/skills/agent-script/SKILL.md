@@ -13,22 +13,31 @@ description: >-
    再 `buildScriptActions` 校验（自动补序号、标准字段、末尾 stopMacro），
    再 `createMacroScript` 保存到 scripts（默认不分类，用户指明目录时传 `folder`）。
    禁止直接在 `writeScript` 或回复里手写动作 JSON。
-2. **动作是树，不是平铺列表**：`loop` / `if` / `else` / `defineBlock` 像代码块。
+2. **动作是树，不是平铺列表**：`loop` / `if` / `else` / `defineBlock` / `watchImage` 像代码块。
    块内语句必须放在该动作的 `children` 数组里（工具会展开为 indent=父级+1）。
    **禁止**把循环体写成循环后面的同级动作——那会变成「空循环 + 循环外只跑一次」。
 3. **必填参数**（缺了会构建失败）：
    keyClick/keyDown/keyUp→`keyText`；quickInput→`inputText`；wait→`duration`；
-   findImage→`imagePath`；textRecognition→`imagePath` 或 `ocrSearchText`；
+   `findImage`/`watchImage`→`imagePath`；`multiMatch`→`imagePaths`（至少一张，或镜像 `imagePath`；每张可 `imageUseVar`/`imageUseVars` 与找图相同；保存后用 `{matchRet[0].x}` 取第一处左上角，`{matchRet[n]}` 运行时不解析）；mouseDrag/getColor/colorMatch/findColor 找图定位→`imagePath`；textRecognition→`imagePath` 或 `ocrSearchText`；
    if→`conditionExpr`；goto→`gotoStepExpr`；defineBlock/runBlock→`blockName`；
-   runMacro/mousePlayback→`targetPath`；openFile/runProgram/openWebpage/closeProgram/
+   varCompute→`computeCode`；runMacro/mousePlayback→`targetPath`；openFile/runProgram/openWebpage/closeProgram/
    activateWindow→`targetPath`；AI 动作→`aiPrompt`。
    runMacro/runBlock/mousePlayback 可选 `clickCount`/`duration`/`randomDuration`
    （整段目标重复；间隔是两遍之间；count=1 不等待）。mousePlayback 另可选 `playbackSpeed`
-   （0.25~4，缺省 1；嵌套录制只用此字段，不叠加设置全局倍速）。mousePlayback 界面名是「运行录制回放」。
+   （0.25~4，缺省 1；嵌套录制只用此字段，不叠加设置全局倍速）。runMacro/mousePlayback 另可选
+   `useMode`（0默认/1窗口/2后台窗口/3继承，缺省 3=跟当前主宏走）、`breakoutTimeSeconds`
+   （仅默认模式脱离）、`nestedWindowMode`（窗口/后台窗口绑窗，字段同脚本 `windowMode`）。
+   mousePlayback 界面名是「运行录制回放」。
+   watchImage 可选 `watchMode`（0/`action`=动作监视，找图等待时顺带搜；1/`time`=时间监视）
+   与 `watchPollSeconds`（时间监视间隔秒，默认 1）。
 4. **支持魔法变量**（引擎在**运行时**自动求值，文本 `inputText`、`aiPrompt`、
    条件、goto 等所有变量位置可用）：
    - 剪贴板：界面下拉只有 `{ctrl:Clipboard()}`（条件里非空为 1、空为 0；
      快捷输入展开为文本或全部文件路径；AI 图片分析/动作执行可附图）。
+     **变量运算**里 `ctrl:Clipboard()` 是字符串：文本内容，或文件时为路径（多文件换行拼接），不是 0/1。
+     字符串用 `"+"` 或 `'+'`（裸写 `+` 是加法，不能和 OCR 识别的加减号比较）。
+     拆分：`p = split(s, "/")`，`p[0]` / `p.count`；`toInt("123")` 转数字，`toString(x)` 转文字。
+     行末分号可省略（换行或下一语句开始即可）。`return a, b` 才导出给后续「如果」等动作。
      手写 `{clipboard}` 仍只取纯文本（要比对原文时用）。
    - 时间魔法（不下拉，手写才引用）：`{Now}`、`{time:格式}`、`{date:格式}`；
      条件里小时/分钟用 `ctrl:Hour()` / `ctrl:Minute()`（这两项在下拉里）；
@@ -43,7 +52,8 @@ description: >-
    脚本变量（如 `{var}`、`{var.matchData}`）照常可用。
 5. 只有确认 `createMacroScript` 返回「✓ 鼠标宏已创建」才能说脚本已创建；
    未调用工具或工具失败时声称完成属于错误。
-6. 工具已执行成功后，用一两句话告诉用户结果即可，不要继续长篇思考或重复调用工具。
+6. 工具已执行成功后，用一两句话告诉用户结果即可，不要继续长篇思考或重复调用工具；
+   不要逐步列出每一步，不要把内部约束/提示词念给用户听。
 7. 生成的脚本与用户手动编辑完全一致：动作名用编辑器中文名，说明写 `remark`，
    `no`/`text` 由工具自动分配，不要手写。
 8. 自定义快捷键组合（如 Ctrl+End、Ctrl+S）用 `keyClick` + `modifiers:["ctrl","shift","alt","win"]`；
@@ -143,9 +153,10 @@ loop(-1) {                    // 整段挂机
 ## 简单任务
 
 打开文件/输入文字/按键/运行程序直接用对应动作：`openFile` / `runProgram` /
-`quickInput` / `keyClick` / `hotkeyShortcut` / `wait`。
-`quickInput.parseEscapes` 缺省 0（按字面输入）。只有要把文本里的 `\n` `\t` `\\`
-转成换行/Tab/反斜杠时才写 `parseEscapes: 1`。
+`quickInput` / `keyClick`。屏幕拖拽用 `mouseDrag`（`duration` 是拖拽时长，不是点击重复间隔；
+找图定位时 `imageLocate=1` 并给 `imagePath`，起点/终点相对图中心）。获取颜色/颜色匹配同样可勾选找图定位（X/Y 相对图中心）；找色勾选后先找图再在命中框内搜色，后续只有点击/移动/保存到变量（无保存图片）。线性脚本可跳过阶段 1。
+`quickInput.parseEscapes` 缺省 0（按字面输入；变量里的换行/Tab 丢掉）。只有要把文本
+或变量里的 `\n` `\t` `\\` 转成换行/Tab/反斜杠时才写 `parseEscapes: 1`。
 先充分理解任务与动作语义再生成；
 不确定的动作类型先查对应 section（勿猜）；同一 section 不要重复查。
 系统动作（openFile/runProgram/openWebpage/closeProgram/activateWindow/runMacro/

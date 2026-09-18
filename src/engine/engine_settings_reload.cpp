@@ -117,7 +117,7 @@ void EngineHost::FlushHomeStatePersist() {
 }
 
 void EngineHost::PersistHomeStateJsonOnly() {
-    SaveAppSettings(appSettings_);
+    SaveAppSettingsPreserveUserSettings(appSettings_, false);
 }
 
 void EngineHost::SaveHomeState() {
@@ -143,7 +143,7 @@ void EngineHost::SaveHomeStateCore(bool persistJson) {
         case quickscript::MainTab::Macro: hs.macroScrollOffset = homeScrollOffset_; break;
         case quickscript::MainTab::ScriptCustom: hs.scriptCustomScrollOffset = homeScrollOffset_; break;
         }
-        if (persistJson) SaveAppSettings(appSettings_);
+        if (persistJson) SaveAppSettingsPreserveUserSettings(appSettings_, false);
         // 与 bridge g_ctx 对齐，避免 UI quietSaveSettings 仍持旧 selected*Path 写回覆盖
         try {
             qst::webview::SyncHomeSelectionCache(

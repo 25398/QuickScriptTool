@@ -38,6 +38,11 @@ void SyncHomeSelectionCache(const std::wstring& selectedScriptPath,
     const std::wstring& selectedRecordingPath, int activeTab);
 /// 宏调试窗被用户关闭后：同步 bridge 缓存并推送 settings.changed。
 void NotifyWebDebugWindowSetting(bool enabled);
+/// 悬浮球拖拽后只写位置，不碰其它设置。
+void PersistFloatBallPlacement(bool docked, int edge, double xRatio, double yRatio,
+    const std::wstring& monitorId);
+/// 右键隐藏悬浮球：写盘并推 settings.changed。
+void PersistShowFloatBall(bool show);
 
 std::string JsonListScripts();
 std::string JsonListRecordings();

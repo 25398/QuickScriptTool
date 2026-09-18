@@ -1,6 +1,7 @@
 #include "hid_interception.h"
 #include "synthetic_input_filter.h"
 
+#include <shlobj.h>
 #include <windows.h>
 
 #include <cstring>
@@ -103,7 +104,15 @@ bool LoadApiOnce() {
             g_api.module = LoadLibraryW(L"interception.dll");
         }
         if (!g_api.module) {
-            g_loadError = L"无法加载 interception.dll（请将其放在程序目录）";
+            wchar_t local[MAX_PATH]{};
+            if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
+                const std::wstring roam =
+                    std::wstring(local) + L"\\QuickScriptTool\\interception.dll";
+                g_api.module = LoadLibraryW(roam.c_str());
+            }
+        }
+        if (!g_api.module) {
+            g_loadError = L"无法加载 interception.dll（设置里安装驱动时会自动下载）";
             return;
         }
         auto load = [&](const char* name) -> FARPROC {

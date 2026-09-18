@@ -40,6 +40,9 @@
     actionSel: -1,
     batchMode: false,
     batchSel: {},
+    editorUndo: [],
+    editorRedo: [],
+    editorClipboard: null,
     // 对齐原生 popupAction_ 默认 sel=0（移动鼠标）；打开已有宏时由首条动作覆盖
     addActionType: "moveMouse",
     addPreview: null,
@@ -67,6 +70,10 @@
     _executedSteps: 0,
     _runningMacroName: "",
     _editorSnapshot: "",
+    _editorRevertPayload: null,
+    _saveEditorIntent: "",
+    _saveEditorBusy: false,
+    _editorAutosaveTimer: 0,
     _pendingRunKind: "",
     _gotScripts: false,
     _gotRecordings: false,
@@ -110,6 +117,12 @@
     { t: "窗口模式", v: 1 },
     { t: "后台窗口模式", v: 2 },
   ];
+  const NESTED_USE_MODES = [
+    { t: "默认模式", v: 0 },
+    { t: "窗口模式", v: 1 },
+    { t: "后台窗口模式", v: 2 },
+    { t: "继承模式", v: 3 },
+  ];
   const WM_METHODS = [
     { t: "启动时使用当前所在窗口", v: "selectOnStartup" },
     { t: "使用宏编辑时获取到的窗口类名", v: "useEditorWindowClass" },
@@ -126,6 +139,7 @@
     { t: "移动鼠标到", v: "moveMouse" },
     { t: "等待", v: "wait" },
     { t: "鼠标点击", v: "mouseClick" },
+    { t: "鼠标拖拽", v: "mouseDrag" },
     { t: "运行录制回放", v: "mousePlayback" },
     { t: "运行鼠标宏", v: "runMacro" },
     { t: "鼠标按下", v: "mouseDown" },
@@ -141,6 +155,9 @@
     { t: "定义宏指令块", v: "defineBlock" },
     { t: "运行宏指令块", v: "runBlock" },
     { t: "找图", v: "findImage" },
+    { t: "找图监视", v: "watchImage" },
+    { t: "多图匹配", v: "multiMatch" },
+    { t: "变量运算", v: "varCompute" },
     { t: "获取颜色", v: "getColor" },
     { t: "找色", v: "findColor" },
     { t: "颜色匹配", v: "colorMatch" },
@@ -164,9 +181,332 @@
     { t: "相对移动鼠标", v: "moveMouseRelative" },
   ];
   const MERGE_CONTAINER_TYPES = ACTION_TYPES.filter(
-    (a) => a.v === "loop" || a.v === "defineBlock" || a.v === "if" || a.v === "else"
+    (a) => a.v === "loop" || a.v === "defineBlock" || a.v === "watchImage" || a.v === "if" || a.v === "else"
   );
+  const ACTION_PY = {
+    moveMouse: "ydsbd yidongshubiaodao",
+    wait: "dd dengdai",
+    mouseClick: "sbdj shubiaodianji",
+    mouseDrag: "sbtz shubiaotuozhuai tuozhuai",
+    mousePlayback: "yxlzhf yunxingluzhihuifang",
+    runMacro: "yxsbh yunxingshubiaohong",
+    mouseDown: "sbax shubiaanxia",
+    mouseUp: "sbsk shubiaosongkai",
+    scrollWheel: "gdgl gundonggunlun",
+    keyClick: "ajdj anjiandianji",
+    keyDown: "jpax jianpananxia",
+    keyUp: "jpsk jianpansongkai",
+    hotkeyShortcut: "kjaj kuaijieanjian",
+    quickInput: "kjsr kuaijieshuru",
+    loop: "xh xunhuan",
+    endLoop: "tcxh tiaochuxunhuan",
+    defineBlock: "dyhzlk dingyihongzhilingkuai",
+    runBlock: "yxhzlk yunxinghongzhilingkuai",
+    findImage: "zt zhaotu",
+    multiMatch: "dtpp duotupipei duotu",
+    watchImage: "ztjs zhaotujianshi jianshi",
+    varCompute: "blys bianliangyunsuan",
+    getColor: "hqys huoquyanse",
+    findColor: "zs zhaose",
+    colorMatch: "yspp yansepipei",
+    textRecognition: "wzsb wenzishibie ocr",
+    if: "tjrg tiaojianruguo",
+    else: "tjfz tiaojianfouze",
+    lockScreenshot: "sdjp suodingjieping",
+    unlockScreenshot: "jsjp jiesuojieping",
+    stopMacro: "jshyx jieshuhongyunxing",
+    runProgram: "yxcx yunxingchengxu",
+    closeProgram: "gbcx guanbichengxu",
+    openWebpage: "dkwy dakaiwangye",
+    openFile: "dkwj dakaiwenjian",
+    activateWindow: "jhck jihuochuangkou",
+    timerRecordTime: "jsqjlsj jishiqijilushijian",
+    aiTextAnalysis: "aiwzfx",
+    aiImageAnalysis: "aitpfx",
+    aiActionExecute: "aidzzx",
+    getCursorPos: "hqdqgbwz huoquguangbiao",
+    goto: "tz tiaozhuan",
+    moveMouseRelative: "xdydsb xiangduiyidongshubiao",
+  };
   let _mergeUiOn = false;
+
+  function knownActionTypeMap() {
+    const m = new Map();
+    ACTION_TYPES.forEach((a) => m.set(a.v, a));
+    return m;
+  }
+
+  function normalizeActionCatalog(other) {
+    const known = ACTION_TYPES.map((a) => a.v);
+    const knownSet = new Set(known);
+    const rawOrder = Array.isArray(other && other.editorActionOrder) ? other.editorActionOrder : [];
+    const order = [];
+    const seen = new Set();
+    for (const t of rawOrder) {
+      if (typeof t !== "string" || !knownSet.has(t) || seen.has(t)) continue;
+      seen.add(t);
+      order.push(t);
+    }
+    for (const t of known) {
+      if (!seen.has(t)) order.push(t);
+    }
+    {
+      const mm = order.indexOf("multiMatch");
+      const fi = order.indexOf("findImage");
+      const wi = order.indexOf("watchImage");
+      if (fi >= 0 && mm === fi + 1 && wi > mm) {
+        order.splice(mm, 1);
+        const wi2 = order.indexOf("watchImage");
+        if (wi2 >= 0) order.splice(wi2 + 1, 0, "multiMatch");
+        else order.splice(mm, 0, "multiMatch");
+      }
+    }
+    const rawHidden = Array.isArray(other && other.editorHiddenActions)
+      ? other.editorHiddenActions
+      : [];
+    const hidden = [];
+    const hiddenSeen = new Set();
+    for (const t of rawHidden) {
+      if (typeof t !== "string" || !knownSet.has(t) || hiddenSeen.has(t)) continue;
+      hiddenSeen.add(t);
+      hidden.push(t);
+    }
+    if (hidden.length >= order.length && order.length) {
+      const keep = order[0];
+      const idx = hidden.indexOf(keep);
+      if (idx >= 0) hidden.splice(idx, 1);
+    }
+    return { order, hidden };
+  }
+
+  const CAT_PRESET_VISIBLE = {
+    simple: [
+      "moveMouse", "wait", "mouseClick", "keyClick", "quickInput",
+      "loop", "endLoop", "if", "else", "findImage",
+    ],
+    office: [
+      "moveMouse", "wait", "mouseClick", "keyClick", "quickInput", "loop", "endLoop", "if", "else",
+      "findImage",
+      "hotkeyShortcut", "runProgram", "closeProgram", "openWebpage", "openFile",
+      "activateWindow", "textRecognition",
+    ],
+    game: [
+      "moveMouse", "wait", "mouseClick", "keyClick", "quickInput", "loop", "if",
+      "findImage", "watchImage", "multiMatch", "mouseDrag", "findColor", "getColor", "colorMatch",
+      "textRecognition", "else", "varCompute", "endLoop",
+    ],
+  };
+
+  function normalizeCatalogPreset(v) {
+    return v === "simple" || v === "office" || v === "game" || v === "all" || v === "custom"
+      ? v
+      : "all";
+  }
+
+  function sameStrList(a, b) {
+    const x = Array.isArray(a) ? a : [];
+    const y = Array.isArray(b) ? b : [];
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+
+  function catalogPresetPayload(id) {
+    const known = ACTION_TYPES.map((a) => a.v);
+    if (id === "all") {
+      return { editorActionOrder: [], editorHiddenActions: [], editorCatalogPreset: "all" };
+    }
+    const visible = (CAT_PRESET_VISIBLE[id] || []).filter((t) => known.indexOf(t) >= 0);
+    const visSet = new Set(visible);
+    const hidden = known.filter((t) => !visSet.has(t));
+    return {
+      editorActionOrder: visible.concat(hidden),
+      editorHiddenActions: hidden,
+      editorCatalogPreset: id,
+    };
+  }
+
+  function catalogPresetIdFrom(order, hidden) {
+    const o = Array.isArray(order) ? order : [];
+    const h = Array.isArray(hidden) ? hidden : [];
+    if (!o.length && !h.length) return "all";
+    const def = ACTION_TYPES.map((a) => a.v);
+    if (!h.length && sameStrList(o, def)) return "all";
+    for (const id of ["simple", "office", "game"]) {
+      const p = catalogPresetPayload(id);
+      if (sameStrList(o, p.editorActionOrder) && sameStrList(h, p.editorHiddenActions)) return id;
+    }
+    return "custom";
+  }
+
+  function cloneCatalogSnapshot(src) {
+    return {
+      editorActionOrder: Array.isArray(src && src.editorActionOrder)
+        ? src.editorActionOrder.slice()
+        : [],
+      editorHiddenActions: Array.isArray(src && src.editorHiddenActions)
+        ? src.editorHiddenActions.slice()
+        : [],
+    };
+  }
+
+  function catalogSnapshotHasItems(src) {
+    return !!(
+      src &&
+      ((src.editorActionOrder && src.editorActionOrder.length) ||
+        (src.editorHiddenActions && src.editorHiddenActions.length))
+    );
+  }
+
+  function sidecarCustomPartial() {
+    const c = state._edCatCustom || cloneCatalogSnapshot(null);
+    return {
+      editorCustomActionOrder: Array.isArray(c.editorActionOrder) ? c.editorActionOrder.slice() : [],
+      editorCustomHiddenActions: Array.isArray(c.editorHiddenActions)
+        ? c.editorHiddenActions.slice()
+        : [],
+    };
+  }
+
+  function catalogPartialFromRows() {
+    const rows = $$("#edActionCatalog .ed-cat-row");
+    if (!rows.length) {
+      if (catalogSnapshotHasItems(state._edCatCustom)) return cloneCatalogSnapshot(state._edCatCustom);
+      return cloneCatalogSnapshot((state.settings && state.settings.other) || {});
+    }
+    const order = [];
+    const hidden = [];
+    rows.forEach((row) => {
+      const v = row.dataset.type;
+      if (!v) return;
+      order.push(v);
+      if (!row.querySelector(".chk")?.classList.contains("on")) hidden.push(v);
+    });
+    if (hidden.length >= order.length && order.length) {
+      const idx = hidden.indexOf(order[0]);
+      if (idx >= 0) hidden.splice(idx, 1);
+    }
+    return { editorActionOrder: order, editorHiddenActions: hidden };
+  }
+
+  function syncCatalogPresetUi(id) {
+    const preset = normalizeCatalogPreset(id);
+    state._edCatPreset = preset;
+    $$("#edCatalogPresets [data-cat-preset]").forEach((btn) => {
+      btn.classList.toggle("on", btn.dataset.catPreset === preset);
+    });
+  }
+
+  function applyCatalogPreset(id) {
+    const next = normalizeCatalogPreset(id);
+    if (next === "custom") {
+      if (catalogSnapshotHasItems(state._edCatCustom)) {
+        renderEditorActionCatalog(state._edCatCustom);
+      } else {
+        state._edCatCustom = catalogPartialFromRows();
+      }
+      syncCatalogPresetUi("custom");
+      return;
+    }
+    if (state._edCatPreset === "custom") {
+      state._edCatCustom = catalogPartialFromRows();
+    }
+    const p = catalogPresetPayload(next);
+    renderEditorActionCatalog(p);
+    syncCatalogPresetUi(p.editorCatalogPreset);
+  }
+
+  function markCatalogPresetCustom() {
+    state._edCatCustom = catalogPartialFromRows();
+    if (state._edCatPreset === "custom") return;
+    syncCatalogPresetUi("custom");
+  }
+
+  function pickerActionTypes(extraType, opts) {
+    const includeHidden = !!(opts && opts.includeHidden);
+    const other = (state.settings && state.settings.other) || {};
+    const { order, hidden } = normalizeActionCatalog(other);
+    const hiddenSet = new Set(hidden);
+    const byV = knownActionTypeMap();
+    const list = [];
+    for (const v of order) {
+      if (!includeHidden && hiddenSet.has(v) && v !== extraType) continue;
+      if (state.findImageEngine === false
+          && (v === "findImage" || v === "watchImage" || v === "multiMatch")
+          && v !== extraType) continue;
+      const a = byV.get(v);
+      if (a) list.push(a);
+    }
+    if (extraType && !list.some((a) => a.v === extraType)) {
+      const a = byV.get(extraType);
+      if (a) list.push(a);
+    }
+    if (list.length) return list;
+    if (state.findImageEngine === false) {
+      return ACTION_TYPES.filter((a) =>
+        a.v !== "findImage" && a.v !== "watchImage" && a.v !== "multiMatch");
+    }
+    return ACTION_TYPES.slice();
+  }
+
+  function editorSearchAllActionsOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorSearchAllActions", false);
+  }
+
+  function pickerMergeContainerTypes() {
+    const allowed = new Set(["loop", "defineBlock", "watchImage", "if", "else"]);
+    const list = pickerActionTypes().filter((a) => allowed.has(a.v));
+    return list.length ? list : MERGE_CONTAINER_TYPES.slice();
+  }
+
+  function firstVisibleActionType() {
+    const t = pickerActionTypes()[0];
+    return (t && t.v) || "moveMouse";
+  }
+
+  function syncEditorActionTypeCombo() {
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const keep = shown && shown.type ? String(shown.type) : "";
+    const hidden = new Set(
+      normalizeActionCatalog((state.settings && state.settings.other) || {}).hidden
+    );
+    const prev = state.addActionType;
+    if (state.addActionType && hidden.has(state.addActionType) && state.addActionType !== keep) {
+      if (!editorSearchAllActionsOn()) state.addActionType = firstVisibleActionType();
+    }
+    const typeCombo = $("#edActionType");
+    if (!typeCombo) return;
+    const mergeLock = typeof mergePickerLocked === "function" && mergePickerLocked();
+    const types = mergeLock ? pickerMergeContainerTypes() : pickerActionTypes(state.addActionType);
+    let cur = types.find((a) => a.v === state.addActionType);
+    if (!cur) {
+      cur = types[0];
+      if (cur) state.addActionType = cur.v;
+    }
+    if (cur) setActionTypeComboText(cur.t);
+    if (state.editor && state.addPreview && prev !== state.addActionType && prev !== keep) {
+      showAddTypePreview();
+    }
+  }
+
+  function actionTypeComboBox() {
+    return $("#edActionTypeBox") || $("#edActionType");
+  }
+
+  function setActionTypeComboText(label) {
+    const el = $("#edActionType");
+    if (!el) return;
+    const text = label == null ? "" : String(label);
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") el.value = text;
+    else el.textContent = text;
+  }
+
+  function actionTypeComboText() {
+    const el = $("#edActionType");
+    if (!el) return "";
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return String(el.value || "");
+    return String(el.textContent || "");
+  }
 
   function toast(msg) {
     const el = $("#toast");
@@ -241,13 +581,55 @@
    * UI 设计要求（用户确认；细节见 ui/index.html :root 注释）：
    * - 主界面客户区 1552×960（黄金分割）；宏编辑器 1800×1230（HWND 由壳保证）
    * - 键鼠录制优化弹窗 1640×1140（壳 setMode opt）
-   * - 设置 / AI 助手组件与主界面同一 --qst-u=1.5，禁止 JS zoom
+   * - 设置 / AI 助手组件与主界面同一 --qst-u 基准 1.5，再乘布局缩放（分辨率自适应 × 用户倍率）
+   * - 禁止 JS zoom
    */
   const SHELL_CLIENT = {
     home: { w: 1552, h: 960 },
     editor: { w: 1800, h: 1230 },
     opt: { w: 1640, h: 1140 },
   };
+  const QST_U_BASE = 1.5;
+  const QST_OPT_U_BASE = 1.491;
+
+  function currentLayoutScale() {
+    const s = Number(state._uiLayoutScale);
+    if (Number.isFinite(s) && s > 0) return s;
+    const u = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--qst-u")
+    );
+    if (Number.isFinite(u) && u > 0) return u / QST_U_BASE;
+    return 1;
+  }
+
+  function applyUiLayoutScale(scale) {
+    const s = Number(scale);
+    if (!(Number.isFinite(s) && s > 0)) return;
+    state._uiLayoutScale = s;
+    const root = document.documentElement;
+    root.style.setProperty("--qst-u", String(QST_U_BASE * s));
+    root.style.setProperty("--qst-opt-u", String(QST_OPT_U_BASE * s));
+  }
+
+  function formatUiScaleFactor(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return "1.0";
+    let s = n.toFixed(4).replace(/\.?0+$/, "");
+    if (s.indexOf(".") < 0) s += ".0";
+    return s;
+  }
+
+  function readUiScaleFactorInput(strict) {
+    const raw = ($("#setUiScale")?.textContent || "").trim();
+    const n = parseFloat(raw);
+    if (Number.isFinite(n) && n > 0) {
+      return Math.min(3, Math.max(0.25, n));
+    }
+    if (strict) return null;
+    const prev = state.settings && state.settings.other && state.settings.other.uiScaleFactor;
+    if (Number.isFinite(Number(prev)) && Number(prev) > 0) return Number(prev);
+    return 1;
+  }
 
   function applyShellScale() {
     // 仅同步客户区记录；组件大小由 CSS --qst-u 负责，不做运行时 zoom
@@ -298,8 +680,11 @@
       runMacro: "运行鼠标宏",
       hotkeyShortcut: "快捷按键",
       defineBlock: "定义宏指令块",
+      watchImage: "找图监视",
+      varCompute: "变量运算",
       runBlock: "运行宏指令块",
       findImage: "找图",
+      multiMatch: "多图匹配",
       getColor: "获取颜色",
       findColor: "找色",
       colorMatch: "颜色匹配",
@@ -412,7 +797,26 @@
           "鼠标点击" +
           (holds ? holds + "+" : "") +
           buttonText(a.button) +
+          ((a.x | 0) || (a.y | 0) ? " 先到(" + (a.x | 0) + "," + (a.y | 0) + ")" : "（当前位置）") +
           repeatInfo(a)
+        );
+      case "mouseDrag":
+        return (
+          "鼠标拖拽" +
+          (holds ? holds + "+" : "") +
+          buttonText(a.button) +
+          (a.imageLocate ? " 相对图" : "") +
+          "(" +
+          (a.x | 0) +
+          "," +
+          (a.y | 0) +
+          ")→(" +
+          (a.endX | 0) +
+          "," +
+          (a.endY | 0) +
+          ") " +
+          f3(a.duration) +
+          "秒"
         );
       case "keyDown":
         return "键盘按下" + (holds ? holds + "+" : "") + (a.keyText || "");
@@ -484,6 +888,61 @@
           "]"
         );
       }
+      case "multiMatch": {
+        const fu = a.findImageFollowUp | 0;
+        const mode = (a.multiMatchMode | 0) === 1 ? "一图多处" : "多图择一";
+        const follow =
+          fu === 2
+            ? mode === "一图多处"
+              ? "保存全部"
+              : "保存匹配度"
+            : fu === 1
+              ? "移动到"
+              : mode === "一图多处"
+                ? "依次点击"
+                : "点击";
+        const thr = matchThresholdPercent(a.matchThreshold);
+        return (
+          "多图匹配[" +
+          mode +
+          "," +
+          follow +
+          "," +
+          (a.perfectMatch ? "完美匹配" : "匹配>" + thr + "%") +
+          ",缩放" +
+          f3(a.imageScaleMin ?? 1) +
+          "-" +
+          f3(a.imageScaleMax ?? 1) +
+          "]"
+        );
+      }
+      case "watchImage": {
+        const thr = matchThresholdPercent(a.matchThreshold);
+        const timed = (a.watchMode | 0) !== 0;
+        const poll = Number(a.watchPollSeconds);
+        const pollTxt = timed
+          ? ",时间监视" + (poll > 0 ? f3(poll) + "秒" : "")
+          : ",动作监视";
+        return (
+          "找图监视[匹配>" +
+          thr +
+          "%" +
+          pollTxt +
+          "," +
+          ((a.resumeAfterWatch | 0) !== 0 ? "从原处继续" : "从监视后继续") +
+          ",缩放" +
+          f3(a.imageScaleMin ?? 1) +
+          "-" +
+          f3(a.imageScaleMax ?? 1) +
+          "]"
+        );
+      }
+      case "varCompute": {
+        let preview = String(a.computeCode || a.inputText || "");
+        preview = preview.replace(/\s+/g, " ");
+        if (preview.length > 24) preview = preview.slice(0, 24) + "...";
+        return "变量运算[" + preview + "]";
+      }
       case "textRecognition": {
         const mode = (a.ocrResultMode | 0) === 1 ? "文字查找" : "获取文字";
         const follow =
@@ -535,6 +994,37 @@
         return "计时器记录时间[" + (a.loopVarName || "未命名") + "]";
       case "getCursorPos":
         return "获取当前光标位置→[" + (a.matchVarName || "未命名") + "]";
+      case "getColor":
+        return (
+          "获取颜色" +
+          (a.imageLocate ? "（找图定位）" : "") +
+          "@" +
+          (a.x | 0) +
+          "," +
+          (a.y | 0) +
+          "→[" +
+          (a.matchVarName || "colorRet") +
+          "]"
+        );
+      case "findColor": {
+        const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
+        const follow = fu === 1 ? "移动到" : fu === 2 ? "保存到变量" : "点击";
+        return (
+          "找色[" +
+          follow +
+          (a.imageLocate ? ",找图定位" : "") +
+          "]"
+        );
+      }
+      case "colorMatch":
+        return (
+          "颜色匹配" +
+          (a.imageLocate ? "（找图定位）" : "") +
+          "@" +
+          (a.x | 0) +
+          "," +
+          (a.y | 0)
+        );
       case "aiTextAnalysis":
       case "aiImageAnalysis":
       case "aiActionExecute": {
@@ -556,6 +1046,8 @@
     if (i < 0 || !state.editorActions[i]) return;
     const row = document.querySelector(`#actionList .arow[data-i="${i}"] .aname-text`);
     if (row) row.textContent = displayActionName(state.editorActions[i]);
+    const V = window.QstVisualEditor;
+    if (V && typeof V.refreshCard === "function") V.refreshCard(i);
     const remarkCell = document.querySelector(`#actionList .arow[data-i="${i}"] span:nth-child(3)`);
     // 备注列在 aname 后；批量/选中时 class 不同，稳妥用整行刷新时更新
     void remarkCell;
@@ -571,6 +1063,19 @@
     return state.editDraft;
   }
 
+  function captureParamPanelIntoDraft() {
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    if (state.addPreview) {
+      readParamPanelInto(state.addPreview);
+      state.addPreview.remark = remark;
+      return;
+    }
+    if (state.actionSel >= 0 && state.editDraft) {
+      readParamPanelInto(state.editDraft);
+      state.editDraft.remark = remark;
+    }
+  }
+
   /** 当前参数面板动作：添加预览 或 选中项草稿（未点修改前不碰列表） */
   function editorParamAction() {
     if (state.addPreview) return state.addPreview;
@@ -583,27 +1088,151 @@
 
   function syncFormIntoSelectedBeforeSave() {
     // 对齐原生 SyncFormIntoActionsBeforeRun：保存前把右栏草稿写入选中项
+    if (state.batchMode || state.addPreview) return;
     if (state.actionSel < 0 || !state.editorActions[state.actionSel]) return;
     if (!state.editDraft) return;
     readParamPanelInto(state.editDraft);
     const remark = ($("#edRemark")?.textContent || "").trim();
     state.editDraft.remark = remark;
     const prev = state.editorActions[state.actionSel];
-    if (state.editDraft.type === "defineBlock" && !isValidBlockName(state.editDraft.blockName)) return;
-    if (
-      state.editDraft.type === "endLoop" &&
-      !hasLoopParentAt(state.editorActions, state.actionSel, prev.indent | 0)
-    ) {
-      return;
+    // 未勾选「不启用修改」时，换类型必须点「修改」：避免保存/定时保存把循环子节点清掉
+    if (!editorDisableModifyOn() && prev && prev.type !== state.editDraft.type) return;
+    const result = applyDraftToActionIndex(state.actionSel, state.editDraft, { silent: true });
+    if (!result) return;
+    state.editDraft = JSON.parse(JSON.stringify(state.editorActions[state.actionSel]));
+  }
+
+  function cloneDraftOntoTarget(draft, prev) {
+    let next;
+    try {
+      next = JSON.parse(JSON.stringify(draft));
+    } catch (_) {
+      next = Object.assign({}, draft);
     }
-    const next = Object.assign({}, state.editDraft);
     next.indent = prev.indent;
+    if (typeof prev._vx === "number") next._vx = prev._vx;
+    if (typeof prev._vy === "number") next._vy = prev._vy;
     if (prev.no != null) next.no = prev.no;
     if (prev.originalNo != null) next.originalNo = prev.originalNo;
     next.name = typeLabel(next.type);
     delete next._preview;
-    state.editorActions[state.actionSel] = next;
-    state.editDraft = JSON.parse(JSON.stringify(next));
+    mmNormalizeForSave(next);
+    return next;
+  }
+
+  function dropContainerChildrenAt(index) {
+    const end = subtreeEnd(index);
+    if (end <= index + 1) return 0;
+    const n = end - (index + 1);
+    state.editorActions.splice(index + 1, n);
+    visualOnDelete(index + 1, n);
+    remapCollapsedAfterDelete(index + 1, end);
+    delete state.collapsedContainers[index];
+    if (state.actionSel > index && state.actionSel < end) state.actionSel = index;
+    else if (state.actionSel >= end) state.actionSel -= n;
+    return n;
+  }
+
+  function applyDraftToActionIndex(index, draft, opts) {
+    const prev = state.editorActions[index];
+    if (!prev || !draft) return null;
+    const silent = !!(opts && opts.silent);
+    if (draft.type === "defineBlock") {
+      if (!validateDefineBlockName(draft.blockName, index)) return null;
+    }
+    if (
+      draft.type === "endLoop" &&
+      !hasLoopParentAt(state.editorActions, index, prev.indent | 0)
+    ) {
+      if (!silent) toast(END_LOOP_NEEDS_LOOP_MSG);
+      return null;
+    }
+    const oldType = prev.type;
+    const dropKids = isSubtreeContainerType(oldType) && !isSubtreeContainerType(draft.type);
+    if (dropKids) dropContainerChildrenAt(index);
+    const next = cloneDraftOntoTarget(draft, state.editorActions[index]);
+    state.editorActions[index] = next;
+    return {
+      typeChanged: oldType !== next.type,
+      droppedKids: !!dropKids,
+    };
+  }
+
+  function patchActionListRow(index) {
+    const a = state.editorActions[index];
+    if (!a) return;
+    const row = document.querySelector('#actionList .arow[data-i="' + index + '"]');
+    if (!row) return;
+    const name = row.querySelector(".aname-text");
+    if (name) name.textContent = displayActionName(a);
+    const aname = row.querySelector(".aname");
+    const remarkEl = aname ? aname.nextElementSibling : null;
+    if (remarkEl && remarkEl.tagName === "SPAN") remarkEl.textContent = a.remark || "";
+  }
+
+  function liveModifyEnabled() {
+    return (
+      !!state.editor &&
+      editorDisableModifyOn() &&
+      !state.batchMode &&
+      !isEditorVisualMode() &&
+      state.actionSel >= 0 &&
+      !state.addPreview
+    );
+  }
+
+  /** 换选中/点列表前先写回：列表 mousedown 会 preventDefault，输入框来不及 blur */
+  function flushPendingLiveEdit() {
+    if (state._flushingLiveEdit) return false;
+    state._flushingLiveEdit = true;
+    try {
+      return liveCommitSelectedIfEnabled();
+    } finally {
+      state._flushingLiveEdit = false;
+    }
+  }
+
+  function liveCommitSelectedIfEnabled() {
+    if (state._inLiveCommit) return false;
+    if (!liveModifyEnabled()) return false;
+    if (state.actionSel < 0 || !state.editorActions[state.actionSel]) return false;
+    if (!state.editDraft) loadEditDraftFromSelection();
+    if (!state.editDraft) return false;
+    readParamPanelInto(state.editDraft);
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    state.editDraft.remark = remark;
+    const idx = state.actionSel;
+    const prev = state.editorActions[idx];
+    const dropKids =
+      isSubtreeContainerType(prev.type) && !isSubtreeContainerType(state.editDraft.type);
+    if (!dropKids) {
+      const guess = cloneDraftOntoTarget(state.editDraft, prev);
+      if (JSON.stringify(guess) === JSON.stringify(prev)) return true;
+    }
+    visualNoteUndo();
+    const result = applyDraftToActionIndex(idx, state.editDraft, { silent: false });
+    if (!result) {
+      revertLastEditorHistory();
+      return false;
+    }
+    state._inLiveCommit = true;
+    try {
+      state.editDraft = JSON.parse(JSON.stringify(state.editorActions[idx]));
+      state.addPreview = null;
+      if (result.typeChanged || result.droppedKids) {
+        state._keepParamPanel = true;
+        state._skipReadback = true;
+        renderEditorActions(state.editorActions);
+        state._skipReadback = false;
+        state._keepParamPanel = false;
+      } else {
+        patchActionListRow(idx);
+        syncActionListRowName(idx);
+      }
+    } finally {
+      state._inLiveCommit = false;
+    }
+    return true;
   }
 
   function commitModifySelected() {
@@ -617,29 +1246,46 @@
     readParamPanelInto(state.editDraft);
     const remark = ($("#edRemark")?.textContent || "").trim();
     state.editDraft.remark = remark;
-    const prev = state.editorActions[state.actionSel];
-    if (state.editDraft.type === "defineBlock") {
-      if (!validateDefineBlockName(state.editDraft.blockName, state.actionSel)) return false;
-    }
-    if (
-      state.editDraft.type === "endLoop" &&
-      !hasLoopParentAt(state.editorActions, state.actionSel, prev.indent | 0)
-    ) {
-      toast(END_LOOP_NEEDS_LOOP_MSG);
+    visualNoteUndo();
+    const result = applyDraftToActionIndex(state.actionSel, state.editDraft, { silent: false });
+    if (!result) {
+      revertLastEditorHistory();
       return false;
     }
-    const next = Object.assign({}, state.editDraft);
-    next.indent = prev.indent;
-    if (prev.no != null) next.no = prev.no;
-    if (prev.originalNo != null) next.originalNo = prev.originalNo;
-    next.name = typeLabel(next.type);
-    delete next._preview;
-    state.editorActions[state.actionSel] = next;
-    state.editDraft = JSON.parse(JSON.stringify(next));
+    state.editDraft = JSON.parse(JSON.stringify(state.editorActions[state.actionSel]));
     state.addPreview = null;
     state._skipReadback = true;
     renderEditorActions(state.editorActions);
     state._skipReadback = false;
+    return true;
+  }
+
+  function commitModifyBatch() {
+    const idxs = selectedBatchIndices();
+    if (!idxs.length) {
+      toast("请先勾选动作");
+      return false;
+    }
+    const src = currentAddActionFromForm();
+    visualNoteUndo();
+    const sorted = idxs.slice().sort((a, b) => b - a);
+    let n = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      const idx = sorted[i];
+      if (idx < 0 || idx >= state.editorActions.length) continue;
+      let one = src;
+      try {
+        one = JSON.parse(JSON.stringify(src));
+      } catch (_) {}
+      if (applyDraftToActionIndex(idx, one, { silent: true })) n += 1;
+    }
+    if (!n) {
+      revertLastEditorHistory();
+      toast("没有可修改的动作");
+      return false;
+    }
+    renderEditorActions(state.editorActions);
+    toast("已修改 " + n + " 条");
     return true;
   }
 
@@ -709,6 +1355,8 @@
       imageScale: 1,
       imageScaleMin: 1,
       imageScaleMax: 1,
+      imageLocate: 0,
+      findTimeExpr: "0",
       findImageFollowUp: 0,
       offsetX: 0,
       offsetY: 0,
@@ -719,6 +1367,9 @@
       scrollDirection: 0,
       scrollVertical: 1,
       scrollHorizontal: 0,
+      resumeAfterWatch: 1,
+      watchMode: 0,
+      watchPollSeconds: 1,
     };
     if (t === "wait") base.duration = 0.5;
     if (t === "findImage") {
@@ -727,8 +1378,35 @@
       base.matchThreshold = 65;
       applyFullScreenSearchCoords(base);
     }
+    if (t === "multiMatch") {
+      base.duration = 0.05;
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      base.imagePaths = [];
+      base.imageUseVars = [];
+      base.multiMatchMode = 0;
+      base.multiMatchMax = 20;
+      base.multiMatchSort = 0;
+      base.matchVarName = "matchRet";
+      base.findImageFollowUp = 0;
+      applyFullScreenSearchCoords(base);
+    }
+    if (t === "watchImage") {
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      base.resumeAfterWatch = 1;
+      base.watchMode = 0;
+      base.watchPollSeconds = 1;
+      applyFullScreenSearchCoords(base);
+    }
+    if (t === "varCompute") {
+      base.computeCode = "";
+    }
     if (t === "getColor") {
       base.matchVarName = "colorRet";
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      applyFullScreenSearchCoords(base);
     }
     if (t === "findColor") {
       base.colorR = 255;
@@ -746,8 +1424,23 @@
       base.colorB = 0;
       base.colorTolerance = 16;
       base.matchVarName = "colorRet";
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      applyFullScreenSearchCoords(base);
     }
     if (t === "mouseClick") base.duration = 0.01;
+    if (t === "mouseDrag") {
+      base.duration = 0.3;
+      base.endX = 0;
+      base.endY = 0;
+      base.randomEndX = 0;
+      base.randomEndY = 0;
+      base.imageLocate = 0;
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      base.findTimeExpr = "0";
+      applyFullScreenSearchCoords(base);
+    }
     if (t === "keyClick") base.duration = 0.01;
     if (t === "mousePlayback") {
       base.blockName = "";
@@ -756,6 +1449,9 @@
       base.duration = 0.01;
       base.randomDuration = 0;
       base.playbackSpeed = 1;
+      base.useMode = 3;
+      base.breakoutTimeSeconds = 0;
+      base.nestedWindowMode = {};
     }
     if (t === "runMacro") {
       base.blockName = "";
@@ -763,6 +1459,9 @@
       base.clickCount = 1;
       base.duration = 0.01;
       base.randomDuration = 0;
+      base.useMode = 3;
+      base.breakoutTimeSeconds = 0;
+      base.nestedWindowMode = {};
     }
     if (t === "loop") base.loopCount = -1;
     if (t === "quickInput") {
@@ -912,6 +1611,7 @@
     const keepAgent = opts && opts.keepAgent;
     if (state.pendingKind === "askInput") {
       state._askInputOk = null;
+      state._askInputAllowEmpty = false;
       state.pendingKind = null;
     }
     const closingHotkey = !!$("#ov-hotkey")?.classList.contains("show");
@@ -926,6 +1626,7 @@
       if (o.id === "ov-agent") o.classList.remove("agent-min");
     });
     hidePopup();
+    state._nestedWmPick = false;
     requestAnimationFrame(syncTypingHotkeyMute);
     if (closingHotkey) stopWebHotkeyCapture();
     if (closingActionKey) stopActionKeyCapture();
@@ -950,14 +1651,16 @@
     $$("#settingsTabs .st-tab").forEach((t) =>
       t.classList.toggle("active", t.dataset.stab === stab)
     );
-    // 专业模式会把设置 dlg 挪出 #ov-settings，不能只查 overlay 下的 pane
-    document.querySelectorAll(".set-pane[data-pane]").forEach((p) =>
-      p.classList.toggle("active", p.dataset.pane === stab)
-    );
+    // 专业模式会把设置 dlg 挪出 #ov-settings，不能只查 overlay 下的 pane。
+    // 勿动 #ov-editor-settings：否则会把编辑器设置页的 .active 清掉，内容 display:none。
+    document.querySelectorAll(".set-pane[data-pane]").forEach((p) => {
+      if (p.closest("#ov-editor-settings")) return;
+      p.classList.toggle("active", p.dataset.pane === stab);
+    });
   }
 
   function quietSaveSettings(partial) {
-    if (!window.qst) return;
+    if (!window.qst || partial == null) return;
     state._quietSaveSettings = true;
     qst.saveSettings(partial || {});
   }
@@ -992,14 +1695,16 @@
       showContentSkeleton("actionList", 10);
       if ($("#edCount")) $("#edCount").textContent = "…";
       // 右栏立刻清晰显示固定「移动鼠标」预览（不参与列表模糊）
-      state.addActionType = "moveMouse";
+      state.addActionType = firstVisibleActionType();
       state.actionSel = -1;
       state.addPreview = null;
       state.editDraft = null;
       const typeCombo = $("#edActionType");
       if (typeCombo) {
-        const cur = ACTION_TYPES.find((a) => a.v === "moveMouse") || ACTION_TYPES[0];
-        typeCombo.textContent = cur.t;
+        const cur =
+          pickerActionTypes(state.addActionType).find((a) => a.v === state.addActionType) ||
+          ACTION_TYPES[0];
+        if (typeCombo && cur) setActionTypeComboText(cur.t);
       }
       showAddTypePreview();
     } else if (kind === "opt") {
@@ -1064,7 +1769,13 @@
     if (state.editor) {
       // silent：启动恢复 / 列表重匹配不得把刚打开的编辑器关掉
       if (silent) return;
-      exitEditor();
+      if (editorAutoSaveOn()) {
+        requestLeaveEditor("x");
+        if (state.editor) return;
+      } else {
+        exitEditor();
+        if (state.editor) return;
+      }
     }
     const map = { clicker: 0, recorder: 1, macro: 2, ai: 3 };
     const engTab = map[tab] != null ? map[tab] : 0;
@@ -1343,6 +2054,17 @@
     } else {
       titleEl.textContent = PRODUCT_NAME;
     }
+    syncSettingsGear();
+  }
+
+  function syncSettingsGear() {
+    const btn = $("#btnSettings");
+    if (!btn) return;
+    const inEditor = !!state.editor;
+    const pro = (window.ProMode ? window.ProMode.mode() : state.uiMode) === "pro";
+    btn.hidden = pro && !inEditor;
+    btn.title = inEditor ? "鼠标宏编辑设置" : "设置";
+    btn.setAttribute("aria-label", btn.title);
   }
 
   /** 极简 / 专业模式切换：只切壳与可见区域，两套交互逻辑互不触碰 */
@@ -1380,16 +2102,15 @@
     const views = $("#views");
     if (nav) nav.style.display = pro ? "none" : "";
     if (views) views.style.display = pro ? "none" : "";
-    // 专业模式顶栏已有「设置」Tab，隐藏标题栏重复齿轮
     document.documentElement.classList.toggle("pro-ui", !!pro);
-    const btnSet = $("#btnSettings");
-    if (btnSet) btnSet.hidden = !!pro;
-    // 仅首次打开主界面居中；之后（含模式切换）保持原位
+    syncSettingsGear();
+    // 仅首次打开主界面居中；之后（含模式切换）保持原位。
+    // 独立助手窗与主壳不同 WebView：禁止 setHomeSize，否则会把主窗口拉去主屏并改尺寸。
     const center =
       opts && Object.prototype.hasOwnProperty.call(opts, "center")
         ? !!opts.center
         : !_homeCenteredOnce;
-    if (window.qst && typeof qst.setHomeSize === "function") {
+    if (!AGENT_SHELL && window.qst && typeof qst.setHomeSize === "function") {
       qst.setHomeSize(SHELL_CLIENT.home.w, SHELL_CLIENT.home.h, { center });
       if (center) _homeCenteredOnce = true;
     }
@@ -1411,7 +2132,8 @@
       !AGENT_SHELL &&
       window.ProMode &&
       window.qst &&
-      typeof quietSaveSettings === "function"
+      typeof quietSaveSettings === "function" &&
+      state._gotSettings
     ) {
       quietSaveSettings({ uiMode: pro ? "pro" : "simple" });
     }
@@ -1966,10 +2688,10 @@
 
   function persistPlaybackSpeedSettings() {
     if (!window.qst || typeof quietSaveSettings !== "function") return;
-    quietSaveSettings({
-      playbackSpeed: readPlaybackSpeedValue(),
-      enablePlaybackSpeed: !!$("#setPlaySpeedEn")?.classList.contains("on"),
-    });
+    const payload = { playbackSpeed: readPlaybackSpeedValue() };
+    const en = $("#setPlaySpeedEn");
+    if (en) payload.enablePlaybackSpeed = en.classList.contains("on");
+    quietSaveSettings(payload);
   }
 
   function bindSpeedSliderRoot(root, opts) {
@@ -2046,8 +2768,347 @@
     });
   }
 
+  function otherFlag(other, key, defaultOn) {
+    if (!other || other[key] == null) return !!defaultOn;
+    return !!other[key];
+  }
+
+  function editorDefaultViewOf(other) {
+    return other && other.editorDefaultView === "visual" ? "visual" : "code";
+  }
+
+  function editorVisualFromState() {
+    const other = (state.settings && state.settings.other) || {};
+    return {
+      editorDefaultView: editorDefaultViewOf(other),
+      visualLoopWrap: otherFlag(other, "visualLoopWrap", true),
+      visualBlockCallWires: otherFlag(other, "visualBlockCallWires", true),
+      visualIfWrap: otherFlag(other, "visualIfWrap", true),
+      visualBlockWrap: otherFlag(other, "visualBlockWrap", true),
+      visualWatchWrap: otherFlag(other, "visualWatchWrap", true),
+      visualJumpWires: otherFlag(other, "visualJumpWires", true),
+      visualShowGrid: otherFlag(other, "visualShowGrid", true),
+      visualShowCardId: otherFlag(other, "visualShowCardId", true),
+      editorActionOrder: Array.isArray(other.editorActionOrder) ? other.editorActionOrder.slice() : [],
+      editorHiddenActions: Array.isArray(other.editorHiddenActions)
+        ? other.editorHiddenActions.slice()
+        : [],
+      editorCatalogPreset: normalizeCatalogPreset(other.editorCatalogPreset),
+      editorCustomActionOrder: Array.isArray(other.editorCustomActionOrder)
+        ? other.editorCustomActionOrder.slice()
+        : [],
+      editorCustomHiddenActions: Array.isArray(other.editorCustomHiddenActions)
+        ? other.editorCustomHiddenActions.slice()
+        : [],
+      editorSearchAllActions: otherFlag(other, "editorSearchAllActions", false),
+      editorHideFixedVars: otherFlag(other, "editorHideFixedVars", false),
+      editorHideCoordVars: otherFlag(other, "editorHideCoordVars", false),
+      editorMultiResultPlaceholderOnly: otherFlag(other, "editorMultiResultPlaceholderOnly", false),
+      editorDisableModifyButton: otherFlag(other, "editorDisableModifyButton", false),
+      editorAutoSaveOnExit: otherFlag(other, "editorAutoSaveOnExit", false),
+      editorEnableBatchInsert: otherFlag(other, "editorEnableBatchInsert", false),
+    };
+  }
+
+  function editorDisableModifyOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorDisableModifyButton", false);
+  }
+
+  function editorAutoSaveOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorAutoSaveOnExit", false);
+  }
+
+  function editorBatchInsertOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorEnableBatchInsert", false);
+  }
+
+  function mergePickerLocked() {
+    return !!(
+      state.batchMode &&
+      typeof isMergeEligible === "function" &&
+      isMergeEligible() &&
+      !editorBatchInsertOn()
+    );
+  }
+
+  function syncEditorGeneralChrome() {
+    const noMod = editorDisableModifyOn();
+    const auto = editorAutoSaveOn();
+    document.body.classList.toggle("editor-no-modify", !!(state.editor && noMod));
+    document.body.classList.toggle("editor-autosave", !!(state.editor && auto));
+    if (state.editor) {
+      if (auto) startEditorAutosaveTimer();
+      else stopEditorAutosaveTimer();
+    }
+  }
+
+  function setEditorSettingsTab(tab) {
+    const t =
+      tab === "general" || tab === "vars" || tab === "common" ? tab : "visual";
+    $$("#editorSettingsTabs .st-tab").forEach((el) =>
+      el.classList.toggle("active", el.dataset.edtab === t)
+    );
+    $$("#ov-editor-settings .ed-set-pane").forEach((p) =>
+      p.classList.toggle("active", p.dataset.edpane === t)
+    );
+  }
+
+  function renderEditorActionCatalog(other) {
+    const host = $("#edActionCatalog");
+    if (!host) return;
+    const { order, hidden } = normalizeActionCatalog(other);
+    const hiddenSet = new Set(hidden);
+    const byV = knownActionTypeMap();
+    host.innerHTML = order
+      .map((v) => {
+        const a = byV.get(v);
+        if (!a) return "";
+        const on = !hiddenSet.has(v);
+        return (
+          `<div class="ed-cat-row${on ? "" : " is-hidden-type"}" data-type="${esc(v)}" draggable="true">` +
+          `<span class="ed-cat-handle" title="拖动排序">⋮⋮</span>` +
+          `<span class="chk${on ? " on" : ""}" data-ed-cat-vis draggable="false"><i></i></span>` +
+          `<span class="ed-cat-name">${esc(a.t)}</span>` +
+          `<span class="ed-cat-btns">` +
+          `<button type="button" class="btn ghost" data-ed-cat-up title="上移" draggable="false">▲</button>` +
+          `<button type="button" class="btn ghost" data-ed-cat-dn title="下移" draggable="false">▼</button>` +
+          `</span></div>`
+        );
+      })
+      .join("");
+  }
+
+  function collectEditorCatalogPartial() {
+    const preset = normalizeCatalogPreset(state._edCatPreset);
+    const sidecar = sidecarCustomPartial();
+    if (preset === "all") {
+      return {
+        editorActionOrder: [],
+        editorHiddenActions: [],
+        editorCatalogPreset: "all",
+        ...sidecar,
+      };
+    }
+    if (preset === "custom") {
+      const rows = catalogPartialFromRows();
+      state._edCatCustom = cloneCatalogSnapshot(rows);
+      return {
+        editorActionOrder: rows.editorActionOrder,
+        editorHiddenActions: rows.editorHiddenActions,
+        editorCatalogPreset: "custom",
+        editorCustomActionOrder: rows.editorActionOrder.slice(),
+        editorCustomHiddenActions: rows.editorHiddenActions.slice(),
+      };
+    }
+    const p = catalogPresetPayload(preset);
+    return {
+      editorActionOrder: p.editorActionOrder,
+      editorHiddenActions: p.editorHiddenActions,
+      editorCatalogPreset: preset,
+      ...sidecar,
+    };
+  }
+
+  function bindEditorCatalogPresets() {
+    const host = $("#edCatalogPresets");
+    if (!host || host._boundPresets) return;
+    host._boundPresets = true;
+    host.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-cat-preset]");
+      if (!btn || !host.contains(btn)) return;
+      e.preventDefault();
+      applyCatalogPreset(btn.dataset.catPreset);
+    });
+  }
+
+  function bindEditorActionCatalog() {
+    const host = $("#edActionCatalog");
+    if (!host || host._boundCat) return;
+    host._boundCat = true;
+    let dragEl = null;
+    host.addEventListener("click", (e) => {
+      const row = e.target.closest(".ed-cat-row");
+      if (!row || !host.contains(row)) return;
+      const up = e.target.closest("[data-ed-cat-up]");
+      const dn = e.target.closest("[data-ed-cat-dn]");
+      if (up) {
+        e.preventDefault();
+        const prev = row.previousElementSibling;
+        if (prev) host.insertBefore(row, prev);
+        markCatalogPresetCustom();
+        return;
+      }
+      if (dn) {
+        e.preventDefault();
+        const next = row.nextElementSibling;
+        if (next) host.insertBefore(next, row);
+        markCatalogPresetCustom();
+        return;
+      }
+      const chk = e.target.closest(".chk");
+      if (!chk) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const turningOff = chk.classList.contains("on");
+      if (turningOff) {
+        const others = $$("#edActionCatalog .ed-cat-row").filter(
+          (r) => r !== row && r.querySelector(".chk.on")
+        );
+        if (!others.length) {
+          toast("至少保留一种可添加的动作");
+          return;
+        }
+      }
+      chk.classList.toggle("on");
+      const i = chk.querySelector("i");
+      if (i) i.textContent = "";
+      row.classList.toggle("is-hidden-type", !chk.classList.contains("on"));
+      markCatalogPresetCustom();
+    });
+    host.addEventListener("dragstart", (e) => {
+      const row = e.target.closest(".ed-cat-row");
+      if (!row) return;
+      if (e.target.closest(".chk, button")) {
+        e.preventDefault();
+        return;
+      }
+      dragEl = row;
+      row.classList.add("dragging");
+      try {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", row.dataset.type || "");
+      } catch (_) {}
+    });
+    host.addEventListener("dragend", () => {
+      if (dragEl) dragEl.classList.remove("dragging");
+      dragEl = null;
+      markCatalogPresetCustom();
+    });
+    host.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      try {
+        e.dataTransfer.dropEffect = "move";
+      } catch (_) {}
+      const over = e.target.closest(".ed-cat-row");
+      if (!over || !dragEl || over === dragEl) return;
+      const rect = over.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      host.insertBefore(dragEl, before ? over : over.nextSibling);
+    });
+    host.addEventListener("drop", (e) => {
+      e.preventDefault();
+    });
+  }
+
+  function fillEditorSettingsForm(other) {
+    other = other || (state.settings && state.settings.other) || {};
+    const edView = editorDefaultViewOf(other);
+    $$("#edSetViewRadios .radio").forEach((r) => {
+      r.classList.toggle("on", (r.dataset.editorView || "code") === edView);
+    });
+    setChk($("#edSetLoopWrap"), otherFlag(other, "visualLoopWrap", true));
+    setChk($("#edSetCallWires"), otherFlag(other, "visualBlockCallWires", true));
+    setChk($("#edSetIfWrap"), otherFlag(other, "visualIfWrap", true));
+    setChk($("#edSetBlockWrap"), otherFlag(other, "visualBlockWrap", true));
+    setChk($("#edSetWatchWrap"), otherFlag(other, "visualWatchWrap", true));
+    setChk($("#edSetJumpWires"), otherFlag(other, "visualJumpWires", true));
+    setChk($("#edSetShowGrid"), otherFlag(other, "visualShowGrid", true));
+    setChk($("#edSetShowCardId"), otherFlag(other, "visualShowCardId", true));
+    setChk($("#edSetSearchAllActions"), otherFlag(other, "editorSearchAllActions", false));
+    setChk($("#edSetHideFixedVars"), otherFlag(other, "editorHideFixedVars", false));
+    setChk($("#edSetHideCoordVars"), otherFlag(other, "editorHideCoordVars", false));
+    setChk($("#edSetMultiResultPlaceholder"), otherFlag(other, "editorMultiResultPlaceholderOnly", false));
+    setChk($("#edSetDisableModify"), otherFlag(other, "editorDisableModifyButton", false));
+    setChk($("#edSetAutoSaveOnExit"), otherFlag(other, "editorAutoSaveOnExit", false));
+    setChk($("#edSetEnableBatchInsert"), otherFlag(other, "editorEnableBatchInsert", false));
+    {
+      const stored = normalizeCatalogPreset(other.editorCatalogPreset);
+      const cat = normalizeActionCatalog(other);
+      const detected = catalogPresetIdFrom(cat.order, cat.hidden);
+      let custom = {
+        editorActionOrder: Array.isArray(other.editorCustomActionOrder)
+          ? other.editorCustomActionOrder.slice()
+          : [],
+        editorHiddenActions: Array.isArray(other.editorCustomHiddenActions)
+          ? other.editorCustomHiddenActions.slice()
+          : [],
+      };
+      const sidecarEmpty = !catalogSnapshotHasItems(custom);
+      if (sidecarEmpty && (stored === "custom" || (stored === "all" && detected === "custom"))) {
+        custom = { editorActionOrder: cat.order.slice(), editorHiddenActions: cat.hidden.slice() };
+      }
+      state._edCatCustom = custom;
+      if (stored === "custom" || (stored === "all" && detected === "custom" && sidecarEmpty)) {
+        renderEditorActionCatalog(state._edCatCustom);
+        syncCatalogPresetUi("custom");
+      } else {
+        renderEditorActionCatalog(catalogPresetPayload(stored));
+        syncCatalogPresetUi(stored);
+      }
+    }
+  }
+
+  function collectEditorSettingsPartial() {
+    return {
+      editorDefaultView:
+        $("#edSetViewRadios .radio.on")?.dataset.editorView === "visual" ? "visual" : "code",
+      visualLoopWrap: !!$("#edSetLoopWrap")?.classList.contains("on"),
+      visualBlockCallWires: !!$("#edSetCallWires")?.classList.contains("on"),
+      visualIfWrap: !!$("#edSetIfWrap")?.classList.contains("on"),
+      visualBlockWrap: !!$("#edSetBlockWrap")?.classList.contains("on"),
+      visualWatchWrap: !!$("#edSetWatchWrap")?.classList.contains("on"),
+      visualJumpWires: !!$("#edSetJumpWires")?.classList.contains("on"),
+      visualShowGrid: !!$("#edSetShowGrid")?.classList.contains("on"),
+      visualShowCardId: !!$("#edSetShowCardId")?.classList.contains("on"),
+      editorSearchAllActions: !!$("#edSetSearchAllActions")?.classList.contains("on"),
+      editorHideFixedVars: !!$("#edSetHideFixedVars")?.classList.contains("on"),
+      editorHideCoordVars: !!$("#edSetHideCoordVars")?.classList.contains("on"),
+      editorMultiResultPlaceholderOnly: !!$("#edSetMultiResultPlaceholder")?.classList.contains("on"),
+      editorDisableModifyButton: !!$("#edSetDisableModify")?.classList.contains("on"),
+      editorAutoSaveOnExit: !!$("#edSetAutoSaveOnExit")?.classList.contains("on"),
+      editorEnableBatchInsert: !!$("#edSetEnableBatchInsert")?.classList.contains("on"),
+      ...collectEditorCatalogPartial(),
+    };
+  }
+
+  function applyEditorVisualPrefs() {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.applyDisplayPrefs === "function") V.applyDisplayPrefs();
+    else if (V && typeof V.render === "function") V.render();
+  }
+
+  function persistEditorSettings(partial, announce) {
+    if (!state.settings) state.settings = {};
+    if (!state.settings.other) state.settings.other = {};
+    Object.assign(state.settings.other, partial);
+    applyEditorVisualPrefs();
+    syncEditorActionTypeCombo();
+    syncEditorGeneralChrome();
+    if (state.editor && state.batchMode && typeof syncMergeModeUi === "function") syncMergeModeUi();
+    if (window.qst) {
+      if (announce) state._announceSettingsSave = true;
+      quietSaveSettings(partial);
+    } else if (announce) {
+      toast("设置已保存");
+    }
+  }
+
+  function openEditorSettings() {
+    fillEditorSettingsForm((state.settings && state.settings.other) || {});
+    setEditorSettingsTab("visual");
+    bindEditorActionCatalog();
+    bindEditorCatalogPresets();
+    openOv("editor-settings");
+  }
+
   function fillSettings(s) {
     state.settings = s || {};
+    const prevFi = state.findImageEngine;
+    state.findImageEngine = s.findImageEngine !== false;
+    if (prevFi !== false && state.findImageEngine === false && !state._toldNoFindImage) {
+      state._toldNoFindImage = true;
+      toast("找图引擎不可用（OpenCV 缺失或被隔离）。连点、脚本编辑和界面仍可使用");
+    }
     const click = s.click || {};
     const other = s.other || {};
     const home = s.home || {};
@@ -2097,6 +3158,18 @@
       playback.autoOutputKeyFunctionDebug == null ? true : !!playback.autoOutputKeyFunctionDebug
     );
     setChk(
+      $("#setLowPerfMode"),
+      playback.lowPerformanceMode == null ? false : !!playback.lowPerformanceMode
+    );
+    setChk(
+      $("#setFindGpuAccel"),
+      playback.findImageGpuAccel == null ? false : !!playback.findImageGpuAccel
+    );
+    setChk(
+      $("#setAiFastPaths"),
+      playback.aiFastPaths == null ? true : !!playback.aiFastPaths
+    );
+    setChk(
       $("#setRecCaptureEn"),
       playback.recordingClickCaptureEnabled == null ? true : !!playback.recordingClickCaptureEnabled
     );
@@ -2115,13 +3188,22 @@
     setChk($("#setSchedResumeEn"), !!playback.scheduledTaskAutoResume);
 
     setChk($("#setAutoHide"), other.autoHideMainWindow == null ? true : !!other.autoHideMainWindow);
-    setChk($("#setPlaySound"), !!other.playSoundOnStart);
+    setChk($("#setPlaySound"), other.playSoundOnStart == null ? true : !!other.playSoundOnStart);
+    setChk($("#setPlaySoundEnd"), other.playSoundOnEnd == null ? true : !!other.playSoundOnEnd);
     setChk($("#setHideTip"), other.hideBottomRightTip == null ? true : !!other.hideBottomRightTip);
     setChk($("#setCloseTray"), other.closeToTray == null ? true : !!other.closeToTray);
+    setChk($("#setFloatBall"), other.showFloatBall == null ? true : !!other.showFloatBall);
     setChk($("#setAutoBoot"), !!other.autoStartOnBoot);
     setChk($("#setImeConflict"), !!other.resolveImeConflict);
+    fillEditorSettingsForm(other);
+    syncEditorActionTypeCombo();
+    applyEditorVisualPrefs();
     if ($("#setHoldSec") && other.holdThresholdSeconds != null)
       $("#setHoldSec").textContent = String(other.holdThresholdSeconds);
+    if ($("#setUiScale")) {
+      const scaleV = other.uiScaleFactor != null ? other.uiScaleFactor : 1;
+      $("#setUiScale").textContent = formatUiScaleFactor(scaleV);
+    }
     state.hideBottomRightTip =
       other.hideBottomRightTip == null ? true : !!other.hideBottomRightTip;
 
@@ -2202,6 +3284,8 @@
     syncRecModeUi();
     updateCtas();
     applyThemeFromSettings(s);
+    if (state.editor) applyEditorVisualPrefs();
+    if (state.editor) syncEditorGeneralChrome();
   }
 
   function findAiSavedProfile(modelName) {
@@ -2299,6 +3383,7 @@
   function persistAiSavedModels() {
     if (!window.qst) return;
     const payload = collectSettings();
+    if (!payload) return;
     // 显式删除最后一个模型时置清除标志；其余场合空数组只表示页面状态未加载，
     // 后端会保留磁盘上已保存的模型（避免 DeepSeek/豆包配置被空列表冲掉）。
     if (!Array.isArray(state._aiSavedModels) || state._aiSavedModels.length === 0) {
@@ -2430,6 +3515,45 @@
       return `"${stem}"`;
     }
     return cur;
+  }
+
+  function applyWindowPickToNestedAction(pick, pending) {
+    pick = pick || {};
+    const a = editorParamAction();
+    if (!a || (a.type !== "runMacro" && a.type !== "mousePlayback")) return;
+    readParamPanelInto(a);
+    const wm = ensureNestedWindowMode(a);
+    if (pick.processPath) wm.targetExePath = pick.processPath;
+    if (pick.windowTitle) {
+      wm.windowTitle = pick.windowTitle;
+      wm.windowName = pick.windowTitle;
+      wm.targetWindowTitle = pick.windowTitle;
+    }
+    if (pick.windowClassName) wm.windowClassName = pick.windowClassName;
+    if (pick.childWindowClassName != null)
+      wm.childWindowClassName = pick.childWindowClassName || "";
+    if (pick.x != null) {
+      wm.pickX = pick.x | 0;
+      wm.targetPickX = pick.x | 0;
+    }
+    if (pick.y != null) {
+      wm.pickY = pick.y | 0;
+      wm.targetPickY = pick.y | 0;
+    }
+    const nextArgs = launchArgsFromWindowPick(pick, wm.launchArgs);
+    if (nextArgs) wm.launchArgs = nextArgs;
+    if (
+      pending === "nestedWmClass" ||
+      pending === "nestedWm" ||
+      wm.windowClassName ||
+      wm.windowName ||
+      wm.windowTitle
+    ) {
+      wm.selectMethod = "useEditorWindowClass";
+    }
+    a.nestedWindowMode = wm;
+    if ((a.useMode | 0) !== 1 && (a.useMode | 0) !== 2) a.useMode = 1;
+    renderParamPanel(a);
   }
 
   /** 对齐原生 ApplyWindowModeTargetFromPoint：写入身份并切到 useEditorWindowClass */
@@ -2844,49 +3968,39 @@
   }
 
   function collectSettings() {
+    if (!state._gotSettings) return null;
     const aiCfg = resolveActiveAiConfig();
+    // 设置页控件不在当前文档时不得写成 false：独立助手窗没有 #setAutoHide 等，
+    // 切模型/保存模型列表会把「运行后自动隐藏主窗口」等勾选冲掉。
+    const assignChk = (obj, key, id) => {
+      const el = $("#" + id);
+      if (!el) return;
+      obj[key] = el.classList.contains("on");
+    };
     const out = {
-      enableRandomInterval: false,
       randomIntervalMaxSeconds: 0.5,
-      enablePressReleaseInterval: false,
       pressReleaseIntervalSeconds: 0.001,
-      enableCoordinateJitter: false,
       jitterX: 2,
       jitterY: 2,
-      enableFixedCoordinates: false,
       fixedX: 0,
       fixedY: 0,
-      enableClickCountLimit: false,
       clickCountLimit: 0,
       themeId: state.themeId | 0,
       useCustomTheme: !!state.useCustomTheme,
       customMainColor: (state.settings && state.settings.other && state.settings.other.customMainColor) || 0,
       customAccentColor:
         (state.settings && state.settings.other && state.settings.other.customAccentColor) || 0,
-      autoHideMainWindow: !!$("#setAutoHide")?.classList.contains("on"),
-      playSoundOnStart: !!$("#setPlaySound")?.classList.contains("on"),
-      hideBottomRightTip: !!$("#setHideTip")?.classList.contains("on"),
-      closeToTray: !!$("#setCloseTray")?.classList.contains("on"),
-      autoStartOnBoot: !!$("#setAutoBoot")?.classList.contains("on"),
-      resolveImeConflict: !!$("#setImeConflict")?.classList.contains("on"),
+      ...editorVisualFromState(),
       // Direct2D 开关已移除：保留磁盘既有值
       preferDirect2D: !!(state.settings && state.settings.other && state.settings.other.preferDirect2D),
       holdThresholdSeconds: parseFloat($("#setHoldSec")?.textContent || "0.2") || 0.2,
-      enablePlaybackCount: !!$("#setPlayCountEn")?.classList.contains("on"),
+      uiScaleFactor: readUiScaleFactorInput(false),
       playbackCount: parseInt($("#setPlayCount")?.textContent || "1", 10) || 0,
-      enablePlaybackInterval: !!$("#setPlayIntervalEn")?.classList.contains("on"),
       playbackIntervalMinSeconds: parseFloat($("#setPlayIntervalMin")?.textContent || "0.5") || 0.5,
       playbackIntervalMaxSeconds: parseFloat($("#setPlayIntervalMax")?.textContent || "1") || 1,
-      enableDebugOutputWindow: !!$("#setDebugWin")?.classList.contains("on"),
-      autoOutputKeyFunctionDebug: !!$("#setAutoKeyDebug")?.classList.contains("on"),
-      recordingClickCaptureEnabled: !!$("#setRecCaptureEn")?.classList.contains("on"),
       recordingClickCaptureHalfSize: parseInt($("#setRecCaptureHalf")?.textContent || "40", 10) || 40,
-      enablePlaybackSpeed: !!$("#setPlaySpeedEn")?.classList.contains("on"),
       playbackSpeed: readPlaybackSpeedValue(),
       uiMode: (window.ProMode ? window.ProMode.mode() : state.uiMode) || "simple",
-      foregroundInputBackend: 0,
-      scheduledTaskConflictPolicy: 0,
-      scheduledTaskAutoResume: false,
       clickerButton: state.clickBtn,
       clickerIntervalMode: state.intervalMode,
       clickerCustomInterval: state.customInterval,
@@ -2905,29 +4019,48 @@
       maxTokens: parseInt($("#aiTokens")?.textContent || "4096", 10) || 4096,
       savedModels: Array.isArray(state._aiSavedModels) ? state._aiSavedModels : [],
     };
+    assignChk(out, "autoHideMainWindow", "setAutoHide");
+    assignChk(out, "playSoundOnStart", "setPlaySound");
+    assignChk(out, "playSoundOnEnd", "setPlaySoundEnd");
+    assignChk(out, "hideBottomRightTip", "setHideTip");
+    assignChk(out, "closeToTray", "setCloseTray");
+    assignChk(out, "showFloatBall", "setFloatBall");
+    assignChk(out, "autoStartOnBoot", "setAutoBoot");
+    assignChk(out, "resolveImeConflict", "setImeConflict");
     const backendOn = document.querySelector(
       '.set-pane[data-pane="play"] .radio[data-backend].on'
     );
     if (backendOn) out.foregroundInputBackend = backendOn.dataset.backend | 0;
     const schedPrioOn = $("#setSchedPrioRadios .radio.on");
     if (schedPrioOn) out.scheduledTaskConflictPolicy = schedPrioOn.dataset.schedPrio | 0;
-    out.scheduledTaskAutoResume = !!$("#setSchedResumeEn")?.classList.contains("on");
-    state.hideBottomRightTip = out.hideBottomRightTip;
+    assignChk(out, "scheduledTaskAutoResume", "setSchedResumeEn");
+    if (Object.prototype.hasOwnProperty.call(out, "hideBottomRightTip")) {
+      state.hideBottomRightTip = out.hideBottomRightTip;
+    }
 
-    out.enableRandomInterval = !!$("#setRandomIntervalEn")?.classList.contains("on");
+    assignChk(out, "enableRandomInterval", "setRandomIntervalEn");
+    assignChk(out, "enablePlaybackCount", "setPlayCountEn");
+    assignChk(out, "enablePlaybackInterval", "setPlayIntervalEn");
+    assignChk(out, "enableDebugOutputWindow", "setDebugWin");
+    assignChk(out, "autoOutputKeyFunctionDebug", "setAutoKeyDebug");
+    assignChk(out, "lowPerformanceMode", "setLowPerfMode");
+    assignChk(out, "findImageGpuAccel", "setFindGpuAccel");
+    assignChk(out, "aiFastPaths", "setAiFastPaths");
+    assignChk(out, "recordingClickCaptureEnabled", "setRecCaptureEn");
+    assignChk(out, "enablePlaybackSpeed", "setPlaySpeedEn");
     out.randomIntervalMaxSeconds = parseFloat($("#setRandomMax")?.textContent || "0.5") || 0;
-    out.enablePressReleaseInterval = !!$("#setPressReleaseEn")?.classList.contains("on");
+    assignChk(out, "enablePressReleaseInterval", "setPressReleaseEn");
     out.pressReleaseIntervalSeconds = parseFloat($("#setPressRelease")?.textContent || "0.001") || 0;
-    out.enableCoordinateJitter = !!$("#setJitterEn")?.classList.contains("on");
+    assignChk(out, "enableCoordinateJitter", "setJitterEn");
     out.jitterX = parseInt($("#setJitterX")?.textContent || "0", 10) || 0;
     out.jitterY = parseInt($("#setJitterY")?.textContent || "0", 10) || 0;
-    out.enableFixedCoordinates = !!$("#setFixedCoordEn")?.classList.contains("on");
+    assignChk(out, "enableFixedCoordinates", "setFixedCoordEn");
     out.fixedX = parseInt($("#setFixedX")?.textContent || "0", 10) || 0;
     out.fixedY = parseInt($("#setFixedY")?.textContent || "0", 10) || 0;
-    out.enableClickCountLimit = !!$("#setClickLimitEn")?.classList.contains("on");
+    assignChk(out, "enableClickCountLimit", "setClickLimitEn");
     out.clickCountLimit = parseInt($("#setClickCountLimit")?.textContent || "0", 10) || 0;
 
-    out.showPreviewThumbnail = !!$("#setWmPreviewThumb")?.classList.contains("on");
+    assignChk(out, "showPreviewThumbnail", "setWmPreviewThumb");
     {
       let ms = parseInt($("#setWmPreviewMs")?.textContent || "500", 10);
       if (!Number.isFinite(ms)) ms = 500;
@@ -2935,12 +4068,16 @@
       if (ms > 5000) ms = 5000;
       out.previewRefreshMs = ms;
     }
-    out.blockRunWhenUnhealthy = !!$("#setWmBlockUnhealthy")?.classList.contains("on");
-    out.allowForegroundInputFallback = !!$("#setWmFgFallback")?.classList.contains("on");
-    out.enableFakeFocusInjection = !!$("#setWmEnableInject")?.classList.contains("on");
+    assignChk(out, "blockRunWhenUnhealthy", "setWmBlockUnhealthy");
+    assignChk(out, "allowForegroundInputFallback", "setWmFgFallback");
+    {
+      const injectEl = $("#setWmEnableInject");
+      // 设置页未挂载时不得写成 false，否则下次运行冒险岛只会 PostMessage、角色不动。
+      if (injectEl) out.enableFakeFocusInjection = injectEl.classList.contains("on");
+    }
     out.injectionTechnique =
       typeof state._wmInjectTech === "number" ? state._wmInjectTech : 0;
-    out.hideInjectedModule = !!$("#setWmHideModule")?.classList.contains("on");
+    assignChk(out, "hideInjectedModule", "setWmHideModule");
 
     out.clickerScrollOffset = state._clickerScrollOffset | 0;
     out.macroScrollOffset = state._macroScrollOffset | 0;
@@ -2948,10 +4085,56 @@
     out.scriptCustomScrollOffset = state._aiScrollOffset | 0;
 
     if (AGENT_SHELL) {
-      delete out.uiMode;
-      delete out.playbackSpeed;
-      delete out.enablePlaybackSpeed;
+      const aiOnly = {
+        aiEnabled: out.aiEnabled,
+        apiUrl: out.apiUrl,
+        apiKey: out.apiKey,
+        modelName: out.modelName,
+        savedModels: out.savedModels,
+      };
+      const ai = (state.settings && state.settings.ai) || {};
+      const t = Number(ai.temperature);
+      if (Number.isFinite(t)) aiOnly.temperature = t;
+      else if ($("#aiTemp")) aiOnly.temperature = out.temperature;
+      const tok = parseInt(ai.maxTokens, 10);
+      if (Number.isFinite(tok) && tok > 0) aiOnly.maxTokens = tok;
+      else if ($("#aiTokens")) aiOnly.maxTokens = out.maxTokens;
+      if (out.savedModelsClear) aiOnly.savedModelsClear = true;
+      return aiOnly;
     }
+
+    if (!state.settings) state.settings = {};
+    if (!state.settings.other) state.settings.other = {};
+    state.settings.other.editorDefaultView = out.editorDefaultView;
+    state.settings.other.visualLoopWrap = out.visualLoopWrap;
+    state.settings.other.visualBlockCallWires = out.visualBlockCallWires;
+    state.settings.other.visualIfWrap = out.visualIfWrap;
+    state.settings.other.visualBlockWrap = out.visualBlockWrap;
+    state.settings.other.visualWatchWrap = out.visualWatchWrap;
+    state.settings.other.visualJumpWires = out.visualJumpWires;
+    state.settings.other.visualShowGrid = out.visualShowGrid;
+    state.settings.other.visualShowCardId = out.visualShowCardId;
+    state.settings.other.editorActionOrder = Array.isArray(out.editorActionOrder)
+      ? out.editorActionOrder
+      : [];
+    state.settings.other.editorHiddenActions = Array.isArray(out.editorHiddenActions)
+      ? out.editorHiddenActions
+      : [];
+    state.settings.other.editorCatalogPreset = normalizeCatalogPreset(out.editorCatalogPreset);
+    state.settings.other.editorCustomActionOrder = Array.isArray(out.editorCustomActionOrder)
+      ? out.editorCustomActionOrder
+      : [];
+    state.settings.other.editorCustomHiddenActions = Array.isArray(out.editorCustomHiddenActions)
+      ? out.editorCustomHiddenActions
+      : [];
+    state.settings.other.editorSearchAllActions = !!out.editorSearchAllActions;
+    state.settings.other.editorHideFixedVars = !!out.editorHideFixedVars;
+    state.settings.other.editorHideCoordVars = !!out.editorHideCoordVars;
+    state.settings.other.editorMultiResultPlaceholderOnly = !!out.editorMultiResultPlaceholderOnly;
+    state.settings.other.editorDisableModifyButton = !!out.editorDisableModifyButton;
+    state.settings.other.editorAutoSaveOnExit = !!out.editorAutoSaveOnExit;
+    state.settings.other.editorEnableBatchInsert = !!out.editorEnableBatchInsert;
+    state.settings.other.uiScaleFactor = out.uiScaleFactor;
 
     return out;
   }
@@ -3000,8 +4183,32 @@
     const y2 = a[px + "Y2"] | 0;
     if (x2 <= x1 || y2 <= y1) applyFullScreenSearchCoords(a, prefix);
   }
+  function editorUsesWindowTarget() {
+    return (state.editorMode | 0) === 1 || (state.editorMode | 0) === 2;
+  }
+  function windowModeWholeWindowHint(forImageRegion) {
+    return (
+      `<p class="hint">窗口/后台窗口模式：默认在整个目标窗口内搜索，不再使用屏幕「选取区域」。` +
+      (forImageRegion
+        ? `勾选「根据图片选取区域」后，会先在窗口内找图，再按相对区域筛选。</p>`
+        : `</p>`)
+    );
+  }
+  function withWindowTargetFindOpts(opts) {
+    const o = opts || {};
+    if (!editorUsesWindowTarget()) return o;
+    const wm = state.windowMode || {};
+    o.constrainToWindow = 1;
+    o.windowClassName = String(wm.windowClassName || "");
+    o.windowTitle = String(wm.windowTitle || wm.windowName || "");
+    o.targetExePath = String(wm.targetExePath || "");
+    return o;
+  }
   /** 绝对识别区域：标签 + 全图/选取区域 + X1Y1X2Y2 */
   function absSearchRegionHtml(a, prefix) {
+    if (editorUsesWindowTarget()) {
+      return windowModeWholeWindowHint(true);
+    }
     const px = prefix || "search";
     const fiFull = px === "aiSearch" ? "aiFull" : "full";
     // OCR/找图共用 search* 时，绝对选区勿走 findImageMatch(region)（那是相对偏移拾取）
@@ -3058,10 +4265,10 @@
     return `<div class="inp ${cls}" contenteditable="true" data-k="${esc(key)}">${esc(val)}</div>`;
   }
 
-  function area3rowHtml(key, val) {
+  function area3rowHtml(key, val, extra) {
     return `<div class="fline"><div class="inp ed-area fixed-3row" contenteditable="true" data-k="${esc(
       key
-    )}">${esc(val || "")}</div></div>`;
+    )}"${extra || ""}>${esc(val || "")}</div></div>`;
   }
 
   /** X:[主=剩余区φ] ±随机:[占同行剩余]；与变量表达式主框同宽 */
@@ -3091,10 +4298,10 @@
     return `<div class="combo ed-full" data-k="${esc(key)}">${esc(text)}</div>`;
   }
 
-  function chkLabeled(key, label, on) {
-    return `<span class="chk ${on ? "on" : ""}" data-k="${esc(key)}"><i></i><span class="chk-lab">${esc(
-      label
-    )}</span></span>`;
+  function chkLabeled(key, label, on, extraAttrs) {
+    return `<span class="chk ${on ? "on" : ""}" data-k="${esc(key)}"${
+      extraAttrs || ""
+    }><i></i><span class="chk-lab">${esc(label)}</span></span>`;
   }
 
   function modBlock(a) {
@@ -3127,33 +4334,133 @@
     );
   }
 
-  function findImageModuleHtml(a, mode) {
+  function attrPath(p) {
+    return esc(String(p || "").replace(/\\/g, "/"));
+  }
+
+  function mmUseVarAt(a, slot) {
+    const vars = Array.isArray(a && a.imageUseVars) ? a.imageUseVars : [];
+    if (slot >= 0 && slot < vars.length) return !!(vars[slot] | 0);
+    return slot === 0 && !!(a && a.imageUseVar);
+  }
+
+  function mmPathAt(a, slot) {
+    const paths = Array.isArray(a && a.imagePaths) ? a.imagePaths : [];
+    if (slot >= 0 && slot < paths.length) return String(paths[slot] || "");
+    if (slot === 0) return String((a && a.imagePath) || "");
+    return "";
+  }
+
+  function mmSetPath(a, slot, path) {
+    if (!a) return;
+    if (!Array.isArray(a.imagePaths)) a.imagePaths = [];
+    if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+    while (a.imagePaths.length <= slot) a.imagePaths.push("");
+    while (a.imageUseVars.length < a.imagePaths.length) a.imageUseVars.push(0);
+    a.imagePaths[slot] = String(path || "");
+    if (slot === 0) a.imagePath = a.imagePaths[0] || "";
+  }
+
+  function mmSetUseVar(a, slot, on) {
+    if (!a) return;
+    if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+    if (!Array.isArray(a.imagePaths)) a.imagePaths = [];
+    while (a.imageUseVars.length <= slot) a.imageUseVars.push(0);
+    while (a.imagePaths.length < a.imageUseVars.length) a.imagePaths.push("");
+    a.imageUseVars[slot] = on ? 1 : 0;
+    if (slot === 0) a.imageUseVar = on ? 1 : 0;
+  }
+
+  function mmDisplayCount(a) {
+    if (!a) return 1;
+    if ((a.multiMatchMode | 0) === 1) return 1;
+    const n = a._mmCount | 0;
+    const paths = Array.isArray(a.imagePaths) ? a.imagePaths.length : 0;
+    const c = n > 0 ? n : Math.max(1, paths);
+    return Math.max(1, Math.min(8, c));
+  }
+
+  function mmNormalizeForSave(a) {
+    if (!a || a.type !== "multiMatch") return a;
+    if (!Array.isArray(a.imagePaths)) a.imagePaths = a.imagePath ? [String(a.imagePath)] : [];
+    if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+    const paths = [];
+    const vars = [];
+    const n = Math.max(a.imagePaths.length, a.imageUseVars.length);
+    for (let i = 0; i < n; i++) {
+      const p = String(a.imagePaths[i] || "").trim();
+      if (!p) continue;
+      paths.push(p);
+      vars.push(mmUseVarAt(a, i) ? 1 : 0);
+    }
+    a.imagePaths = paths;
+    a.imageUseVars = vars;
+    a.imagePath = paths[0] || "";
+    a.imageUseVar = vars[0] ? 1 : 0;
+    delete a._mmCount;
+    return a;
+  }
+
+  function mmSlotFromEl(el) {
+    const host = el && el.closest ? el.closest("[data-mm-slot]") : null;
+    if (!host) return -1;
+    const n = parseInt(host.dataset.mmSlot, 10);
+    return Number.isFinite(n) ? n : -1;
+  }
+
+  function applyMmImagePath(a, path, slot) {
+    const p = String(path || "").trim();
+    if (!a || !p) return false;
+    const i = Number.isInteger(slot) && slot >= 0 ? slot : 0;
+    mmSetPath(a, i, p);
+    return true;
+  }
+
+  function findImageModuleHtml(a, mode, opts) {
+    opts = opts || {};
     const isAi = mode === "ai";
     const isOcr = mode === "ocr";
-    const useVarKey = isAi ? "aiImageUseVar" : "imageUseVar";
-    const useVar = !!(isAi ? a.aiImageUseVar : a.imageUseVar);
-    const path = isAi ? a.aiTargetImagePath || "" : a.imagePath || "";
+    const isMm = Number.isInteger(opts.slot);
+    const slot = isMm ? opts.slot : -1;
+    const useVarKey = isMm ? "_mmUseVar" : isAi ? "aiImageUseVar" : "imageUseVar";
+    const useVar = isMm
+      ? mmUseVarAt(a, slot)
+      : !!(isAi ? a.aiImageUseVar : a.imageUseVar);
+    const path = isMm
+      ? mmPathAt(a, slot)
+      : isAi
+        ? a.aiTargetImagePath || ""
+        : a.imagePath || "";
     const previewInner =
       !useVar && path
-        ? `<img class="fi-thumb" alt="" data-img-path="${esc(path)}" src="" />`
+        ? `<img class="fi-thumb" alt="" data-img-path="${attrPath(path)}" src="" />`
         : useVar
           ? `<span class="fi-empty">变量模式</span>`
           : "";
-    const varChk = chkLabeled(useVarKey, "变量", useVar);
-    // 仅找图动作顶栏带「测试」；OCR/AI 无此按钮（OCR 底部另有测试）
+    const varChk = chkLabeled(
+      useVarKey,
+      "变量",
+      useVar,
+      isMm ? ` data-mm-slot="${slot}"` : ""
+    );
     const withTest = !isAi && !isOcr;
+    const countCombo = opts.showCount
+      ? `<div class="combo find-mod-count" data-k="_mmCount">${esc(String(opts.countValue || 1))}</div>`
+      : "";
+    const lab = opts.label || "要查找的图";
     const topRow = withTest
       ? `<div class="find-mod-top find-mod-top--with-test">
           <div class="find-mod-top-main">
-            <span class="find-mod-lab">要查找的图</span>
+            <span class="find-mod-lab">${esc(lab)}</span>
             <span class="find-mod-var">${varChk}</span>
+            ${countCombo}
           </div>
           <button type="button" class="btn ghost sm" data-fi="test"${
             useVar ? " disabled" : ""
           }>测试</button>
         </div>`
       : `<div class="find-mod-top find-mod-top--no-test">
-          <span class="find-mod-lab">要查找的图</span>
+          <span class="find-mod-lab">${esc(lab)}</span>
           <span class="find-mod-var">${varChk}</span>
         </div>`;
     const dis = useVar ? " disabled" : "";
@@ -3164,7 +4471,8 @@
       : `<button type="button" class="btn ghost find-btn" data-fi="screen"${dis}>屏幕截图</button>
         <button type="button" class="btn ghost find-btn" data-fi="pick"${dis}>本地图片</button>
         <button type="button" class="btn ghost find-btn" data-fi="clear">清除图片</button>`;
-    return `<div class="find-mod">
+    const slotAttr = isMm ? ` data-mm-slot="${slot}"` : "";
+    return `<div class="find-mod"${slotAttr}>
       ${topRow}
       <div class="find-mod-grid">
         <div class="fm-preview" data-fi="${isAi ? "aiCrop" : "crop"}">${previewInner}</div>
@@ -3189,10 +4497,19 @@
   }
 
   /** 变量模式下：「变量/路径」整排输入（在范围上方） */
-  function findImageVarPathHtml(a, mode) {
+  function findImageVarPathHtml(a, mode, slot) {
     const isAi = mode === "ai";
-    const useVar = !!(isAi ? a.aiImageUseVar : a.imageUseVar);
+    const isMm = Number.isInteger(slot);
+    const useVar = isMm
+      ? mmUseVarAt(a, slot)
+      : !!(isAi ? a.aiImageUseVar : a.imageUseVar);
     if (!useVar) return "";
+    if (isMm) {
+      return (
+        labOnly("变量/路径") +
+        area3rowHtml("_mmPath", mmPathAt(a, slot), ` data-mm-slot="${slot}"`)
+      );
+    }
     const key = isAi ? "aiTargetImagePath" : "imagePath";
     const val = isAi ? a.aiTargetImagePath || "" : a.imagePath || "";
     return labOnly("变量/路径") + area3rowHtml(key, val);
@@ -3202,6 +4519,91 @@
     const isAi = mode === "ai";
     const path = String(isAi ? a.aiTargetImagePath || "" : a.imagePath || "").trim();
     return !!path;
+  }
+
+  function findImageShowsFindTime(a) {
+    const fu = a.findImageFollowUp | 0;
+    if (fu === 2 || fu === 3) return findImageHasTemplate(a);
+    return true;
+  }
+
+  function findImageTimeRowHtml(a) {
+    return fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
+  }
+
+  function usesImageLocateOffsetPick(a) {
+    return !!(
+      a &&
+      a.imageLocate &&
+      (a.type === "mouseDrag" || a.type === "getColor" || a.type === "colorMatch")
+    );
+  }
+
+  function imageLocateSearchRegionHtml(a, regionLab) {
+    if (editorUsesWindowTarget()) {
+      return windowModeWholeWindowHint(false);
+    }
+    ensureFullScreenCoordsVisible(a);
+    const lab = regionLab || "搜索区域";
+    return (
+      `<div class="fline"><span class="tl grow-lab">${esc(lab)}</span><div class="inline-btns">
+        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
+        <button type="button" class="btn ghost sm" data-fi="absRegion">选取区域</button>
+      </div></div>` +
+      flineXy(
+        "X1",
+        inpField("searchX1", a.searchX1 ?? 0),
+        "Y1",
+        inpField("searchY1", a.searchY1 ?? 0)
+      ) +
+      flineXy(
+        "X2",
+        inpField("searchX2", a.searchX2 ?? 0),
+        "Y2",
+        inpField("searchY2", a.searchY2 ?? 0)
+      )
+    );
+  }
+
+  function findImageAbsRegionHtml(a, regionLab) {
+    if (editorUsesWindowTarget()) {
+      return windowModeWholeWindowHint(false);
+    }
+    ensureFullScreenCoordsVisible(a);
+    const lab = regionLab || "找图区域";
+    return (
+      `<div class="fline"><span class="tl grow-lab">${esc(lab)}</span><div class="inline-btns">
+        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
+        <button type="button" class="btn ghost sm" data-fi="absRegion">选取区域</button>
+      </div></div>` +
+      flineXy(
+        "X1",
+        inpField("searchX1", a.searchX1 ?? 0),
+        "Y1",
+        inpField("searchY1", a.searchY1 ?? 0)
+      ) +
+      flineXy(
+        "X2",
+        inpField("searchX2", a.searchX2 ?? 0),
+        "Y2",
+        inpField("searchY2", a.searchY2 ?? 0)
+      )
+    );
+  }
+
+  function imageLocateTemplateHtml(a, hint) {
+    let html = findImageModuleHtml(a);
+    html += findImageVarPathHtml(a);
+    html += matchThresholdRowHtml(a);
+    html += flineXy(
+      "最小",
+      inpField("imageScaleMin", a.imageScaleMin ?? 1),
+      "最大",
+      inpField("imageScaleMax", a.imageScaleMax ?? 1)
+    );
+    html += fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
+    if (hint) html += `<p class="hint">${hint}</p>`;
+    return html;
   }
 
   function looksLikeFilePath(s) {
@@ -3214,6 +4616,19 @@
     return false;
   }
 
+  /** 推断变量图锚框时扫描到哪里（不含当前正在编辑的消费步）。新增预览会把选中的上一步算进去。 */
+  function imageVarAnchorBeforeIndex() {
+    const acts = state.editorActions || [];
+    const sel = Number.isInteger(state.actionSel) ? state.actionSel : -1;
+    const cur = editorParamAction();
+    if (cur && cur._preview) {
+      if (sel >= 0) return Math.min(acts.length, sel + 1);
+      return acts.length;
+    }
+    if (sel < 0) return acts.length;
+    return Math.min(acts.length, sel);
+  }
+
   /** 编辑期推断图片变量锚框尺寸（用于合成选区）。找不到则返回 null。 */
   function inferImageVarAnchorSize(token, beforeIndex) {
     const name = String(token || "").trim();
@@ -3223,18 +4638,19 @@
       return { w: 0, h: 0, pathOnly: true };
     }
     const acts = state.editorActions || [];
-    const end = Math.min(acts.length, Math.max(0, beforeIndex));
+    const end =
+      beforeIndex == null ? imageVarAnchorBeforeIndex() : Math.min(acts.length, Math.max(0, beforeIndex));
     for (let i = end - 1; i >= 0; --i) {
       const p = acts[i];
-      if (!p || p.type !== "findImage" || (p.findImageFollowUp | 0) !== 3) continue;
+      if (!p || p._preview || p.type !== "findImage" || (p.findImageFollowUp | 0) !== 3) continue;
       const vn = String(p.matchVarName || "image").trim() || "image";
       if (vn !== name) continue;
       const hasTpl = findImageHasTemplate(p);
       if (!hasTpl) {
         const w = Math.abs((p.searchX2 | 0) - (p.searchX1 | 0));
         const h = Math.abs((p.searchY2 | 0) - (p.searchY1 | 0));
-        if (w >= 8 && h >= 8) return { w, h };
-        continue;
+        if ((p.searchFullScreen | 0) === 1 || w < 8 || h < 8) return { useScreen: true };
+        return { w, h };
       }
       const rx1 = p.imageRegionX1 | 0;
       const ry1 = p.imageRegionY1 | 0;
@@ -3247,6 +4663,70 @@
       if (tpl && !p.imageUseVar) return { w: 0, h: 0, pathOnly: true, path: tpl };
     }
     return null;
+  }
+
+  function collectVarComputeReturnNames(code) {
+    const names = [];
+    const seen = new Set();
+    const src = String(code || "");
+    const re = /\breturn\b/g;
+    let m;
+    while ((m = re.exec(src))) {
+      let i = m.index + m[0].length;
+      const skipWs = () => {
+        while (i < src.length && /[ \t\r\n]/.test(src[i])) i++;
+      };
+      skipWs();
+      while (i < src.length) {
+        const id = src.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+        if (!id) break;
+        if (!seen.has(id[0])) {
+          seen.add(id[0]);
+          names.push(id[0]);
+        }
+        i += id[0].length;
+        skipWs();
+        if (src[i] !== ",") break;
+        i++;
+        skipWs();
+      }
+    }
+    return names;
+  }
+
+  function startSyntheticAnchorOverlay(mode, imagePath) {
+    if (!window.qst) {
+      toast("无桥接");
+      return false;
+    }
+    const path = String(imagePath || "").trim();
+    const size = inferImageVarAnchorSize(path);
+    const opts = { mode };
+    if (size && size.useScreen) {
+      opts.syntheticUseScreen = 1;
+      opts.syntheticW = 0;
+      opts.syntheticH = 0;
+    } else if (size && size.pathOnly) {
+      opts.imagePath = size.path || path;
+      opts.syntheticW = 0;
+      opts.syntheticH = 0;
+    } else if (size) {
+      opts.syntheticW = size.w;
+      opts.syntheticH = size.h;
+    } else if (looksLikeFilePath(path)) {
+      opts.imagePath = path;
+      opts.syntheticW = 0;
+      opts.syntheticH = 0;
+    } else {
+      toast(
+        mode === "offsetBySize"
+          ? "无法推断变量图尺寸，无法在屏幕中心画出锚框。请先用「保存图片」生成该变量，或在变量/路径填磁盘图片。"
+          : "无法推断图片尺寸，请手填相对区域坐标"
+      );
+      return false;
+    }
+    qst.findImageMatch(opts);
+    return true;
   }
 
   function buildEditorVarItems() {
@@ -3298,6 +4778,22 @@
       ) {
         const n = (a.aiOutputVarName || "aiResult").trim() || "aiResult";
         push(n, "AI 输出");
+      } else if (t === "varCompute") {
+        collectVarComputeReturnNames(a.computeCode).forEach((n) => push(n, "变量运算"));
+      } else if (t === "multiMatch") {
+        const n = (a.matchVarName || "matchRet").trim() || "matchRet";
+        push(n + ".count", "多图匹配命中个数");
+        push(n + "[n]", "多图匹配第 n 处（把 n 换成 0、1、2…）");
+        push(n + "[0]", "多图匹配第一处是否命中");
+        push(n + "[0].matchData", "第一处匹配度");
+        push(n + "[0].x", "第一处左上角 X");
+        push(n + "[0].y", "第一处左上角 Y");
+        push(n + "[0].x1", "第一处右下角 X");
+        push(n + "[0].y1", "第一处右下角 Y");
+        push(n + "[0].cx", "第一处中心 X");
+        push(n + "[0].cy", "第一处中心 Y");
+        push(n + "[0].hit", "命中模板序号(从1计)");
+        push(n + "[0].hitName", "命中模板文件名");
       }
     });
     // 固定变量：无论脚本是否添加了动作，始终可用
@@ -3309,15 +4805,26 @@
       ["ctrl:Clipboard()", "剪贴板：条件里有内容为1否则0；输入展开文字或全部文件路径；AI图片分析/动作可附图（固定变量）"],
     ];
     fixed.forEach(([code, tip]) => push(code, tip));
-    if (!items.length) {
-      items.push({
+    const other = (state.settings && state.settings.other) || {};
+    const hideFixed = otherFlag(other, "editorHideFixedVars", false);
+    const hideCoord = otherFlag(other, "editorHideCoordVars", false);
+    const placeholderOnly = otherFlag(other, "editorMultiResultPlaceholderOnly", false);
+    const filtered = items.filter((it) => {
+      const c = it.code || "";
+      if (hideFixed && /^ctrl:/.test(c)) return false;
+      if (hideCoord && /\.(x|y|x1|y1|cx|cy)$/.test(c)) return false;
+      if (placeholderOnly && /\[[0-9]+\]/.test(c)) return false;
+      return true;
+    });
+    if (!filtered.length) {
+      filtered.push({
         t: "（暂无可用变量）",
         v: "",
         code: "",
-        d: "固定变量已内置：宏次数/随机/时分/剪贴板",
+        d: hideFixed ? "当前设置隐藏了固定变量" : "固定变量已内置：宏次数/随机/时分/剪贴板",
       });
     }
-    return items;
+    return filtered;
   }
 
   function requestFindImageThumbs(root) {
@@ -3349,10 +4856,42 @@
     $$("[data-k]", panel).forEach((el) => {
       const k = el.dataset.k;
       if (!k) return;
+      if (k === "watchMode") {
+        const on = el.querySelector ? el.querySelector(".radio.on") : null;
+        action.watchMode = on ? parseInt(on.dataset.v, 10) || 0 : 0;
+        return;
+      }
+      if (k === "multiMatchMode") {
+        const on = el.querySelector ? el.querySelector(".radio.on") : null;
+        action.multiMatchMode = on ? parseInt(on.dataset.v, 10) || 0 : 0;
+        return;
+      }
+      if (k === "_mmCount" || k === "_mmUseVar") return;
+      if (k === "_mmPath") {
+        let pathVal;
+        if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") pathVal = el.value;
+        else if (el.isContentEditable) {
+          pathVal = el.classList.contains("ed-area")
+            ? String(el.innerText != null ? el.innerText : el.textContent || "")
+            : String(el.textContent || "").trim();
+        } else pathVal = String(el.textContent || "").trim();
+        mmSetPath(action, parseInt(el.dataset.mmSlot, 10) || 0, pathVal);
+        return;
+      }
       if (k.startsWith("_if") && k !== "_ifValue") return;
-      let v = (el.textContent || "").trim();
+      let v;
       if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
         v = el.value;
+      } else if (el.isContentEditable) {
+        v = el.classList.contains("ed-area")
+          ? String(el.innerText != null ? el.innerText : el.textContent || "")
+          : String(el.textContent || "").trim();
+      } else {
+        v = String(el.textContent || "").trim();
+      }
+      if (k === "computeCode") {
+        action.computeCode = String(v || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        return;
       }
       if (k === "_ifValue") {
         action._ifValue = v;
@@ -3381,6 +4920,17 @@
           action.scrollDirection = v.includes("下") || v.includes("右") ? 1 : 0;
           return;
         }
+        if (k === "useMode") {
+          if (v.includes("继承")) action.useMode = 3;
+          else if (v.includes("后台")) action.useMode = 2;
+          else if (v.includes("窗口")) action.useMode = 1;
+          else action.useMode = 0;
+          return;
+        }
+        if (k === "_nwmSelectMethod") {
+          action._nwmSelectMethod = v;
+          return;
+        }
         if (k === "findImageFollowUp") {
           if (action.type === "findColor") {
             if (v.includes("变量")) action.findImageFollowUp = 2;
@@ -3388,10 +4938,21 @@
             else action.findImageFollowUp = 0;
             return;
           }
+          if (action.type === "multiMatch") {
+            if (v.includes("保存") || v.includes("匹配度") || v.includes("全部") || v.includes("变量")) {
+              action.findImageFollowUp = 2;
+            } else if (v.includes("移动")) action.findImageFollowUp = 1;
+            else action.findImageFollowUp = 0;
+            return;
+          }
           if (v.includes("图片")) action.findImageFollowUp = 3;
           else if (v.includes("匹配度") || v.includes("变量")) action.findImageFollowUp = 2;
           else if (v.includes("移动")) action.findImageFollowUp = 1;
           else action.findImageFollowUp = 0;
+          return;
+        }
+        if (k === "multiMatchSort") {
+          action.multiMatchSort = v.includes("匹配度") ? 1 : 0;
           return;
         }
         if (k === "ocrResultMode") {
@@ -3439,6 +5000,10 @@
           "y",
           "randomX",
           "randomY",
+          "endX",
+          "endY",
+          "randomEndX",
+          "randomEndY",
           "clickCount",
           "keyVk",
           "searchX1",
@@ -3454,6 +5019,9 @@
           "loopCount",
           "scrollSteps",
           "findImageFollowUp",
+          "multiMatchMode",
+          "multiMatchMax",
+          "multiMatchSort",
           "searchFullScreen",
           "aiOutputType",
           "aiContextMode",
@@ -3478,6 +5046,8 @@
           "ocrFollowUp",
           "findUntilFound",
           "matchFileNameOnly",
+          "resumeAfterWatch",
+          "watchMode",
           "holdLeftWin",
           "holdRightWin",
           "holdLeftCtrl",
@@ -3491,6 +5061,7 @@
           "colorR",
           "colorG",
           "colorB",
+          "imageLocate",
         ].includes(k)
       ) {
         action[k] = parseInt(v, 10) || 0;
@@ -3503,6 +5074,8 @@
           "aiImageScale",
           "imageScaleMin",
           "imageScaleMax",
+          "watchPollSeconds",
+          "breakoutTimeSeconds",
         ].includes(k)
       ) {
         let n = parseFloat(v);
@@ -3511,6 +5084,11 @@
           if (n <= 1) n *= 100;
           if (n < 1) n = 1;
           if (n > 100) n = 100;
+        }
+        if (k === "watchPollSeconds") {
+          if (!(n > 0)) n = 1;
+          if (n < 0.05) n = 0.05;
+          if (n > 3600) n = 3600;
         }
         action[k] = n || 0;
       } else {
@@ -3555,9 +5133,14 @@
       action.imageScaleMin != null &&
       action.imageScaleMax != null &&
       (action.type === "findImage" ||
+        action.type === "watchImage" ||
         action.type === "textRecognition" ||
         action.type === "aiImageAnalysis" ||
-        action.type === "aiActionExecute")
+        action.type === "aiActionExecute" ||
+        action.type === "mouseDrag" ||
+        action.type === "getColor" ||
+        action.type === "findColor" ||
+        action.type === "colorMatch")
     ) {
       const lo = Number(action.imageScaleMin);
       const hi = Number(action.imageScaleMax);
@@ -3567,10 +5150,145 @@
     }
     if (
       action.type === "findImage" &&
-      ((action.findImageFollowUp | 0) === 2 || (action.findImageFollowUp | 0) === 3)
+      (action.findImageFollowUp | 0) === 3 &&
+      !findImageHasTemplate(action)
     ) {
       action.findTimeExpr = "0";
     }
+    if (action.type === "runMacro" || action.type === "mousePlayback") {
+      applyNestedWmTempFields(action);
+    }
+  }
+
+  function nestedUseModeLabel(mode) {
+    const m = NESTED_USE_MODES.find((x) => x.v === (mode | 0));
+    return (m || NESTED_USE_MODES[3]).t;
+  }
+
+  function ensureNestedWindowMode(a) {
+    if (!a.nestedWindowMode || typeof a.nestedWindowMode !== "object") {
+      a.nestedWindowMode = {};
+    }
+    const wm = a.nestedWindowMode;
+    wm.selectMethod = normalizeWmSelectMethod(wm.selectMethod);
+    if (wm.targetExePath == null) wm.targetExePath = "";
+    if (wm.windowTitle == null) wm.windowTitle = wm.windowName || "";
+    if (wm.windowName == null) wm.windowName = wm.windowTitle || "";
+    if (wm.windowClassName == null) wm.windowClassName = "";
+    if (wm.childWindowClassName == null) wm.childWindowClassName = "";
+    if (wm.fakeFocusEnabled == null) wm.fakeFocusEnabled = 0;
+    return wm;
+  }
+
+  function applyNestedWmTempFields(action) {
+    const wm = ensureNestedWindowMode(action);
+    if (action._nwmSelectMethod != null) {
+      wm.selectMethod = resolveWmSelectMethodForSave(
+        wm.selectMethod,
+        action._nwmSelectMethod
+      );
+    }
+    if (action._nwmTargetExePath != null)
+      wm.targetExePath = String(action._nwmTargetExePath || "").trim();
+    if (action._nwmWindowTitle != null) {
+      const title = String(action._nwmWindowTitle || "").trim();
+      wm.windowTitle = title;
+      wm.windowName = title;
+      wm.targetWindowTitle = title;
+    }
+    if (action._nwmWindowClassName != null)
+      wm.windowClassName = String(action._nwmWindowClassName || "").trim();
+    if (action._nwmFakeFocus != null)
+      wm.fakeFocusEnabled = action._nwmFakeFocus ? 1 : 0;
+    delete action._nwmSelectMethod;
+    delete action._nwmTargetExePath;
+    delete action._nwmWindowTitle;
+    delete action._nwmWindowClassName;
+    delete action._nwmFakeFocus;
+    action.nestedWindowMode = wm;
+  }
+
+  function applyTargetScriptUseMode(a, meta) {
+    if (!a || !meta) return;
+    const mode = typeof meta.mode === "number" ? meta.mode | 0 : 0;
+    if (mode === 1 || mode === 2) {
+      a.useMode = mode;
+      const src = meta.windowMode && typeof meta.windowMode === "object" ? meta.windowMode : {};
+      a.nestedWindowMode = Object.assign({}, src);
+      a.nestedWindowMode.enabled = 1;
+      a.nestedWindowMode.executionKind =
+        mode === 2 ? "backgroundWindow" : "hiddenDesktop";
+      a.nestedWindowMode.selectMethod = normalizeWmSelectMethod(
+        a.nestedWindowMode.selectMethod
+      );
+      const title =
+        src.windowTitle ||
+        src.windowName ||
+        src.targetWindowTitle ||
+        "";
+      a.nestedWindowMode.windowTitle = title;
+      if (!a.nestedWindowMode.windowName) {
+        a.nestedWindowMode.windowName = title;
+      }
+    } else {
+      a.useMode = 0;
+      a.nestedWindowMode = {};
+      if (meta.breakoutTimeSeconds != null) {
+        const n = parseFloat(meta.breakoutTimeSeconds);
+        a.breakoutTimeSeconds = Number.isFinite(n) && n > 0 ? n : 0;
+      }
+    }
+  }
+
+  function nestedUseModeHtml(a) {
+    const mode = a.useMode == null ? 3 : a.useMode | 0;
+    let html = flineStack("使用模式", comboField("useMode", nestedUseModeLabel(mode)));
+    if (mode === 3) {
+      html += `<p class="hint">*继承当前主鼠标宏的模式与窗口绑定</p>`;
+      return html;
+    }
+    if (mode === 0) {
+      html += flineStack(
+        "脱离时间",
+        inpField("breakoutTimeSeconds", a.breakoutTimeSeconds ?? 0, "sm") +
+          `<span class="tl">秒</span>`
+      );
+      return html;
+    }
+    const wm = ensureNestedWindowMode(a);
+    const method = WM_METHODS.find((m) => m.v === wm.selectMethod) || WM_METHODS[0];
+    const targetLab = mode === 2 ? "目标窗口" : "目标程序";
+    html += flineStack("选择窗口方式", comboField("_nwmSelectMethod", method.t));
+    html += `<div class="fline-stack nwm-full"><div class="stack-lab nwm-lab"><span>${esc(
+      targetLab
+    )}</span>${chkLabeled(
+      "_nwmFakeFocus",
+      "聚焦",
+      !!wm.fakeFocusEnabled,
+      ' title="向目标进程注入假焦点（联机/反作弊游戏请勿使用，易被扫描）。远程桌面(mstsc)请勿开启——会搞挂客户端；mstsc 回放会自动改用前台本机键鼠"'
+    )}</div><div class="stack-ctrl">${inpField(
+      "_nwmTargetExePath",
+      wm.targetExePath || "",
+      "full"
+    )}</div></div>`;
+    html += `<div class="fline wrap nwm-btns">`;
+    html += `<button type="button" class="btn ghost sm" data-fi="nwmBrowse">浏览</button>`;
+    html += `<button type="button" class="btn ghost sm" data-fi="nwmPick">${
+      mode === 2 ? "准星绑定窗口" : "准星找程序"
+    }</button>`;
+    html += `<button type="button" class="btn ghost sm" data-fi="nwmClass">指定窗口类</button>`;
+    html += `</div>`;
+    html += `<div class="fline-stack nwm-full"><div class="stack-lab">窗口标题</div><div class="stack-ctrl">${inpField(
+      "_nwmWindowTitle",
+      wm.windowTitle || wm.windowName || "",
+      "full"
+    )}</div></div>`;
+    html += `<div class="fline-stack nwm-full"><div class="stack-lab">窗口类名</div><div class="stack-ctrl">${inpField(
+      "_nwmWindowClassName",
+      wm.windowClassName || "",
+      "full"
+    )}</div></div>`;
+    return html;
   }
 
   function chkField(key, on) {
@@ -3581,7 +5299,13 @@
     const panel = $("#paramPanel");
     const tag = $("#paramTag");
     if (!panel) return;
+    const nextKey = a
+      ? `${a.type}:${a._preview ? "preview" : String(state.actionSel | 0)}`
+      : "";
+    const keepScroll =
+      a && panel.dataset.paramKey === nextKey ? panel.scrollTop : 0;
     if (!a) {
+      delete panel.dataset.paramKey;
       panel.innerHTML =
         '<div class="panel-empty">在左侧选中一条动作后，在此编辑参数</div>';
       if (tag) tag.textContent = "未选择";
@@ -3628,6 +5352,52 @@
       html += labOnly("同时按住");
       html += modBlock(a);
       if (t === "mouseClick") html += repeatBlock(a);
+      html += `<p class="hint">*默认在鼠标当前位置点击。紧跟找图/OCR「移动到」时会点回找图落点（远程桌面把光标拖走也不例外）。更稳的做法是找图后续直接选「点击」并设循环次数。</p>`;
+      if ((a.x | 0) || (a.y | 0)) {
+        html += `<p class="hint">当前会先移动到 ${a.x | 0},${a.y | 0} 再点击（改动作类型时可能带过来）。找图之后的连点会忽略这些残留坐标。</p>`;
+        html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="clickHere">改为在当前位置点击</button></div>`;
+      }
+    } else if (t === "mouseDrag") {
+      const btnMap = {
+        left: "左键",
+        right: "右键",
+        middle: "中键",
+        x1: "侧键1",
+        x2: "侧键2",
+      };
+      const btnText = btnMap[a.button] || "左键";
+      const locate = !!(a.imageLocate | 0);
+      html += labOnly("选择鼠标键");
+      html += fline("", comboField("button", btnText));
+      html += labOnly("同时按住");
+      html += modBlock(a);
+      html += flineStack(
+        "拖拽时间",
+        inpField("duration", a.duration ?? 0.3) + `<span class="tl">秒</span>`
+      );
+      html += flineStack(
+        "最大随机时间",
+        inpField("randomDuration", a.randomDuration ?? 0) + `<span class="tl">秒</span>`
+      );
+      html += `<p class="hint">*拖拽总时间=拖拽时间+随机(0~最大随机时间)。这是按下到松开的时长，不是点击的重复间隔。</p>`;
+      html += labOnly(locate ? "相对图中心偏移（起点→终点）" : "起点 / 终点");
+      html += flineCoord("起点X:", "x", "randomX", a);
+      html += flineCoord("起点Y:", "y", "randomY", a);
+      html += flineCoord("终点X:", "endX", "randomEndX", a);
+      html += flineCoord("终点Y:", "endY", "randomEndY", a);
+      if (!locate) {
+        html += `<div class="fline"><button type="button" class="btn primary fluid" data-fi="pickDrag">选取拖拽</button></div>`;
+      }
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoord">准星取起点</button></div>`;
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoordEnd">准星取终点</button></div>`;
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateSearchRegionHtml(a, "搜索区域");
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后起点/终点是相对找到的图中心的偏移。请用「准星取起点/终点」在图上选偏移点。未找到则跳过本步拖拽。"
+        );
+      }
     } else if (t === "wait") {
       html += flineStack(
         "等待时间",
@@ -3646,25 +5416,62 @@
       html += modBlock(a);
       if (t === "keyClick") html += repeatBlock(a);
     } else if (t === "getColor") {
+      const locate = !!(a.imageLocate | 0);
+      html += labOnly(locate ? "相对图中心偏移" : "读取位置");
       html += flineXy("X", inpField("x", a.x ?? 0), "Y", inpField("y", a.y ?? 0));
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoord">拖动准星获取坐标</button></div>`;
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateSearchRegionHtml(a, "搜索区域");
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后 X/Y 是相对找到的图中心的偏移。请用准星在图上选偏移点。未找到则跳过本步。"
+        );
+      }
       html += fline("保存到", inpField("matchVarName", a.matchVarName || "colorRet"));
       html += `<p class="hint">*提示:读取屏幕坐标颜色，写入变量（#RRGGBB）</p>`;
     } else if (t === "findColor") {
       const followLabs = ["点击", "鼠标移动到", "保存到变量"];
       const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
-      ensureFullScreenCoordsVisible(a);
+      const locate = !!(a.imageLocate | 0);
       html += fline("目标颜色", inpField("inputText", a.inputText || `#${((a.colorR|0)<<16|(a.colorG|0)<<8|(a.colorB|0)).toString(16).padStart(6,"0")}`));
       html += fline("容差", inpField("colorTolerance", a.colorTolerance ?? 16));
-      html += `<div class="fline"><span class="tl grow-lab">搜索区域</span><div class="inline-btns">
-        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
-        <button type="button" class="btn ghost sm" data-fi="region">选取区域</button>
-      </div></div>`;
-      html += flineXy("X1", inpField("searchX1", a.searchX1 ?? 0), "Y1", inpField("searchY1", a.searchY1 ?? 0));
-      html += flineXy("X2", inpField("searchX2", a.searchX2 ?? 0), "Y2", inpField("searchY2", a.searchY2 ?? 0));
+      html += imageLocateSearchRegionHtml(a, locate ? "找图区域" : "搜索区域");
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后先在区域内找图，再在命中图范围内找色（不是文字识别那种模板内裁切）。未找到图则跳过本步。"
+        );
+      }
       html += fline("后续操作", comboField("findImageFollowUp", followLabs[fu]));
+      if (fu === 0 || fu === 1) {
+        html += flineXy(
+          "X偏",
+          inpField("offsetX", a.offsetX ?? 0),
+          "Y偏",
+          inpField("offsetY", a.offsetY ?? 0)
+        );
+      }
+      if (fu === 0) {
+        html += repeatBlock(a);
+        html += `<p class="hint">循环次数是在找到的颜色位置重复点击。</p>`;
+      }
       html += fline("变量名", inpField("matchVarName", a.matchVarName || "colorRet"));
+      html += `<p class="hint">*点击/移动到找到的颜色位置；保存到变量只写入结果、不点不移。三种后续都会写入 colorRet（#RRGGBB 与坐标）。找色没有「保存图片」。</p>`;
     } else if (t === "colorMatch") {
+      const locate = !!(a.imageLocate | 0);
+      html += labOnly(locate ? "相对图中心偏移" : "读取位置");
       html += flineXy("X", inpField("x", a.x ?? 0), "Y", inpField("y", a.y ?? 0));
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoord">拖动准星获取坐标</button></div>`;
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateSearchRegionHtml(a, "搜索区域");
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后 X/Y 是相对找到的图中心的偏移。请用准星在图上选偏移点。未找到则跳过本步。"
+        );
+      }
       html += fline("目标颜色", inpField("inputText", a.inputText || `#${((a.colorR|0)<<16|(a.colorG|0)<<8|(a.colorB|0)).toString(16).padStart(6,"0")}`));
       html += fline("容差", inpField("colorTolerance", a.colorTolerance ?? 16));
       html += fline("变量名", inpField("matchVarName", a.matchVarName || "colorRet"));
@@ -3673,23 +5480,7 @@
       const fu = Math.min(3, Math.max(0, a.findImageFollowUp | 0));
       const hasTpl = findImageHasTemplate(a);
       const regionLab = fu === 3 && !hasTpl ? "截图区域" : "找图区域";
-      ensureFullScreenCoordsVisible(a);
-      html += `<div class="fline"><span class="tl grow-lab">${esc(regionLab)}</span><div class="inline-btns">
-        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
-        <button type="button" class="btn ghost sm" data-fi="region">选取区域</button>
-      </div></div>`;
-      html += flineXy(
-        "X1",
-        inpField("searchX1", a.searchX1 ?? 0),
-        "Y1",
-        inpField("searchY1", a.searchY1 ?? 0)
-      );
-      html += flineXy(
-        "X2",
-        inpField("searchX2", a.searchX2 ?? 0),
-        "Y2",
-        inpField("searchY2", a.searchY2 ?? 0)
-      );
+      html += findImageAbsRegionHtml(a, regionLab);
       html += findImageModuleHtml(a);
       html += findImageVarPathHtml(a);
       html += matchThresholdRowHtml(a);
@@ -3722,8 +5513,120 @@
           inpField("offsetY", a.offsetY ?? 0)
         );
         html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="offset">选择偏移点击位置</button></div>`;
-        html += fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
+        if (fu === 0) {
+          html += repeatBlock(a);
+          html += `<p class="hint">循环次数是在找图落点（含偏移）重复点击，不必再加「鼠标点击」。默认模式会先激活落点窗口并用绝对坐标点下去；游戏不在前台时请先点进游戏，或改用窗口模式。</p>`;
+        }
       }
+      if (findImageShowsFindTime(a)) html += findImageTimeRowHtml(a);
+    } else if (t === "multiMatch") {
+      const mode = (a.multiMatchMode | 0) === 1 ? 1 : 0;
+      const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
+      const followLabs =
+        mode === 1 ? ["依次点击", "移动到第一处", "保存全部"] : ["点击", "鼠标移动到", "保存匹配度"];
+      const sortLabs = ["从左到右", "匹配度高到低"];
+      if (!Array.isArray(a.imagePaths)) a.imagePaths = a.imagePath ? [a.imagePath] : [];
+      if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+      while (a.imageUseVars.length < a.imagePaths.length) a.imageUseVars.push(0);
+      const slotN = mmDisplayCount(a);
+      a._mmCount = slotN;
+      ensureFullScreenCoordsVisible(a);
+      html += `<div class="fline wrap"><span class="tl grow-lab">匹配方式</span><div class="radios" data-k="multiMatchMode">
+        <span class="radio${mode === 0 ? " on" : ""}" data-v="0"><i></i>多图择一</span>
+        <span class="radio${mode === 1 ? " on" : ""}" data-v="1"><i></i>一图多处</span>
+      </div></div>`;
+      html += `<p class="hint">${
+        mode === 1
+          ? "只用下面这一张图，同一帧找出多处（最多 20）。切模式不会删图。"
+          : "按从上到下顺序找，第一张过阈值就停。右边数字是同时展示几张找图。切模式不会删图。"
+      }</p>`;
+      html += findImageAbsRegionHtml(a, "找图区域");
+      for (let si = 0; si < slotN; si++) {
+        html += findImageModuleHtml(a, "", {
+          slot: si,
+          showCount: mode === 0 && si === 0,
+          countValue: slotN,
+          label: mode === 0 && slotN > 1 ? "要查找的图 " + (si + 1) : "要查找的图",
+        });
+        html += findImageVarPathHtml(a, "", si);
+      }
+      html += matchThresholdRowHtml(a);
+      html += flineXy(
+        "最小",
+        inpField("imageScaleMin", a.imageScaleMin ?? 1),
+        "最大",
+        inpField("imageScaleMax", a.imageScaleMax ?? 1)
+      );
+      if (mode === 1) {
+        html += fline("最多处数", inpField("multiMatchMax", a.multiMatchMax ?? 20));
+        html += fline("排序", comboField("multiMatchSort", sortLabs[(a.multiMatchSort | 0) === 1 ? 1 : 0]));
+      }
+      html += fline("后续操作", comboField("findImageFollowUp", followLabs[fu]));
+      if (fu === 2) {
+        html += flineStack("匹配度保存到", inpField("matchVarName", a.matchVarName || "matchRet"));
+        html += `<p class="hint">用 matchRet[0].x 取第一处左上角 X；matchRet.count 是命中个数。</p>`;
+      } else {
+        html += flineXy(
+          "X偏",
+          inpField("offsetX", a.offsetX ?? 0),
+          "Y偏",
+          inpField("offsetY", a.offsetY ?? 0)
+        );
+        html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="offset">选择偏移点击位置</button></div>`;
+        if (fu === 0 && mode !== 1) {
+          html += repeatBlock(a);
+          html += `<p class="hint">循环次数是在命中落点重复点击。</p>`;
+        }
+        if (mode === 1 && fu === 0) {
+          html += fline(
+            "点击间隔",
+            inpField("duration", a.duration ?? 0.05) + `<span class="tl">秒</span>`
+          );
+          html += fline(
+            "随机间隔",
+            inpField("randomDuration", a.randomDuration ?? 0) + `<span class="tl">秒</span>`
+          );
+          html += `<p class="hint">多处依次点击之间的间隔，不是等待找图的时间。</p>`;
+        }
+      }
+      html += fline(
+        "时间",
+        inpField("findTimeExpr", a.findTimeExpr || "0") + `<span class="tl">秒</span>`
+      );
+      html += `<p class="hint">等到至少一处后再继续；0=只找一次，与找图相同。</p>`;
+    } else if (t === "watchImage") {
+      html += findImageAbsRegionHtml(a, "监视区域");
+      html += findImageModuleHtml(a);
+      html += findImageVarPathHtml(a);
+      html += matchThresholdRowHtml(a);
+      html += flineXy(
+        "最小",
+        inpField("imageScaleMin", a.imageScaleMin ?? 1),
+        "最大",
+        inpField("imageScaleMax", a.imageScaleMax ?? 1)
+      );
+      html += `<div class="fline wrap">${chkLabeled(
+        "resumeAfterWatch",
+        "中断后从原处继续执行",
+        a.resumeAfterWatch == null ? true : !!a.resumeAfterWatch
+      )}</div>`;
+      const watchMode = (a.watchMode | 0) !== 0 ? 1 : 0;
+      html += `<div class="fline wrap"><span class="tl grow-lab">监视方式</span><div class="radios" data-k="watchMode">
+        <span class="radio${watchMode === 0 ? " on" : ""}" data-v="0"><i></i>动作监视</span>
+        <span class="radio${watchMode === 1 ? " on" : ""}" data-v="1"><i></i>时间监视</span>
+      </div></div>`;
+      html += `<div${watchMode === 1 ? "" : " hidden"} data-watch-poll-row>${flineStack(
+        "轮询间隔",
+        inpField("watchPollSeconds", a.watchPollSeconds == null ? 1 : a.watchPollSeconds) +
+          `<span class="tl">秒</span>`
+      )}</div>`;
+      html += `<p class="hint">*主流程不执行本动作。动作监视：任意找图等待时顺带搜监视用图。时间监视：每隔指定秒数搜索一次。命中后跑子动作；子树里若执行了跳转则以跳转为准。</p>`;
+    } else if (t === "varCompute") {
+      html += labOnly("运算代码");
+      html += `<div class="fline"><textarea class="inp ed-area ed-code" data-k="computeCode" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" placeholder="int a = 2&#10;return a">${esc(
+        a.computeCode || ""
+      )}</textarea></div>`;
+      html += `<p class="hint">*类 C：int/double/string、if/else、for/while。字符串用 "+" 或 '+'（裸写 + 是加法）。split(s, "/") 按你写的分隔符拆成数组，用 parts[0]、parts.count（可负下标）。toInt("123") 转数字，toString(x) 转文字，trim(s) 去首尾空格。行末可省略分号。局部变量默认销毁；末尾 return a, b 导出。ctrl:Clipboard() 为文本或文件路径，不是 0/1。</p>`;
     } else if (t === "quickInput") {
       const parseOn = a.parseEscapes == null ? false : !!a.parseEscapes;
       html += `<div class="fline"><span class="tl">要输入的文字</span>${chkLabeled(
@@ -3733,6 +5636,7 @@
       )}</div>`;
       html += area3rowHtml("inputText", a.inputText || "");
       html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="insertVar" data-target="inputText">插入变量</button></div>`;
+      html += `<p class="hint">*解析转义同时作用于插入的变量。未勾选时，变量里的换行/Tab 会丢掉，不输入。</p>`;
       html += flineStack(
         "字输入间隔(秒)",
         inpField("charInterval", a.charInterval ?? 0.01)
@@ -3840,6 +5744,10 @@
         if (!searchMode) {
           html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="ocrOffset">选择偏移位置</button></div>`;
         }
+        if (ofu === 0) {
+          html += repeatBlock(a);
+          html += `<p class="hint">循环次数是在识别落点重复点击。</p>`;
+        }
       } else {
         html += flineStack("结果保存到", inpField("matchVarName", a.matchVarName || "a"));
       }
@@ -3874,8 +5782,9 @@
       const recLabel =
         a.blockName ||
         (a.targetPath ? a.targetPath.split(/[/\\]/).pop() : "") ||
-        "请选择用于回放的鼠标录制";
+        "请选择用于回放的键鼠录制";
       html += flineStack("录制脚本", comboField("blockName", recLabel));
+      html += nestedUseModeHtml(a);
       const spd = a.playbackSpeed == null ? 1 : a.playbackSpeed;
       html +=
         `<div class="fline-stack ed-speed-stack"><div class="stack-lab">回放倍速</div>` +
@@ -3888,6 +5797,7 @@
         (a.targetPath ? a.targetPath.split(/[/\\]/).pop() : "") ||
         "请选择用于运行的鼠标宏";
       html += flineStack("鼠标宏", comboField("blockName", macLabel));
+      html += nestedUseModeHtml(a);
       html += repeatBlock(a);
     } else if (t === "defineBlock") {
       html += flineStack(
@@ -4098,14 +6008,65 @@
     }
     html += "</div></div>";
     panel.innerHTML = html;
+    panel.dataset.paramKey = nextKey;
+    panel.scrollTop = keepScroll;
     requestFindImageThumbs(panel);
     wireParamPanelEvents(a, t);
     if (!a._preview && state.actionSel >= 0) syncActionListRowName(state.actionSel);
+    if (!state._suppressLiveCommit && a && !a._preview) liveCommitSelectedIfEnabled();
   }
 
   function wireParamPanelEvents(a, t) {
     const panel = $("#paramPanel");
     if (!panel || !a) return;
+    panel.querySelectorAll("[data-k='watchMode'] .radio").forEach((r) => {
+      r.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const host = r.closest("[data-k='watchMode']");
+        if (host) host.querySelectorAll(".radio").forEach((x) => x.classList.remove("on"));
+        r.classList.add("on");
+        const mode = parseInt(r.dataset.v, 10) || 0;
+        a.watchMode = mode;
+        if (mode === 1 && !(Number(a.watchPollSeconds) > 0)) a.watchPollSeconds = 1;
+        const row = panel.querySelector("[data-watch-poll-row]");
+        if (row) {
+          if (mode === 1) row.removeAttribute("hidden");
+          else row.setAttribute("hidden", "");
+        }
+        if (!a._preview && state.actionSel >= 0) syncActionListRowName(state.actionSel);
+        liveCommitSelectedIfEnabled();
+      });
+    });
+    panel.querySelectorAll("[data-k='multiMatchMode'] .radio").forEach((r) => {
+      r.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const host = r.closest("[data-k='multiMatchMode']");
+        if (host) host.querySelectorAll(".radio").forEach((x) => x.classList.remove("on"));
+        r.classList.add("on");
+        a.multiMatchMode = parseInt(r.dataset.v, 10) || 0;
+        if ((a.findImageFollowUp | 0) > 2) a.findImageFollowUp = 2;
+        renderParamPanel(a);
+        liveCommitSelectedIfEnabled();
+      });
+    });
+    const mmCountCombo = panel.querySelector('[data-k="_mmCount"]');
+    if (mmCountCombo) {
+      mmCountCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const items = [];
+        for (let n = 1; n <= 8; n++) items.push({ t: String(n), v: n });
+        showPopup(mmCountCombo, items, (it) => {
+          a._mmCount = it.v;
+          if (!Array.isArray(a.imagePaths)) a.imagePaths = [];
+          if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+          while (a.imagePaths.length < it.v) a.imagePaths.push("");
+          while (a.imageUseVars.length < a.imagePaths.length) a.imageUseVars.push(0);
+          renderParamPanel(a);
+        });
+      });
+    }
     const edSpeed = panel.querySelector('.speed-slider[data-speed-scope="action"]');
     if (edSpeed && t === "mousePlayback") {
       bindSpeedSliderRoot(edSpeed, {
@@ -4198,22 +6159,57 @@
     if (followCombo) {
       followCombo.addEventListener("click", (e) => {
         e.stopPropagation();
-        showPopup(
-          followCombo,
-          [
-            { t: "点击", v: 0 },
-            { t: "鼠标移动到", v: 1 },
-            { t: "保存匹配度", v: 2 },
-            { t: "保存图片", v: 3 },
-          ],
-          (it) => {
-            a.findImageFollowUp = it.v;
-            // 在默认名之间切换：保存图片→image，保存匹配度→matchRet；自定义名保留
+        const colorFollow =
+          a.type === "findColor"
+            ? [
+                { t: "点击", v: 0 },
+                { t: "鼠标移动到", v: 1 },
+                { t: "保存到变量", v: 2 },
+              ]
+            : a.type === "multiMatch"
+              ? (a.multiMatchMode | 0) === 1
+                ? [
+                    { t: "依次点击", v: 0 },
+                    { t: "移动到第一处", v: 1 },
+                    { t: "保存全部", v: 2 },
+                  ]
+                : [
+                    { t: "点击", v: 0 },
+                    { t: "鼠标移动到", v: 1 },
+                    { t: "保存匹配度", v: 2 },
+                  ]
+              : [
+                { t: "点击", v: 0 },
+                { t: "鼠标移动到", v: 1 },
+                { t: "保存匹配度", v: 2 },
+                { t: "保存图片", v: 3 },
+              ];
+        showPopup(followCombo, colorFollow, (it) => {
+          a.findImageFollowUp = it.v;
+          if (a.type !== "findColor" && a.type !== "multiMatch") {
             const vn = (a.matchVarName || "").trim();
             if (it.v === 3 && (!vn || vn === "matchRet")) a.matchVarName = "image";
             if (it.v === 2 && (!vn || vn === "image")) a.matchVarName = "matchRet";
-            followCombo.textContent = it.t;
-            renderParamPanel(a);
+          }
+          if (a.type === "multiMatch" && (a.findImageFollowUp | 0) > 2) a.findImageFollowUp = 2;
+          followCombo.textContent = it.t;
+          renderParamPanel(a);
+        });
+      });
+    }
+    const mmSortCombo = panel.querySelector('[data-k="multiMatchSort"]');
+    if (mmSortCombo) {
+      mmSortCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showPopup(
+          mmSortCombo,
+          [
+            { t: "从左到右", v: 0 },
+            { t: "匹配度高到低", v: 1 },
+          ],
+          (it) => {
+            a.multiMatchSort = it.v;
+            mmSortCombo.textContent = it.t;
           }
         );
       });
@@ -4355,11 +6351,69 @@
         else pickMacroInto(a, pbCombo);
       });
     }
+    const useModeCombo = panel.querySelector('[data-k="useMode"]');
+    if (useModeCombo && (t === "mousePlayback" || t === "runMacro")) {
+      useModeCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const cur = a.useMode == null ? 3 : a.useMode | 0;
+        const selectedIndex = Math.max(
+          0,
+          NESTED_USE_MODES.findIndex((m) => m.v === cur)
+        );
+        showPopup(
+          useModeCombo,
+          NESTED_USE_MODES,
+          (it) => {
+            readParamPanelInto(a);
+            a.useMode = it.v | 0;
+            if (a.useMode === 1 || a.useMode === 2) ensureNestedWindowMode(a);
+            renderParamPanel(a);
+          },
+          { selectedIndex }
+        );
+      });
+    }
+    const nwmMethodCombo = panel.querySelector('[data-k="_nwmSelectMethod"]');
+    if (nwmMethodCombo && (t === "mousePlayback" || t === "runMacro")) {
+      nwmMethodCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wm = ensureNestedWindowMode(a);
+        const cur = normalizeWmSelectMethod(wm.selectMethod);
+        const selectedIndex = Math.max(
+          0,
+          WM_METHODS.findIndex((m) => m.v === cur)
+        );
+        showPopup(
+          nwmMethodCombo,
+          WM_METHODS,
+          (it) => {
+            readParamPanelInto(a);
+            const next = ensureNestedWindowMode(a);
+            next.selectMethod = it.v;
+            a.nestedWindowMode = next;
+            nwmMethodCombo.textContent = it.t;
+            renderParamPanel(a);
+          },
+          { selectedIndex, minWidth: 260 }
+        );
+      });
+    }
     $$(".chk[data-k]", panel).forEach((el) => {
       el.addEventListener("click", (e) => {
         e.stopPropagation();
         el.classList.toggle("on");
+        if (el.dataset.k === "_mmUseVar") {
+          const slot = mmSlotFromEl(el);
+          mmSetUseVar(a, slot < 0 ? 0 : slot, el.classList.contains("on"));
+          renderParamPanel(a);
+          liveCommitSelectedIfEnabled();
+          return;
+        }
         a[el.dataset.k] = el.classList.contains("on") ? 1 : 0;
+        if (el.dataset.k === "_nwmFakeFocus") {
+          const wm = ensureNestedWindowMode(a);
+          wm.fakeFocusEnabled = el.classList.contains("on") ? 1 : 0;
+        }
         if (el.dataset.k === "ocrRegionByImage") {
           if (el.classList.contains("on")) {
             ensureFullScreenCoordsVisible(a);
@@ -4390,6 +6444,12 @@
           el.dataset.k === "perfectMatch"
         ) {
           renderParamPanel(a);
+        } else if (el.dataset.k === "imageLocate") {
+          if (el.classList.contains("on")) {
+            if (!(a.searchFullScreen | 0)) a.searchFullScreen = 1;
+            ensureFullScreenCoordsVisible(a);
+          }
+          renderParamPanel(a);
         } else if (
           el.dataset.k === "moveFromVar" ||
           el.dataset.k === "loopFromVar"
@@ -4398,6 +6458,7 @@
         } else if (!a._preview && state.actionSel >= 0) {
           syncActionListRowName(state.actionSel);
         }
+        liveCommitSelectedIfEnabled();
       });
     });
     // 参数变更时同步左侧动作名（对齐原生 ActionName 实时刷新）
@@ -4410,7 +6471,23 @@
         }
       };
       el.addEventListener("input", sync);
-      el.addEventListener("blur", sync);
+      el.addEventListener("blur", () => {
+        sync();
+        liveCommitSelectedIfEnabled();
+      });
+    });
+    panel.querySelectorAll("textarea.ed-code").forEach((el) => {
+      el.addEventListener("blur", () => liveCommitSelectedIfEnabled());
+      el.addEventListener("keydown", (e) => {
+        if (e.key !== "Tab") return;
+        e.preventDefault();
+        const start = el.selectionStart | 0;
+        const end = el.selectionEnd | 0;
+        const v = el.value || "";
+        el.value = v.slice(0, start) + "    " + v.slice(end);
+        el.selectionStart = el.selectionEnd = start + 4;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      });
     });
     // 条件-如果：变量 / 判断 / 连接 + 添加
     if (t === "if") {
@@ -4491,7 +6568,10 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          else renderParamPanel(a);
+          peekScriptActions(a.targetPath).then((msg) => {
+            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
+            renderParamPanel(a);
+          });
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -4525,7 +6605,10 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          else renderParamPanel(a);
+          peekScriptActions(a.targetPath).then((msg) => {
+            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
+            renderParamPanel(a);
+          });
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -4538,33 +6621,133 @@
     open();
   }
 
+  function startDragImageOffsetPick(a, which) {
+    readParamPanelInto(a);
+    if (!window.qst) {
+      toast("无桥接");
+      return;
+    }
+    if (!a.imagePath) {
+      toast("请先截图或选择图片");
+      return;
+    }
+    if (a.imageUseVar) {
+      state._pendingDragOffset = which === "end" ? "end" : "start";
+      if (!startSyntheticAnchorOverlay("offsetBySize", a.imagePath)) {
+        state._pendingDragOffset = "";
+      }
+      return;
+    }
+    state._pendingDragOffset = which === "end" ? "end" : "start";
+    const full =
+      (a.searchFullScreen | 0) === 1 ||
+      (a.searchX2 | 0) <= (a.searchX1 | 0) ||
+      (a.searchY2 | 0) <= (a.searchY1 | 0);
+    qst.findImageMatch(
+      withWindowTargetFindOpts({
+      imagePath: a.imagePath,
+      mode: "offset",
+      searchFullScreen: full ? 1 : 0,
+      searchX1: a.searchX1 | 0,
+      searchY1: a.searchY1 | 0,
+      searchX2: a.searchX2 | 0,
+      searchY2: a.searchY2 | 0,
+      matchThreshold: matchThresholdPercent(a.matchThreshold),
+      perfectMatch: a.perfectMatch ? 1 : 0,
+      imageScaleMin: a.imageScaleMin ?? 0.9,
+      imageScaleMax: a.imageScaleMax ?? 1.1,
+      maxMatches: 1,
+    })
+    );
+  }
+
   function wireFindImageButtons(panel, a) {
     if (!panel || !a) return;
     panel.querySelectorAll("[data-fi]").forEach((btn) => {
       const act = btn.dataset.fi;
+      if (act === "clickHere") {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          a.x = 0;
+          a.y = 0;
+          a.nx = 0;
+          a.ny = 0;
+          a.randomX = 0;
+          a.randomY = 0;
+          renderParamPanel(a);
+          toast("已改为在当前位置点击");
+        });
+        return;
+      }
       if (act === "pickCoord") {
+        if (usesImageLocateOffsetPick(a)) {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            startDragImageOffsetPick(a, "start");
+          });
+          return;
+        }
         wireCrosshairPointerDown(btn, "coordinates", "coord", () => readParamPanelInto(a));
+        return;
+      }
+      if (act === "pickCoordEnd") {
+        if (a.type === "mouseDrag" && a.imageLocate) {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            startDragImageOffsetPick(a, "end");
+          });
+          return;
+        }
+        wireCrosshairPointerDown(btn, "coordinates", "coordEnd", () => readParamPanelInto(a));
         return;
       }
       if (act === "pickProg") {
         wireCrosshairPointerDown(btn, "programPath", "program", () => readParamPanelInto(a));
         return;
       }
+      if (act === "nwmPick") {
+        wireCrosshairPointerDown(btn, "windowTarget", "nestedWm", () => readParamPanelInto(a));
+        return;
+      }
+      if (act === "nwmClass") {
+        wireCrosshairPointerDown(btn, "windowTarget", "nestedWmClass", () => readParamPanelInto(a));
+        return;
+      }
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
         readParamPanelInto(a);
+        const mmSlot = mmSlotFromEl(btn);
         if (act === "clear") {
-          a.imagePath = "";
+          if (mmSlot >= 0) mmSetPath(a, mmSlot, "");
+          else a.imagePath = "";
           renderParamPanel(a);
           return;
         }
         if (act === "full") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           applyFullScreenSearchCoords(a);
           renderParamPanel(a);
           return;
         }
+        if (act === "pickDrag") {
+          if (!window.qst) {
+            toast("无桥接");
+            return;
+          }
+          qst.pickScreenDrag();
+          return;
+        }
         if (act === "absRegion") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           state._pendingRegionTarget = "search";
           if (window.qst) qst.pickScreenRegion();
           else toast("无桥接");
@@ -4573,6 +6756,12 @@
         if (act === "browseExe") {
           state._pendingBrowse = "exe";
           a.shortcutPreset = 0;
+          if (window.qst) qst.browsePath(true);
+          else toast("无桥接");
+          return;
+        }
+        if (act === "nwmBrowse") {
+          state._pendingBrowse = "nestedWmTarget";
           if (window.qst) qst.browsePath(true);
           else toast("无桥接");
           return;
@@ -4640,7 +6829,8 @@
             toast("请先输入要在结果中查找的文字");
             return;
           }
-          qst.testOcr({
+          qst.testOcr(
+            withWindowTargetFindOpts({
             mode: act === "ocrOffset" ? "offset" : "test",
             ocrRegionByImage: a.ocrRegionByImage ? 1 : 0,
             ocrDigitsOnly: a.ocrDigitsOnly ? 1 : 0,
@@ -4660,7 +6850,8 @@
             imagePath: a.imagePath || "",
             ocrSearchText: a.ocrSearchText || "",
             ocrResultMode: a.ocrResultMode | 0,
-          });
+          })
+          );
           return;
         }
         if (act === "browseFile") {
@@ -4674,16 +6865,14 @@
           return;
         }
         if (act === "ocrInstall") {
-          state._ocrRepair = false;
           if ($("#ocrDlgTitle"))
             $("#ocrDlgTitle").childNodes[0].textContent = "键鼠工坊-插件安装 ";
           if ($("#btnOcrInstall")) {
             $("#btnOcrInstall").disabled = false;
-            $("#btnOcrInstall").textContent = "安装插件";
+            $("#btnOcrInstall").textContent = "安装 / 修复";
           }
-          if ($("#btnOcrRepair")) $("#btnOcrRepair").disabled = false;
           if ($("#ocrStatus"))
-            $("#ocrStatus").textContent = "已就绪，点击安装开始下载安装…";
+            $("#ocrStatus").textContent = "已就绪，点击下方按钮开始安装或修复…";
           if ($("#ocrBar")) $("#ocrBar").style.width = "0%";
           openOv("ocr");
           return;
@@ -4691,6 +6880,7 @@
         if (act === "screen" || act === "aiScreen") {
           if (window.qst) {
             state._pendingAiTemplateShot = act === "aiScreen";
+            state._pendingMmSlot = mmSlot;
             qst.captureTemplateScreenshot();
           } else toast("无桥接");
           return;
@@ -4701,6 +6891,7 @@
         }
         if (act === "pick" || act === "pickAiImg") {
           state._pendingImageField = act === "pickAiImg" ? "aiTargetImagePath" : "imagePath";
+          state._pendingMmSlot = mmSlot;
           qst.pickImageFile();
           return;
         }
@@ -4732,22 +6923,32 @@
           return;
         }
         if (act === "aiFull") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           a.aiSearchRegion = 0;
           applyFullScreenSearchCoords(a, "aiSearch");
           renderParamPanel(a);
           return;
         }
         if (act === "aiRegion") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           state._pendingRegionTarget = "ai";
           qst.pickScreenRegion();
           return;
         }
         if (act === "crop") {
-          if (!a.imagePath) {
+          const cropPath = mmSlot >= 0 ? mmPathAt(a, mmSlot) : a.imagePath;
+          if (!cropPath) {
             toast("请先截图或选择图片");
             return;
           }
-          openWebFindImageCrop(a);
+          state._pendingMmSlot = mmSlot;
+          openWebFindImageCrop(a, cropPath);
           return;
         }
         if (act === "pickImageRegion") {
@@ -4769,26 +6970,15 @@
           state._pendingImageRegionPick = true;
 
           if (useVar) {
-            const size = inferImageVarAnchorSize(path, state.actionSel | 0);
-            if (!size) {
-              toast("无法推断图片尺寸，请手填 X1Y1X2Y2 相对坐标");
+            if (!startSyntheticAnchorOverlay("regionBySize", path)) {
               state._pendingImageRegionPick = false;
               return;
             }
-            const opts = { mode: "regionBySize" };
-            if (size.pathOnly) {
-              opts.imagePath = size.path || path;
-              opts.syntheticW = 0;
-              opts.syntheticH = 0;
-            } else {
-              opts.syntheticW = size.w;
-              opts.syntheticH = size.h;
-            }
-            qst.findImageMatch(opts);
             return;
           }
 
-          qst.findImageMatch({
+          qst.findImageMatch(
+            withWindowTargetFindOpts({
             imagePath: path,
             mode: "region",
             searchFullScreen: full ? 1 : 0,
@@ -4800,25 +6990,54 @@
             perfectMatch: a.perfectMatch ? 1 : 0,
             imageScaleMin: a.imageScaleMin ?? 0.9,
             imageScaleMax: a.imageScaleMax ?? 1.1,
-          });
+            maxMatches: 1,
+          })
+          );
           return;
         }
         if (act === "test" || act === "offset" || act === "region") {
-          if (act === "region" && !a.imagePath) {
+          const imgPath =
+            mmSlot >= 0
+              ? mmPathAt(a, mmSlot)
+              : a.type === "multiMatch"
+                ? mmPathAt(a, 0)
+                : a.imagePath;
+          if (act === "region" && !imgPath) {
+            if (editorUsesWindowTarget()) {
+              toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+              return;
+            }
             state._pendingRegionTarget = "search";
             qst.pickScreenRegion();
             return;
           }
-          if (!a.imagePath) {
+          if (!imgPath) {
             toast("请先截图或选择图片");
+            return;
+          }
+          const useVar =
+            mmSlot >= 0
+              ? mmUseVarAt(a, mmSlot)
+              : a.type === "multiMatch"
+                ? mmUseVarAt(a, 0)
+                : !!(a.imageUseVar);
+          if (act === "offset" && useVar) {
+            startSyntheticAnchorOverlay("offsetBySize", imgPath);
             return;
           }
           const full =
             (a.searchFullScreen | 0) === 1 ||
             (a.searchX2 | 0) <= (a.searchX1 | 0) ||
             (a.searchY2 | 0) <= (a.searchY1 | 0);
-          qst.findImageMatch({
-            imagePath: a.imagePath,
+          const maxMatches =
+            act === "offset" || act === "region"
+              ? 1
+              : a.type === "multiMatch" && (a.multiMatchMode | 0) === 1
+                ? Math.max(1, Math.min(20, a.multiMatchMax | 0 || 20))
+                : 20;
+          qst.findImageMatch(
+            withWindowTargetFindOpts({
+            imagePath: imgPath,
             mode: act === "test" ? "test" : act === "offset" ? "offset" : "region",
             searchFullScreen: full ? 1 : 0,
             searchX1: a.searchX1 | 0,
@@ -4829,7 +7048,9 @@
             perfectMatch: a.perfectMatch ? 1 : 0,
             imageScaleMin: a.imageScaleMin ?? 0.9,
             imageScaleMax: a.imageScaleMax ?? 1.1,
-          });
+            maxMatches,
+          })
+          );
         }
       });
     });
@@ -5310,6 +7531,10 @@
   }
 
   function closeAgentWindow() {
+    if (anyAgentTabBusy()) {
+      toast("请先取消或等待当前回复");
+      return;
+    }
     state.agentMinimized = false;
     persistAgentDraft(undefined, true);
     clearAgentEditMode();
@@ -6082,14 +8307,15 @@
   }
 
   function enterEditorBatch(on) {
+    if (on) flushPendingLiveEdit();
     state.batchMode = !!on;
     state.batchSel = {};
+    state._batchAnchor = -1;
     resetMergeUiChrome();
     if (on) {
       state.actionSel = -1;
       state.editDraft = null;
       state.addPreview = null;
-      renderParamPanel(null);
     }
     // 列表已在时只改勾选/选中态，禁止 innerHTML 把滚动条拆掉重建
     if (!state._actionListRendering && patchActionListBatchMode(on)) {
@@ -6112,6 +8338,167 @@
     return out;
   }
 
+  function mergeBatchSelectionBefore() {
+    if (!isMergeEligible()) {
+      toast("请勾选至少两个同级动作");
+      return false;
+    }
+    runMergeWithPlacement("before");
+    return true;
+  }
+
+  function debugSelectedBatch(stepMode) {
+    const idx = selectedBatchIndices();
+    if (!idx.length) {
+      toast("请先勾选动作");
+      return false;
+    }
+    startDebugFrom(idx[0], !!stepMode);
+    return true;
+  }
+
+  function prepareBatchContextSelection(index) {
+    if (index < 0 || index >= (state.editorActions || []).length) return;
+    if (state.batchSel && state.batchSel[index]) return;
+    state.batchSel = {};
+    state.batchSel[index] = true;
+    state._batchAnchor = index;
+    refreshEditorBatchSelectionUi();
+  }
+
+  function showEditorBatchContextMenu(clientX, clientY, extra) {
+    extra = extra || {};
+    const hasSel = selectedBatchIndices().length > 0;
+    const items = [
+      { t: "剪切", v: "cut", disabled: !hasSel },
+      { t: "复制", v: "copy", disabled: !hasSel },
+      { t: "合并到动作", v: "merge", disabled: !isMergeEligible() },
+    ];
+    if (extra.clickIndex >= 0 && !isEditorVisualMode()) {
+      items.push(
+        { t: "插入到此项前", v: "insertBefore" },
+        { t: "插入到此项后", v: "insertAfter" }
+      );
+    }
+    items.push(
+      { t: "调试选中的步骤（单步）", v: "step", disabled: !hasSel },
+      { t: "调试选中的步骤（运行）", v: "run", disabled: !hasSel }
+    );
+    requestAnimationFrame(() => {
+      showPopup(
+        { clientX: clientX, clientY: clientY },
+        items,
+        (it) => {
+          if (!it) return;
+          if (it.v === "cut") {
+            if (!cutSelectedEditorActions()) toast("请先勾选动作");
+          } else if (it.v === "copy") {
+            if (!copySelectedEditorActions()) toast("请先勾选动作");
+          } else if (it.v === "merge") mergeBatchSelectionBefore();
+          else if (it.v === "insertBefore" || it.v === "insertAfter") {
+            const place = it.v === "insertBefore" ? "before" : "after";
+            const prior = Array.isArray(extra.priorSel) ? extra.priorSel : [];
+            const targets = prior.length
+              ? prior
+              : extra.clickIndex >= 0
+                ? [extra.clickIndex]
+                : [];
+            if (!targets.length) {
+              toast("请先勾选动作");
+              return;
+            }
+            const inserted = insertFormActionsForTargets(targets, place);
+            if (!inserted.length) return;
+            state.batchSel = {};
+            inserted.forEach((idx) => {
+              state.batchSel[idx] = true;
+            });
+            renderEditorActions(state.editorActions);
+            if (inserted.length === 1 && !prior.length) {
+              enterEditorBatch(false);
+              selectEditorAction(inserted[0]);
+            }
+          } else if (it.v === "step") debugSelectedBatch(true);
+          else if (it.v === "run") debugSelectedBatch(false);
+        },
+        { preferUp: true }
+      );
+    });
+  }
+
+  function setEditorVisualSelection(indices) {
+    const n = (state.editorActions || []).length;
+    const uniq = [];
+    const seen = {};
+    (indices || []).forEach((i) => {
+      const v = i | 0;
+      if (v >= 0 && v < n && !seen[v]) {
+        seen[v] = true;
+        uniq.push(v);
+      }
+    });
+    if (uniq.length >= 2) {
+      state.batchMode = true;
+      state.batchSel = {};
+      uniq.forEach((i) => { state.batchSel[i] = true; });
+      state.actionSel = -1;
+      state.editDraft = null;
+      state.addPreview = null;
+      syncEditorBatchChrome();
+      syncMergeModeUi();
+      return;
+    }
+    enterEditorBatch(false);
+    if (uniq.length === 1) selectEditorAction(uniq[0]);
+    else {
+      state.actionSel = -1;
+      renderParamPanel(null);
+      showAddTypePreview();
+    }
+  }
+
+  function mergeVisualSelection(ordered) {
+    const n = (state.editorActions || []).length;
+    const uniq = [];
+    const seen = {};
+    (ordered || []).forEach((i) => {
+      const v = i | 0;
+      if (v >= 0 && v < n && !seen[v]) {
+        seen[v] = true;
+        uniq.push(v);
+      }
+    });
+    if (uniq.length < 2) {
+      toast("请先选中至少两个动作", "warn");
+      return;
+    }
+    state._mergeRootOrder = uniq.slice();
+    state.batchMode = true;
+    state.batchSel = {};
+    uniq.forEach((i) => { state.batchSel[i] = true; });
+    state.actionSel = -1;
+    syncEditorBatchChrome();
+    syncMergeModeUi();
+    if (!isMergeEligible()) {
+      const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
+      toast((plan && plan.error) || "当前选择无法并入", "warn");
+      state._mergeRootOrder = null;
+      return;
+    }
+    const type = (state.addPreview && state.addPreview.type) || state.addActionType;
+    const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
+    if (type === "defineBlock" || type === "watchImage" || (plan && plan.contiguous)) {
+      runMergeWithPlacement(type === "defineBlock" || type === "watchImage" ? "first" : "inplace");
+      return;
+    }
+    const pop = $("#mergePlacementPopup");
+    if (pop) {
+      pop.classList.remove("hidden");
+      const firstBtn = pop.querySelector("[data-place]");
+      if (firstBtn) firstBtn.focus();
+    }
+  }
+
   function syncEdRemarkFromSelection() {
     const el = $("#edRemark");
     if (!el) return;
@@ -6126,6 +8513,7 @@
     return (
       type === "loop" ||
       type === "defineBlock" ||
+      type === "watchImage" ||
       type === "if" ||
       type === "else"
     );
@@ -6282,6 +8670,7 @@
   }
 
   function applyDisassemblePatch(start, oldCount, inserted) {
+    visualNoteUndo();
     state.collapsedContainers = remapIndexDictAfterReplace(
       state.collapsedContainers,
       start,
@@ -6295,6 +8684,7 @@
       inserted.length
     );
     state.editorActions.splice(start, oldCount, ...inserted);
+    visualOnReplace(start, oldCount, inserted.length);
     state.actionSel = inserted.length ? start : -1;
     state.editDraft = null;
     state.addPreview = null;
@@ -6306,7 +8696,7 @@
         state.addActionType = a.type;
         const typeCombo = $("#edActionType");
         const cur = ACTION_TYPES.find((x) => x.v === a.type);
-        if (typeCombo && cur) typeCombo.textContent = cur.t;
+        if (typeCombo && cur) setActionTypeComboText(cur.t);
       }
     } else {
       showAddTypePreview();
@@ -6344,7 +8734,7 @@
     }
     const destIndent = clampIndent(target.indent);
     const t = target.type;
-    if (t === "loop" || t === "if" || t === "else" || t === "defineBlock") {
+    if (t === "loop" || t === "if" || t === "else" || t === "defineBlock" || t === "watchImage") {
       const body = copyContainerBody(actions, index);
       if (!body.length) {
         toast("没有可拆解的子动作");
@@ -6376,7 +8766,7 @@
     }
     const path = String(target.targetPath || "").trim();
     if (!path) {
-      toast(t === "mousePlayback" ? "请先选择用于回放的鼠标录制" : "请先选择要运行的鼠标宏");
+      toast(t === "mousePlayback" ? "请先选择用于回放的键鼠录制" : "请先选择要运行的鼠标宏");
       return;
     }
     const peeked = await peekScriptActions(path);
@@ -6400,7 +8790,7 @@
   }
 
   function isMergeContainerType(type) {
-    return type === "loop" || type === "if" || type === "else" || type === "defineBlock";
+    return type === "loop" || type === "if" || type === "else" || type === "defineBlock" || type === "watchImage";
   }
 
   function mergeSubtreeEndOn(actions, fromIdx) {
@@ -6562,12 +8952,30 @@
     if (placement === "inplace" && !plan.contiguous) {
       return { ok: false, error: "所选动作不连续，请选择插入位置" };
     }
-    const asDefine = container.type === "defineBlock";
+    const asDefine = container.type === "defineBlock" || container.type === "watchImage";
     const destIndent = asDefine ? 0 : plan.indent;
     const ranges = [];
     const body = [];
-    for (let r = 0; r < plan.roots.length; ++r) {
-      const root = plan.roots[r];
+    let roots = plan.roots.slice();
+    if (state._mergeRootOrder && state._mergeRootOrder.length) {
+      const keep = {};
+      roots.forEach((i) => {
+        keep[i] = true;
+      });
+      const ordered = [];
+      state._mergeRootOrder.forEach((i) => {
+        if (keep[i]) {
+          ordered.push(i);
+          delete keep[i];
+        }
+      });
+      roots.forEach((i) => {
+        if (keep[i]) ordered.push(i);
+      });
+      roots = ordered;
+    }
+    for (let r = 0; r < roots.length; ++r) {
+      const root = roots[r];
       const end = mergeSubtreeEndOn(actions, root);
       ranges.push({ start: root, end });
       for (let i = root; i < end; ++i) body.push(cloneActionForInline(actions[i]));
@@ -6665,6 +9073,11 @@
     state.batchSel = {};
     state.batchSel[result.containerIndex] = true;
     renderEditorActions(state.editorActions);
+    state._mergeRootOrder = null;
+    const V = window.QstVisualEditor;
+    if (V && typeof V.isVisual === "function" && V.isVisual() && typeof V.afterMerge === "function") {
+      V.afterMerge(result.containerIndex, result);
+    }
   }
 
   function syncMergeModeUi() {
@@ -6677,9 +9090,14 @@
     const on = isMergeEligible();
     const was = _mergeUiOn;
     _mergeUiOn = on;
-    if (lbl) lbl.textContent = on ? "请选择要并入的宏" : "请选择要添加的宏";
+    const lock = on && !editorBatchInsertOn();
+    const type = (state.addPreview && state.addPreview.type) || state.addActionType;
+    if (lbl) {
+      lbl.textContent =
+        on && (lock || isMergeContainerType(type)) ? "请选择要并入的宏" : "请选择要添加的宏";
+    }
     if (on && !was) {
-      if (!isMergeContainerType(state.addActionType)) state.addActionType = "loop";
+      if (lock && !isMergeContainerType(state.addActionType)) state.addActionType = "loop";
       showAddTypePreview();
       return "enter";
     }
@@ -6689,8 +9107,13 @@
       return "leave";
     }
     if (!on) {
-      renderParamPanel(null);
+      if (!state.addPreview) showAddTypePreview();
+      else renderParamPanel(state.addPreview);
       return "batch";
+    }
+    if (lock && !isMergeContainerType(state.addActionType)) {
+      state.addActionType = "loop";
+      showAddTypePreview();
     }
     return "stay";
   }
@@ -6718,7 +9141,9 @@
       toast(result.error || "并入失败");
       return;
     }
+    visualNoteUndo();
     applyMergeResult(result);
+    state._mergeRootOrder = null;
     const remarkEl = $("#edRemark");
     if (remarkEl) remarkEl.textContent = "";
   }
@@ -6844,9 +9269,558 @@
     return true;
   }
 
-  function insertEditorAction(action, pos, indentOverride) {
+  const EDITOR_UNDO_MAX = 50;
+
+  function cloneEditorJson(v) {
+    return JSON.parse(JSON.stringify(v));
+  }
+
+  function isEditorVisualMode() {
+    const V = window.QstVisualEditor;
+    return !!(V && typeof V.isVisual === "function" && V.isVisual());
+  }
+
+  function resetEditorHistory(opts) {
+    state.editorUndo = [];
+    state.editorRedo = [];
+    if (!(opts && opts.keepClipboard)) state.editorClipboard = null;
+  }
+
+  function captureEditorHistory() {
+    const V = window.QstVisualEditor;
+    let visual = null;
+    try {
+      visual = V && typeof V.collectHistory === "function" ? V.collectHistory() : null;
+    } catch (_) {
+      visual = null;
+    }
+    return {
+      actions: cloneEditorJson(state.editorActions || []),
+      actionSel: state.actionSel | 0,
+      batchMode: !!state.batchMode,
+      batchSel: cloneEditorJson(state.batchSel || {}),
+      collapsed: cloneEditorJson(state.collapsedContainers || {}),
+      breakpoints: cloneEditorJson(state.editorBreakpoints || {}),
+      visual: visual,
+    };
+  }
+
+  function applyEditorSnapshot(snap) {
+    if (!snap) return;
+    state.editorActions = Array.isArray(snap.actions) ? cloneEditorJson(snap.actions) : [];
+    state.actionSel = snap.actionSel | 0;
+    if (state.actionSel >= state.editorActions.length) state.actionSel = -1;
+    state.batchMode = !!snap.batchMode;
+    state.batchSel = snap.batchSel && typeof snap.batchSel === "object" ? cloneEditorJson(snap.batchSel) : {};
+    state.collapsedContainers =
+      snap.collapsed && typeof snap.collapsed === "object" ? cloneEditorJson(snap.collapsed) : {};
+    state.editorBreakpoints =
+      snap.breakpoints && typeof snap.breakpoints === "object" ? cloneEditorJson(snap.breakpoints) : {};
+    state.addPreview = null;
+    const V = window.QstVisualEditor;
+    if (V && typeof V.applyHistory === "function") {
+      try {
+        V.applyHistory(snap.visual || null);
+      } catch (_) {}
+    }
+    if (state.batchMode) {
+      state.editDraft = null;
+      syncEditorBatchChrome();
+      syncMergeModeUi();
+    } else {
+      resetMergeUiChrome();
+      state._mergeRootOrder = null;
+      syncEditorBatchChrome();
+      if (state.actionSel >= 0) loadEditDraftFromSelection();
+      else {
+        state.editDraft = null;
+        showAddTypePreview();
+      }
+    }
+    renderEditorActions(state.editorActions);
+  }
+
+  function pushEditorHistory() {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.isHistoryHeld === "function" && V.isHistoryHeld()) return false;
+    try {
+      if (!state.editorUndo) state.editorUndo = [];
+      state.editorUndo.push(captureEditorHistory());
+      if (state.editorUndo.length > EDITOR_UNDO_MAX) state.editorUndo.shift();
+      state.editorRedo = [];
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function undoEditorHistory() {
+    if (!state.editorUndo || !state.editorUndo.length) return false;
+    if (!state.editorRedo) state.editorRedo = [];
+    const current = captureEditorHistory();
+    const prev = state.editorUndo.pop();
+    state.editorRedo.push(current);
+    if (state.editorRedo.length > EDITOR_UNDO_MAX) state.editorRedo.shift();
+    applyEditorSnapshot(prev);
+    return true;
+  }
+
+  function redoEditorHistory() {
+    if (!state.editorRedo || !state.editorRedo.length) return false;
+    if (!state.editorUndo) state.editorUndo = [];
+    const current = captureEditorHistory();
+    const next = state.editorRedo.pop();
+    state.editorUndo.push(current);
+    if (state.editorUndo.length > EDITOR_UNDO_MAX) state.editorUndo.shift();
+    applyEditorSnapshot(next);
+    return true;
+  }
+
+  function revertLastEditorHistory() {
+    if (!state.editorUndo || !state.editorUndo.length) return false;
+    const prev = state.editorUndo.pop();
+    applyEditorSnapshot(prev);
+    return true;
+  }
+
+  function discardEditorHistory() {
+    if (state.editorUndo && state.editorUndo.length) state.editorUndo.pop();
+  }
+
+  function visualNoteUndo() {
+    return pushEditorHistory();
+  }
+
+  function selectedEditorActionRoots() {
+    const list = state.editorActions || [];
+    let idxs = [];
+    if (state.batchMode) idxs = selectedBatchIndices();
+    if (!idxs.length && state.actionSel >= 0 && state.actionSel < list.length) {
+      idxs = [state.actionSel];
+    }
+    if (!idxs.length) return [];
+    const roots = [];
+    for (let i = 0; i < idxs.length; i++) {
+      const idx = idxs[i];
+      let covered = false;
+      for (let j = 0; j < idxs.length; j++) {
+        const other = idxs[j];
+        if (other < idx && subtreeEnd(other) > idx) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered) roots.push(idx);
+    }
+    return roots;
+  }
+
+  function uniquifyPastedBlockName(name, used) {
+    let base = String(name || "Block").trim();
+    if (!isValidBlockName(base)) base = "Block";
+    let n = base;
+    let i = 2;
+    while (used[n] || isBlockNameDuplicate(n, -1)) {
+      n = base + i;
+      i += 1;
+    }
+    used[n] = true;
+    return n;
+  }
+
+  function pasteAnchorIndex() {
+    const list = state.editorActions || [];
+    if (state.batchMode) {
+      const roots = selectedEditorActionRoots();
+      if (roots.length) return roots[roots.length - 1];
+      return -1;
+    }
+    if (state.actionSel >= 0 && state.actionSel < list.length) return state.actionSel;
+    return -1;
+  }
+
+  function editorHasClipboard() {
+    const blocks = state.editorClipboard;
+    if (!blocks || !blocks.length) return false;
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i] && blocks[i].length) return true;
+    }
+    return false;
+  }
+
+  function resolveEditorOpRoots(opts) {
+    opts = opts || {};
+    const list = state.editorActions || [];
+    let roots;
+    if (Array.isArray(opts.roots) && opts.roots.length) roots = opts.roots.slice();
+    else if (opts.index != null && opts.index >= 0) roots = [opts.index | 0];
+    else roots = selectedEditorActionRoots();
+    return roots.filter((i) => i >= 0 && i < list.length);
+  }
+
+  function copySelectedEditorActions(opts) {
+    opts = opts || {};
+    if (isEditorVisualMode() && !opts.allowVisual) return false;
+    const roots = resolveEditorOpRoots(opts);
+    if (!roots.length) return false;
+    const blocks = [];
+    for (let r = 0; r < roots.length; r++) {
+      const i = roots[r];
+      const end = subtreeEnd(i);
+      const block = (state.editorActions || []).slice(i, end).map((a) => {
+        const c = cloneEditorJson(a);
+        delete c._preview;
+        return c;
+      });
+      if (block.length) blocks.push(block);
+    }
+    if (!blocks.length) return false;
+    state.editorClipboard = blocks;
+    const V = window.QstVisualEditor;
+    if (V && typeof V.setClipboard === "function") V.setClipboard(blocks[0][0]);
+    const n = blocks.reduce((s, b) => s + b.length, 0);
+    if (!opts.silent) toast(n > 1 ? "已复制 " + n + " 条动作" : "已复制");
+    return true;
+  }
+
+  function cutSelectedEditorActions(opts) {
+    opts = opts || {};
+    const visual = isEditorVisualMode();
+    const V = window.QstVisualEditor;
+    const roots = resolveEditorOpRoots(opts);
+    if (!roots.length) return false;
+    if (visual && !state.batchMode && roots.length === 1 && typeof V.cutCard === "function") {
+      return !!V.cutCard(roots[0]);
+    }
+    if (!copySelectedEditorActions({ silent: true, allowVisual: true, roots })) return false;
+    const n = (state.editorClipboard || []).reduce((s, b) => s + ((b && b.length) || 0), 0);
+    if (!deleteSelectedEditorActions({ skipEdge: true, roots })) return false;
+    toast(n > 1 ? "已剪切 " + n + " 条动作" : "已剪切");
+    return true;
+  }
+
+  function pasteEditorClipboardAfterSelection(opts) {
+    opts = opts || {};
+    if (isEditorVisualMode()) return false;
+    const blocks = state.editorClipboard;
+    if (!blocks || !blocks.length) return false;
+    const list = state.editorActions || [];
+    let pos;
+    let destIndent;
+    if (!list.length) {
+      pos = 0;
+      destIndent = 0;
+    } else {
+      const sel = opts.index != null && opts.index >= 0 ? opts.index | 0 : pasteAnchorIndex();
+      if (sel < 0 || sel >= list.length) return false;
+      pos = subtreeEnd(sel);
+      destIndent = clampIndent(list[sel].indent);
+    }
+    const toInsert = [];
+    const usedNames = {};
+    for (let b = 0; b < blocks.length; b++) {
+      const copy = cloneEditorJson(blocks[b]);
+      remapCopiedIndents(copy, destIndent);
+      for (let i = 0; i < copy.length; i++) {
+        const a = copy[i];
+        delete a._preview;
+        a.name = typeLabel(a.type);
+        if (a.type === "defineBlock") a.blockName = uniquifyPastedBlockName(a.blockName, usedNames);
+        mmNormalizeForSave(a);
+        toInsert.push(a);
+      }
+    }
+    if (!toInsert.length) return false;
+    const combined = list.slice(0, pos).concat(toInsert).concat(list.slice(pos));
+    const err = validateEndLoopPlacements(combined);
+    if (err) {
+      toast(err);
+      return false;
+    }
+    visualNoteUndo();
+    for (let i = 0; i < toInsert.length; i++) {
+      list.splice(pos + i, 0, toInsert[i]);
+      visualOnInsert(pos + i);
+      shiftCollapsedAfterInsert(pos + i);
+      if (isSubtreeContainerType(toInsert[i].type)) delete state.collapsedContainers[pos + i];
+    }
+    if (state.batchMode) {
+      state.batchMode = false;
+      state.batchSel = {};
+      resetMergeUiChrome();
+      syncEditorBatchChrome();
+    }
+    state.actionSel = pos;
+    state.addPreview = null;
+    loadEditDraftFromSelection();
+    renderEditorActions(state.editorActions);
+    focusEditorActionList();
+    return true;
+  }
+
+  function deleteSelectedEditorActions(opts) {
+    opts = opts || {};
+    const V = window.QstVisualEditor;
+    const visual = isEditorVisualMode();
+    if (!opts.skipEdge && visual && typeof V.deleteSelectedEdgeIfAny === "function" && V.deleteSelectedEdgeIfAny()) {
+      return true;
+    }
+    const roots = resolveEditorOpRoots(opts);
+    if (!roots.length) return false;
+    if (visual && !state.batchMode && roots.length === 1 && typeof V.deleteCard === "function") {
+      V.deleteCard(roots[0]);
+      return true;
+    }
+    visualNoteUndo();
+    const sorted = roots.slice().sort((a, b) => b - a);
+    for (let k = 0; k < sorted.length; k++) {
+      const idx = sorted[k];
+      if (idx < 0 || idx >= (state.editorActions || []).length) continue;
+      deleteSubtreeAt(idx, { skipUndo: true });
+    }
+    if (state.batchMode) {
+      state.batchMode = false;
+      state.batchSel = {};
+      resetMergeUiChrome();
+      syncEditorBatchChrome();
+    }
+    if (visual && typeof V.afterListDelete === "function") V.afterListDelete();
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    if (state.actionSel < 0 && !state.batchMode) showAddTypePreview();
+    return true;
+  }
+
+  function editorShortcutBlockedByOverlay() {
+    const ids = [
+      "ov-hotkey",
+      "ov-action-key",
+      "ov-prompt",
+      "ov-rename",
+      "ov-crop",
+      "ov-pick",
+      "ov-ocr",
+      "ov-opt",
+      "ov-theme",
+      "ov-settings",
+      "ov-sched",
+      "ov-sched-create",
+      "ov-editor-settings",
+      "ov-driver-ic",
+      "ov-driver-vhid",
+      "ov-interval",
+    ];
+    for (let i = 0; i < ids.length; i++) {
+      const el = document.getElementById(ids[i]);
+      if (el && el.classList.contains("show")) return true;
+    }
+    if ($("#ov-agent")?.classList.contains("show") && !state.agentMinimized) return true;
+    const imgV = $("#agentImgViewer");
+    if (imgV && !imgV.hidden && imgV.classList.contains("show")) return true;
+    if (document.querySelector(".popup-menu.show")) return true;
+    return false;
+  }
+
+  function onEditorActionShortcut(ev) {
+    if (!state.editor) return;
+    const visEd = window.QstVisualEditor;
+    if (visEd && typeof visEd.isInteracting === "function" && visEd.isInteracting()) return;
+    const ctrl = !!(ev.ctrlKey || ev.metaKey);
+    const key = ev.key || "";
+    if (!ctrl && !ev.altKey && key === "Escape") {
+      if (document.querySelector(".popup-menu.show")) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        hidePopup();
+        return;
+      }
+      if (editorShortcutBlockedByOverlay()) return;
+      if (state.batchMode) {
+        ev.preventDefault();
+        enterEditorBatch(false);
+      }
+      return;
+    }
+    if (isEditableTypingTarget(ev.target) || isEditableTypingTarget(document.activeElement)) {
+      if (
+        !ctrl &&
+        !ev.altKey &&
+        (key === "Delete" || key === "Backspace") &&
+        isEditorVisualMode()
+      ) {
+        const V = window.QstVisualEditor;
+        if (V && typeof V.deleteSelectedEdgeIfAny === "function" && V.deleteSelectedEdgeIfAny()) {
+          ev.preventDefault();
+          ev.stopPropagation();
+        }
+      }
+      return;
+    }
+    if (editorShortcutBlockedByOverlay()) return;
+    if (ctrl && !ev.altKey && (key === "z" || key === "Z") && !ev.shiftKey) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      undoEditorHistory();
+      return;
+    }
+    if (
+      (ctrl && !ev.altKey && (key === "y" || key === "Y") && !ev.shiftKey) ||
+      (ctrl && ev.shiftKey && (key === "z" || key === "Z"))
+    ) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      redoEditorHistory();
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "c" || key === "C")) {
+      if (copySelectedEditorActions()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "x" || key === "X")) {
+      if (cutSelectedEditorActions()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "v" || key === "V")) {
+      if (pasteEditorClipboardAfterSelection()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (!ctrl && !ev.altKey && key === "Delete") {
+      if (deleteSelectedEditorActions()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "a" || key === "A")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      selectAllEditorActions();
+    }
+  }
+
+  function bindEditorActionShortcuts() {
+    if (document._qstEditorShortcuts) return;
+    document._qstEditorShortcuts = true;
+    document.addEventListener("keydown", onEditorActionShortcut, true);
+  }
+
+  function focusEditorActionList() {
+    try {
+      if (isEditableTypingTarget(document.activeElement)) return;
+      if (isEditorVisualMode()) {
+        const host = $("#visualCanvasHost");
+        if (host) host.focus({ preventScroll: true });
+        return;
+      }
+      const list = $("#actionList");
+      if (!list) return;
+      if (list.tabIndex < 0) list.tabIndex = -1;
+      list.focus({ preventScroll: true });
+    } catch (_) {}
+  }
+
+  function visualOnInsert(pos) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onInsert === "function") V.onInsert(pos);
+  }
+
+  function visualOnDelete(index, count) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onDelete === "function") V.onDelete(index, count);
+  }
+
+  function visualOnMove(fromIdx, end, insert) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onMove === "function") V.onMove(fromIdx, end, insert);
+  }
+
+  function visualOnReplace(start, oldCount, newCount) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onReplace === "function") V.onReplace(start, oldCount, newCount);
+  }
+
+  function visualDiscardUndo() {
+    discardEditorHistory();
+  }
+
+  function visualActionsChanged() {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onActionsChanged === "function") V.onActionsChanged();
+  }
+
+  function collectVisualLayoutForSave() {
+    const V = window.QstVisualEditor;
+    if (!V) return undefined;
+    if (typeof V.collectLayoutIfAny === "function") return V.collectLayoutIfAny();
+    if (typeof V.collectLayout === "function") return V.collectLayout();
+    return undefined;
+  }
+
+  function editorPrefersVisual() {
+    return !!(
+      state.settings &&
+      state.settings.other &&
+      state.settings.other.editorDefaultView === "visual"
+    );
+  }
+
+  function applyEditorDefaultView() {
+    const V = window.QstVisualEditor;
+    if (!V || !editorPrefersVisual()) return;
+    if (typeof V.applyOpenView === "function") V.applyOpenView(true);
+    else if (typeof V.setMode === "function") V.setMode(true);
+  }
+
+  function selectEditorAction(i, opts) {
+    i = i | 0;
+    if (i < 0 || i >= (state.editorActions || []).length) return;
+    opts = opts || {};
+    if (!(opts && opts.skipFlush) && i !== state.actionSel) flushPendingLiveEdit();
+    if (
+      opts.keepDraft &&
+      state.actionSel === i &&
+      state.editDraft &&
+      !state.addPreview
+    ) {
+      captureParamPanelIntoDraft();
+      const V = window.QstVisualEditor;
+      if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
+      return;
+    }
+    const prevSel = state.actionSel;
+    state.actionSel = i;
+    state.addPreview = null;
+    loadEditDraftFromSelection();
+    {
+      const a = state.editDraft;
+      if (a && a.type) {
+        state.addActionType = a.type;
+        const typeCombo = $("#edActionType");
+        const cur = ACTION_TYPES.find((x) => x.v === a.type);
+        if (typeCombo && cur) setActionTypeComboText(cur.t);
+      }
+    }
+    state._skipReadback = true;
+    updateEditorSelectionUi(prevSel, i);
+    state._skipReadback = false;
+    const row = $("#actionList")?.querySelector('.arow[data-i="' + i + '"]');
+    if (row && row.scrollIntoView) row.scrollIntoView({ block: "nearest" });
+    focusEditorActionList();
+  }
+
+  function insertEditorAction(action, pos, indentOverride, opts) {
     const a = Object.assign({}, action);
     delete a._preview;
+    mmNormalizeForSave(a);
     if (typeof indentOverride === "number" && indentOverride >= 0) {
       a.indent = clampIndent(indentOverride);
     } else if (a.indent == null) {
@@ -6854,8 +9828,8 @@
     } else {
       a.indent = clampIndent(a.indent);
     }
-    if (a.type === "defineBlock") {
-      if (!validateDefineBlockName(a.blockName, -1)) return false;
+    if (a.type === "defineBlock" || a.type === "watchImage") {
+      if (a.type === "defineBlock" && !validateDefineBlockName(a.blockName, -1)) return false;
       pos = 0;
       a.indent = 0;
     }
@@ -6865,28 +9839,253 @@
       toast(END_LOOP_NEEDS_LOOP_MSG);
       return false;
     }
+    if (!(opts && opts.skipUndo)) visualNoteUndo();
     list.splice(pos, 0, a);
+    visualOnInsert(pos);
     shiftCollapsedAfterInsert(pos);
     if (isSubtreeContainerType(a.type)) delete state.collapsedContainers[pos];
     return true;
   }
 
-  function deleteSubtreeAt(index) {
+  const KEY_EXEC_ACTION_TYPES = new Set([
+    "moveMouseRelative", "mouseClick", "mouseDown", "mouseUp", "scrollWheel", "mouseDrag",
+    "keyClick", "keyDown", "keyUp", "hotkeyShortcut", "quickInput",
+    "findImage", "multiMatch", "findColor", "textRecognition",
+    "runProgram", "closeProgram", "activateWindow", "openFile", "openWebpage",
+    "runMacro", "runBlock", "mousePlayback",
+  ]);
+
+  function currentAddActionFromForm() {
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    let a;
+    if (state.addPreview && state.addPreview.type === state.addActionType) {
+      readParamPanelInto(state.addPreview);
+      a = Object.assign({}, state.addPreview);
+      delete a._preview;
+      a.remark = remark;
+      a.name = typeLabel(a.type);
+    } else if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
+      if (!state.editDraft) loadEditDraftFromSelection();
+      if (state.editDraft) {
+        readParamPanelInto(state.editDraft);
+        a = Object.assign({}, state.editDraft);
+        delete a._preview;
+        a.remark = remark;
+        a.name = typeLabel(a.type);
+      } else {
+        a = defaultAction(state.addActionType, remark);
+      }
+    } else {
+      a = defaultAction(state.addActionType, remark);
+    }
+    mmNormalizeForSave(a);
+    return a;
+  }
+
+  function addPlacementMenuItems(hasSel, selAct, formAction, fromContextMenu) {
+    const items = hasSel
+      ? [
+          { t: "添加到最后", v: "last" },
+          { t: "插入到最前", v: "first" },
+          { t: "插入到选择项前", v: "before" },
+          { t: "插入到选择项后", v: "after" },
+        ]
+      : [
+          { t: "添加到最后", v: "last" },
+          { t: "插入到最前", v: "first" },
+        ];
+    if (hasSel && selAct && isSubtreeContainerType(selAct.type)) {
+      items.push({ t: "添加为子节点", v: "asChild" });
+    }
+    if (fromContextMenu && formAction && formAction.type === "wait") {
+      items.push({ t: "插入到所有关键执行动作间", v: "betweenKey" });
+    }
+    return items;
+  }
+
+  function applyAddPlacement(it, a, sel, selAct, finishInsert) {
+    if (!it) return;
+    if (it.v === "betweenKey") {
+      insertWaitsBetweenKeyActions(a);
+      return;
+    }
+    let pos = state.editorActions.length;
+    let indent = -1;
+    if (it.v === "first") {
+      pos = 0;
+      indent = 0;
+    } else if (it.v === "before" && selAct) {
+      pos = sel;
+      indent = selAct.indent | 0;
+    } else if (it.v === "after" && selAct) {
+      pos = subtreeEnd(sel);
+      indent = selAct.indent | 0;
+    } else if (it.v === "asChild" && selAct) {
+      pos = subtreeEnd(sel);
+      indent = (selAct.indent | 0) + 1;
+    } else {
+      pos = state.editorActions.length;
+      indent = 0;
+    }
+    finishInsert(pos, indent);
+  }
+
+  function insertWaitsBetweenKeyActions(waitSrc) {
+    const list = state.editorActions || [];
+    const slots = [];
+    for (let i = 0; i < list.length - 1; i++) {
+      const cur = list[i];
+      const nxt = list[i + 1];
+      if (!cur || !nxt) continue;
+      if (!KEY_EXEC_ACTION_TYPES.has(cur.type) || !KEY_EXEC_ACTION_TYPES.has(nxt.type)) continue;
+      if ((cur.indent | 0) !== (nxt.indent | 0)) continue;
+      slots.push(i + 1);
+    }
+    if (!slots.length) {
+      toast("没有可插入的位置");
+      return;
+    }
+    visualNoteUndo();
+    let added = 0;
+    for (let s = slots.length - 1; s >= 0; s--) {
+      const pos = slots[s];
+      const indent = list[pos - 1].indent | 0;
+      const w = defaultAction("wait", waitSrc.remark || "");
+      w.duration = waitSrc.duration;
+      w.randomDuration = waitSrc.randomDuration;
+      w.indent = clampIndent(indent);
+      delete w._preview;
+      list.splice(pos, 0, w);
+      visualOnInsert(pos);
+      shiftCollapsedAfterInsert(pos);
+      added += 1;
+    }
+    state.actionSel = -1;
+    state.batchMode = false;
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    const remarkEl = $("#edRemark");
+    if (remarkEl) remarkEl.textContent = "";
+    showAddTypePreview();
+    toast("已插入 " + added + " 处等待");
+  }
+
+  function finishAddInsert(a, pos, indent) {
+    if (!insertEditorAction(a, pos, indent)) return;
+    state.actionSel = -1;
+    state.batchMode = false;
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    const remarkEl = $("#edRemark");
+    if (remarkEl) remarkEl.textContent = "";
+    showAddTypePreview();
+  }
+
+  function insertFormActionRelativeTo(index, placement, opts) {
+    const a = JSON.parse(JSON.stringify(currentAddActionFromForm()));
+    const selAct = state.editorActions[index];
+    if (!selAct) return -1;
+    let pos = index;
+    let indent = selAct.indent | 0;
+    if (placement === "before") {
+      pos = index;
+      indent = selAct.indent | 0;
+    } else if (placement === "asChild") {
+      pos = subtreeEnd(index);
+      indent = (selAct.indent | 0) + 1;
+    } else {
+      pos = subtreeEnd(index);
+      indent = selAct.indent | 0;
+    }
+    if (!insertEditorAction(a, pos, indent, opts)) return -1;
+    if (a.type === "defineBlock" || a.type === "watchImage") return 0;
+    return pos;
+  }
+
+  function insertAndSelectFormAction(index, placement) {
+    flushPendingLiveEdit();
+    if (index < 0 || index >= (state.editorActions || []).length) return false;
+    const pos = insertFormActionRelativeTo(index, placement);
+    if (pos < 0) return false;
+    state.batchMode = false;
+    state.batchSel = {};
+    state.addPreview = null;
+    state.actionSel = pos;
+    state.editDraft = null;
+    renderEditorActions(state.editorActions);
+    selectEditorAction(pos);
+    return true;
+  }
+
+  function insertFormActionsForTargets(indices, placement) {
+    flushPendingLiveEdit();
+    const targets = (indices || []).filter((i) => i >= 0 && i < (state.editorActions || []).length);
+    if (!targets.length) return [];
+    visualNoteUndo();
+    const inserted = [];
+    const sorted = targets.slice().sort((a, b) => b - a);
+    for (let i = 0; i < sorted.length; i++) {
+      const pos = insertFormActionRelativeTo(sorted[i], placement, { skipUndo: true });
+      if (pos < 0) continue;
+      for (let k = 0; k < inserted.length; k++) {
+        if (inserted[k] >= pos) inserted[k] += 1;
+      }
+      inserted.push(pos);
+    }
+    if (!inserted.length) {
+      revertLastEditorHistory();
+      return [];
+    }
+    return inserted.sort((a, b) => a - b);
+  }
+
+  function editorBatchAddType() {
+    return (state.addPreview && state.addPreview.type) || state.addActionType;
+  }
+
+  function shouldBatchInsertOnAdd() {
+    if (!state.batchMode || !editorBatchInsertOn()) return false;
+    if (isMergeContainerType(editorBatchAddType())) return false;
+    return selectedBatchIndices().length >= 2;
+  }
+
+  function commitBatchInsertAtSelection(placement) {
+    const targets = selectedBatchIndices();
+    if (targets.length < 1) {
+      toast("请先勾选动作");
+      return false;
+    }
+    const inserted = insertFormActionsForTargets(targets, placement || "after");
+    if (!inserted.length) return false;
+    state.batchSel = {};
+    inserted.forEach((idx) => {
+      state.batchSel[idx] = true;
+    });
+    renderEditorActions(state.editorActions);
+    toast("已插入 " + inserted.length + " 条");
+    return true;
+  }
+
+  function deleteSubtreeAt(index, opts) {
+    if (!(opts && opts.skipUndo)) visualNoteUndo();
     const end = subtreeEnd(index);
     state.editorActions.splice(index, end - index);
+    visualOnDelete(index, end - index);
     remapCollapsedAfterDelete(index, end);
     if (state.actionSel >= index && state.actionSel < end) state.actionSel = -1;
     else if (state.actionSel >= end) state.actionSel -= end - index;
   }
 
-  function batchDeleteSelectedSubtrees() {
+  function batchDeleteSelectedSubtrees(opts) {
     const selected = new Set(selectedBatchIndices());
     if (!selected.size) return 0;
+    if (!(opts && opts.skipUndo)) visualNoteUndo();
     let removed = 0;
     for (let i = state.editorActions.length - 1; i >= 0; --i) {
       if (!selected.has(i)) continue;
       const end = subtreeEnd(i);
       state.editorActions.splice(i, end - i);
+      visualOnDelete(i, end - i);
       remapCollapsedAfterDelete(i, end);
       removed += 1;
       // 落在已删子树内的勾选索引随之失效
@@ -6924,6 +10123,28 @@
         break;
       }
     }
+    for (let i = 0; i < state.editorActions.length; ++i) {
+      const a = state.editorActions[i];
+      if (!a || (a.type !== "runMacro" && a.type !== "mousePlayback")) continue;
+      const mode = a.useMode == null ? 3 : a.useMode | 0;
+      if (mode !== 1 && mode !== 2) continue;
+      const wm = a.nestedWindowMode || {};
+      const method = normalizeWmSelectMethod(wm.selectMethod);
+      const hasIdentity = !!(
+        (wm.windowClassName && String(wm.windowClassName).trim()) ||
+        (wm.windowName && String(wm.windowName).trim()) ||
+        (wm.windowTitle && String(wm.windowTitle).trim())
+      );
+      const hasExe = !!(wm.targetExePath && String(wm.targetExePath).trim());
+      if (method === "useEditorWindowClass" && !hasIdentity) {
+        toast("嵌套动作请先点击「指定窗口类」配置目标窗口，或改用其他选择窗口方式。");
+        return false;
+      }
+      if (method === "noSelect" && !hasExe) {
+        toast("嵌套动作请填写目标程序路径，可使用「浏览」或「准星找程序」。");
+        return false;
+      }
+    }
     return true;
   }
 
@@ -6938,7 +10159,7 @@
     if (typeCombo) {
       const cur =
         ACTION_TYPES.find((a) => a.v === state.addActionType) || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      setActionTypeComboText(cur.t);
     }
     renderParamPanel(preview);
   }
@@ -7016,8 +10237,10 @@
       toast(END_LOOP_NEEDS_LOOP_MSG);
       return false;
     }
+    visualNoteUndo();
     remapCollapsedAfterMove(fromIdx, end, insert, end - fromIdx);
     state.editorActions = combined;
+    visualOnMove(fromIdx, end, insert);
     if (state.actionSel >= fromIdx && state.actionSel < end) {
       state.actionSel = insert + (state.actionSel - fromIdx);
     } else if (state.actionSel >= end) {
@@ -7130,9 +10353,27 @@
     applyRowNestTint(row, i, selected, covering);
   }
 
+  function refreshEditorBatchSelectionUi() {
+    const list = $("#actionList");
+    const rows = list ? list.querySelectorAll(".arow") : [];
+    if (state._actionListRendering || (!rows.length && (state.editorActions || []).length)) {
+      renderEditorActions(state.editorActions);
+      return;
+    }
+    const layout = precomputeRowLayout();
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      const i = row.dataset.i | 0;
+      patchBatchRowSelected(row, !!(state.batchSel && state.batchSel[i]), layout.cover[i]);
+    }
+    syncEditorActionCount();
+    syncMergeModeUi();
+  }
+
   function toggleEditorBatchRow(index) {
     if (!state.batchSel) state.batchSel = {};
     state.batchSel[index] = !state.batchSel[index];
+    state._batchAnchor = index;
     const list = $("#actionList");
     const row = list && list.querySelector(`.arow[data-i="${index}"]`);
     if (!row || state._actionListRendering) {
@@ -7145,25 +10386,48 @@
     syncMergeModeUi();
   }
 
+  function applyEditorBatchRowClick(index, ev) {
+    if (!state.batchSel) state.batchSel = {};
+    const n = (state.editorActions || []).length;
+    if (index < 0 || index >= n) return;
+    if (ev && ev.shiftKey && state._batchAnchor >= 0 && state._batchAnchor < n) {
+      const a = Math.min(state._batchAnchor, index);
+      const b = Math.max(state._batchAnchor, index);
+      for (let i = a; i <= b; i++) {
+        if (isRowVisibleInTree(i)) state.batchSel[i] = true;
+      }
+      refreshEditorBatchSelectionUi();
+      return;
+    }
+    toggleEditorBatchRow(index);
+  }
+
   function setEditorBatchSelectedAll(on) {
     state.batchSel = {};
     if (on) {
       for (let i = 0; i < state.editorActions.length; i++) state.batchSel[i] = true;
+      state._batchAnchor = Math.max(0, state.editorActions.length - 1);
+    } else {
+      state._batchAnchor = -1;
     }
-    const list = $("#actionList");
-    const rows = list ? list.querySelectorAll(".arow") : [];
-    if (state._actionListRendering || (!rows.length && state.editorActions.length)) {
-      renderEditorActions(state.editorActions);
-      return;
+    refreshEditorBatchSelectionUi();
+  }
+
+  function selectAllEditorActions() {
+    const n = (state.editorActions || []).length;
+    if (!n) return false;
+    if (isEditorVisualMode()) {
+      const idxs = [];
+      for (let i = 0; i < n; i++) idxs.push(i);
+      setEditorVisualSelection(idxs);
+      const V = window.QstVisualEditor;
+      if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
+      if (V && typeof V.render === "function") V.render();
+      return true;
     }
-    const layout = precomputeRowLayout();
-    for (let r = 0; r < rows.length; r++) {
-      const row = rows[r];
-      const i = row.dataset.i | 0;
-      patchBatchRowSelected(row, !!state.batchSel[i], layout.cover[i]);
-    }
-    syncEditorActionCount();
-    syncMergeModeUi();
+    if (!state.batchMode) enterEditorBatch(true);
+    setEditorBatchSelectedAll(true);
+    return true;
   }
 
   /** 进出批量：CSS 显隐勾选框，只清行选中态，不重绘整表 */
@@ -7217,6 +10481,16 @@
     if (!state.batchSel) state.batchSel = {};
     const list = $("#actionList");
     syncEditorActionCount();
+    if (window.QstVisualEditor && typeof QstVisualEditor.isVisual === "function" && QstVisualEditor.isVisual()) {
+      if (state.actionSel >= 0) {
+        if (!state.editDraft) loadEditDraftFromSelection();
+        if (state.editDraft) renderParamPanel(state.editDraft);
+      } else if (state.addPreview) renderParamPanel(state.addPreview);
+      else showAddTypePreview();
+      syncEdRemarkFromSelection();
+      visualActionsChanged();
+      return;
+    }
     if (!list) return;
     list.classList.toggle("is-batch", !!state.batchMode);
     const keepScroll =
@@ -7247,6 +10521,7 @@
       state._actionListRendering = false;
       state._actionListScrollTop = list.scrollTop | 0;
       if (document.body.classList.contains("progressive-editor")) endProgressiveLoad();
+      visualActionsChanged();
       return;
     }
     // 数据已写入：揭开动作区模糊；首开可跳过错开 reveal，避免「有计数无行」闪帧
@@ -7308,6 +10583,17 @@
     const finishRender = () => {
       if (onProgressive) endProgressiveLoad();
       ensureActionInsertLine(list);
+      if (state._keepParamPanel) {
+        syncEditorBatchChrome();
+        wireActionListDrag();
+        list.scrollTop = keepScroll;
+        state._actionListRendering = false;
+        state._actionListScrollTop = list.scrollTop | 0;
+        visualActionsChanged();
+        return;
+      }
+      state._suppressLiveCommit = true;
+      try {
       if (state.batchMode) {
         syncMergeModeUi();
       } else if (state.actionSel >= 0 && !state.addPreview) {
@@ -7318,12 +10604,16 @@
       } else {
         showAddTypePreview();
       }
+      } finally {
+        state._suppressLiveCommit = false;
+      }
       syncEdRemarkFromSelection();
       syncEditorBatchChrome();
       wireActionListDrag();
       list.scrollTop = keepScroll;
       state._actionListRendering = false;
       state._actionListScrollTop = list.scrollTop | 0;
+      visualActionsChanged();
     };
 
     const CHUNK = 48;
@@ -7367,11 +10657,23 @@
     };
     patchRow(prevSel, false);
     patchRow(nextSel, true);
+    const V = window.QstVisualEditor;
+    if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
     if (nextSel >= 0 && !state.addPreview) {
       if (!state.editDraft) loadEditDraftFromSelection();
-      renderParamPanel(state.editDraft);
+      state._suppressLiveCommit = true;
+      try {
+        renderParamPanel(state.editDraft);
+      } finally {
+        state._suppressLiveCommit = false;
+      }
     } else if (state.addPreview) {
-      renderParamPanel(state.addPreview);
+      state._suppressLiveCommit = true;
+      try {
+        renderParamPanel(state.addPreview);
+      } finally {
+        state._suppressLiveCommit = false;
+      }
     } else {
       showAddTypePreview();
     }
@@ -7394,6 +10696,7 @@
       if (ev.target.closest("[data-act='copy'], [data-act='del'], [data-act='expand-toggle'], .op-a, .chk, .exp-toggle")) return;
       const fromIdx = +row.dataset.i;
       if (!(fromIdx >= 0)) return;
+      flushPendingLiveEdit();
 
       const startX = ev.clientX;
       const startY = ev.clientY;
@@ -7471,10 +10774,12 @@
     state.collapsedContainers = {};
     state._actionListScrollTop = 0;
     state.editorPath = path || "";
+    state._editorOpenedNew = !state.editorPath;
     state.editorName = name || "";
     state.editorActions = [];
     state.editDraft = null;
-    state.addActionType = "moveMouse";
+    state.addActionType = firstVisibleActionType();
+    resetEditorHistory();
     document.body.classList.add("editor-open", "editor-booting");
     const app = $("#app");
     if (app) app.classList.add("editor-mode");
@@ -7491,10 +10796,12 @@
     const edName = $("#edName");
     if (edName) edName.textContent = state.editorName || "…";
     resetMergeUiChrome();
+    if (window.QstVisualEditor && typeof QstVisualEditor.reset === "function") {
+      QstVisualEditor.reset();
+    }
     const typeCombo = $("#edActionType");
     if (typeCombo) {
-      const cur = ACTION_TYPES.find((a) => a.v === "moveMouse") || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      syncEditorActionTypeCombo();
     }
     if (!state.addPreview) showAddTypePreview();
     syncEditorBatchChrome();
@@ -7516,18 +10823,27 @@
     } else {
       renderEditorActions([]);
       showAddTypePreview();
+      applyEditorDefaultView();
       document.body.classList.remove("editor-booting");
       endModeTransition("force");
     }
   }
 
   function captureEditorSnapshot() {
+    const scrub = (a) => {
+      const c = Object.assign({}, a);
+      delete c._vx;
+      delete c._vy;
+      return c;
+    };
     return JSON.stringify({
-      name: state.editorName || "",
+      name:
+        ($("#edName")?.textContent || "").trim() || state.editorName || "",
       mode: state.editorMode | 0,
       breakout: ($("#edBreakout")?.textContent || "").trim(),
-      windowMode: state.windowMode || {},
-      actions: state.editorActions || [],
+      windowMode: collectWindowModeForSave() || {},
+      actions: (state.editorActions || []).map(scrub),
+      visualLayout: collectVisualLayoutForSave() || null,
     });
   }
 
@@ -7537,11 +10853,224 @@
     return captureEditorSnapshot() !== state._editorSnapshot;
   }
 
+  const EDITOR_AUTOSAVE_MS = 10000;
+
+  function stopEditorAutosaveTimer() {
+    if (state._editorAutosaveTimer) {
+      clearInterval(state._editorAutosaveTimer);
+      state._editorAutosaveTimer = 0;
+    }
+  }
+
+  function startEditorAutosaveTimer() {
+    stopEditorAutosaveTimer();
+    if (!state.editor || !editorAutoSaveOn()) return;
+    state._editorAutosaveTimer = setInterval(() => {
+      if (!state.editor || !editorAutoSaveOn() || state._saveEditorBusy) return;
+      if (!isEditorDirty()) return;
+      saveEditorNow({ intent: "autosave", skipVisualConfirm: true });
+    }, EDITOR_AUTOSAVE_MS);
+  }
+
+  function collectEditorSavePayload() {
+    const name =
+      ($("#edName")?.textContent || "").trim() ||
+      state.editorName ||
+      "鼠标宏-" + Math.floor(Date.now() / 1000);
+    state.editorName = name;
+    const layout = collectVisualLayoutForSave();
+    return {
+      path: state.editorPath || "",
+      name,
+      breakoutTimeSeconds: parseFloat($("#edBreakout")?.textContent || "0") || 0,
+      mode: state.editorMode | 0,
+      windowMode: collectWindowModeForSave(),
+      actions: JSON.parse(JSON.stringify(state.editorActions || [])),
+      visualLayout: layout == null ? undefined : JSON.parse(JSON.stringify(layout)),
+    };
+  }
+
+  function revertPayloadWithCurrentPath() {
+    const payload = state._editorRevertPayload
+      ? JSON.parse(JSON.stringify(state._editorRevertPayload))
+      : collectEditorSavePayload();
+    payload.path = state.editorPath || payload.path || "";
+    return payload;
+  }
+
+  function ackAppClosing() {
+    if (window.qst && typeof qst.post === "function") qst.post({ type: "app.closingAck" });
+  }
+
+  function saveEditorNow(opts) {
+    opts = opts || {};
+    const intent = opts.intent || "manual";
+    if (state._saveEditorBusy) {
+      if (intent === "appclose") state._saveEditorQueuedClose = true;
+      else if (intent === "exit") state._saveEditorQueuedExit = true;
+      return false;
+    }
+    if (intent !== "revert") {
+      syncFormIntoSelectedBeforeSave();
+      if (!opts.skipValidate) {
+        if (!validateEditorBeforeSave()) {
+          if (intent === "autosave") return false;
+          if (intent === "appclose") ackAppClosing();
+          return false;
+        }
+      }
+      const wm = collectWindowModeForSave();
+      if (!validateWindowModeForSave(wm)) {
+        if (intent === "autosave") return false;
+        if (intent === "appclose") ackAppClosing();
+        return false;
+      }
+    }
+    if (!window.qst) {
+      if (intent === "revert" || intent === "exit") {
+        exitEditor(true);
+        return true;
+      }
+      if (intent !== "autosave") toast("无桥接环境");
+      if (intent === "appclose") ackAppClosing();
+      return false;
+    }
+    const doSave = () => {
+      state._saveEditorIntent = intent;
+      state._saveEditorBusy = true;
+      const payload =
+        intent === "revert" ? revertPayloadWithCurrentPath() : collectEditorSavePayload();
+      qst.saveEditor(payload);
+    };
+    const V = window.QstVisualEditor;
+    if (
+      !opts.skipVisualConfirm &&
+      intent !== "autosave" &&
+      intent !== "revert" &&
+      V &&
+      typeof V.isVisual === "function" &&
+      V.isVisual() &&
+      typeof V.commitGraphToList === "function"
+    ) {
+      V.commitGraphToList(function (ok) {
+        if (ok) doSave();
+        else if (intent === "appclose") ackAppClosing();
+      }, "与初始节点无关的流程会直接删除，确定保存？");
+      return true;
+    }
+    doSave();
+    return true;
+  }
+
+  function afterEditorSaveSuccess(msg, intent) {
+    if (Array.isArray(msg.scripts)) state.macros = msg.scripts;
+    if (msg.path) {
+      state.editorPath = msg.path;
+      if (state._editorRevertPayload && !state._editorRevertPayload.path)
+        state._editorRevertPayload.path = msg.path;
+    }
+    state._editorSnapshot = captureEditorSnapshot();
+    if (intent === "autosave") {
+      if (state._saveEditorQueuedClose) {
+        state._saveEditorQueuedClose = false;
+        saveEditorNow({
+          intent: "appclose",
+          skipVisualConfirm: true,
+          skipValidate: true,
+        });
+        return;
+      }
+      if (state._saveEditorQueuedExit) {
+        state._saveEditorQueuedExit = false;
+        if (isEditorDirty()) {
+          saveEditorNow({ intent: "exit", skipVisualConfirm: true });
+        } else {
+          finishLeaveEditor();
+        }
+      }
+      return;
+    }
+    if (intent === "appclose") {
+      ackAppClosing();
+      return;
+    }
+    if (intent === "revert") {
+      finishLeaveEditor();
+      if (window.qst) qst.listScripts();
+      return;
+    }
+    toast("已保存");
+    finishLeaveEditor();
+    renderLists();
+    updateCtas();
+    if (msg.path) selectPathInLists(msg.path, "macro");
+    else syncEngineHomeSelection();
+    if (window.qst) qst.listScripts();
+  }
+
+  function finishLeaveEditor() {
+    exitEditor(true);
+    renderLists();
+    updateCtas();
+    syncEngineHomeSelection();
+  }
+
+  function discardNewEditorFileThenLeave() {
+    const path = state.editorPath || "";
+    if (path && window.qst && typeof qst.deleteScript === "function") {
+      state._quietDeleteScript = true;
+      qst.deleteScript(path);
+    }
+    finishLeaveEditor();
+    if (window.qst) qst.listScripts();
+  }
+
+  function requestLeaveEditor(reason) {
+    if (!state.editor) return;
+    if (reason === "cancel") {
+      if (editorAutoSaveOn()) {
+        if (state._editorOpenedNew) {
+          discardNewEditorFileThenLeave();
+          return;
+        }
+        saveEditorNow({ intent: "revert", skipVisualConfirm: true, skipValidate: true });
+        return;
+      }
+      exitEditor();
+      return;
+    }
+    if (editorAutoSaveOn()) {
+      if (!isEditorDirty() && state.editorPath) {
+        exitEditor(true);
+        return;
+      }
+      saveEditorNow({
+        intent: reason === "appclose" ? "appclose" : "exit",
+        skipVisualConfirm: true,
+        skipValidate: reason === "appclose",
+      });
+      return;
+    }
+    if (reason === "appclose") {
+      ackAppClosing();
+      return;
+    }
+    exitEditor();
+  }
+
   function exitEditor(force) {
     if (!force && isEditorDirty()) {
       askConfirm("有未保存的改动，确定离开编辑器？", () => exitEditor(true));
       return;
     }
+    stopEditorAutosaveTimer();
+    document.body.classList.remove("editor-no-modify", "editor-autosave");
+    state._editorRevertPayload = null;
+    state._editorOpenedNew = false;
+    state._saveEditorIntent = "";
+    state._saveEditorBusy = false;
+    state._saveEditorQueuedClose = false;
+    state._saveEditorQueuedExit = false;
     const ed = $("#editor");
     if (ed) ed.style.pointerEvents = "";
     endProgressiveLoad(true);
@@ -7559,6 +11088,7 @@
     state.collapsedContainers = {};
     state.addActionType = "moveMouse";
     state.editorActions = [];
+    resetEditorHistory();
     resetMergeUiChrome();
     // 调试缓存随编辑器关闭清理干净
     state.editorBreakpoints = {};
@@ -7574,7 +11104,7 @@
     const typeCombo = $("#edActionType");
     if (typeCombo) {
       const cur = ACTION_TYPES.find((a) => a.v === state.addActionType) || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      setActionTypeComboText(cur.t);
     }
     const remark = $("#edRemark");
     if (remark) remark.textContent = "";
@@ -7642,33 +11172,46 @@
       toast("已有宏/调试在运行");
       return;
     }
-    if (index < 0 || index >= state.editorActions.length) index = 0;
-    // 保存前把右栏草稿同步进选中动作，调试用的就是当前所见内容
-    syncFormIntoSelectedBeforeSave();
-    const bp = Object.keys(state.editorBreakpoints)
-      .map((k) => Number(k))
-      .filter(
-        (k) => Number.isFinite(k) && k >= 0 && k < state.editorActions.length
-      )
-      .sort((a, b) => a - b);
-    const name =
-      ($("#edName")?.textContent || "").trim() || state.editorName || "调试";
-    state.debugging = true;
-    state.debugPaused = false;
-    state.debugStepMode = !!stepMode;
-    qst.debugScript({
-      path: state.editorPath || "",
-      name,
-      actions: state.editorActions,
-      startIndex: index | 0,
-      mode: stepMode ? "step" : "run",
-      // 与保存/热键回放同一套窗口模式；勿再用空配置走前台 SendInput（调试假绿）
-      editorMode: state.editorMode | 0,
-      windowMode: collectWindowModeForSave(),
-      breakpoints: bp,
-      hotkeyVk: (state.debugHotkey && state.debugHotkey.vk) | 0,
-      hotkeyModifiers: (state.debugHotkey && state.debugHotkey.modifiers) | 0,
-    });
+    const go = (idx) => {
+      if (idx < 0 || idx >= state.editorActions.length) idx = 0;
+      syncFormIntoSelectedBeforeSave();
+      const bp = Object.keys(state.editorBreakpoints)
+        .map((k) => Number(k))
+        .filter(
+          (k) => Number.isFinite(k) && k >= 0 && k < state.editorActions.length
+        )
+        .sort((a, b) => a - b);
+      const name =
+        ($("#edName")?.textContent || "").trim() || state.editorName || "调试";
+      state.debugging = true;
+      state.debugPaused = false;
+      state.debugStepMode = !!stepMode;
+      qst.debugScript({
+        path: state.editorPath || "",
+        name,
+        actions: state.editorActions,
+        startIndex: idx | 0,
+        mode: stepMode ? "step" : "run",
+        editorMode: state.editorMode | 0,
+        windowMode: collectWindowModeForSave(),
+        breakpoints: bp,
+        hotkeyVk: (state.debugHotkey && state.debugHotkey.vk) | 0,
+        hotkeyModifiers: (state.debugHotkey && state.debugHotkey.modifiers) | 0,
+      });
+    };
+    const V = window.QstVisualEditor;
+    if (V && typeof V.isVisual === "function" && V.isVisual() && typeof V.commitGraphToList === "function") {
+      const act =
+        index >= 0 && index < state.editorActions.length ? state.editorActions[index] : null;
+      V.commitGraphToList(function (ok) {
+        if (!ok) return;
+        let idx = act ? state.editorActions.indexOf(act) : 0;
+        if (idx < 0) idx = 0;
+        go(idx);
+      }, "与初始节点无关的流程会直接删除，确定调试？");
+      return;
+    }
+    go(index);
   }
 
   function itemPath(item) {
@@ -7683,7 +11226,7 @@
   }
 
   /** 统一文本输入（替代 window.prompt），复用 ov-rename */
-  function askInput(title, defaultVal, onOk) {
+  function askInput(title, defaultVal, onOk, opts) {
     const titleEl = $("#ov-rename .dlg-title");
     if (titleEl) {
       titleEl.innerHTML =
@@ -7697,6 +11240,7 @@
     // 必须先 openOv（内部 closeAllOv 会清 askInput），再写入 pending 状态
     openOv("rename");
     state._askInputOk = typeof onOk === "function" ? onOk : null;
+    state._askInputAllowEmpty = !!(opts && opts.allowEmpty);
     state.pendingKind = "askInput";
     state.pendingPath = "";
     if (inp) {
@@ -7948,13 +11492,14 @@
     setCropSelCss(sel, r.left, r.top, r.width, r.height);
   }
 
-  function openWebFindImageCrop(a) {
-    if (!a || !a.imagePath) {
+  function openWebFindImageCrop(a, pathOverride) {
+    const path = String(pathOverride || (a && a.imagePath) || "").trim();
+    if (!a || !path) {
       toast("请先截图或选择图片");
       return;
     }
     _cropPending = {
-      imagePath: a.imagePath,
+      imagePath: path,
       offsetX: a.offsetX | 0,
       offsetY: a.offsetY | 0,
       followUpSaveVar: (a.findImageFollowUp | 0) === 2 ? 1 : 0,
@@ -7971,7 +11516,7 @@
     }
     const reqId = "crop_" + Date.now();
     state._pendingCropReqId = reqId;
-    qst.readImageDataUrl(a.imagePath, reqId);
+    qst.readImageDataUrl(path, reqId);
   }
 
   function confirmWebFindImageCrop() {
@@ -8609,7 +12154,14 @@
   function showPopup(anchor, items, onPick, opts) {
     opts = opts || {};
     if (popupEl && popupAnchor === anchor) {
-      hidePopup();
+      if (opts.updateItems) {
+        refreshPopupItems(items, opts.selectedIndex);
+        return;
+      }
+      if (!opts.forceOpen) {
+        hidePopup();
+        return;
+      }
       return;
     }
     hidePopup();
@@ -8633,6 +12185,7 @@
     popupEl = document.createElement("div");
     popupEl.className = "popup-menu show" + (opts.preferUp ? " popup-up" : "");
     popupEl.setAttribute("role", "listbox");
+    popupEl._qstPickItems = items;
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
     const spaceBelow = Math.max(0, vh - rect.bottom - 8);
@@ -8659,12 +12212,13 @@
     popupEl.innerHTML = items
       .map((it, idx) => {
         const on = idx === selectedIdx ? " on" : "";
+        const dis = it && it.disabled ? " disabled" : "";
         if (it.d) {
-          return `<div class="mi wide${on}" data-i="${idx}" role="option"><span>${esc(it.t || it.v || "")}</span><span class="d">${esc(
+          return `<div class="mi wide${on}${dis}" data-i="${idx}" role="option"><span>${esc(it.t || it.v || "")}</span><span class="d">${esc(
             it.d
           )}</span></div>`;
         }
-        return `<div class="mi${on}" data-i="${idx}" role="option">${esc(it.t || it.v || "")}</div>`;
+        return `<div class="mi${on}${dis}" data-i="${idx}" role="option">${esc(it.t || it.v || "")}</div>`;
       })
       .join("");
     // 挂到当前 overlay 内，避免 body 级菜单在 WebView2 里被全屏遮罩抢走点击
@@ -8740,9 +12294,16 @@
       e.stopPropagation();
       if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
       if (picked) return;
-      picked = true;
       const idx = +item.dataset.i;
-      const chosen = items[idx];
+      const liveItems = (popupEl && popupEl._qstPickItems) || items;
+      const chosen = liveItems[idx];
+      if (chosen && chosen.disabled) return;
+      picked = true;
+      const fromParam =
+        popupAnchor &&
+        typeof popupAnchor.closest === "function" &&
+        $("#paramPanel") &&
+        $("#paramPanel").contains(popupAnchor);
       hidePopup();
       if (chosen && typeof onPick === "function") {
         try {
@@ -8750,6 +12311,7 @@
         } catch (err) {
           console.error("popup onPick", err);
         }
+        if (fromParam) liveCommitSelectedIfEnabled();
       }
     };
     // 捕获阶段选中，避免 document mousedown(capture) 先关掉菜单
@@ -8780,11 +12342,156 @@
     };
   }
 
+  function refreshPopupItems(items, selectedIndex) {
+    if (!popupEl || !items) return;
+    const selectedIdx = selectedIndex == null ? -1 : selectedIndex | 0;
+    popupEl.innerHTML = items
+      .map((it, idx) => {
+        const on = idx === selectedIdx ? " on" : "";
+        const dis = it && it.disabled ? " disabled" : "";
+        if (it.d) {
+          return `<div class="mi wide${on}${dis}" data-i="${idx}" role="option"><span>${esc(it.t || it.v || "")}</span><span class="d">${esc(
+            it.d
+          )}</span></div>`;
+        }
+        return `<div class="mi${on}${dis}" data-i="${idx}" role="option">${esc(it.t || it.v || "")}</div>`;
+      })
+      .join("");
+    popupEl._qstItems = items;
+    popupEl._qstPickItems = items;
+    if (selectedIdx >= 0) {
+      const selEl = popupEl.querySelector(`.mi[data-i="${selectedIdx}"]`);
+      if (selEl) {
+        const maxScroll = Math.max(0, popupEl.scrollHeight - popupEl.clientHeight);
+        popupEl.scrollTop = Math.min(Math.max(0, selEl.offsetTop - 2), maxScroll);
+      }
+    }
+  }
+
+  function actionTypeFilterQuery() {
+    const raw = actionTypeComboText().trim();
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const curType = (shown && shown.type) || state.addActionType;
+    const cur =
+      ACTION_TYPES.find((a) => a.v === curType) ||
+      pickerActionTypes(curType).find((a) => a.v === curType);
+    if (cur && raw === cur.t) return "";
+    return raw;
+  }
+
+  function filteredActionTypes(query) {
+    const mergeLock = typeof mergePickerLocked === "function" && mergePickerLocked();
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const curType = (shown && shown.type) || state.addActionType;
+    const raw = String(query || "").trim();
+    const searchAll = editorSearchAllActionsOn() && !!raw;
+    const types = mergeLock
+      ? (searchAll
+          ? pickerActionTypes(curType, { includeHidden: true }).filter((a) =>
+              a && (a.v === "loop" || a.v === "defineBlock" || a.v === "watchImage" || a.v === "if" || a.v === "else")
+            )
+          : pickerMergeContainerTypes())
+      : pickerActionTypes(curType, { includeHidden: searchAll });
+    const pool = types.length
+      ? types
+      : mergeLock
+        ? MERGE_CONTAINER_TYPES.slice()
+        : ACTION_TYPES.slice();
+    if (!raw) return pool;
+    const q = raw.toLowerCase();
+    return pool.filter((a) => {
+      if (!a) return false;
+      if (String(a.t || "").indexOf(raw) >= 0) return true;
+      if (String(a.t || "").toLowerCase().indexOf(q) >= 0) return true;
+      if (String(a.v || "").toLowerCase().indexOf(q) >= 0) return true;
+      const py = ACTION_PY[a.v] || "";
+      return py.toLowerCase().indexOf(q) >= 0;
+    });
+  }
+
+  function applyPickedActionType(it) {
+    if (!it || !it.v) return;
+    const mergeOn = typeof isMergeEligible === "function" && isMergeEligible();
+    state.addActionType = it.v;
+    setActionTypeComboText(it.t);
+    hidePopup();
+    if (mergeOn) {
+      showAddTypePreview();
+      if (typeof syncMergeModeUi === "function") syncMergeModeUi();
+      return;
+    }
+    if (
+      state.actionSel >= 0 &&
+      state.editorActions[state.actionSel] &&
+      !state.addPreview
+    ) {
+      if (!state.editDraft) loadEditDraftFromSelection();
+      if (state.editDraft) {
+        readParamPanelInto(state.editDraft);
+        const remark = ($("#edRemark")?.textContent || "").trim() || state.editDraft.remark;
+        const fresh = defaultAction(it.v, remark);
+        const merged = Object.assign({}, fresh, state.editDraft);
+        merged.type = it.v;
+        merged.name = typeLabel(it.v);
+        merged.remark = remark;
+        if (it.v === "mouseClick" || it.v === "mouseDown" || it.v === "mouseUp") {
+          merged.x = 0;
+          merged.y = 0;
+          merged.nx = 0;
+          merged.ny = 0;
+          merged.randomX = 0;
+          merged.randomY = 0;
+          merged.moveFromVar = 0;
+        }
+        delete merged._preview;
+        state.editDraft = merged;
+        state.addPreview = null;
+        renderParamPanel(state.editDraft);
+        if (liveModifyEnabled()) liveCommitSelectedIfEnabled();
+        return;
+      }
+    }
+    showAddTypePreview();
+  }
+
+  function openActionTypeMenu(opts) {
+    opts = opts || {};
+    const box = actionTypeComboBox();
+    if (!box) return;
+    if (opts.toggle && popupEl && popupAnchor === box) {
+      hidePopup();
+      return;
+    }
+    const types = filteredActionTypes(actionTypeFilterQuery());
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const curType = (shown && shown.type) || state.addActionType;
+    const sel = types.findIndex((a) => a.v === curType);
+    const items = types.length
+      ? types
+      : [{ t: "无匹配动作", v: "", disabled: true }];
+    if (popupEl && popupAnchor === box) {
+      refreshPopupItems(items, sel >= 0 ? sel : 0);
+      popupEl._qstPickItems = items;
+      return;
+    }
+    showPopup(
+      box,
+      items,
+      (picked) => applyPickedActionType(picked),
+      {
+        minRows: 10,
+        selectedIndex: sel >= 0 ? sel : 0,
+        forceOpen: true,
+      }
+    );
+  }
+
   function bindDynamic(root) {
     bindPlaybackSpeedSlider();
     $$(".chk", root || document).forEach((c) => {
       if (c._bound) return;
       if (c.closest("#optList")) return;
+      if (c.closest("#edActionCatalog")) return;
       if (c.id === "schedGlobalDisable") return;
       c._bound = true;
       c.addEventListener("click", (e) => {
@@ -8795,7 +12502,7 @@
         if (i) i.textContent = "";
       });
     });
-    $$(".sched-resume-pair", root || document).forEach((p) => {
+    $$(".sched-resume-pair, .sound-chk-pair", root || document).forEach((p) => {
       if (p._boundResume) return;
       p._boundResume = true;
       p.addEventListener("click", (e) => {
@@ -8824,6 +12531,11 @@
   function onBridge(ev) {
     const msg = ev.detail || {};
     const type = msg.type || "";
+    if (type === "app.closing") {
+      if (state.editor) requestLeaveEditor("appclose");
+      else ackAppClosing();
+      return;
+    }
     if (type === "listScripts.result" && msg.ok) {
       state.macros = Array.isArray(msg.scripts) ? msg.scripts : [];
       rematchListSelectionByPath();
@@ -8881,6 +12593,13 @@
         } else {
           hideDebugFloat();
         }
+      }
+      const other = msg.other || {};
+      if (other.showFloatBall != null) {
+        setChk($("#setFloatBall"), !!other.showFloatBall);
+        if (!state.settings) state.settings = {};
+        if (!state.settings.other) state.settings.other = {};
+        state.settings.other.showFloatBall = !!other.showFloatBall;
       }
       return;
     }
@@ -8978,14 +12697,18 @@
       if (msg.rebootPending) {
         label = "检测到旧版安装留下的开机任务，请点「卸载并修复」，不要再重启进 BIOS";
         if (bar) bar.style.width = "40%";
+      } else if (msg.driverNeedsUpdate) {
+        label = "已安装但权限过旧，请重新安装（点「重新安装」更新驱动 ACL）";
+        if (btn) btn.textContent = "重新安装";
+        if (bar) bar.style.width = "70%";
       } else if (msg.driverReady) {
         label = "虚拟 HID 驱动已安装，设备可用";
         if (btn) btn.textContent = "重新安装";
         if (bar) bar.style.width = "100%";
         const root = $("#vhidSteps");
         if (root) $$(".driver-step", root).forEach((s) => s.classList.add("done"));
-      } else if (!msg.installScriptPresent) {
-        label = "未找到驱动安装文件，请使用完整发版包";
+      } else if (!msg.packagePresent) {
+        label = "本地尚无内核驱动文件。点「开始安装」将先从官网下载驱动包，再弹出 UAC";
       } else if (msg.lastExitCode === 3) {
         label = "上次安装因驱动签名不被当前系统信任而拒绝，未改启动配置";
       } else if (msg.lastExitCode === 5) {
@@ -9097,16 +12820,27 @@
         if ($("#setFixedY")) $("#setFixedY").textContent = String(pick.y | 0);
         setChk($("#setFixedCoordEn"), true);
         toast(`定点 ${pick.x | 0},${pick.y | 0}`);
-      } else if (mode === "coordinates" || pending === "coord") {
+      } else if (mode === "coordinates" || pending === "coord" || pending === "coordEnd") {
         const a = editorParamAction();
         if (a) {
-          a.x = pick.x | 0;
-          a.y = pick.y | 0;
+          if (pending === "coordEnd") {
+            a.endX = pick.x | 0;
+            a.endY = pick.y | 0;
+          } else {
+            a.x = pick.x | 0;
+            a.y = pick.y | 0;
+          }
           renderParamPanel(a);
         } else {
-          toast("请先选中或添加「移动鼠标」动作");
+          toast("请先选中或添加动作");
         }
-        if (a) toast(`坐标 ${a.x},${a.y}`);
+        if (a) {
+          toast(
+            pending === "coordEnd"
+              ? `终点 ${a.endX},${a.endY}`
+              : `坐标 ${a.x},${a.y}`
+          );
+        }
       } else if (mode === "programPath" || pending === "program") {
         const a = editorParamAction();
         if (a && pick.processPath) {
@@ -9117,12 +12851,22 @@
         } else {
           toast(pick.processPath || "未获取路径");
         }
-      } else if (mode === "windowTarget" || pending === "windowClass" || pending === "window") {
-        applyWindowPickToEditor(pick, pending);
-        fillPickOverlay(pick);
-        // 指定窗口类：打开浮层细调；准星绑定：已写入编辑器字段，仅在无路径时再开浮层
-        if (pending === "windowClass" || !pick.processPath) openOv("pick");
-        else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
+      } else if (mode === "windowTarget" || pending === "windowClass" || pending === "window"
+          || pending === "nestedWm" || pending === "nestedWmClass") {
+        if (pending === "nestedWm" || pending === "nestedWmClass") {
+          applyWindowPickToNestedAction(pick, pending);
+          fillPickOverlay(pick);
+          if (pending === "nestedWmClass" || !pick.processPath) {
+            state._nestedWmPick = true;
+            openOv("pick");
+          } else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
+        } else {
+          applyWindowPickToEditor(pick, pending);
+          fillPickOverlay(pick);
+          // 指定窗口类：打开浮层细调；准星绑定：已写入编辑器字段，仅在无路径时再开浮层
+          if (pending === "windowClass" || !pick.processPath) openOv("pick");
+          else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
+        }
       } else {
         fillPickOverlay(pick);
         openOv("pick");
@@ -9154,6 +12898,19 @@
         state._pendingBrowse = "";
         return;
       }
+      if (state._pendingBrowse === "nestedWmTarget") {
+        const a = editorParamAction();
+        if (a && (a.type === "runMacro" || a.type === "mousePlayback") && msg.path) {
+          readParamPanelInto(a);
+          const wm = ensureNestedWindowMode(a);
+          wm.targetExePath = msg.path;
+          a.nestedWindowMode = wm;
+          renderParamPanel(a);
+          toast("已选择程序路径");
+        }
+        state._pendingBrowse = "";
+        return;
+      }
       // 助手窗开着时 browse 回包也会到主壳：无本页待处理选择则忽略，避免写进编辑器路径
       if (!state._pendingBrowse) return;
       const a = editorParamAction();
@@ -9169,17 +12926,21 @@
       if (!msg.ok) {
         if (msg.detail !== "cancelled") toast(msg.detail || "截图取消");
         state._pendingAiTemplateShot = false;
+        state._pendingMmSlot = -1;
         return;
       }
       const a = editorParamAction();
       if (a) {
         const path = msg.imagePath || msg.resolvedPath || "";
         if (state._pendingAiTemplateShot) a.aiTargetImagePath = path;
+        else if (a.type === "multiMatch")
+          applyMmImagePath(a, path, Number.isInteger(state._pendingMmSlot) ? state._pendingMmSlot : 0);
         else a.imagePath = path;
         renderParamPanel(a);
         toast("模板已保存");
       }
       state._pendingAiTemplateShot = false;
+      state._pendingMmSlot = -1;
       return;
     }
     if (type === "readImageDataUrl.result") {
@@ -9336,6 +13097,12 @@
       }
       return;
     }
+    if (type === "uiScale.apply") {
+      if (msg.scale != null) applyUiLayoutScale(msg.scale);
+      else if (msg.qstU != null) applyUiLayoutScale(Number(msg.qstU) / QST_U_BASE);
+      applyShellScale();
+      return;
+    }
     if (type === "window.clientSize") {
       state._clientW = msg.clientW | 0;
       state._clientH = msg.clientH | 0;
@@ -9352,10 +13119,11 @@
           msg.dpi
         );
       }
+      const expectW = Math.round(SHELL_CLIENT.editor.w * currentLayoutScale());
       if (
         state.editor &&
         (state._clientW | 0) > 0 &&
-        (state._clientW | 0) < 1600 &&
+        (state._clientW | 0) < expectW - 48 &&
         window.qst &&
         !state._resizeRetry
       ) {
@@ -9528,12 +13296,21 @@
       return;
     }
     if (type === "pickImageFile.result") {
-      if (!msg.ok) return;
+      if (!msg.ok) {
+        state._pendingMmSlot = -1;
+        state._pendingImageField = "";
+        return;
+      }
       const a = editorParamAction();
-      if (a && state._pendingImageField) {
+      const mmSlot = Number.isInteger(state._pendingMmSlot) ? state._pendingMmSlot : -1;
+      if (a && a.type === "multiMatch" && mmSlot >= 0) {
+        applyMmImagePath(a, msg.path || "", mmSlot);
+        renderParamPanel(a);
+      } else if (a && state._pendingImageField) {
         a[state._pendingImageField] = msg.path || "";
         renderParamPanel(a);
       }
+      state._pendingMmSlot = -1;
       state._pendingImageField = "";
       return;
     }
@@ -9544,11 +13321,18 @@
       }
       const a = editorParamAction();
       if (a && !msg.unchanged) {
-        if (msg.imagePath) a.imagePath = msg.imagePath;
+        if (a.type === "multiMatch" && msg.imagePath)
+          applyMmImagePath(
+            a,
+            msg.imagePath,
+            Number.isInteger(state._pendingMmSlot) ? state._pendingMmSlot : 0
+          );
+        else if (msg.imagePath) a.imagePath = msg.imagePath;
         if (msg.offsetX != null) a.offsetX = msg.offsetX;
         if (msg.offsetY != null) a.offsetY = msg.offsetY;
         renderParamPanel(a);
       }
+      state._pendingMmSlot = -1;
       if ($("#ov-crop")?.classList.contains("show")) {
         closeAllOv();
         if (msg.unchanged) toast("未裁切（全图）");
@@ -9558,14 +13342,38 @@
     }
     if (type === "findImageMatch.result") {
       if (!msg.ok) {
+        state._pendingDragOffset = "";
+        state._pendingImageRegionPick = false;
         if (msg.detail && msg.detail !== "cancelled") toast(msg.detail);
         return;
       }
       const a = editorParamAction();
       if (a) {
-        if (msg.mode === "offset") {
-          a.offsetX = msg.offsetX | 0;
-          a.offsetY = msg.offsetY | 0;
+        if (msg.mode === "offset" || msg.mode === "offsetBySize") {
+          const pending = state._pendingDragOffset;
+          state._pendingDragOffset = "";
+          if (
+            (a.type === "mouseDrag" || a.type === "getColor" || a.type === "colorMatch") &&
+            pending
+          ) {
+            const ox = msg.offsetX | 0;
+            const oy = msg.offsetY | 0;
+            if (a.type === "mouseDrag" && pending === "end") {
+              a.endX = ox;
+              a.endY = oy;
+              toast(`终点偏移 ${ox},${oy}`);
+            } else {
+              a.x = ox;
+              a.y = oy;
+              toast(
+                a.type === "mouseDrag" ? `起点偏移 ${ox},${oy}` : `相对图偏移 ${ox},${oy}`
+              );
+            }
+          } else {
+            a.offsetX = msg.offsetX | 0;
+            a.offsetY = msg.offsetY | 0;
+            toast(`偏移 ${a.offsetX},${a.offsetY}`);
+          }
         } else if (
           (msg.mode === "region" || msg.mode === "regionBySize") &&
           msg.regionValid
@@ -9588,13 +13396,22 @@
         }
         if (msg.mode === "test") {
           if (msg.found) {
+            const n = msg.matchCount != null ? msg.matchCount | 0 : 0;
             const score =
               msg.bestScore != null ? Math.round(Number(msg.bestScore) || 0) : null;
-            toast(
-              score != null
-                ? `测试：已找到匹配（最高 ${score}%）`
-                : "测试：已找到匹配"
-            );
+            if (n > 1) {
+              toast(
+                score != null
+                  ? `测试：找到 ${n} 处（最高 ${score}%）`
+                  : `测试：找到 ${n} 处`
+              );
+            } else {
+              toast(
+                score != null
+                  ? `测试：已找到匹配（最高 ${score}%）`
+                  : "测试：已找到匹配"
+              );
+            }
           } else {
             toast("测试：未找到匹配");
           }
@@ -9625,6 +13442,24 @@
         renderParamPanel(a);
       }
       state._pendingRegionTarget = "";
+      return;
+    }
+    if (type === "pickScreenDrag.result" || type === "pickTemplateDrag.result") {
+      if (!msg.ok) {
+        if (msg.detail !== "cancelled") toast(msg.detail || "选取取消");
+        return;
+      }
+      const a = editorParamAction();
+      if (!a) return;
+      a.x = msg.x1 | 0;
+      a.y = msg.y1 | 0;
+      a.endX = msg.x2 | 0;
+      a.endY = msg.y2 | 0;
+      let dur = Number(msg.duration);
+      if (!Number.isFinite(dur) || dur < 0.05) dur = 0.05;
+      a.duration = dur;
+      renderParamPanel(a);
+      toast("已写入拖拽 " + (a.x | 0) + "," + (a.y | 0) + "→" + (a.endX | 0) + "," + (a.endY | 0));
       return;
     }
     if (type === "saveSettings.result") {
@@ -9805,19 +13640,29 @@
       state.actionSel = -1;
       state.addPreview = null;
       state.editDraft = null;
-      state.addActionType = "moveMouse";
+      state.addActionType = firstVisibleActionType();
       const typeCombo = $("#edActionType");
       if (typeCombo) {
-        const cur = ACTION_TYPES.find((x) => x.v === "moveMouse") || ACTION_TYPES[0];
-        typeCombo.textContent = cur.t;
+        syncEditorActionTypeCombo();
       }
       // 首屏一次性写入，跳过错开 reveal（避免「有计数无行」闪帧）
       state._skipOpenReveal = true;
       renderEditorActions(loaded);
       state._skipOpenReveal = false;
+      if (window.QstVisualEditor && typeof QstVisualEditor.applyLayout === "function" && script.visualLayout) {
+        QstVisualEditor.applyLayout(script.visualLayout);
+      }
+      applyEditorDefaultView();
       syncDebugHotkeyUi();
       showAddTypePreview();
+      resetEditorHistory({ keepClipboard: true });
       state._editorSnapshot = captureEditorSnapshot();
+      try {
+        state._editorRevertPayload = collectEditorSavePayload();
+      } catch (_) {
+        state._editorRevertPayload = null;
+      }
+      syncEditorGeneralChrome();
       // 内容已齐：再放大窗体（cloak 中），setMode.result 里揭开
       state._pendingModeReveal = "editor";
       if (window.qst) qst.setMode("editor");
@@ -9830,19 +13675,15 @@
       return;
     }
     if (type === "saveEditor.result") {
+      const intent = state._saveEditorIntent || "manual";
+      state._saveEditorIntent = "";
+      state._saveEditorBusy = false;
       if (!msg.ok) {
-        toast(msg.detail || "保存失败");
+        if (intent !== "autosave") toast(msg.detail || "保存失败");
+        if (intent === "appclose") ackAppClosing();
         return;
       }
-      toast("已保存");
-      if (Array.isArray(msg.scripts)) state.macros = msg.scripts;
-      state._editorSnapshot = captureEditorSnapshot();
-      exitEditor(true);
-      renderLists();
-      updateCtas();
-      if (msg.path) selectPathInLists(msg.path, "macro");
-      else syncEngineHomeSelection();
-      if (window.qst) qst.listScripts();
+      afterEditorSaveSuccess(msg, intent);
       return;
     }
     if (
@@ -9870,7 +13711,10 @@
       } else {
         syncEngineHomeSelection();
       }
-      if (type === "deleteScript.result") toast("已删除");
+      if (type === "deleteScript.result") {
+        if (state._quietDeleteScript) state._quietDeleteScript = false;
+        else toast("已删除");
+      }
       if (type === "renameScript.result") toast("已重命名");
       if (type === "setScriptHotkey.result") {
         toast(
@@ -9908,13 +13752,12 @@
       if (!msg.ok) {
         if (msg.needInstall) {
           askConfirm("OCR 未就绪，是否打开安装/修复？", () => {
-            state._ocrRepair = false;
             if ($("#ocrStatus"))
-              $("#ocrStatus").textContent = "已就绪，点击安装开始下载安装…";
+              $("#ocrStatus").textContent = "已就绪，点击下方按钮开始安装或修复…";
             if ($("#ocrBar")) $("#ocrBar").style.width = "0%";
             if ($("#btnOcrInstall")) {
               $("#btnOcrInstall").disabled = false;
-              $("#btnOcrInstall").textContent = "安装插件";
+              $("#btnOcrInstall").textContent = "安装 / 修复";
             }
             openOv("ocr");
           });
@@ -10200,6 +14043,7 @@
       const id = String(msg.id || "");
       const name = String(msg.name || "").trim();
       if (!id || !name) return;
+      if (/\[错误\]|\[提示\]|API\s*请求失败/.test(name)) return;
       const tab = findAgentTabById(id) || activeAgentTab();
       if (tab && (!tab.id || String(tab.id) === id)) {
         tab.id = id;
@@ -10294,7 +14138,7 @@
             /已取消|cancelled/i.test(String(msg.detail || "")) ||
             /已取消|cancelled/i.test(String(msg.reply || ""));
           state._agentCancelRequested = false;
-          toast(cancelled ? "已取消" : msg.detail || "发送失败");
+          toast(cancelled ? "已取消" : msg.detail || msg.reply || "发送失败");
           return;
         }
         if (tab.key === state.agentTabKey) {
@@ -10341,7 +14185,7 @@
         state.agentBusy = false;
         syncAgentSendBtn();
         if (!msg.ok) {
-          toast(msg.detail || "发送失败");
+          toast(msg.detail || msg.reply || "发送失败");
           return;
         }
       }
@@ -10542,12 +14386,10 @@
       if (track) track.classList.remove("indeterminate");
       if (bar) bar.style.width = msg.ok ? "100%" : "0%";
       const btn = $("#btnOcrInstall");
-      const repairBtn = $("#btnOcrRepair");
       if (btn) {
         btn.disabled = false;
-        btn.textContent = msg.ok ? "完成" : state._ocrRepair ? "修复/更新" : "安装插件";
+        btn.textContent = msg.ok ? "完成" : "安装 / 修复";
       }
-      if (repairBtn) repairBtn.disabled = false;
       if (msg.ok) {
         if ($("#ocrStatus")) $("#ocrStatus").textContent = msg.detail || "安装成功";
         toast("OCR 插件已安装");
@@ -10744,7 +14586,7 @@
       '<div class="th"><span>任务名称</span><span>类型</span><span>文件</span><span>频率</span><span>时间</span><span>状态</span><span>操作</span></div>';
     const rows = state.schedTasks
       .map((t) => {
-        const kind = (t.kind | 0) === 0 ? "鼠标录制" : "鼠标宏";
+        const kind = (t.kind | 0) === 0 ? "键鼠录制" : "鼠标宏";
         const freq = FREQ_LABELS[t.frequency | 0] || "自定义";
         const st = (t.status | 0) === 0 ? "启用" : "禁用";
         return `<div class="tr" data-id="${esc(t.id || "")}">
@@ -11274,10 +15116,14 @@
 
   function init() {
     window.addEventListener("qst:bridge", onBridge);
-    window.addEventListener("qst:open-settings", () => openOv("settings"));
-    window.addEventListener("qst:exit-editor", () => exitEditor());
+    window.addEventListener("qst:open-settings", () => {
+      if (state.editor) openEditorSettings();
+      else openOv("settings");
+    });
+    window.addEventListener("qst:exit-editor", () => requestLeaveEditor("x"));
     installPlainTextPaste();
     bindTypingHotkeyMute();
+    bindEditorActionShortcuts();
     // 极简 / 专业双模式：默认极简；切换仅在设置「保存」后生效
     if (window.ProMode) state.uiMode = window.ProMode.mode();
     applyUiMode({ center: true });
@@ -11304,8 +15150,7 @@
 
     const typeCombo = $("#edActionType");
     if (typeCombo) {
-      const cur = ACTION_TYPES.find((a) => a.v === state.addActionType) || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      syncEditorActionTypeCombo();
     }
 
     $$("#homeNav .tab").forEach((t) =>
@@ -11315,6 +15160,10 @@
     $$("#settingsTabs .st-tab").forEach((t) =>
       t.addEventListener("click", () => setSettingsTab(t.dataset.stab))
     );
+    $$("#editorSettingsTabs .st-tab").forEach((t) =>
+      t.addEventListener("click", () => setEditorSettingsTab(t.dataset.edtab))
+    );
+    bindEditorActionCatalog();
 
     document.addEventListener("click", (e) => {
       const open = e.target.closest("[data-open]");
@@ -12034,72 +15883,121 @@
       if (window.qst) qst.exportScript(itemPath(r));
     });
 
-    $("#edActionType")?.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const anchor = e.currentTarget;
-      const mergeOn = isMergeEligible();
-      const types = mergeOn ? MERGE_CONTAINER_TYPES : ACTION_TYPES;
-      const shown = editorParamAction();
-      const curType = (shown && shown.type) || state.addActionType;
-      const sel = types.findIndex((a) => a.v === curType);
-      showPopup(
-        anchor,
-        types,
-        (it) => {
-          if (!it) return;
-          state.addActionType = it.v;
-          anchor.textContent = it.t;
-          if (mergeOn) {
-            showAddTypePreview();
-            return;
+    const bindActionTypeCombo = () => {
+      const input = $("#edActionType");
+      const caret = $("#edActionTypeCaret");
+      const box = $("#edActionTypeBox");
+      if (input && !input._qstTypeBound) {
+        input._qstTypeBound = true;
+        input.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openActionTypeMenu();
+        });
+        input.addEventListener("focus", () => {
+          const cur = ACTION_TYPES.find((a) => a.v === state.addActionType);
+          if (cur && actionTypeComboText().trim() === cur.t) {
+            try {
+              input.select();
+            } catch (err) {}
           }
-          // 选中动作时：切换类型 = 转换当前动作草稿（对齐原生 ActionFromForm +
-          // ModifySelected）。未选中时保持“添加新动作”预览语义。
-          if (
-            state.actionSel >= 0 &&
-            state.editorActions[state.actionSel] &&
-            !state.addPreview
-          ) {
-            if (!state.editDraft) loadEditDraftFromSelection();
-            if (state.editDraft) {
-              readParamPanelInto(state.editDraft);
-              const remark = ($("#edRemark")?.textContent || "").trim() || state.editDraft.remark;
-              const fresh = defaultAction(it.v, remark);
-              const merged = Object.assign({}, fresh, state.editDraft);
-              merged.type = it.v;
-              merged.name = typeLabel(it.v);
-              merged.remark = remark;
-              delete merged._preview;
-              state.editDraft = merged;
-              state.addPreview = null;
-              renderParamPanel(state.editDraft);
-              return;
-            }
+          openActionTypeMenu();
+        });
+        input.addEventListener("input", () => {
+          openActionTypeMenu();
+        });
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            hidePopup();
+            syncEditorActionTypeCombo();
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            const types = filteredActionTypes(actionTypeFilterQuery());
+            if (types[0] && types[0].v) applyPickedActionType(types[0]);
+            else hidePopup();
+          } else if (e.key === "ArrowDown") {
+            e.preventDefault();
+            openActionTypeMenu();
           }
-          showAddTypePreview();
-        },
-        { minRows: mergeOn ? 4 : 10, selectedIndex: sel >= 0 ? sel : 0 }
-      );
-    });
+        });
+      }
+      if (caret && !caret._qstTypeBound) {
+        caret._qstTypeBound = true;
+        caret.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+        caret.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openActionTypeMenu({ toggle: true });
+        });
+      }
+      if (box && !box._qstTypeBound) {
+        box._qstTypeBound = true;
+        box.addEventListener("click", (e) => {
+          if (e.target === caret || (caret && caret.contains(e.target))) return;
+          if (e.target === input) return;
+          e.stopPropagation();
+          openActionTypeMenu();
+        });
+      }
+    };
+    bindActionTypeCombo();
 
-    // 右键动作：断点 / 从这里开始调试（单步或运行）
+    // 右键动作：剪切/复制/粘贴 + 断点 / 从这里开始调试
     $("#actionList")?.addEventListener("contextmenu", (e) => {
-      if (state.batchMode || state.debugging) return;
+      if (state.debugging) return;
+      flushPendingLiveEdit();
+      if (state.batchMode) {
+        e.preventDefault();
+        e.stopPropagation();
+        const row = e.target.closest(".arow");
+        const i = row ? +row.dataset.i : -1;
+        const priorSel = selectedBatchIndices();
+        prepareBatchContextSelection(i);
+        showEditorBatchContextMenu(e.clientX, e.clientY, {
+          clickIndex: i,
+          priorSel: priorSel,
+        });
+        return;
+      }
       const row = e.target.closest(".arow");
-      if (!row) return;
       e.preventDefault();
       e.stopPropagation();
-      const i = +row.dataset.i;
-      const isBp = editorBreakpointAt(i);
-      const items = [
-        { t: isBp ? "取消断点" : "设为断点（执行后结束调试）", v: "bp" },
-        { t: "从这里开始调试（单步）", v: "step" },
-        { t: "从这里开始调试（运行）", v: "run" },
-      ];
-      const act = state.editorActions[i];
-      if (act && isDisassemblableType(act.type)) {
-        items.push({ t: "拆解为动作", v: "disassemble" });
+      const hasClip = editorHasClipboard();
+      const i = row ? +row.dataset.i : -1;
+      const items = [];
+      if (row && i >= 0) {
+        items.push(
+          { t: "剪切 (Ctrl+X)", v: "cut" },
+          { t: "复制 (Ctrl+C)", v: "copy" },
+          { t: "粘贴 (Ctrl+V)", v: "paste", disabled: !hasClip }
+        );
+        const isBp = editorBreakpointAt(i);
+        items.push(
+          { t: isBp ? "取消断点" : "设为断点（执行后结束调试）", v: "bp" },
+          { t: "从这里开始调试（单步）", v: "step" },
+          { t: "从这里开始调试（运行）", v: "run" },
+          { t: "转到可视化", v: "visual" }
+        );
+        const act = state.editorActions[i];
+        if (editorDisableModifyOn() && !isEditorVisualMode()) {
+          items.push(
+            { t: "插入到此项前", v: "insertBefore" },
+            { t: "插入到此项后", v: "insertAfter" }
+          );
+          if (act && isSubtreeContainerType(act.type)) {
+            items.push({ t: "添加为子节点", v: "insertChild" });
+          }
+        }
+        if (act && isDisassemblableType(act.type)) {
+          items.push({ t: "拆解为动作", v: "disassemble" });
+        }
+      } else if (hasClip) {
+        items.push({ t: "粘贴 (Ctrl+V)", v: "paste" });
+      } else {
+        return;
       }
       requestAnimationFrame(() => {
         showPopup(
@@ -12107,9 +16005,27 @@
           items,
           (it) => {
             if (!it) return;
-            if (it.v === "bp") toggleEditorBreakpoint(i);
+            if (it.v === "cut") cutSelectedEditorActions({ index: i });
+            else if (it.v === "copy") copySelectedEditorActions({ index: i });
+            else if (it.v === "paste") {
+              if (i >= 0) pasteEditorClipboardAfterSelection({ index: i });
+              else if (!(state.editorActions || []).length) pasteEditorClipboardAfterSelection();
+              else pasteEditorClipboardAfterSelection({ index: state.editorActions.length - 1 });
+            } else if (it.v === "bp") toggleEditorBreakpoint(i);
             else if (it.v === "step") startDebugFrom(i, true);
             else if (it.v === "run") startDebugFrom(i, false);
+            else if (it.v === "visual") {
+              const V = window.QstVisualEditor;
+              if (V && typeof V.enterVisual === "function") V.enterVisual(i);
+              else if (V && typeof V.setMode === "function") {
+                V.setMode(true);
+                if (typeof V.selectAction === "function") {
+                  requestAnimationFrame(() => V.selectAction(i));
+                }
+              }
+            } else if (it.v === "insertBefore") insertAndSelectFormAction(i, "before");
+            else if (it.v === "insertAfter") insertAndSelectFormAction(i, "after");
+            else if (it.v === "insertChild") insertAndSelectFormAction(i, "asChild");
             else if (it.v === "disassemble") disassembleEditorAction(i);
           },
           { preferUp: true }
@@ -12128,16 +16044,23 @@
       const i = +row.dataset.i;
       const act = e.target.closest("[data-act]")?.dataset.act;
       if (act === "expand-toggle") {
+        flushPendingLiveEdit();
         toggleContainerExpand(i);
         renderEditorActions(state.editorActions);
         return;
       }
+      if (!state.debugging && (e.ctrlKey || e.metaKey) && !state.batchMode && act !== "copy" && act !== "del") {
+        enterEditorBatch(true);
+        toggleEditorBatchRow(i);
+        return;
+      }
       if (state.batchMode) {
-        if (act === "batch-toggle" || !act) toggleEditorBatchRow(i);
+        if (act === "batch-toggle" || !act) applyEditorBatchRowClick(i, e);
         return;
       }
       if (act === "batch-toggle") return;
       if (act === "copy") {
+        flushPendingLiveEdit();
         const src = state.editorActions[i];
         if (!src) return;
         e.preventDefault();
@@ -12155,12 +16078,17 @@
             if (!it) return;
             const copy = JSON.parse(JSON.stringify(src));
             copy.name = typeLabel(copy.type);
+            if (copy.type === "defineBlock") {
+              copy.blockName = uniquifyPastedBlockName(copy.blockName, {});
+            }
             let pos = state.editorActions.length;
             if (it.v === "first") pos = 0;
             else if (it.v === "before") pos = i;
             else if (it.v === "after") pos = subtreeEnd(i);
             else pos = state.editorActions.length;
+            visualNoteUndo();
             state.editorActions.splice(pos, 0, copy);
+            visualOnInsert(pos);
             shiftCollapsedAfterInsert(pos);
             if (isSubtreeContainerType(copy.type)) delete state.collapsedContainers[pos];
             state.actionSel = pos;
@@ -12171,19 +16099,15 @@
         return;
       }
       if (act === "del") {
-        const end = subtreeEnd(i);
-        state.editorActions.splice(i, end - i);
-        remapCollapsedAfterDelete(i, end);
-        if (state.actionSel >= i && state.actionSel < end) {
-          state.actionSel = -1;
-          state.editDraft = null;
-        } else if (state.actionSel >= end) state.actionSel -= end - i;
+        if (i !== state.actionSel) flushPendingLiveEdit();
+        deleteSubtreeAt(i);
         state.addPreview = null;
         renderEditorActions(state.editorActions);
         if (state.actionSel < 0) showAddTypePreview();
         return;
       }
-      // 对齐 exe：再点已选中行 → 取消选中并恢复添加草稿（未点修改的改动丢弃）
+      flushPendingLiveEdit();
+      // 再点已选中行：写回后取消选中，恢复添加预览
       if (state.actionSel === i) {
         const prev = state.actionSel;
         state.actionSel = -1;
@@ -12197,31 +16121,21 @@
         state._skipReadback = false;
         return;
       }
-      const prevSel = state.actionSel;
-      state.actionSel = i;
-      state.addPreview = null;
-      loadEditDraftFromSelection();
-      {
-        const a = state.editDraft;
-        if (a && a.type) {
-          state.addActionType = a.type;
-          const typeCombo = $("#edActionType");
-          const cur = ACTION_TYPES.find((x) => x.v === a.type);
-          if (typeCombo && cur) typeCombo.textContent = cur.t;
-        }
-      }
-      state._skipReadback = true;
-      updateEditorSelectionUi(prevSel, i);
-      state._skipReadback = false;
+      selectEditorAction(i);
     });
 
     $("#btnEdAdd")?.addEventListener("click", (e) => {
+      if (e.button !== 0) return;
+      if (shouldBatchInsertOnAdd()) {
+        commitBatchInsertAtSelection("after");
+        return;
+      }
       if (state.batchMode && isMergeEligible()) {
         const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
         const type =
           (state.addPreview && state.addPreview.type) || state.addActionType;
-        if (type === "defineBlock" || (plan && plan.contiguous)) {
-          runMergeWithPlacement(type === "defineBlock" ? "first" : "inplace");
+        if (type === "defineBlock" || type === "watchImage" || (plan && plan.contiguous)) {
+          runMergeWithPlacement(type === "defineBlock" || type === "watchImage" ? "first" : "inplace");
           return;
         }
         const point = { clientX: e.clientX, clientY: e.clientY };
@@ -12244,99 +16158,78 @@
         return;
       }
 
-      const remark = ($("#edRemark")?.textContent || "").trim();
-      let a;
-      if (state.addPreview && state.addPreview.type === state.addActionType) {
-        readParamPanelInto(state.addPreview);
-        a = Object.assign({}, state.addPreview);
-        delete a._preview;
-        a.remark = remark;
-        a.name = typeLabel(a.type);
-      } else if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
-        // 对齐原生 ActionFromForm：选中列表项时，添加的是右栏「动作详情」当前内容
-        // （含尚未点「修改」的改动），而不是重置成默认空动作
-        if (!state.editDraft) loadEditDraftFromSelection();
-        if (state.editDraft) {
-          readParamPanelInto(state.editDraft);
-          a = Object.assign({}, state.editDraft);
-          delete a._preview;
-          a.remark = remark;
-          a.name = typeLabel(a.type);
-        } else {
-          a = defaultAction(state.addActionType, remark);
-        }
-      } else {
-        a = defaultAction(state.addActionType, remark);
-      }
-
-      const finishInsert = (pos, indent) => {
-        if (!insertEditorAction(a, pos, indent)) return;
-        state.actionSel = -1;
-        state.batchMode = false;
-        state.addPreview = null;
-        renderEditorActions(state.editorActions);
-        // 对齐原生 TryInsertActionFromForm：添加成功后清空备注栏，避免下一条动作继承
-        const remarkEl = $("#edRemark");
-        if (remarkEl) remarkEl.textContent = "";
-        showAddTypePreview();
-      };
-
-      // DefineBlock：强制列表顶部 indent=0
-      if (a.type === "defineBlock") {
-        finishInsert(0, 0);
+      flushPendingLiveEdit();
+      const a = currentAddActionFromForm();
+      if (a.type === "defineBlock" || a.type === "watchImage") {
+        finishAddInsert(a, 0, 0);
         return;
       }
-
-      // 无选中：直接末尾，顶层缩进（勿因上一条是容器而变成其子节点）
       if (state.actionSel < 0 || state.actionSel >= state.editorActions.length) {
-        finishInsert(state.editorActions.length, 0);
+        finishAddInsert(a, state.editorActions.length, 0);
         return;
       }
-
       const sel = state.actionSel;
       const selAct = state.editorActions[sel];
-      const items = [
-        { t: "添加到最后", v: "last" },
-        { t: "插入到最前", v: "first" },
-        { t: "插入到选择项前", v: "before" },
-        { t: "插入到选择项后", v: "after" },
-      ];
-      if (isSubtreeContainerType(selAct.type)) {
-        items.push({ t: "添加为子节点", v: "asChild" });
+      applyAddPlacement({ v: "after" }, a, sel, selAct, (pos, indent) => finishAddInsert(a, pos, indent));
+    });
+    $("#btnEdAdd")?.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (shouldBatchInsertOnAdd()) {
+        const point = { clientX: e.clientX, clientY: e.clientY };
+        requestAnimationFrame(() => {
+          showPopup(
+            point,
+            [
+              { t: "插入到选择项前", v: "before" },
+              { t: "插入到选择项后", v: "after" },
+            ],
+            (it) => {
+              if (!it) return;
+              commitBatchInsertAtSelection(it.v);
+            },
+            { preferUp: true }
+          );
+        });
+        return;
       }
+      flushPendingLiveEdit();
+      const a = currentAddActionFromForm();
+      const hasSel = state.actionSel >= 0 && state.actionSel < state.editorActions.length;
+      const sel = hasSel ? state.actionSel : -1;
+      const selAct = hasSel ? state.editorActions[sel] : null;
+      const items = addPlacementMenuItems(hasSel, selAct, a, true);
       const point = { clientX: e.clientX, clientY: e.clientY };
       requestAnimationFrame(() => {
         showPopup(point, items, (it) => {
-          if (!it) return;
-          let pos = state.editorActions.length;
-          let indent = -1;
-          if (it.v === "first") {
-            pos = 0;
-          } else if (it.v === "before") {
-            pos = sel;
-            indent = selAct.indent | 0;
-          } else if (it.v === "after") {
-            pos = subtreeEnd(sel);
-            indent = selAct.indent | 0;
-          } else if (it.v === "asChild") {
-            pos = subtreeEnd(sel);
-            indent = (selAct.indent | 0) + 1;
-          } else if (it.v === "last") {
-            pos = state.editorActions.length;
-            indent = 0;
+          if (a.type === "defineBlock" || a.type === "watchImage") {
+            if (it && it.v !== "betweenKey") {
+              finishAddInsert(a, 0, 0);
+              return;
+            }
           }
-          finishInsert(pos, indent);
+          applyAddPlacement(it, a, sel, selAct, (pos, indent) => finishAddInsert(a, pos, indent));
         }, { preferUp: true });
       });
     });
     $("#btnEdRemark")?.addEventListener("click", () => {
+      if (state.batchMode) {
+        if (editorDisableModifyOn()) return;
+        commitModifyBatch();
+        return;
+      }
       commitModifySelected();
     });
+    $("#edRemark")?.addEventListener("blur", () => liveCommitSelectedIfEnabled());
     $("#btnEdClear")?.addEventListener("click", () => {
-      askConfirm("确定清空动作列表？", () => {
-        state.editorActions = [];
-        state.actionSel = -1;
-        state.batchSel = {};
+        askConfirm("确定清空动作列表？", () => {
+          visualNoteUndo();
+          const n = state.editorActions.length;
+          state.editorActions = [];
+          if (n) visualOnDelete(0, n);
+          state.actionSel = -1;
+          state.batchMode = false;
+          state.batchSel = {};
         renderEditorActions(state.editorActions);
         closeAllOv();
       });
@@ -12377,7 +16270,17 @@
         const copies = idx.map((i) =>
           JSON.parse(JSON.stringify(state.editorActions[i]))
         );
-        state.editorActions.push(...copies);
+        const usedNames = {};
+        visualNoteUndo();
+        const start = state.editorActions.length;
+        copies.forEach((a, i) => {
+          delete a._preview;
+          a.name = typeLabel(a.type);
+          if (a.type === "defineBlock") a.blockName = uniquifyPastedBlockName(a.blockName, usedNames);
+          state.editorActions.push(a);
+          visualOnInsert(start + i);
+          shiftCollapsedAfterInsert(start + i);
+        });
         state.batchSel = {};
         renderEditorActions(state.editorActions);
         toast("已复制 " + copies.length + " 条到列表末尾");
@@ -12405,18 +16308,21 @@
       const doc = ($("#pickDoc")?.textContent || "").trim();
       const cls = ($("#pickClass")?.textContent || "").trim();
       const title = ($("#pickTitle")?.textContent || "").trim();
-      applyWindowPickToEditor(
-        {
-          processPath: path,
-          documentPath: doc,
-          windowClassName: cls,
-          windowTitle: title,
-          childWindowClassName: ($("#pickChild")?.textContent || "").trim(),
-          x: parseInt($("#pickX")?.textContent || "0", 10) || 0,
-          y: parseInt($("#pickY")?.textContent || "0", 10) || 0,
-        },
-        "windowClass"
-      );
+      const payload = {
+        processPath: path,
+        documentPath: doc,
+        windowClassName: cls,
+        windowTitle: title,
+        childWindowClassName: ($("#pickChild")?.textContent || "").trim(),
+        x: parseInt($("#pickX")?.textContent || "0", 10) || 0,
+        y: parseInt($("#pickY")?.textContent || "0", 10) || 0,
+      };
+      if (state._nestedWmPick) {
+        applyWindowPickToNestedAction(payload, "nestedWmClass");
+        state._nestedWmPick = false;
+      } else {
+        applyWindowPickToEditor(payload, "windowClass");
+      }
       closeAllOv();
       toast("已填入目标窗口");
     });
@@ -12470,31 +16376,14 @@
       closeAllOv();
     });
 
-    $("#btnBackHome")?.addEventListener("click", () => exitEditor());
-    $("#btnEdCancel")?.addEventListener("click", () => exitEditor());
+    $("#btnBackHome")?.addEventListener("click", () => requestLeaveEditor("x"));
+    $("#btnEdCancel")?.addEventListener("click", () => requestLeaveEditor("cancel"));
     $("#btnDebugHotkey")?.addEventListener("click", () => openDebugHotkeyCapture());
     $("#btnEdSave")?.addEventListener("click", () => {
-      syncFormIntoSelectedBeforeSave();
-      if (!validateEditorBeforeSave()) return;
-      const wm = collectWindowModeForSave();
-      if (!validateWindowModeForSave(wm)) return;
-      const name =
-        ($("#edName")?.textContent || "").trim() || state.editorName || ("鼠标宏-" + Math.floor(Date.now() / 1000));
-      if (!window.qst) {
-        toast("无桥接环境");
-        return;
-      }
-      qst.saveEditor({
-        path: state.editorPath || "",
-        name,
-        breakoutTimeSeconds: parseFloat(($("#edBreakout")?.textContent || "0")) || 0,
-        mode: state.editorMode | 0,
-        windowMode: wm,
-        actions: state.editorActions,
-      });
+      saveEditorNow({ intent: "manual" });
     });
     $$("[data-exit-editor]").forEach((b) =>
-      b.addEventListener("click", () => exitEditor())
+      b.addEventListener("click", () => requestLeaveEditor("x"))
     );
 
     $("#btnRenameOk")?.addEventListener("click", () => {
@@ -12504,7 +16393,9 @@
         state._askInputOk = null;
         state.pendingKind = null;
         closeAllOv();
-        if (!name) {
+        const allowEmpty = !!state._askInputAllowEmpty;
+        state._askInputAllowEmpty = false;
+        if (!name && !allowEmpty) {
           toast("名称无效");
           return;
         }
@@ -12620,9 +16511,14 @@
     // 脚本/启停热键：Web #ov-hotkey + LL（不再走原生 HotkeyCapture）
     $("#ov-settings .dlg-foot .btn.primary")?.addEventListener("click", () => {
       if (!window.qst) return;
+      if (readUiScaleFactorInput(true) == null) {
+        toast("界面缩放倍率必须为正数");
+        return;
+      }
       const wantDebug = !!$("#setDebugWin")?.classList.contains("on");
       state._announceSettingsSave = true;
       const payload = collectSettings();
+      if (!payload) return;
       payload.uiMode = readUiModeDraft();
       qst.saveSettings(payload);
       commitUiModeFromDraft();
@@ -12634,6 +16530,41 @@
         qst.showDebugWindow(); // ReloadSettings → HideDebugWindow
       }
       closeAllOv();
+    });
+    $("#btnSaveEditorSettings")?.addEventListener("click", () => {
+      persistEditorSettings(collectEditorSettingsPartial(), true);
+      closeAllOv();
+    });
+    $("#btnRestoreEditorDefaults")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      askConfirm("确定将鼠标宏编辑设置恢复为默认？", () => {
+        const defaults = {
+          editorDefaultView: "code",
+          visualLoopWrap: true,
+          visualBlockCallWires: true,
+          visualIfWrap: true,
+          visualBlockWrap: true,
+          visualWatchWrap: true,
+          visualJumpWires: true,
+          visualShowGrid: true,
+          visualShowCardId: true,
+          editorActionOrder: [],
+          editorHiddenActions: [],
+          editorCatalogPreset: "all",
+          editorCustomActionOrder: [],
+          editorCustomHiddenActions: [],
+          editorSearchAllActions: false,
+          editorHideFixedVars: false,
+          editorHideCoordVars: false,
+          editorMultiResultPlaceholderOnly: false,
+          editorDisableModifyButton: false,
+          editorAutoSaveOnExit: false,
+          editorEnableBatchInsert: false,
+        };
+        fillEditorSettingsForm(defaults);
+        persistEditorSettings(defaults, true);
+        closeAllOv();
+      });
     });
     $("#btnRestoreDefaults")?.addEventListener("click", (e) => {
       e.preventDefault();
@@ -12854,9 +16785,15 @@
         toast(err);
         return;
       }
+      const compressOn = $("#optCompressRadios .radio.on");
+      const waitCalculation = (compressOn && compressOn.dataset.merge) || "first";
+      const waitVal = parseFloat($("#optCompressWait")?.textContent || "0.1") || 0.1;
       applyOptimizePayload({
         scheme: 3,
-        compressWait: parseFloat($("#optCompressWait")?.textContent || "0.1") || 0.1,
+        waitCalculation,
+        mergeWaitValue: waitVal,
+        waitValue: waitVal,
+        compressWait: waitVal,
         distanceThreshold: parseFloat($("#optCompressDist")?.textContent || "1") || 1,
       });
     });
@@ -12876,6 +16813,14 @@
       $$("#optMergeRadios .radio").forEach((x) => x.classList.remove("on"));
       r.classList.add("on");
       const custom = $("#optMergeCustom");
+      if (custom) custom.style.display = r.dataset.merge === "fixed" ? "" : "none";
+    });
+    $("#optCompressRadios")?.addEventListener("click", (e) => {
+      const r = e.target.closest(".radio");
+      if (!r) return;
+      $$("#optCompressRadios .radio").forEach((x) => x.classList.remove("on"));
+      r.classList.add("on");
+      const custom = $("#optCompressCustom");
       if (custom) custom.style.display = r.dataset.merge === "fixed" ? "" : "none";
     });
     $("#optList")?.addEventListener("click", (e) => {
@@ -13026,14 +16971,11 @@
         return;
       }
       if (state._ocrBusy) return;
-      const repair = !!state._ocrRepair;
       state._ocrBusy = true;
       if ($("#ocrDlgTitle"))
-        $("#ocrDlgTitle").childNodes[0].textContent = repair
-          ? "键鼠工坊-插件修复 "
-          : "键鼠工坊-插件安装 ";
+        $("#ocrDlgTitle").childNodes[0].textContent = "键鼠工坊-插件安装 ";
       if ($("#ocrStatus"))
-        $("#ocrStatus").textContent = repair ? "正在准备修复…" : "正在准备安装…";
+        $("#ocrStatus").textContent = "正在准备安装…";
       const bar = $("#ocrBar");
       const track = bar && bar.parentElement;
       if (track) track.classList.remove("indeterminate");
@@ -13042,18 +16984,7 @@
         btn.disabled = true;
         btn.textContent = "安装中...";
       }
-      if ($("#btnOcrRepair")) $("#btnOcrRepair").disabled = true;
-      qst.installOcr(repair);
-    });
-    $("#btnOcrRepair")?.addEventListener("click", () => {
-      if (state._ocrBusy) return;
-      state._ocrRepair = true;
-      if ($("#ocrDlgTitle"))
-        $("#ocrDlgTitle").childNodes[0].textContent = "键鼠工坊-插件修复 ";
-      if ($("#btnOcrInstall")) $("#btnOcrInstall").textContent = "修复/更新";
-      if ($("#ocrStatus"))
-        $("#ocrStatus").textContent = "已就绪，点击下方按钮开始修复/更新…";
-      $("#btnOcrInstall")?.click();
+      qst.installOcr(true);
     });
 
     // 调试窗勾选：产品路径 Web #debugFloat（引擎推送 debugWindow.*）
@@ -13139,6 +17070,12 @@
     $$("#setSchedPrioRadios .radio").forEach((r) => {
       r.addEventListener("click", () => {
         $$("#setSchedPrioRadios .radio").forEach((x) => x.classList.remove("on"));
+        r.classList.add("on");
+      });
+    });
+    $$("#edSetViewRadios .radio").forEach((r) => {
+      r.addEventListener("click", () => {
+        $$("#edSetViewRadios .radio").forEach((x) => x.classList.remove("on"));
         r.classList.add("on");
       });
     });
@@ -13300,5 +17237,37 @@
     openAgentSession,
     openSchedEditor,
     toggleSchedTaskStatus,
+    ACTION_TYPES,
+    displayActionName,
+    clampIndent,
+    subtreeEnd,
+    isSubtreeContainerType,
+    insertEditorAction,
+    moveActionSubtree,
+    deleteSubtreeAt,
+    defaultAction,
+    renderEditorActions,
+    renderParamPanel,
+    loadEditDraftFromSelection,
+    updateEditorSelectionUi,
+    selectEditorAction,
+    startDebugFrom,
+    showPopup,
+    showAddTypePreview,
+    enterEditorBatch,
+    setEditorVisualSelection,
+    mergeVisualSelection,
+    commitModifySelected,
+    flushPendingLiveEdit,
+    saveEditorNow,
+    editorAutoSaveOn,
+    syncEdRemarkFromSelection,
+    editorParamAction,
+    readParamPanelInto,
+    pushEditorHistory,
+    undoEditorHistory,
+    redoEditorHistory,
+    revertLastEditorHistory,
+    discardEditorHistory,
   };
 })();

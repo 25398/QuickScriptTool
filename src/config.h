@@ -279,6 +279,8 @@ constexpr UINT WM_APP_DEFER_EXT_BRIDGE = WM_APP + 41;
 constexpr UINT WM_APP_HOTKEY_WATCHDOG = WM_APP + 42;
 /// 当前脚本结束后启动排队的定时任务（避免在 OnRunDone 里重入 StartActionsWorker）
 constexpr UINT WM_APP_RUN_SCHEDULED_PENDING = WM_APP + 43;
+/// 定时任务 Tick：隐藏引擎窗的 WM_TIMER 会被 coalescing，改由 Timer Queue 投递此消息。
+constexpr UINT WM_APP_SCHEDULED_TICK = WM_APP + 44;
 constexpr UINT WM_SETTINGS_EXTERNAL_SYNC = WM_APP + 19;
 
 // ── 主题感知颜色（运行时随 CurrentTheme() 变化） ──────────────────

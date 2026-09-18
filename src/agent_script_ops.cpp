@@ -65,6 +65,24 @@ bool ValidateScriptActionCompleteness(const ScriptAction& a, std::wstring& err) 
             return false;
         }
         break;
+    case ActionType::MultiMatch:
+        if (a.imagePaths.empty() && Trim(a.imagePath).empty()) {
+            err = L"multiMatch 缺少 imagePaths（至少一张模板图）";
+            return false;
+        }
+        break;
+    case ActionType::WatchImage:
+        if (Trim(a.imagePath).empty()) {
+            err = L"watchImage 缺少 imagePath（监视用图）";
+            return false;
+        }
+        break;
+    case ActionType::VarCompute:
+        if (Trim(a.computeCode).empty()) {
+            err = L"varCompute 缺少 computeCode";
+            return false;
+        }
+        break;
     case ActionType::TextRecognition:
         if (Trim(a.imagePath).empty() && Trim(a.ocrSearchText).empty()) {
             err = L"textRecognition 需要 imagePath 或 ocrSearchText 至少一项";
@@ -137,26 +155,17 @@ FindResult FindScriptFile(const std::wstring& fileName, const std::wstring& dirH
     if (!IsSafeFileName(fileName))
         return {L"[错误] 文件名包含非法字符。", false};
 
+    std::wstring found;
     const std::wstring hintDir = DirFromHint(dirHint);
     if (!hintDir.empty()) {
-        const std::wstring path = hintDir + L"\\" + fileName;
-        const DWORD attr = GetFileAttributesW(path.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
-            return {path, true};
+        if (FindScriptJsonByFileName(hintDir, fileName, found))
+            return {found, true};
         const std::wstring label = (dirHint == L"recordings") ? L"键鼠录制目录" : L"脚本宏目录";
         return {L"[错误] 在" + label + L"中未找到文件：" + fileName, false};
     }
 
-    std::wstring path = ScriptsDir() + L"\\" + fileName;
-    DWORD attr = GetFileAttributesW(path.c_str());
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
-        return {path, true};
-
-    path = RecordingsDir() + L"\\" + fileName;
-    attr = GetFileAttributesW(path.c_str());
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
-        return {path, true};
-
+    if (ResolveLibraryScriptPath(fileName, found))
+        return {found, true};
     return {L"[错误] 文件不存在：" + fileName + L"（已检查脚本目录和录制目录）", false};
 }
 
@@ -498,7 +507,8 @@ AgentScriptOpResult AgentOptimizeScriptFile(const AgentOptimizeOptions& options)
     const bool compress = options.mergeMode == L"compressPath" || options.mergeMode == L"compress";
     if (compress) {
         applied = recopt::CompressAllKeySplit(
-            data.actions, options.distanceThreshold, options.compressWait);
+            data.actions, options.distanceThreshold,
+            ToUtf8(options.waitCalculation), options.mergeWaitValue);
     } else {
         applied = recopt::MergeAllKeySplit(
             data.actions, ToUtf8(options.waitCalculation), options.mergeWaitValue);
@@ -586,6 +596,7 @@ AgentScriptOpResult AgentDeleteScriptFile(const std::wstring& fileName,
     DeleteUnreferencedImagesOfScript(found.path);
     if (!DeleteFileW(found.path.c_str()))
         return FailMsg(L"[错误] 删除失败：" + fileName);
+    DeleteVisualLayoutCache(found.path);
     undo.Success();
 
     const std::wstring label = (dirHint == L"recordings") ? L"键鼠录制" : L"鼠标宏";
@@ -693,8 +704,9 @@ std::wstring FindColorText(const ScriptAction& a) {
     } else if (a.findImageFollowUp == 1) {
         s += L" → 移动";
     } else {
-        s += L" → 保存匹配度到" + a.matchVarName;
+        s += L" → 保存到变量" + a.matchVarName;
     }
+    if (a.imageLocate) s += L"（找图定位）";
     return s;
 }
 
@@ -732,6 +744,26 @@ std::wstring FindImageActionText(const ScriptAction& a) {
     return s;
 }
 
+std::wstring MultiMatchActionText(const ScriptAction& a) {
+    std::wstring s = a.multiMatchMode == 1 ? L"多图匹配(一图多处)" : L"多图匹配(多图择一)";
+    s += L" " + std::to_wstring(static_cast<int>(a.imagePaths.empty() ? (a.imagePath.empty() ? 0 : 1)
+        : a.imagePaths.size())) + L"张";
+    if (!a.searchFullScreen) {
+        s += L" 区域" + CoordText(a, a.searchX1, a.searchY1)
+            + L"-" + CoordText(a, a.searchX2, a.searchY2);
+    }
+    if (a.findImageFollowUp == 0) {
+        s += a.multiMatchMode == 1 ? L" → 依次点击" : L" → 点击";
+    } else if (a.findImageFollowUp == 1) {
+        s += L" → 移动";
+    } else {
+        s += L" → 保存匹配度到" + a.matchVarName;
+    }
+    if (a.findTimeExpr != L"0" && !a.findTimeExpr.empty())
+        s += L" 限时" + TrimShort(a.findTimeExpr, 16) + L"s";
+    return s;
+}
+
 std::wstring DescribeOneAction(const ScriptAction& a) {
     switch (a.type) {
     case ActionType::MoveMouse:
@@ -754,6 +786,14 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
     case ActionType::MouseClick:
         return HoldPrefix(a) + ButtonText(a.button) + L"点击 "
             + CoordOrExpr(a, a.x, a.y) + RepeatBrief(a);
+    case ActionType::MouseDrag: {
+        std::wstring s = HoldPrefix(a) + ButtonText(a.button) + L"拖拽 ";
+        if (a.imageLocate) s += L"相对图";
+        s += CoordText(a, a.x, a.y) + L"→" + CoordText(a, a.endX, a.endY)
+            + L" " + FmtNum(a.duration) + L"s";
+        if (a.randomDuration > 0) s += L" +随机" + FmtNum(a.randomDuration) + L"s";
+        return s;
+    }
     case ActionType::MouseDown:
         return HoldPrefix(a) + ButtonText(a.button) + L"按下 "
             + CoordText(a, a.x, a.y)
@@ -785,10 +825,20 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
         std::wstring s = L"运行录制回放 " + RunTargetText(a) + RepeatBrief(a);
         if (std::abs(a.playbackSpeed - 1.0) > 1e-6)
             s += L" " + FmtNum(a.playbackSpeed) + L"x";
+        if (a.useMode == kNestedUseModeDefault) s += L" 默认模式";
+        else if (a.useMode == kNestedUseModeWindow) s += L" 窗口模式";
+        else if (a.useMode == kNestedUseModeBackground) s += L" 后台窗口";
+        else s += L" 继承模式";
         return s;
     }
-    case ActionType::RunMacro:
-        return L"运行宏 " + RunTargetText(a) + RepeatBrief(a);
+    case ActionType::RunMacro: {
+        std::wstring s = L"运行宏 " + RunTargetText(a) + RepeatBrief(a);
+        if (a.useMode == kNestedUseModeDefault) s += L" 默认模式";
+        else if (a.useMode == kNestedUseModeWindow) s += L" 窗口模式";
+        else if (a.useMode == kNestedUseModeBackground) s += L" 后台窗口";
+        else s += L" 继承模式";
+        return s;
+    }
     case ActionType::QuickInput:
         return L"输入 \"" + TrimShort(a.inputText, 60) + L"\""
             + (a.parseEscapes ? L" 解析转义" : L"")
@@ -803,6 +853,19 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
             + RepeatBrief(a);
     case ActionType::FindImage:
         return FindImageActionText(a);
+    case ActionType::MultiMatch:
+        return MultiMatchActionText(a);
+    case ActionType::WatchImage: {
+        std::wstring s = L"找图监视 " + a.imagePath;
+        if (!a.searchFullScreen) s += RegionText(a);
+        s += a.watchMode != 0
+            ? (L" 时间监视" + FmtNum(a.watchPollSeconds) + L"s")
+            : L" 动作监视";
+        s += a.resumeAfterWatch ? L" 从原处继续" : L" 从监视后继续";
+        return s;
+    }
+    case ActionType::VarCompute:
+        return L"变量运算 \"" + TrimShort(a.computeCode, 48) + L"\"";
     case ActionType::TextRecognition: {
         std::wstring s = a.ocrRegionByImage
             ? L"OCR 按锚点区域"
@@ -840,6 +903,7 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
             + (a.matchVarName.empty() ? L"a" : a.matchVarName);
     case ActionType::GetColor:
         return L"获取颜色 " + CoordOrExpr(a, a.x, a.y)
+            + (a.imageLocate ? L"（找图定位）" : L"")
             + L" → " + (a.matchVarName.empty() ? L"colorRet" : a.matchVarName);
     case ActionType::FindColor:
         return FindColorText(a);
@@ -847,6 +911,7 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
         return L"颜色匹配 " + FmtColor(a.colorR, a.colorG, a.colorB)
             + L" 容差" + std::to_wstring(a.colorTolerance)
             + L" @" + CoordOrExpr(a, a.x, a.y)
+            + (a.imageLocate ? L"（找图定位）" : L"")
             + L" → " + (a.matchVarName.empty() ? L"colorRet" : a.matchVarName);
     case ActionType::CustomText:
         return a.customText.empty() ? L"自定义文本" : a.customText;
@@ -893,6 +958,9 @@ std::wstring QuickDescribeOneAction(const ScriptAction& a) {
     case ActionType::MouseClick:
         return HoldPrefix(a) + ButtonText(a.button) + L"点击"
             + (a.moveFromVar ? L"（坐标来自变量）" : L"");
+    case ActionType::MouseDrag:
+        return HoldPrefix(a) + ButtonText(a.button)
+            + (a.imageLocate ? L"拖拽（找图定位）" : L"拖拽");
     case ActionType::MouseDown: return ButtonText(a.button) + L"按下";
     case ActionType::MouseUp: return ButtonText(a.button) + L"松开";
     case ActionType::KeyClick: return HoldPrefix(a) + L"按键点击";
@@ -910,6 +978,20 @@ std::wstring QuickDescribeOneAction(const ScriptAction& a) {
         if (a.findUntilFound) s += L"（循环直到找到）";
         return s;
     }
+    case ActionType::MultiMatch: {
+        std::wstring s = a.multiMatchMode == 1 ? L"多图匹配（一图多处）" : L"多图匹配（多图择一）";
+        if (!a.searchFullScreen) s += L"（限定区域）";
+        if (a.findImageFollowUp == 1) s += L"后移动";
+        else if (a.findImageFollowUp == 2) s += L"后保存匹配度";
+        else s += a.multiMatchMode == 1 ? L"后依次点击" : L"后点击";
+        return s;
+    }
+    case ActionType::WatchImage:
+        return std::wstring(L"找图监视")
+            + (a.watchMode != 0 ? L"（时间监视）" : L"（动作监视）")
+            + (a.resumeAfterWatch ? L"（从原处继续）" : L"（从监视后继续）");
+    case ActionType::VarCompute:
+        return L"变量运算";
     case ActionType::TextRecognition: {
         std::wstring s = std::wstring(L"文字识别")
             + (a.ocrRegionByImage ? L"（按锚点图）" : L"")
@@ -936,12 +1018,15 @@ std::wstring QuickDescribeOneAction(const ScriptAction& a) {
     case ActionType::GetCursorPos: return L"获取光标位置";
     case ActionType::GetColor:
         return std::wstring(L"获取颜色")
+            + (a.imageLocate ? L"（找图定位）" : L"")
             + (a.moveFromVar ? L"（坐标来自变量）" : L"");
     case ActionType::FindColor:
         return std::wstring(L"区域找色")
+            + (a.imageLocate ? L"（找图定位）" : L"")
             + (a.searchFullScreen ? L"" : L"（限定区域）");
     case ActionType::ColorMatch:
         return std::wstring(L"颜色匹配")
+            + (a.imageLocate ? L"（找图定位）" : L"")
             + (a.moveFromVar ? L"（坐标来自变量）" : L"");
     case ActionType::AiTextAnalysis:
         return std::wstring(L"AI文字分析")

@@ -146,7 +146,7 @@ AppTheme MakeArcticTheme() {
 #endif
 
 const AppTheme kThemes[] = {
-    MakeTheme(L"经典绿橙", RGB(64, 168, 99), RGB(232, 248, 239), RGB(255, 154, 72), true),
+    MakeTheme(L"翠绿暖橙", RGB(64, 168, 99), RGB(232, 248, 239), RGB(255, 154, 72), true),
     MakeTheme(L"晴空蓝", RGB(78, 148, 210), RGB(230, 240, 248), RGB(235, 148, 40), true),
     MakeTheme(L"活力橙", RGB(230, 145, 52), RGB(255, 244, 228), RGB(20, 168, 188), true),
     MakeTheme(L"珊瑚橙", RGB(228, 118, 88), RGB(250, 236, 232), RGB(240, 196, 72), true),
@@ -157,8 +157,10 @@ const AppTheme kThemes[] = {
     MakeArcticTheme(),
 #endif
 };
-AppTheme gResolvedTheme = kThemes[0];
-int gCurrentThemeId = 0;
+static_assert(kDefaultThemeId >= 0 && kDefaultThemeId < kThemeCount,
+              "kDefaultThemeId must index ThemeCatalog");
+AppTheme gResolvedTheme = kThemes[kDefaultThemeId];
+int gCurrentThemeId = kDefaultThemeId;
 bool gRandSeeded = false;
 
 }  // namespace

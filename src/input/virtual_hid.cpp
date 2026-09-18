@@ -1,6 +1,7 @@
 #include "virtual_hid.h"
 
 #include <vector>
+#include <cstdio>
 #include <cstring>
 
 #include "../../driver/qst_vhid/qst_vhid_ioctl.h"
@@ -408,4 +409,53 @@ bool VirtualHidBackend::ReleaseAll() {
 std::wstring VirtualHidBackend::LastError() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return lastError_;
+}
+
+bool VirtualHidBackend::QueryInstalledDriverVersion(unsigned& a, unsigned& b, unsigned& c, unsigned& d) {
+    a = b = c = d = 0;
+    HDEVINFO info = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_QSTVHID, nullptr, nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (info == INVALID_HANDLE_VALUE) return false;
+
+    SP_DEVICE_INTERFACE_DATA ifData{};
+    ifData.cbSize = sizeof(ifData);
+    bool ok = false;
+    for (DWORD index = 0;
+         SetupDiEnumDeviceInterfaces(info, nullptr, &GUID_DEVINTERFACE_QSTVHID, index, &ifData);
+         ++index) {
+        DWORD needed = 0;
+        SetupDiGetDeviceInterfaceDetailW(info, &ifData, nullptr, 0, &needed, nullptr);
+        if (needed == 0) continue;
+        std::vector<BYTE> buf(needed);
+        auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        SP_DEVINFO_DATA devInfo{};
+        devInfo.cbSize = sizeof(devInfo);
+        if (!SetupDiGetDeviceInterfaceDetailW(info, &ifData, detail, needed, nullptr, &devInfo)) {
+            continue;
+        }
+        wchar_t driver[256]{};
+        if (!SetupDiGetDeviceRegistryPropertyW(info, &devInfo, SPDRP_DRIVER, nullptr,
+                reinterpret_cast<PBYTE>(driver), sizeof(driver), nullptr)) {
+            continue;
+        }
+        std::wstring key = L"SYSTEM\\CurrentControlSet\\Control\\Class\\";
+        key += driver;
+        HKEY hk = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS) {
+            continue;
+        }
+        wchar_t ver[64]{};
+        DWORD cb = sizeof(ver);
+        const LONG q = RegQueryValueExW(hk, L"DriverVersion", nullptr, nullptr,
+            reinterpret_cast<LPBYTE>(ver), &cb);
+        RegCloseKey(hk);
+        if (q != ERROR_SUCCESS || ver[0] == 0) continue;
+        if (swscanf_s(ver, L"%u.%u.%u.%u", &a, &b, &c, &d) >= 1) {
+            ok = true;
+            break;
+        }
+    }
+    SetupDiDestroyDeviceInfoList(info);
+    return ok;
 }

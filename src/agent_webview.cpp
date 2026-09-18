@@ -6,11 +6,17 @@
 // ──────────────────────────────────────────────────────────────────
 #include "agent_webview.h"
 
+#include "agent_web.h"
 #include "utils.h"
 
 #include <windows.h>
+#include <objbase.h>
 #include <wrl.h>
 #include <WebView2.h>
+
+#include <chrono>
+#include <memory>
+#include <string>
 
 #include <chrono>
 #include <memory>
@@ -85,6 +91,7 @@ std::wstring DecodeJsonString(const std::wstring& json) {
 bool FetchWebPageRendered(const std::wstring& url, std::wstring& outText,
                           std::wstring& err, int timeoutMs) {
     outText.clear();
+    if (AgentFetchUrlDestinationBlocked(url, err)) return false;
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(co) && co != RPC_E_CHANGED_MODE) {
         err = L"COM 初始化失败";
@@ -107,8 +114,8 @@ bool FetchWebPageRendered(const std::wstring& url, std::wstring& outText,
         browserFolder = fixedFolder;
     }
     // 独立用户数据目录，避免与主壳 WebView2UserData 冲突
-    const std::wstring userData = AppDir() + L"\\WebView2FetchData";
-    CreateDirectoryW(userData.c_str(), nullptr);
+    // Program Files 下必须用 LocalAppData，否则 Edge 沙箱无法写盘
+    const std::wstring userData = WebView2FetchDataDir();
 
     auto state = std::make_shared<FetchState>();
     const HRESULT envHr = CreateCoreWebView2EnvironmentWithOptions(
@@ -140,6 +147,26 @@ bool FetchWebPageRendered(const std::wstring& url, std::wstring& outText,
                             RECT r{0, 0, 1, 1};
                             controller->put_Bounds(r);
                             controller->put_IsVisible(TRUE);
+                            EventRegistrationToken navStartToken{};
+                            webview->add_NavigationStarting(
+                                Callback<ICoreWebView2NavigationStartingEventHandler>(
+                                    [state](ICoreWebView2*,
+                                        ICoreWebView2NavigationStartingEventArgs* args)
+                                        -> HRESULT {
+                                        if (!args) return S_OK;
+                                        LPWSTR uri = nullptr;
+                                        if (FAILED(args->get_Uri(&uri)) || !uri) return S_OK;
+                                        std::wstring blockErr;
+                                        const bool blocked =
+                                            AgentFetchUrlDestinationBlocked(uri, blockErr);
+                                        CoTaskMemFree(uri);
+                                        if (blocked) {
+                                            args->put_Cancel(TRUE);
+                                            state->error = blockErr;
+                                            state->done = true;
+                                        }
+                                        return S_OK;
+                                    }).Get(), &navStartToken);
                             EventRegistrationToken navToken{};
                             webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(

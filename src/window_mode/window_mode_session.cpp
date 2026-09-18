@@ -220,8 +220,9 @@ HWND ResolveBindHwnd(HWND top, const WindowModeScriptConfig& config, bool /*back
     if (!top || !IsWindow(top)) return nullptr;
     top = TopLevelTargetWindow(top);
 
-    // 桌面模拟器/Unity/传奇：假焦点绑顶层；MuMu 等安卓壳绑渲染子窗（坐标与 PostMessage 对齐）。
-    if (UsesFakeFocus(config) || UsesFakeFocusForTarget(config, top)) {
+    // 桌面模拟器/Unity/传奇：假焦点绑顶层；冒险岛/LCA 也绑顶层（子控件不吃键）。
+    if (UsesFakeFocus(config) || UsesFakeFocusForTarget(config, top)
+        || PrefersLcaBackgroundMessages(config, top)) {
         return top;
     }
 
@@ -366,9 +367,10 @@ bool WaitForBindHwnd(HWND top, const WindowModeScriptConfig& config, bool backgr
     outHwnd = nullptr;
     if (!top || !IsWindow(top)) return false;
 
-    // DeSmuME 等假焦点目标必须绑顶层；勿在后台模式误绑 Edit/子窗。
+    // DeSmuME 等假焦点目标必须绑顶层；冒险岛同样绑顶层（LCA 后台一也是绑 MapleStory 主窗）。
     if (UsesFakeFocus(config) || IsDesktopEmulatorTarget(top, &config)
-        || UsesFakeFocusForTarget(config, top)) {
+        || UsesFakeFocusForTarget(config, top)
+        || PrefersLcaBackgroundMessages(config, top)) {
         outHwnd = top;
         return true;
     }
@@ -420,9 +422,12 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
 
     DWORD pid = 0;
     GetWindowThreadProcessId(top, &pid);
+    DWORD bindPid = 0;
+    GetWindowThreadProcessId(bindHwnd, &bindPid);
 
     state.targetHwnd = bindHwnd;
     state.targetPid = pid;
+    state.bindPid = bindPid;
 
     RECT clientRc{};
     GetClientRect(bindHwnd, &clientRc);
@@ -461,6 +466,7 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
         err = L"\u5ba2\u6237\u533a\u5750\u6807\u6620\u5c04\u5931\u8d25";
         state.targetHwnd = nullptr;
         state.targetPid = 0;
+        state.bindPid = 0;
         return false;
     }
     state.clientRectScreen = RECT{sx1, sy1, sx2, sy2};
@@ -473,8 +479,11 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
                 state.health = WindowModeHealth::PermissionMismatch;
                 err = HealthToUserHint(state.health);
                 state.lastError = err;
-                WindowModeLogf(L"[窗口模式] 后台绑窗权限检查失败 pid=%lu（目标完整性更高）",
+                WindowModeLogf(L"[窗口模式] 后台绑窗权限检查失败 pid=%lu（目标完整性更高，禁止自动打开）",
                     static_cast<unsigned long>(pidCheck));
+                state.targetHwnd = nullptr;
+                state.targetPid = 0;
+                state.bindPid = 0;
                 return false;
             }
             state.health = WindowModeHealth::Ok;
@@ -490,6 +499,11 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
     if (logBind) {
             WindowModeLogf(L"[\u7a97\u53e3\u6a21\u5f0f] \u5df2\u7ed1\u5b9a pid=%lu top=0x%p bind=0x%p title=%s",
             static_cast<unsigned long>(pid), top, bindHwnd, title);
+            if (bindPid != 0 && pid != 0 && bindPid != pid) {
+                WindowModeLogf(
+                    L"[窗口模式] 跨进程宿主：顶层 pid=%lu 输入窗 pid=%lu（UWP 计算器等；存活判定按输入窗）",
+                    static_cast<unsigned long>(pid), static_cast<unsigned long>(bindPid));
+            }
     }
     return true;
 }
@@ -1271,6 +1285,7 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         state_.lastError = err;
         state_.targetHwnd = nullptr;
         state_.targetPid = 0;
+        state_.bindPid = 0;
         return false;
     }
 
@@ -1282,6 +1297,7 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         state_.lastError = err;
         state_.targetHwnd = nullptr;
         state_.targetPid = 0;
+        state_.bindPid = 0;
         return false;
     }
 
@@ -1295,6 +1311,7 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         state_.lastError = err;
         state_.targetHwnd = nullptr;
         state_.targetPid = 0;
+        state_.bindPid = 0;
         return false;
     }
 
@@ -1481,6 +1498,7 @@ void WindowModeSession::ClearTargetBinding() {
     ReleaseLaunchedProcess();
     state_.targetHwnd = nullptr;
     state_.targetPid = 0;
+    state_.bindPid = 0;
     state_.health = WindowModeHealth::Unknown;
     state_.lastError.clear();
 }

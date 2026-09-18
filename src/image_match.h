@@ -39,6 +39,10 @@ struct ImageMatchOptions {
     bool perfectMatch = false;
     /// 完美匹配每通道允许的最大绝对差（默认 1，吸收截图 1LSB 抖动）
     int perfectMatchChannelTol = 1;
+    /// 「精确定位救援」（非归一化 SQDIFF）允许的最大降采样倍数：1=全分辨率（旧行为）。
+    /// 大区域搜索时先在降采样图粗搜、再回全分辨率小窗口复算，语义与分数口径不变。
+    /// 低性能模式可以调大它换取更低 CPU（默认 4）。
+    int rescueMaxDownscale = 4;
 };
 
 // 图像匹配输出 (多结果)
@@ -48,12 +52,70 @@ struct ImageMatchOutput {
     std::vector<ImageMatchResult> matches;      // 匹配结果列表
     double debugBestNccPercent = 0.0;          // NCC 峰值（含未过阈值的候选，调试用）
     int debugRawCandidates = 0;                // 各引擎原始候选总数
+    double debugBestPixelAgreePercent = 0.0;  // 候选里最好的像素容差分（未过阈也会记录）
+    /// 未匹配的**原因**（给 AI/用户看）。典型：模板几乎是纯色 —— 归一化互相关/平方差
+    /// 在零方差模板上会退化成「处处 1.0 / 处处 0」，于是报出一个假匹配（常在 (0,0)）。
+    /// 这种情况必须显式说明并让调用方换手段（findColor/getColor 或换有纹理的模板）。
+    std::wstring reason;
+    /// 模板灰度标准差（诊断用；<0 表示没算出来）
+    double debugTemplateStdDev = -1.0;
 };
 
 // ── 位图加载/保存 ──────────────────────────────────────────────
+/// 加载模板/图片为 HBITMAP。内部带**解码缓存**（按 路径 + 大小 + 修改时间 失效），
+/// 循环里反复找同一步模板时不再重新读盘+解码。返回句柄所有权不变：调用方负责 DeleteBitmapHandle。
 HBITMAP LoadBitmapFromFile(const std::wstring& path);
 bool SaveBitmapToFile(HBITMAP bitmap, const std::wstring& path);
 void DeleteBitmapHandle(HBITMAP bitmap);
+
+/// 模板解码缓存诊断/自检（hits/lookups 反映复用率；Entries 受上限约束）
+uint64_t TemplateImageCacheLookups();
+uint64_t TemplateImageCacheHits();
+uint64_t TemplateImageCacheEvictions();
+size_t TemplateImageCacheEntries();
+void ClearTemplateImageCache();
+
+/// 只查「已缓存模板的宽高」：命中返回 true 且不产生 HBITMAP；
+/// 未命中返回 false（调用方再走 LoadBitmapFromFile，行为与之前一致）。
+bool TryGetCachedTemplateImageSize(const std::wstring& path, int& outW, int& outH);
+
+// ── 找图 GPU（OpenCL）加速 ─────────────────────────────────────
+/// 开关本体在 `findimage_gpu.h`（进程级内联原子量，避免设置层依赖 OpenCV）：
+/// `SetFindImageGpuAccel(bool)` / `FindImageGpuAccelEnabled()` / `FindImageGpuAccelActive()`。
+/// 实测 2560x1440 + 96x96：CPU 46~100ms / GPU 19~35ms（≈2.9x，含上传与结果回传）；
+/// 480x360 两者打平 → 面积 < 500k 像素一律走 CPU。低性能模式开启时强制回落 CPU。
+/// 这里只提供诊断用的设备名。
+std::wstring FindImageGpuDeviceName();
+
+// ── 找图「上一帧命中」本地复核（快速路径）的门槛：纯函数，便于穷举自检 ──────
+/// 思路：循环里反复找同一个东西时，画面基本没变。先在上一帧命中点**周围的小窗口**里
+/// 用**同一套阈值/校验**复算一次；过了就直接用，没过就照旧全屏搜。
+/// 因此「找不到」永远不会发生 —— 最坏情况是多花一次小窗口搜索的时间。
+struct FindImageFastPathParams {
+    /// 新命中与上一帧命中的切比雪夫距离上限（像素）：更大就当目标移动了，回退全屏
+    int maxDriftPx = 8;
+    /// 新命中分数必须比阈值高这么多（百分点）：避免「本地复核刚过线、全屏搜却不过线」
+    /// 让用户脚本里的 `matchData >= X` 分支判断变样
+    double scoreMarginPct = 3.0;
+    /// 上一帧全屏搜索至少这么慢（毫秒）才值得走快速路径：区域找图本来几毫秒，白付调度开销
+    double minFullSearchMs = 12.0;
+    /// 上一帧命中的新鲜度上限（毫秒）
+    int maxAgeMs = 3000;
+};
+
+/// 判断能否用上一帧命中做本地复核，并给出小窗口（屏幕/截图坐标，右下开区间）。
+/// 返回 false = 不走快速路径（上一帧太旧/上帧搜索本来很快/命中贴着搜索区边缘导致
+/// 漂移带放不进窗口/窗口几乎等于整个搜索区）。
+bool PlanFindImageFastPath(const FindImageFastPathParams& params,
+    int roiX1, int roiY1, int roiX2, int roiY2,
+    int prevTLX, int prevTLY, int tplW, int tplH,
+    double lastFullSearchMs, long long ageMs,
+    int& winX1, int& winY1, int& winX2, int& winY2);
+
+/// 本地复核的命中是否可接受：必须是同一实例（漂移 ≤ maxDriftPx）且分数留足余量。
+bool AcceptFindImageFastPathHit(const FindImageFastPathParams& params,
+    int prevTLX, int prevTLY, int newTLX, int newTLY,
+    double thresholdPercent, double newScore);
 
 /// 从源图裁 [L,T,R,B)（右下开）并保存为 BMP。失败返回 false。
 bool SaveCroppedTemplateRegion(const std::wstring& srcPath,
@@ -65,6 +127,11 @@ void GetVirtualScreenRect(int& x, int& y, int& w, int& h);
 HBITMAP CaptureVirtualScreen(int& outX, int& outY);
 
 // ── 模板匹配 (多引擎) ─────────────────────────────────────────
+/// 按「低性能模式」同步 OpenCV 线程预算（勾选时限 1 线程，避免 matchTemplate 把
+/// 全部物理核顶满导致升温）。找图入口内部已经调用，外部一般不需要手动调；
+/// 自检里要断言行预算时可显式调用。
+void SyncImageMatchThreadBudget();
+
 ImageMatchOutput FindTemplateOnScreenMulti(
     int searchX1, int searchY1, int searchX2, int searchY2,
     HBITMAP templateBmp, const ImageMatchOptions& options);
@@ -118,12 +185,59 @@ inline void FindImageClickPoint(const ImageMatchResult& m, int offsetX, int offs
     ty = cy + offsetY;
 }
 
+/// 按搜索区中心合成模板尺寸的锚框（编辑器选偏移：把变量图区域画在屏幕中央）。
+inline ImageMatchResult SynthesizeSearchRectCenterMatch(
+    int x1, int y1, int x2, int y2, int templateW, int templateH) {
+    ImageMatchResult m{};
+    if (x2 <= x1 || y2 <= y1) return m;
+    const int tw = templateW > 0 ? templateW : (x2 - x1);
+    const int th = templateH > 0 ? templateH : (y2 - y1);
+    const int cx = x1 + (x2 - x1) / 2;
+    const int cy = y1 + (y2 - y1) / 2;
+    m.found = true;
+    m.scale = 1.0;
+    m.score = 100.0;
+    m.x = cx;
+    m.y = cy;
+    m.topLeftX = cx - tw / 2;
+    m.topLeftY = cy - th / 2;
+    m.bottomRightX = m.topLeftX + tw;
+    m.bottomRightY = m.topLeftY + th;
+    return m;
+}
+
 // 屏幕点击点 → 相对匹配中心的偏移（选择偏移点击位置；与 FindImageClickPoint 互逆）
 inline void FindImageRelativeClickOffset(const ImageMatchResult& m, int clickX, int clickY, int& ox, int& oy) {
     int cx = 0, cy = 0;
     FindImageMatchCenter(m, cx, cy);
     ox = clickX - cx;
     oy = clickY - cy;
+}
+
+// 离点击/框选最近的命中（偏移点、相对区域必须以唯一锚框为基准）
+inline const ImageMatchResult* FindNearestImageMatch(
+    const std::vector<ImageMatchResult>& matches, int absX, int absY) {
+    const ImageMatchResult* best = nullptr;
+    double bestD = 1e100;
+    for (const auto& m : matches) {
+        if (!m.found) continue;
+        int cx = 0, cy = 0;
+        FindImageMatchCenter(m, cx, cy);
+        const double dx = static_cast<double>(absX - cx);
+        const double dy = static_cast<double>(absY - cy);
+        const double d = dx * dx + dy * dy;
+        if (!best || d < bestD) {
+            best = &m;
+            bestD = d;
+        }
+    }
+    return best;
+}
+
+/// 偏移点 / 相对区域 / 回放点击都以唯一锚框为基准（与叠层拾取一致）。
+inline void RestrictFindImageToSingleAnchor(ImageMatchOptions& opt) {
+    opt.maxMatches = 1;
+    opt.disablePyramid = true;
 }
 
 // ── 辅助功能 ──────────────────────────────────────────────────

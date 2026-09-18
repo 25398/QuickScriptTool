@@ -18,4 +18,9 @@ bool ScaleWindowClientPoint(int recordW, int recordH, int liveW, int liveH, int&
 void ScaleWindowClientRect(int recordW, int recordH, int liveW, int liveH,
     int& x1, int& y1, int& x2, int& y2);
 
+/// 窗口/后台窗口模式找图：忽略脚本里的绝对「选取区域」，始终用整个客户区。
+/// 「根据图片选取区域」在命中后再用 ApplyImageRegionToMatch 二次筛选。
+bool EffectiveWindowModeClientSearchRect(int clientW, int clientH,
+    int& x1, int& y1, int& x2, int& y2);
+
 }  // namespace windowmode

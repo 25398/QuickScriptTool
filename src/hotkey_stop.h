@@ -6,9 +6,10 @@
 // 精密鼠标宏把工作线程拉到过高优先级忙等时，UI/钩子会被饿死或
 // 被 MatchesKey / 卡住的 NeedKeyUp 吞掉物理 F7，表现为「停止热键没用、
 // 一直闪、键鼠操作不了」。策略：
-//   1) 忙碌时物理单击热键必须能停，不被 Handling / 指纹吞掉
+//   1) 忙碌时用户单击热键必须能停，不被 Handling / 指纹吞掉
 //   2) 启动那次按键仍按着时（NeedKeyUp）不得把自动连发当成停止
 //   3) 独立轮询：等启动键松开后再认下一次按下为停止
+//   4) 远控 SendInput（LLKHF_INJECTED、无 ExtraInfo）当作用户键，否则能开不能停
 //
 // 全屏游戏 / 反作弊（英雄联盟、逆战等）还会让 RegisterHotKey 与 WH_KEYBOARD_LL
 // 同时哑火（RIDEV_NOHOTKEYS、独占全屏、UIPI：游戏提权而本进程未提权时钩子
@@ -25,29 +26,42 @@ struct PollerState {
     bool fired = false;        // 已发出紧急停止
 };
 
+// 本进程脚本注入：只认 ExtraInfo 标签（'QSTH'）。
+// 不能把 LLKHF_INJECTED / LLMHF_INJECTED 当成脚本注入——ToDesk / 向日葵 /
+// TeamViewer 的 SendInput 也带 INJECTED。空闲启动能走 RegisterHotKey，
+// 回放卸掉系统热键后停止只靠 LL；若把远控键当注入丢掉，就会「能开不能停」。
+inline bool IsScriptTaggedInjection(bool taggedSynthetic) {
+    return taggedSynthetic;
+}
+
 // 忙碌中的单击热键 KEYDOWN：是否应立刻停止（LL 钩子）。
 // needKeyUp：启动键还没抬起（含 Windows 自动连发），不得停。
-// injected / ExtraInfo 标记仍视为脚本注入，不得当作用户停止。
+// taggedSynthetic（本进程 ExtraInfo）仍视为脚本注入，不得当作用户停止。
+// injected 仅为调用方传入的 LL 注入标志，远控 SendInput 也带它，不得据此否决。
 // 真丢 KEYUP 时由 UI 16ms SyncHotkeyLatches / 轮询松手后再按 兜底。
 inline bool ShouldStopOnToggleKeyDown(bool sessionBusy, bool needKeyUp,
     bool injected, bool taggedSynthetic) {
+    (void)injected;
     if (!sessionBusy || needKeyUp) return false;
-    if (injected || taggedSynthetic) return false;
+    if (IsScriptTaggedInjection(taggedSynthetic)) return false;
     return true;
 }
 
 // 空闲时启动：NeedKeyUp / pending / handling 仍挡连发与双通道。
+// 远控 INJECTED 可以启动；仅 ExtraInfo 标签视为脚本回声。
 inline bool ShouldStartOnToggleKeyDown(bool sessionBusy, bool needKeyUp,
     bool pending, bool handling, bool injected, bool taggedSynthetic) {
+    (void)injected;
     if (sessionBusy) return false;
-    if (injected || taggedSynthetic) return false;
+    if (IsScriptTaggedInjection(taggedSynthetic)) return false;
     if (needKeyUp || pending || handling) return false;
     return true;
 }
 
-// 物理 KEYUP 必须清 NeedKeyUp，即使指纹把该键当成注入回声。
+// 非脚本标签的 KEYUP（含远控 SendInput）必须清 NeedKeyUp，否则启动闩粘死、再按停不了。
 inline bool ShouldClearToggleLatchOnKeyUp(bool injected, bool taggedSynthetic) {
-    return !injected && !taggedSynthetic;
+    (void)injected;
+    return !IsScriptTaggedInjection(taggedSynthetic);
 }
 
 enum class PollTick {

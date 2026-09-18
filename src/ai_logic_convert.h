@@ -74,6 +74,8 @@ void AiLogicConvertNoteAction(const ScriptAction& a);
 void AiLogicConvertNoteLocate(const std::wstring& target, int screenX, int screenY,
     const std::wstring& button, int clickCount, const std::wstring& templatePath);
 void AiLogicConvertNoteWindowActivate(const std::wstring& matchQuery);
+/// 扩展桥导航（searchOnPage / clickRef 打开用户页）：固化为打开网页，便于无扩展回放
+void AiLogicConvertNoteOpenWebpage(const std::wstring& url);
 
 /// completeTask reason / 结果文本是否像失败收尾（未找到/卡点等）→ 禁止写回
 bool AiLogicConvertLooksLikeFailedComplete(const std::wstring& text);

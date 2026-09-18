@@ -1,6 +1,6 @@
 # WebView 原生分层盘点（阶段 0）
 
-> 产品主路径：`QstWebViewShell` = **WebShell**（`ui/`）+ **Engine**（跑宏/录制/热键/设置）+ **DesktopTools**（选区/叠层/准星/托盘等）。  
+> 产品主路径：`QuickScriptTool.exe`（CMake 目标 `QstWebViewShell`）= **WebShell**（`ui/`）+ **Engine**（跑宏/录制/热键/设置）+ **DesktopTools**（选区/叠层/准星/托盘等）。  
 > **GdiLegacy** 仅 `forceNative` / `QuickScriptTool.Gdi.exe`；发版默认应可关闭。  
 > 设计真值：`docs/ui-redesign-mockup.html`；桥接契约：`docs/webview-bridge-api.md`。  
 > 本文件是归属真值；改目录/CMake/调用边时同步更新。
@@ -64,9 +64,10 @@
 | `src/hotkey_dialog.*`（`HotkeyCapture`） | `captureGlobalHotkey` / `captureScriptHotkey`；动作键产品走 Web `#ov-action-key` |
 | `src/macro_debug_window.*` | Gdi 原生后端；**产品**另开 WebView 顶层窗 `ui/debug.html`（`SetMacroDebugWebPoster`） |
 | `src/tray_menu.*` / `themed_popup_menu.*` | 系统托盘菜单 |
+| `src/desktop_tools/float_ball.*` / `float_ball_geom.h` | 桌面悬浮球（贴边半露 / 自由整圆、悬停面板、启停）；设置 `showFloatBall` |
 | `src/process_utils.*` | 准星取窗/进程路径 |
 | `src/ocr_install_dialog.*` | 历史 GDI 安装 UI；Web 主路径已走 `RunOcrInstall` 进度桥 | 安装逻辑可 Shared；对话框可 Legacy |
-| UAC `ShellExecute`（门面内） | `installDriver` |
+| UAC `ShellExecute`（门面内） | `installDriver`（主程序 asInvoker；仅装驱动时提权。缺内核文件则先下载 HidDriver zip） |
 
 ### GdiLegacy（可删 / `QST_BUILD_GDI_LEGACY`；实现归档于 `archive/gdi_legacy/`）
 
@@ -111,7 +112,7 @@
 **禁止断**（误删即产品残废）：
 
 - `ScreenshotOverlay` / `MatchOverlay` / `OcrOverlay` / `CrosshairDragController` / `FindImageCropEditor`（或 B3 Web 裁切替代）
-- `HotkeyCapture`、`MacroDebugWindow`、托盘 NotifyIcon
+- `HotkeyCapture`、`MacroDebugWindow`、托盘 NotifyIcon、`FloatBall`
 - `image_match` / `ocr_engine` / `script_io` / `window_mode` 运行时 / `qst_engine_host` API
 - `qst::desktop_tools::*` 门面
 
@@ -135,6 +136,7 @@
 | `TestOcr(owner, params)` | `testOcr` | `mode=test\|offset` + text/offset |
 | `InstallDriver(owner, kind, onProgress)` | `installDriver` | ok + probed/suggestedBackend（探测可留 Shell） |
 | `RequestShowDebugWindow(fn)` | `showDebugWindow` | headless → Web `#debugFloat`；Gdi → `MacroDebug` 原生窗；`fn` 通常为 `ReloadSettings`/Apply |
+| `FloatBall::Instance()` | （设置 `other.showFloatBall`，无 bridge type） | 桌面悬浮球：贴边半露或自由整圆；启停走 Engine `RunScriptPath` / Stop |
 | `BrowsePath` / `PickImageFile` | `browsePath` / `pickImageFile` | 系统文件对话框（可归 Tools） |
 
 Tray：`TrayMenu::Show` 仍属 DesktopTools；菜单项扩展（停宏等）在阶段 A3。
@@ -201,7 +203,7 @@ Bridge JSON 字段保持兼容；契约变更必须改 `docs/webview-bridge-api.
 ### B2 构建目标（MSBuild）
 
 ```powershell
-# 产品壳（默认 QST_GDI_LEGACY=0）
+# 产品壳（默认 QST_GDI_LEGACY=0）→ build\Release\QuickScriptTool.exe
 & "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" `
   ".\build\QuickScriptTool.sln" /p:Configuration=Release /t:QstWebViewShell /m /v:minimal
 

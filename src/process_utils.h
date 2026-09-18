@@ -24,6 +24,10 @@ WindowInfoFromPoint GetWindowInfoFromPoint(int x, int y);
 /// 已是存在的绝对/相对路径则原样返回；解析失败返回 Trim 后的原串。
 std::wstring ResolveProgramLaunchPath(const std::wstring& nameOrPath);
 
+/// 进程映像名（含扩展名，如 "msedge.exe"）；取不到返回空。
+/// 用途：判断前台窗口属于哪个浏览器（打开 edge:// 内置页时要用对浏览器）。
+std::wstring ProcessImageNameByPid(unsigned long pid);
+
 /// 是否为「优先复用已开实例」的浏览器类目标（edge/chrome/firefox…）
 bool IsBrowserLaunchTarget(const std::wstring& nameOrPath);
 

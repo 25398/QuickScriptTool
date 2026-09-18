@@ -27,7 +27,19 @@ struct ScriptFileData {
     // 0/缺省=旧文件；1=微秒轴但仍可把前延迟挂在动作上；2=时间只在显式 Wait（及重复间隔）
     int inputTimingVersion = 0;
     std::vector<ScriptAction> actions;
+    /// 旧脚本可能带 visualLayout；新保存不再写入脚本文件，打开时迁到缓存。
+    std::wstring visualLayoutJson;
 };
+
+/// AppDir()\cache\visual\<hash>.json — 卡片坐标，不进脚本文件
+std::wstring VisualLayoutCachePathForScript(const std::wstring& scriptPath);
+bool SaveVisualLayoutCache(const std::wstring& scriptPath, const std::wstring& json);
+bool LoadVisualLayoutCache(const std::wstring& scriptPath, std::wstring& jsonOut);
+void DeleteVisualLayoutCache(const std::wstring& scriptPath);
+void MoveVisualLayoutCache(const std::wstring& oldScriptPath, const std::wstring& newScriptPath);
+
+/// 提取 JSON 对象字段（key 后的 {...}），找不到返回空
+std::wstring ExtractNamedJsonObject(const std::wstring& content, const wchar_t* key);
 
 /// 若 version<2：安全 Expand 前延迟为 Wait，合并相邻 Wait，升为 version=2。
 void NormalizeInputTiming(ScriptFileData& data, const std::wstring& path,
@@ -51,3 +63,7 @@ std::wstring ScriptActionToJsonString(const ScriptAction& a);
 ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDisplay = true);
 ScriptFileData ParseScriptContent(const std::wstring& content);
 bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data);
+/// 把其它脚本里 runMacro/mousePlayback 的 targetPath 从 oldPath 改到 newPath。返回改写文件数。
+int RetargetNestedLibraryScriptPaths(const std::wstring& oldPath, const std::wstring& newPath);
+/// 文件夹重命名：改写 targetPath 落在 oldDir 子树内的嵌套引用。
+int RetargetNestedLibraryScriptPathPrefix(const std::wstring& oldDir, const std::wstring& newDir);

@@ -63,8 +63,16 @@ const selftest::CaseInfo kCases[] = {
         L"frequency 4 parses as Interval; out-of-range stays Custom"},
     {L"interval_touch_resets_clock", L"default",
         L"TouchIntervalClock re-anchors origin (save/enable)"},
+    {L"interval_status_toggle_reanchors", L"default",
+        L"Disable→enable (list status click) restarts interval clock"},
     {L"interval_global_disable_reload_resets", L"default",
         L"Clearing globalDisabled via Reload re-anchors interval clocks"},
+    {L"retarget_filepath_after_move", L"default",
+        L"RetargetScheduledTaskFilePaths rewrites filePath after a library move"},
+    {L"retarget_filepath_folder_rename", L"default",
+        L"RetargetScheduledTaskFilePathPrefix rewrites filePath after folder rename"},
+    {L"weekdays_out_of_range_clamped", L"default",
+        L"weekDays <0 钳到 0、>127 钳到 127"},
 };
 
 SYSTEMTIME MakeSt(int y, int mo, int d, int h, int mi, int s, int ms, int dow) {
@@ -481,6 +489,40 @@ void CaseIntervalTouchResetsClock() {
         ok ? L"" : L"TouchIntervalClock must restart the elapsed clock");
 }
 
+void CaseIntervalStatusToggleReanchors() {
+    // 模拟列表点启用：status 进入签名 → Reload/SetTasks 换钟，再 Touch 锚到现在。
+    ScheduledTaskScheduler sched;
+    int fires = 0;
+    sched.SetRunCallback([&](const std::wstring&) { ++fires; });
+    sched.SetNowMsForTest(1000);
+
+    auto task = MakeTask(ScheduledFrequency::Interval);
+    task.time.hour = 0;
+    task.time.minute = 0;
+    task.time.second = 5;
+    task.time.millisecond = 0;
+    sched.SetTasks({task});
+
+    sched.SetNowMsForTest(4000);
+    task.status = ScheduledTaskStatus::Disabled;
+    sched.SetTasks({task});
+
+    sched.SetNowMsForTest(4500);
+    task.status = ScheduledTaskStatus::Enabled;
+    sched.SetTasks({task});
+    sched.TouchIntervalClock(task.id);
+
+    const SYSTEMTIME dummy = MakeSt(2026, 7, 14, 20, 30, 15, 0, 2);
+    sched.SetNowMsForTest(8500);
+    sched.TickAt(dummy);
+    const int before = fires;
+    sched.SetNowMsForTest(9500);
+    sched.TickAt(dummy);
+    const bool ok = before == 0 && fires == 1;
+    Emit(L"interval_status_toggle_reanchors", ok,
+        ok ? L"" : L"Enabling an interval task must restart the elapsed clock");
+}
+
 void CaseIntervalGlobalDisableReloadResets() {
     ScheduledTaskScheduler sched;
     int fires = 0;
@@ -514,6 +556,62 @@ void CaseIntervalGlobalDisableReloadResets() {
     const bool ok = whileDisabled == 0 && atReenable == 0 && fires == 1;
     Emit(L"interval_global_disable_reload_resets", ok,
         ok ? L"" : L"Re-enabling global disable must re-anchor interval clocks, not burst-fire");
+}
+
+void CaseRetargetFilePathAfterMove() {
+    auto task = MakeTask(ScheduledFrequency::Daily);
+    task.id = L"retarget_move";
+    task.name = L"retarget_fx";
+    task.filePath = L"C:\\qst_iotest\\scripts\\__qst_iotest_moved.json";
+    SaveScheduledTasks({task}, false);
+    const std::wstring neu = L"C:\\qst_iotest\\scripts\\folder\\__qst_iotest_moved.json";
+    const int n = RetargetScheduledTaskFilePaths(task.filePath, neu);
+    std::vector<ScheduledTask> loaded;
+    LoadScheduledTasks(loaded, nullptr);
+    const bool ok = n == 1 && loaded.size() == 1
+        && LibraryPathsEqual(loaded[0].filePath, neu);
+    Emit(L"retarget_filepath_after_move", ok,
+        ok ? L"" : L"scheduled filePath was not rewritten after move");
+}
+
+void CaseRetargetFilePathFolderRename() {
+    auto task = MakeTask(ScheduledFrequency::Daily);
+    task.id = L"retarget_ren";
+    task.name = L"retarget_fx";
+    task.filePath = L"C:\\qst_iotest\\scripts\\oldfolder\\a.json";
+    SaveScheduledTasks({task}, false);
+    const int n = RetargetScheduledTaskFilePathPrefix(
+        L"C:\\qst_iotest\\scripts\\oldfolder",
+        L"C:\\qst_iotest\\scripts\\newfolder");
+    std::vector<ScheduledTask> loaded;
+    LoadScheduledTasks(loaded, nullptr);
+    const bool ok = n == 1 && loaded.size() == 1
+        && LibraryPathsEqual(loaded[0].filePath,
+            L"C:\\qst_iotest\\scripts\\newfolder\\a.json");
+    Emit(L"retarget_filepath_folder_rename", ok,
+        ok ? L"" : L"scheduled filePath prefix was not rewritten after folder rename");
+}
+
+void CaseWeekDaysOutOfRangeClamped() {
+    const std::wstring json =
+        L"{\"tasks\":["
+        L"{\"id\":\"wd1\",\"name\":\"wdneg\",\"kind\":1,\"filePath\":\"C:\\\\a.json\","
+        L"\"fileDisplayName\":\"a.json\",\"frequency\":2,\"status\":0,\"customFired\":false,"
+        L"\"year\":0,\"month\":0,\"day\":0,\"hour\":9,\"minute\":0,\"second\":0,"
+        L"\"millisecond\":0,\"weekDays\":-1},"
+        L"{\"id\":\"wd2\",\"name\":\"wdbig\",\"kind\":1,\"filePath\":\"C:\\\\b.json\","
+        L"\"fileDisplayName\":\"b.json\",\"frequency\":2,\"status\":0,\"customFired\":false,"
+        L"\"year\":0,\"month\":0,\"day\":0,\"hour\":9,\"minute\":0,\"second\":0,"
+        L"\"millisecond\":0,\"weekDays\":256}"
+        L"],\"globalDisabled\":false}";
+    std::vector<ScheduledTask> tasks;
+    bool globalDisabled = false;
+    const bool parsed = ParseScheduledTasksJson(json, tasks, &globalDisabled);
+    const bool ok = parsed && tasks.size() == 2
+        && tasks[0].time.weekDays == 0
+        && tasks[1].time.weekDays == 127;
+    Emit(L"weekdays_out_of_range_clamped", ok,
+        ok ? L"" : L"weekDays -1/256 were not clamped to 0/127");
 }
 
 void PrintHelp() {
@@ -581,7 +679,11 @@ int wmain(int argc, wchar_t** argv) {
     CaseIntervalIgnoresWallClock();
     CaseParseIntervalFrequency();
     CaseIntervalTouchResetsClock();
+    CaseIntervalStatusToggleReanchors();
     CaseIntervalGlobalDisableReloadResets();
+    CaseRetargetFilePathAfterMove();
+    CaseRetargetFilePathFolderRename();
+    CaseWeekDaysOutOfRangeClamped();
 
     SetScheduledTasksFilePathForTest(L"");
     DeleteFileW(isolated.c_str());

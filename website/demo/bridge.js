@@ -27,6 +27,12 @@
     saveSettings: (settings) => post({ type: "saveSettings", settings: settings || {} }),
     restoreSettingsDefaults: () => post({ type: "restoreSettingsDefaults" }),
     openEditor: (path) => post({ type: "openEditor", path: String(path || "") }),
+    peekScriptActions: (path, reqId) =>
+      post({
+        type: "peekScriptActions",
+        path: String(path || ""),
+        reqId: String(reqId || ""),
+      }),
     saveEditor: (payload) => post(Object.assign({ type: "saveEditor" }, payload || {})),
     debugScript: (payload) => post(Object.assign({ type: "debugScript" }, payload || {})),
     deleteScript: (path) => post({ type: "deleteScript", path: String(path || "") }),

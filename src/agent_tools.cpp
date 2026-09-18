@@ -9,6 +9,7 @@
 #include "action_utils.h"
 #include "ai_logic_convert.h"
 #include "app_settings_store.h"
+#include "ui_scale.h"
 #include "scheduled_task_store.h"
 #include "scheduled_task_types.h"
 #include "agent_script_ops.h"
@@ -81,28 +82,17 @@ FindResult FindScriptFile(const std::wstring& fileName, const std::wstring& dirH
     if (!IsSafeFileName(fileName))
         return { L"[错误] 文件名包含非法字符。", false };
 
-    // 如果指定了目录，只在该目录查找
+    std::wstring found;
     std::wstring hintDir = DirFromHint(dirHint);
     if (!hintDir.empty()) {
-        std::wstring path = hintDir + L"\\" + fileName;
-        DWORD attr = GetFileAttributesW(path.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
-            return { path, true };
+        if (FindScriptJsonByFileName(hintDir, fileName, found))
+            return { found, true };
         std::wstring label = (dirHint == L"recordings") ? L"键鼠录制目录" : L"脚本宏目录";
         return { L"[错误] 在" + label + L"中未找到文件：" + fileName, false };
     }
 
-    // 自动模式：先查 scripts，再查 recordings
-    std::wstring path = ScriptsDir() + L"\\" + fileName;
-    DWORD attr = GetFileAttributesW(path.c_str());
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
-        return { path, true };
-
-    path = RecordingsDir() + L"\\" + fileName;
-    attr = GetFileAttributesW(path.c_str());
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
-        return { path, true };
-
+    if (ResolveLibraryScriptPath(fileName, found))
+        return { found, true };
     return { L"[错误] 文件不存在：" + fileName + L"（已检查脚本目录和录制目录）", false };
 }
 
@@ -215,6 +205,7 @@ void WriteScriptStats(const ScriptFileData& data, std::wstringstream& ss) {
         case ActionType::If: ++ifCount; ++keyCount; break;
         case ActionType::Else: ++keyCount; break;
         case ActionType::FindImage: ++findImageCount; ++keyCount; break;
+        case ActionType::MultiMatch: ++findImageCount; ++keyCount; break;
         case ActionType::MouseClick: case ActionType::MouseDown: case ActionType::MouseUp:
             ++clickCount; ++keyCount; break;
         case ActionType::KeyDown: ++keyDownCount; ++keyCount; break;
@@ -628,7 +619,7 @@ AgentTool MakeBuildScriptActionsTool() {
         L"步骤说明写 remark；禁止 customText 与 text/no 字段（工具自动分配序号与标准动作名）。"
         L"非无限循环脚本末尾会自动追加 stopMacro（结束宏运行）。"
         L"传入 actions 数组，每项含 type 及该类型参数；返回可直接嵌入脚本的 JSON 数组文本。"
-        L"★ loop/if/else/defineBlock 必须用 children 嵌套子动作（像写代码的花括号），"
+        L"★ loop/if/else/defineBlock/watchImage 必须用 children 嵌套子动作（像写代码的花括号），"
         L"循环体放在 loop.children 里，不要写成循环后面的同级动作；空循环会构建失败。"
         L"含循环/条件时先 planScriptActions 核对动作树，再调用本工具。"
         L"支持全部编辑器动作（不含 AI 专用动作）。"
@@ -639,9 +630,9 @@ AgentTool MakeBuildScriptActionsTool() {
         L"count=1 时不等待，也不在首前/末后插入等待。"
         L"endLoop 必须放在 loop 的 children 里，否则构建失败。"
         L"必填参数（缺了会构建失败）：keyClick/keyDown/keyUp→keyText；quickInput→inputText；"
-        L"wait→duration；findImage→imagePath；textRecognition→imagePath 或 ocrSearchText；"
+        L"wait→duration；findImage/watchImage→imagePath；textRecognition→imagePath 或 ocrSearchText；"
         L"if→conditionExpr；goto→gotoStepExpr；defineBlock/runBlock→blockName；"
-        L"runMacro/mousePlayback→targetPath；openFile/runProgram/openWebpage/closeProgram/"
+        L"varCompute→computeCode；runMacro/mousePlayback→targetPath；openFile/runProgram/openWebpage/closeProgram/"
         L"activateWindow→targetPath；AI 动作→aiPrompt。禁止省略必填参数或用默认值凑数。";
 
     tool.parameters_json = LR"({
@@ -649,14 +640,14 @@ AgentTool MakeBuildScriptActionsTool() {
         "properties": {
             "actions": {
                 "type": "array",
-                "description": "动作参数对象数组。loop/if/else/defineBlock 用 children 嵌套子动作，不要把循环体写成后面的同级项",
+                "description": "动作参数对象数组。loop/if/else/defineBlock/watchImage 用 children 嵌套子动作，不要把循环体写成后面的同级项",
                 "items": {
                     "type": "object",
                     "properties": {
                         "type": { "type": "string" },
                         "children": {
                             "type": "array",
-                            "description": "容器的子动作（仅 loop/if/else/defineBlock）"
+                            "description": "容器的子动作（仅 loop/if/else/defineBlock/watchImage）"
                         }
                     },
                     "required": ["type"]
@@ -689,7 +680,7 @@ AgentTool MakePlanScriptActionsTool() {
     tool.name = L"planScriptActions";
     tool.description =
         L"规划脚本动作树（不保存、不校验坐标/路径等必填细节）。"
-        L"像写代码一样传入嵌套 actions：loop/if/else/defineBlock 用 children 包住循环体/分支。"
+        L"像写代码一样传入嵌套 actions：loop/if/else/defineBlock/watchImage 用 children 包住循环体/分支。"
         L"返回带缩进的中文动作树，供核对父子关系。空循环（循环后面的动作都是同级）会报错。"
         L"含循环/条件/挂机刷任务时必须先调本工具确认树正确，再补齐参数调用 createMacroScript。"
         L"本步只需 type、remark、children、loopCount/conditionExpr；imagePath 等可留到下一步。";
@@ -864,11 +855,11 @@ AgentTool MakeOptimizeScriptTool() {
             "waitCalculation": {
                 "type": "string",
                 "enum": ["sum", "average", "first", "last", "fixed"],
-                "description": "合并后等待时间（仅 merge，按每段独立计算）：sum=累加, average=平均, first=该段第一个, last=该段最后一个, fixed=指定秒数。默认 sum"
+                "description": "合并/压缩后等待时间（按每段或每个留下的移动间隔独立计算）：sum=累加, average=平均, first=该段第一个, last=该段最后一个, fixed=指定秒数。默认 sum"
             },
             "mergeWaitValue": {
                 "type": "number",
-                "description": "waitCalculation=fixed 时每段使用的等待秒数，默认 0.1"
+                "description": "waitCalculation=fixed 时使用的等待秒数，默认 0.1"
             },
             "distanceThreshold": {
                 "type": "number",
@@ -876,7 +867,7 @@ AgentTool MakeOptimizeScriptTool() {
             },
             "compressWait": {
                 "type": "number",
-                "description": "路径压缩时移动点之间的等待时间（秒），默认 0.05"
+                "description": "兼容旧参数。waitCalculation=fixed 且未传 mergeWaitValue 时作为指定秒数"
             }
         },
         "required": ["fileName"]
@@ -897,8 +888,11 @@ AgentTool MakeOptimizeScriptTool() {
         opts.mergeWaitValue = params.value("mergeWaitValue", 0.1);
         opts.distanceThreshold = params.value("distanceThreshold", 5.0);
         opts.compressWait = params.value("compressWait", 0.05);
+        if (!params.contains("mergeWaitValue") && params.contains("compressWait"))
+            opts.mergeWaitValue = opts.compressWait;
         if (opts.distanceThreshold < 0.1) opts.distanceThreshold = 0.1;
         if (opts.compressWait < 0.0) opts.compressWait = 0.0;
+        if (opts.mergeWaitValue < 0.0) opts.mergeWaitValue = 0.0;
 
         const auto result = AgentOptimizeScriptFile(opts);
         return result.message;
@@ -914,7 +908,7 @@ AgentTool MakeCreateMacroScriptTool() {
     tool.description =
         L"一步创建鼠标宏：构建动作并保存到 scripts 目录。"
         L"禁止 customText；说明写 remark；末尾自动追加 stopMacro（除非顶层无限 loop）。"
-        L"★ loop/if/else/defineBlock 必须用 children 嵌套子动作（像写代码）；"
+        L"★ loop/if/else/defineBlock/watchImage 必须用 children 嵌套子动作（像写代码）；"
         L"循环体放在 loop.children，不要写成循环后面的同级。含循环/条件时先 planScriptActions。"
         L"含 AI 动作时无需手写 aiModelName，保存时会自动从已添加模型中选取（图片分析优先识图模型）。"
         L"默认效率优先：优先 findImage/OCR，少调用 AI 分析；aiActionExecute 仅用户明确要求时使用。"
@@ -923,8 +917,8 @@ AgentTool MakeCreateMacroScriptTool() {
         L"默认模式可传 breakoutTimeSeconds（秒，0=禁用；用户中途操作键鼠会暂停宏，松开后空闲该秒数再恢复）。"
         L"默认保存到 scripts 根目录（不分类）；用户指明分类/目录时传 folder 保存到 scripts/<folder>。"
         L"必填参数：keyClick/keyDown/keyUp→keyText；quickInput→inputText；wait→duration；"
-        L"findImage→imagePath；if→conditionExpr；goto→gotoStepExpr；runMacro→targetPath；"
-        L"openFile/runProgram/openWebpage→targetPath；AI 动作→aiPrompt。缺必填会构建失败。";
+        L"findImage/watchImage→imagePath；if→conditionExpr；goto→gotoStepExpr；runMacro→targetPath；"
+        L"varCompute→computeCode；openFile/runProgram/openWebpage→targetPath；AI 动作→aiPrompt。缺必填会构建失败。";
 
     tool.parameters_json = LR"({
         "type": "object",
@@ -950,7 +944,7 @@ AgentTool MakeCreateMacroScriptTool() {
             },
             "actions": {
                 "type": "array",
-                "description": "动作参数数组。loop/if/else/defineBlock 用 children 嵌套子动作（同 buildScriptActions）",
+                "description": "动作参数数组。loop/if/else/defineBlock/watchImage 用 children 嵌套子动作（同 buildScriptActions）",
                 "items": { "type": "object" }
             }
         },
@@ -1000,11 +994,11 @@ AgentTool MakeOptimizeRecordingTool() {
             "waitCalculation": {
                 "type": "string",
                 "enum": ["sum", "average", "first", "last", "fixed"],
-                "description": "合并后等待时间（仅 merge，按每段独立计算）：sum=累加, average=平均, first=该段第一个, last=该段最后一个, fixed=指定秒数。默认 sum"
+                "description": "合并/压缩后等待时间（按每段或每个留下的移动间隔独立计算）：sum=累加, average=平均, first=该段第一个, last=该段最后一个, fixed=指定秒数。默认 sum"
             },
             "mergeWaitValue": {
                 "type": "number",
-                "description": "waitCalculation=fixed 时每段使用的等待秒数，默认 0.1"
+                "description": "waitCalculation=fixed 时使用的等待秒数，默认 0.1"
             },
             "distanceThreshold": {
                 "type": "number",
@@ -1012,7 +1006,7 @@ AgentTool MakeOptimizeRecordingTool() {
             },
             "compressWait": {
                 "type": "number",
-                "description": "路径压缩时移动点之间的等待时间（秒），默认 0.05"
+                "description": "兼容旧参数。waitCalculation=fixed 且未传 mergeWaitValue 时作为指定秒数"
             }
         },
         "required": ["fileName"]
@@ -1032,8 +1026,11 @@ AgentTool MakeOptimizeRecordingTool() {
         opts.mergeWaitValue = params.value("mergeWaitValue", 0.1);
         opts.distanceThreshold = params.value("distanceThreshold", 5.0);
         opts.compressWait = params.value("compressWait", 0.05);
+        if (!params.contains("mergeWaitValue") && params.contains("compressWait"))
+            opts.mergeWaitValue = opts.compressWait;
         if (opts.distanceThreshold < 0.1) opts.distanceThreshold = 0.1;
         if (opts.compressWait < 0.0) opts.compressWait = 0.0;
+        if (opts.mergeWaitValue < 0.0) opts.mergeWaitValue = 0.0;
 
         const auto result = AgentOptimizeScriptFile(opts);
         return result.message;
@@ -1253,7 +1250,8 @@ AgentTool MakeCreateScheduledTaskTool() {
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
         undo.Success();
-        NotifyAgentScriptLibraryChanged();
+        NotifyAgentScheduledTasksChanged(
+            task.frequency == ScheduledFrequency::Interval ? task.id : std::wstring());
 
         std::wstringstream ss;
         ss << L"定时任务已创建：\n";
@@ -1375,7 +1373,8 @@ AgentTool MakeUpdateScheduledTaskTool() {
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
         undo.Success();
-        NotifyAgentScriptLibraryChanged();
+        NotifyAgentScheduledTasksChanged(
+            target->frequency == ScheduledFrequency::Interval ? target->id : std::wstring());
 
         return L"定时任务已更新：" + target->name + L"\n"
                L"  新的执行时间: " + FormatScheduledRunTime(*target);
@@ -1426,7 +1425,7 @@ AgentTool MakeDeleteScheduledTaskTool() {
         if (!SaveScheduledTasks(tasks, globalDisabled))
             return L"[错误] 保存定时任务失败。";
         undo.Success();
-        NotifyAgentScriptLibraryChanged();
+        NotifyAgentScheduledTasksChanged();
 
         return L"已删除定时任务：" + deletedName;
     };
@@ -1485,16 +1484,84 @@ AgentTool MakeListSettingsTool() {
                   settings.playback.scheduledTaskConflictPolicy))
            << L"（0=执行脚本优先 1=定时脚本优先）\n";
         ss << L"  脚本中断后自动恢复: "
-           << (settings.playback.scheduledTaskAutoResume ? L"启用" : L"禁用") << L"\n\n";
+           << (settings.playback.scheduledTaskAutoResume ? L"启用" : L"禁用") << L"\n";
+        ss << L"  低性能模式: "
+           << (settings.playback.lowPerformanceMode
+                   ? L"启用（找图限单线程、回放不提优先级/不抬系统定时器分辨率、减少自旋）"
+                   : L"禁用（性能/精度优先）")
+           << L"\n";
+        ss << L"  找图 GPU 加速: "
+           << (settings.playback.findImageGpuAccel
+                   ? (settings.playback.lowPerformanceMode
+                           ? L"已勾选但被低性能模式压制（低性能模式优先）"
+                           : L"启用（≥500k 像素的找图走 OpenCL）")
+                   : L"禁用")
+           << L"\n\n";
 
         ss << L"【其他设置】\n";
         ss << L"  宏执行后自动隐藏主窗口: " << (settings.other.autoHideMainWindow ? L"是" : L"否") << L"\n";
-        ss << L"  宏启动时播放提示音: " << (settings.other.playSoundOnStart ? L"是" : L"否") << L"\n";
+        ss << L"  脚本启动时播放提示音: " << (settings.other.playSoundOnStart ? L"是" : L"否") << L"\n";
+        ss << L"  脚本结束时播放提示音: " << (settings.other.playSoundOnEnd ? L"是" : L"否") << L"\n";
         ss << L"  隐藏右下角弹窗提示: " << (settings.other.hideBottomRightTip ? L"是" : L"否") << L"\n";
         ss << L"  关闭按钮最小化到托盘: " << (settings.other.closeToTray ? L"是" : L"否") << L"\n";
+        ss << L"  显示桌面悬浮球: " << (settings.other.showFloatBall ? L"是" : L"否") << L"\n";
         ss << L"  开机自动启动: " << (settings.other.autoStartOnBoot ? L"是" : L"否") << L"\n";
         ss << L"  中文输入法不触发热键: " << (settings.other.resolveImeConflict ? L"是" : L"否") << L"\n";
+        ss << L"  鼠标宏编辑界面默认视图: "
+           << (quickscript::NormalizeEditorDefaultView(settings.other.editorDefaultView) == L"visual"
+               ? L"可视化" : L"代码化") << L"\n";
+        ss << L"  循环体标识: " << (settings.other.visualLoopWrap ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  指令块调用线: " << (settings.other.visualBlockCallWires ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  条件块标识: " << (settings.other.visualIfWrap ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  指令块包裹: " << (settings.other.visualBlockWrap ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  找图监视包裹: " << (settings.other.visualWatchWrap ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  跳转连线: " << (settings.other.visualJumpWires ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  可视化网格: " << (settings.other.visualShowGrid ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  卡片编号: " << (settings.other.visualShowCardId ? L"显示" : L"隐藏") << L"\n";
+        ss << L"  编辑器动作顺序: "
+           << (settings.other.editorActionOrder.empty() ? L"产品默认"
+               : (std::to_wstring(settings.other.editorActionOrder.size()) + L" 项自定义"))
+           << L"\n";
+        ss << L"  编辑器隐藏动作: "
+           << (settings.other.editorHiddenActions.empty()
+               ? L"无"
+               : (std::to_wstring(settings.other.editorHiddenActions.size()) + L" 种（仅添加列表，不影响已有步骤）"))
+           << L"\n";
+        {
+            const std::wstring preset = quickscript::NormalizeEditorCatalogPreset(
+                settings.other.editorCatalogPreset);
+            ss << L"  编辑器目录预设: "
+               << (preset == L"simple" ? L"精简"
+                   : preset == L"office" ? L"办公"
+                   : preset == L"game" ? L"游戏图色"
+                   : preset == L"custom" ? L"自定义"
+                   : L"全部")
+               << L"\n";
+            ss << L"  自定义目录槽: "
+               << (settings.other.editorCustomActionOrder.empty()
+                       && settings.other.editorCustomHiddenActions.empty()
+                   ? L"空"
+                   : (std::to_wstring(settings.other.editorCustomActionOrder.size()) + L" 项顺序 / "
+                       + std::to_wstring(settings.other.editorCustomHiddenActions.size()) + L" 种隐藏"))
+               << L"\n";
+            ss << L"  搜索动作从所有动作里搜索: "
+               << (settings.other.editorSearchAllActions ? L"是" : L"否") << L"\n";
+            ss << L"  隐藏固定变量: "
+               << (settings.other.editorHideFixedVars ? L"是" : L"否") << L"\n";
+            ss << L"  隐藏坐标变量: "
+               << (settings.other.editorHideCoordVars ? L"是" : L"否") << L"\n";
+            ss << L"  多结果仅显示代指: "
+               << (settings.other.editorMultiResultPlaceholderOnly ? L"是" : L"否") << L"\n";
+            ss << L"  不启用修改按钮: "
+               << (settings.other.editorDisableModifyButton ? L"是" : L"否") << L"\n";
+            ss << L"  退出时自动保存: "
+               << (settings.other.editorAutoSaveOnExit ? L"是" : L"否") << L"\n";
+            ss << L"  启用批量插入: "
+               << (settings.other.editorEnableBatchInsert ? L"是" : L"否") << L"\n";
+        }
         ss << L"  长按判定(秒): " << FormatHoldThresholdLabel(settings.other.holdThresholdSeconds) << L"\n";
+        ss << L"  界面缩放倍率: " << settings.other.uiScaleFactor
+           << L"（叠在分辨率自适应之后，默认 1.0）\n";
 
         ss << L"\n修改设置请使用 updateSettings 工具。";
         return ss.str();
@@ -1542,13 +1609,39 @@ AgentTool MakeUpdateSettingsTool() {
             "foregroundInputBackend": { "type": "integer", "description": "前台注入后端：0=Software 1=Interception 2=VirtualHid" },
             "scheduledTaskConflictPolicy": { "type": "integer", "description": "定时任务优先级：0=执行脚本优先 1=定时脚本优先。未勾选自动恢复时 0=忙则跳过、1=打断不恢复；勾选时 0=结束后再跑、1=插入后从原步骤继续" },
             "scheduledTaskAutoResume": { "type": "boolean", "description": "脚本中断后自动恢复。false=跳过或打断不恢复；true=结束后再跑或插入后从原步骤继续" },
+            "lowPerformanceMode": { "type": "boolean", "description": "低性能模式（省 CPU/降温）：找图限 1 个 OpenCV 线程、输入时间轴大幅减少自旋、回放不再提优先级/不抬全系统定时器分辨率、找图监视轮询下限 50→200ms。代价是注入节奏可有 ~1ms 抖动、单帧找图变慢。用户抱怨「跑脚本时电脑很烫/风扇很响」时建议开启" },
+            "findImageGpuAccel": { "type": "boolean", "description": "找图 GPU 加速（OpenCL）：大区域全屏找图走显卡（实测约快 3 倍），面积小于 500k 像素的区域找图自动仍用 CPU；机器无 OpenCL 设备时自动忽略。与 lowPerformanceMode 同时开启时本项不生效（低性能模式优先）" },
             "autoHideMainWindow": { "type": "boolean", "description": "宏执行后自动隐藏主窗口" },
-            "playSoundOnStart": { "type": "boolean", "description": "宏启动时播放提示音" },
+            "playSoundOnStart": { "type": "boolean", "description": "脚本启动时播放提示音" },
+            "playSoundOnEnd": { "type": "boolean", "description": "脚本结束时播放提示音" },
             "hideBottomRightTip": { "type": "boolean", "description": "隐藏右下角弹窗提示" },
             "closeToTray": { "type": "boolean", "description": "关闭按钮最小化到托盘" },
+            "showFloatBall": { "type": "boolean", "description": "显示桌面悬浮球（可贴边半露，也可拖到屏幕中间自由悬浮；悬停展开启停）" },
             "autoStartOnBoot": { "type": "boolean", "description": "开机自动启动" },
-            "resolveImeConflict": { "type": "boolean", "description": "中文输入法正在组字时不触发鼠标宏热键（空闲中文模式仍可触发）" },
-            "holdThresholdSeconds": { "type": "number", "description": "长按判定秒数（>0，热键按住启停与捕获共用）" }
+            "resolveImeConflict": { "type": "boolean", "description": "中文输入法处于中文模式时不触发热键；Shift 英文或关闭输入法后仍可触发" },
+            "editorDefaultView": { "type": "string", "enum": ["code", "visual"], "description": "鼠标宏编辑界面默认视图：code=代码化 visual=可视化" },
+            "visualLoopWrap": { "type": "boolean", "description": "可视化循环体大包裹框" },
+            "visualBlockCallWires": { "type": "boolean", "description": "可视化定义宏与运行宏之间的虚线调用线" },
+            "visualIfWrap": { "type": "boolean", "description": "可视化 if/else 大包裹框" },
+            "visualBlockWrap": { "type": "boolean", "description": "可视化定义宏指令块大包裹框" },
+            "visualWatchWrap": { "type": "boolean", "description": "可视化找图监视大包裹框" },
+            "visualJumpWires": { "type": "boolean", "description": "可视化跳转/goto 连线" },
+            "visualShowGrid": { "type": "boolean", "description": "可视化画布点阵网格" },
+            "visualShowCardId": { "type": "boolean", "description": "可视化卡片标题中的 ID" },
+            "editorActionOrder": { "type": "array", "items": { "type": "string" }, "description": "编辑器「请选择要添加的宏」排列顺序（动作 type）；空=产品默认" },
+            "editorHiddenActions": { "type": "array", "items": { "type": "string" }, "description": "从添加列表隐藏的动作 type；不影响脚本里已有步骤" },
+            "editorCatalogPreset": { "type": "string", "enum": ["simple", "office", "game", "all", "custom"], "description": "编辑器动作目录预设：simple=精简 office=办公 game=游戏图色 all=全部 custom=手改" },
+            "editorCustomActionOrder": { "type": "array", "items": { "type": "string" }, "description": "动作目录「自定义」槽的排列顺序；切换其它预设时保留" },
+            "editorCustomHiddenActions": { "type": "array", "items": { "type": "string" }, "description": "动作目录「自定义」槽的隐藏列表；仅在其它预设上改勾选/顺序时覆盖" },
+            "editorSearchAllActions": { "type": "boolean", "description": "添加列表搜索是否包含已隐藏动作；false=只搜当前目录显示项" },
+            "editorHideFixedVars": { "type": "boolean", "description": "插入变量列表隐藏 ctrl:CurLoops 等固定变量" },
+            "editorHideCoordVars": { "type": "boolean", "description": "插入变量列表隐藏 .x/.y/.cx 等坐标字段" },
+            "editorMultiResultPlaceholderOnly": { "type": "boolean", "description": "多结果只显示 matchRet[n] 代指，不列出 [0]/[1]/[2]" },
+            "editorDisableModifyButton": { "type": "boolean", "description": "不启用修改按钮：隐藏「修改」，选中后改参数失焦即写回列表" },
+            "editorAutoSaveOnExit": { "type": "boolean", "description": "退出时自动保存：×/关软件写盘，「取消」恢复到打开时" },
+            "editorEnableBatchInsert": { "type": "boolean", "description": "启用批量插入：多选时非容器类型点添加逐条插入，容器类型仍并入" },
+            "holdThresholdSeconds": { "type": "number", "description": "长按判定秒数（>0，热键按住启停与捕获共用）" },
+            "uiScaleFactor": { "type": "number", "description": "界面缩放倍率（正数，可小数，默认 1.0；叠在分辨率自适应之后，0.25~3）" }
         },
         "required": ["category"]
     })";
@@ -1619,16 +1712,74 @@ AgentTool MakeUpdateSettingsTool() {
                         params["scheduledTaskConflictPolicy"].get<int>()));
             }
             setBool("scheduledTaskAutoResume", settings.playback.scheduledTaskAutoResume);
+            setBool("lowPerformanceMode", settings.playback.lowPerformanceMode);
+            setBool("findImageGpuAccel", settings.playback.findImageGpuAccel);
         } else if (category == L"other") {
             setBool("autoHideMainWindow", settings.other.autoHideMainWindow);
             setBool("playSoundOnStart", settings.other.playSoundOnStart);
+            setBool("playSoundOnEnd", settings.other.playSoundOnEnd);
             setBool("hideBottomRightTip", settings.other.hideBottomRightTip);
             setBool("closeToTray", settings.other.closeToTray);
+            setBool("showFloatBall", settings.other.showFloatBall);
             setBool("autoStartOnBoot", settings.other.autoStartOnBoot);
             setBool("resolveImeConflict", settings.other.resolveImeConflict);
+            if (params.contains("editorDefaultView") && params["editorDefaultView"].is_string()) {
+                settings.other.editorDefaultView = quickscript::NormalizeEditorDefaultView(
+                    FromUtf8(params["editorDefaultView"].get<std::string>()));
+            }
+            setBool("visualLoopWrap", settings.other.visualLoopWrap);
+            setBool("visualBlockCallWires", settings.other.visualBlockCallWires);
+            setBool("visualIfWrap", settings.other.visualIfWrap);
+            setBool("visualBlockWrap", settings.other.visualBlockWrap);
+            setBool("visualWatchWrap", settings.other.visualWatchWrap);
+            setBool("visualJumpWires", settings.other.visualJumpWires);
+            setBool("visualShowGrid", settings.other.visualShowGrid);
+            setBool("visualShowCardId", settings.other.visualShowCardId);
+            auto setTokenArray = [&](const char* key, std::vector<std::wstring>& target) {
+                if (!params.contains(key) || !params[key].is_array()) return;
+                target.clear();
+                for (const auto& el : params[key]) {
+                    if (!el.is_string()) continue;
+                    const std::wstring w = FromUtf8(el.get<std::string>());
+                    if (w.empty() || w.size() > 64) continue;
+                    bool tokenOk = true;
+                    for (const wchar_t c : w) {
+                        const bool chOk = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')
+                            || (c >= L'0' && c <= L'9') || c == L'_';
+                        if (!chOk) {
+                            tokenOk = false;
+                            break;
+                        }
+                    }
+                    if (!tokenOk) continue;
+                    if (target.size() < 80
+                        && std::find(target.begin(), target.end(), w) == target.end()) {
+                        target.push_back(w);
+                    }
+                }
+            };
+            setTokenArray("editorActionOrder", settings.other.editorActionOrder);
+            setTokenArray("editorHiddenActions", settings.other.editorHiddenActions);
+            setTokenArray("editorCustomActionOrder", settings.other.editorCustomActionOrder);
+            setTokenArray("editorCustomHiddenActions", settings.other.editorCustomHiddenActions);
+            if (params.contains("editorCatalogPreset") && params["editorCatalogPreset"].is_string()) {
+                settings.other.editorCatalogPreset = quickscript::NormalizeEditorCatalogPreset(
+                    FromUtf8(params["editorCatalogPreset"].get<std::string>()));
+            }
+            setBool("editorSearchAllActions", settings.other.editorSearchAllActions);
+            setBool("editorHideFixedVars", settings.other.editorHideFixedVars);
+            setBool("editorHideCoordVars", settings.other.editorHideCoordVars);
+            setBool("editorMultiResultPlaceholderOnly", settings.other.editorMultiResultPlaceholderOnly);
+            setBool("editorDisableModifyButton", settings.other.editorDisableModifyButton);
+            setBool("editorAutoSaveOnExit", settings.other.editorAutoSaveOnExit);
+            setBool("editorEnableBatchInsert", settings.other.editorEnableBatchInsert);
             if (params.contains("holdThresholdSeconds")) {
                 settings.other.holdThresholdSeconds = NormalizeHoldThresholdSeconds(
                     params["holdThresholdSeconds"].get<double>());
+            }
+            if (params.contains("uiScaleFactor")) {
+                settings.other.uiScaleFactor = quickscript::NormalizeUiScaleFactor(
+                    params["uiScaleFactor"].get<double>());
             }
         } else {
             return L"[错误] 无效的 category：" + category + L"。可选值：click, playback, other";
@@ -1638,9 +1789,10 @@ AgentTool MakeUpdateSettingsTool() {
         if (!SaveAppSettings(settings))
             return L"[错误] 保存设置失败。";
         undo.Success();
+        UiScaleSetUserFactor(settings.other.uiScaleFactor);
 
         return L"设置已更新（" + category + L" 分类）。\n"
-               L"回放类设置会在当前宏的下一轮循环自动生效；其他设置在下次启动宏时生效。";
+               L"回放类设置会在当前宏的下一轮循环自动生效；界面缩放倍率请在设置中点保存以立刻应用到窗口，或重启软件。";
     };
 
     return tool;

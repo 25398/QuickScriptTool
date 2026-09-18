@@ -2,8 +2,8 @@
 name: module-selftest
 description: >-
   QuickScriptTool 模块自检总索引。改窗口模式/定时任务/宏变量/脚本构建/坐标/脚本IO/
-  找图引擎/AI 路由/设置库/主题弹窗布局/脱离冷却/停止热键，或用户报 找图/绑窗/定时不触发/宏条件错/Agent 写坏动作/
-  主题窗裁切字号/按住键仍恢复宏/快捷键停止失灵时：读本 skill，选 suite，MSBuild Release 目标，跑 --json，exit 0 前不宣称修好。
+  找图引擎/OCR 找字解析/AI 路由/设置库/主题弹窗布局/脱离冷却/停止热键/连点间隔，或用户报 找图/绑窗/定时不触发/宏条件错/Agent 写坏动作/
+  主题窗裁切字号/按住键仍恢复宏/快捷键停止失灵/连点过短点不上时：读本 skill，选 suite，MSBuild Release 目标，跑 --json，exit 0 前不宣称修好。
   Prefer over guessing.
 ---
 
@@ -54,19 +54,21 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 | `coord_space` | `CoordSpaceSelfTest` | 换分辨率、coordMeta、n* 归一化、找图 scale | 下表 | `src/coord_space.cpp` |
 | `script_io` | `ScriptIoSelfTest` | 脚本存读丢字段、录制路径归类、坏 JSON | 下表 | `src/script_io.cpp` |
 | `image_match` | `ImageMatchSelfTest` | 阈值清零、NMS、金字塔/分数量化、冷冻位图找模板 | 下表 | `src/image_match*.cpp` / `image_match_internal.h` |
+| `ocr` | `OcrSelfTest` | OCR JSON 解析、找字（子串/全半角/邻行/模糊）、变量打包 | 下表 | `src/ocr_engine.cpp` |
 | `ai_action_router` | `AiActionRouterSelfTest` | Vision/Click/Tool/多轮分类、坐标映射、点击 JSON | 下表 | `src/ai_action_router.cpp` |
 | `agent_assistant` | `AgentAssistantSelfTest` | 对话编辑截断、撤销日志、白名单命令、文件工具、Skill 文件加载 | 下表 | `src/agent_undo.cpp`, `src/agent_shell.cpp`, `src/agent_core.cpp`, `tools/agent_assistant_selftest.cpp` |
 | `app_settings_store` | `AppSettingsStoreSelfTest` | 设置存读、theme/preview clamp、坏文件 | 下表 | `src/app_settings_store.cpp` |
 | `theme_ui` | `ThemeUiSelfTest` | 自定义主题/取色弹窗裁切、字号、随机色可用性 | 下表 | `src/theme_ui_layout.h`, `src/app_theme.cpp` |
 | `breakout_cooldown` | `BreakoutCooldownSelfTest` | 默认模式脱离：按住不计冷却、松开后 idle、新输入重置 | 下表 | `src/breakout_cooldown.h`, `src/breakout_input.h` |
-| `hotkey_stop` | `HotkeyStopSelfTest` | 运行中停止热键被吞/失灵、宏回放停不下来、键鼠假死 | 下表 | `src/hotkey_stop.h`, `src/engine/engine_hotkeys.cpp` |
+| `hotkey_stop` | `HotkeyStopSelfTest` | 运行中停止热键被吞/失灵、宏回放停不下来、键鼠假死、中文输入法仍触发热键 | 下表 | `src/hotkey_stop.h`, `src/ime_hotkey_pass.h`, `src/engine/engine_hotkeys.cpp` |
+| `clicker_timing` | `ClickerTimingSelfTest` | 连点自定义 0.001s 截成 0ms、按下抬起粘连、间隔毫秒量化 | 下表 | `src/clicker_timing.h`, `src/engine/engine_record_click.cpp` |
 | `recorder` | `RecorderSelfTest`（产物 `QstRecorderLogicTest.exe`） | 录制排序/转换/时间轴/调度器 | 下表 | `src/recorder*.cpp`, `src/input_timeline_scheduler.cpp` |
 | `virtual_hid` | `VirtualHidSelfTest` | VirtualHid 键/相对/绝对/滚轮注入；进程被杀须抬起（驱动 FileCleanup） | 下表 | `src/input/virtual_hid.*`, `input_emergency_teardown.*`, `driver/qst_vhid/` |
 | `injection` | `InjectionSelfTest` | 注入对抗测试：7 种注入技术 + PEB 隐藏 + XOR；`--inject <pid> <dll> <technique>` 驱动真实目标测试 | 见 `docs/anticheat-injection-testing.md` | `src/window_mode/injection/**`, `tools/injection_selftest.cpp`, `tools/injection_test_*.cpp` |
 
 ### 仍偏手工（无 exe）
 
-连点 / OCR / Agent 对话·附件·热键观感、以及「拖拽闪烁」等时序观感 — 见 `docs/comprehensive-test-cases.md`。停止热键策略已由 `HotkeyStopSelfTest` 覆盖；布局裁切/字号已由 `ThemeUiSelfTest` 覆盖。
+连点注入观感 / Agent 对话·附件·热键观感、以及「拖拽闪烁」等时序观感 — 见 `docs/comprehensive-test-cases.md`。OCR 解析与找字已由 `OcrSelfTest` 覆盖；安装/实机正确率仍偏手工。停止热键策略已由 `HotkeyStopSelfTest` 覆盖；布局裁切/字号已由 `ThemeUiSelfTest` 覆盖。连点间隔/按下抬起换算已由 `ClickerTimingSelfTest` 覆盖。
 
 ## FAIL → 源码
 
@@ -77,6 +79,7 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 | `resolve_match_var_brace` | `ResolveMacroVariables` / `LookupMatchVarProperty` |
 | `resolve_cur_loops` | `ResolveMacroVariables` (`ctrl:CurLoops()`) |
 | `decode_quick_input_escapes` | `DecodeQuickInputEscapes` |
+| `resolve_quick_input_var_escapes` | `ResolveQuickInputText`（未勾选丢掉 `{var}` 中的换行/Tab） |
 | `find_image_time_sec` | `ResolveFindImageTimeSec` |
 | `condition_compare_and_or` | `EvaluateConditionExpr` / `ParseConditionParts` |
 | `goto_step_from_literal` | `TryResolveGotoStepNo` |
@@ -89,6 +92,15 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 | `resolve_ctrl_hour_minute` | `ResolveMacroOperandImpl`（`ctrl:Hour()` / `ctrl:Minute()`） |
 | `resolve_ctrl_clipboard` | `ResolveMacroOperandImpl` / `ClipboardExpandMode`（`ctrl:Clipboard()`） |
 | `user_var_beats_magic_name` | `ResolveMacroOperandImpl`（用户变量优先于无前缀魔法名） |
+| `var_compute_return_exports` | `RunVarCompute`（`return` 导出；未 return 局部丢弃） |
+| `var_compute_clipboard_string` | `ResolveClipboardVarCompute`（文本或文件路径，不是 0/1） |
+| `var_compute_user_var_roundtrip` | `userVars` + `RunVarCompute` + 条件读取 |
+| `var_compute_optional_semi_newline` | `RunVarCompute` 换行/下一语句可省略 `;`，return 仍导出 |
+| `var_compute_string_compare_sign` | `RunVarCompute`（OCR 符号 `'+'`/`"+"` 比较；裸写 `+` 报运算符） |
+| `var_compute_split_string` | `RunVarCompute`（`split` / `[i]` / `.count` / `toInt`） |
+| `collect_varcompute_return_names` | `CollectVarComputeReturnNames` / `BuildQuickInputVarItems`（return 导出名进变量下拉） |
+| `resolve_match_list_index` | `ParseIndexedVarRef` / `LookupMatchListVar`（`matchRet[0].x` / `count` / `[n]` 为空） |
+| `build_quick_input_multimatch` | `BuildQuickInputVarItems`（MultiMatch 注册 `[n]` / `[0].x` / `count`） |
 
 ### ScriptActionBuilderSelfTest
 
@@ -110,14 +122,29 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 | `fragment_loop_skips_tree_check` | `BuildScriptActionsJsonArray(..., validateContainerBodies=false)` |
 | `indent_siblings_form_loop_body` | `ValidateContainerBodies`（indent=父级+1） |
 | `build_move_mouse_relative` | `BuildScriptActionFromJson` (`moveMouseRelative`) |
-| `inter_repeat_interval_*` | `ShouldWaitAfterRepeat` / `ActionUsesInterRepeatInterval`（`action_utils`；含 runMacro/runBlock） |
+| `inter_repeat_interval_*` | `ShouldWaitAfterRepeat` / `ActionUsesInterRepeatInterval`（`action_utils`；含 runMacro/runBlock；mouseDrag 否） |
+| `build_mousedrag_abs` | `BuildScriptActionFromJson` mouseDrag 绝对坐标；duration 为拖拽时长 |
+| `build_mousedrag_image_locate_requires_path` | mouseDrag `imageLocate=1` 缺 `imagePath` 失败 |
+| `lookup_mousedrag` | `LookupMacroActionSchema`（imageLocate/endX；脚注拖拽时长） |
+| `build_color_image_locate_requires_path` | getColor/colorMatch/findColor `imageLocate=1` 缺 `imagePath` 失败 |
+| `build_findcolor_followup_clamped` | findColor `followUp=saveImage` 钳到 2 |
+| `lookup_getcolor` | `LookupMacroActionSchema`（getColor 含 imageLocate） |
 | `build_runblock_repeat_fields` | `BuildScriptActionFromJson` runBlock/runMacro 重复字段 |
 | `build_mouseplayback_speed` | `BuildScriptActionFromJson` mousePlayback `playbackSpeed` |
 | `disassemble_*` | `DisassembleActionAt`（`action_disassemble.h`） |
 | `merge_*` | `MergeSelectedIntoContainer`（`action_assemble.h`） |
-| `build_findimage_save_image` | `ParseFollowUpValue` / FindImage `saveImage`→3 |
+| `flatten_watchimage_children` | `FlattenNestedActionParamList`（watchImage children） |
+| `flatten_watchimage_nested_rejected` | `FlattenNestedActionParamList`（watchImage 禁止写在 loop/if children 里） |
+| `lookup_watchimage_resume` | `LookupMacroActionSchema`（watchImage 续行含 resumeAfterWatch / watchMode） |
+| `build_watchimage_time_mode` | `BuildScriptActionFromJson` `watchMode=time` + `watchPollSeconds` |
+| `build_varcompute_code` | `BuildScriptActionFromJson` `varCompute` / `computeCode` |
+| `build_findimage_save_image` | `ParseFollowUpValue` / FindImage `saveImage`→3；有模板保留 `findTimeExpr` |
+| `build_multimatch_ok` | `BuildTypedAction` MultiMatch：缺 `imagePaths` 失败；mode/duration/followUp 钳 2；保留 `findTimeExpr` |
+| `build_multimatch_image_use_var` | MultiMatch 每槽 `imageUseVars` 不被强制关掉 |
+| `build_multimatch_hole_use_vars` | `imagePaths` 中间空槽不得把后面的 `imageUseVars` 错位 |
+| `lookup_multimatch` | `LookupMacroActionSchema(L"multiMatch")` |
 | `build_quickinput_parse_escapes` | `BuildScriptActionFromJson` QuickInput `parseEscapes` |
-| `resolve_key_nav_names` | `ResolveKeyVk`（Home/Up/Right/Delete 等须映射真 VK，禁止首字母回落） |
+| `resolve_key_nav_names` | `ResolveKeyVk`（Home/Up/Right/Delete/`←` 等须映射真 VK，禁止首字母或 U+2190 回落） |
 | `reject_unknown_keytext` | `ResolveKeyVk` / `BuildScriptActionFromJson`（未知多字符键名须拒绝） |
 
 ### 重复间隔语义（脚本动作，非连点器）
@@ -127,7 +154,7 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 - `clickCount` = 重复次数
 - `duration` / `randomDuration` = **相邻两次之间**的间隔
 - `clickCount=1`：完全不等待；不在第一次之前、最后一次之后插入等待
-- 与 `wait` 动作的 `duration`（整段阻塞等待）不同；`quickInput.charInterval` 是字间间隔
+- 与 `wait` 动作的 `duration`（整段阻塞等待）不同；`mouseDrag.duration` 是按下到松开的拖拽时长，不是重复间隔；`quickInput.charInterval` 是字间间隔
 
 Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此一致。
 
@@ -136,11 +163,14 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | name | 优先查看 |
 |------|----------|
 | `standard_meta_*` / `save_meta_*` / `exec_meta_*` | `StandardScriptCoordMeta` / `BuildScriptCoordMetaForSave` / `ScriptCoordMetaForExecution` |
-| `coordmeta_json_*` / `has_coordmeta_*` | `WriteCoordMetaJson` / `ParseCoordMetaJson` / `HasCoordMetaJson` |
+| `coordmeta_json_*` / `has_coordmeta_*` | `WriteCoordMetaJson` / `ParseCoordMetaJson` / `HasCoordMetaJson`（`space`/`ref*` 在 `coordMeta` 对象内，须先取出该对象再 Extract） |
 | `normalize_move_*` / `migrate_*` | `NormalizeActionCoords` / `MigrateLegacyScriptToNormalized` |
 | `normalize_relative_skip` | `NormalizeActionCoords`（相对移动不得归一化） |
+| `normalize_mousedrag_end_nstar` | `NormalizeActionCoords`（mouseDrag `endX/endY` → `nEndX/nEndY`；`imageLocate` 按模板尺寸） |
+| `getcolor_imagelocate_xy_roundtrip` | `SyncMouseDragNorm` / `DenormMouseDragPixels`（getColor 找图定位 x/y 相对模板） |
+| `var_image_offset_norm_from_producer` | `SyncNormFieldsFromPixels`（变量图 offset 跟前序「保存图片」搜索区/相对区，不跟屏幕） |
 | `template_scale_*` / `exec_find_opts_*` | `ComputeTemplateScale` / `BuildExecutionFindImageOptions` |
-| `resolve_click_point_*` | `ResolveFindImageClickPoint` |
+| `resolve_click_point_*` | `ResolveFindImageClickPoint`（含窗口模式命中框映射后偏移跟框缩放） |
 
 ### ScriptIoSelfTest
 
@@ -155,7 +185,21 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `mouse_playback_speed_roundtrip` | `ParseScriptActionBlock` / `WriteActionJson` `playbackSpeed` |
 | `write_norm_xy_keeps_pixel` | `WriteActionJson`（n* 须 max_digits10，禁默认 precision=6） |
 | `write_norm_xy_keeps_pixel` | `WriteActionJson`（n* 须 max_digits10，禁默认 precision=6） |
-| `parse_findimage_save_image` | `findImageFollowUp=3` / `imageUseVar` 读写 |
+| `parse_findimage_save_image` | `findImageFollowUp=3` / `imageUseVar` 读写；有模板保留 `findTimeExpr` |
+| `parse_multimatch_roundtrip` | `multiMatch` `imagePaths` / mode / sort；`followUp=2` 保留 `findTimeExpr` |
+| `parse_multimatch_template_t_path` | `imagePaths` 含 `template_` 不得把 `\t` 吃成 `imagestemplate_` |
+| `parse_multimatch_image_use_vars` | `imageUseVars` 与变量图槽位 roundtrip |
+| `parse_multimatch_hole_use_vars` | `imagePaths` 中间空槽不得把后面的 `imageUseVars` 错位 |
+| `resolve_imagestemplate_typo` | 旧 `\t` 吃路径后 `imagestemplate_` 应找回 `template_` |
+| `parse_watchimage_resume` | `watchImage` / `resumeAfterWatch` 读写 |
+| `parse_watchimage_time_mode` | `watchImage` `watchMode` / `watchPollSeconds` 读写 |
+| `parse_mousedrag_abs` | `mouseDrag` `endX/endY`/`duration`/`imageLocate=0` 读写 |
+| `parse_mousedrag_image_locate` | `mouseDrag` 找图定位 `imagePath` + 相对偏移读写 |
+| `parse_color_actions_image_locate` | getColor/colorMatch/findColor `imageLocate` + `imagePath` 读写 |
+| `parse_findcolor_keeps_find_time` | findColor `followUp=2` 保留 `findTimeExpr`；`followUp=3` 钳到 2；findImage `followUp=2` 同样保留 |
+| `save_load_color_image_locate` | Save/Load 找图定位按模板归一化；zip 收集图路径 |
+| `load_imagelocate_norm_xy_not_pixels` | getColor `imageLocate` `nx>1.5` 不得当像素重解析 |
+| `parse_varcompute_code` | `varCompute` / `computeCode` 读写 |
 | `parse_quickinput_escapes` | `ParseScriptActionBlock` / `WriteActionJson` `parseEscapes` |
 | `looks_like_file_path` | `LooksLikeFilePath` (`image_var_util`) |
 | `window_relative_pixel_xy` | `ParseScriptActionBlock` `windowRelative` 像素路径 |
@@ -164,6 +208,13 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `script_default_mode_not_revived` | `SaveScriptFileData`/`LoadScriptFileData`：`scripts` 路径明确 `enabled=0` 不得复活窗口模式 |
 | `recording_wipes_editor_window_mode` | `SaveScriptFileData`：普通录制仍强制关残留 `windowMode` |
 | `save_after_load_false_keeps_xy` | `SaveScriptFileData`：`Load(..., false)` 后改 wait 再存不得冲掉 n* |
+| `find_json_by_filename_nested` | `FindScriptJsonByFileName` 递归子目录 |
+| `resolve_library_stale_root_path` | `ResolveLibraryScriptPath`：根路径失效后按文件名找回子文件夹 |
+| `resolve_library_outside_rejected` | `ResolveLibraryScriptPath` 拒绝目录外文件 |
+| `retarget_nested_runmacro_path` | `RetargetNestedLibraryScriptPaths` 改写 `runMacro` `targetPath` |
+| `resolve_library_chinese_folder` | `ResolveLibraryScriptPath` 中文子文件夹：旧根路径 + 真实路径 |
+| `save_load_visual_layout_roundtrip` | `visualLayout` 顶层对象存读（画布坐标；引擎忽略） |
+| `parse_arrow_keytext_vk` | `ParseScriptActionBlock`：`←` / `keyVk=8592` → `VK_LEFT` |
 
 ### ImageMatchSelfTest
 
@@ -171,10 +222,30 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 |------|----------|
 | `normalize_match_*` | `NormalizeMatchVarResult` |
 | `match_center_*` / `click_point_*` | `FindImageMatchCenter` / `FindImageClickPoint` / `FindImageRelativeClickOffset` |
+| `var_offset_anchor_screen_center` | `SynthesizeSearchRectCenterMatch`（选偏移：变量图锚框画在屏幕中心） |
 | `pyramid_*` / `score_*` / `threshold01_*` | `image_match_internal.h` |
 | `nms_*` | `GlobalNms` |
+| `findpeaks_sqdiff_keeps_two_minima` | `FindPeaks` / `SuppressPeak`（SQDIFF 抑制填值） |
 | `frozen_bitmap_*` | `FindTemplateInFrozenScreenMulti` |
+| `similar_buttons_only_true_match` / `unrelated_scene_rejected` | `MatchInGrayMatsMultiVerify` 像素容差验收（禁 NCC 裸兜底） |
+| `repeated_template_finds_all` | 定位峰抑制过松会只剩 1 框；`kLocatePeakMaxOverlap` |
+| `offset_pick_max_matches_one` | 选偏移点 `maxMatches=1` 只留最佳一处 |
+| `nearest_match_offset_not_first` | `FindNearestImageMatch`：相对偏移不得永远用第一框 |
+| `alpha_mask_ignores_transparent` | PNG alpha mask（透明像素不得当黑边） |
+| `alpha_padded_near_edge` | 透明边伸出搜索区时不得误拒贴边不透明内容 |
 | `perfect_match_*` | `MatchPerfectPixel`（完美匹配像素终审） |
+
+### OcrSelfTest
+
+| name | 优先查看 |
+|------|----------|
+| `parse_success_lines` / `parse_unicode_escape` / `parse_failure_error` | `ParseOcrEngineJson` / `ParseOcrJson` |
+| `find_exact_substring` / `find_fullwidth_digits` / `find_ignores_spaces` | `FindTextInOcrLines` / `NormalizeOcrSearchText` |
+| `find_adjacent_lines` | `FindTextInOcrLines` 邻行拼接 |
+| `find_fuzzy_close` | `FindTextInOcrLines` Levenshtein |
+| `find_empty_or_miss` | 空目标 / 无关文本不得命中 |
+| `concat_lines_newline` | `ConcatOcrLines` |
+| `make_ocr_vars` | `MakeOcrTextVarResult` / `MakeOcrSearchVarResult` |
 
 ### AiActionRouterSelfTest
 
@@ -206,7 +277,9 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `adaptive_refine_gate` | `ShouldAcceptCoarseLocateWithoutRefine`（紧凑跳过二级 / 过小过大不跳） |
 | `planner_observe_image_attach` | `ShouldAttachObserveImageToPlanner`（纯文本规划不附观察图） |
 | `model_supports_vision` / `resolve_vision_subtask_*` | `ModelSupportsVision` / `ResolveVisionSubtaskModelName` |
-| `task_data_cleared_on_reset` | `ResetAiActionSessionState` 须清空 `aiData`（防串上轮 historyRecords） |
+| `page_snapshot_format_and_ref` | `FormatPageSnapshotForAgent` 可视/屏外覆盖；列表第1项=重复卡片最上最左 |
+| `click_ref_navigates_space_href` | 身份卡 href 才直接打开；列表内容卡点元素 |
+| `web_browse_allows_vision_fallback` | 扩展是优化层：树上没有或未装扩展时允许 `locateAndClick` 识图兜底 |
 
 ### AppSettingsStoreSelfTest
 
@@ -214,8 +287,13 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 |------|----------|
 | `default_*` / `settings_path_*` | `DefaultAppSettings` / `AppSettingsFilePath` |
 | `load_missing_*` / `load_garbage_*` | `LoadAppSettings` |
-| `save_load_*` / `theme_id_*` / `custom_theme_*` / `wm_preview_*` / `save_load_playback_speed` / `playback_speed_scale_math` / `save_load_home_ui_mode` | `SaveAppSettings` / clamp in load / `ScalePlaybackTimeSeconds` / `RecordingPlaybackTimeScale` |
+| `save_load_*` / `theme_id_*` / `custom_theme_*` / `wm_preview_*` / `save_load_playback_speed` / `playback_speed_scale_math` / `save_load_home_ui_mode` / `save_load_other_os_flags` / `save_load_float_ball` / `float_ball_geom_dock_expand` / `save_load_ui_scale_factor` / `save_load_editor_default_view` / `save_load_editor_visual_flags` / `save_load_editor_action_catalog` / `save_load_editor_var_filters` | `SaveAppSettings` / clamp in load / `ScalePlaybackTimeSeconds` / `RecordingPlaybackTimeScale` / `playSoundOnEnd` / `NormalizeUiScaleFactor` / `NormalizeEditorDefaultView` / `other.editorActionOrder` / `other.editorHiddenActions` / `other.editorCatalogPreset` / `other.editorSearchAllActions`（缺 key/junk→`all` / 搜索默认关） / `editorHideFixedVars` / `editorHideCoordVars` / `editorMultiResultPlaceholderOnly`（默认关） / `other.showFloatBall` / `src/desktop_tools/float_ball_geom.h` |
 | `save_load_scheduled_conflict_policy` | `scheduledTaskConflictPolicy` 存读 + clamp 0..1；`scheduledTaskAutoResume` 存读 |
+| `try_load_missing_leaves_out` | `TryLoadAppSettings` 缺文件失败且不改 out |
+| `load_omits_auto_hide_keeps_default` | `LoadOtherSettings` 缺 `autoHideMainWindow` 保持默认 true；助手窗/部分保存不得把「运行后自动隐藏主窗口」写成 false |
+| `home_runtime_save_preserves_playback` | `SaveAppSettingsPreserveUserSettings`：home 选中叠上去，playback/ai/uiMode 不被引擎过期内存覆盖 |
+| `startup_wav_*` / `finish_wav_path_sidecar` | `IsPlayableWavFile` / `AppFinishSoundFilePath`。启动/结束音缺文件或 PlaySound 失败均回退 `MessageBeep(MB_OK)` |
+| `path_is_under_root` / `webview_userdata_*` / `webview_fetchdata_*` | `PathIsUnderRoot` / `ResolveWebView2UserDataDir`：Program Files 漫游 LocalAppData，便携目录旁路 |
 
 ### AgentAssistantSelfTest
 
@@ -227,11 +305,15 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `skill_optimize_directs_to_tools` | `.cursor/skills/agent-optimize/SKILL.md` |
 | `skill_script_tree_and_plan` | `.cursor/skills/agent-script/SKILL.md` / `MakePlanScriptActionsTool` |
 | `write_script_rejects_empty_loop` | `ValidateContainerBodies`（writeScript 不得绕过空循环） |
-| `recopt_*` | `src/recording_optimize_ops.cpp` 按关键动作分段合并（与产品对话框共用） |
+| `recopt_*` | `src/recording_optimize_ops.cpp` 按关键动作分段合并/压缩（与产品对话框共用） |
 | `clipboard_roundtrip` | `copyAgentTextToClipboard` / `pasteAgentClipboardText` |
 | `conversation_draft_roundtrip` | `SaveAgentConversationDraft`（无轮次草稿不进列表） |
 | `empty_conversation_not_listed` | 空会话关窗不得写入 `index.json` |
 | `conversation_with_round_is_listed` | 有用户轮次仍进列表（防误伤） |
+| `conversation_title_rejects_api_error` | `IsUsableConversationTitle` / 加载时回退首条用户消息 |
+| `user_facing_tool_reply_strips_outline` | `AgentUserFacingToolReply`（终态回复去动作一览） |
+| `outline_header_has_no_user_constraints` | `FormatScriptActionsOutline` 标题不得含对用户约束 |
+| `skill_reply_forbids_dumping_constraints` | `kSkillReply` / `AgentSkillGet(reply)` |
 
 ### ThemeUiSelfTest
 
@@ -260,12 +342,27 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 |------|----------|
 | `busy_physical_down_stops` | `ShouldStopOnToggleKeyDown`（忙碌物理键必须停） |
 | `busy_needkeyup_does_not_stop` | 启动键仍按着（自动连发）不得停 |
-| `busy_injected_down_ignored` | 注入/ExtraInfo 不得当停止 |
+| `busy_tagged_down_ignored` | ExtraInfo 脚本注入不得当停止 |
+| `busy_remote_injected_down_stops` | 远控 LLKHF_INJECTED（无 ExtraInfo）忙碌必须停 |
 | `idle_needkeyup_blocks_start` / `idle_physical_can_start` | `ShouldStartOnToggleKeyDown` |
-| `physical_up_clears_latch` / `injected_up_does_not_clear` | `ShouldClearToggleLatchOnKeyUp` |
+| `idle_remote_injected_can_start` / `idle_tagged_blocks_start` | 远控 INJECTED 可启动；ExtraInfo 不得启动 |
+| `physical_up_clears_latch` / `tagged_up_does_not_clear` / `remote_injected_up_clears` | `ShouldClearToggleLatchOnKeyUp` |
 | `poller_*` | `TickPoller`（松手后再按才紧急停止） |
 | `idle_fallback_*` / `toggle_consume_*` / `ll_owns_*` | `TickIdleStart` / `TryConsumeTogglePress`（全屏游戏 RegisterHotKey/LL 哑火时的空闲启动兜底） |
 | `busy_stop_honors_emergency_if_consume_stuck` / `busy_stop_blocks_duplicate_without_emergency` | `AllowBusyToggleStop`（非管理员+提权游戏：启动次消费闩粘死时紧急停止仍须停） |
+| `ime_pass_idle_native_blocks` / `ime_pass_composing_blocks` | `ime_hotkey_pass.h`：中文转换模式/组字必须挡 |
+| `ime_pass_tsf_english_hkl_blocks` | Win11 TSF：英文 HKL 但 native 仍须挡；仅 OpenStatus 不得挡 |
+| `ime_pass_english_mode_allows` / `ime_pass_us_keyboard_allows` | 拼音 Shift 英文（中文 HKL+IME 开、非 native）必须放行 |
+
+### ClickerTimingSelfTest
+
+| name | 优先查看 |
+|------|----------|
+| `custom_1ms_is_1000us` | `ClickerGapUs` / `ClickerSecondsToUs`（禁止 `int(seconds*1000)`） |
+| `hold_always_at_least_1ms` | `ClickerHoldUs`（未启用按下抬起仍保留 1ms 脉冲） |
+| `hold_uses_press_release_when_longer` | `ClickerHoldUs` |
+| `gap_extreme_10ms` | `ClickerGapUs` |
+| `old_ms_truncation_drops_sub_ms` | `ClickerSecondsToUs`（亚毫秒不得截成 0） |
 
 ### RecorderSelfTest
 

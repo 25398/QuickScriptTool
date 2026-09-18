@@ -1,16 +1,21 @@
 #include "ai_action_service.h"
+#include "ai_fast_paths.h"
 
 #include "action_utils.h"
 #include "agent_ai_actions.h"
 #include "agent_web.h"
 #include "ai_action_lookahead.h"
 #include "ai_action_router.h"
+#include "ai_locate_verify.h"
 #include "ai_logic_convert.h"
 #include "color_match.h"
 #include "image_match.h"
+#include "opencv_runtime.h"
 #include "macro_execute_tools.h"
+#include "page_snapshot.h"
 #include "script_action_builder.h"
 #include "utils.h"
+#include "window_mode/ui_element_probe.h"
 
 #include <opencv2/opencv.hpp>
 
@@ -148,7 +153,7 @@ std::vector<uint8_t> Base64Decode(const std::string& data) {
 }
 
 cv::Mat DecodeBase64Image(const std::string& base64) {
-    if (base64.empty()) return {};
+    if (base64.empty() || !OpenCvAvailable()) return {};
     const std::vector<uint8_t> bytes = Base64Decode(base64);
     if (bytes.empty()) return {};
     try {
@@ -163,7 +168,7 @@ cv::Mat DecodeBase64Image(const std::string& base64) {
 
 
 cv::Mat MatFromBitmap(HBITMAP hbmp) {
-    if (!hbmp) return {};
+    if (!hbmp || !OpenCvAvailable()) return {};
     BITMAP bm{};
     if (!GetObject(hbmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) return {};
 
@@ -479,6 +484,79 @@ AgentSendCallbacks MakeAiMacroSendCallbacks(AiMacroLogFn logFn, const std::atomi
             }
             return;
         }
+        if (name == L"observePage" || name == L"clickRef" || name == L"typeRef"
+            || name == L"searchOnPage") {
+            logFn(L"  调用工具：" + name + L"（网页扩展 DOM）");
+            try {
+                const nlohmann::json j = nlohmann::json::parse(ToUtf8(args));
+                if (name == L"observePage") {
+                    std::wstring q;
+                    if (j.contains("query") && j["query"].is_string())
+                        q = FromUtf8(j["query"].get<std::string>());
+                    const bool force = j.contains("force") && j["force"].is_boolean()
+                        && j["force"].get<bool>();
+                    if (!q.empty())
+                        logFn(L"    query=" + TruncateForLog(q, 80));
+                    if (force) logFn(L"    force=true");
+                    if (q.empty() && !force)
+                        logFn(L"    抓当前标签控件树");
+                } else if (name == L"searchOnPage") {
+                    std::wstring q;
+                    if (j.contains("query") && j["query"].is_string())
+                        q = FromUtf8(j["query"].get<std::string>());
+                    logFn(L"    query=" + (q.empty() ? L"?" : TruncateForLog(q, 80)));
+                } else {
+                    std::wstring ref;
+                    if (j.contains("ref") && j["ref"].is_string())
+                        ref = FromUtf8(j["ref"].get<std::string>());
+                    std::wstring extra;
+                    if (name == L"typeRef" && j.contains("text") && j["text"].is_string())
+                        extra = L" text=" + TruncateForLog(
+                            FromUtf8(j["text"].get<std::string>()), 40);
+                    if (name == L"typeRef" && j.contains("submit") && j["submit"].is_boolean()
+                        && j["submit"].get<bool>())
+                        extra += L" submit=true";
+                    if (name == L"clickRef" && j.contains("doubleClick") && j["doubleClick"].is_boolean()
+                        && j["doubleClick"].get<bool>())
+                        extra += L" 双击";
+                    logFn(L"    ref=" + (ref.empty() ? L"?" : ref) + extra);
+                }
+            } catch (...) {
+                logFn(L"    参数=" + TruncateForLog(args, 160));
+            }
+            return;
+        }
+        if (name == L"runCommand") {
+            // runCommand 不是动作类型（动作层是 runProgram）：预览按「命令行」打印，
+            // 否则日志会出现「未知动作类型：runCommand」，看着像工具坏了。
+            logFn(L"  调用工具：runCommand（命令行 → 运行程序动作，可回放）");
+            try {
+                const nlohmann::json j = nlohmann::json::parse(ToUtf8(args));
+                std::wstring shell = L"powershell";
+                if (j.contains("shell") && j["shell"].is_string()) {
+                    const std::wstring s = FromUtf8(j["shell"].get<std::string>());
+                    if (s == L"cmd") shell = L"cmd";
+                }
+                std::wstring cmd;
+                if (j.contains("command") && j["command"].is_string())
+                    cmd = FromUtf8(j["command"].get<std::string>());
+                logFn(L"    " + shell + L" 命令：" + TruncateForLog(cmd, 160));
+            } catch (...) {
+                logFn(L"    参数=" + TruncateForLog(args, 160));
+            }
+            return;
+        }
+        // 「本地工具」：名字不是动作类型（动作层没有 invokeUiControl/clickRef/…），
+        // 别按动作类型去解析预览（否则日志出现「未知动作类型：invokeUiControl」）。
+        if (name == L"invokeUiControl" || name == L"listUiControls" || name == L"locateAndClick"
+            || name == L"clickRef" || name == L"typeRef" || name == L"typeByLabel"
+            || name == L"searchOnPage" || name == L"observePage" || name == L"computer"
+            || name == L"readDocument") {
+            logFn(L"  调用工具：" + name + L"（本地工具，经宿主落成动作）");
+            if (!args.empty() && args != L"{}")
+                logFn(L"    参数=" + TruncateForLog(args, 200));
+            return;
+        }
         if (IsMacroActionRunToolName(name) && name != L"submitMacroActions") {
             logFn(L"  调用工具：" + name + L"（规范动作）");
             try {
@@ -536,6 +614,12 @@ AgentSendCallbacks MakeAiMacroSendCallbacks(AiMacroLogFn logFn, const std::atomi
             return;
         }
 
+        if (name == L"observePage" || name == L"clickRef" || name == L"typeRef"
+            || name == L"searchOnPage") {
+            logFn(L"  扩展返回：" + TruncateForLog(result, 240));
+            return;
+        }
+
         if (result.rfind(L"[EXECUTED]", 0) == 0) {
             if (IsSubmitSkipObserveToolResult(result))
                 logFn(L"  工具返回：本批动作已即时执行（同轮继续，跳过截屏）");
@@ -560,7 +644,7 @@ AgentSendCallbacks MakeAiMacroSendCallbacks(AiMacroLogFn logFn, const std::atomi
 
 
 std::string BitmapToBase64Jpeg(HBITMAP hBitmap, int quality, double scale) {
-    if (!hBitmap) return {};
+    if (!hBitmap || !OpenCvAvailable()) return {};
     try {
         cv::Mat mat = MatFromBitmap(hBitmap);
         if (mat.empty()) return {};
@@ -653,6 +737,36 @@ std::vector<std::string> EncodeClipboardSnapshotImages(const MacroClipboardSnaps
         DeleteBitmapHandle(bmp);
     }
     return out;
+}
+
+bool DrawPredictionCrossOnBitmap(HBITMAP bmp, int cx, int cy, int armPx, int lineWidth) {
+    if (!bmp) return false;
+    BITMAP bm{};
+    if (!GetObjectW(bmp, sizeof(bm), &bm)) return false;
+    const int w = bm.bmWidth;
+    const int h = bm.bmHeight;
+    if (w <= 2 || h <= 2) return false;
+    if (cx < 0 || cy < 0 || cx >= w || cy >= h) return false;
+    const int arm = (std::max)(4, armPx);
+    const int lw = (std::max)(1, lineWidth);
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return false;
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    HPEN pen = CreatePen(PS_SOLID, lw, RGB(255, 0, 0));
+    HGDIOBJ oldPen = pen ? SelectObject(dc, pen) : nullptr;
+    const int x1 = (std::max)(0, cx - arm);
+    const int x2 = (std::min)(w - 1, cx + arm);
+    const int y1 = (std::max)(0, cy - arm);
+    const int y2 = (std::min)(h - 1, cy + arm);
+    MoveToEx(dc, x1, cy, nullptr);
+    LineTo(dc, x2, cy);
+    MoveToEx(dc, cx, y1, nullptr);
+    LineTo(dc, cx, y2);
+    if (oldPen) SelectObject(dc, oldPen);
+    if (pen) DeleteObject(pen);
+    SelectObject(dc, oldBmp);
+    DeleteDC(dc);
+    return true;
 }
 
 AiImageEncodeResult EncodeBitmapForAiZoomUpload(HBITMAP hBitmap, int targetLongEdge) {
@@ -799,7 +913,16 @@ std::unique_ptr<AgentCore> CreateAiActionExecuteCore(
 
     cfg.temperature = temperatureOverride >= 0.0 ? temperatureOverride : profile.temperature;
 
-    cfg.maxTokens = profile.maxTokens > 0 ? std::min(profile.maxTokens, 2048) : 2048;
+    // ★AI 动作执行默认**允许思考**（用户选定的策略），而思考 token 也算在 max_tokens 里：
+    //   原来这里硬钳 2048，长思考会**中途被截断**（finish_reason=length）→ 触发
+    //   「改用完整响应重试（省略截图）」→ 重试若整段都是思考、正文为空，网关直接回
+    //   「服务器返回空响应」→ 整个宏当场结束（用户实测第十三次日志）。所以工具轮给足 8k，
+    //   上限仍收到 16k（再高会把单轮思考拖成「卡死」，见 webview_bridge_backend 的注释）。
+    constexpr int kAiActionToolMaxTokensFloor = 8192;
+    {
+        const int want = profile.maxTokens > 0 ? profile.maxTokens : kAiActionToolMaxTokensFloor;
+        cfg.maxTokens = std::clamp((std::max)(want, kAiActionToolMaxTokensFloor), 2048, 16384);
+    }
 
     cfg.recvTimeoutMs = std::max(5000, recvTimeoutMs);
 
@@ -1212,7 +1335,7 @@ std::wstring BuildAiActionExecuteTextSystemPrompt() {
 int ResolveAiActionExecuteTimeoutSec(int userTimeoutSec, bool withImage) {
     const int base = userTimeoutSec > 0 ? userTimeoutSec : 30;
     if (withImage) return std::max(base, 90);  // 与图片分析对齐；过长只会让用户干等
-    return std::max(base, 45);
+    return std::max(base, 60);
 }
 
 /// 单次识图定位：上限更短，避免「找不到」时干等 90s×2 级
@@ -1282,7 +1405,6 @@ ChatMessage BuildAiUserMessage(const std::wstring& text, const std::string& scre
 
 
 AiActionResult RunVisionMessage(
-
     AgentCore* core,
 
     const ChatMessage& msg,
@@ -1491,7 +1613,35 @@ AiActionResult FinalizeToolActionsResult(
 
 }  // namespace
 
-
+// ★必须在文件作用域（同 planSpend 门槛的教训）：放进上面的匿名 namespace 会变成内部链接，
+//   engine_script_run.cpp 引用时报 LNK2019「无法解析的外部符号」。已踩第二次，勿再犯。
+AiActionResult RunAiOneShotVisionQuery(
+    const std::wstring& modelName,
+    const std::vector<quickscript::AiModelProfile>& savedModels,
+    const std::wstring& fallbackApiUrl,
+    const std::wstring& fallbackApiKey,
+    const std::wstring& systemPrompt,
+    const std::wstring& userPrompt,
+    const std::string& imageBase64,
+    int recvTimeoutMs,
+    const std::atomic_bool& stopFlag,
+    AiHttpAbortSlot* httpAbort) {
+    AiActionResult out;
+    if (imageBase64.empty()) {
+        out.ok = false;
+        out.errorMessage = L"一次性识图：没有图片";
+        return out;
+    }
+    auto core = CreateAiActionCore(modelName, savedModels, fallbackApiUrl, fallbackApiKey,
+        systemPrompt, recvTimeoutMs);
+    if (!core) {
+        out.ok = false;
+        out.errorMessage = L"一次性识图：无法创建识图客户端";
+        return out;
+    }
+    const ChatMessage msg = BuildAiUserMessage(userPrompt, imageBase64);
+    return RunVisionMessage(core.get(), msg, 0, stopFlag, nullptr, httpAbort);
+}
 
 ZoomRefineLocateResult ExecuteZoomRefineLocate(
     AgentCore* core,
@@ -1503,7 +1653,10 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
     const std::atomic_bool& stopFlag,
     AiMacroLogFn logFn,
     AiHttpAbortSlot* httpAbort,
-    ZoomRefineLocateOptions opts) {
+    ZoomRefineLocateOptions opts,
+    const std::vector<AiUiAnchor>* uiAnchors,
+    AiLocateVerdict* outVerdict,
+    std::wstring* outVerdictWhy) {
     ZoomRefineLocateResult out;
     if (!core) {
         out.errorMessage = L"无 AI 客户端";
@@ -1533,6 +1686,10 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
     int priorBoxMaxSide = 0;
     int startLevel = 0;
     int effectiveMaxLevels = maxLevels;
+    // 循环外留档：本地校验要用最后一个有效定位的框尺寸与候选一致性
+    int finalBoxW = 0;
+    int finalBoxH = 0;
+    double finalClusterAgreement = 1.0;
 
     auto finishWithPrior = [&](int levelsUsed, const wchar_t* why) -> ZoomRefineLocateResult {
         if (logFn) {
@@ -1627,6 +1784,14 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
     };
 
     // ZoomClick 风格：按粗框/收缩比裁屏，再上采样到 uploadLongEdge
+    // 「上一轮预测点红叉」：默认开（可用 QST_NO_PRED_CROSS=1 关掉做 A/B ——
+    // 研究结论是叠加类改动**按模型分档**，通用 VLM 收益大、原生 grounding 模型可能变差）
+    bool zoomMarkPrevPrediction = true;
+    {
+        wchar_t envBuf[8]{};
+        if (GetEnvironmentVariableW(L"QST_NO_PRED_CROSS", envBuf, 8) > 0) zoomMarkPrevPrediction = false;
+    }
+    bool zoomCropHasMarker = false;
     auto advanceZoomCrop = [&](int centerX, int centerY, int boxW, int boxH) -> bool {
         try {
             const int prevW = std::max(1, curMap.capX2 - curMap.capX1);
@@ -1639,8 +1804,16 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
                 side = static_cast<int>(boxMax * pad);
                 side = std::clamp(side, 80, 200);
             } else if (boxW > 0 && boxH > 0) {
-                side = static_cast<int>(boxMax * std::max(1.5, opts.bboxPadFactor));
-                side = std::clamp(side, opts.minRoiSide, opts.maxRoiSide);
+                // ★「裁多大」决定了二级精炼到底有没有用：上传长边是固定的（默认 768），
+                //   所以 ROI 越小、目标在上传图里就越大。实测日志里 720×720 → 768×768
+                //   只有 ×1.07（等于没放大，白花一轮 API）。研究结论（ScreenSeekR / MEGA-GUI /
+                //   ScreenSpot-Pro 排行榜被 "Zoom In" 两遍法主导）都指向同一个方向：
+                //   第二遍必须在**明显放大**的画面里指。这里按粗框尺寸自适应：
+                //   ROI ≈ 粗框 + 两侧各留 max(60px, 0.6×粗框) 的容错（粗框常有 40~60px 误差），
+                //   于是典型小按钮能拿到 ~1.8× 有效放大，而不是 1.07×。
+                const int slack = (std::max)(60, boxMax * 3 / 5);
+                side = boxMax + slack * 2;
+                side = std::clamp(side, (std::max)(256, opts.minRoiSide), opts.maxRoiSide);
             } else {
                 side = static_cast<int>(std::min(prevW, prevH) * std::clamp(opts.shrinkRatio, 0.25, 0.85));
                 side = std::clamp(side, opts.minRoiSide, opts.maxRoiSide);
@@ -1659,6 +1832,24 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
             if (!crop) {
                 if (logFn) logFn(L"  [诊断] Zoom 截屏失败");
                 return false;
+            }
+            // ★在放大图上标出「上一轮预测点」红叉（PrecisionCUA 的闭环形态，本机绘制 <1ms）：
+            //   模型看得见自己上一轮落在哪，就能校正系统性偏移（实测我们那次 y 低了 63px）。
+            //   纪律：① 只标**上一轮**那个点，不累积；② 仍要求**绝对坐标**，不要 dx/dy
+            //   （同一论文里「让模型用锚点估算相对位置」的提示词反而把 41.0% 打到 18.5%）；
+            //   ③ 验证/下一轮一律回到干净图（Midscene 明确要求模型「忽略一切标注叠加」）。
+            if (zoomMarkPrevPrediction) {
+                const int cropSide = (std::max)(roiX2 - roiX1, roiY2 - roiY1);
+                const int arm = (std::max)(10, cropSide / 20);      // ≈图像宽高 5%
+                const int penW = (std::max)(2, cropSide / 160);
+                zoomCropHasMarker = DrawPredictionCrossOnBitmap(
+                    crop, centerX - roiX1, centerY - roiY1, arm, penW);
+                if (logFn && zoomCropHasMarker) {
+                    logFn(L"  [诊断] 放大图已标注上一轮预测点红叉（"
+                        + std::to_wstring(centerX - roiX1) + L","
+                        + std::to_wstring(centerY - roiY1) + L"，臂长 "
+                        + std::to_wstring(arm) + L"px）→ 让模型校正落点偏差");
+                }
             }
             const int uploadEdge = opts.uploadLongEdge > 0 ? opts.uploadLongEdge : 768;
             const AiImageEncodeResult enc = EncodeBitmapForAiZoomUpload(crop, uploadEdge);
@@ -1712,7 +1903,8 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
                 locatePhrase.empty() ? userTask : locatePhrase, curApiW, curApiH);
         } else {
             prompt = BuildCompositeRefinePointPrompt(
-                locatePhrase.empty() ? userTask : locatePhrase, level, curApiW, curApiH);
+                locatePhrase.empty() ? userTask : locatePhrase, level, curApiW, curApiH,
+                zoomCropHasMarker);
         }
         if (logFn) {
             logFn(L"  [诊断] locate 第 " + std::to_wstring(level + 1) + L"/"
@@ -1767,7 +1959,76 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
         std::wstring coordNote;
         bool coordsWereRemapped = false;
 
-        if (haveBox) {
+        // ── 多候选聚类 + UIA 融合（对齐 MVP/GUI-Actor/UFO²）─────────────
+        // 一级整图：模型可能给了多行候选。先把它们逐个归一到上传图坐标 → 屏幕坐标，
+        // 再和 UIA 控件框做 IoU 去重：命中控件就直接用控件的精确框（比 VLM 框准得多），
+        // 否则对候选做空间聚类取簇心。互相矛盾（没聚成一簇）才需要多花一轮 Zoom。
+        AiLocateFusionResult fusion;
+        double clusterAgreement = 1.0;
+        if (level == 0) {
+            const std::vector<std::wstring> lines =
+                SplitVisionCandidateLines(vision.textResult, 3);
+            std::vector<AiVisionCandidate> cands;
+            for (const auto& line : lines) {
+                int lx1 = 0, ly1 = 0, lx2 = 0, ly2 = 0;
+                if (TryParseBoundingBox(line, lx1, ly1, lx2, ly2)) {
+                    std::wstring note;
+                    if (!ResolveVisionRectToApiImage(lx1, ly1, lx2, ly2,
+                            curApiW, curApiH, curMap.srcWidth, curMap.srcHeight, &note)) {
+                        continue;
+                    }
+                    if (IsVisionApiBoxTooLarge(lx1, ly1, lx2, ly2, curApiW, curApiH, 0.22))
+                        continue;
+                    if (IsApiPointClearlyOutsideImage(lx1, ly1, curApiW, curApiH)) continue;
+                    int sx1 = 0, sy1 = 0, sx2 = 0, sy2 = 0;
+                    MapApiRectToScreen(curMap, lx1, ly1, lx2, ly2, sx1, sy1, sx2, sy2);
+                    cands.push_back(AiVisionCandidate{ sx1, sy1, sx2, sy2, false });
+                } else {
+                    int px = 0, py = 0;
+                    if (!TryParseCoordinatePair(line, px, py)) continue;
+                    std::wstring note;
+                    if (!ResolveVisionPointToApiImage(px, py,
+                            curApiW, curApiH, curMap.srcWidth, curMap.srcHeight, &note)) {
+                        continue;
+                    }
+                    int sx = 0, sy = 0;
+                    MapApiPointToScreen(curMap, px, py, sx, sy);
+                    cands.push_back(AiVisionCandidate{ sx, sy, sx, sy, true });
+                }
+            }
+            if (!cands.empty()) {
+                // UIA 锚点由调用方（引擎）传入：它才知道当前是不是窗口模式
+                //（窗口模式下前台往往不是目标窗口，取来的控件框会张冠李戴）。
+                std::vector<AiUiAnchor> anchors;
+                if (uiAnchors) anchors = *uiAnchors;
+                // 带上目标描述：锚点名字对不上就不采信（单候选也能借此吃到 UIA 精确框）
+                fusion = FuseLocateCandidates(cands, anchors, 0.5, userTask);
+                if (fusion.ok && fusion.candidateCount > 0) {
+                    clusterAgreement = static_cast<double>(fusion.clusterSize)
+                        / static_cast<double>(fusion.candidateCount);
+                }
+                if (fusion.ok) {
+                    if (logFn) {
+                        logFn(L"  [诊断] 候选 " + std::to_wstring(fusion.candidateCount)
+                            + L" 个 → " + fusion.note);
+                    }
+                    if (fusion.uiaConfirmed) {
+                        // UIA 确认：直接采信控件精确框，省掉后续 Zoom
+                        bx1 = fusion.boxX1;
+                        by1 = fusion.boxY1;
+                        bx2 = fusion.boxX2;
+                        by2 = fusion.boxY2;
+                        haveScreenBox = true;
+                        newSx = fusion.cx;
+                        newSy = fusion.cy;
+                        boxW = (std::max)(1, bx2 - bx1);
+                        boxH = (std::max)(1, by2 - by1);
+                    }
+                }
+            }
+        }
+
+        if (haveBox && !haveScreenBox) {
             if (!ResolveVisionRectToApiImage(bx1, by1, bx2, by2,
                     curApiW, curApiH, curMap.srcWidth, curMap.srcHeight, &coordNote)) {
                 if (havePriorLocate)
@@ -1860,12 +2121,38 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
         screenY = newSy;
         priorScreenX = newSx;
         priorScreenY = newSy;
+        finalBoxW = boxW;
+        finalBoxH = boxH;
+        finalClusterAgreement = clusterAgreement;
         if (haveScreenBox)
             priorBoxMaxSide = (std::max)(boxW, boxH);
         else if (level == 0)
             priorBoxMaxSide = 0;
         havePriorLocate = true;
         out.levelsUsed = level + 1;
+
+        // ★UIA 控件确认 → 直接用控件精确框，**不再 Zoom 精炼**：控件矩形比 VLM 放大精点
+        // 更准（UFO² 的结论），再花一轮 API 只会更慢且更差。实测浏览器工具栏小图标
+        // （「…」菜单）原本强制 Zoom：多烧一轮 15s、结果只挪了 10px。
+        if (level == 0 && fusion.uiaConfirmed) {
+            if (logFn) {
+                logFn(L"  [诊断] UIA 控件确认「" + fusion.uiaName
+                    + L"」→ 用控件精确框，跳过 Zoom 精炼（省一轮 API）");
+            }
+            out.ok = true;
+            out.screenX = screenX;
+            out.screenY = screenY;
+            out.skippedRefine = true;
+            // 快路径也要定级：UIA 命中即「可用」，别再让模型看到「可疑」去重复确认
+            out.verdict = ComputeLocateVerdictAtPoint(screenX, screenY, boxW, boxH,
+                clusterAgreement, uiAnchors ? *uiAnchors : std::vector<AiUiAnchor>{},
+                outVerdict, outVerdictWhy);
+            if (logFn) {
+                logFn(L"  [诊断] 定位校验: " + std::wstring(AiLocateVerdictName(out.verdict))
+                    + L"（" + (outVerdictWhy ? *outVerdictWhy : std::wstring()) + L"）");
+            }
+            return out;
+        }
 
         // 自适应 refine：紧凑/宽控件粗框 / 归一化单点可直接点，省一轮 API（对齐 Midscene deepLocate 按需）
         {
@@ -1892,6 +2179,7 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
                 if (why == CoarseLocateSkipReason::WideControlRemapped) whyText = L"宽控件";
                 else if (why == CoarseLocateSkipReason::CompactRemapped) whyText = L"归一化紧凑框";
                 else if (why == CoarseLocateSkipReason::CompactPixel) whyText = L"像素紧凑框";
+                else if (why == CoarseLocateSkipReason::SmallLabel) whyText = L"小标签/小卡片";
                 else if (why == CoarseLocateSkipReason::PointRemapped) whyText = L"归一化单点";
                 if (logFn) {
                     if (why == CoarseLocateSkipReason::PointRemapped) {
@@ -1906,6 +2194,14 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
                 out.screenX = screenX;
                 out.screenY = screenY;
                 out.skippedRefine = true;
+                // 快路径同样定级（否则 verdict 停在默认 Suspect → 误导模型重复确认）
+                out.verdict = ComputeLocateVerdictAtPoint(screenX, screenY, boxW, boxH,
+                    clusterAgreement, uiAnchors ? *uiAnchors : std::vector<AiUiAnchor>{},
+                    outVerdict, outVerdictWhy);
+                if (logFn) {
+                    logFn(L"  [诊断] 定位校验: " + std::wstring(AiLocateVerdictName(out.verdict))
+                        + L"（" + (outVerdictWhy ? *outVerdictWhy : std::wstring()) + L"）");
+                }
                 return out;
             }
         }
@@ -1994,7 +2290,57 @@ ZoomRefineLocateResult ExecuteZoomRefineLocate(
         }
     }
     if (!out.ok) out.errorMessage = L"定位未得到有效坐标";
+
+    // ── 本地校验（不依赖 OCR）───────────────────────────────────────
+    // 用「多候选一致性 + UIA 是否确认 + 框内特征密度」三样本地证据给定位定级：
+    //  · 低特征（纯色/空白区）= 最典型的「框对了位置但没框到东西」→ 判 Refine
+    //  · 候选互相矛盾 → Refine（调用方会据此再精炼或换描述）
+    //  · 只有单候选、无其他证据 → Suspect（可用，但要在结果里提示模型「可能不准」）
+    // OCR 文本核对不在这里做：用户没装识别引擎时不能走，装了才由调用方叠加。
+    if (out.ok && outVerdict) {
+        out.verdict = ComputeLocateVerdictAtPoint(out.screenX, out.screenY,
+            finalBoxW, finalBoxH, finalClusterAgreement, *uiAnchors, outVerdict, outVerdictWhy);
+        if (logFn) {
+            logFn(L"  [诊断] 定位校验: " + std::wstring(AiLocateVerdictName(out.verdict))
+                + L"（" + (outVerdictWhy ? *outVerdictWhy : std::wstring()) + L"）");
+        }
+    }
     return out;
+}
+
+AiLocateVerdict ComputeLocateVerdictAtPoint(int screenX, int screenY,
+    int boxW, int boxH, double clusterAgreement,
+    const std::vector<AiUiAnchor>& anchors,
+    AiLocateVerdict* outVerdict, std::wstring* outWhy) {
+    bool uiaConfirmed = false;
+    for (const auto& a : anchors) {
+        if (screenX >= a.x1 && screenX <= a.x2 && screenY >= a.y1 && screenY <= a.y2) {
+            uiaConfirmed = true;
+            break;
+        }
+    }
+    bool lowFeature = false;
+    {
+        const int half = 24;
+        HBITMAP crop = CaptureScreenRegion(screenX - half, screenY - half,
+            screenX + half, screenY + half);
+        if (crop) {
+            lowFeature = BitmapRegionLooksLowFeature(crop, nullptr);
+            DeleteBitmapHandle(crop);
+        }
+    }
+    AiLocateVerifyInput vin;
+    vin.boxW = (std::max)(1, boxW);
+    vin.boxH = (std::max)(1, boxH);
+    vin.clusterAgreement = clusterAgreement;
+    vin.uiaConfirmed = uiaConfirmed;
+    vin.lowFeature = lowFeature;
+    vin.pointOnInteractiveControl = windowmode::ProbeUiElementAtPoint(screenX, screenY).probed;
+    std::wstring why;
+    const AiLocateVerdict verdict = JudgeLocateConfidence(vin, &why);
+    if (outVerdict) *outVerdict = verdict;
+    if (outWhy) *outWhy = why;
+    return verdict;
 }
 
 bool VerifyClickEffectByColorSample(
@@ -2021,7 +2367,8 @@ AiActionResult ExecuteAiActionExecute(
     const AiCaptureMapping* captureMapping,
     AiActionHostHooks* hostHooks,
     int maxAgentRounds,
-    const std::vector<std::string>* extraImageJpegBase64) {
+    const std::vector<std::string>* extraImageJpegBase64,
+    const AiActionRouteKind* routeOverride) {
 
     AiActionResult result;
     if (!core) {
@@ -2034,7 +2381,8 @@ AiActionResult ExecuteAiActionExecute(
     }
 
     const bool withImage = !screenshotBase64.empty();
-    const AiActionRouteKind route = ClassifyAiActionRoute(resolvedPrompt, withImage);
+    const AiActionRouteKind route = routeOverride
+        ? *routeOverride : ClassifyAiActionRoute(resolvedPrompt, withImage);
     result.routeKind = route;
     const int effectiveTimeoutSec = ResolveAiActionExecuteTimeoutSec(timeoutSec, withImage);
     core->SetRecvTimeoutMs(effectiveTimeoutSec * 1000);
@@ -2059,7 +2407,8 @@ AiActionResult ExecuteAiActionExecute(
     }
 
     if (logFn) {
-        logFn(L"  [诊断] 路由: " + AiActionRouteLabel(route));
+        logFn(L"  [诊断] 路由: " + AiActionRouteLabel(route)
+            + (routeOverride ? L"（宿主覆盖：本地定位点击自带截屏，已省首帧截图）" : L""));
         logFn(L"  [诊断] 用户消息含图片: " + std::wstring(withImage ? L"是" : L"否"));
         if (withImage)
             logFn(L"  [诊断] base64字节数: " + std::to_wstring(screenshotBase64.size()));
@@ -2077,7 +2426,11 @@ AiActionResult ExecuteAiActionExecute(
             // 工具路径优先流式：思考模型可尽早吐字/调工具；失败再回落完整响应
             logFn(L"  [诊断] 传输: 优先流式（失败则完整响应）");
         }
-        logFn(L"  [诊断] 工具轮: thinking=disabled（避免只想不调工具）");
+        // 思考开关按当前网关/模型的实际策略打印（默认允许；QST_FAST_THINKING=1 才关）
+        const AgentConfig& aiCfg = core->GetConfig();
+        logFn(ShouldDisableThinking(aiCfg.apiUrl, aiCfg.model)
+            ? L"  [诊断] 工具轮: thinking=disabled（QST_FAST_THINKING=1 强制快速执行）"
+            : L"  [诊断] 工具轮: thinking=允许（复杂任务准确率优先；上轮没调工具会被催促）");
         const auto& hist = core->GetHistory();
         if (!hist.empty() && hist[0].role == L"system") {
             logFn(L"  [诊断] system 提示 " + std::to_wstring(hist[0].content.size())
@@ -2143,8 +2496,8 @@ AiActionResult ExecuteAiActionExecute(
                     + L") 识图轮次=" + std::to_wstring(zr.levelsUsed)
                     + (zr.skippedRefine ? L"（自适应跳过二级）" : L""));
             }
-            int br = 0, bg = 0, bb = 0;
-            const bool hadBefore = GetScreenPixelRgb(zr.screenX, zr.screenY, br, bg, bb);
+            int br[kClickColorGridN]{}, bg[kClickColorGridN]{}, bb[kClickColorGridN]{};
+            const bool hadBefore = SampleClickColorGrid(zr.screenX, zr.screenY, br, bg, bb);
             result.routeKind = route;
             const std::wstring clickButton = PromptIntendsRightClick(resolvedPrompt)
                 ? L"right" : L"left";
@@ -2155,10 +2508,12 @@ AiActionResult ExecuteAiActionExecute(
             if (hadBefore && hostHooks && hostHooks->onExecuteActions) {
                 hostHooks->onExecuteActions(result.textResult);
                 result.actionsAlreadyExecuted = true;
-                if (VerifyClickEffectByColorSample(zr.screenX, zr.screenY, br, bg, bb, 12)) {
-                    if (logFn) logFn(L"  [诊断] 点击后采样点颜色已变化（可能生效）");
+                int ar[kClickColorGridN]{}, ag[kClickColorGridN]{}, ab[kClickColorGridN]{};
+                if (SampleClickColorGrid(zr.screenX, zr.screenY, ar, ag, ab)
+                    && ClickColorGridChanged(br, bg, bb, ar, ag, ab, 12, 2)) {
+                    if (logFn) logFn(L"  [诊断] 点击后邻域颜色已变化（可能生效）");
                 } else if (logFn) {
-                    logFn(L"  [诊断] 点击后采样点颜色接近（界面可能未变，仅供参考）");
+                    logFn(L"  [诊断] 点击后邻域颜色接近（仅供参考，局部 ROI 变了仍可能已切换）");
                 }
             }
             return result;
@@ -2262,7 +2617,11 @@ AiActionResult ExecuteAiActionExecute(
             int consecutiveScrollNoopRounds = 0;
             bool saveAsForeground = false;
             std::wstring lastSettleHint;
+            /// 宿主探测到的前台状态事实（模态对话框等），下一轮优先注入
+            std::wstring lastForegroundFact;
             std::wstring lastChangeRoisText;
+            /// 本地 OCR 的屏幕文字坐标索引（每轮注入；OCR 未装则为空）
+            std::wstring lastTextIndex;
             std::wstring repeatToolHint;
             std::wstring locateLoopHint;
             AiActionLookahead lookahead;
@@ -2306,8 +2665,20 @@ AiActionResult ExecuteAiActionExecute(
                     const auto& m = hist[i];
                     if (m.role != L"assistant") continue;
                     for (const auto& tc : m.tool_calls) {
-                        if (tc.name == L"locateAndClick" || tc.name == L"mouseClick")
+                        if (tc.name == L"locateAndClick" || tc.name == L"mouseClick"
+                            || tc.name == L"clickRef" || tc.name == L"typeRef"
+                            || tc.name == L"searchOnPage")
                             return true;
+                    }
+                }
+                return false;
+            };
+            auto historyHasObservePage = [](const std::vector<ChatMessage>& hist, size_t afterIdx) {
+                for (size_t i = afterIdx; i < hist.size(); ++i) {
+                    const auto& m = hist[i];
+                    if (m.role != L"assistant") continue;
+                    for (const auto& tc : m.tool_calls) {
+                        if (tc.name == L"observePage" || tc.name == L"searchOnPage") return true;
                     }
                 }
                 return false;
@@ -2341,7 +2712,12 @@ AiActionResult ExecuteAiActionExecute(
                 const size_t histBefore = core->GetHistory().size();
                 std::wstring instruction;
                 // 规则放 Skill（lookupMacroAction）；此处只给短事实，避免塞长约束拖慢/卡流式
-                if (toolNudgePending) {
+                if (!lastForegroundFact.empty()) {
+                    // ★前台模态对话框（另存为/打开/确认）优先于一切其它指令：
+                    // 它决定「现在唯一能做的事」是什么，别的策略在这个状态下全是空转。
+                    instruction = lastForegroundFact;
+                    lastForegroundFact.clear();
+                } else if (toolNudgePending) {
                     toolNudgePending = false;
                     instruction =
                         L"上轮未调工具。立刻调用工具；细则 lookupMacroAction(section=usage|agent)。";
@@ -2353,7 +2729,7 @@ AiActionResult ExecuteAiActionExecute(
                     instruction +=
                         L"用工具完成任务。同轮多工具；按观察自适应，勿套死剧本。"
                         L"已开应用 listWindows→activateWindow；启动 runProgram/openWebpage；"
-                        L"路径用 resolveSystemPath。卡点时可 lookupMacroAction(section=agent)。";
+                        L"网页搜人 searchOnPage(query)。路径用 resolveSystemPath。卡点时可 lookupMacroAction(section=agent)。";
                     // 任务点名 Edge/浏览器/历史时，首轮就钉死「必须开源」，防模型读空缓存后瞎填
                     {
                         const std::wstring p = resolvedPrompt;
@@ -2373,27 +2749,35 @@ AiActionResult ExecuteAiActionExecute(
                 } else if (lastLocateFailed) {
                     const int locateRetries = AiLocateRetryCount();
                     if (locateRetries >= 2) {
-                        // A4 连败硬拦：只允许露出目标或结束，禁止继续换 target 碰运气
                         instruction = L"上轮定位失败，且已连续重试达到硬拦上限（"
                             + std::to_wstring(locateRetries)
                             + L" 次）。本轮禁止 locateAndClick/mouseClick 及非白名单快捷键。"
-                              L"只允许 scrollWheel / activateWindow 让目标露出后重新观察，"
-                              L"或直接 completeTask(reason=未找到)。细则 section=agent。";
+                              L"网页可 searchOnPage / observePage + clickRef；或 scrollWheel / activateWindow 露出目标，"
+                              L"或 completeTask(reason=未找到)。细则 section=agent。";
                     } else {
                         instruction = L"上轮定位失败。换短标签再 locate 最多 1 次，或 completeTask。"
                             L"禁止 F12/应用专属快捷键/hotkeyShortcut 碰运气。细则 section=agent。";
                     }
-                } else if (!lastSettleHint.empty()) {
-                    // 宿主本地结论（短事实）；策略见 Skill
-                    instruction = lastSettleHint;
-                    if (!lastChangeRoisText.empty())
-                        instruction += L" 结构变化区:" + lastChangeRoisText;
-                    lastSettleHint.clear();
                 } else if (lastOpenedWebpage) {
-                    instruction = L"已 openWebpage。辨认是否可交互；加载中只 wait。"
-                        L"细则 section=agent。";
-                } else if (lastObserveUnchanged) {
-                    if (consecutiveUnchangedRounds >= 1 || lastClickish) {
+                    instruction = L"已 openWebpage。优先 searchOnPage(query)+clickRef；"
+                        L"未装扩展或树上没有则 locateAndClick。"
+                        L"禁止再 openWebpage/fetchWebPage 打开 api 接口或猜用户 UID。"
+                        L"加载中只 wait。细则 section=agent。";
+                    pendingLookaheadHint.clear();
+                    instruction.clear();
+                    lastTextIndex.clear();
+                } else if (!lastSettleHint.empty()) {
+                    instruction = lastSettleHint;
+                    if (!lastChangeRoisText.empty()) {
+                        // ★必须写清坐标系：变化区是**原始屏幕像素**，而 mouseClick 用的是
+                        // upload（缩图）像素 —— 实测模型拿这两个数反复换算（"up to 1997 but image
+                        // is 1024 wide…"），白烧好几轮思考。这里直接把口径点名。
+                        instruction += L" 结构变化区（**原始屏幕像素**，不是 click 用的 upload 坐标；"
+                            L"click 请用图上 0~1000 归一化描述交给 locateAndClick）:"
+                            + lastChangeRoisText;
+                    }
+                    lastSettleHint.clear();
+                } else if (lastObserveUnchanged) {                    if (consecutiveUnchangedRounds >= 1 || lastClickish) {
                         instruction =
                             L"界面未变。若有模态确认/错误弹窗：locateAndClick(确定/关闭/OK) "
                             L"或看图处理；禁止默认 Escape/Alt+F4（会关掉未完成的对话框）。"
@@ -2404,8 +2788,52 @@ AiActionResult ExecuteAiActionExecute(
                 } else {
                     instruction = L"继续下一里程碑或 completeTask。有弹窗先看图处理，勿默认 Escape。";
                 }
+                {
+                    const std::wstring pk = AiLastPageKind();
+                    if (pk == L"canvas") {
+                        instruction += L"\n★pageKind=canvas（画布/游戏）：禁止 observePage 抓 HTML。"
+                            L"用视觉推进：locateAndClick(短目标) + keyClick/keyDown+keyUp，"
+                            L"每轮至少落一个动作。细则 lookupMacroAction(section=game)。";
+                    } else if (pk == L"dom") {
+                        instruction += L"\n★pageKind=dom：搜人/搜词用 searchOnPage(query)，树上 clickRef/typeRef。"
+                            L"树上有目标则 clickRef；没有或未装扩展则 locateAndClick。";
+                        if (LooksLikeSiteSearchResultsUrl(AiLastPageUrl())) {
+                            instruction += L"\n★已在搜索结果页：clickRef 用户卡片（href 含 space.bilibili.com，会打开主页）或视频。"
+                                L"点筛选项不会跳转。禁止再搜索。";
+                        } else if (LooksLikeUserSpaceSiteUrl(AiLastPageUrl())) {
+                            instruction += L"\n★这是某个用户空间，找别的UP请 searchOnPage(query)，勿用站内搜。";
+                        }
+                    } else if (pk == L"mixed") {
+                        instruction += L"\n★pageKind=mixed：网页按钮优先 clickRef/typeRef；树上没有则 locateAndClick。"
+                            L"播放器在动也可点工具栏。";
+                    }
+                }
+                // ★桌面游戏/自绘画面：每轮都必须把「用视觉推进」写进指令。
+                // 这类前台没有控件树、没有 DOM，模型若被其它提示（页面动态大/别点内容）
+                // 带偏就会一直观察+思考不出手 —— 用户实测的「游戏没反应」。
+                if (AiActionGameForegroundLikely()) {
+                    instruction += L"\n★前台是游戏/自绘动态画面（无控件树，UIA 无效）：**就用视觉推进**——"
+                        L"locateAndClick(target=短描述) 点画面里的按钮/植物/僵尸；"
+                        L"两步操作（拿卡→放卡、点A→点B）用 locateAndClick(targets=[\"A\",\"B\"]) "
+                        L"一次做完，不要分成两轮；同一张卡冷却独立，批量进攻就把多个目标一次列进 targets。"
+                        L"键盘用 keyClick / keyDown+keyUp（长按不要用 keyClick 连点）；"
+                        L"看不清先 screenshot。本轮必须至少落一个动作（点/按/找图），"
+                        L"不要只观察、不要反复 activateWindow。细则 lookupMacroAction(section=game)。"
+                        + AiGameNudgeOnce();
+                }
+                // ★通用「换策略」约束（不限游戏）：同一手段连续 3 轮没有进展就必须换，别原地重试。
+                // 实测：AI 会「同一个点连点被拦→再点→再被拦」或「同一只僵尸送死 5 轮」。
+                if (consecutiveRepeatRounds >= 2 || consecutiveUnchangedRounds >= 2) {
+                    instruction += L"\n★连续 " + std::to_wstring((std::max)(consecutiveRepeatRounds,
+                            consecutiveUnchangedRounds))
+                        + L" 轮没有实质进展：**换策略**——换目标描述/换落点/换单位或加量（阳光或预算够就多上），"
+                          L"或先算账 planSpend 看能不能多买/多放；仍然不行再 completeTask 说明卡点。"
+                          L"禁止对同一位置反复重试。";
+                }
                 if (!unlimitedRounds && round + 1 >= rounds)
                     instruction += L" 最后一轮：做完或 completeTask 说明卡点。";
+                // ★文字索引排在最后：模型最容易看到，且它是「不必看图也能点」的依据
+                if (!lastTextIndex.empty()) instruction += L"\n" + lastTextIndex;
                 // 对话框：只注入探测事实，不教操作菜单元
                 saveAsForeground = false;
                 if (hostHooks && hostHooks->onProbeForegroundDialog) {
@@ -2507,7 +2935,29 @@ AiActionResult ExecuteAiActionExecute(
                 }
 
                 std::string attachB64 = curB64;
-                if (!ShouldAttachObserveImageToPlanner(core->GetConfig().model, !attachB64.empty())) {
+                // 注意：只有「控件树可信（与前台标签一致）」时才敢按 dom 剥截图。
+                // 实测前台已切到「历史记录」页、树却还是上一个页面：剥掉截图后模型既看不到
+                // 新画面、又拿着旧树决策，连续 10 轮都意识不到界面已变。视觉兜底优先。
+                const bool domTreeUsable = AiPageKindIsDom() && AiPageTreeTrusted();
+                if (domTreeUsable) {
+                    if (!attachB64.empty()) {
+                        if (logFn)
+                            logFn(L"  [诊断] 网页 DOM：不上传截图（用 searchOnPage/observePage，省 token）");
+                        attachB64.clear();
+                    }
+                } else if (AiPageKindIsDom()) {
+                    if (!attachB64.empty()) {
+                        const std::wstring why = AiPageTreeUntrustedReason();
+                        if (logFn) {
+                            logFn(L"  [诊断] 控件树与前台不一致（" + TruncateForLog(why, 80)
+                                + L"）→ 保留截图走视觉兜底");
+                        }
+                        instruction += L"\n★上一轮控件树与前台标签不一致（"
+                            + (why.empty() ? std::wstring(L"疑似旧树") : why)
+                            + L"）：本轮以截图为准，勿依赖旧控件树；"
+                              L"需要网页控件时先 observePage 重新抓取。";
+                    }
+                } else if (!ShouldAttachObserveImageToPlanner(core->GetConfig().model, !attachB64.empty())) {
                     if (!attachB64.empty()) {
                         if (logFn) {
                             logFn(L"  [诊断] 本轮观察截图 "
@@ -2516,8 +2966,8 @@ AiActionResult ExecuteAiActionExecute(
                         }
                         instruction +=
                             L"\n★你是纯文本规划模型：本轮未附截图（避免无效多模态请求）。"
-                            L"宿主已完成本地 settle；要点击/辨认控件请 locateAndClick"
-                            L"（自动用列表中的识图模型）。"
+                            L"宿主已完成本地 settle；网页用 searchOnPage/observePage+clickRef；"
+                            L"桌面/画布才 locateAndClick（自动用列表中的识图模型）。"
                             L"禁止猜绝对坐标；弹窗用 locate 点确定/关闭，勿默认 Escape。";
                         attachB64.clear();
                     }
@@ -2533,8 +2983,9 @@ AiActionResult ExecuteAiActionExecute(
                 }
                 const ChatMessage msg = BuildAiUserMessage(instruction, attachB64, extrasNow);
                 AgentSendCallbacks cb = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
-                // 无图+工具 required 时部分网关流式首包极慢/空等；改完整响应更稳
-                cb.preferNonStream = attachB64.empty();
+                // 无图也走流式：豆包完整响应要等整段生成完才给响应头，TTFB 常超过
+                // 旧 5s 轮询；失败再回落完整响应（CallApi）。
+                cb.preferNonStream = false;
                 cb.toolChoice = L"required";
                 cb.stopToolLoopAfterTools = [core, histBefore]() {
                     return HistoryHasCompleteTask(core->GetHistory(), histBefore)
@@ -2632,21 +3083,36 @@ AiActionResult ExecuteAiActionExecute(
                     const bool mustObserve = lastLocateFailed || saveAsForeground
                         || forceObserveSignals;
                     if (!needObserve && !mustObserve) {
-                        if (logFn)
+                        if (AiPageKindIsDom() && AiPageTreeTrusted()) {
+                            curB64.clear();
+                            if (logFn)
+                                logFn(L"  [诊断] pageKind=dom 跳过截屏（扩展树已回传，省 token）");
+                        } else if (AiPageKindIsDom()) {
+                            if (logFn) {
+                                logFn(L"  [诊断] 控件树不可信 → SKIP_OBSERVE 也保留上次截图"
+                                    L"（视觉兜底）");
+                            }
+                        } else if (logFn) {
                             logFn(L"  [诊断] 本轮 SKIP_OBSERVE，跳过截屏观察（保留上次画面）");
-                        if (!AiActionShouldSkipLookahead()) {
+                        }
+                        if (!AiActionShouldSkipLookahead() && !lastOpenedWebpage && !AiPageKindIsDom()) {
                             NoteAiActionLookaheadStarted();
                             const std::wstring batch = SummarizeAiToolBatchForLookahead(
                                 core->GetHistory(), histBefore);
                             lookahead.BeginAfterTools(
                                 core->GetConfig(), ReadAiTaskMemoText(), batch,
                                 stopFlag, httpAbort);
-                            pendingLookaheadHint = lookahead.TakeHintSkipObserve(4000);
+                            pendingLookaheadHint = lookahead.TakeHintSkipObserve(
+                                kAiLookaheadSkipObserveWaitMs);
                             if (logFn && !pendingLookaheadHint.empty())
                                 logFn(L"  [诊断] lookahead(SKIP_OBSERVE): "
                                     + TruncateForLog(pendingLookaheadHint, 120));
                         } else if (logFn) {
-                            logFn(L"  [诊断] 跳过 lookahead（动态干扰或次数上限）");
+                            logFn(lastOpenedWebpage
+                                ? L"  [诊断] 跳过 lookahead（刚 openWebpage，下一轮 observePage）"
+                                : AiPageKindIsDom()
+                                ? L"  [诊断] 跳过 lookahead（pageKind=dom，以控件树为准）"
+                                : L"  [诊断] 跳过 lookahead（动态干扰或次数上限）");
                         }
                         consecutiveUnchangedRounds = 0;
                         consecutiveBlindKeyRounds = 0;
@@ -2671,7 +3137,7 @@ AiActionResult ExecuteAiActionExecute(
                     lastObserveUnchanged = false;
                     bool captured = false;
                     bool lastOnlyDynamicChanged = false;
-                    if (!AiActionShouldSkipLookahead()) {
+                    if (!AiActionShouldSkipLookahead() && !lastOpenedWebpage) {
                         NoteAiActionLookaheadStarted();
                         const std::wstring batch = SummarizeAiToolBatchForLookahead(
                             core->GetHistory(), histBefore);
@@ -2679,7 +3145,9 @@ AiActionResult ExecuteAiActionExecute(
                             core->GetConfig(), ReadAiTaskMemoText(), batch,
                             stopFlag, httpAbort);
                     } else if (logFn) {
-                        logFn(L"  [诊断] 跳过 lookahead（动态干扰或次数上限）");
+                        logFn(lastOpenedWebpage
+                            ? L"  [诊断] 跳过 lookahead（刚 openWebpage，下一轮 observePage）"
+                            : L"  [诊断] 跳过 lookahead（动态干扰或次数上限）");
                     }
                     if (hostHooks->onObserveScreen) {
                         const bool forceRefresh = forceRefreshObserve;
@@ -2693,28 +3161,75 @@ AiActionResult ExecuteAiActionExecute(
                         // 游戏/广告页：与 locate busy 门闩对齐（10% / 动态仍在变 4%）
                         if (obs.busyCoverageRatio >= 0.10
                             || (obs.suggestRefresh && obs.busyCoverageRatio >= 0.04)) {
-                            curB64.clear();
-                            captured = true;
-                            lastSettleHint =
-                                L"前台动态干扰大（游戏/广告/视频）。禁止在页面内容上 locateAndClick。"
-                                L"先开新标签页（浏览器通用键）再操作，或切到站外空白区；"
-                                L"禁止反复刷新 / 反复开同一内容视图。";
+                            if (AiPageKindIsDom()) {
+                                curB64.clear();
+                                captured = true;
+                                lastSettleHint =
+                                    L"前台动态干扰大（视频区在变）。树上优先 clickRef；"
+                                    L"树上没有则 locateAndClick。切窗用 activateWindow。";
+                                if (logFn)
+                                    logFn(L"  [诊断] 高动态覆盖 "
+                                        + std::to_wstring(static_cast<int>(obs.busyCoverageRatio * 100))
+                                        + L"%，跳过上传整屏（省 token）");
+                            } else if (AiLastPageKind() == L"mixed") {
+                                lastSettleHint =
+                                    L"播放器在动。树上优先 clickRef；树上没有则 locateAndClick 点工具栏。"
+                                    L"切窗用 activateWindow。";
+                                if (logFn)
+                                    logFn(L"  [诊断] 高动态覆盖 "
+                                        + std::to_wstring(static_cast<int>(obs.busyCoverageRatio * 100))
+                                        + L"%，网页外壳保留截图（识图兜底）");
+                            } else {
+                                // ★这里**不再**清掉截图，也不再禁止 locateAndClick。
+                                // 前台是桌面游戏/自绘画面时没有控件树可退，视觉是唯一手段；
+                                // 旧文案「禁止在页面内容上 locateAndClick + 切窗用 activateWindow」
+                                // 等于把模型唯一能推进的手段收走 —— 实测表现就是
+                                // 「游戏一直没反应、一直在思考、反复 activateWindow」。
+                                lastSettleHint =
+                                    L"前台是游戏/自绘画面（无控件树，UIA 无效）。**用视觉推进**："
+                                    L"locateAndClick(短目标) 点画面里的按钮/植物/僵尸，"
+                                    L"键盘用 keyClick / keyDown+keyUp；看不清先 screenshot。"
+                                    L"每一轮至少落一个动作，不要只观察、不要反复 activateWindow。"
+                                    L"玩法与踩坑细则 lookupMacroAction(section=game)。";
+                                if (logFn)
+                                    logFn(L"  [诊断] 高动态覆盖 "
+                                        + std::to_wstring(static_cast<int>(obs.busyCoverageRatio * 100))
+                                        + L"%，游戏/自绘前台：保留截图并走视觉动作（不拦 locateAndClick）");
+                            }
+                        }
+                        if (!obs.foregroundFact.empty()) lastForegroundFact = obs.foregroundFact;
+                        // ★文字坐标索引（通用）：每轮注入一次，让模型不靠看图也能准确点。
+                        if (!obs.textIndex.empty()) {
+                            lastTextIndex = obs.textIndex;
                             if (logFn)
-                                logFn(L"  [诊断] 高动态覆盖 "
-                                    + std::to_wstring(static_cast<int>(obs.busyCoverageRatio * 100))
-                                    + L"%，跳过上传整屏（省 token）");
+                                logFn(L"  [诊断] 文字索引 " + std::to_wstring(obs.textIndexCount)
+                                    + L" 条（本地 OCR，模型可直接按文字/坐标点，不必看图猜）");
                         }
                         if (!obs.settleHint.empty()) {
                             lastSettleHint = obs.settleHint;
                             if (!obs.changeRoisText.empty())
-                                lastChangeRoisText = obs.changeRoisText;
-                            if (logFn && (obs.settleChecked || obs.onlyDynamicChanged)) {
+                                lastChangeRoisText = obs.changeRoisText;                            if (logFn && (obs.settleChecked || obs.onlyDynamicChanged)) {
                                 logFn(L"  [诊断] 本地 settle：" + TruncateForLog(obs.settleHint, 160)
                                     + (obs.suggestRefresh ? L" [建议刷新]" : L"")
                                     + (obs.onlyDynamicChanged ? L" [仅动态区]" : L""));
                             }
                         }
-                        if (obs.ok && obs.unchanged) {
+                        if (obs.ok && obs.unchanged && AiFastPathsEnabled()) {
+                            // ★通用规则：只有「上一轮确实做过动作」时才敢靠「界面未变」省掉这一帧。
+                            // 如果整轮下来一个动作都没执行（模型只是在看/在读），说明它还没消费过
+                            // 当前画面 —— 这时跳过上传就等于让它「闭着眼睛继续想」，
+                            // 实测模型会反复自问「我看不到图」并空转几十秒。
+                            if (!anyExecuted) {
+                                lastObserveUnchanged = true;
+                                lastOnlyDynamicChanged = obs.onlyDynamicChanged;
+                                if (logFn)
+                                    logFn(L"  [诊断] 界面未变但本轮尚未执行任何动作 → 仍回传当前帧（避免盲想）");
+                                curB64 = obs.base64;   // 可能为空：为空时保留上一帧
+                                if (curB64.empty() && !screenshotBase64.empty())
+                                    curB64 = screenshotBase64;
+                                captured = true;
+                                continue;
+                            }
                             lastObserveUnchanged = true;
                             lastOnlyDynamicChanged = obs.onlyDynamicChanged;
                             ++consecutiveUnchangedRounds;
@@ -2846,10 +3361,16 @@ AiActionResult ExecuteAiActionExecute(
                         }
                         pendingLookaheadHint = lookahead.TakeHintAfterObserve(
                             lastObserveUnchanged, lastOnlyDynamicChanged,
-                            dialogBlocking, 6000);
+                            dialogBlocking, kAiLookaheadAfterObserveWaitMs);
+                        if (lastOpenedWebpage)
+                            pendingLookaheadHint.clear();
                         if (logFn && !pendingLookaheadHint.empty())
                             logFn(L"  [诊断] lookahead: "
                                 + TruncateForLog(pendingLookaheadHint, 120));
+                        else if (logFn && lookahead.LastTakeDiscardedNotReady())
+                            logFn(L"  [诊断] lookahead 预取未就绪（>" 
+                                + std::to_wstring(kAiLookaheadAfterObserveWaitMs)
+                                + L"ms）已中断丢弃，不让主链路等预规划");
                         else if (logFn && lastObserveUnchanged)
                             logFn(L"  [诊断] lookahead 已丢弃（界面未变）");
                     }
@@ -2870,6 +3391,20 @@ AiActionResult ExecuteAiActionExecute(
                     } else if (!captured) {
                         curB64.clear();
                     }
+                    continue;
+                }
+
+                if (historyHasObservePage(core->GetHistory(), histBefore)) {
+                    anyExecuted = true;
+                    if (AiPageKindIsDom() && AiPageTreeTrusted()) {
+                        curB64.clear();
+                        if (logFn)
+                            logFn(L"  [诊断] observePage 已回传控件树，跳过截屏上传（省 token）");
+                    } else if (AiPageKindIsDom() && logFn) {
+                        logFn(L"  [诊断] observePage 回的树与前台不一致 → 保留截图（视觉兜底）");
+                    }
+                    consecutiveUnchangedRounds = 0;
+                    lastObserveUnchanged = false;
                     continue;
                 }
 

@@ -18,11 +18,10 @@
 
 | 随包（解压/安装即可用） | 软件内按钮 / 运行时再装 |
 |-------------------------|-------------------------|
-| `WebView2Fixed\` | Interception / 虚拟 HID **内核驱动**（设置里安装） |
+| `WebView2Fixed\` | Interception / 虚拟 HID（设置里下载 `QuickScriptTool-HidDriver.zip` 再 UAC 安装） |
 | MSVC x64 CRT（`vcruntime140*.dll` / `msvcp140*.dll` 旁路） | Python + PaddleOCR（OCR 一键安装） |
-| OpenCV / FakeFocus / VirtualDesktopAccessor | |
-| `extension\edge`、`ui\`、VHID **安装脚本与 package** | |
-| `interception.dll` | |
+| OpenCV / FakeFocus / VirtualDesktopAccessor | 缺 OpenCV 仍可进壳，找图禁用 |
+| `extension\edge`、`ui\`、VHID **安装脚本**（不含 `.sys` / `interception.dll`） | |
 
 版本号以 `tools\product_version.txt` 为准，须与 `installer\QuickScriptTool.iss` 的 `MyAppVersion`、`src\app_branding.cpp` 一致。
 

@@ -35,7 +35,7 @@ std::wstring ActionTypeBriefLabel(ActionType type);
 /// JSON type 字段 → 编辑器中文动作名
 std::wstring JsonTypeBriefLabel(const std::wstring& jsonType);
 
-/// 脚本动作列表的可读大纲（供 AI 回复用户时引用）。
+/// 脚本动作列表的可读大纲（仅给模型看，不要原样念给用户）。
 /// maxLines：最多输出多少行动作；超出时保留头尾并注明省略。0=不限制（不推荐给 Agent）。
 std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions,
     size_t maxLines = 80);
@@ -75,7 +75,7 @@ void SendKeyboardKey(UINT vk, bool down);
 /// 模拟鼠标按下事件（根据按键类型）
 void MouseButtonEvent(MouseButtonType button, bool down);
 
-/// 模拟鼠标完整点击（按下 + 释放）
+/// 模拟鼠标完整点击（按下 + 至少 1ms + 释放；0ms down/up 会被许多游戏合成一次按住）
 void MouseClick(MouseButtonType button);
 
 /// 相对移动鼠标（dx/dy 像素，SendInput MOUSEEVENTF_MOVE；FPS 视角等）
@@ -83,6 +83,10 @@ void SendMouseMoveRelative(int dx, int dy);
 
 /// 前台绝对移标：VirtualHid→SetCursorPos；Interception→绝对报告+钉像素；否则 SetCursorPos
 bool SetCursorScreenPos(int x, int y);
+
+/// 默认模式点到屏幕坐标：SetCursorPos + 软件模拟时再发绝对 SendInput，避免游戏只认键鼠报告不认 SetCursorPos。
+void SendMouseMoveAbsoluteScreen(int x, int y);
+void SendMouseClickAtScreen(int x, int y, MouseButtonType button);
 
 /// 精密回放时临时关闭鼠标加速并设中性速度（录制为 Raw，回放 SendInput 会再套加速）
 class MouseBallisticsGuard {
@@ -125,10 +129,12 @@ private:
     DWORD_PTR prevMask_ = 0;
 };
 
-/// 精密回放时 timeBeginPeriod(1) + 尽量申请更高定时器分辨率
+/// 精密回放时 timeBeginPeriod(1) + 尽量申请更高定时器分辨率。
+/// highResolution=false（低性能模式）：只保留 timeBeginPeriod(1)，
+/// 跳过 NtSetTimerResolution 的全系统 0.5ms 请求（那会让整机无法进深度 C-state）。
 class MultimediaTimerGuard {
 public:
-    explicit MultimediaTimerGuard(bool enable);
+    explicit MultimediaTimerGuard(bool enable, bool highResolution = true);
     ~MultimediaTimerGuard();
     MultimediaTimerGuard(const MultimediaTimerGuard&) = delete;
     MultimediaTimerGuard& operator=(const MultimediaTimerGuard&) = delete;

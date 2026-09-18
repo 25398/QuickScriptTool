@@ -149,6 +149,9 @@
     applyOptimizeRecording: (opts) =>
       post(Object.assign({ type: "applyOptimizeRecording" }, opts || {})),
     pickScreenRegion: () => post({ type: "pickScreenRegion" }),
+    pickScreenDrag: () => post({ type: "pickScreenDrag" }),
+    pickTemplateDrag: (opts) =>
+      post(Object.assign({ type: "pickTemplateDrag" }, opts || {})),
     getEngineStatus: () => post({ type: "getEngineStatus" }),
     getAppBranding: () => post({ type: "getAppBranding" }),
     checkUpgrade: () => post({ type: "checkUpgrade" }),

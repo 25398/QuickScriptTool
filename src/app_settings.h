@@ -68,18 +68,98 @@ struct PlaybackTabSettings {
     int scheduledTaskConflictPolicy = 0;
     /// 脚本中断后自动恢复：排队到当前脚本结束后跑，或插入定时后再从原步骤继续
     bool scheduledTaskAutoResume = false;
+    /// 低性能模式（用户反馈「挂机脚本时 CPU 温度到 80°C」后的取舍开关）：
+    /// 勾选后优先「少占资源」而不是「最快/最准」——
+    ///   · 图像匹配限 1 个 OpenCV 线程（默认按核数 fan-out，4 核瞬间满载升温）
+    ///   · 输入时间轴大幅减少自旋（改用高精度定时器等待），代价是注入节奏可有 ~1ms 抖动
+    ///   · 回放期间不再提进程/线程优先级、不绑核、不抬全系统定时器分辨率
+    ///   · 找图监视（WatchImage 时间模式）最小轮询间隔 50ms → 200ms
+    /// 不勾选时行为与之前完全一致。开关在 Load/SaveAppSettings 里同步到进程级原子量，
+    /// 保存后立即生效、无需重启。详见 docs/ai-action-exec-optimization.md §19。
+    bool lowPerformanceMode = false;
+    /// AI 高级加速（默认开）：布局记忆 + 相对网格 + 观察帧省上传/文字索引。
+    /// 出问题（点错位置/界面看不懂）时可一键关掉，退回「每步真识图 + 每轮回传整帧」。
+    /// 见 src/ai_fast_paths.h。
+    bool aiFastPaths = true;
+    /// 找图 GPU 加速（OpenCL）：大区域全屏找图走显卡（实测 ~2.9x），区域找图自动走 CPU。
+    /// 勾选但机器没有 OpenCL 设备时自动回落 CPU（只写一次调试日志，不报错）。
+    /// 与「低性能模式」冲突时低性能模式优先（见 FindImageGpuAccelActive()）。
+    bool findImageGpuAccel = false;
 };
+
+/// 安装/恢复默认主题：Web 壳为「极光 Arctic」(id=7)；GDI 目录无 Arctic，回退 id=0。
+#ifdef QST_WEBVIEW_SHELL
+inline constexpr int kDefaultThemeId = 7;
+#else
+inline constexpr int kDefaultThemeId = 0;
+#endif
 
 struct OtherTabSettings {
     bool autoHideMainWindow = true;
-    bool playSoundOnStart = false;
+    bool playSoundOnStart = true;
+    bool playSoundOnEnd = true;
     bool hideBottomRightTip = true;
     bool closeToTray = true;
     bool autoStartOnBoot = false;
     bool resolveImeConflict = false;
+    /// 桌面悬浮球；默认显示
+    bool showFloatBall = true;
+    /// 贴边半露；false=自由悬浮整圆
+    bool floatBallDocked = true;
+    /// 0=左 1=右 2=上 3=下
+    int floatBallEdge = 1;
+    /// 沿工作区宽度的球左缘 0~1（自由/上下贴边）
+    double floatBallXRatio = 1.0;
+    /// 沿工作区高度的球上缘 0~1
+    double floatBallYRatio = 0.55;
+    /// MONITORINFOEX.szDevice；空=主屏
+    std::wstring floatBallMonitorId;
+    /// 鼠标宏编辑界面默认视图：code=代码化 visual=可视化
+    std::wstring editorDefaultView = L"code";
+    /// 可视化：循环体大包裹框（头卡角标不受影响）
+    bool visualLoopWrap = true;
+    /// 可视化：定义宏 ↔ 运行宏 的虚线调用线
+    bool visualBlockCallWires = true;
+    /// 可视化：if/else 大包裹框
+    bool visualIfWrap = true;
+    /// 可视化：定义宏指令块大包裹框
+    bool visualBlockWrap = true;
+    /// 可视化：找图监视大包裹框
+    bool visualWatchWrap = true;
+    /// 可视化：goto/跳转连线
+    bool visualJumpWires = true;
+    /// 可视化：画布点阵网格
+    bool visualShowGrid = true;
+    /// 可视化：卡片标题中的 ID
+    bool visualShowCardId = true;
+    /// 编辑器「请选择要添加的宏」排列顺序（动作 type）；空=产品默认顺序
+    std::vector<std::wstring> editorActionOrder;
+    /// 从添加列表中隐藏的动作 type；空=全部显示。脚本里已有步骤仍可见。
+    std::vector<std::wstring> editorHiddenActions;
+    /// 编辑器动作目录预设：simple/office/game/all/custom；空=all
+    std::wstring editorCatalogPreset;
+    /// 「自定义」槽：切换精简/办公/游戏图色/全部时保留；仅在其它预设上改勾选/顺序时覆盖
+    std::vector<std::wstring> editorCustomActionOrder;
+    std::vector<std::wstring> editorCustomHiddenActions;
+    /// 添加列表搜索是否包含已隐藏动作；false=只搜当前目录显示项
+    bool editorSearchAllActions = false;
+    /// 插入变量列表：隐藏 ctrl:CurLoops 等固定变量
+    bool editorHideFixedVars = false;
+    /// 插入变量列表：隐藏 .x/.y/.cx 等坐标字段
+    bool editorHideCoordVars = false;
+    /// 多结果只显示 matchRet[n] 代指，不列出 [0]/[1]/[2]
+    bool editorMultiResultPlaceholderOnly = false;
+    /// 不启用修改按钮：隐藏「修改」，选中后改参数失焦即写回列表（不立刻存盘）
+    bool editorDisableModifyButton = false;
+    /// 退出时自动保存：去掉「保存」，×/关软件时写盘；「取消」恢复到打开时
+    bool editorAutoSaveOnExit = false;
+    /// 启用批量插入：批量勾选多条时，非容器类型点「添加」逐条插入；容器类型仍并入
+    bool editorEnableBatchInsert = false;
     /// 长按判定（秒）：热键捕获与运行时按住启停的最小按住时间，须 > 0
     double holdThresholdSeconds = 0.2;
-    int themeId = 0;
+    /// 界面缩放倍率：叠在分辨率自适应之后，相对当前分辨率下的默认大小；默认 1.0，须为正数
+    double uiScaleFactor = 1.0;
+    int themeId = kDefaultThemeId;
     /// 为 true 时使用 customMain/Accent，忽略预设 themeId 的外观（themeId 仍保留以便取消自定义后回退）
     bool useCustomTheme = false;
     int customMainColor = 0x0063A840;    // COLORREF: RGB(64,168,99)
@@ -153,6 +233,24 @@ struct HomeState {
     std::wstring uiMode = L"simple";
 };
 
+/// 引擎写 home 运行时字段时用：叠选中/滚动/连点/录制模式，不碰 uiMode / 全局热键。
+/// 避免 SaveHomeState 把内存里过期的整份 AppSettings 盖掉设置页刚保存的 playback/other/ai。
+inline void OverlayHomeRuntimeSelection(HomeState& dst, const HomeState& src) {
+    dst.activeTab = src.activeTab;
+    dst.clickerButton = src.clickerButton;
+    dst.clickerIntervalMode = src.clickerIntervalMode;
+    dst.clickerCustomInterval = src.clickerCustomInterval;
+    dst.recorderCaptureScope = src.recorderCaptureScope;
+    dst.recorderInputMode = src.recorderInputMode;
+    dst.recorderWindowMode = src.recorderWindowMode;
+    dst.selectedScriptPath = src.selectedScriptPath;
+    dst.selectedRecordingPath = src.selectedRecordingPath;
+    dst.clickerScrollOffset = src.clickerScrollOffset;
+    dst.recorderScrollOffset = src.recorderScrollOffset;
+    dst.macroScrollOffset = src.macroScrollOffset;
+    dst.scriptCustomScrollOffset = src.scriptCustomScrollOffset;
+}
+
 struct AppSettings {
     ClickTabSettings click{};
     PlaybackTabSettings playback{};
@@ -175,8 +273,30 @@ inline double ClampPlaybackSpeed(double s) {
     return s;
 }
 
+inline constexpr double kUiScaleFactorMin = 0.25;
+inline constexpr double kUiScaleFactorMax = 3.0;
+inline constexpr double kUiScaleFactorDefault = 1.0;
+
+/// 界面缩放倍率：须为正数；非正/NaN 回 1.0；过小/过大钳到 0.25~3.0
+inline double NormalizeUiScaleFactor(double s) {
+    if (!(s > 0.0)) return kUiScaleFactorDefault;
+    if (s < kUiScaleFactorMin) return kUiScaleFactorMin;
+    if (s > kUiScaleFactorMax) return kUiScaleFactorMax;
+    return s;
+}
+
 inline std::wstring NormalizeHomeUiMode(const std::wstring& m) {
     return m == L"pro" ? L"pro" : L"simple";
+}
+
+inline std::wstring NormalizeEditorDefaultView(const std::wstring& v) {
+    return v == L"visual" ? L"visual" : L"code";
+}
+
+inline std::wstring NormalizeEditorCatalogPreset(const std::wstring& v) {
+    if (v == L"simple" || v == L"office" || v == L"game" || v == L"all" || v == L"custom")
+        return v;
+    return L"all";
 }
 
 inline bool HomeUiModeIsPro(const HomeState& h) {

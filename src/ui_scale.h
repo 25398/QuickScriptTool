@@ -13,8 +13,13 @@ void UiScaleInitFromHwnd(HWND hwnd);
 // 显示器/DPI 变化时刷新（按分辨率重算，忽略 DPI 数值）
 void UiScaleSetFromDpi(int dpi, HWND hwnd = nullptr);
 void UiScaleSetPercent(int percent);
+/// 用户界面缩放倍率（叠在分辨率自适应之后，默认 1.0）
+void UiScaleSetUserFactor(double factor);
+double UiUserScaleFactor();
+/// 分辨率自适应 × 用户倍率（1.0 = 当前分辨率下的默认大小）
+double UiEffectiveScale();
 
-// 当前缩放百分比（2560×1440 = 100）
+// 当前缩放百分比（2560×1440 = 100；不含用户倍率）
 int UiScalePercent();
 
 // 将设计稿像素换算为当前缩放下的物理像素

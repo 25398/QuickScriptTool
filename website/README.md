@@ -13,9 +13,9 @@ website/
 ├── downloads/        # 安装包 / 便携 zip（package_release 后同步；部署时一并上传）
 │   ├── QuickScriptTool-Setup.exe       # 官网固定链接（安装包最新）
 │   ├── QuickScriptTool-Release.zip     # 官网固定链接（便携最新）
-│   ├── QuickScriptTool-1.1.10.exe      # 带版本号归档
-│   ├── QuickScriptTool-Setup-1.1.10.exe
-│   └── QuickScriptTool-Release-1.1.10.zip
+│   ├── QuickScriptTool-1.3.3.exe       # 带版本号归档
+│   ├── QuickScriptTool-Setup-1.3.3.exe
+│   └── QuickScriptTool-Release-1.3.3.zip
 ├── favicon.ico       # 站点图标（复用产品图标）
 ├── css/site.css      # 官网样式（极光 Arctic：海军蓝 + 冰蓝 + 薄荷）
 ├── js/site.js        # 导航 / Demo iframe 缩放 / 页脚年份

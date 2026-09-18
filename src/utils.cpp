@@ -4,8 +4,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <filesystem>
+#include <system_error>
 #include <unordered_set>
+
+#include <mmsystem.h>
+#include <shlobj.h>
+#pragma comment(lib, "winmm.lib")
 
 // ── 字符串处理 ────────────────────────────────────────────────────
 std::wstring Trim(const std::wstring& value) {
@@ -22,6 +30,156 @@ std::wstring AppDir() {
     std::wstring value(path);
     const auto slash = value.find_last_of(L"\\/");
     return slash == std::wstring::npos ? L"." : value.substr(0, slash);
+}
+
+std::wstring NormalizeDirPathForCompare(std::wstring path) {
+    path = Trim(path);
+    for (auto& ch : path) {
+        if (ch == L'/') ch = L'\\';
+    }
+    while (path.size() > 3 && (path.back() == L'\\' || path.back() == L' '))
+        path.pop_back();
+    return path;
+}
+
+bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root) {
+    const std::wstring p = NormalizeDirPathForCompare(path);
+    const std::wstring r = NormalizeDirPathForCompare(root);
+    if (p.empty() || r.empty() || p.size() < r.size()) return false;
+    if (_wcsnicmp(p.c_str(), r.c_str(), r.size()) != 0) return false;
+    if (p.size() == r.size()) return true;
+    return p[r.size()] == L'\\';
+}
+
+bool InstallDirNeedsRoamingWebView2Data(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86) {
+    return PathIsUnderRoot(exeDir, programFiles)
+        || PathIsUnderRoot(exeDir, programFilesX86);
+}
+
+namespace {
+constexpr wchar_t kProductRegKey[] = L"Software\\QuickScriptTool";
+constexpr wchar_t kWebView2UserDataName[] = L"WebView2UserData";
+constexpr wchar_t kWebView2FetchDataName[] = L"WebView2FetchData";
+
+std::wstring ResolveRoamingOrSidecar(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86,
+    const std::wstring& localAppData, const wchar_t* leaf) {
+    if (InstallDirNeedsRoamingWebView2Data(exeDir, programFiles, programFilesX86)
+        && !Trim(localAppData).empty()) {
+        return NormalizeDirPathForCompare(localAppData) + L"\\QuickScriptTool\\" + leaf;
+    }
+    return NormalizeDirPathForCompare(exeDir) + L"\\" + leaf;
+}
+
+std::wstring QuerySpecialFolder(int csidl) {
+    wchar_t buf[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, csidl, nullptr, SHGFP_TYPE_CURRENT, buf)))
+        return {};
+    return buf;
+}
+
+std::wstring EnsureDirectoryPath(const std::wstring& dir) {
+    if (dir.empty()) return dir;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+}  // namespace
+
+std::wstring ResolveWebView2UserDataDir(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86,
+    const std::wstring& localAppData) {
+    return ResolveRoamingOrSidecar(exeDir, programFiles, programFilesX86,
+        localAppData, kWebView2UserDataName);
+}
+
+std::wstring ResolveWebView2FetchDataDir(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86,
+    const std::wstring& localAppData) {
+    return ResolveRoamingOrSidecar(exeDir, programFiles, programFilesX86,
+        localAppData, kWebView2FetchDataName);
+}
+
+std::wstring WebView2UserDataDir() {
+    return EnsureDirectoryPath(ResolveWebView2UserDataDir(AppDir(),
+        QuerySpecialFolder(CSIDL_PROGRAM_FILES),
+        QuerySpecialFolder(CSIDL_PROGRAM_FILESX86),
+        QuerySpecialFolder(CSIDL_LOCAL_APPDATA)));
+}
+
+std::wstring WebView2FetchDataDir() {
+    return EnsureDirectoryPath(ResolveWebView2FetchDataDir(AppDir(),
+        QuerySpecialFolder(CSIDL_PROGRAM_FILES),
+        QuerySpecialFolder(CSIDL_PROGRAM_FILESX86),
+        QuerySpecialFolder(CSIDL_LOCAL_APPDATA)));
+}
+
+void RecordLastRunAppDir() {
+    const std::wstring dir = AppDir();
+    if (dir.empty()) return;
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kProductRegKey, 0, nullptr, 0,
+            KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS || !key) {
+        return;
+    }
+    RegSetValueExW(key, L"LastRunDir", 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(dir.c_str()),
+        static_cast<DWORD>((dir.size() + 1) * sizeof(wchar_t)));
+    wchar_t exePath[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+        const std::wstring exe = exePath;
+        RegSetValueExW(key, L"LastRunExe", 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(exe.c_str()),
+            static_cast<DWORD>((exe.size() + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(key);
+}
+
+std::wstring AppStartupSoundFilePath() {
+    return AppDir() + L"\\startup.wav";
+}
+
+std::wstring AppFinishSoundFilePath() {
+    return AppDir() + L"\\finish.wav";
+}
+
+bool IsPlayableWavFile(const std::wstring& path) {
+    if (path.empty()) return false;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 12) {
+        CloseHandle(h);
+        return false;
+    }
+    unsigned char hdr[12]{};
+    DWORD n = 0;
+    const BOOL ok = ReadFile(h, hdr, 12, &n, nullptr);
+    CloseHandle(h);
+    return ok && n == 12
+        && std::memcmp(hdr, "RIFF", 4) == 0
+        && std::memcmp(hdr + 8, "WAVE", 4) == 0;
+}
+
+namespace {
+void PlayWavOrFallbackBeep(const std::wstring& path) {
+    // SND_NODEFAULT：自定义文件失败时不要再播一遍系统音，由下面统一 MessageBeep。
+    if (IsPlayableWavFile(path)
+        && PlaySoundW(path.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
+        return;
+    }
+    MessageBeep(MB_OK);
+}
+}
+
+void PlayAppStartupSound() {
+    PlayWavOrFallbackBeep(AppStartupSoundFilePath());
+}
+
+void PlayAppFinishSound() {
+    PlayWavOrFallbackBeep(AppFinishSoundFilePath());
 }
 
 std::wstring ExpandEnvironmentVars(const std::wstring& text) {
@@ -194,6 +352,130 @@ void EnumerateScriptJsonFiles(const std::wstring& rootDir, std::vector<ScriptFil
     EnumerateScriptJsonFilesRec(rootDir, L"", out);
 }
 
+std::wstring LibraryJsonFileName(std::wstring name) {
+    name = Trim(std::move(name));
+    if (name.empty()) return {};
+    const auto slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    if (name.size() < 5 || _wcsicmp(name.c_str() + name.size() - 5, L".json") != 0)
+        name += L".json";
+    return name;
+}
+
+bool FindScriptJsonByFileName(const std::wstring& rootDir, const std::wstring& fileName,
+    std::wstring& outPath) {
+    outPath.clear();
+    const std::wstring want = LibraryJsonFileName(fileName);
+    if (want.empty() || rootDir.empty()) return false;
+    std::vector<ScriptFileEntry> files;
+    EnumerateScriptJsonFiles(rootDir, files);
+    for (const auto& f : files) {
+        if (_wcsicmp(f.fileName.c_str(), want.c_str()) == 0) {
+            outPath = f.path;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring StripExtendedPathPrefix(std::wstring p) {
+    if (p.size() >= 4 && wcsncmp(p.c_str(), L"\\\\?\\", 4) == 0) {
+        p.erase(0, 4);
+        if (p.size() >= 4 && _wcsnicmp(p.c_str(), L"UNC\\", 4) == 0)
+            p = L"\\\\" + p.substr(4);
+    }
+    for (auto& ch : p) {
+        if (ch == L'/') ch = L'\\';
+    }
+    while (!p.empty() && p.back() == L'\\') p.pop_back();
+    return p;
+}
+
+std::wstring WinFullPath(const std::wstring& path) {
+    if (path.empty()) return {};
+    DWORD n = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (n == 0) return StripExtendedPathPrefix(path);
+    std::wstring buf(n, L'\0');
+    n = GetFullPathNameW(path.c_str(), n, buf.data(), nullptr);
+    if (n == 0) return StripExtendedPathPrefix(path);
+    buf.resize(n);
+    while (!buf.empty() && buf.back() == L'\0') buf.pop_back();
+    return StripExtendedPathPrefix(buf);
+}
+
+bool PathIsUnderDir(const std::wstring& path, const std::wstring& dir) {
+    if (path.empty() || dir.empty()) return false;
+    const std::wstring f = WinFullPath(path);
+    const std::wstring d = WinFullPath(dir);
+    if (f.empty() || d.empty() || f.size() <= d.size()) return false;
+    if (_wcsnicmp(f.c_str(), d.c_str(), d.size()) != 0) return false;
+    return f[d.size()] == L'\\';
+}
+
+bool LibraryFileExists(const std::wstring& path) {
+    if (path.empty()) return false;
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool ResolveLibraryScriptPath(const std::wstring& pathOrName, std::wstring& outPath) {
+    outPath.clear();
+    const std::wstring cand = Trim(pathOrName);
+    if (cand.empty()) return false;
+
+    const bool hasSep = cand.find(L'\\') != std::wstring::npos
+        || cand.find(L'/') != std::wstring::npos;
+    const bool exists = LibraryFileExists(cand);
+    const bool inScripts = PathIsUnderDir(cand, ScriptsDir());
+    const bool inRec = PathIsUnderDir(cand, RecordingsDir());
+
+    if (exists && (inScripts || inRec)) {
+        const std::wstring full = WinFullPath(cand);
+        outPath = full.empty() ? cand : full;
+        return true;
+    }
+
+    const std::wstring name = LibraryJsonFileName(cand);
+    if (name.empty()) return false;
+    const bool preferRec = hasSep && inRec && !inScripts;
+    if (preferRec) {
+        if (FindScriptJsonByFileName(RecordingsDir(), name, outPath)) return true;
+        if (FindScriptJsonByFileName(ScriptsDir(), name, outPath)) return true;
+    } else {
+        if (FindScriptJsonByFileName(ScriptsDir(), name, outPath)) return true;
+        if (FindScriptJsonByFileName(RecordingsDir(), name, outPath)) return true;
+    }
+    return false;
+}
+
+std::wstring NormalizeLibraryPathKey(const std::wstring& path) {
+    std::error_code ec;
+    const auto canon = std::filesystem::weakly_canonical(path, ec);
+    std::wstring s = (!ec && !canon.empty()) ? canon.wstring() : path;
+    for (auto& ch : s) {
+        if (ch == L'/') ch = L'\\';
+    }
+    while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    return s;
+}
+
+bool LibraryPathsEqual(const std::wstring& a, const std::wstring& b) {
+    if (a.empty() || b.empty()) return false;
+    return _wcsicmp(NormalizeLibraryPathKey(a).c_str(), NormalizeLibraryPathKey(b).c_str()) == 0;
+}
+
+bool RelocatePathUnderDir(std::wstring& path, const std::wstring& oldDir, const std::wstring& newDir) {
+    if (path.empty() || oldDir.empty() || newDir.empty()) return false;
+    const std::wstring p = NormalizeLibraryPathKey(path);
+    const std::wstring o = NormalizeLibraryPathKey(oldDir);
+    const std::wstring n = NormalizeLibraryPathKey(newDir);
+    if (o.empty() || p.size() <= o.size()) return false;
+    if (_wcsnicmp(p.c_str(), o.c_str(), o.size()) != 0) return false;
+    if (p[o.size()] != L'\\') return false;
+    path = n + p.substr(o.size());
+    return true;
+}
+
 void EnumerateRelativeFolders(const std::wstring& rootDir, std::vector<std::wstring>& out) {
     EnumerateRelativeFoldersRec(rootDir, L"", out);
     std::sort(out.begin(), out.end());
@@ -213,7 +495,7 @@ std::wstring TimestampName() {
     using namespace std::chrono;
     const auto ts = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
-    // 仅时间戳；业务前缀由调用方加（鼠标宏- / 鼠标录制- / 任务-），避免叠成「鼠标录制-鼠标宏-…」
+    // 仅时间戳；业务前缀由调用方加（鼠标宏- / 键鼠录制- / 任务-），避免叠成「键鼠录制-鼠标宏-…」
     return std::to_wstring(ts);
 }
 
@@ -374,7 +656,58 @@ size_t FindMatchingJsonDelimImpl(const StringT& src, size_t openPos, CharT openC
     return StringT::npos;
 }
 
+size_t FindTopLevelJsonKeyColonImpl(const std::wstring& src, const std::wstring& key) {
+    if (key.empty()) return std::wstring::npos;
+    size_t lastColon = std::wstring::npos;
+    int objDepth = 0;
+    int arrDepth = 0;
+    bool expectKey = false;
+    bool inStr = false;
+    bool esc = false;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const wchar_t c = src[i];
+        if (inStr) {
+            if (esc) { esc = false; continue; }
+            if (c == L'\\') { esc = true; continue; }
+            if (c == L'"') inStr = false;
+            continue;
+        }
+        if (c == L'"') {
+            if (expectKey && objDepth == 1 && arrDepth == 0) {
+                const size_t end = FindJsonStringEnd(src, i);
+                if (end == std::wstring::npos) break;
+                const std::wstring k = UnescapeJson(src.substr(i + 1, end - i - 1));
+                size_t j = end + 1;
+                while (j < src.size() && (src[j] == L' ' || src[j] == L'\t'
+                    || src[j] == L'\n' || src[j] == L'\r')) {
+                    ++j;
+                }
+                if (j < src.size() && src[j] == L':' && k == key)
+                    lastColon = j;
+                expectKey = false;
+                i = end;
+                continue;
+            }
+            inStr = true;
+            continue;
+        }
+        if (c == L'{') { ++objDepth; expectKey = true; continue; }
+        if (c == L'}') { if (objDepth > 0) --objDepth; expectKey = false; continue; }
+        if (c == L'[') { ++arrDepth; expectKey = false; continue; }
+        if (c == L']') { if (arrDepth > 0) --arrDepth; expectKey = false; continue; }
+        if (c == L',') {
+            expectKey = (objDepth >= 1 && arrDepth == 0);
+            continue;
+        }
+    }
+    return lastColon;
+}
+
 }  // namespace
+
+size_t FindTopLevelJsonKeyColon(const std::wstring& src, const std::wstring& key) {
+    return FindTopLevelJsonKeyColonImpl(src, key);
+}
 
 size_t FindMatchingJsonBrace(const std::wstring& src, size_t openPos) {
     return FindMatchingJsonDelimImpl(src, openPos, L'{', L'}');
@@ -386,6 +719,114 @@ size_t FindMatchingJsonBrace(const std::string& src, size_t openPos) {
 
 size_t FindMatchingJsonBracket(const std::string& src, size_t openPos) {
     return FindMatchingJsonDelimImpl(src, openPos, '[', ']');
+}
+
+size_t FindMatchingJsonBracket(const std::wstring& src, size_t openPos) {
+    return FindMatchingJsonDelimImpl(src, openPos, L'[', L']');
+}
+
+std::vector<std::wstring> ExtractJsonStringArray(const std::wstring& src, const std::wstring& key) {
+    std::vector<std::wstring> out;
+    const auto pos = src.find(L"\"" + key + L"\"");
+    if (pos == std::wstring::npos) return out;
+    const auto colon = src.find(L':', pos);
+    if (colon == std::wstring::npos) return out;
+    size_t tok = colon + 1;
+    while (tok < src.size() && (src[tok] == L' ' || src[tok] == L'\t'
+        || src[tok] == L'\n' || src[tok] == L'\r')) {
+        ++tok;
+    }
+    if (tok >= src.size() || src[tok] != L'[') return out;
+    const auto rb = FindMatchingJsonBracket(src, tok);
+    if (rb == std::wstring::npos) return out;
+    size_t i = tok + 1;
+    while (i < rb) {
+        while (i < rb && (src[i] == L' ' || src[i] == L'\t' || src[i] == L'\n'
+            || src[i] == L'\r' || src[i] == L',')) {
+            ++i;
+        }
+        if (i >= rb || src[i] != L'"') break;
+        ++i;
+        std::wstring val;
+        for (; i < rb; ++i) {
+            const wchar_t c = src[i];
+            if (c == L'\\') {
+                val.push_back(c);
+                if (i + 1 < rb) val.push_back(src[++i]);
+                continue;
+            }
+            if (c == L'"') {
+                ++i;
+                break;
+            }
+            val.push_back(c);
+        }
+        val = UnescapeJson(val);
+        out.push_back(std::move(val));
+    }
+    return out;
+}
+
+std::vector<int> ExtractJsonIntArray(const std::wstring& src, const std::wstring& key) {
+    std::vector<int> out;
+    const auto pos = src.find(L"\"" + key + L"\"");
+    if (pos == std::wstring::npos) return out;
+    const auto colon = src.find(L':', pos);
+    if (colon == std::wstring::npos) return out;
+    size_t tok = colon + 1;
+    while (tok < src.size() && (src[tok] == L' ' || src[tok] == L'\t'
+        || src[tok] == L'\n' || src[tok] == L'\r')) {
+        ++tok;
+    }
+    if (tok >= src.size() || src[tok] != L'[') return out;
+    const auto rb = FindMatchingJsonBracket(src, tok);
+    if (rb == std::wstring::npos) return out;
+    size_t i = tok + 1;
+    while (i < rb) {
+        while (i < rb && (src[i] == L' ' || src[i] == L'\t' || src[i] == L'\n'
+            || src[i] == L'\r' || src[i] == L',')) {
+            ++i;
+        }
+        if (i >= rb) break;
+        if (src[i] == L'"') {
+            ++i;
+            bool esc = false;
+            for (; i < rb; ++i) {
+                if (esc) {
+                    esc = false;
+                    continue;
+                }
+                if (src[i] == L'\\') {
+                    esc = true;
+                    continue;
+                }
+                if (src[i] == L'"') {
+                    ++i;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (i + 4 <= rb && src.compare(i, 4, L"true") == 0) {
+            out.push_back(1);
+            i += 4;
+            continue;
+        }
+        if (i + 5 <= rb && src.compare(i, 5, L"false") == 0) {
+            out.push_back(0);
+            i += 5;
+            continue;
+        }
+        wchar_t* endPtr = nullptr;
+        const long v = wcstol(src.c_str() + static_cast<ptrdiff_t>(i), &endPtr, 10);
+        if (endPtr && endPtr != src.c_str() + static_cast<ptrdiff_t>(i)) {
+            out.push_back(static_cast<int>(v));
+            i = static_cast<size_t>(endPtr - src.c_str());
+            continue;
+        }
+        ++i;
+    }
+    return out;
 }
 
 std::vector<std::wstring> ExtractJsonActionBlocks(const std::wstring& content) {
@@ -437,9 +878,8 @@ std::wstring ReadAll(const std::wstring& path) {
 
 std::wstring ExtractString(const std::wstring& src,
                             const std::wstring& key) {
-    const auto pos = src.find(L"\"" + key + L"\"");
-    if (pos == std::wstring::npos) return L"";
-    const auto colon = src.find(L':', pos);
+    const auto colon = FindTopLevelJsonKeyColon(src, key);
+    if (colon == std::wstring::npos) return L"";
     const auto first = src.find(L'\"', colon + 1);
     if (first == std::wstring::npos) return L"";
     const size_t second = FindJsonStringEnd(src, first);
@@ -449,11 +889,9 @@ std::wstring ExtractString(const std::wstring& src,
 
 double ExtractNumber(const std::wstring& src,
                       const std::wstring& key, double fallback) {
-    const auto pos = src.find(L"\"" + key + L"\"");
-    if (pos == std::wstring::npos) return fallback;
-    const auto colon = src.find(L':', pos);
+    const auto colon = FindTopLevelJsonKeyColon(src, key);
     if (colon == std::wstring::npos) return fallback;
-    const auto end = src.find_first_of(L",}\n", colon + 1);
+    const auto end = src.find_first_of(L",}]\n", colon + 1);
     try {
         return std::stod(Trim(src.substr(colon + 1, end - colon - 1)));
     } catch (...) {
@@ -462,15 +900,16 @@ double ExtractNumber(const std::wstring& src,
 }
 
 bool ExtractBool(const std::wstring& src, const std::wstring& key, bool fallback) {
-    const auto pos = src.find(L"\"" + key + L"\"");
-    if (pos == std::wstring::npos) return fallback;
-    const auto colon = src.find(L':', pos);
+    const auto colon = FindTopLevelJsonKeyColon(src, key);
     if (colon == std::wstring::npos) return fallback;
     size_t i = colon + 1;
-    while (i < src.size() && (src[i] == L' ' || src[i] == L'\t')) ++i;
+    while (i < src.size() && (src[i] == L' ' || src[i] == L'\t'
+        || src[i] == L'\n' || src[i] == L'\r')) {
+        ++i;
+    }
     if (i < src.size() && src.compare(i, 4, L"true") == 0) return true;
     if (i < src.size() && src.compare(i, 5, L"false") == 0) return false;
-    const auto end = src.find_first_of(L",}\n", colon + 1);
+    const auto end = src.find_first_of(L",}]\n", colon + 1);
     try {
         return std::stod(Trim(src.substr(colon + 1, end - colon - 1))) != 0.0;
     } catch (...) {
@@ -576,6 +1015,40 @@ std::wstring ResolveImagePath(const std::wstring& stored) {
     }
     wchar_t fullBuf[MAX_PATH]{};
     if (GetFullPathNameW(candidate.c_str(), MAX_PATH, fullBuf, nullptr) == 0) return L"";
+
+    auto fileOk = [](const wchar_t* p) {
+        return p && p[0] && GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+    };
+    auto recoverEatenTemplateName = [](std::wstring name) -> std::wstring {
+        name.erase(std::remove(name.begin(), name.end(), L'\t'), name.end());
+        auto swapPrefix = [&](const wchar_t* bad, const wchar_t* good) -> std::wstring {
+            const size_t n = wcslen(bad);
+            if (name.size() > n && _wcsnicmp(name.c_str(), bad, n) == 0) {
+                return std::wstring(good) + name.substr(n);
+            }
+            return L"";
+        };
+        std::wstring r = swapPrefix(L"imagestemplate_", L"template_");
+        if (!r.empty()) return r;
+        return swapPrefix(L"imagesemplate_", L"template_");
+    };
+    if (!fileOk(fullBuf)) {
+        std::wstring cur = fullBuf;
+        const auto slash = cur.find_last_of(L"\\/");
+        const std::wstring dir = slash == std::wstring::npos ? L"" : cur.substr(0, slash + 1);
+        const std::wstring name = slash == std::wstring::npos ? cur : cur.substr(slash + 1);
+        const std::wstring recoveredName = recoverEatenTemplateName(name);
+        if (!recoveredName.empty()) {
+            const std::wstring recovered = dir + recoveredName;
+            wchar_t recoveredFull[MAX_PATH]{};
+            if (GetFullPathNameW(recovered.c_str(), MAX_PATH, recoveredFull, nullptr) != 0
+                && fileOk(recoveredFull)
+                && (IsAbsolutePath(stored) || IsPathInImageDir(recoveredFull))) {
+                return recoveredFull;
+            }
+        }
+    }
+
     if (IsAbsolutePath(stored)) {
         // 绝对路径：规范化后返回（旧脚本可能指向库外文件）；桥接读图另做 images 目录门闩
         return fullBuf;
@@ -596,11 +1069,15 @@ std::wstring ImagePathForJson(const std::wstring& absolutePath) {
         const wchar_t* rest = normalized.c_str() + imgDir.size();
         if (*rest == L'\\') ++rest;
         if (*rest == L'\0') return L"";
-        return L"images\\" + std::wstring(rest);
+        std::wstring restStr(rest);
+        for (wchar_t& ch : restStr) {
+            if (ch == L'\\') ch = L'/';
+        }
+        return L"images/" + restStr;
     }
     const auto slash = normalized.find_last_of(L"\\/");
     const std::wstring fileName = slash == std::wstring::npos ? normalized : normalized.substr(slash + 1);
-    return fileName.empty() ? L"" : L"images\\" + fileName;
+    return fileName.empty() ? L"" : L"images/" + fileName;
 }
 
 std::wstring EnsureImageInLibrary(const std::wstring& path) {
@@ -636,11 +1113,25 @@ std::unordered_set<std::wstring> CollectImagePathsFromJson(const std::wstring& j
         const auto type = ExtractString(block, L"type");
         const auto imgPath = ExtractString(block, L"imagePath");
         if (!imgPath.empty()) {
-            if (type == L"findImage") {
+            if (type == L"findImage" || type == L"watchImage" || type == L"multiMatch") {
+                paths.insert(ResolveImagePath(imgPath));
+            } else if ((type == L"mouseDrag" || type == L"getColor"
+                || type == L"colorMatch" || type == L"findColor")
+                && ExtractBool(block, L"imageLocate", false)) {
                 paths.insert(ResolveImagePath(imgPath));
             } else if (type == L"textRecognition"
                 && ExtractNumber(block, L"ocrRegionByImage", 0) != 0) {
                 paths.insert(ResolveImagePath(imgPath));
+            }
+        }
+        if (type == L"multiMatch") {
+            const auto mmPaths = ExtractJsonStringArray(block, L"imagePaths");
+            const auto mmUse = ExtractJsonIntArray(block, L"imageUseVars");
+            const bool fallbackUse = ExtractNumber(block, L"imageUseVar", 0) != 0;
+            for (size_t i = 0; i < mmPaths.size(); ++i) {
+                const bool useVar = i < mmUse.size() ? mmUse[i] != 0 : (i == 0 && fallbackUse);
+                if (useVar || mmPaths[i].empty()) continue;
+                paths.insert(ResolveImagePath(mmPaths[i]));
             }
         }
         const auto recordedCapturePath = ExtractString(block, L"recordedCapturePath");
@@ -695,12 +1186,24 @@ void RemapImportedImagePathInScriptJson(std::wstring& content,
     for (const auto& block : blocks) {
         const auto type = ExtractString(block, L"type");
         const bool remapImagePath = type == L"findImage"
+            || type == L"watchImage"
+            || type == L"multiMatch"
             || (type == L"textRecognition"
                 && ExtractNumber(block, L"ocrRegionByImage", 0) != 0);
         if (remapImagePath) {
             const auto oldPath = ExtractString(block, L"imagePath");
             if (ImportedImageFileNameMatches(oldPath, zipEntryFileName, destFileName)) {
                 ReplaceJsonStringFieldValue(content, L"imagePath", oldPath, newRelPath);
+            }
+        }
+        if (type == L"multiMatch") {
+            for (const auto& oldPath : ExtractJsonStringArray(block, L"imagePaths")) {
+                if (!ImportedImageFileNameMatches(oldPath, zipEntryFileName, destFileName)) continue;
+                const std::wstring quotedOld = L"\"" + EscapeJson(oldPath) + L"\"";
+                const std::wstring quotedNew = L"\"" + EscapeJson(newRelPath) + L"\"";
+                const auto p = content.find(quotedOld);
+                if (p != std::wstring::npos)
+                    content.replace(p, quotedOld.size(), quotedNew);
             }
         }
         if (type == L"aiImageAnalysis" || type == L"aiActionExecute") {
@@ -1194,6 +1697,31 @@ std::wstring VkName(UINT vk) {
     case VK_CLEAR:      return L"Clear";
     }
     return L"按键" + std::to_wstring(vk);
+}
+
+UINT VirtualKeyFromKeyText(const std::wstring& keyText) {
+    if (keyText.empty()) return 0;
+    if (keyText == L"←") return VK_LEFT;
+    if (keyText == L"↑") return VK_UP;
+    if (keyText == L"→") return VK_RIGHT;
+    if (keyText == L"↓") return VK_DOWN;
+    if (keyText == L"空格键") return VK_SPACE;
+    return 0;
+}
+
+UINT NormalizeScriptKeyVk(UINT vk, const std::wstring& keyText) {
+    const UINT fromText = VirtualKeyFromKeyText(keyText);
+    switch (vk) {
+    case 0x2190: return VK_LEFT;
+    case 0x2191: return VK_UP;
+    case 0x2192: return VK_RIGHT;
+    case 0x2193: return VK_DOWN;
+    default:
+        break;
+    }
+    if (vk > 255) return fromText;
+    if (vk == 0) return fromText;
+    return vk;
 }
 
 std::wstring HotkeyText(UINT modifiers, UINT vk) {

@@ -74,11 +74,24 @@ struct QuickInputVarItem {
     std::wstring codeHint;  // 代码补全提示
 };
 
+/// 多图匹配保存的全部命中（matchRet[0].x）
+struct ImageMatchListHit {
+    ImageMatchResult match;
+    int templateIndex = 0;          // 0-based 模板序号
+    std::wstring templateName;
+};
+
+struct ImageMatchListVar {
+    std::vector<ImageMatchListHit> hits;
+};
+
 // 宏变量执行上下文 (传递当前脚本的变量状态)
 struct MacroVariableContext {
     const std::unordered_map<std::wstring, ImageMatchResult>* matchVars = nullptr;  // 找图结果变量
+    const std::unordered_map<std::wstring, ImageMatchListVar>* matchListVars = nullptr;  // 多图/多处结果
     const std::unordered_map<std::wstring, OcrVarResult>* ocrVars = nullptr;      // 文字识别变量
     const std::unordered_map<std::wstring, std::wstring>* aiVars = nullptr;       // AI输出变量
+    const std::unordered_map<std::wstring, std::wstring>* userVars = nullptr;     // 变量运算 return 导出
     const std::unordered_map<std::wstring, std::wstring>* imageVars = nullptr;    // 图片变量→绝对路径
     const std::unordered_map<std::wstring, int>* loopVars = nullptr;                // 循环计数变量
     const std::unordered_map<std::wstring, std::chrono::steady_clock::time_point>* timerStarts = nullptr;  // 计时器变量起始时刻
@@ -90,11 +103,19 @@ struct MacroVariableContext {
 // 构建编辑器变量提示列表 (从脚本动作中提取所有定义过的变量)
 std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptAction>& actions);
 
-// 将文本中的 ${varName} 占位符替换为实际值
+// 将文本中的 {varName} 占位符替换为实际值
 std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariableContext& ctx);
+
+// 快捷输入：展开 {var} 后按 parseEscapes 处理转义。
+// 勾选：整段（含变量值）把 \n \r \t \\ 转成换行/Tab/反斜杠。
+// 未勾选：文本框字面保留；变量里已有的换行/Tab 直接丢掉，避免 OCR/剪贴板换行仍被当成回车。
+std::wstring ResolveQuickInputText(const std::wstring& text, const MacroVariableContext& ctx, bool parseEscapes);
 
 // 解析单个操作数 token (处理变量引用和数值字面量)
 std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableContext& ctx);
+
+/// 变量运算中的剪贴板：有文件则路径（多文件换行分隔），否则为文本；空则空串。
+std::wstring ResolveClipboardVarCompute(const MacroVariableContext& ctx);
 
 // 尝试将 token 解析为整数操作数
 bool TryResolveIntOperand(const std::wstring& token, const MacroVariableContext& ctx, int& out);

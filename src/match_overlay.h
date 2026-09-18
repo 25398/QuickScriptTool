@@ -9,7 +9,13 @@
 
 #include "image_match.h"
 
-enum class MatchOverlayMode { Test, OffsetPick, RelativeRegionPick, SyntheticAnchorRegionPick };
+enum class MatchOverlayMode {
+    Test,
+    OffsetPick,
+    RelativeRegionPick,
+    SyntheticAnchorRegionPick,
+    SyntheticAnchorOffsetPick
+};
 
 class MatchOverlay {
 public:
@@ -27,6 +33,11 @@ public:
         int regionY2 = 0;
     };
 
+    /// 窗口模式测试：搜索区已是目标窗口客户区，禁止因框小于模板而扩到整块虚拟屏。
+    void SetAllowExpandSearchToVirtualScreen(bool allow) {
+        allowExpandSearchToVirtualScreen_ = allow;
+    }
+
     ActionResult Show(const std::wstring& imagePath,
                       int searchX1, int searchY1, int searchX2, int searchY2,
                       double thresholdPercent, double scaleMin, double scaleMax,
@@ -39,6 +50,8 @@ public:
 
     /// 变量模式：按宽高在屏幕中央放合成锚框，框选相对区域（不做内容匹配）。
     ActionResult ShowSyntheticAnchor(int anchorW, int anchorH);
+    /// 变量模式：按宽高在屏幕中央放合成锚框，再相对中心点选点击偏移。
+    ActionResult ShowSyntheticAnchorOffset(int anchorW, int anchorH);
 
     bool matchDone_ = false;
     ImageMatchResult matchResult_;
@@ -77,6 +90,7 @@ private:
     bool useCustomMatchOptions_ = false;
     ImageMatchOptions customMatchOptions_{};
     MatchOverlayMode mode_ = MatchOverlayMode::Test;
+    bool allowExpandSearchToVirtualScreen_ = true;
     int syntheticW_ = 0;
     int syntheticH_ = 0;
 

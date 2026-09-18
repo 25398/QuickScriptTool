@@ -5,6 +5,7 @@
 
 #include "screenshot_overlay.h"
 #include "image_match.h"
+#include "ui_scale.h"
 
 #include <algorithm>
 #include <cstring>
@@ -499,7 +500,7 @@ void ScreenshotOverlay::Paint(HDC hdc) {
         std::wstring text = std::to_wstring(w) + L" × " + std::to_wstring(h);
         SetBkMode(memDc, TRANSPARENT);
         SetTextColor(memDc, RGB(255, 255, 255));
-        HFONT font = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        HFONT font = CreateFontW(UiFontHeight(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
         HGDIOBJ oldFont = SelectObject(memDc, font);
@@ -627,7 +628,7 @@ void ScreenshotOverlay::DrawSizeInfo(HDC hdc) {
     const int sh = selection_.bottom - selection_.top;
     std::wstring text = std::to_wstring(sw) + L" × " + std::to_wstring(sh);
 
-    HFONT font = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT font = CreateFontW(UiFontHeight(15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
     HGDIOBJ oldFont = SelectObject(hdc, font);
@@ -675,7 +676,7 @@ void ScreenshotOverlay::DrawToolbar(HDC hdc) {
     FillRect(hdc, &confirmRc, green);
     DeleteObject(green);
     SetTextColor(hdc, RGB(255, 255, 255));
-    HFONT font = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT font = CreateFontW(UiFontHeight(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
     HGDIOBJ oldFont = SelectObject(hdc, font);

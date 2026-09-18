@@ -947,7 +947,7 @@ body:not(.opt-open) .app{
 }
 .col-headers > span:first-child{text-align:left;padding-left:calc(2px * var(--qst-u))}
 .col-headers > span:last-child{text-align:center}
-.action-list{flex:1;min-height:0;overflow:auto;border:none;border-radius:0;background:transparent;scrollbar-gutter:stable}
+.action-list{flex:1;min-height:0;overflow:auto;border:none;border-radius:0;background:transparent;scrollbar-gutter:stable;outline:none}
 .arow{
   height:calc(38px * var(--qst-u));
   display:grid;
@@ -1029,6 +1029,162 @@ body:not(.opt-open) .app{
 .arow.sel .op{color:var(--mint-300)}
 .arow.sel .op .op-drag{cursor:grabbing;pointer-events:none;opacity:1}
 .add-bar{margin-top:calc(8px * var(--qst-u));display:flex;align-items:center;gap:calc(8px * var(--qst-u));flex-shrink:0}
+.app.editor-mode .left-col.is-visual .action-table,
+.app.editor-mode .left-col.is-visual .add-bar,
+.app.editor-mode .editor-chrome.is-visual .action-table,
+.app.editor-mode .editor-chrome.is-visual .add-bar,
+.app.visual-editor .action-table,
+.app.visual-editor .add-bar{display:none !important}
+.app.editor-mode .left-col.is-visual #visualCanvasHost,
+.app.editor-mode .editor-chrome.is-visual #visualCanvasHost,
+.app.visual-editor #visualCanvasHost{display:block !important;flex:1 1 auto;min-height:0}
+.left-col.is-visual #btnBatch{display:none}
+.app.editor-mode .left-col.is-visual #batchBar,
+.app.visual-editor #batchBar{display:none !important}
+.app.editor-mode .left-col.is-visual #normalBar,
+.app.visual-editor #normalBar{display:flex !important}
+.visual-canvas-host{
+  display:none;flex:1;min-height:0;position:relative;overflow:hidden;
+  border:1px solid var(--line);border-radius:calc(8px * var(--qst-u));
+  background:#e8eef3;cursor:grab;outline:none;user-select:none;
+}
+.visual-scroll{
+  position:absolute;inset:0;overflow:auto;cursor:inherit;
+}
+.visual-marquee{
+  position:absolute;z-index:9;pointer-events:none;display:none;box-sizing:border-box;
+  border:1px solid #3b82f6;background:rgba(59,130,246,.18);
+}
+.visual-canvas-host.is-panning,
+.visual-canvas-host.is-dragging{cursor:grabbing}
+.visual-sizer{position:relative;min-width:100%;min-height:100%}
+.visual-world{
+  position:absolute;left:0;top:0;transform-origin:0 0;
+  background-image:radial-gradient(circle,#c5ced6 1.15px,transparent 1.25px);
+  background-size:18px 18px;background-color:#eef2f6;
+}
+.visual-world.no-grid{background-image:none}
+.visual-wraps{position:absolute;left:0;top:0;right:0;bottom:0;z-index:1;pointer-events:none}
+.vwrap{
+  position:absolute;box-sizing:border-box;border-radius:16px;pointer-events:none;
+  border:2px solid rgba(56,189,248,.55);background:rgba(56,189,248,.07);
+}
+.vwrap.loop{border-color:rgba(56,189,248,.7);background:rgba(56,189,248,.08)}
+.vwrap.if{border-color:rgba(34,197,94,.65);background:rgba(34,197,94,.07)}
+.vwrap.else{border-color:rgba(245,158,11,.7);background:rgba(245,158,11,.07)}
+.vwrap.defineBlock{border-color:rgba(139,92,246,.65);background:rgba(139,92,246,.07)}
+.visual-edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:auto;z-index:3}
+.visual-cards{position:absolute;left:0;top:0;right:0;bottom:0;z-index:4;pointer-events:none}
+.vcard{
+  position:absolute;width:210px;min-height:72px;box-sizing:border-box;
+  background:#fff;border:1px solid #d5dee6;border-radius:10px;
+  box-shadow:0 2px 8px rgba(15,23,42,.08);padding:10px 14px 10px 22px;
+  cursor:grab;z-index:2;pointer-events:auto;
+}
+.vcard.start{
+  background:linear-gradient(180deg,#ecfdf5,#fff);border-color:#10b981;
+}
+.vcard.start .vcard-title{color:#047857}
+.vcard.container.loop{border-color:#38bdf8}
+.vcard.loop-tag{
+  width:168px;padding:10px 12px 10px 22px;
+  border-color:#38bdf8;background:linear-gradient(180deg,#f0f9ff,#fff);
+}
+.vcard.is-loop-head{
+  padding-top:30px;min-height:94px;border-color:#38bdf8;
+}
+.vcard.is-loop-head .vcard-dots{top:30px}
+.vloop-badge{
+  position:absolute;left:0;right:0;top:0;height:22px;z-index:4;
+  border:0;border-radius:10px 10px 0 0;cursor:pointer;
+  background:#e0f2fe;color:#0369a1;font-size:11px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;
+  letter-spacing:.02em;
+}
+.vloop-badge:hover{background:#bae6fd}
+.vcard.sel-loop .vloop-badge{background:#0284c7;color:#fff}
+.vcard.container.if{border-color:#22c55e}
+.vcard.container.else{border-color:#f59e0b}
+.vcard.container.defineBlock{border-color:#8b5cf6}
+.vcard.sel{
+  border-color:#38bdf8;background:#f0f9ff;
+  box-shadow:0 0 0 2px rgba(56,189,248,.28),0 4px 14px rgba(14,116,144,.12);
+  z-index:4;
+}
+.vcard.is-moving{cursor:grabbing;z-index:6;opacity:.96}
+.vcard-dots{
+  position:absolute;left:7px;top:10px;bottom:10px;width:8px;
+  display:flex;flex-direction:column;justify-content:center;gap:4px;
+}
+.vcard-dots i{width:6px;height:6px;border-radius:50%;display:block}
+.vcard-dots i.g{background:#22c55e}
+.vcard-dots i.b{background:#3b82f6}
+.vcard-dots i.r{background:#ef4444}
+.vcard-title{
+  font-size:12.5px;font-weight:700;color:#1e293b;line-height:1.35;
+  word-break:break-word;
+}
+.vcard-remark{
+  margin-top:4px;font-size:11px;color:#64748b;line-height:1.35;
+  word-break:break-word;min-height:1em;
+}
+.vport{
+  position:absolute;width:12px;height:12px;border-radius:50%;
+  background:#3b82f6;border:2px solid #fff;box-shadow:0 0 0 1px #3b82f6;
+  top:36px;transform:translateY(-50%);z-index:3;cursor:crosshair;
+}
+.vport.in{left:-6px}
+.vport.out{right:-6px}
+.vport.in.enter,.vport.out.if-true,.vport.out.exit{top:30%;transform:translateY(-50%)}
+.vport.in.back,.vport.out.if-false,.vport.out.back{top:70%;transform:translateY(-50%)}
+.vcard.is-loop-head .vport{
+  top:58px;transform:translateY(-50%);
+}
+.vcard.is-loop-head .vport.in.enter,
+.vcard.is-loop-head .vport.out.exit,
+.vcard.is-loop-head .vport.out.if-true{
+  top:calc(22px + (100% - 22px) * 0.3);transform:translateY(-50%);
+}
+.vcard.is-loop-head .vport.in.back,
+.vcard.is-loop-head .vport.out.back,
+.vcard.is-loop-head .vport.out.if-false{
+  top:calc(22px + (100% - 22px) * 0.7);transform:translateY(-50%);
+}
+.vport.if-true{background:#22c55e;box-shadow:0 0 0 1px #22c55e}
+.vport.if-false{background:#f59e0b;box-shadow:0 0 0 1px #f59e0b}
+.vport.back{background:#6366f1;box-shadow:0 0 0 1px #6366f1}
+.visual-empty{
+  position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  color:#94a3b8;font-size:13px;pointer-events:none;white-space:nowrap;z-index:0;
+}
+.visual-edge{fill:none;stroke:#3b82f6;stroke-width:1.8;stroke-dasharray:6 4;pointer-events:none}
+.visual-edge-g{pointer-events:none}
+.visual-edge-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:grab}
+.vedge-handle{
+  fill:#fff;stroke:#2563eb;stroke-width:1.6;pointer-events:auto;cursor:grab;
+}
+.visual-canvas-host.is-dragging .visual-edge-hit,
+.visual-canvas-host.is-dragging .vedge-handle{cursor:grabbing}
+.visual-edge-g:hover .visual-edge{stroke-width:2.6}
+.visual-edge-g.sel .visual-edge,
+.visual-edge.sel{stroke:#ef4444;stroke-width:2.4;stroke-dasharray:none}
+.visual-edge.back{stroke:#6366f1}
+.visual-edge.ifTrue,.visual-edge.branch,.visual-edge.guard{stroke:#22c55e}
+.visual-edge.ifFalse,.visual-edge.fail{stroke:#f59e0b}
+.visual-edge.jump{stroke:#a855f7}
+.visual-edge.call{stroke:#94a3b8}
+.visual-edge.temp{stroke:#0ea5e9;stroke-width:2;stroke-dasharray:4 3}
+.visual-hud{
+  position:absolute;left:50%;bottom:32px;transform:translateX(-50%);
+  z-index:12;pointer-events:none;
+  min-width:52px;text-align:center;padding:6px 14px;border-radius:8px;
+  background:rgba(15,23,42,.58);color:#fff;border:0;
+  font-size:13px;font-weight:700;letter-spacing:.04em;
+  user-select:none;opacity:0;
+  transition:opacity .45s ease;
+  box-shadow:none;
+}
+.visual-hud.show{opacity:1;transition:opacity .08s ease}
 .param-title{font-size:calc(15px * var(--qst-u));font-weight:700;margin-bottom:calc(10px * var(--qst-u));display:flex;align-items:center;gap:calc(8px * var(--qst-u));flex-shrink:0}
 .param-title span{font-size:calc(11px * var(--qst-u));font-weight:600;color:#0369a1;background:var(--ice-200);padding:calc(2px * var(--qst-u)) calc(8px * var(--qst-u));border-radius:calc(4px * var(--qst-u))}
 /* 勿用 flex 列：子块会被压扁导致找图预览与匹配区重叠 */
@@ -1130,6 +1286,14 @@ body:not(.opt-open) .app{
   width:100%;max-width:100%;justify-content:center;margin:calc(2px * var(--qst-u)) 0 calc(8px * var(--qst-u));
   box-sizing:border-box;
 }
+.param-block .fline.nwm-btns{
+  width:100%;
+  gap:calc(6px * var(--qst-u));
+  align-items:center;
+}
+.param-block .fline.nwm-btns > button.btn{
+  width:auto;max-width:none;flex:0 0 auto;min-width:calc(72px * var(--qst-u));margin:0;white-space:nowrap;
+}
 .pf-sec > h4{display:none} /* 类型名已在 #paramTag，避免与原生重复大标题 */
 .ocr-panel{
   padding:calc(8px * var(--qst-u)) calc(12px * var(--qst-u)) calc(16px * var(--qst-u));
@@ -1208,6 +1372,15 @@ body:not(.opt-open) .app{
 }
 .param-block .fline-stack .stack-ctrl > .combo{
   flex:1 1 auto;width:100%;max-width:100%;min-width:0;
+}
+.param-block .fline-stack.nwm-full .stack-ctrl > .inp{
+  flex:1 1 auto;width:100%;max-width:100%;
+}
+.param-block .fline-stack.nwm-full .stack-lab.nwm-lab{
+  display:flex;align-items:center;gap:calc(8px * var(--qst-u));
+}
+.param-block .fline-stack.nwm-full .stack-lab.nwm-lab > .chk{
+  flex:0 0 auto;font-weight:500;
 }
 .param-block .fline.coord-row .coord-rest > .inp.ed-coord,
 .param-block .fline.coord-row .coord-rest > .inp.ed-varx{
@@ -1513,6 +1686,7 @@ body:not(.opt-open) .app{
   display:flex;align-items:center;justify-content:center;padding:20px 16px;
   opacity:0;pointer-events:none;transition:opacity .28s;
 }
+.app.editor-mode .overlay,.app.visual-editor .overlay{z-index:4000}
 .overlay.show{opacity:1;pointer-events:auto}
 .dlg{
   background:var(--frost);border-radius:14px;overflow:hidden;width:min(640px,100%);
@@ -1614,6 +1788,99 @@ html.agent-shell .bubble{
   height:min(780px, calc(100vh - 48px));
   max-width:none;
   max-height:none;
+}
+.dlg.settings-size.editor-settings-size{
+  width:min(680px, 92vw);
+  height:min(640px, calc(100vh - 48px)) !important;
+  max-height:min(720px, calc(100vh - 48px));
+}
+.dlg.settings-size.editor-settings-size .dlg-body{
+  display:flex;
+  flex-direction:column;
+  flex:1 1 auto;
+  min-height:0;
+  overflow:hidden;
+  padding:0;
+}
+.dlg.settings-size.editor-settings-size .ed-set-pane{
+  display:none;
+  flex:1 1 auto;
+  min-height:0;
+  overflow:hidden;
+}
+.dlg.settings-size.editor-settings-size .ed-set-pane.active{
+  display:flex;
+  flex-direction:column;
+  animation:fadeUp .3s var(--ease-out);
+}
+.dlg.settings-size.editor-settings-size .ed-set-pane .panel{
+  display:block;
+  flex:1 1 auto;
+  min-height:0;
+  overflow:auto;
+  height:auto;
+}
+.dlg.settings-size.editor-settings-size .ed-set-pane .row{
+  margin-left:0;
+  margin-right:0;
+}
+.ed-action-catalog{
+  display:flex;
+  flex-direction:column;
+  gap:0;
+  margin:0 calc(10px * var(--qst-u)) calc(12px * var(--qst-u));
+  border:1px solid var(--line);
+  border-radius:calc(8px * var(--qst-u));
+  background:var(--frost);
+  overflow:hidden;
+}
+.ed-cat-row{
+  display:flex;
+  align-items:center;
+  gap:calc(8px * var(--qst-u));
+  min-height:calc(36px * var(--qst-u));
+  padding:calc(4px * var(--qst-u)) calc(8px * var(--qst-u));
+  border-bottom:1px solid var(--line);
+  cursor:grab;
+  user-select:none;
+}
+.ed-cat-row:last-child{border-bottom:none}
+.ed-cat-row:hover{background:rgba(255,255,255,.55)}
+.ed-cat-row.dragging{opacity:.45}
+.ed-cat-row.is-hidden-type{opacity:.48}
+.ed-cat-handle{
+  flex:0 0 auto;
+  width:calc(18px * var(--qst-u));
+  text-align:center;
+  color:var(--text-3);
+  font-size:calc(14px * var(--qst-u));
+  letter-spacing:-2px;
+  cursor:grab;
+}
+.ed-cat-name{
+  flex:1 1 auto;
+  min-width:0;
+  font-size:calc(13px * var(--qst-u));
+  font-weight:600;
+}
+.ed-cat-btns{
+  display:flex;
+  gap:calc(4px * var(--qst-u));
+  flex:0 0 auto;
+}
+.ed-cat-btns .btn{
+  min-width:calc(28px * var(--qst-u));
+  padding:calc(2px * var(--qst-u)) calc(6px * var(--qst-u));
+  font-size:calc(11px * var(--qst-u));
+}
+.dlg.settings-size .row .hint{
+  flex:0 0 100%;
+  margin:0;
+  padding:0 0 0 calc(28px * var(--qst-u));
+  font-size:calc(12px * var(--qst-u));
+  font-weight:500;
+  color:var(--text-3);
+  line-height:1.4;
 }
 .dlg.settings-size .dlg-body{
   flex:1 1 auto;
@@ -1723,6 +1990,23 @@ html.agent-shell .bubble{
   overflow:visible;
   box-sizing:border-box;
   font-size:calc(13.5px * var(--qst-u));
+}
+.dlg.settings-size .row.sound-pair-row{
+  flex-wrap:nowrap;
+  align-items:center;
+  gap:calc(10px * var(--qst-u)) calc(22px * var(--qst-u));
+}
+.dlg.settings-size .row.sound-pair-row .sound-chk-pair{
+  display:flex;
+  align-items:center;
+  gap:calc(10px * var(--qst-u));
+  cursor:pointer;
+  flex:0 1 auto;
+  min-width:0;
+}
+.dlg.settings-size .row.sound-pair-row .sound-chk-pair .lbl-w{
+  padding-top:0;
+  flex:0 0 auto;
 }
 .dlg.settings-size .row.ui-mode-row{
   align-items:center;
@@ -1868,8 +2152,8 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
   flex:1 1 auto;width:auto;max-width:none;min-width:0;
 }
 
-/* 专业模式：隐藏标题栏重复设置齿轮 */
-html.pro-ui #btnSettings{display:none !important}
+/* 专业模式：主页已有设置 Tab，隐藏标题栏齿轮；编辑鼠标宏时仍显示（打开编辑器专用设置） */
+html.pro-ui body:not(.editor-open) #btnSettings{display:none !important}
 .dlg.settings-size .row .sub{
   flex:0 0 100%;
   width:100%;
@@ -2523,7 +2807,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
 </style>
 
 
-<link rel="stylesheet" href="shell.css?v=20260805g" />
+<link rel="stylesheet" href="shell.css?v=20260912nwm6" />
 <link rel="stylesheet" href="vendor/katex/katex.min.css" />
 <link rel="stylesheet" href="pro-mode.css?v=20260831a" />
 </head>
@@ -2559,7 +2843,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
     </div>
     <div class="tab" data-tab="recorder">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 12h6"/></svg>
-      鼠标录制
+      键鼠录制
     </div>
     <div class="tab" data-tab="macro">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 7h10v4H7zM7 13h6v4H7z"/></svg>
@@ -2788,18 +3072,31 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
               <button class="btn ghost">复制所选项</button>
             </div>
             <div id="normalBar" style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn ghost" id="btnVisualMode" title="在列表与可视化画布之间切换">可视化</button>
               <button class="btn ghost" id="btnBatch">批量编辑</button>
               <button class="btn ghost" id="btnEdClear">清空列表</button>
               <button class="btn ghost" id="btnDebugHotkey" title="调试热键：单步/暂停-继续（仅本次编辑会话，关闭编辑器后恢复默认 F9）">调试热键</button>
             </div>
           </div>
-          <div class="action-table">
+          <div class="action-table" id="actionTable">
           <div class="col-headers"><span>序号</span><span>动作</span><span>备注</span><span>操作</span></div>
-          <div class="action-list" id="actionList"></div>
+          <div class="action-list" id="actionList" tabindex="-1"></div>
           </div>
-          <div class="add-bar"><span class="lbl">备注</span><div class="inp grow" id="edRemark" contenteditable="true" data-placeholder="备注"></div>
+          <div class="visual-canvas-host" id="visualCanvasHost" tabindex="0">
+            <div class="visual-scroll" id="visualScroll">
+            <div class="visual-sizer" id="visualSizer">
+              <div class="visual-world" id="visualWorld">
+                <div class="visual-wraps" id="visualWraps"></div>
+                <svg class="visual-edges" id="visualEdges" xmlns="http://www.w3.org/2000/svg"></svg>
+                <div class="visual-cards" id="visualCards"></div>
+              </div>
+            </div>
+            </div>
+            <div class="visual-marquee" id="visualMarquee"></div>
+          </div>
+          <div class="add-bar" id="editorAddBar"><span class="lbl">备注</span><div class="inp grow" id="edRemark" contenteditable="true" data-placeholder="备注"></div>
             <button class="btn ghost" id="btnEdRemark">修改</button>
-            <button class="btn primary" id="btnEdAdd">添加</button></div>
+            <button class="btn primary" id="btnEdAdd" title="左键插入到选中项后（无选中则添加到最后）；右键选择插入位置">添加</button></div>
         </div>
         <div class="right-col">
           <div class="form-line ed-add-type" style="margin:0 0 8px;flex-shrink:0">
@@ -2886,9 +3183,19 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         <div class="set-pane" data-pane="other">
           <div class="panel"><div class="panel-head"><div><h3>行为与外观</h3></div></div>
             <div class="row"><span class="chk on" id="setAutoHide"><i>✓</i></span><span class="lbl-w">运行后自动隐藏主窗口</span></div>
-            <div class="row"><span class="chk" id="setPlaySound"><i>✓</i></span><span class="lbl-w">启动时播放声音</span></div>
+            <div class="row sound-pair-row">
+              <span class="sound-chk-pair">
+                <span class="chk on" id="setPlaySound"><i>✓</i></span>
+                <span class="lbl-w">脚本启动时播放声音</span>
+              </span>
+              <span class="sound-chk-pair">
+                <span class="chk on" id="setPlaySoundEnd"><i>✓</i></span>
+                <span class="lbl-w">脚本结束时播放声音</span>
+              </span>
+            </div>
             <div class="row"><span class="chk on" id="setHideTip"><i>✓</i></span><span class="lbl-w">关闭右下角运行提示</span></div>
             <div class="row"><span class="chk on" id="setCloseTray"><i>✓</i></span><span class="lbl-w">关闭按钮隐藏到托盘</span></div>
+            <div class="row"><span class="chk on" id="setFloatBall"><i>✓</i></span><span class="lbl-w">显示桌面悬浮球</span></div>
             <div class="row"><span class="chk" id="setAutoBoot"><i>✓</i></span><span class="lbl-w">开机自动启动</span></div>
             <div class="row"><span class="chk" id="setImeConflict"><i>✓</i></span><span class="lbl-w">中文输入法不触发热键</span></div>
             <div class="row"><span class="lbl-w">长按判定</span><div class="inp sm" id="setHoldSec" contenteditable="true">0.5</div><span class="lbl">秒</span></div>
@@ -2943,6 +3250,70 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
       <div class="dlg-foot">
         <a class="link" id="btnRestoreDefaults" style="margin-right:auto">恢复所有默认值</a>
         <button class="btn lg primary" data-close>保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="ov-editor-settings">
+    <div class="dlg settings-size editor-settings-size">
+      <div class="dlg-title">键鼠工坊 — 鼠标宏编辑设置 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
+      <div class="settings-tabs" id="editorSettingsTabs">
+        <div class="st-tab active" data-edtab="visual">可视化</div>
+        <div class="st-tab" data-edtab="general">通用</div>
+      </div>
+      <div class="dlg-body settings-body">
+        <div class="ed-set-pane active" data-edpane="visual">
+          <div class="panel">
+            <div class="panel-head"><div><h3>默认视图</h3><p>下次打开鼠标宏编辑器时使用</p></div></div>
+            <div class="row ui-mode-row">
+              <span class="lbl-w">鼠标宏编辑界面默认视图</span>
+              <div class="radios" id="edSetViewRadios">
+                <span class="radio on" data-editor-view="code"><i></i>代码化</span>
+                <span class="radio" data-editor-view="visual"><i></i>可视化</span>
+              </div>
+            </div>
+            <div class="panel-head"><div><h3>可视化显示</h3><p>只影响画布呈现，不影响脚本执行</p></div></div>
+            <div class="row" title="取消后循环体内动作不再被大块包裹；循环头卡角标仍保留">
+              <span class="chk on" id="edSetLoopWrap"><i>✓</i></span><span class="lbl-w">循环体标识</span>
+              <p class="hint">取消勾选后，循环体内动作不再被大块包裹（角标仍保留）</p>
+            </div>
+            <div class="row" title="取消后定义宏指令块与运行宏指令块之间不显示虚线">
+              <span class="chk on" id="edSetCallWires"><i>✓</i></span><span class="lbl-w">指令块调用线</span>
+              <p class="hint">取消勾选后，定义宏与运行宏之间不再显示虚线连线</p>
+            </div>
+            <div class="row" title="取消后 if/else 不再用大框包裹">
+              <span class="chk on" id="edSetIfWrap"><i>✓</i></span><span class="lbl-w">条件块标识</span>
+              <p class="hint">取消勾选后，if / else 不再用大框包裹</p>
+            </div>
+            <div class="row" title="取消后定义宏指令块不再用大框包裹">
+              <span class="chk on" id="edSetBlockWrap"><i>✓</i></span><span class="lbl-w">指令块包裹</span>
+              <p class="hint">取消勾选后，定义宏指令块不再用大框包裹</p>
+            </div>
+            <div class="row" title="取消后不显示跳转/goto 连线">
+              <span class="chk on" id="edSetJumpWires"><i>✓</i></span><span class="lbl-w">跳转连线</span>
+              <p class="hint">取消勾选后，不显示跳转 / goto 连线</p>
+            </div>
+            <div class="row" title="取消后画布不显示点阵网格">
+              <span class="chk on" id="edSetShowGrid"><i>✓</i></span><span class="lbl-w">显示网格</span>
+              <p class="hint">取消勾选后，画布背景不显示点阵</p>
+            </div>
+            <div class="row" title="取消后卡片标题不显示 ID">
+              <span class="chk on" id="edSetShowCardId"><i>✓</i></span><span class="lbl-w">卡片编号</span>
+              <p class="hint">取消勾选后，不显示「ID: 12」这类编号</p>
+            </div>
+          </div>
+        </div>
+        <div class="ed-set-pane" data-edpane="general">
+          <div class="panel">
+            <div class="panel-head"><div><h3>动作隐藏 / 显示</h3><p>取消勾选后，该动作不再出现在「请选择要添加的宏」里。脚本中已有步骤不受影响。</p></div></div>
+            <div class="panel-head"><div><h3>排列顺序</h3><p>拖动手柄或点上下按钮，调整添加列表中的顺序。</p></div></div>
+            <div class="ed-action-catalog" id="edActionCatalog"></div>
+          </div>
+        </div>
+      </div>
+      <div class="dlg-foot">
+        <a class="link" id="btnRestoreEditorDefaults" style="margin-right:auto">恢复默认</a>
+        <button class="btn lg primary" id="btnSaveEditorSettings">保存</button>
       </div>
     </div>
   </div>
@@ -3039,7 +3410,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         <div class="panel" style="padding:6px 0">
           <div class="row"><span class="lbl form-lab">任务名称</span><div class="inp grow" id="schedName" contenteditable="true"></div></div>
           <div class="row" id="schedKindRow"><span class="lbl form-lab">类型</span>
-            <div class="radio on" data-kind="0"><i></i>鼠标录制</div><div class="radio" data-kind="1"><i></i>鼠标宏</div></div>
+            <div class="radio on" data-kind="0"><i></i>键鼠录制</div><div class="radio" data-kind="1"><i></i>鼠标宏</div></div>
           <div class="row"><span class="lbl form-lab">文件</span><div class="combo" id="schedFile" style="flex:1">选择文件…</div></div>
           <div class="row" id="schedFreqRow"><span class="lbl form-lab">频率</span>
             <div class="radio" data-freq="0"><i></i>每小时</div><div class="radio on" data-freq="1"><i></i>每日</div>
@@ -3403,10 +3774,11 @@ body.editor-open #qstDemoBadge{display:none}
 })();
 </script>
 <script src="vendor/katex/katex.min.js" defer></script>
-<script src="bridge.stub.js?v=20260831a" defer></script>
-<script src="bridge.js?v=20260831a" defer></script>
+<script src="bridge.stub.js?v=20260912nwm4" defer></script>
+<script src="bridge.js?v=20260912nwm4" defer></script>
 <script src="agent-inline.js?v=20260818" defer></script>
-<script src="app.js?v=20260831c" defer></script>
+<script src="app.js?v=20260913vis1" defer></script>
+<script src="visual_editor.js?v=20260913d" defer></script>
 <script src="pro-mode.js?v=20260831c" defer></script>
 </body>
 </html>

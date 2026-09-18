@@ -317,6 +317,14 @@ std::vector<TimedInputEvent> CompileInputTimeline(
             elapsedUs += stepUs;
             continue;
         }
+        if (action.type == ActionType::MouseDrag) {
+            TimedInputEvent timed{};
+            timed.deadlineUs = elapsedUs;
+            timed.action = action;
+            out.push_back(std::move(timed));
+            elapsedUs += stepUs;
+            continue;
+        }
         if (!ActionUsesInterRepeatInterval(action.type))
             elapsedUs += stepUs;
         TimedInputEvent timed{};

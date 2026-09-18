@@ -329,9 +329,14 @@ bool InjectManualMapBytes(HANDLE process, DWORD pid,
         const uint32_t rawSize = detail::PeU32(s + 16);
         const uint32_t rawPtr = detail::PeU32(s + 20);
         if (va >= imageSize) continue;
-        if (rawPtr + rawSize <= peBytes.size() && rawSize > 0) {
-            std::memcpy(image.data() + va, peBytes.data() + rawPtr, rawSize);
-        }
+        if (rawSize == 0) continue;
+        if (rawPtr >= peBytes.size()) continue;
+        const size_t maxFromFile = peBytes.size() - rawPtr;
+        const size_t maxInImage = imageSize - va;
+        const size_t copySize = (std::min)(static_cast<size_t>(rawSize),
+            (std::min)(maxFromFile, maxInImage));
+        if (copySize == 0) continue;
+        std::memcpy(image.data() + va, peBytes.data() + rawPtr, copySize);
     }
 
     if (!ResolveImports(image, view, process, pid, err)) return false;

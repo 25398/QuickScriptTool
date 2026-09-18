@@ -16,11 +16,14 @@
 #include "window_mode/window_coords.h"
 #include "window_mode/background_window_input.h"
 #include "window_mode/background_input_target.h"
+#include "script_types.h"
+#include "action_utils.h"
 #include "window_mode/background_uia_input.h"
 #include "window_mode/window_list.h"
 #include "window_mode/window_mode_permission.h"
 #include "window_mode/ext_bridge/ext_bridge_server.h"
 #include "window_mode/fake_focus/fake_focus_soft_input_host.h"
+#include "window_mode/ui_element_probe.h"
 #include "window_mode/virtual_desktop_accessor.h"
 #include "window_mode/injection/inject_common.h"
 #include "action_utils.h"
@@ -72,12 +75,26 @@ const selftest::CaseInfo kCases[] = {
         L"FindBackgroundInputChild keeps DeSmuME top (not toolbar/largest child) when config=null"},
     {L"android_qt_fake_focus_gate", L"default",
         L"MuMu/LDPlayer must not auto fake-focus (PostMessage to render child)"},
+    {L"weixin_qt_fake_focus", L"default",
+        L"Weixin.exe + Qt*QWindowIcon: lite fake-focus; KEY* without WM_CHAR/ACTIVATE; quick-input KEY* not WM_PASTE"},
+    {L"weixin_qt_mouse_hooks", L"default",
+        L"Weixin Qt FakeFocus lite hooks GetCursorPos/GetAsyncKeyState; SetCursorPos swallowed; no WndProc subclass"},
+    {L"chromium_shell_soft_input", L"default",
+        L"Chromium shell FakeFocus hooks soft cursor + GetKeyboardState (Ctrl+V combo) and injects no fake WM_INPUT"},
+    {L"quick_input_skips_paste_non_edit", L"default",
+        L"Non-Edit windows must not get fake-success WM_PASTE; Qt/AIR/Maple KEY*; generic custom class WM_CHAR"},
+    {L"posted_quick_keys_timing", L"default",
+        L"LCA/game posted quick-input holds each key >=1 frame and keeps DOWN-CHAR-UP order (no swallowed digit)"},
+    {L"soft_key_combo_state_race", L"default",
+        L"Soft-input combo keys: target must still read the modifier as down when it processes the char keydown (Ctrl+V paste)"},
     {L"background_quick_input", L"default",
         L"WindowModeExecutor background quick-input succeeds"},
     {L"background_click_keeps_foreground", L"default",
         L"Background PostMessage click does not steal FG; minimized target may quiet-restore"},
     {L"window_client_scale", L"default",
         L"ScaleWindowClientPoint / find-image template scale use recorded vs live client size"},
+    {L"window_findimage_full_client", L"default",
+        L"Window/background find-image ignores absolute 选取区域 and uses the full client"},
     {L"window_relative_playback_enables_wm", L"default",
         L"录制回放 reviveEnabled 才把 enabled=0 复活；编辑器默认模式不得复活"},
     {L"background_minimized_quiet_restore", L"default",
@@ -113,9 +130,13 @@ const selftest::CaseInfo kCases[] = {
     {L"monitor_covering_fullscreen", L"default",
         L"LooksLikeMonitorCoveringFullscreen: WS_POPUP covering monitor; framed/small windows excluded"},
     {L"game_hardware_without_inject", L"default",
-        L"Windowed Unreal without fake-focus injection needs hardware SendInput; do not park offscreen"},
+        L"Windowed Unreal (incl. LaunchUnrealUWindowsClient) without fake-focus needs hardware SendInput in window/background"},
     {L"hardware_offscreen_park", L"default",
-        L"Windowed hardware target parks off-screen + topmost and restores placement"},
+        L"Windowed hardware target parks off-screen + topmost and restores placement; failed park must not leave the window at (0,0)"},
+    {L"clamp_rect_keeps_bottom_right", L"default",
+        L"ClampRectToContainingWorkArea keeps a bottom-right window; does not snap to primary origin"},
+    {L"clamp_rect_shrinks_into_work", L"default",
+        L"Oversized rect shrinks into its monitor work area without filling from (0,0) as a new origin snap"},
     {L"vda_selects_os_dll", L"default",
         L"VirtualDesktopAccessor picks Win11 24H2+/23H2/Win10 DLL by OS build; no cross-OS fallback"},
     {L"fake_focus_hook_local", L"default",
@@ -140,10 +161,20 @@ const selftest::CaseInfo kCases[] = {
         L"Parse build/*/scripts/安居镇.json windowMode: fakeFocus + Chrome child class"},
     {L"permission_match_uipi", L"default",
         L"CheckPermissionMatch: self/0 ok; explorer allowed even if this process is elevated"},
+    {L"permission_mismatch_no_autolaunch", L"default",
+        L"PermissionMismatch/DesktopNotReady must abort auto-launch (do not re-open MapleStoryt.exe)"},
     {L"maplestory_bg_fake_focus", L"default",
-        L"MapleStoryClass / MapleStory.exe / 冒险岛 title → game class + BackgroundWindow UsesFakeFocus"},
+        L"MapleStoryClass / MapleStory.exe / 冒险岛 title →LCA PostMessage + mapleSafe lite；UsesFakeFocus=0、不最小化"},
+    {L"lca_bg_unknown_game", L"default",
+        L"未登记游戏类名走 LCA 窗口消息；Unity 仍注入；记事本仍走Edit/WM_CHAR"},
+    {L"tianlong_bg_fake_focus", L"default",
+        L"TianLongBaBuHJ WndClass / 天龙八部 →精简假焦点，不是 LCA 纯PostMessage"},
+    {L"lca_arrow_key_lparam", L"default",
+        L"方向键lParam 扫描码0x4B + KF_EXTENDED；←/U+2190 规整为VK_LEFT"},
     {L"window_mode_target_lost_stops", L"default",
         L"BeginRun then DestroyWindow → TargetStillAlive is false (game crash must stop the script)"},
+    {L"uwp_frame_bind_pid_still_alive", L"default",
+        L"UWP ApplicationFrameHost vs CoreWindow PID mismatch must not look like a crash"},
     {L"invisible_child_class_bind", L"default",
         L"FindChildWindowByClass finds WS_CHILD without WS_VISIBLE (macro-desktop case)"},
     {L"browser_render_skips_d3d", L"default",
@@ -158,7 +189,146 @@ const selftest::CaseInfo kCases[] = {
         L"ActivateWindow brings the self-test window to foreground (restores if minimized)"},
     {L"window_activate_by_process", L"default",
         L"ActivateByProcessName activates frontmost window of given process"},
+    {L"uia_control_pick_by_name", L"default",
+        L"UIA 控件按名字选：完全同名 > 前缀；灰控件降权；近似竞争判歧义；同分取阅读顺序最前"},
+    {L"uia_control_list_format", L"default",
+        L"UIA 控件台账文本：编号连续、含类型/名字/灰态能力位与坐标"},
+    {L"screen_point_occlusion_check", L"default",
+        L"IsScreenPointOnForegroundWindow：屏幕外点必须判「不属于前台」；抢到前台时窗口内点必须判「属于前台」"},
 };
+
+void TestUiaControlPickByName() {
+    auto mk = [](const wchar_t* name, const wchar_t* type, int top, int left,
+                 bool enabled, bool invokable) {
+        windowmode::UiControlInfo c;
+        c.name = name;
+        c.controlType = type;
+        c.rect = RECT{ left, top, left + 100, top + 30 };
+        c.enabled = enabled;
+        c.invokable = invokable;
+        return c;
+    };
+    std::vector<windowmode::UiControlInfo> items = {
+        mk(L"保存并关闭", L"按钮", 300, 10, true, true),
+        mk(L"保存", L"按钮", 100, 10, true, true),
+        mk(L"保存", L"菜单项", 500, 10, true, true),
+    };
+    for (size_t i = 0; i < items.size(); ++i) items[i].id = static_cast<int>(i) + 1;
+
+    bool amb = false;
+    // 完全同名两项：取阅读顺序最前（top 小的），且不算歧义）
+    const int exact = windowmode::PickUiControlByName(items, L"保存", &amb);
+    const bool exactOk = exact == 1 && !amb;
+
+    // 部分命中：目标比控件名长时命中更「具体」的那个（保存并关闭 > 保存）
+    amb = false;
+    const int partial = windowmode::PickUiControlByName(items, L"保存并关闭窗口", &amb);
+    const bool partialOk = partial == 0 && !amb;
+
+    // 近似竞争（两个都是「包含」级且分数接近）→判歧义）
+    std::vector<windowmode::UiControlInfo> tie = {
+        mk(L"确定提交订单", L"按钮", 200, 10, true, true),
+        mk(L"确定放弃订单", L"按钮", 210, 10, true, true),
+    };
+    for (size_t i = 0; i < tie.size(); ++i) tie[i].id = static_cast<int>(i) + 1;
+    amb = false;
+    const int tieIdx = windowmode::PickUiControlByName(tie, L"订单", &amb);
+    const bool tieAmb = amb;
+    const bool tieOk = tieIdx >= 0 && tieAmb;
+
+    // 灰控件降权：同名前缀时优先可用的那个
+    std::vector<windowmode::UiControlInfo> gray = {
+        mk(L"下一步", L"按钮", 100, 10, false, true),
+        mk(L"下一步", L"按钮", 400, 10, true, true),
+    };
+    for (size_t i = 0; i < gray.size(); ++i) gray[i].id = static_cast<int>(i) + 1;
+    amb = false;
+    const int grayIdx = windowmode::PickUiControlByName(gray, L"下一步", &amb);
+    const bool grayOk = grayIdx == 1;
+
+    // 完全无命中→-1（调用方回落识图）。
+    const bool missOk = windowmode::PickUiControlByName(items, L"立即购买", nullptr) < 0;
+    // 空标签→-1
+    const bool emptyOk = windowmode::PickUiControlByName(items, L"", nullptr) < 0;
+
+    const bool ok = exactOk && partialOk && tieOk && grayOk && missOk && emptyOk;
+    selftest::Emit(L"uia_control_pick_by_name", ok,
+        ok ? L"" : (L"exact=" + std::to_wstring(exact) + L" exactOk="
+            + std::to_wstring(exactOk ? 1 : 0) + L" partial="
+            + std::to_wstring(partial) + L" partialOk=" + std::to_wstring(partialOk ? 1 : 0)
+            + L" tie=" + std::to_wstring(tieIdx) + L"/" + std::to_wstring(tieAmb ? 1 : 0)
+            + L" tieOk=" + std::to_wstring(tieOk ? 1 : 0)
+            + L" gray=" + std::to_wstring(grayIdx) + L" grayOk="
+            + std::to_wstring(grayOk ? 1 : 0) + L" miss=" + std::to_wstring(missOk ? 1 : 0)
+            + L" empty=" + std::to_wstring(emptyOk ? 1 : 0)).c_str());
+}
+
+void TestUiaControlListFormat() {
+    windowmode::UiControlInfo a;
+    a.id = 1;
+    a.name = L"保存";
+    a.controlType = L"按钮";
+    a.rect = RECT{ 100, 200, 180, 230 };
+    a.enabled = true;
+    a.invokable = true;
+    windowmode::UiControlInfo b;
+    b.id = 2;
+    b.name = L"文件名";
+    b.controlType = L"输入框";
+    b.rect = RECT{ 300, 400, 500, 430 };
+    b.enabled = false;      // 灰
+    b.valuePattern = true;  // 可填
+    b.invokable = false;    // 需点击
+    const std::wstring text = windowmode::FormatUiControlListForAgent({ a, b }, 2000);
+    const bool ok = text.find(L"[1]") != std::wstring::npos
+        && text.find(L"[2]") != std::wstring::npos
+        && text.find(L"按钮") != std::wstring::npos
+        && text.find(L"保存") != std::wstring::npos
+        && text.find(L"（灰）") != std::wstring::npos
+        && text.find(L"[可填]") != std::wstring::npos
+        && text.find(L"[需点击]") != std::wstring::npos
+        && text.find(L"@140,215") != std::wstring::npos;
+    // 空列表→空串（调用方据此判「枚举不到」）
+    const bool emptyOk = windowmode::FormatUiControlListForAgent({}, 100).empty();
+    selftest::Emit(L"uia_control_list_format", ok && emptyOk,
+        ok ? (emptyOk ? L"" : L"empty-list not empty") : text.c_str());
+}
+
+void TestScreenPointOcclusionCheck() {
+    // 屏幕外的点：WindowFromPoint 取不到窗口→必须判定为「不属于前台。
+    const bool outside = !windowmode::IsScreenPointOnForegroundWindow(-20000, -20000);
+    // 自建窗口并置前（不复用文件后面的 helper，避免依赖定义顺序）；
+    // 窗口内中心点必须判定为「属于前台」，否则会把正常点击误拦。
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"QstOcclusionProbe";
+    RegisterClassW(&wc);
+    HWND w = CreateWindowExW(0, wc.lpszClassName, L"QstOcclusion",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 60, 60, 420, 300,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    bool insideOk = true;
+    if (w) {
+        ShowWindow(w, SW_SHOW);
+        SetForegroundWindow(w);
+        // 只有真的抢到前台才验证「窗口内点= 属于前台」；抢不到（被别的程序挡住
+
+        // 测试机前台策略限制）就跳过这半条——否则这条会变成环境相关的假失败。
+        HWND fgNow = GetForegroundWindow();
+        const bool weAreForeground = fgNow && GetAncestor(fgNow, GA_ROOT) == GetAncestor(w, GA_ROOT);
+        RECT rc{};
+        if (weAreForeground && GetWindowRect(w, &rc)) {
+            const int cx = (rc.left + rc.right) / 2;
+            const int cy = (rc.top + rc.bottom) / 2;
+            insideOk = windowmode::IsScreenPointOnForegroundWindow(cx, cy);
+        }
+        DestroyWindow(w);
+    }
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    selftest::Emit(L"screen_point_occlusion_check", outside && insideOk,
+        (L"outside=" + std::to_wstring(outside ? 1 : 0) + L" inside="
+            + std::to_wstring(insideOk ? 1 : 0)).c_str());
+}
 
 void PrintHelp() {
     std::fwprintf(stderr,
@@ -342,6 +512,17 @@ void PumpMessagesFor(std::chrono::milliseconds duration) {
     }
 }
 
+void PumpMessagesDispatchOnly(std::chrono::milliseconds duration) {
+    const auto end = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < end) {
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            DispatchMessageW(&msg);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 void TestPostKeyClickChar(HWND edit) {
     SetWindowTextW(edit, L"");
     windowmode::ResetSoftMouseState();
@@ -380,6 +561,11 @@ void TestPostKeyShiftChar(HWND edit) {
 
 void TestQuickInputCancel(HWND edit) {
     SetWindowTextW(edit, L"");
+    windowmode::ResetSoftMouseState();
+    RECT rc{};
+    GetClientRect(edit, &rc);
+    windowmode::RememberSoftMouseClientPos(edit,
+        (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
     const std::wstring longText(80, L'X');
     std::atomic_bool cancel{false};
     std::atomic_bool workerDone{false};
@@ -387,8 +573,19 @@ void TestQuickInputCancel(HWND edit) {
         windowmode::PostQuickInputToWindow(edit, longText, 0.03, false, &cancel);
         workerDone.store(true, std::memory_order_relaxed);
     });
-    // SendMessage 打到本线程窗口：等待期间必须泵消息，否则会死锁
-    PumpMessagesFor(std::chrono::milliseconds(90));
+    // SendMessage 打到本线程窗口：必须先等到至少写出一字，再取消。
+    // 固定睡280ms 再cancel：工作线程若还没排上队，会len=0 误报。
+    const auto startWait = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ReadEditText(edit).empty()
+        && std::chrono::steady_clock::now() < startWait
+        && !workerDone.load(std::memory_order_relaxed)) {
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     cancel.store(true, std::memory_order_relaxed);
     while (!workerDone.load(std::memory_order_relaxed)) {
         MSG msg{};
@@ -407,7 +604,7 @@ void TestQuickInputCancel(HWND edit) {
 }
 
 void TestDesktopQuickInputCancel() {
-    // 不依赖焦点窗口：取消后应很快返回（完整 40 字×30ms 约 1.2s，取消应远小于此）
+    // 不依赖焦点窗口：取消后应很快返回（完整40 字×30ms 约 1.2s，取消应远小于此）
     const std::wstring longText(40, L'A');
     std::atomic_bool cancel{false};
     const auto t0 = std::chrono::steady_clock::now();
@@ -1059,6 +1256,7 @@ void TestMonitorCoveringFullscreen() {
 
     const bool classOk = windowmode::LooksLikeGameWindowClass(L"UnrealWindow");
     const bool unrealCls = windowmode::LooksLikeUnrealEngineWindowClass(L"UnrealWindow")
+        && windowmode::LooksLikeUnrealEngineWindowClass(L"LaunchUnrealUWindowsClient")
         && !windowmode::LooksLikeUnrealEngineWindowClass(L"UnityWndClass");
 
     // UE5：小窗也必须当成 DXGI 敏感目标（不得等铺满才跳过假焦点）。
@@ -1135,6 +1333,10 @@ void TestGameHardwareWithoutInject() {
     cfg.fakeFocusEnabled = false;
     cfg.inputStrategy = windowmode::WindowModeInputStrategy::SoftMessage;
 
+    const bool launchUe = windowmode::LooksLikeUnrealEngineWindowClass(L"LaunchUnrealUWindowsClient")
+        && windowmode::LooksLikeGameWindowClass(L"LaunchUnrealUWindowsClient")
+        && !windowmode::LooksLikeUnrealEngineWindowClass(L"Notepad");
+
     WNDCLASSW ueWc{};
     ueWc.lpfnWndProc = DefWindowProcW;
     ueWc.hInstance = GetModuleHandleW(nullptr);
@@ -1146,6 +1348,10 @@ void TestGameHardwareWithoutInject() {
     const bool needHw = unreal
         && windowmode::GameTargetNeedsHardwareWithoutFakeFocus(cfg, unreal)
         && windowmode::UsesFakeFocusForTarget(cfg, unreal)
+        && !windowmode::CanParkHardwareInputTargetOffscreen(unreal);
+    cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    const bool bgNeedHw = unreal
+        && windowmode::GameTargetNeedsHardwareWithoutFakeFocus(cfg, unreal)
         && !windowmode::CanParkHardwareInputTargetOffscreen(unreal);
     if (unreal) DestroyWindow(unreal);
     UnregisterClassW(ueWc.lpszClassName, ueWc.hInstance);
@@ -1165,9 +1371,10 @@ void TestGameHardwareWithoutInject() {
     if (note) DestroyWindow(note);
     UnregisterClassW(noteWc.lpszClassName, noteWc.hInstance);
 
-    const bool ok = needHw && noteSkip;
+    const bool ok = needHw && bgNeedHw && launchUe && noteSkip;
     wchar_t detail[160]{};
-    swprintf_s(detail, L"unrealHw=%d noteSkip=%d", needHw ? 1 : 0, noteSkip ? 1 : 0);
+    swprintf_s(detail, L"unrealHw=%d bgHw=%d launchUe=%d noteSkip=%d",
+        needHw ? 1 : 0, bgNeedHw ? 1 : 0, launchUe ? 1 : 0, noteSkip ? 1 : 0);
     Emit(L"game_hardware_without_inject", ok, ok ? L"" : detail);
 }
 
@@ -1206,16 +1413,66 @@ void TestHardwareOffscreenPark() {
     const bool back = restored
         && std::abs(after.left - before.left) < 80
         && std::abs(after.top - before.top) < 80;
+    const bool rolledBack = !parked
+        && std::abs(after.left - before.left) < 40
+        && std::abs(after.top - before.top) < 40;
 
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 
-    const bool ok = canPark && parked && offscreen && topmost && restored && back;
+    const bool ok = canPark && ((parked && offscreen && topmost && restored && back)
+        || rolledBack);
     wchar_t detail[192]{};
-    swprintf_s(detail, L"can=%d park=%d off=%d top=%d rest=%d back=%d",
+    swprintf_s(detail, L"can=%d park=%d off=%d top=%d rest=%d back=%d roll=%d",
         canPark ? 1 : 0, parked ? 1 : 0, offscreen ? 1 : 0,
-        topmost ? 1 : 0, restored ? 1 : 0, back ? 1 : 0);
+        topmost ? 1 : 0, restored ? 1 : 0, back ? 1 : 0, rolledBack ? 1 : 0);
     Emit(L"hardware_offscreen_park", ok, ok ? L"" : detail);
+}
+
+void TestClampRectKeepsBottomRight() {
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    const int waW = (std::max)(200, static_cast<int>(wa.right - wa.left));
+    const int waH = (std::max)(200, static_cast<int>(wa.bottom - wa.top));
+    const int w = (std::max)(200, waW / 4);
+    const int h = (std::max)(160, waH / 4);
+    RECT dest{};
+    dest.left = wa.right - w - 24;
+    dest.top = wa.bottom - h - 24;
+    dest.right = dest.left + w;
+    dest.bottom = dest.top + h;
+    int destW = w;
+    int destH = h;
+    const LONG savedL = dest.left;
+    const LONG savedT = dest.top;
+    windowmode::ClampRectToContainingWorkArea(dest, destW, destH);
+    const bool ok = destW == w && destH == h
+        && std::abs(dest.left - savedL) < 8
+        && std::abs(dest.top - savedT) < 8
+        && dest.left > wa.left + 40;
+    wchar_t detail[160]{};
+    swprintf_s(detail, L"pos=%d,%d want=%d,%d size=%dx%d",
+        dest.left, dest.top, savedL, savedT, destW, destH);
+    Emit(L"clamp_rect_keeps_bottom_right", ok, ok ? L"" : detail);
+}
+
+void TestClampRectShrinksIntoWork() {
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    RECT dest{wa.left + 48, wa.top + 48, wa.left + 48 + 8000, wa.top + 48 + 6000};
+    int destW = 8000;
+    int destH = 6000;
+    windowmode::ClampRectToContainingWorkArea(dest, destW, destH);
+    const bool ok = destW <= (wa.right - wa.left)
+        && destH <= (wa.bottom - wa.top)
+        && dest.left >= wa.left
+        && dest.top >= wa.top
+        && dest.right <= wa.right
+        && dest.bottom <= wa.bottom
+        && destW >= 64 && destH >= 64;
+    wchar_t detail[160]{};
+    swprintf_s(detail, L"pos=%d,%d size=%dx%d", dest.left, dest.top, destW, destH);
+    Emit(L"clamp_rect_shrinks_into_work", ok, ok ? L"" : detail);
 }
 
 void TestVdaSelectsOsDll() {
@@ -1247,7 +1504,7 @@ void TestVdaSelectsOsDll() {
 }
 
 void TestSoftMessageExeGates() {
-    // 原 exe 链路：非游戏 Win32 类 → softMessage；默认可最小化。
+    // 原 exe 链路：非游戏 Win32 类→ softMessage；默认可最小化。
     windowmode::WindowModeScriptConfig exe{};
     exe.enabled = true;
     exe.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
@@ -1300,7 +1557,7 @@ void TestSoftMessageExeGates() {
         && !windowmode::UsesCdpInput(forceSoft)
         && windowmode::UsesFakeFocus(forceSoft);
 
-    // Discord / 微信 / CEF：与 QQ 同一套 Chromium 壳路径。
+    // Discord / CEF：与 QQ 同一套 Chromium 壳路径。Weixin.exe + Chrome 类仍走壳（开发者工具旧CEF）。
     windowmode::WindowModeScriptConfig discord{};
     discord.enabled = true;
     discord.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
@@ -1313,11 +1570,27 @@ void TestSoftMessageExeGates() {
         && windowmode::UsesFakeFocus(discord)
         && !windowmode::ShouldMinimizeTargetAfterBind(discord);
 
-    windowmode::WindowModeScriptConfig wechat = discord;
-    wechat.targetExePath = L"D:\\Tencent\\Weixin\\Weixin.exe";
-    const bool wechatOk = windowmode::ConfigLooksLikeElectronShell(wechat)
+    windowmode::WindowModeScriptConfig wechatCef = discord;
+    wechatCef.targetExePath = L"D:\\Tencent\\Weixin\\Weixin.exe";
+    const bool wechatCefOk = windowmode::ConfigLooksLikeElectronShell(wechatCef)
         && windowmode::LooksLikeChromiumBrowserClass(L"CefBrowserWindow")
         && windowmode::LooksLikeChromiumBrowserClass(L"Chrome_RenderWidgetHostHWND");
+
+    windowmode::WindowModeScriptConfig wechatQt{};
+    wechatQt.enabled = true;
+    wechatQt.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    wechatQt.windowClassName = L"Qt51514QWindowIcon";
+    wechatQt.targetExePath = L"D:\\Weixin\\Weixin.exe";
+    wechatQt.windowName = L"微信";
+    wechatQt.inputStrategy = windowmode::WindowModeInputStrategy::Auto;
+    const bool wechatQtOk =
+        windowmode::LooksLikeWeixinTarget(wechatQt, nullptr)
+        && windowmode::NeedsFakeFocusInjection(wechatQt, nullptr)
+        && windowmode::UsesFakeFocus(wechatQt)
+        && !windowmode::ConfigLooksLikeElectronShell(wechatQt)
+        && !windowmode::ConfigLooksLikeEmulatorTarget(wechatQt)
+        && !windowmode::PrefersLcaBackgroundMessages(wechatQt, nullptr)
+        && !windowmode::ShouldMinimizeTargetAfterBind(wechatQt);
 
     // DeSmuME 等模拟器：外层 WM_KEY* 无效，须自动假焦点（GetAsyncKeyState 钩）。
     windowmode::WindowModeScriptConfig desmume{};
@@ -1372,7 +1645,8 @@ void TestSoftMessageExeGates() {
     const bool emuDowngradeOk =
         windowmode::ConfigLooksLikeEmulatorTarget(mumuHidden);
 
-    const bool ok = softOk && unityAutoOk && legendAutoOk && ffOk && forceOk && discordOk && wechatOk
+    const bool ok = softOk && unityAutoOk && legendAutoOk && ffOk && forceOk && discordOk && wechatCefOk
+        && wechatQtOk
         && desmumeOk && desmumeExeOk && desmumeDesktopOk && melonPrefixedOk
         && ldOk && mumuOk && emuDowngradeOk;
     Emit(L"soft_message_exe_gates", ok,
@@ -1636,8 +1910,8 @@ void TestFakeFocusMapleStoryFocusOnly() {
     const bool hitsOk = (hookHits & 0xFFu) > 0;
 
     MSG msg{};
-    const BOOL peekEmpty = PeekMessageW(&msg, hwnd, 0, 0, PM_NOREMOVE) == FALSE
-        || msg.message != WM_INPUT;
+    const BOOL peeked = PeekMessageW(&msg, hwnd, 0, 0, PM_NOREMOVE);
+    const bool peekOk = peeked == FALSE || msg.message != WM_INPUT;
 
     WNDCLASSW wcTitle{};
     wcTitle.lpfnWndProc = DefWindowProcW;
@@ -1665,14 +1939,14 @@ void TestFakeFocusMapleStoryFocusOnly() {
     const bool noUser32BodyJmp = (mapleDiag & 0x1000u) == 0;
     const bool noDiDataBodyJmp = (mapleDiag & 0x2000u) == 0;
     const bool ok = installed && updated && hooked == hwnd && procOk && cursorOk
-        && keyOk && hitsOk && peekEmpty && titleProcOk && iatOk && noUser32BodyJmp && noDiDataBodyJmp;
+        && keyOk && hitsOk && peekOk && titleProcOk && iatOk && noUser32BodyJmp && noDiDataBodyJmp;
     wchar_t detail[360]{};
     swprintf_s(detail,
         L"install=%d update=%d fg=%d proc=%d cursor=(%ld,%ld) space=%d lbtn=%d hitsGaks=%u peekOk=%d titleProc=%d iat=%lu diag=0x%04X",
         installed ? 1 : 0, updated ? 1 : 0, hooked == hwnd ? 1 : 0, procOk ? 1 : 0,
         pt.x, pt.y, (space & 0x8000) ? 1 : 0, (lbtn & 0x8000) ? 1 : 0,
         static_cast<unsigned>(hookHits & 0xFFu),
-        peekEmpty ? 1 : 0, titleProcOk ? 1 : 0,
+        peekOk ? 1 : 0, titleProcOk ? 1 : 0,
         static_cast<unsigned long>(iatSlots), static_cast<unsigned>(mapleDiag));
     Emit(L"fake_focus_maplestory_focus_only", ok, ok ? L"" : detail);
 }
@@ -2125,6 +2399,25 @@ void TestPermissionMatchUipi() {
     Emit(L"permission_match_uipi", ok, detail.c_str());
 }
 
+void TestPermissionMismatchNoAutolaunch() {
+    using windowmode::ShouldAbortAutoLaunchOnBindFailure;
+    using windowmode::WindowModeHealth;
+    using windowmode::HealthToUserHint;
+
+    const bool abortPerm = ShouldAbortAutoLaunchOnBindFailure(WindowModeHealth::PermissionMismatch);
+    const bool abortDesk = ShouldAbortAutoLaunchOnBindFailure(WindowModeHealth::DesktopNotReady);
+    const bool keepNotFound = !ShouldAbortAutoLaunchOnBindFailure(WindowModeHealth::TargetNotFound);
+    const bool keepOk = !ShouldAbortAutoLaunchOnBindFailure(WindowModeHealth::Ok);
+    const wchar_t* hint = HealthToUserHint(WindowModeHealth::PermissionMismatch);
+    const bool hintOk = hint && wcsstr(hint, L"管理员") != nullptr;
+    const bool ok = abortPerm && abortDesk && keepNotFound && keepOk && hintOk;
+    wchar_t detail[200]{};
+    swprintf_s(detail, L"perm=%d desk=%d notFoundKeep=%d okKeep=%d hintAdmin=%d",
+        abortPerm ? 1 : 0, abortDesk ? 1 : 0, keepNotFound ? 1 : 0, keepOk ? 1 : 0,
+        hintOk ? 1 : 0);
+    Emit(L"permission_mismatch_no_autolaunch", ok, ok ? L"" : detail);
+}
+
 void TestMapleStoryBackgroundFakeFocus() {
     const bool classOk = windowmode::LooksLikeMapleStoryWindowClass(L"MapleStoryClass")
         && windowmode::LooksLikeMapleStoryWindowClass(L"MapleStory")
@@ -2141,24 +2434,229 @@ void TestMapleStoryBackgroundFakeFocus() {
     windowmode::WindowModeScriptConfig cfg{};
     cfg.enabled = true;
     cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
-    cfg.fakeFocusEnabled = false;
+    cfg.fakeFocusEnabled = true;
     cfg.windowClassName = L"MapleStoryClass";
-    const bool ffOk = windowmode::UsesFakeFocus(cfg)
-        && !windowmode::ShouldMinimizeTargetAfterBind(cfg);
+    const bool ffOk = !windowmode::UsesFakeFocus(cfg)
+        && !windowmode::UsesFakeFocusForTarget(cfg, nullptr)
+        && windowmode::PrefersLcaBackgroundMessages(cfg, nullptr)
+        && windowmode::MapleNeedsSafeFakeFocusLite(cfg, nullptr)
+        && !windowmode::NeedsFakeFocusInjection(cfg, nullptr)
+        && !windowmode::ShouldMinimizeTargetAfterBind(cfg)
+        && !windowmode::GameTargetNeedsHardwareWithoutFakeFocus(cfg, nullptr);
+
+    cfg.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    const bool hwOk = !windowmode::GameTargetNeedsHardwareWithoutFakeFocus(cfg, nullptr);
+    cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
 
     cfg.windowClassName.clear();
     cfg.targetExePath = L"D:\\星辰\\MapleStory.exe";
-    const bool exeFfOk = windowmode::UsesFakeFocus(cfg)
-        && windowmode::LooksLikeMapleStoryExecutable(cfg.targetExePath);
+    const bool exeFfOk = !windowmode::UsesFakeFocus(cfg)
+        && windowmode::LooksLikeMapleStoryExecutable(cfg.targetExePath)
+        && !windowmode::ShouldMinimizeTargetAfterBind(cfg);
 
     cfg.targetExePath.clear();
     cfg.windowName = L"MapleStory(星辰冒险岛)";
-    const bool titleFfOk = windowmode::UsesFakeFocus(cfg);
+    const bool titleFfOk = !windowmode::UsesFakeFocus(cfg)
+        && !windowmode::ShouldMinimizeTargetAfterBind(cfg);
 
-    const bool ok = classOk && exeOk && titleOk && ffOk && exeFfOk && titleFfOk;
+    windowmode::WindowModeScriptConfig mapleCfg{};
+    mapleCfg.enabled = true;
+    mapleCfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    mapleCfg.targetExePath = L"D:\\冒险岛\\MapleStoryt.exe";
+    const bool targetOk = windowmode::LooksLikeMapleStoryTarget(mapleCfg, nullptr)
+        && !windowmode::LooksLikeMapleStoryTarget(windowmode::WindowModeScriptConfig{}, nullptr);
+
+    const bool ok = classOk && exeOk && titleOk && ffOk && hwOk && exeFfOk && titleFfOk && targetOk;
     Emit(L"maplestory_bg_fake_focus", ok,
-        ok ? L"MapleStoryClass + exe → BackgroundWindow fake focus"
-           : L"MapleStory not classified as game / fake focus off");
+        ok ? L"MapleStoryClass + exe →LCA PostMessage + mapleSafe lite（UsesFakeFocus=0、不最小化）"
+           : L"MapleStory not classified or UsesFakeFocus/minimize/lite flag wrong");
+}
+
+void TestLcaBackgroundUnknownGame() {
+    windowmode::WindowModeScriptConfig unknown{};
+    unknown.enabled = true;
+    unknown.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    unknown.fakeFocusEnabled = true;
+    unknown.windowClassName = L"IWWindowClass";
+    const bool unknownOk = windowmode::PrefersLcaBackgroundMessages(unknown, nullptr)
+        && !windowmode::NeedsFakeFocusInjection(unknown, nullptr)
+        && !windowmode::UsesFakeFocus(unknown)
+        && !windowmode::UsesFakeFocusForTarget(unknown, nullptr)
+        && !windowmode::ShouldMinimizeTargetAfterBind(unknown)
+        && !windowmode::LooksLikeInjectRequiredGameClass(L"IWWindowClass")
+        && !windowmode::MapleNeedsSafeFakeFocusLite(unknown, nullptr)
+        && windowmode::LooksLikeStandardDesktopAppClass(L"Notepad")
+        && !windowmode::LooksLikeStandardDesktopAppClass(L"IWWindowClass");
+
+    unknown.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+    const bool hiddenOk = windowmode::PrefersLcaBackgroundMessages(unknown, nullptr)
+        && !windowmode::GameTargetNeedsHardwareWithoutFakeFocus(unknown, nullptr);
+
+    windowmode::WindowModeScriptConfig unity{};
+    unity.enabled = true;
+    unity.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    unity.windowClassName = L"UnityWndClass";
+    const bool unityOk = windowmode::NeedsFakeFocusInjection(unity, nullptr)
+        && !windowmode::PrefersLcaBackgroundMessages(unity, nullptr)
+        && windowmode::UsesFakeFocus(unity)
+        && windowmode::LooksLikeInjectRequiredGameClass(L"UnityWndClass")
+        && windowmode::LooksLikeInjectRequiredGameClass(L"UnrealWindow")
+        && windowmode::LooksLikeInjectRequiredGameClass(L"GLFW30")
+        && !windowmode::LooksLikeInjectRequiredGameClass(L"MapleStoryClass");
+
+    windowmode::WindowModeScriptConfig note{};
+    note.enabled = true;
+    note.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    note.windowClassName = L"Notepad";
+    const bool noteOk = !windowmode::PrefersLcaBackgroundMessages(note, nullptr)
+        && !windowmode::NeedsFakeFocusInjection(note, nullptr)
+        && windowmode::ShouldMinimizeTargetAfterBind(note);
+
+    const bool ok = unknownOk && hiddenOk && unityOk && noteOk;
+    Emit(L"lca_bg_unknown_game", ok,
+        ok ? L"unknown IWWindowClass →LCA; Unity inject; Notepad Edit path"
+           : L"LCA unknown-game gate / Unity inject / Notepad split failed");
+}
+
+void TestTianLongBaBuFakeFocus() {
+    windowmode::WindowModeScriptConfig tl{};
+    tl.enabled = true;
+    tl.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    tl.windowClassName = L"TianLongBaBuHJ WndClass";
+    tl.targetExePath = L"D:\\yx\\开心天龙\\Bin64\\Game.exe";
+    tl.windowName = L"《新天龙八部》0.08.0826 (一大区:梦笔生花)";
+    const bool classOk = windowmode::LooksLikeTianLongBaBuWindowClass(tl.windowClassName)
+        && windowmode::LooksLikeTianLongBaBuExecutable(tl.targetExePath)
+        && windowmode::LooksLikeTianLongBaBuTitle(tl.windowName)
+        && windowmode::LooksLikeTianLongBaBuTarget(tl, nullptr)
+        && windowmode::LooksLikeGameWindowClass(tl.windowClassName)
+        && windowmode::LooksLikeInjectRequiredGameClass(tl.windowClassName)
+        && windowmode::NeedsFakeFocusInjection(tl, nullptr)
+        && !windowmode::PrefersLcaBackgroundMessages(tl, nullptr)
+        && windowmode::UsesFakeFocus(tl)
+        && windowmode::UsesFakeFocusForTarget(tl, nullptr)
+        && !windowmode::ShouldMinimizeTargetAfterBind(tl)
+        && !windowmode::LooksLikeMapleStoryTarget(tl, nullptr);
+
+    windowmode::WindowModeScriptConfig unknown{};
+    unknown.enabled = true;
+    unknown.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    unknown.windowClassName = L"IWWindowClass";
+    const bool unknownStillLca = windowmode::PrefersLcaBackgroundMessages(unknown, nullptr)
+        && !windowmode::NeedsFakeFocusInjection(unknown, nullptr);
+
+    const bool ok = classOk && unknownStillLca;
+    Emit(L"tianlong_bg_fake_focus", ok,
+        ok ? L"TianLongBaBuHJ →inject lite fake-focus; IWWindowClass still LCA"
+           : L"天龙八部 still classified as LCA unknown game");
+}
+
+UINT g_arrowProbeVk = 0;
+LPARAM g_arrowProbeLp = 0;
+
+int g_weixinProbeActivate = 0;
+int g_weixinProbeSetFocus = 0;
+int g_weixinProbeKeyDown = 0;
+int g_weixinProbeKeyUp = 0;
+int g_weixinProbeChar = 0;
+int g_weixinProbePaste = 0;
+int g_weixinProbeLButton = 0;
+
+LRESULT CALLBACK WeixinKeyProbeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE) ++g_weixinProbeActivate;
+        break;
+    case WM_SETFOCUS:
+        ++g_weixinProbeSetFocus;
+        break;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        ++g_weixinProbeKeyDown;
+        break;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        ++g_weixinProbeKeyUp;
+        break;
+    case WM_CHAR:
+    case WM_SYSCHAR:
+        ++g_weixinProbeChar;
+        break;
+    case WM_PASTE:
+        ++g_weixinProbePaste;
+        break;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+        ++g_weixinProbeLButton;
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK ArrowProbeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        g_arrowProbeVk = static_cast<UINT>(wParam);
+        g_arrowProbeLp = lParam;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void TestLcaArrowKeyLParam() {
+    const LPARAM leftDown = windowmode::BuildWindowKeyLParam(VK_LEFT, true);
+    const UINT leftScan = static_cast<UINT>((leftDown >> 16) & 0xFF);
+    const bool leftExt = ((leftDown >> 24) & 1) != 0;
+    const LPARAM upDown = windowmode::BuildWindowKeyLParam(VK_UP, true);
+    const UINT upScan = static_cast<UINT>((upDown >> 16) & 0xFF);
+    const bool bitsOk = leftScan == 0x4B && leftExt && (leftDown & 0xFFFF) == 1
+        && upScan == 0x48 && (((upDown >> 24) & 1) != 0);
+    const bool normOk = NormalizeScriptKeyVk(0x2190, L"") == VK_LEFT
+        && VirtualKeyFromKeyText(L"←") == VK_LEFT
+        && NormalizeScriptKeyVk(37, L"←") == VK_LEFT;
+
+    constexpr wchar_t kCls[] = L"QstLcaArrowProbeWnd";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ArrowProbeProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCls;
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        kCls, L"QST ArrowProbe",
+        WS_OVERLAPPEDWINDOW, 40, 40, 160, 80,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    bool postedOk = false;
+    if (hwnd) {
+        g_arrowProbeVk = 0;
+        g_arrowProbeLp = 0;
+        windowmode::SetLcaBackgroundMessageMode(true);
+        windowmode::PostKeyToWindow(hwnd, 0x2190, true);
+        for (int i = 0; i < 40; ++i) {
+            MSG msg{};
+            while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (g_arrowProbeVk == VK_LEFT) break;
+            Sleep(5);
+        }
+        const UINT postedScan = static_cast<UINT>((g_arrowProbeLp >> 16) & 0xFF);
+        postedOk = g_arrowProbeVk == VK_LEFT && postedScan == 0x4B
+            && ((g_arrowProbeLp >> 24) & 1) != 0;
+        windowmode::PostKeyToWindow(hwnd, VK_LEFT, false);
+        windowmode::SetLcaBackgroundMessageMode(false);
+        DestroyWindow(hwnd);
+    }
+    UnregisterClassW(kCls, wc.hInstance);
+
+    const bool ok = bitsOk && normOk && postedOk;
+    wchar_t detail[200]{};
+    swprintf_s(detail, L"scan=0x%02X ext=%d norm=%d postedVk=0x%02X postedScan=0x%02X",
+        leftScan, leftExt ? 1 : 0, normOk ? 1 : 0, g_arrowProbeVk,
+        static_cast<unsigned>((g_arrowProbeLp >> 16) & 0xFF));
+    Emit(L"lca_arrow_key_lparam", ok, ok ? L"" : detail);
 }
 
 void TestTargetLostAfterDestroy() {
@@ -2215,6 +2713,21 @@ void TestTargetLostAfterDestroy() {
     wchar_t detail[96]{};
     swprintf_s(detail, L"before=%d after=%d", aliveBefore ? 1 : 0, aliveAfter ? 1 : 0);
     Emit(L"window_mode_target_lost_stops", ok, ok ? L"" : detail);
+}
+
+void TestUwpFrameBindPidStillAlive() {
+    using windowmode::TargetBindPidStillMatches;
+    const bool win32Same = TargetBindPidStillMatches(100, 100, 100, 100);
+    const bool uwpSplit = TargetBindPidStillMatches(200, 200, 100, 100);
+    const bool legacyUwpNoBindStored = TargetBindPidStillMatches(0, 200, 100, 100);
+    const bool hijacked = !TargetBindPidStillMatches(200, 300, 100, 100);
+    const bool hwndReused = !TargetBindPidStillMatches(200, 400, 100, 500);
+    const bool ok = win32Same && uwpSplit && legacyUwpNoBindStored && hijacked && hwndReused;
+    wchar_t detail[160]{};
+    swprintf_s(detail, L"win32=%d uwp=%d legacy=%d hijack=%d reuse=%d",
+        win32Same ? 1 : 0, uwpSplit ? 1 : 0, legacyUwpNoBindStored ? 1 : 0,
+        hijacked ? 1 : 0, hwndReused ? 1 : 0);
+    Emit(L"uwp_frame_bind_pid_still_alive", ok, ok ? L"" : detail);
 }
 
 constexpr wchar_t kInvisibleChildClass[] = L"QstInvisibleChildSelfTest";
@@ -2477,6 +2990,10 @@ void TestWindowListAndActivate(HWND edit) {
     Emit(L"window_activate_by_process", byProcOk,
         byProcOk ? L"" : (selfProc.empty() ? L"no processName"
             : (byProcErr.empty() ? L"hwnd/fg mismatch" : byProcErr.c_str())));
+    // 激活可能抢不到前台而停在最小化；后面screen_point 还要用这扇窗。
+    ShowWindow(top, SW_RESTORE);
+    ShowWindow(top, SW_SHOWNOACTIVATE);
+    UpdateWindow(top);
 }
 
 
@@ -2687,6 +3204,98 @@ void TestWindowClientScale() {
         detail += tplOk ? L" | tpl ok" : L" | tpl FAIL";
     }
     Emit(L"window_client_scale", ok, detail.c_str());
+}
+
+void TestWindowFindImageFullClient(HWND edit) {
+    int px1 = 9, py1 = 9, px2 = 9, py2 = 9;
+    const bool pureOk = windowmode::EffectiveWindowModeClientSearchRect(800, 600, px1, py1, px2, py2)
+        && px1 == 0 && py1 == 0 && px2 == 800 && py2 == 600;
+    int zx1 = 1, zy1 = 2, zx2 = 3, zy2 = 4;
+    const bool rejectZero = !windowmode::EffectiveWindowModeClientSearchRect(0, 100, zx1, zy1, zx2, zy2);
+
+    bool liveOk = true;
+    std::wstring liveDetail;
+    if (!edit) {
+        liveOk = true;
+        liveDetail = L"no hwnd (pure only)";
+    } else {
+        HWND top = ParentTopWindow(edit);
+        wchar_t topCls[256]{};
+        GetClassNameW(top, topCls, 256);
+        RECT wr{};
+        GetWindowRect(top, &wr);
+
+        windowmode::WindowModeScriptConfig cfg{};
+        cfg.enabled = true;
+        cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+        cfg.windowClassName = topCls;
+        cfg.selectMethod = windowmode::WindowSelectMethod::UseEditorWindowClass;
+        cfg.targetPickX = (wr.left + wr.right) / 2;
+        cfg.targetPickY = (wr.top + wr.bottom) / 2;
+        cfg.coordSpace = windowmode::WindowModeCoordinateSpace::ScreenAbsolute;
+
+        std::wstring err;
+        windowmode::WindowModeExecutor exec;
+        if (!exec.BeginRun(cfg, err)) {
+            liveOk = false;
+            liveDetail = err.empty() ? L"BeginRun failed" : err;
+        } else {
+            RECT cr{};
+            HWND bound = exec.TargetHwnd();
+            HWND cap = bound ? windowmode::TopLevelTargetWindow(bound) : top;
+            if (!cap || !GetClientRect(cap, &cr)) GetClientRect(top, &cr);
+            const int cw = std::max(0, static_cast<int>(cr.right - cr.left));
+            const int ch = std::max(0, static_cast<int>(cr.bottom - cr.top));
+
+            ScriptAction picked{};
+            picked.searchFullScreen = false;
+            picked.searchX1 = 40;
+            picked.searchY1 = 50;
+            picked.searchX2 = 140;
+            picked.searchY2 = 150;
+
+            int x1 = -1, y1 = -1, x2 = -1, y2 = -1;
+            const bool pickedOk = exec.ResolveClientSearchRect(picked, x1, y1, x2, y2)
+                && x1 == 0 && y1 == 0 && x2 == cw && y2 == ch;
+
+            ScriptAction fullScreen{};
+            fullScreen.searchFullScreen = true;
+            fullScreen.searchX1 = 0;
+            fullScreen.searchY1 = 0;
+            fullScreen.searchX2 = 3840;
+            fullScreen.searchY2 = 2160;
+            int fx1 = -1, fy1 = -1, fx2 = -1, fy2 = -1;
+            const bool fullOk = exec.ResolveClientSearchRect(fullScreen, fx1, fy1, fx2, fy2)
+                && fx1 == 0 && fy1 == 0 && fx2 == cw && fy2 == ch;
+
+            POINT origin{0, 0};
+            ClientToScreen(cap, &origin);
+            int mx1 = -1, my1 = -1, mx2 = -1, my2 = -1;
+            const bool mapOk = exec.MapClientRect(0, 0, cw, ch, mx1, my1, mx2, my2)
+                && mx1 == origin.x && my1 == origin.y
+                && mx2 == origin.x + cw && my2 == origin.y + ch;
+
+            exec.EndRun();
+            liveOk = pickedOk && fullOk && mapOk && cw > 0 && ch > 0;
+            if (!liveOk) {
+                wchar_t buf[256]{};
+                swprintf_s(buf,
+                    L"picked=(%d,%d)-(%d,%d) full=(%d,%d)-(%d,%d) map=(%d,%d)-(%d,%d) origin=(%d,%d) client=%dx%d",
+                    x1, y1, x2, y2, fx1, fy1, fx2, fy2, mx1, my1, mx2, my2,
+                    origin.x, origin.y, cw, ch);
+                liveDetail = buf;
+            }
+        }
+    }
+
+    const bool ok = pureOk && rejectZero && liveOk;
+    std::wstring detail;
+    if (!ok) {
+        detail = pureOk ? L"pure ok" : L"pure FAIL";
+        detail += rejectZero ? L" | rejectZero ok" : L" | rejectZero FAIL";
+        detail += liveOk ? L" | live ok" : (L" | live FAIL " + liveDetail);
+    }
+    Emit(L"window_findimage_full_client", ok, detail.c_str());
 }
 
 void TestWindowRelativePlaybackEnablesWm() {
@@ -3051,7 +3660,689 @@ void TestAndroidQtFakeFocusGate() {
         ok ? L"" : L"MuMu PostMessage-only / LDPlayer gate wrong");
 }
 
+void TestWeixinQtFakeFocus() {
+    windowmode::WindowModeScriptConfig wx{};
+    wx.enabled = true;
+    wx.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    wx.windowClassName = L"Qt51514QWindowIcon";
+    wx.targetExePath = L"D:\\Weixin\\Weixin.exe";
+    wx.windowName = L"微信";
+    const bool classOk = windowmode::LooksLikeWeixinExecutable(wx.targetExePath)
+        && windowmode::LooksLikeWeixinTitle(L"微信")
+        && windowmode::LooksLikeWeixinTarget(wx, nullptr)
+        && windowmode::LooksLikeQtRenderWindowClass(wx.windowClassName)
+        && windowmode::NeedsFakeFocusInjection(wx, nullptr)
+        && windowmode::UsesFakeFocus(wx)
+        && windowmode::UsesFakeFocusForTarget(wx, nullptr)
+        && !windowmode::ConfigLooksLikeElectronShell(wx)
+        && !windowmode::LooksLikeChromiumShellTarget(wx, nullptr)
+        && !windowmode::ConfigLooksLikeEmulatorTarget(wx)
+        && !windowmode::PrefersLcaBackgroundMessages(wx, nullptr)
+        && !windowmode::ShouldMinimizeTargetAfterBind(wx)
+        && !windowmode::GameTargetNeedsHardwareWithoutFakeFocus(wx, nullptr);
+
+    const bool titleGate = !windowmode::LooksLikeWeixinTitle(L"微信开发者工具")
+        && !windowmode::LooksLikeWeixinExecutable(L"C:\\Tools\\wechatdevtools.exe")
+        && windowmode::LooksLikeWeixinExecutable(L"C:\\Tencent\\WeChat.exe");
+
+    windowmode::WindowModeScriptConfig qtOnly{};
+    qtOnly.enabled = true;
+    qtOnly.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    qtOnly.windowClassName = L"Qt51514QWindowIcon";
+    const bool qtOnlyOk = !windowmode::LooksLikeWeixinTarget(qtOnly, nullptr)
+        && !windowmode::UsesFakeFocus(qtOnly)
+        && windowmode::ConfigLooksLikeEmulatorTarget(qtOnly);
+
+    windowmode::WindowModeScriptConfig mumu{};
+    mumu.enabled = true;
+    mumu.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    mumu.windowClassName = L"Qt5156QWindowIcon";
+    mumu.windowName = L"MuMu安卓设备-1";
+    const bool mumuStillEmu = windowmode::ConfigLooksLikeEmulatorTarget(mumu)
+        && !windowmode::LooksLikeWeixinTarget(mumu, nullptr)
+        && !windowmode::UsesFakeFocus(mumu);
+
+    constexpr wchar_t kTopCls[] = L"Qt51514QWindowIcon";
+    constexpr wchar_t kChildCls[] = L"QstWmWeixinChild";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WeixinKeyProbeProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kTopCls;
+    RegisterClassExW(&wc);
+    WNDCLASSEXW wcChild = wc;
+    wcChild.lpfnWndProc = DefWindowProcW;
+    wcChild.lpszClassName = kChildCls;
+    RegisterClassExW(&wcChild);
+
+    HWND parent = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kTopCls, L"微信",
+        WS_OVERLAPPEDWINDOW, 80, 80, 900, 700, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND child = CreateWindowExW(0, kChildCls, L"",
+        WS_CHILD | WS_VISIBLE, 0, 40, 900, 660, parent, nullptr, wc.hInstance, nullptr);
+    ShowWindow(parent, SW_SHOWNOACTIVATE);
+    UpdateWindow(parent);
+
+    windowmode::BackgroundInputTargetKind kind = windowmode::BackgroundInputTargetKind::TopLevel;
+    HWND found = windowmode::FindBackgroundInputChild(parent, &wx, &kind);
+    const bool topOk = parent && child && found == parent
+        && kind == windowmode::BackgroundInputTargetKind::TopLevel;
+
+    g_weixinProbeActivate = 0;
+    g_weixinProbeSetFocus = 0;
+    g_weixinProbeKeyDown = 0;
+    g_weixinProbeKeyUp = 0;
+    g_weixinProbeChar = 0;
+    const HWND fgBefore = GetForegroundWindow();
+    windowmode::ResetSoftMouseState();
+    windowmode::PostKeyToWindow(parent, 'A', true);
+    windowmode::PostKeyToWindow(parent, 'A', false);
+    PumpMessagesDispatchOnly(std::chrono::milliseconds(80));
+    const HWND fgAfter = GetForegroundWindow();
+    const bool stoleFg = parent && fgBefore != parent && fgAfter == parent;
+    const bool keyOk = parent
+        && g_weixinProbeKeyDown == 1
+        && g_weixinProbeKeyUp == 1
+        && g_weixinProbeChar == 0
+        && g_weixinProbeActivate == 0
+        && g_weixinProbeSetFocus == 0
+        && !stoleFg;
+
+    g_weixinProbeActivate = 0;
+    g_weixinProbeSetFocus = 0;
+    g_weixinProbeKeyDown = 0;
+    g_weixinProbeKeyUp = 0;
+    g_weixinProbeChar = 0;
+    g_weixinProbePaste = 0;
+    g_weixinProbeLButton = 0;
+    windowmode::PostQuickInputToWindow(parent, L"h", 0.0, false, nullptr);
+    {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+        while (std::chrono::steady_clock::now() < until
+            && (g_weixinProbeKeyDown < 1 || g_weixinProbeKeyUp < 1)) {
+            PumpMessagesDispatchOnly(std::chrono::milliseconds(10));
+        }
+    }
+    const bool quickOk = g_weixinProbeKeyDown >= 1
+        && g_weixinProbeKeyUp >= 1
+        && g_weixinProbePaste == 0
+        && g_weixinProbeChar == 0
+        && g_weixinProbeActivate == 0;
+
+    g_weixinProbeActivate = 0;
+    g_weixinProbeLButton = 0;
+    windowmode::PostMouseButtonToWindow(parent, 40, 40, MouseButtonType::Left, true);
+    windowmode::PostMouseButtonToWindow(parent, 40, 40, MouseButtonType::Left, false);
+    PumpMessagesDispatchOnly(std::chrono::milliseconds(80));
+    const bool clickOk = g_weixinProbeLButton >= 2 && g_weixinProbeActivate == 0;
+
+    DestroyWindow(parent);
+    UnregisterClassW(kChildCls, wc.hInstance);
+    UnregisterClassW(kTopCls, wc.hInstance);
+
+    const bool ok = classOk && titleGate && qtOnlyOk && mumuStillEmu && topOk
+        && keyOk && quickOk && clickOk;
+    wchar_t detail[280]{};
+    if (ok) {
+        Emit(L"weixin_qt_fake_focus", true,
+            L"Weixin Qt →lite fake-focus; KEY* no CHAR/ACTIVATE/PASTE");
+    } else {
+        swprintf_s(detail,
+            L"class=%d top=%d key=%d quick=%d click=%d down=%d paste=%d lbtn=%d act=%d",
+            classOk && titleGate && qtOnlyOk && mumuStillEmu ? 1 : 0,
+            topOk ? 1 : 0, keyOk ? 1 : 0, quickOk ? 1 : 0, clickOk ? 1 : 0,
+            g_weixinProbeKeyDown, g_weixinProbePaste, g_weixinProbeLButton,
+            g_weixinProbeActivate);
+        Emit(L"weixin_qt_fake_focus", false, detail);
+    }
+}
+
+void TestWeixinQtMouseHooks() {
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+
+    constexpr wchar_t kCls[] = L"Qt51514QWindowIcon";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCls;
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kCls, L"微信",
+        WS_OVERLAPPEDWINDOW, 64, 64, 240, 140, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"weixin_qt_mouse_hooks", false, L"CreateWindow Weixin probe failed");
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    std::wstring softErr;
+    if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+        DestroyWindow(hwnd);
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"weixin_qt_mouse_hooks", false,
+            softErr.empty() ? L"Attach failed" : softErr.c_str());
+        return;
+    }
+
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        windowmode::FakeFocusSoftInput_Detach();
+        DestroyWindow(hwnd);
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"weixin_qt_mouse_hooks", false, L"LoadLibrary failed");
+        return;
+    }
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    auto* installLite = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_InstallLite"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    const LONG_PTR procBefore = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if (!installLite || !uninstall || !installLite(hwnd)) {
+        if (uninstall) uninstall();
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        DestroyWindow(hwnd);
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"weixin_qt_mouse_hooks", false, L"InstallLite failed");
+        return;
+    }
+
+    windowmode::FakeFocusSoftInput_SetCursorScreen(1234, 5678);
+    POINT pt{};
+    GetCursorPos(&pt);
+    windowmode::FakeFocusSoftInput_SetMouseButtonVk(VK_LBUTTON, true);
+    const SHORT lbtn = GetAsyncKeyState(VK_LBUTTON);
+    const SHORT spaceIsolated = GetAsyncKeyState(VK_SPACE);
+    SetCursorPos(1, 1);
+    POINT after{};
+    GetCursorPos(&after);
+    const LONG_PTR procAfter = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    HWND hookedFg = GetForegroundWindow();
+
+    uninstall();
+    FreeLibrary(mod);
+    windowmode::FakeFocusSoftInput_Detach();
+    DestroyWindow(hwnd);
+    UnregisterClassW(kCls, wc.hInstance);
+
+    const bool ok = pt.x == 1234 && pt.y == 5678
+        && after.x == 1234 && after.y == 5678
+        && (lbtn & 0x8000) != 0
+        && (spaceIsolated & 0x8000) == 0
+        && procBefore == procAfter
+        && hookedFg == hwnd;
+    wchar_t detail[200]{};
+    swprintf_s(detail, L"get=(%ld,%ld) afterWarp=(%ld,%ld) lbtn=0x%04x space=0x%04x proc=%d fg=%d",
+        pt.x, pt.y, after.x, after.y,
+        static_cast<unsigned>(lbtn) & 0xFFFF,
+        static_cast<unsigned>(spaceIsolated) & 0xFFFF,
+        procBefore == procAfter ? 1 : 0,
+        hookedFg == hwnd ? 1 : 0);
+    Emit(L"weixin_qt_mouse_hooks", ok, ok ? L"" : detail);
+}
+
+/// Chromium 壳（Electron/CEF）软输入：键盘组合键与鼠标点不动的根因回归。
+/// 用户症状：脚本Ctrl+V 在壳里「只出v 不粘贴」；鼠标移到某处不动、点了没反应。
+/// 原因：electronSafe 分支只做焦点欺骗 + 灌键线程（*没钩软光标/软键态*——
+/// 目标进程 GetKeyboardState 读到系统键态（本机 Ctrl 全抬起）→Chromium 把
+/// Ctrl+V 当普通字符；GetCursorPos 读到本机真光标（可能在别的窗上）→命中判定错位。
+void TestChromiumShellSoftInput() {
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+
+    constexpr wchar_t kCls[] = L"Chrome_WidgetWin_1";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCls;
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kCls, L"Chromium 壳探针",
+        WS_OVERLAPPEDWINDOW, 64, 64, 240, 140, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"chromium_shell_soft_input", false, L"CreateWindow Chromium probe failed");
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    std::wstring softErr;
+    if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+        DestroyWindow(hwnd);
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"chromium_shell_soft_input", false,
+            softErr.empty() ? L"Attach failed" : softErr.c_str());
+        return;
+    }
+
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        windowmode::FakeFocusSoftInput_Detach();
+        DestroyWindow(hwnd);
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"chromium_shell_soft_input", false, L"LoadLibrary failed");
+        return;
+    }
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    auto* install = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_Install"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    const LONG_PTR procBefore = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if (!install || !uninstall || !install(hwnd)) {
+        if (uninstall) uninstall();
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        DestroyWindow(hwnd);
+        UnregisterClassW(kCls, wc.hInstance);
+        Emit(L"chromium_shell_soft_input", false, L"Install failed");
+        return;
+    }
+
+    // 不排空消息队列：本进程前一个用例的假WM_INPUT/焦点消息可能积压上千条，
+    // while(PeekMessage) 会把用例拖成看起来像卡死。这里只测钩子回报的状态。
+    windowmode::FakeFocusSoftInput_SetCursorScreen(1234, 5678);
+    windowmode::FakeFocusSoftInput_SetKey(VK_LCONTROL, true);
+    const BYTE kbCtrl = [&]() {
+        BYTE keys[256]{};
+        GetKeyboardState(keys);
+        return keys[VK_CONTROL];
+    }();
+    const BYTE kbVCtrl = [&]() {
+        windowmode::FakeFocusSoftInput_SetKey('V', true);
+        BYTE keys[256]{};
+        GetKeyboardState(keys);
+        return keys['V'];
+    }();
+    const BYTE kbShiftUntouched = [&]() {
+        BYTE keys[256]{};
+        GetKeyboardState(keys);
+        return keys[VK_SHIFT];
+    }();
+    const SHORT gksCtrl = GetKeyState(VK_CONTROL);
+    const SHORT gaksCtrl = GetAsyncKeyState(VK_CONTROL);
+    const SHORT gaksSpace = GetAsyncKeyState(VK_SPACE);
+    POINT pt{};
+    GetCursorPos(&pt);
+    HWND hookedFg = GetForegroundWindow();
+
+    // 静默钩：Chromium 壳不得被灌假 WM_INPUT（会被当伪造输入丢弃甚至洪泛队列）。
+    BYTE rawBuf[256]{};
+    UINT rawSz = sizeof(rawBuf);
+    const UINT rawCount = GetRawInputBuffer(
+        reinterpret_cast<PRAWINPUT>(rawBuf), &rawSz, sizeof(RAWINPUTHEADER));
+
+    // 收尾：抬起软键，避免状态泄漏到同进程后续用例。
+    windowmode::FakeFocusSoftInput_SetKey('V', false);
+    windowmode::FakeFocusSoftInput_SetKey(VK_LCONTROL, false);
+    const BYTE kbCtrlAfterUp = [&]() {
+        BYTE keys[256]{};
+        GetKeyboardState(keys);
+        return keys[VK_CONTROL];
+    }();
+    const LONG_PTR procAfter = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+
+    uninstall();
+    FreeLibrary(mod);
+    windowmode::FakeFocusSoftInput_Detach();
+    DestroyWindow(hwnd);
+    UnregisterClassW(kCls, wc.hInstance);
+
+    const bool ok = (kbCtrl & 0x80) != 0
+        && (kbVCtrl & 0x80) != 0
+        && (kbShiftUntouched & 0x80) == 0
+        && (kbCtrlAfterUp & 0x80) == 0
+        && (gksCtrl & 0x8000) != 0
+        && (gaksCtrl & 0x8000) != 0
+        && (gaksSpace & 0x8000) == 0
+        && pt.x == 1234 && pt.y == 5678
+        && rawCount == 0
+        && hookedFg == hwnd
+        && procBefore == procAfter;
+    wchar_t detail[320]{};
+    swprintf_s(detail,
+        L"kbCtrl=0x%02x kbV=0x%02x kbShift=0x%02x kbCtrlUp=0x%02x gks=0x%04x gaks=0x%04x "
+        L"space=0x%04x pt=(%ld,%ld) raw=%u fg=%d proc=%d",
+        kbCtrl, kbVCtrl, kbShiftUntouched, kbCtrlAfterUp,
+        static_cast<unsigned>(gksCtrl) & 0xFFFF,
+        static_cast<unsigned>(gaksCtrl) & 0xFFFF,
+        static_cast<unsigned>(gaksSpace) & 0xFFFF,
+        pt.x, pt.y, rawCount,
+        hookedFg == hwnd ? 1 : 0, procBefore == procAfter ? 1 : 0);
+    Emit(L"chromium_shell_soft_input", ok, ok ? L"" : detail);
+}
+
+void ResetQiProbeCounts() {
+    g_weixinProbeActivate = 0;
+    g_weixinProbeSetFocus = 0;
+    g_weixinProbeKeyDown = 0;
+    g_weixinProbeKeyUp = 0;
+    g_weixinProbeChar = 0;
+    g_weixinProbePaste = 0;
+    g_weixinProbeLButton = 0;
+}
+
+bool ProbeQuickInputNoPaste(const wchar_t* cls, const wchar_t* title, bool expectKey,
+    bool expectNoChar, wchar_t* detail, size_t detailN) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WeixinKeyProbeProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, cls, title,
+        WS_OVERLAPPEDWINDOW, 72, 72, 240, 140, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+        UnregisterClassW(cls, wc.hInstance);
+        swprintf_s(detail, detailN, L"%s create failed", cls);
+        return false;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(hwnd);
+    ResetQiProbeCounts();
+    windowmode::ResetSoftMouseState();
+    windowmode::PostQuickInputToWindow(hwnd, L"h", 0.0, false, nullptr);
+    PumpMessagesDispatchOnly(std::chrono::milliseconds(80));
+    const bool pasteOk = g_weixinProbePaste == 0;
+    const bool keyOk = !expectKey || g_weixinProbeKeyDown >= 1;
+    const bool charOk = !expectNoChar || g_weixinProbeChar == 0;
+    const bool genericChar = expectKey || g_weixinProbeChar >= 1;
+    const bool ok = pasteOk && keyOk && charOk && genericChar;
+    if (!ok) {
+        swprintf_s(detail, detailN, L"%s paste=%d key=%d char=%d",
+            cls, g_weixinProbePaste, g_weixinProbeKeyDown, g_weixinProbeChar);
+    }
+    DestroyWindow(hwnd);
+    UnregisterClassW(cls, wc.hInstance);
+    return ok;
+}
+
+void TestQuickInputSkipsPasteNonEdit() {
+    wchar_t qtDetail[120]{};
+    wchar_t airDetail[120]{};
+    wchar_t mapleDetail[120]{};
+    wchar_t chromeDetail[120]{};
+    wchar_t plainDetail[120]{};
+    const bool qtOk = ProbeQuickInputNoPaste(L"Qt5156QWindowIcon", L"QtProbe",
+        true, true, qtDetail, 120);
+    const bool airOk = ProbeQuickInputNoPaste(L"ApolloRuntimeContentWindow", L"AIRProbe",
+        true, false, airDetail, 120);
+    const bool mapleOk = ProbeQuickInputNoPaste(L"MapleStoryClass", L"MapleProbe",
+        true, true, mapleDetail, 120);
+    const bool chromeOk = ProbeQuickInputNoPaste(L"Chrome_WidgetWin_1", L"ChromeProbe",
+        true, false, chromeDetail, 120);
+    const bool plainOk = ProbeQuickInputNoPaste(L"QstQiPlainWnd", L"PlainProbe",
+        false, false, plainDetail, 120);
+    const bool ok = qtOk && airOk && mapleOk && chromeOk && plainOk;
+    wchar_t detail[520]{};
+    if (!ok) {
+        swprintf_s(detail, L"qt:%s air:%s maple:%s chrome:%s plain:%s",
+            qtOk ? L"ok" : qtDetail,
+            airOk ? L"ok" : airDetail,
+            mapleOk ? L"ok" : mapleDetail,
+            chromeOk ? L"ok" : chromeDetail,
+            plainOk ? L"ok" : plainDetail);
+    }
+    Emit(L"quick_input_skips_paste_non_edit", ok, ok ? L"" : detail);
+}
+
 }  // namespace
+
+// ── 后台逐字投递探针：模拟「按帧取键+ 只在键仍按下时接受WM_CHAR」的游戏窗口 ──
+// 真实键盘顺序是DOWN →（目标自己的TranslateMessage 出WM_CHAR）→ UP。
+// 若宿主把 UP 紧跟 DOWN 发出，WM_CHAR 会被排到 KEYUP 之后，游戏按「键仍按下」判定时整串被吞
+// （现场实测：后台窗口快捷输入 "11" 只进一个1，前台SendInput 正常）。
+struct PostedKeyProbe {
+    std::wstring text;
+    int keyDown = 0;
+    int keyUp = 0;
+    int charAccepted = 0;
+    int charDroppedKeyUp = 0;
+    bool vkDown[256] = {};
+    std::chrono::steady_clock::time_point vkDownTick[256] = {};
+    std::chrono::steady_clock::time_point firstDigitDownTick{};
+    std::chrono::steady_clock::time_point secondDigitDownTick{};
+    long long maxHoldMs = 0;
+    /// 同一键「前一个 UP 未派发又来 DOWN」的次数（两击挤进同一帧的形态）。
+    int sameKeyOverlap = 0;
+};
+
+PostedKeyProbe g_postedKeyProbe;
+
+void ResetPostedKeyProbe() {
+    g_postedKeyProbe = PostedKeyProbe{};
+}
+
+long long MsBetween(std::chrono::steady_clock::time_point a,
+    std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+}
+
+LRESULT CALLBACK PostedKeyProbeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        const UINT vk = static_cast<UINT>(wParam);
+        const auto now = std::chrono::steady_clock::now();
+        ++g_postedKeyProbe.keyDown;
+        if (vk < 256) {
+            if (g_postedKeyProbe.vkDown[vk]) ++g_postedKeyProbe.sameKeyOverlap;
+            if (!g_postedKeyProbe.vkDown[vk]) g_postedKeyProbe.vkDownTick[vk] = now;
+            g_postedKeyProbe.vkDown[vk] = true;
+        }
+        if (vk == '1') {
+            if (g_postedKeyProbe.firstDigitDownTick == std::chrono::steady_clock::time_point{}) {
+                g_postedKeyProbe.firstDigitDownTick = now;
+            } else if (g_postedKeyProbe.secondDigitDownTick
+                == std::chrono::steady_clock::time_point{}) {
+                g_postedKeyProbe.secondDigitDownTick = now;
+            }
+        }
+        break;
+    }
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+        const UINT vk = static_cast<UINT>(wParam);
+        const auto now = std::chrono::steady_clock::now();
+        ++g_postedKeyProbe.keyUp;
+        if (vk < 256 && g_postedKeyProbe.vkDown[vk]) {
+            const long long hold = MsBetween(g_postedKeyProbe.vkDownTick[vk], now);
+            if (hold > g_postedKeyProbe.maxHoldMs) g_postedKeyProbe.maxHoldMs = hold;
+            g_postedKeyProbe.vkDown[vk] = false;
+        }
+        break;
+    }
+    case WM_CHAR:
+    case WM_SYSCHAR: {
+        const UINT scan = static_cast<UINT>((static_cast<unsigned long long>(lParam) >> 16) & 0xFF);
+        const UINT vk = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK);
+        if (vk < 256 && g_postedKeyProbe.vkDown[vk]) {
+            g_postedKeyProbe.text.push_back(static_cast<wchar_t>(wParam));
+            ++g_postedKeyProbe.charAccepted;
+        } else {
+            ++g_postedKeyProbe.charDroppedKeyUp;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ── 软键「状态 vs 事件」竞态探针 ──
+// 假焦点软键的 down[] 是**当前值**（宿主一次写完），事件却由 DLL 灌键线程稍后 PostMessage。
+// 目标在自己的 WndProc 里读 GetKeyState 判组合键（Chromium 的 Ctrl+V 正是如此）——
+// 若宿主在目标处理 WM_KEYDOWN(V) 之前就写回「Ctrl 抬起」，组合键退化成普通字符（只出 v 不粘贴）。
+int g_comboProbeVDown = 0;
+int g_comboProbeVDownCtrlHeld = 0;
+
+LRESULT CALLBACK ComboProbeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wParam == 'V') {
+        ++g_comboProbeVDown;
+        if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) ++g_comboProbeVDownCtrlHeld;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void TestSoftKeyComboStateRace() {
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+    constexpr wchar_t kCls[] = L"Chrome_WidgetWin_1";  // 与产品同一条链路：壳类名 → electronSafe 软键
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ComboProbeProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCls;
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kCls, L"QST 软键组合探针",
+        WS_OVERLAPPEDWINDOW, 72, 72, 240, 140, nullptr, nullptr, wc.hInstance, nullptr);
+    wchar_t detail[200]{};
+    bool ok = false;
+    if (!hwnd) {
+        swprintf_s(detail, L"CreateWindow failed");
+    } else {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        std::wstring softErr;
+        if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+            swprintf_s(detail, L"Attach failed: %s", softErr.c_str());
+        } else {
+            HMODULE mod = LoadLibraryW(dllPath.c_str());
+            using InstallFn = BOOL(WINAPI*)(HWND);
+            using UninstallFn = BOOL(WINAPI*)();
+            auto* install = mod
+                ? reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_Install")) : nullptr;
+            auto* uninstall = mod
+                ? reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall")) : nullptr;
+            if (!mod || !install || !uninstall || !install(hwnd)) {
+                swprintf_s(detail, L"Install failed");
+                if (uninstall) uninstall();
+                if (mod) FreeLibrary(mod);
+            } else {
+                g_comboProbeVDown = 0;
+                g_comboProbeVDownCtrlHeld = 0;
+                // 产品在 Chromium 壳会话里就是这么开的（灌键走 DLL PostMessage 队列）。
+                windowmode::FakeFocusSoftInput_SetPostKeyEvents(true);
+                // 与产品同一条链路：中文文本走「非 Edit → Ctrl+V」，且此时是进程内灌键队列。
+                std::atomic_bool done{false};
+                std::thread worker([&]() {
+                    windowmode::PostQuickInputToWindow(hwnd, L"中文", 0.0, false, nullptr);
+                    done.store(true, std::memory_order_relaxed);
+                });
+                const auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(6);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    MSG msg{};
+                    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    if (done.load(std::memory_order_relaxed)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                worker.join();
+                windowmode::FakeFocusSoftInput_ClearKeys();
+                ok = g_comboProbeVDown >= 1 && g_comboProbeVDownCtrlHeld == g_comboProbeVDown;
+                swprintf_s(detail, L"V-DOWN=%d 其中读到 Ctrl 仍按下=%d",
+                    g_comboProbeVDown, g_comboProbeVDownCtrlHeld);
+            }
+        }
+        DestroyWindow(hwnd);
+    }
+    UnregisterClassW(kCls, wc.hInstance);
+    if (windowmode::FakeFocusSoftInput_IsAttached()) windowmode::FakeFocusSoftInput_Detach();
+    Emit(L"soft_key_combo_state_race", ok, detail);
+}
+
+void TestPostedQuickKeysTiming() {    constexpr wchar_t kCls[] = L"QstLcaPostedKeyProbe";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = PostedKeyProbeProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCls;
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kCls, L"QST PostedKeyProbe",
+        WS_OVERLAPPEDWINDOW, 60, 60, 220, 110, nullptr, nullptr, wc.hInstance, nullptr);
+
+    std::wstring got;
+    int accepted = 0;
+    int dropped = 0;
+    long long hold = 0;
+    long long gap = 0;
+    long long workerMs = 0;
+    bool ok = false;
+    if (hwnd) {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(hwnd);
+        ResetPostedKeyProbe();
+        windowmode::SetLcaBackgroundMessageMode(true);
+        std::atomic_bool done{false};
+        std::thread worker([&]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            windowmode::PostQuickInputToWindow(hwnd, L"11", 0.0, false, nullptr);
+            workerMs = MsBetween(t0, std::chrono::steady_clock::now());
+            done.store(true, std::memory_order_relaxed);
+        });
+        // 主线程按**每帧一次**的节奏取消息（≈60fps 游戏的 process_events），模拟「按帧取键」的目标：
+        // 一帧内到达的 DOWN/UP 会被同一批处理，目标自己 TranslateMessage 出的 WM_CHAR 只能排到这批
+        // 消息之后 —— 零间隔连发时 WM_CHAR 因此落在 KEYUP 之后（用例判「丢」）。
+        // 正常时序（按住 ≥1 帧，或队列屏障）下每个字的 DOWN→CHAR→UP 不会挤进同一批。
+        bool workerSettled = false;
+        auto drainUntil = std::chrono::steady_clock::now();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (std::chrono::steady_clock::now() < deadline) {
+            MSG msg{};
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (done.load(std::memory_order_relaxed)) {
+                if (!workerSettled) {
+                    workerSettled = true;
+                    drainUntil = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(200);
+                } else if (std::chrono::steady_clock::now() >= drainUntil) {
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        worker.join();
+        windowmode::SetLcaBackgroundMessageMode(false);
+        got = g_postedKeyProbe.text;
+        accepted = g_postedKeyProbe.charAccepted;
+        dropped = g_postedKeyProbe.charDroppedKeyUp;
+        hold = g_postedKeyProbe.maxHoldMs;
+        if (g_postedKeyProbe.firstDigitDownTick != std::chrono::steady_clock::time_point{}
+            && g_postedKeyProbe.secondDigitDownTick != std::chrono::steady_clock::time_point{}) {
+            gap = MsBetween(g_postedKeyProbe.firstDigitDownTick,
+                g_postedKeyProbe.secondDigitDownTick);
+        }
+        // 判据是**消息时序**，不是某个固定毫秒数：
+        //  ① 两个相同数字都要进（"11"）；② 喂给目标的 WM_CHAR 一律在「该键仍按下」时到达；
+        //  ③ 同一键不得重叠（前一个 UP 未派发就又来 DOWN = 两击挤进同一帧，正是现场吞字的形态）。
+        ok = got == L"11" && accepted == 2 && dropped == 0
+            && g_postedKeyProbe.sameKeyOverlap == 0;
+        DestroyWindow(hwnd);
+    }
+    UnregisterClassW(kCls, wc.hInstance);
+
+    wchar_t detail[280]{};
+    swprintf_s(detail,
+        L"文本=\"%s\" 收=%d 丢=%d 同键重叠=%d 按住=%lldms 两击间隔=%lldms 投递耗时=%lldms",
+        got.c_str(), accepted, dropped, g_postedKeyProbe.sameKeyOverlap, hold, gap, workerMs);
+    Emit(L"posted_quick_keys_timing", ok, detail);
+}
 
 int wmain(int argc, wchar_t** argv) {
     bool runMacro = false;
@@ -3102,6 +4393,7 @@ int wmain(int argc, wchar_t** argv) {
         Emit(L"window_list_match_and_format", false, L"skipped");
         Emit(L"window_activate_foreground", false, L"skipped");
         Emit(L"screen_point_to_client_within", false, L"skipped");
+        TestWindowFindImageFullClient(nullptr);
     } else {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         TestFindTarget(edit);
@@ -3113,6 +4405,7 @@ int wmain(int argc, wchar_t** argv) {
         TestQuickInputCancel(edit);
         TestWindowListAndActivate(edit);
         TestScreenPointToClientWithin(edit);
+        TestWindowFindImageFullClient(edit);
         DestroyWindow(ParentTopWindow(edit));
     }
 
@@ -3125,6 +4418,12 @@ int wmain(int argc, wchar_t** argv) {
     TestBackgroundInputDesktopEmulatorTop();
     TestBackgroundInputMumuQtRecursive();
     TestAndroidQtFakeFocusGate();
+    TestWeixinQtFakeFocus();
+    TestWeixinQtMouseHooks();
+    TestChromiumShellSoftInput();
+    TestSoftKeyComboStateRace();
+    TestQuickInputSkipsPasteNonEdit();
+    TestPostedQuickKeysTiming();
 
     TestDesktopQuickInputCancel();
     TestFakeFocusJsonRoundtrip();
@@ -3137,6 +4436,8 @@ int wmain(int argc, wchar_t** argv) {
     TestMonitorCoveringFullscreen();
     TestGameHardwareWithoutInject();
     TestHardwareOffscreenPark();
+    TestClampRectKeepsBottomRight();
+    TestClampRectShrinksIntoWork();
     TestVdaSelectsOsDll();
     TestFakeFocusHookLocal();
     TestFakeFocusLiteUnreal();
@@ -3149,11 +4450,19 @@ int wmain(int argc, wchar_t** argv) {
     TestFakeFocusSoftInput();
     TestAnjuzhenScriptWmConfig();
     TestPermissionMatchUipi();
+    TestPermissionMismatchNoAutolaunch();
     TestMapleStoryBackgroundFakeFocus();
+    TestLcaBackgroundUnknownGame();
+    TestTianLongBaBuFakeFocus();
+    TestLcaArrowKeyLParam();
     TestTargetLostAfterDestroy();
+    TestUwpFrameBindPidStillAlive();
     TestInvisibleChildClassBind();
     TestBrowserRenderSkipsD3d();
     TestCdpParkExpandable();
+    TestUiaControlPickByName();
+    TestUiaControlListFormat();
+    TestScreenPointOcclusionCheck();
 
     if (runMacro) TestMacroDesktopSmoke();
 

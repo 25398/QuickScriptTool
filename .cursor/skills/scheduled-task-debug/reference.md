@@ -24,6 +24,9 @@ FAIL 的 `name` → 直接跳文件。
 | `interval_ignores_wall_clock` | 间隔按钟点匹配或 clamp 错 | `ScheduledTaskShouldRun` / `ClampScheduledFrequency` |
 | `parse_interval_frequency` | `frequency:4` 被夹成自定义 | `scheduled_task_store.cpp` `ClampScheduledFrequency` |
 | `interval_touch_resets_clock` | 保存后间隔计时未从保存时刻重锚 | `TouchIntervalClock` |
+| `interval_status_toggle_reanchors` | 列表点启用后仍用旧原点（或立刻补火） | `IntervalSignature` 含 status；Reload + `TouchIntervalClock` |
 | `interval_global_disable_reload_resets` | 解除全局禁用后间隔任务集中补火 | `Reload` 解除禁用时清 `intervalClocks_` |
+| `retarget_filepath_after_move` | 脚本拖进专业模式文件夹后定时仍指向旧路径 | `scheduled_task_store.cpp` `RetargetScheduledTaskFilePaths`；运行时 `ResolveLibraryScriptPath` |
+| `retarget_filepath_folder_rename` | 重命名专业模式文件夹后 `filePath` 未改前缀 | `RetargetScheduledTaskFilePathPrefix` |
 
 Agent CRUD / Reload：`src/agent_tools.cpp`（本 harness 不覆盖 UI 通知，改完后须人工或主程序路径确认 Reload）。

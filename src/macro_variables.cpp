@@ -1,4 +1,5 @@
 #include "macro_variables.h"
+#include "var_compute.h"
 
 #include <algorithm>
 #include <cmath>
@@ -403,6 +404,79 @@ std::wstring LookupMatchVarProperty(const ImageMatchResult& match, const std::ws
     return L"";
 }
 
+std::wstring MissingMatchNumeric(const std::wstring& prop) {
+    if (prop.empty() || prop == L"matchData" || prop == L"x" || prop == L"y" || prop == L"x1"
+        || prop == L"y1" || prop == L"cx" || prop == L"cy" || prop == L"count" || prop == L"hit") {
+        return L"0";
+    }
+    return L"";
+}
+
+struct IndexedVarRef {
+    std::wstring name;
+    bool hasIndex = false;
+    int index = 0;
+    bool indexIsPlaceholder = false;
+    std::wstring prop;
+};
+
+bool ParseIndexedVarRef(const std::wstring& token, IndexedVarRef& out) {
+    out = {};
+    if (token.empty()) return false;
+    const size_t lb = token.find(L'[');
+    if (lb != std::wstring::npos) {
+        const size_t rb = token.find(L']', lb + 1);
+        if (rb == std::wstring::npos || rb < lb + 1) return false;
+        out.name = token.substr(0, lb);
+        if (out.name.empty()) return false;
+        const std::wstring idx = token.substr(lb + 1, rb - lb - 1);
+        if (idx == L"n" || idx == L"N") {
+            out.indexIsPlaceholder = true;
+        } else {
+            if (idx.empty()) return false;
+            for (wchar_t ch : idx) {
+                if (!iswdigit(ch)) return false;
+            }
+            out.index = static_cast<int>(wcstol(idx.c_str(), nullptr, 10));
+            if (out.index < 0) return false;
+        }
+        out.hasIndex = true;
+        if (rb + 1 < token.size()) {
+            if (token[rb + 1] != L'.') return false;
+            out.prop = token.substr(rb + 2);
+        }
+        return true;
+    }
+    const size_t dot = token.find(L'.');
+    if (dot == std::wstring::npos) {
+        out.name = token;
+        return !out.name.empty();
+    }
+    out.name = token.substr(0, dot);
+    out.prop = token.substr(dot + 1);
+    return !out.name.empty();
+}
+
+std::wstring LookupMatchListVar(const ImageMatchListVar& list, const IndexedVarRef& ref) {
+    if (ref.indexIsPlaceholder) return L"";
+    if (ref.prop == L"count") return std::to_wstring(static_cast<int>(list.hits.size()));
+    const ImageMatchListHit* hit = nullptr;
+    if (ref.hasIndex) {
+        if (ref.index < 0 || ref.index >= static_cast<int>(list.hits.size())) {
+            return MissingMatchNumeric(ref.prop);
+        }
+        hit = &list.hits[static_cast<size_t>(ref.index)];
+    } else {
+        if (ref.prop.empty()) return L"";
+        if (list.hits.empty()) return MissingMatchNumeric(ref.prop);
+        hit = &list.hits.front();
+    }
+    if (ref.prop.empty()) return hit->match.found ? L"1" : L"0";
+    if (ref.prop == L"hit") return std::to_wstring(hit->templateIndex + 1);
+    if (ref.prop == L"hitName") return hit->templateName;
+    return LookupMatchVarProperty(hit->match, ref.prop);
+}
+
 void AddOcrSearchVarItems(const std::wstring& varName, std::vector<QuickInputVarItem>& items) {
     items.push_back({
         varName,
@@ -499,16 +573,32 @@ std::wstring ResolveMacroOperandImpl(const std::wstring& token, const MacroVaria
         return ResolveMacroVariables(t, ctx);
     }
 
+    IndexedVarRef indexed;
+    if (ParseIndexedVarRef(t, indexed) && (indexed.hasIndex || !indexed.prop.empty())) {
+        if (indexed.indexIsPlaceholder) return L"";
+        if (ctx.matchListVars) {
+            const auto it = ctx.matchListVars->find(indexed.name);
+            if (it != ctx.matchListVars->end()) {
+                return LookupMatchListVar(it->second, indexed);
+            }
+        }
+        if (ctx.matchVars) {
+            const auto it = ctx.matchVars->find(indexed.name);
+            if (it != ctx.matchVars->end()) {
+                if (indexed.hasIndex && indexed.index != 0) {
+                    return MissingMatchNumeric(indexed.prop);
+                }
+                if (indexed.prop == L"count") return it->second.found ? L"1" : L"0";
+                if (indexed.prop.empty()) return it->second.found ? L"1" : L"0";
+                return LookupMatchVarProperty(it->second, indexed.prop);
+            }
+        }
+    }
+
     const size_t dot = t.find(L'.');
     if (dot != std::wstring::npos) {
         const std::wstring varName = t.substr(0, dot);
         const std::wstring prop = t.substr(dot + 1);
-        if (ctx.matchVars) {
-            const auto it = ctx.matchVars->find(varName);
-            if (it != ctx.matchVars->end()) {
-                return LookupMatchVarProperty(it->second, prop);
-            }
-        }
         std::wstring ocrVal;
         if (LookupOcrVar(ctx, varName, prop, ocrVal)) return ocrVal;
     } else if (ctx.ocrVars) {
@@ -518,6 +608,11 @@ std::wstring ResolveMacroOperandImpl(const std::wstring& token, const MacroVaria
             if (it->second.mode == OcrVarMode::Text) return it->second.text;
             return std::to_wstring(it->second.found);
         }
+    }
+
+    if (ctx.userVars) {
+        const auto it = ctx.userVars->find(t);
+        if (it != ctx.userVars->end()) return it->second;
     }
 
     if (ctx.aiVars) {
@@ -627,6 +722,24 @@ bool TryParseDouble(const std::wstring& text, double& out) {
 
 std::wstring ResolveMacroOperand(const std::wstring& token, const MacroVariableContext& ctx) {
     return ResolveMacroOperandImpl(token, ctx, false);
+}
+
+std::wstring ResolveClipboardVarCompute(const MacroVariableContext& ctx) {
+    MacroClipboardSnapshot live;
+    const MacroClipboardSnapshot* snap = ctx.clipboardSnapshot;
+    if (!snap) {
+        live = ReadMacroClipboardSnapshot();
+        snap = &live;
+    }
+    if (!snap->files.empty()) {
+        std::wstring out;
+        for (size_t i = 0; i < snap->files.size(); ++i) {
+            if (i) out += L'\n';
+            out += snap->files[i];
+        }
+        return out;
+    }
+    return snap->text;
 }
 
 double ResolveFindImageTimeSec(const std::wstring& expr, const MacroVariableContext& ctx) {
@@ -798,6 +911,17 @@ std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptA
         AddFindImageVarItems(a.matchVarName, items);
     }
     for (const auto& a : actions) {
+        if (a.type != ActionType::MultiMatch || a.matchVarName.empty()) continue;
+        if (!seen.insert(a.matchVarName + L"#mm").second) continue;
+        const std::wstring n = a.matchVarName;
+        items.push_back({n + L".count", L"{" + n + L".count}", L"多图匹配命中个数", n + L".count"});
+        items.push_back({n + L"[n]", L"{" + n + L"[n]}", L"多图匹配第 n 处（把 n 换成 0、1、2…）", n + L"[n]"});
+        items.push_back({n + L"[0]", L"{" + n + L"[0]}", L"多图匹配第一处是否命中", n + L"[0]"});
+        AddFindImageVarItems(n + L"[0]", items);
+        items.push_back({n + L"[0].hit", L"{" + n + L"[0].hit}", L"命中模板序号(从1计)", n + L"[0].hit"});
+        items.push_back({n + L"[0].hitName", L"{" + n + L"[0].hitName}", L"命中模板文件名", n + L"[0].hitName"});
+    }
+    for (const auto& a : actions) {
         if (a.type != ActionType::GetCursorPos || a.matchVarName.empty()) continue;
         if (!seen.insert(a.matchVarName).second) continue;
         AddCursorPosVarItems(a.matchVarName, items);
@@ -838,11 +962,36 @@ std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptA
             a.aiOutputVarName
         });
     }
+    for (const auto& a : actions) {
+        if (a.type != ActionType::VarCompute) continue;
+        for (const auto& name : CollectVarComputeReturnNames(a.computeCode)) {
+            if (name.empty() || !seen.insert(name).second) continue;
+            items.push_back({
+                name,
+                L"{" + name + L"}",
+                L"变量运算:" + name,
+                name
+            });
+        }
+    }
     AppendFixedVarItems(items);
     return items;
 }
 
-std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariableContext& ctx) {
+namespace {
+
+std::wstring StripQuickInputControlChars(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (wchar_t ch : text) {
+        if (ch == L'\n' || ch == L'\r' || ch == L'\t') continue;
+        out.push_back(ch);
+    }
+    return out;
+}
+
+std::wstring ResolveMacroVariablesMapped(const std::wstring& text, const MacroVariableContext& ctx,
+    std::wstring (*mapReplacement)(const std::wstring&)) {
     // 防御嵌套花括号 `{{{{...}}}}`：限制展开深度，避免恶意/畸形脚本递归爆栈。
     thread_local int depth = 0;
     constexpr int kMaxDepth = 16;
@@ -863,12 +1012,26 @@ std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariable
         if (!TryResolveBuiltinExpr(expr, ctx, false, replacement)) {
             replacement = ResolveMacroOperand(expr, ctx);
         }
+        if (mapReplacement) replacement = mapReplacement(replacement);
 
         result.erase(pos, end - pos + 1);
         result.insert(pos, replacement);
         pos += replacement.size();
     }
     return result;
+}
+
+}  // namespace
+
+std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariableContext& ctx) {
+    return ResolveMacroVariablesMapped(text, ctx, nullptr);
+}
+
+std::wstring ResolveQuickInputText(const std::wstring& text, const MacroVariableContext& ctx, bool parseEscapes) {
+    if (parseEscapes) {
+        return DecodeQuickInputEscapes(ResolveMacroVariables(text, ctx));
+    }
+    return ResolveMacroVariablesMapped(text, ctx, StripQuickInputControlChars);
 }
 
 std::wstring DecodeQuickInputEscapes(const std::wstring& text) {

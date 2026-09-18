@@ -78,12 +78,24 @@ ISS 要求 `{app}\extension\...` **必须存在**，缺扩展会编不过。
 
 | 桥命令 | 作用 |
 |--------|------|
-| `hello` | 回 `vision:true`、`capabilities:["vision","mouse","keys","layout"]` |
+| `hello` | 回 `vision:true`、`capabilities:["vision","mouse","keys","layout","pageSnapshot","typeRef","navigatePage"]` |
 | `vision` / `screenshot` | `Page.captureScreenshot` → HTTP `POST /qst/shot`；WS 只回小 JSON（`shotHttp:true`）；禁止 WS 大 base64 |
 | `mouse` / `cdp` | 键鼠（surface→iframe） |
 | `layout` | iframe/pageCss 几何 |
+| `observePage` | 压缩可访问性树 + `pageKind=dom|mixed|canvas`（canvas 不抓 HTML）；`query` 过滤 |
+| `clickRef` | 按 `ref=eN` 点网页控件；成功后返回新树 |
+| `typeRef` | 按 ref 填输入框/下拉（React native setter）；成功后返回新树 |
+| `navigatePage` | `tabs.update` 到指定 URL，等待加载后返回新树（宿主 `searchOnPage`） |
 
-版本：`manifest.json` == `BRIDGE_VERSION` == **1.0.0**。
+版本：`manifest.json` == `BRIDGE_VERSION` == **1.0.19**。
+
+`GET /qst/status` 只返回健康信息（port/ws/running），**不含 token**。
+侧载（解压目录）扩展从同目录 `bridge_runtime.json` 读取 token（宿主启动时写入）。
+打包 CRX 读不到该文件：改走 Native Messaging 宿主 `com.quickscripttool.bridge`
+（`QuickScriptTool.exe` 在 stdin/stdout 管道下读 `%LOCALAPPDATA%\QuickScriptTool\ext_bridge.json`）。
+产品运行时会扫描 Edge/Chrome 用户配置里名为「键鼠工坊」的扩展 ID，写入
+`HKCU\...\NativeMessagingHosts\com.quickscripttool.bridge`。
+须在 `manifest.json` 声明 `nativeMessaging` 权限。
 
 
 ## 顶栏弹窗与脚本 API（v1.0.22+）

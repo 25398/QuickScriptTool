@@ -31,6 +31,9 @@ $required = @(
     "options.html",
     "options.js",
     "guide.html",
+    "offscreen.html",
+    "offscreen.js",
+    "wake.js",
     "README.txt",
     "icons\icon16.png",
     "icons\icon48.png",
@@ -73,6 +76,10 @@ $bridgeVer = $m.Groups[1].Value
 if ($bridgeVer -ne $ver) {
     Fail ("Version mismatch: manifest=$ver background.js=$bridgeVer")
 }
+$perms = @($manifest.permissions)
+if ($perms -notcontains "nativeMessaging") {
+    Fail "manifest.json missing nativeMessaging permission (packed CRX needs it for token)"
+}
 
 Write-Host ("OK  extension\edge v{0}  files+JSON OK" -f $ver)
 
@@ -87,7 +94,15 @@ $zipPath = Join-Path $OutDir $zipName
 $stage = Join-Path $OutDir ("_edge_pack_stage_" + [guid]::NewGuid().ToString("N"))
 try {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
-    Copy-Item -Path (Join-Path $ExtDir "*") -Destination $stage -Recurse -Force
+    # Shared exclusion helper. bridge_runtime.json is host runtime state whose ACL is
+    # hardened, so a plain recursive copy can fail the whole pack. See copy_extension_edge.ps1.
+    $copyHelper = Join-Path $Root "tools\copy_extension_edge.ps1"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $copyHelper -Source $ExtDir -Dest $stage
+    if ($LASTEXITCODE -ne 0) { Fail "extension copy failed (see tools\copy_extension_edge.ps1)" }
+    $runtimeJson = Join-Path $stage "bridge_runtime.json"
+    if (Test-Path -LiteralPath $runtimeJson) {
+        Remove-Item -LiteralPath $runtimeJson -Force
+    }
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force
     }

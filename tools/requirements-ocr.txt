@@ -1,19 +1,9 @@
-# PaddleOCR runtime for QuickScriptTool (Windows, Python 3.12, CPU)
-paddlepaddle==2.6.2
-paddleocr==2.7.3
-numpy==1.26.4
-opencv-python==4.6.0.66
-opencv-contrib-python==4.6.0.66
-scipy==1.11.4
-scikit-image==0.22.0
-tifffile==2023.12.9
+# RapidOCR (ONNX) runtime for QuickScriptTool
+# Windows, Python 3.12, CPU. Far smaller than paddlepaddle.
+rapidocr>=3.4.0,<4
+onnxruntime>=1.17.0,<2
+numpy>=1.26.4,<3
 Pillow>=9.0.1,<13
+PyYAML
 shapely
 pyclipper
-lmdb
-tqdm
-rapidfuzz
-PyYAML
-attrdict
-protobuf>=3.1.0,<=3.20.2
-setuptools

@@ -25,6 +25,9 @@ public:
 
     std::wstring LastError() const;
 
+    /// 读取已装 QstVHid 的 DriverVersion（INF DriverVer）。找不到返回 false。
+    static bool QueryInstalledDriverVersion(unsigned& a, unsigned& b, unsigned& c, unsigned& d);
+
 private:
     enum class PointerMode : int { Relative = 0, Absolute = 1 };
 

@@ -3,6 +3,7 @@
 #include "drawing.h"
 #include "image_match.h"
 #include "ocr_engine.h"
+#include "ui_scale.h"
 
 #include <algorithm>
 #include <climits>
@@ -152,12 +153,7 @@ void OcrOverlay::RunOcr() {
     highlightFound_ = false;
 
     if (ocrSuccess_ && !highlightText_.empty()) {
-        for (const auto& line : lines_) {
-            if (line.text.find(highlightText_) != std::wstring::npos) {
-                highlightFound_ = true;
-                break;
-            }
-        }
+        highlightFound_ = FindTextInOcrLines(output, highlightText_).has_value();
     }
 
     ocrDone_ = true;
@@ -188,12 +184,12 @@ OcrOverlay::ActionResult OcrOverlay::Show(int searchX1, int searchY1, int search
     if (!classRegistered_) RegisterWindowClass();
 
     if (!statusFont_) {
-        statusFont_ = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        statusFont_ = CreateFontW(UiFontHeight(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
     }
     if (!magnifierFont_) {
-        magnifierFont_ = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        magnifierFont_ = CreateFontW(UiFontHeight(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     }

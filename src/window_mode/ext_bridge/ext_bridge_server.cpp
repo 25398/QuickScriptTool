@@ -9,6 +9,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
+#include <sddl.h>
 #include <shellapi.h>
 
 #include "ext_bridge_server.h"
@@ -362,11 +363,35 @@ void ExtBridgeServer::SetScriptApiHandlers(ExtScriptApiHandlers handlers) {
 }
 
 bool ExtBridgeServer::TokenMatches(const std::string& got) const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
-    return !token_.empty() && got == token_;
+    std::string expect;
+    {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
+        expect = token_;
+    }
+    if (expect.empty()) return false;
+    const size_t n = expect.size();
+    unsigned char diff = (got.size() == n) ? 0 : 1;
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char g = (i < got.size())
+            ? static_cast<unsigned char>(got[i]) : 0;
+        diff |= static_cast<unsigned char>(expect[i]) ^ g;
+    }
+    return diff == 0 && got.size() == n;
 }
 
-void ExtBridgeServer::SendHttpJson(uintptr_t clientSock, int status, const std::string& body) {
+std::string CorsHeadersForOrigin(const std::string& origin) {
+    if (origin.size() < 19 || origin.rfind("chrome-extension://", 0) != 0) return {};
+    for (unsigned char c : origin) {
+        if (c < 0x20 || c == 0x7F) return {};
+    }
+    return "Access-Control-Allow-Origin: " + origin + "\r\n"
+        "Vary: Origin\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-Qst-Token\r\n";
+}
+
+void ExtBridgeServer::SendHttpJson(uintptr_t clientSock, int status, const std::string& body,
+    const std::string& origin, bool publicOk) {
     SOCKET s = static_cast<SOCKET>(clientSock);
     const char* reason = "OK";
     if (status == 400) reason = "Bad Request";
@@ -375,14 +400,23 @@ void ExtBridgeServer::SendHttpJson(uintptr_t clientSock, int status, const std::
     else if (status == 409) reason = "Conflict";
     else if (status == 500) reason = "Internal Server Error";
     else if (status == 503) reason = "Service Unavailable";
-    char hdr[256];
-    std::snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\nContent-Type: application/json; charset=utf-8\r\n"
-        "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, X-Qst-Token\r\n"
-        "Connection: close\r\nContent-Length: %u\r\n\r\n",
-        status, reason, static_cast<unsigned>(body.size()));
-    SendAll(s, hdr, static_cast<int>(strlen(hdr)));
+    std::string cors;
+    if (publicOk) {
+        cors = "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Private-Network: true\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, X-Qst-Token, "
+            "Access-Control-Request-Private-Network\r\n";
+    } else {
+        cors = CorsHeadersForOrigin(origin);
+        cors += "Access-Control-Allow-Private-Network: true\r\n";
+    }
+    std::string hdr = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        + cors
+        + "Connection: close\r\nContent-Length: "
+        + std::to_string(body.size()) + "\r\n\r\n";
+    SendAll(s, hdr.data(), static_cast<int>(hdr.size()));
     if (!body.empty()) {
         SendAll(s, body.data(), static_cast<int>(body.size()));
     }
@@ -392,8 +426,9 @@ bool ExtBridgeServer::BindPort(std::wstring& err) {
     for (int port = kPortLo; port <= kPortHi; ++port) {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) continue;
-        BOOL reuse = TRUE;
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        BOOL exclusive = TRUE;
+        setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+            reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(static_cast<u_short>(port));
@@ -402,7 +437,7 @@ bool ExtBridgeServer::BindPort(std::wstring& err) {
             closesocket(s);
             continue;
         }
-        if (listen(s, 4) != 0) {
+        if (listen(s, 16) != 0) {
             closesocket(s);
             continue;
         }
@@ -415,12 +450,44 @@ bool ExtBridgeServer::BindPort(std::wstring& err) {
     return false;
 }
 
+bool WriteUtf8AclFile(const std::wstring& path, const std::string& body) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FR;;;AU)",
+            SDDL_REVISION_1, &sd, nullptr)) {
+        sd = nullptr;
+    }
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, sd ? &sa : nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (sd) LocalFree(sd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const BOOL ok = WriteFile(h, body.data(), static_cast<DWORD>(body.size()),
+        &written, nullptr);
+    CloseHandle(h);
+    return ok != FALSE;
+}
+
+std::wstring FindSourceExtensionEdge() {
+    std::wstring dir = ModuleDir();
+    for (int i = 0; i < 6; ++i) {
+        const std::wstring cand = dir + L"\\extension\\edge";
+        if (GetFileAttributesW((cand + L"\\background.js").c_str()) != INVALID_FILE_ATTRIBUTES
+            && GetFileAttributesW((dir + L"\\CMakeLists.txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return cand;
+        }
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) break;
+        dir = dir.substr(0, slash);
+    }
+    return {};
+}
+
 void ExtBridgeServer::WriteConfigFile() const {
-    wchar_t localApp[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) == 0) return;
-    std::wstring dir = std::wstring(localApp) + L"\\QuickScriptTool";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    const std::wstring path = dir + L"\\ext_bridge.json";
     const int port = port_.load();
     std::string tok;
     {
@@ -433,12 +500,22 @@ void ExtBridgeServer::WriteConfigFile() const {
         "  \"ws\": \"ws://127.0.0.1:%d/qst/ws\",\n"
         "  \"status\": \"http://127.0.0.1:%d/qst/status\"\n}\n",
         port, tok.c_str(), port, port);
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    WriteFile(h, body, static_cast<DWORD>(strlen(body)), &written, nullptr);
-    CloseHandle(h);
+    wchar_t localApp[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) != 0) {
+        std::wstring dir = std::wstring(localApp) + L"\\QuickScriptTool";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        WriteUtf8AclFile(dir + L"\\ext_bridge.json", body);
+    }
+    const std::wstring packed = ExtensionEdgeDirectory();
+    if (!packed.empty()
+        && GetFileAttributesW((packed + L"\\background.js").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        WriteUtf8AclFile(packed + L"\\bridge_runtime.json", body);
+    }
+    const std::wstring src = FindSourceExtensionEdge();
+    if (!src.empty() && src != packed) {
+        WriteUtf8AclFile(src + L"\\bridge_runtime.json", body);
+    }
+    RegisterExtNativeMessagingHost();
 }
 
 bool ExtBridgeServer::Start(std::wstring& err) {
@@ -467,7 +544,7 @@ bool ExtBridgeServer::Start(std::wstring& err) {
     ClearAbort();
     running_.store(true);
     WriteConfigFile();
-    WindowModeLogf(L"[窗口模式] 扩展桥已监听 127.0.0.1:%d", port_.load());
+    WindowModeLogEventf(L"[窗口模式] 扩展桥已监听 127.0.0.1:%d", port_.load());
 
     thread_ = std::thread([this]() { ThreadMain(); });
     err.clear();
@@ -579,6 +656,7 @@ bool ExtBridgeServer::RecvWsText(uintptr_t sock, std::string& out, int timeoutMs
     } else if (payloadLen == 127) {
         return false;
     }
+    if (payloadLen > 1024 * 1024) return false;
     unsigned char mask[4]{};
     if (masked) {
         std::string m;
@@ -629,9 +707,11 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         std::istringstream iss(reqLine);
         iss >> method >> path;
     }
+    const std::string origin = ExtractHeader(headers, "Origin");
 
     if (method == "OPTIONS") {
-        SendHttpJson(clientSock, 200, "{\"ok\":true}");
+        httpProbeCount_.fetch_add(1);
+        SendHttpJson(clientSock, 200, "{\"ok\":true}", origin, true);
         return false;
     }
 
@@ -642,7 +722,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
     const bool isShot = (method == "POST" && path.rfind("/qst/shot", 0) == 0);
     const bool isWs = (method == "GET" && path.rfind("/qst/ws", 0) == 0);
     if (!isStatus && !isScripts && !isRun && !isStop && !isShot && !isWs) {
-        SendHttpJson(clientSock, 404, "{\"ok\":false,\"error\":\"not_found\"}");
+        SendHttpJson(clientSock, 404, "{\"ok\":false,\"error\":\"not_found\"}", origin);
         return false;
     }
 
@@ -659,14 +739,14 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         const std::string qToken = QueryParam(path, "token");
         const std::string hToken = ExtractHeader(headers, "X-Qst-Token");
         if (!TokenMatches(qToken) && !TokenMatches(hToken)) {
-            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}");
+            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}", origin);
             return false;
         }
         // JPEG 可达数 MB；禁止走 WebSocket 大包（会弄死 MV3 SW）。
         constexpr int kMaxShot = 12 * 1024 * 1024;
         std::string body = readBody(kMaxShot, 15000);
         if (body.size() < 64) {
-            SendHttpJson(clientSock, 400, "{\"ok\":false,\"error\":\"empty_shot\"}");
+            SendHttpJson(clientSock, 400, "{\"ok\":false,\"error\":\"empty_shot\"}", origin);
             return false;
         }
         {
@@ -675,17 +755,16 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         }
         cv_.notify_all();
         SendHttpJson(clientSock, 200,
-            "{\"ok\":true,\"bytes\":" + std::to_string(body.size()) + "}");
+            "{\"ok\":true,\"bytes\":" + std::to_string(body.size()) + "}", origin);
         return false;
     }
 
     if (isStatus) {
+        httpProbeCount_.fetch_add(1);
         const int port = port_.load();
-        std::string tok;
         ExtScriptApiHandlers api;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            tok = token_;
             api = scriptApi_;
         }
         bool running = false;
@@ -696,23 +775,22 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
             cur = st.currentScript;
         }
         std::string body = "{\"ok\":true,\"port\":" + std::to_string(port)
-            + ",\"token\":\"" + JsonEscape(tok) + "\""
             + ",\"ws\":\"ws://127.0.0.1:" + std::to_string(port) + "/qst/ws\""
             + ",\"running\":" + (running ? "true" : "false")
             + ",\"currentScript\":\"" + JsonEscape(cur) + "\"}";
-        SendHttpJson(clientSock, 200, body);
-        static std::atomic<int> statusHits{0};
-        const int n = ++statusHits;
+        SendHttpJson(clientSock, 200, body, origin, true);
+        const int n = httpProbeCount_.load();
         if (n == 1 || (n % 8) == 0) {
-            WindowModeLogVerbosef(L"[窗口模式] 扩展桥被探测 status×%d（扩展进程活着）", n);
+            WindowModeLogEventf(L"[窗口模式] 扩展桥被探测 status×%d", n);
         }
+        RegisterExtNativeMessagingHost();
         return false;
     }
 
     if (isScripts) {
         const std::string qToken = QueryParam(path, "token");
         if (!TokenMatches(qToken)) {
-            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}");
+            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}", origin);
             return false;
         }
         ExtScriptApiHandlers api;
@@ -721,7 +799,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
             api = scriptApi_;
         }
         if (!api.listScripts) {
-            SendHttpJson(clientSock, 503, "{\"ok\":false,\"error\":\"no_handler\"}");
+            SendHttpJson(clientSock, 503, "{\"ok\":false,\"error\":\"no_handler\"}", origin);
             return false;
         }
         const auto scripts = api.listScripts();
@@ -737,7 +815,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
                 + ",\"inputStrategy\":\"" + JsonEscape(scripts[i].inputStrategy) + "\"}";
         }
         body += "]}";
-        SendHttpJson(clientSock, 200, body);
+        SendHttpJson(clientSock, 200, body, origin);
         return false;
     }
 
@@ -745,7 +823,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         const std::string bodyIn = readBody(65536, 3000);
         const std::string tok = ExtractJsonString(bodyIn, "token");
         if (!TokenMatches(tok)) {
-            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}");
+            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}", origin);
             return false;
         }
         std::string pathOrFile = ExtractJsonString(bodyIn, "path");
@@ -756,17 +834,18 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
             api = scriptApi_;
         }
         if (!api.runScript) {
-            SendHttpJson(clientSock, 503, "{\"ok\":false,\"error\":\"no_handler\"}");
+            SendHttpJson(clientSock, 503, "{\"ok\":false,\"error\":\"no_handler\"}", origin);
             return false;
         }
         std::string err;
         if (!api.runScript(pathOrFile, err)) {
             const int code = (err == "busy") ? 409 : 400;
             SendHttpJson(clientSock, code,
-                "{\"ok\":false,\"error\":\"" + JsonEscape(err.empty() ? "run_failed" : err) + "\"}");
+                "{\"ok\":false,\"error\":\"" + JsonEscape(err.empty() ? "run_failed" : err) + "\"}",
+                origin);
             return false;
         }
-        SendHttpJson(clientSock, 200, "{\"ok\":true}");
+        SendHttpJson(clientSock, 200, "{\"ok\":true}", origin);
         return false;
     }
 
@@ -774,7 +853,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         const std::string bodyIn = readBody(65536, 3000);
         const std::string tok = ExtractJsonString(bodyIn, "token");
         if (!TokenMatches(tok)) {
-            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}");
+            SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}", origin);
             return false;
         }
         ExtScriptApiHandlers api;
@@ -783,7 +862,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
             api = scriptApi_;
         }
         if (api.stopScript) api.stopScript();
-        SendHttpJson(clientSock, 200, "{\"ok\":true}");
+        SendHttpJson(clientSock, 200, "{\"ok\":true}", origin);
         return false;
     }
 
@@ -803,15 +882,18 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         || headers.find("websocket") != std::string::npos
         || headers.find("WebSocket") != std::string::npos;
     if (!upgradeOk || wsKey.empty()) {
-        WindowModeLogf(L"[窗口模式] 扩展桥 WS 握手失败: upgradeLen=%u keyLen=%u",
+        wsHandshakeFailCount_.fetch_add(1);
+        WindowModeLogEventf(L"[窗口模式] 扩展桥 WS 握手失败: upgradeLen=%u keyLen=%u",
             static_cast<unsigned>(upgrade.size()), static_cast<unsigned>(wsKey.size()));
-        const char* resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-        SendAll(s, resp, static_cast<int>(strlen(resp)));
+        SendHttpJson(clientSock, 400, "{\"ok\":false,\"error\":\"bad_upgrade\"}", origin);
         return false;
     }
-    if (qToken != expectTok) {
-        WindowModeLogf(L"[窗口模式] 扩展桥 WS token 不匹配 (qLen=%u expectLen=%u)，仍继续握手并依赖 hello 校验",
+    if (!qToken.empty() && (!TokenMatches(qToken) || qToken != expectTok)) {
+        wsHandshakeFailCount_.fetch_add(1);
+        WindowModeLogEventf(L"[窗口模式] 扩展桥 WS token 不匹配 (qLen=%u expectLen=%u)",
             static_cast<unsigned>(qToken.size()), static_cast<unsigned>(expectTok.size()));
+        SendHttpJson(clientSock, 401, "{\"ok\":false,\"error\":\"bad_token\"}", origin);
+        return false;
     }
 
     const std::string accept = MakeWsAccept(wsKey);
@@ -823,6 +905,16 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         accept.c_str());
     if (!SendAll(s, resp, static_cast<int>(strlen(resp)))) return false;
 
+    std::string hello;
+    if (!RecvWsText(clientSock, hello, 5000)) return false;
+    const std::string helloType = ExtractJsonString(hello, "type");
+    const std::string helloTok = ExtractJsonString(hello, "token");
+    if (helloType != "hello" || !TokenMatches(helloTok)) {
+        wsHandshakeFailCount_.fetch_add(1);
+        WindowModeLogEvent(L"[窗口模式] 扩展桥 WS hello 校验失败");
+        return false;
+    }
+
     int clientCount = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -832,7 +924,7 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
         cv_.notify_all();
     }
     if (!stop_.load() && !abort_.load()) {
-        WindowModeLogVerbosef(L"[窗口模式] 配套扩展已连接本机桥（当前 %d 路）", clientCount);
+        WindowModeLogEventf(L"[窗口模式] 配套扩展已连接本机桥（当前 %d 路）", clientCount);
     }
 
     while (!stop_.load()) {
@@ -874,13 +966,21 @@ bool ExtBridgeServer::HandleClient(uintptr_t clientSock) {
 
 void ExtBridgeServer::ThreadMain() {
     SOCKET listen = static_cast<SOCKET>(listenSock_);
+    auto lastNativeReg = std::chrono::steady_clock::now();
     while (!stop_.load()) {
         TIMEVAL tv{0, 200000};
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(listen, &fds);
         const int sel = select(0, &fds, nullptr, nullptr, &tv);
-        if (sel <= 0) continue;
+        if (sel <= 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastNativeReg > std::chrono::seconds(15)) {
+                lastNativeReg = now;
+                RegisterExtNativeMessagingHost();
+            }
+            continue;
+        }
         sockaddr_in peer{};
         int peerLen = sizeof(peer);
         SOCKET client = accept(listen, reinterpret_cast<sockaddr*>(&peer), &peerLen);
@@ -896,6 +996,11 @@ void ExtBridgeServer::ThreadMain() {
             }
         }).detach();
     }
+}
+
+void ExtBridgeServer::RefreshDiscovery() {
+    if (!running_.load()) return;
+    WriteConfigFile();
 }
 
 bool ExtBridgeServer::WaitForExtension(int timeoutMs, std::wstring& err) {

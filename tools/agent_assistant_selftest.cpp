@@ -27,6 +27,7 @@
 #include "macro_execute_tools.h"
 #include "recording_optimize_ops.h"
 #include "script_io.h"
+#include "action_utils.h"
 #include "utils.h"
 
 #include <opencv2/opencv.hpp>
@@ -61,6 +62,14 @@ const selftest::CaseInfo kCases[] = {
         L"git 写子命令（commit）被拒"},
     {L"shell_where_readonly_ok", L"default",
         L"where.exe 只读命令可执行且返回 exit="},
+    {L"shell_where_reject_recursive", L"default",
+        L"where /R 与路径参数被拒"},
+    {L"file_tools_reject_settings", L"default",
+        L"readAgentFile 拒绝 app_settings.json"},
+    {L"file_tools_reject_write_ui", L"default",
+        L"writeAgentFile 拒绝写入仓库 ui/"},
+    {L"fetch_url_blocks_rfc1918", L"default",
+        L"AgentFetchUrlIsBlocked 拦截 10/172.16/127/v4mapped 且放行公网"},
     {L"file_tools_write_read_search_undo", L"default",
         L"writeAgentFile/readAgentFile/searchAgentFiles/撤销闭环"},
     {L"skill_catalog_lists_new_sections", L"default",
@@ -99,6 +108,10 @@ const selftest::CaseInfo kCases[] = {
         L"等待时间 first 按段取该段第一个 Wait，不串段"},
     {L"recopt_skip_relative_segment", L"default",
         L"含相对位移的段跳过，其它段照常合并"},
+    {L"recopt_compress_wait_first", L"default",
+        L"路径压缩 first：留下的移动点间隔取该间隔第一个 Wait"},
+    {L"recopt_compress_wait_fixed", L"default",
+        L"路径压缩 fixed：留下的移动点间隔使用指定等待"},
     {L"skill_optimize_directs_to_tools", L"default",
         L"optimize Skill 要求调用 optimizeRecording/optimizeScript，禁止 readScript 手改"},
     {L"skill_script_tree_and_plan", L"default",
@@ -109,6 +122,14 @@ const selftest::CaseInfo kCases[] = {
         L"无轮次空会话不进对话列表、不落盘"},
     {L"conversation_with_round_is_listed", L"default",
         L"有用户轮次的会话仍进入对话列表"},
+    {L"conversation_title_rejects_api_error", L"default",
+        L"API 错误原文不能当对话标题，加载时回退为首条用户消息"},
+    {L"user_facing_tool_reply_strips_outline", L"default",
+        L"终态工具回复去掉动作一览与内部约束，只留创建摘要"},
+    {L"outline_header_has_no_user_constraints", L"default",
+        L"动作一览标题不含对用户说明/禁止说英文等约束句"},
+    {L"skill_reply_forbids_dumping_constraints", L"default",
+        L"reply Skill 禁止逐步复述动作和把内部约束念给用户"},
     {L"create_macro_folder_support", L"default",
         L"createMacroScript 默认保存根目录/支持 folder，且新脚本不绑定热键"},
     {L"delete_script_via_tool", L"default",
@@ -141,6 +162,8 @@ const selftest::CaseInfo kCases[] = {
         L"AI 动作执行工具集包含 fetchWebPage（规划快捷键/操作时可联网查资料）"},
     {L"locate_fail_block", L"default",
         L"同一目标连续定位失败第 3 次被硬拦，换目标不误伤"},
+    {L"fetch_then_runprogram_needs_confirm", L"default",
+        L"fetchWebPage 之后 runProgram 无确认钩子则拒绝；未抓网页的 RPA 启动不弹"},
 };
 
 struct JournalGuard {
@@ -458,6 +481,64 @@ void CaseShellWhereOk() {
     Emit(L"shell_where_readonly_ok",
         r.find(L"exit=") != std::wstring::npos
             && r.find(L"[错误]") == std::wstring::npos, r.c_str());
+}
+
+void CaseShellWhereRejectRecursive() {
+    const AgentTool tool = MakeRunAgentCommandTool();
+    const std::wstring r = tool.execute(LR"({"command":"where /R C:\\ *.pem"})");
+    Emit(L"shell_where_reject_recursive",
+        r.find(L"[错误]") != std::wstring::npos, r.c_str());
+}
+
+void CaseFileRejectSettings() {
+    const AgentTool reader = MakeReadAgentFileTool();
+    const std::wstring r = reader.execute(LR"({"path":"app_settings.json"})");
+    Emit(L"file_tools_reject_settings",
+        r.find(L"受保护") != std::wstring::npos
+            || r.find(L"[错误]") != std::wstring::npos, r.c_str());
+}
+
+void CaseFileRejectWriteUi() {
+    std::wstring dir = AppDir();
+    std::wstring repo;
+    for (int up = 0; up < 6; ++up) {
+        if (GetFileAttributesW((dir + L"\\CMakeLists.txt").c_str()) != INVALID_FILE_ATTRIBUTES
+            && GetFileAttributesW((dir + L"\\ui").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            repo = dir;
+            break;
+        }
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) break;
+        dir = dir.substr(0, slash);
+    }
+    if (repo.empty()) {
+        Emit(L"file_tools_reject_write_ui", true, L"no repo ui (skipped)");
+        return;
+    }
+    const std::wstring path = repo + L"\\ui\\__agent_selftest_ui.txt";
+    std::wstring json = L"{\"path\":\"";
+    for (wchar_t c : path) {
+        if (c == L'\\') json += L"\\\\";
+        else json.push_back(c);
+    }
+    json += L"\",\"content\":\"x\"}";
+    const AgentTool writer = MakeWriteAgentFileTool();
+    const std::wstring r = writer.execute(json);
+    const bool rejected = r.find(L"[错误]") != std::wstring::npos;
+    DeleteFileW(path.c_str());
+    Emit(L"file_tools_reject_write_ui", rejected, r.c_str());
+}
+
+void CaseFetchUrlBlocksRfc1918() {
+    std::wstring err;
+    const bool ten = AgentFetchUrlIsBlocked(L"http://10.1.2.3/secret", err);
+    const bool priv = AgentFetchUrlIsBlocked(L"http://172.16.0.9/", err);
+    const bool loop = AgentFetchUrlIsBlocked(L"http://127.0.0.1/status", err);
+    const bool mapped = AgentFetchUrlIsBlocked(L"http://[::ffff:10.1.2.3]/x", err);
+    std::wstring okErr;
+    const bool publicOk = !AgentFetchUrlIsBlocked(L"https://example.com/a", okErr);
+    Emit(L"fetch_url_blocks_rfc1918", ten && priv && loop && publicOk && mapped,
+        publicOk && mapped ? L"" : (mapped ? okErr.c_str() : L"v4mapped 未拦"));
 }
 
 void CaseFileTools(JournalGuard&) {
@@ -847,6 +928,12 @@ void CaseDescribeCoversParams() {
     push(ActionType::RunMacro, [](ScriptAction& a) {
         a.targetPath = L"scripts\\sub\\other.json";
     });
+    push(ActionType::WatchImage, [](ScriptAction& a) {
+        a.imagePath = L"images\\w.bmp";
+        a.watchMode = 1;
+        a.watchPollSeconds = 2.5;
+        a.resumeAfterWatch = true;
+    });
 
     size_t shown = 0;
     const std::wstring s = DescribeScriptActionsDetail(acts, 0, 60, shown);
@@ -862,7 +949,7 @@ void CaseDescribeCoversParams() {
         && s.find(L"找色 ") != std::wstring::npos
         && s.find(L"#FF0000") != std::wstring::npos
         && s.find(L"容差32") != std::wstring::npos
-        && s.find(L"保存匹配度到col") != std::wstring::npos
+        && s.find(L"保存到变量col") != std::wstring::npos
         && s.find(L"颜色匹配") != std::wstring::npos
         && s.find(L"AI 图片分析") != std::wstring::npos
         && s.find(L"图:images") != std::wstring::npos
@@ -878,7 +965,9 @@ void CaseDescribeCoversParams() {
         && s.find(L"→ c") != std::wstring::npos
         && s.find(L"输入 \"hello\"") != std::wstring::npos
         && s.find(L"间隔0.05s") != std::wstring::npos
-        && s.find(L"运行宏 scripts") != std::wstring::npos;
+        && s.find(L"运行宏 scripts") != std::wstring::npos
+        && s.find(L"找图监视") != std::wstring::npos
+        && s.find(L"时间监视") != std::wstring::npos;
     Emit(L"describe_actions_covers_key_params", ok,
         ok ? L"" : s.substr(0, 400).c_str());
 }
@@ -1016,6 +1105,78 @@ void CaseConversationWithRoundIsListed() {
             + (rounds >= 1 ? L"" : L"轮次未写入 ")).c_str());
 }
 
+void CaseConversationTitleRejectsApiError() {
+    const bool rejectErr = !IsUsableConversationTitle(L"[错误] API 请求失败：读取")
+        && !IsUsableConversationTitle(L"API请求失败")
+        && !IsUsableConversationTitle(L"新对话")
+        && !IsUsableConversationTitle(L"")
+        && IsUsableConversationTitle(L"自动按QWER");
+    AgentConversationSavePayload payload;
+    payload.shouldSave = true;
+    payload.id = L"selftest_title_" + TimestampName();
+    payload.name = L"[错误] API 请求失败：读取";
+    payload.createdTime = L"2026-09-12 00:00:00";
+    ChatMessage user;
+    user.role = L"user";
+    user.content = L"帮我生成一个脚本，自动按QWER";
+    payload.messages.push_back(user);
+    const bool saved = SaveAgentConversation(payload);
+    AgentConversationRecord rec;
+    const bool loaded = LoadAgentConversationRecord(payload.id, rec);
+    const bool repaired = loaded && IsUsableConversationTitle(rec.meta.name)
+        && rec.meta.name.find(L"API") == std::wstring::npos
+        && rec.meta.name.find(L"错误") == std::wstring::npos;
+    DeleteAgentConversation(payload.id);
+    Emit(L"conversation_title_rejects_api_error", rejectErr && saved && repaired,
+        (std::wstring(rejectErr ? L"" : L"判定未拒错误标题 ")
+            + (saved ? L"" : L"保存失败 ")
+            + (repaired ? L"" : (L"加载未回退: " + rec.meta.name))).c_str());
+}
+
+void CaseUserFacingToolReplyStripsOutline() {
+    const std::wstring raw =
+        L"✓ 鼠标宏已创建：qwer.json\n  名称: 自动按QWER\n\n"
+        L"【动作一览 — 缩进表示父子（循环/条件体内）；对用户说明时必须用下列名称（与编辑器动作列一致），禁止说英文 type】\n"
+        L"第1步 按键点击Q\n";
+    const std::wstring facing = AgentUserFacingToolReply(raw);
+    const std::wstring modern =
+        L"✓ 鼠标宏已创建：a.json\n  动作数: 2\n\n动作一览（缩进=循环/条件体内）：\n第1步 等待\n";
+    const std::wstring facing2 = AgentUserFacingToolReply(modern);
+    const bool ok = facing.find(L"已创建") != std::wstring::npos
+        && facing.find(L"自动按QWER") != std::wstring::npos
+        && facing.find(L"动作一览") == std::wstring::npos
+        && facing.find(L"禁止说英文") == std::wstring::npos
+        && facing.find(L"对用户说明") == std::wstring::npos
+        && facing.find(L"第1步") == std::wstring::npos
+        && facing2.find(L"已创建") != std::wstring::npos
+        && facing2.find(L"动作一览") == std::wstring::npos
+        && facing2.find(L"第1步") == std::wstring::npos;
+    Emit(L"user_facing_tool_reply_strips_outline", ok,
+        ok ? L"" : (L"facing=" + facing.substr(0, 160)).c_str());
+}
+
+void CaseOutlineHeaderHasNoUserConstraints() {
+    std::vector<ScriptAction> acts(1);
+    acts[0].type = ActionType::Wait;
+    acts[0].duration = 1;
+    acts[0].remark = L"等一秒";
+    const std::wstring s = FormatScriptActionsOutline(acts);
+    const bool ok = s.find(L"对用户说明") == std::wstring::npos
+        && s.find(L"禁止说英文") == std::wstring::npos
+        && s.find(L"必须用") == std::wstring::npos
+        && s.find(L"等一秒") != std::wstring::npos;
+    Emit(L"outline_header_has_no_user_constraints", ok,
+        ok ? L"" : s.substr(0, 160).c_str());
+}
+
+void CaseSkillReplyForbidsDumping() {
+    const std::wstring t = AgentSkillGet(L"reply");
+    const bool ok = t.find(L"一两句") != std::wstring::npos
+        && t.find(L"内部约束") != std::wstring::npos;
+    Emit(L"skill_reply_forbids_dumping_constraints", ok,
+        ok ? L"" : t.substr(0, 160).c_str());
+}
+
 void CaseCreateMacroFolder(JournalGuard&) {
     nlohmann::json action;
     action["type"] = "wait";
@@ -1138,12 +1299,23 @@ void CaseLoopTerminalScriptEndsImmediately() {
     const bool created = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool twoRounds = server.requests.load() == 2;
     const bool replyOk = reply.find(L"已创建") != std::wstring::npos
-        && reply.find(L"[错误]") == std::wstring::npos;
+        && reply.find(L"[错误]") == std::wstring::npos
+        && reply.find(L"动作一览") == std::wstring::npos
+        && reply.find(L"禁止说英文") == std::wstring::npos;
+    bool historyHasVisible = false;
+    for (const auto& m : core.GetHistory()) {
+        if (m.role == L"assistant" && m.content.find(L"已创建") != std::wstring::npos
+            && m.content.find(L"动作一览") == std::wstring::npos) {
+            historyHasVisible = true;
+            break;
+        }
+    }
     DeleteFileW(path.c_str());
-    Emit(L"loop_terminal_script_ends_immediately", created && twoRounds && replyOk,
+    Emit(L"loop_terminal_script_ends_immediately", created && twoRounds && replyOk && historyHasVisible,
         ((created ? L"" : L"脚本未创建 ")
             + (twoRounds ? L"" : (L"请求数=" + std::to_wstring(server.requests.load()) + L" "))
-            + (replyOk ? L"" : (L"回复异常: " + reply.substr(0, 120)))).c_str());
+            + (replyOk ? L"" : (L"回复异常: " + reply.substr(0, 120)))
+            + (historyHasVisible ? L"" : L"历史缺可见回复 ")).c_str());
 }
 
 void CaseLoopRepeatGuidesAndGracefulEnd() {
@@ -1431,6 +1603,7 @@ void CaseAiActionExecHasFetch() {
 }
 
 void CaseLocateFailBlock() {
+    ResetAiActionSessionState();
     AiActionHostHooks hooks;
     hooks.onLocateAndClick = [](const std::wstring&, int, const std::wstring&, int)
         -> std::wstring {
@@ -1464,6 +1637,32 @@ void CaseLocateFailBlock() {
     if (!blocked) detail += L"第3次同目标未拦截: " + r3.substr(0, 80);
     if (!different) detail += L"换目标被误拦: " + r4.substr(0, 80);
     Emit(L"locate_fail_block", fail1 && fail2 && blocked && different, detail.c_str());
+    ResetAiActionSessionState();
+}
+
+void CaseFetchThenRunProgramNeedsConfirm() {
+    ResetAiActionSessionState();
+    AiActionToolOptions opts;
+    const auto tools = BuildAiActionExecuteTools(nullptr, opts);
+    const AgentTool* run = nullptr;
+    for (const auto& t : tools) {
+        if (t.name == L"runProgram") run = &t;
+    }
+    if (!run) {
+        Emit(L"fetch_then_runprogram_needs_confirm", false, L"缺少 runProgram");
+        return;
+    }
+    const std::wstring before = run->execute(LR"({"targetPath":"notepad"})");
+    const bool rpaOk = before.find(L"刚抓取过网页") == std::wstring::npos;
+    AiNoteWebFetchUntrusted();
+    const std::wstring after = run->execute(LR"({"targetPath":"notepad"})");
+    const bool denied = after.find(L"刚抓取过网页") != std::wstring::npos
+        && after.find(L"确认框") != std::wstring::npos;
+    std::wstring detail;
+    if (!rpaOk) detail += L"未抓网页也被拦: " + before.substr(0, 80) + L" ";
+    if (!denied) detail += L"抓网页后未要求确认: " + after.substr(0, 80);
+    Emit(L"fetch_then_runprogram_needs_confirm", rpaOk && denied, detail.c_str());
+    ResetAiActionSessionState();
 }
 
 void CaseToolsSchemaSize() {
@@ -1589,6 +1788,50 @@ void CaseRecoptSkipRelative() {
             + L" skipRel=" + std::to_wstring(r.skippedRelative)).c_str());
 }
 
+std::vector<ScriptAction> CompressWaitSample() {
+    // 中间两点距起点 < 5px，压缩后只留 (0,0) 与 (80,0)；间隔等待 0.10/0.30/0.50
+    return {
+        TestMove(0, 0), TestWait(0.10), TestMove(0, 1),
+        TestWait(0.30), TestMove(0, 2), TestWait(0.50), TestMove(80, 0)
+    };
+}
+
+void CaseRecoptCompressWaitFirst() {
+    auto acts = CompressWaitSample();
+    const auto r = recopt::CompressAllKeySplit(acts, 5.0, "first", 0.0);
+    std::vector<double> waits;
+    int moves = 0;
+    for (const auto& a : acts) {
+        if (a.type == ActionType::Wait) waits.push_back(a.duration);
+        if (a.type == ActionType::MoveMouse) ++moves;
+    }
+    const bool ok = r.collectOk && r.applied == 1 && moves == 2 && waits.size() == 1
+        && std::abs(waits[0] - 0.10) < 0.0005;
+    Emit(L"recopt_compress_wait_first", ok,
+        ok ? L"" : (L"applied=" + std::to_wstring(r.applied)
+            + L" n=" + std::to_wstring(acts.size())
+            + L" moves=" + std::to_wstring(moves)
+            + L" waits=" + std::to_wstring(waits.size())).c_str());
+}
+
+void CaseRecoptCompressWaitFixed() {
+    auto acts = CompressWaitSample();
+    const auto r = recopt::CompressAllKeySplit(acts, 5.0, "fixed", 0.2);
+    std::vector<double> waits;
+    int moves = 0;
+    for (const auto& a : acts) {
+        if (a.type == ActionType::Wait) waits.push_back(a.duration);
+        if (a.type == ActionType::MoveMouse) ++moves;
+    }
+    const bool ok = r.collectOk && r.applied == 1 && moves == 2 && waits.size() == 1
+        && std::abs(waits[0] - 0.2) < 0.0005;
+    Emit(L"recopt_compress_wait_fixed", ok,
+        ok ? L"" : (L"applied=" + std::to_wstring(r.applied)
+            + L" n=" + std::to_wstring(acts.size())
+            + L" moves=" + std::to_wstring(moves)
+            + L" waits=" + std::to_wstring(waits.size())).c_str());
+}
+
 void CaseSkillOptimizeDirectsToTools() {
     const std::wstring t = AgentSkillGet(L"optimize");
     const bool ok = t.find(L"optimizeRecording") != std::wstring::npos
@@ -1663,6 +1906,10 @@ int wmain(int argc, wchar_t** argv) {
     CaseShellRejectUnknown();
     CaseShellRejectGitWrite();
     CaseShellWhereOk();
+    CaseShellWhereRejectRecursive();
+    CaseFileRejectSettings();
+    CaseFileRejectWriteUi();
+    CaseFetchUrlBlocksRfc1918();
     CaseSkillCatalog();
     CaseSkillFileOverride();
     CaseClipboard();
@@ -1693,11 +1940,17 @@ int wmain(int argc, wchar_t** argv) {
     guarded(L"recopt_merge_splits_on_keys", CaseRecoptMergeSplitsOnKeys);
     guarded(L"recopt_merge_wait_per_segment", CaseRecoptMergeWaitPerSegment);
     guarded(L"recopt_skip_relative_segment", CaseRecoptSkipRelative);
+    guarded(L"recopt_compress_wait_first", CaseRecoptCompressWaitFirst);
+    guarded(L"recopt_compress_wait_fixed", CaseRecoptCompressWaitFixed);
     guarded(L"skill_optimize_directs_to_tools", CaseSkillOptimizeDirectsToTools);
     guarded(L"skill_script_tree_and_plan", CaseSkillScriptTreeAndPlan);
     guarded(L"conversation_draft_roundtrip", CaseConversationDraftRoundtrip);
     guarded(L"empty_conversation_not_listed", CaseEmptyConversationNotListed);
     guarded(L"conversation_with_round_is_listed", CaseConversationWithRoundIsListed);
+    guarded(L"conversation_title_rejects_api_error", CaseConversationTitleRejectsApiError);
+    guarded(L"user_facing_tool_reply_strips_outline", CaseUserFacingToolReplyStripsOutline);
+    guarded(L"outline_header_has_no_user_constraints", CaseOutlineHeaderHasNoUserConstraints);
+    guarded(L"skill_reply_forbids_dumping_constraints", CaseSkillReplyForbidsDumping);
     guarded(L"create_macro_folder_support",
         [] { JournalGuard guard; CaseCreateMacroFolder(guard); });
     guarded(L"delete_script_via_tool",
@@ -1718,6 +1971,7 @@ int wmain(int argc, wchar_t** argv) {
     guarded(L"fetch_tool_guards", CaseFetchToolGuards);
     guarded(L"ai_action_exec_has_fetch", CaseAiActionExecHasFetch);
     guarded(L"locate_fail_block", CaseLocateFailBlock);
+    guarded(L"fetch_then_runprogram_needs_confirm", CaseFetchThenRunProgramNeedsConfirm);
 
     selftest::EmitSummary();
     return selftest::ExitCode();

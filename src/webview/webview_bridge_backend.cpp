@@ -12,6 +12,7 @@
 #include "ai_action_service.h"
 #include "app_settings_store.h"
 #include "app_theme.h"
+#include "ui_scale.h"
 #include "desktop_tools/desktop_tools.h"
 #include "image_match.h"
 #include "main_features.h"
@@ -22,6 +23,7 @@
 #include "scheduled_task_types.h"
 #include "script_io.h"
 #include "app_branding.h"
+#include "opencv_runtime.h"
 #include "utils.h"
 #include "action_tree.h"
 #include "action_utils.h"
@@ -47,6 +49,7 @@
 #include <cwctype>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 
 namespace qst::webview {
@@ -334,6 +337,75 @@ bool JsonGetInt(const std::string& json, const char* key, int& out) {
     return true;
 }
 
+bool IsEditorActionTypeTokenUtf8(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (const unsigned char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool JsonGetStringArray(const std::string& json, const char* key, std::vector<std::wstring>& out) {
+    const std::string pat = std::string("\"") + key + "\"";
+    const auto k = json.find(pat);
+    if (k == std::string::npos) return false;
+    const auto colon = json.find(':', k + pat.size());
+    if (colon == std::string::npos) return false;
+    size_t tok = colon + 1;
+    while (tok < json.size() && (json[tok] == ' ' || json[tok] == '\t'
+        || json[tok] == '\n' || json[tok] == '\r')) {
+        ++tok;
+    }
+    if (tok >= json.size() || json[tok] != '[') return false;
+    const auto rb = FindMatchingJsonBracket(json, tok);
+    if (rb == std::string::npos) return false;
+    out.clear();
+    size_t i = tok + 1;
+    while (i < rb) {
+        while (i < rb && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n'
+            || json[i] == '\r' || json[i] == ',')) {
+            ++i;
+        }
+        if (i >= rb || json[i] != '"') break;
+        ++i;
+        std::string val;
+        bool esc = false;
+        for (; i < rb; ++i) {
+            const char c = json[i];
+            if (esc) {
+                val.push_back(c);
+                esc = false;
+                continue;
+            }
+            if (c == '\\') {
+                esc = true;
+                continue;
+            }
+            if (c == '"') {
+                ++i;
+                break;
+            }
+            val.push_back(c);
+        }
+        if (IsEditorActionTypeTokenUtf8(val) && out.size() < 80) {
+            const std::wstring w = FromUtf8(val);
+            if (std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
+        }
+    }
+    return true;
+}
+
+void AppendJsonStringArray(std::ostringstream& oss, const char* key, const std::vector<std::wstring>& items) {
+    oss << "\"" << key << "\":[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) oss << ",";
+        oss << JsonString(items[i]);
+    }
+    oss << "]";
+}
+
 }  // namespace
 
 void InvalidateScriptListCache() {
@@ -356,9 +428,18 @@ void PostToWebUi(std::string jsonUtf8) {
 
 void ReloadSettingsFromDisk() {
     std::lock_guard<std::mutex> lock(g_mu);
-    LoadAppSettings(g_ctx.settings);
-    ApplyLoadedSettingsToClicker();
-    g_settingsLoaded = true;
+    quickscript::AppSettings loaded;
+    if (TryLoadAppSettings(loaded)) {
+        g_ctx.settings = std::move(loaded);
+        ApplyLoadedSettingsToClicker();
+        g_settingsLoaded = true;
+        return;
+    }
+    if (!g_settingsLoaded) {
+        LoadAppSettings(g_ctx.settings);
+        ApplyLoadedSettingsToClicker();
+        g_settingsLoaded = true;
+    }
 }
 
 void SyncHomeSelectionCache(const std::wstring& selectedScriptPath,
@@ -387,6 +468,36 @@ void NotifyWebDebugWindowSetting(bool enabled) {
     }
     PostToWebUi(std::string("{\"type\":\"settings.changed\",\"playback\":{\"enableDebugOutputWindow\":")
         + (enabled ? "true" : "false") + "}}");
+}
+
+void PersistFloatBallPlacement(bool docked, int edge, double xRatio, double yRatio,
+    const std::wstring& monitorId) {
+    EnsureSettingsLoaded();
+    std::lock_guard<std::mutex> lock(g_mu);
+    TryLoadAppSettings(g_ctx.settings);
+    g_ctx.settings.other.floatBallDocked = docked;
+    if (edge < 0 || edge > 3) edge = 1;
+    g_ctx.settings.other.floatBallEdge = edge;
+    if (!(xRatio >= 0.0)) xRatio = 0.0;
+    if (xRatio > 1.0) xRatio = 1.0;
+    g_ctx.settings.other.floatBallXRatio = xRatio;
+    if (!(yRatio >= 0.0)) yRatio = 0.0;
+    if (yRatio > 1.0) yRatio = 1.0;
+    g_ctx.settings.other.floatBallYRatio = yRatio;
+    g_ctx.settings.other.floatBallMonitorId = monitorId;
+    SaveAppSettings(g_ctx.settings);
+}
+
+void PersistShowFloatBall(bool show) {
+    EnsureSettingsLoaded();
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        TryLoadAppSettings(g_ctx.settings);
+        g_ctx.settings.other.showFloatBall = show;
+        SaveAppSettings(g_ctx.settings);
+    }
+    PostToWebUi(std::string("{\"type\":\"settings.changed\",\"other\":{\"showFloatBall\":")
+        + (show ? "true" : "false") + "}}");
 }
 
 BridgeContext& Ctx() {
@@ -512,13 +623,54 @@ std::string JsonOpenSettings() {
         << "\"customAccentColor\":" << static_cast<unsigned>(s.other.customAccentColor) << ","
         << "\"preferDirect2D\":" << (s.other.preferDirect2D ? "true" : "false") << ","
         << "\"holdThresholdSeconds\":" << s.other.holdThresholdSeconds << ","
+        << "\"uiScaleFactor\":" << s.other.uiScaleFactor << ","
         << "\"autoHideMainWindow\":" << (s.other.autoHideMainWindow ? "true" : "false") << ","
         << "\"playSoundOnStart\":" << (s.other.playSoundOnStart ? "true" : "false") << ","
+        << "\"playSoundOnEnd\":" << (s.other.playSoundOnEnd ? "true" : "false") << ","
         << "\"hideBottomRightTip\":" << (s.other.hideBottomRightTip ? "true" : "false") << ","
         << "\"closeToTray\":" << (s.other.closeToTray ? "true" : "false") << ","
         << "\"autoStartOnBoot\":" << (s.other.autoStartOnBoot ? "true" : "false") << ","
-        << "\"resolveImeConflict\":" << (s.other.resolveImeConflict ? "true" : "false")
-        << "},"
+        << "\"resolveImeConflict\":" << (s.other.resolveImeConflict ? "true" : "false") << ","
+        << "\"showFloatBall\":" << (s.other.showFloatBall ? "true" : "false") << ","
+        << "\"floatBallDocked\":" << (s.other.floatBallDocked ? "true" : "false") << ","
+        << "\"floatBallEdge\":" << s.other.floatBallEdge << ","
+        << "\"floatBallXRatio\":" << s.other.floatBallXRatio << ","
+        << "\"floatBallYRatio\":" << s.other.floatBallYRatio << ","
+        << "\"floatBallMonitorId\":" << JsonString(s.other.floatBallMonitorId) << ","
+        << "\"editorDefaultView\":"
+        << JsonString(quickscript::NormalizeEditorDefaultView(s.other.editorDefaultView)) << ","
+        << "\"visualLoopWrap\":" << (s.other.visualLoopWrap ? "true" : "false") << ","
+        << "\"visualBlockCallWires\":" << (s.other.visualBlockCallWires ? "true" : "false") << ","
+        << "\"visualIfWrap\":" << (s.other.visualIfWrap ? "true" : "false") << ","
+        << "\"visualBlockWrap\":" << (s.other.visualBlockWrap ? "true" : "false") << ","
+        << "\"visualWatchWrap\":" << (s.other.visualWatchWrap ? "true" : "false") << ","
+        << "\"visualJumpWires\":" << (s.other.visualJumpWires ? "true" : "false") << ","
+        << "\"visualShowGrid\":" << (s.other.visualShowGrid ? "true" : "false") << ","
+        << "\"visualShowCardId\":" << (s.other.visualShowCardId ? "true" : "false") << ",";
+    AppendJsonStringArray(oss, "editorActionOrder", s.other.editorActionOrder);
+    oss << ",";
+    AppendJsonStringArray(oss, "editorHiddenActions", s.other.editorHiddenActions);
+    oss << ",\"editorCatalogPreset\":"
+        << JsonString(quickscript::NormalizeEditorCatalogPreset(s.other.editorCatalogPreset));
+    oss << ",";
+    AppendJsonStringArray(oss, "editorCustomActionOrder", s.other.editorCustomActionOrder);
+    oss << ",";
+    AppendJsonStringArray(oss, "editorCustomHiddenActions", s.other.editorCustomHiddenActions);
+    oss << ",\"editorSearchAllActions\":"
+        << (s.other.editorSearchAllActions ? "true" : "false");
+    oss << ",\"editorHideFixedVars\":"
+        << (s.other.editorHideFixedVars ? "true" : "false");
+    oss << ",\"editorHideCoordVars\":"
+        << (s.other.editorHideCoordVars ? "true" : "false");
+    oss << ",\"editorMultiResultPlaceholderOnly\":"
+        << (s.other.editorMultiResultPlaceholderOnly ? "true" : "false");
+    oss << ",\"editorDisableModifyButton\":"
+        << (s.other.editorDisableModifyButton ? "true" : "false");
+    oss << ",\"editorAutoSaveOnExit\":"
+        << (s.other.editorAutoSaveOnExit ? "true" : "false");
+    oss << ",\"editorEnableBatchInsert\":"
+        << (s.other.editorEnableBatchInsert ? "true" : "false");
+    oss << "},"
         << "\"windowMode\":{"
         << "\"showPreviewThumbnail\":" << (s.windowMode.showPreviewThumbnail ? "true" : "false") << ","
         << "\"previewRefreshMs\":" << s.windowMode.previewRefreshMs << ","
@@ -549,7 +701,13 @@ std::string JsonOpenSettings() {
                 ? "true" : "false") << ","
         << "\"scheduledTaskConflictPolicy\":" << s.playback.scheduledTaskConflictPolicy << ","
         << "\"scheduledTaskAutoResume\":"
-        << (s.playback.scheduledTaskAutoResume ? "true" : "false")
+        << (s.playback.scheduledTaskAutoResume ? "true" : "false") << ","
+        << "\"lowPerformanceMode\":"
+        << (s.playback.lowPerformanceMode ? "true" : "false") << ","
+        << "\"aiFastPaths\":"
+        << (s.playback.aiFastPaths ? "true" : "false") << ","
+        << "\"findImageGpuAccel\":"
+        << (s.playback.findImageGpuAccel ? "true" : "false")
         << "},"
         << "\"ai\":{"
         << "\"enabled\":" << (s.ai.enabled ? "true" : "false") << ","
@@ -590,7 +748,8 @@ std::string JsonOpenSettings() {
         << "\"globalHotkeyModifiers\":" << s.home.globalHotkeyModifiers << ","
         << "\"globalHotkeyHold\":" << (s.home.globalHotkeyHold ? "true" : "false") << ","
         << "\"uiMode\":" << JsonString(quickscript::NormalizeHomeUiMode(s.home.uiMode))
-        << "}"
+        << "},"
+        << "\"findImageEngine\":" << (OpenCvAvailable() ? "true" : "false")
         << "}";
     return oss.str();
 }
@@ -613,6 +772,7 @@ std::string JsonAppBranding() {
 bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err) {
     EnsureSettingsLoaded();
     std::lock_guard<std::mutex> lock(g_mu);
+    TryLoadAppSettings(g_ctx.settings);
     auto& s = g_ctx.settings;
     bool b = false;
     int i = 0;
@@ -634,13 +794,60 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
     if (JsonGetInt(settingsObjJson, "customMainColor", i)) s.other.customMainColor = i;
     if (JsonGetInt(settingsObjJson, "customAccentColor", i)) s.other.customAccentColor = i;
     if (JsonGetBool(settingsObjJson, "preferDirect2D", b)) s.other.preferDirect2D = b;
-    if (JsonGetNumber(settingsObjJson, "holdThresholdSeconds", d)) s.other.holdThresholdSeconds = d;
+    if (JsonGetNumber(settingsObjJson, "holdThresholdSeconds", d))
+        s.other.holdThresholdSeconds = NormalizeHoldThresholdSeconds(d);
+    if (JsonGetNumber(settingsObjJson, "uiScaleFactor", d))
+        s.other.uiScaleFactor = quickscript::NormalizeUiScaleFactor(d);
+    // 缺键不得写成 false：独立助手窗 collectSettings 没有 #setAutoHide 等控件。
     if (JsonGetBool(settingsObjJson, "autoHideMainWindow", b)) s.other.autoHideMainWindow = b;
     if (JsonGetBool(settingsObjJson, "playSoundOnStart", b)) s.other.playSoundOnStart = b;
+    if (JsonGetBool(settingsObjJson, "playSoundOnEnd", b)) s.other.playSoundOnEnd = b;
     if (JsonGetBool(settingsObjJson, "hideBottomRightTip", b)) s.other.hideBottomRightTip = b;
     if (JsonGetBool(settingsObjJson, "closeToTray", b)) s.other.closeToTray = b;
     if (JsonGetBool(settingsObjJson, "autoStartOnBoot", b)) s.other.autoStartOnBoot = b;
     if (JsonGetBool(settingsObjJson, "resolveImeConflict", b)) s.other.resolveImeConflict = b;
+    if (JsonGetBool(settingsObjJson, "showFloatBall", b)) s.other.showFloatBall = b;
+    if (JsonGetBool(settingsObjJson, "floatBallDocked", b)) s.other.floatBallDocked = b;
+    if (JsonGetInt(settingsObjJson, "floatBallEdge", i)) {
+        if (i < 0 || i > 3) i = 1;
+        s.other.floatBallEdge = i;
+    }
+    if (JsonGetNumber(settingsObjJson, "floatBallXRatio", d)) {
+        s.other.floatBallXRatio = d;
+        if (!(s.other.floatBallXRatio >= 0.0)) s.other.floatBallXRatio = 0.0;
+        if (s.other.floatBallXRatio > 1.0) s.other.floatBallXRatio = 1.0;
+    }
+    if (JsonGetNumber(settingsObjJson, "floatBallYRatio", d)) {
+        s.other.floatBallYRatio = d;
+        if (!(s.other.floatBallYRatio >= 0.0)) s.other.floatBallYRatio = 0.0;
+        if (s.other.floatBallYRatio > 1.0) s.other.floatBallYRatio = 1.0;
+    }
+    if (JsonGetBool(settingsObjJson, "visualLoopWrap", b)) s.other.visualLoopWrap = b;
+    if (JsonGetBool(settingsObjJson, "visualBlockCallWires", b)) s.other.visualBlockCallWires = b;
+    if (JsonGetBool(settingsObjJson, "visualIfWrap", b)) s.other.visualIfWrap = b;
+    if (JsonGetBool(settingsObjJson, "visualBlockWrap", b)) s.other.visualBlockWrap = b;
+    if (JsonGetBool(settingsObjJson, "visualWatchWrap", b)) s.other.visualWatchWrap = b;
+    if (JsonGetBool(settingsObjJson, "visualJumpWires", b)) s.other.visualJumpWires = b;
+    if (JsonGetBool(settingsObjJson, "visualShowGrid", b)) s.other.visualShowGrid = b;
+    if (JsonGetBool(settingsObjJson, "visualShowCardId", b)) s.other.visualShowCardId = b;
+    JsonGetStringArray(settingsObjJson, "editorActionOrder", s.other.editorActionOrder);
+    JsonGetStringArray(settingsObjJson, "editorHiddenActions", s.other.editorHiddenActions);
+    JsonGetStringArray(settingsObjJson, "editorCustomActionOrder", s.other.editorCustomActionOrder);
+    JsonGetStringArray(settingsObjJson, "editorCustomHiddenActions", s.other.editorCustomHiddenActions);
+    if (JsonGetBool(settingsObjJson, "editorSearchAllActions", b))
+        s.other.editorSearchAllActions = b;
+    if (JsonGetBool(settingsObjJson, "editorHideFixedVars", b))
+        s.other.editorHideFixedVars = b;
+    if (JsonGetBool(settingsObjJson, "editorHideCoordVars", b))
+        s.other.editorHideCoordVars = b;
+    if (JsonGetBool(settingsObjJson, "editorMultiResultPlaceholderOnly", b))
+        s.other.editorMultiResultPlaceholderOnly = b;
+    if (JsonGetBool(settingsObjJson, "editorDisableModifyButton", b))
+        s.other.editorDisableModifyButton = b;
+    if (JsonGetBool(settingsObjJson, "editorAutoSaveOnExit", b))
+        s.other.editorAutoSaveOnExit = b;
+    if (JsonGetBool(settingsObjJson, "editorEnableBatchInsert", b))
+        s.other.editorEnableBatchInsert = b;
     if (JsonGetBool(settingsObjJson, "showPreviewThumbnail", b)) s.windowMode.showPreviewThumbnail = b;
     if (JsonGetInt(settingsObjJson, "previewRefreshMs", i)) {
         s.windowMode.previewRefreshMs = std::clamp(i, 200, 5000);
@@ -697,6 +904,12 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
     }
     if (JsonGetBool(settingsObjJson, "scheduledTaskAutoResume", b))
         s.playback.scheduledTaskAutoResume = b;
+    if (JsonGetBool(settingsObjJson, "lowPerformanceMode", b))
+        s.playback.lowPerformanceMode = b;
+    if (JsonGetBool(settingsObjJson, "findImageGpuAccel", b))
+        s.playback.findImageGpuAccel = b;
+    if (JsonGetBool(settingsObjJson, "aiFastPaths", b))
+        s.playback.aiFastPaths = b;
     {
         auto getStr = [](const std::string& json, const char* key, std::string& out) -> bool {
             const std::string pat = std::string("\"") + key + "\"";
@@ -754,6 +967,12 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
             s.home.selectedRecordingPath = FromUtf8(str);
         if (getTopStr("uiMode", str))
             s.home.uiMode = quickscript::NormalizeHomeUiMode(FromUtf8(str));
+        if (getTopStr("editorDefaultView", str))
+            s.other.editorDefaultView = quickscript::NormalizeEditorDefaultView(FromUtf8(str));
+        if (getTopStr("floatBallMonitorId", str))
+            s.other.floatBallMonitorId = FromUtf8(str);
+        if (getTopStr("editorCatalogPreset", str))
+            s.other.editorCatalogPreset = quickscript::NormalizeEditorCatalogPreset(FromUtf8(str));
 
         // savedModels: optional array of profiles（字符串感知，避免 apiKey 等字段中的 }/] 截断）。
         // 空数组且未显式声明 savedModelsClear=1 时视为「页面状态未加载/未修改」，保留磁盘已有
@@ -856,6 +1075,7 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
     // 与原生 ApplyOtherOsSettings 对齐：开机自启写 HKCU\...\Run「键鼠工坊」
     SetAutoStartOnBoot(s.other.autoStartOnBoot);
     quickscript::ApplyThemeFromSettings(s);
+    UiScaleSetUserFactor(s.other.uiScaleFactor);
     return true;
 }
 
@@ -875,6 +1095,7 @@ bool RestoreSettingsDefaults(std::string& err) {
     }
     SetAutoStartOnBoot(g_ctx.settings.other.autoStartOnBoot);
     quickscript::ApplyThemeFromSettings(g_ctx.settings);
+    UiScaleSetUserFactor(g_ctx.settings.other.uiScaleFactor);
     return true;
 }
 
@@ -884,6 +1105,7 @@ bool StartClickerFromOpts(const std::string& msgJson, std::string& err) {
     StopClicker();
     {
         std::lock_guard<std::mutex> lock(g_mu);
+        TryLoadAppSettings(g_ctx.settings);
         int i = 0;
         double d = 0;
         if (JsonGetInt(msgJson, "button", i)) {
@@ -939,37 +1161,9 @@ bool ResolveScriptPath(const std::string& idOrPathUtf8, std::wstring& outPath, s
         err = "empty path";
         return false;
     }
-    std::wstring cand = FromUtf8(idOrPathUtf8);
-    if (cand.find(L'\\') == std::wstring::npos && cand.find(L'/') == std::wstring::npos) {
-        std::wstring name = cand;
-        if (name.size() < 5 || _wcsicmp(name.c_str() + name.size() - 5, L".json") != 0)
-            name += L".json";
-        auto findByName = [&](const std::wstring& root) -> bool {
-            std::vector<ScriptFileEntry> files;
-            EnumerateScriptJsonFiles(root, files);
-            for (const auto& f : files) {
-                if (_wcsicmp(f.fileName.c_str(), name.c_str()) == 0) {
-                    outPath = f.path;
-                    return true;
-                }
-            }
-            return false;
-        };
-        if (findByName(ScriptsDir()) || findByName(RecordingsDir())) return true;
-        err = "script not found";
-        return false;
-    }
-    // 含路径分隔符：只允许应用脚本/录制目录内的既有文件，防路径穿越读写任意文件。
-    if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        err = "script not found";
-        return false;
-    }
-    if (!IsPathInside(cand, ScriptsDir()) && !IsPathInside(cand, RecordingsDir())) {
-        err = "script path outside app directories";
-        return false;
-    }
-    outPath = cand;
-    return true;
+    if (ResolveLibraryScriptPath(FromUtf8(idOrPathUtf8), outPath)) return true;
+    err = "script not found";
+    return false;
 }
 
 std::wstring ActionTypeLabel(const std::wstring& type) {
@@ -978,6 +1172,7 @@ std::wstring ActionTypeLabel(const std::wstring& type) {
     if (type == L"mouseDown") return L"鼠标按下";
     if (type == L"mouseUp") return L"鼠标松开";
     if (type == L"mouseClick") return L"鼠标点击";
+    if (type == L"mouseDrag") return L"鼠标拖拽";
     if (type == L"mousePlayback") return L"运行录制回放";
     if (type == L"keyDown") return L"键盘按下";
     if (type == L"keyUp") return L"键盘松开";
@@ -986,6 +1181,8 @@ std::wstring ActionTypeLabel(const std::wstring& type) {
     if (type == L"quickInput") return L"快捷输入";
     if (type == L"scrollWheel") return L"滚动滚轮";
     if (type == L"findImage") return L"找图";
+    if (type == L"watchImage") return L"找图监视";
+    if (type == L"varCompute") return L"变量运算";
     if (type == L"textRecognition") return L"文字识别";
     if (type == L"wait") return L"等待";
     if (type == L"loop") return L"循环";
@@ -1046,7 +1243,21 @@ std::string SerializeEditorActionsJsonArray(const std::vector<ScriptAction>& act
 
 std::string JsonPeekScriptActions(const std::wstring& path) {
     ScriptFileData data = LoadScriptFileData(path, true);
-    return SerializeEditorActionsJsonArray(data.actions);
+    int modeSel = 0;
+    if (data.windowMode.enabled) {
+        modeSel = (data.windowMode.executionKind
+            == windowmode::WindowModeExecutionKind::BackgroundWindow) ? 2 : 1;
+    }
+    std::wstring wmJson;
+    windowmode::WriteWindowModeJson(wmJson, data.windowMode, false);
+    while (!wmJson.empty() && (wmJson.front() == L' ' || wmJson.front() == L'\n'))
+        wmJson.erase(wmJson.begin());
+    std::ostringstream oss;
+    oss << "{\"actions\":" << SerializeEditorActionsJsonArray(data.actions)
+        << ",\"mode\":" << modeSel
+        << ",\"breakoutTimeSeconds\":" << data.breakoutTimeSeconds
+        << "," << ToUtf8(wmJson) << "}";
+    return oss.str();
 }
 
 std::string JsonPreviewScriptActions(const std::wstring& path, int maxNames) {
@@ -1069,7 +1280,7 @@ std::string JsonLoadScriptEditor(const std::wstring& path, bool isNew) {
     std::ostringstream oss;
     oss << "{";
     if (isNew || path.empty()) {
-        // 与 GDI 编辑器 / 鼠标录制一致：鼠标宏-<unix秒>
+        // 与 GDI 编辑器 / 键鼠录制一致：鼠标宏-<unix秒>
         const std::wstring newName = L"鼠标宏-" + TimestampName();
         // selectedActionIndex=-1：打开编辑器不选中列表项，右栏固定「移动鼠标」添加预览（更快）
         oss << "\"name\":" << JsonString(newName) << ",\"path\":\"\",\"actions\":[],\"selectedActionIndex\":-1,"
@@ -1108,6 +1319,17 @@ std::string JsonLoadScriptEditor(const std::wstring& path, bool isNew) {
         << "\"selectedActionIndex\":" << selectedActionIndex << ","
         << ToUtf8(wmJson) << ","
         << "\"actions\":" << SerializeEditorActionsJsonArray(data.actions);
+    {
+        std::wstring cached;
+        if (LoadVisualLayoutCache(path, cached) && cached.size() >= 2 && cached.front() == L'{') {
+            data.visualLayoutJson = std::move(cached);
+        } else if (!data.visualLayoutJson.empty() && data.visualLayoutJson.front() == L'{') {
+            SaveVisualLayoutCache(path, data.visualLayoutJson);
+        }
+    }
+    if (!data.visualLayoutJson.empty() && data.visualLayoutJson.front() == L'{') {
+        oss << ",\"visualLayout\":" << ToUtf8(data.visualLayoutJson);
+    }
     oss << "}";
     return oss.str();
 }
@@ -1454,6 +1676,13 @@ bool SaveEditorFromJson(const std::string& msgJson, std::string& outPathUtf8, st
         return false;
     }
     {
+        const std::wstring layout = ExtractNamedJsonObject(FromUtf8(msgJson), L"visualLayout");
+        if (layout.size() >= 2 && layout.front() == L'{') {
+            SaveVisualLayoutCache(path, layout);
+        }
+        data.visualLayoutJson.clear();
+    }
+    {
         bool anyRel = data.windowMode.windowRelativeCoordinates;
         for (const auto& a : data.actions) {
             if (a.windowRelative) { anyRel = true; break; }
@@ -1486,6 +1715,10 @@ bool SaveEditorFromJson(const std::string& msgJson, std::string& outPathUtf8, st
                 // 纠正：DefineBlock 必须顶层
                 data.actions[i].indent = 0;
             }
+        }
+        for (size_t i = 0; i < data.actions.size(); ++i) {
+            if (data.actions[i].type != ActionType::WatchImage) continue;
+            if (data.actions[i].indent != 0) data.actions[i].indent = 0;
         }
     }
 
@@ -1545,6 +1778,7 @@ bool DeleteScriptFile(const std::string& pathUtf8, std::string& err) {
         err = "DeleteFile failed";
         return false;
     }
+    DeleteVisualLayoutCache(path);
     return true;
 }
 
@@ -1612,6 +1846,7 @@ bool RenameScriptFile(const std::string& pathUtf8, const std::string& newNameUtf
         if (!DeleteFileW(path.c_str())) {
             // 新文件已写好；旧文件删不掉时仍以新路径为准
         }
+        MoveVisualLayoutCache(path, newPath);
         outNewPathUtf8 = ToUtf8(newPath);
     } else {
         std::ofstream out(path, std::ios::binary);
@@ -1912,6 +2147,7 @@ bool SetScriptHotkeyJson(const std::string& pathUtf8, const std::string& hotkeyT
 bool SetRecorderInputMode(int mode, std::string& err) {
     EnsureSettingsLoaded();
     std::lock_guard<std::mutex> lock(g_mu);
+    TryLoadAppSettings(g_ctx.settings);
     g_ctx.settings.home.recorderInputMode = std::clamp(mode, 0, 3);
     if (!SaveAppSettings(g_ctx.settings)) {
         err = "SaveAppSettings failed";
@@ -1926,13 +2162,12 @@ std::string MessagesToJson(const std::vector<ChatMessage>& msgs) {
     std::ostringstream oss;
     oss << "[";
     bool first = true;
-    for (const auto& m : msgs) {
+    for (size_t i = 0; i < msgs.size(); ++i) {
+        const ChatMessage& m = msgs[i];
         if (m.role == L"system") continue;
         if (m.role == L"tool") continue;
         // 内部引导消息（重复提示/图片参考等）不显示给用户
         if (m.internal_nudge) continue;
-        if (!first) oss << ",";
-        first = false;
         const bool isUser = (m.role == L"user");
         std::wstring content = m.content;
         if (content.empty() && !m.parts.empty()) {
@@ -1940,6 +2175,34 @@ std::string MessagesToJson(const std::vector<ChatMessage>& msgs) {
                 if (p.type == L"text") content += p.text;
             }
         }
+        if (!isUser && content.empty()) {
+            // 终态工具成功但旧会话没写入可见回复：从后续 tool 消息补摘要
+            std::wstring recovered;
+            bool laterVisibleReply = false;
+            for (size_t j = i + 1; j < msgs.size(); ++j) {
+                if (msgs[j].internal_nudge) continue;
+                if (msgs[j].role == L"user") break;
+                if (msgs[j].role == L"assistant") {
+                    if (!msgs[j].content.empty()) laterVisibleReply = true;
+                    break;
+                }
+                if (msgs[j].role == L"tool") {
+                    const std::wstring facing = AgentUserFacingToolReply(msgs[j].content);
+                    if (!facing.empty() && (facing.find(L"✓") != std::wstring::npos
+                        || facing.find(L"已创建") != std::wstring::npos
+                        || facing.find(L"已保存") != std::wstring::npos
+                        || facing.find(L"已更新") != std::wstring::npos
+                        || facing.find(L"优化完成") != std::wstring::npos
+                        || facing.find(L"路径压缩完成") != std::wstring::npos)) {
+                        recovered = facing;
+                    }
+                }
+            }
+            if (laterVisibleReply || recovered.empty()) continue;
+            content = recovered;
+        }
+        if (!first) oss << ",";
+        first = false;
         oss << "{"
             << "\"role\":" << JsonString(m.role) << ","
             << "\"content\":" << JsonString(content) << ","
@@ -1995,14 +2258,26 @@ void PersistAgentSession() {
     if (!payload.shouldSave) return;
     payload.id = g_agent.id;
     payload.createdTime = g_agent.createdTime.empty() ? NowText() : g_agent.createdTime;
-    // 占位名；正式名由首轮后的 AI 总结写入
     if (g_agent.name.empty()) g_agent.name = L"新对话";
     payload.name = g_agent.name;
+    AgentConversationRecord existing;
+    if (LoadAgentConversationRecord(g_agent.id, existing)) {
+        payload.draft = existing.draft;
+        payload.attachmentPaths = existing.attachmentPaths;
+        payload.editIndex = existing.editIndex;
+        if (!IsUsableConversationTitle(payload.name)
+            && IsUsableConversationTitle(existing.meta.name)) {
+            payload.name = existing.meta.name;
+            g_agent.name = existing.meta.name;
+        }
+        if (payload.createdTime.empty() && !existing.meta.createdTime.empty())
+            payload.createdTime = existing.meta.createdTime;
+    }
     SaveAgentConversation(payload);
 }
 
 bool NeedsAiConversationTitle(const std::wstring& name) {
-    return name.empty() || name == L"新对话";
+    return !IsUsableConversationTitle(name);
 }
 
 std::wstring ClipForTitle(const std::wstring& s, size_t maxChars) {
@@ -2024,6 +2299,8 @@ std::wstring FirstUserTextFromHistory(const std::vector<ChatMessage>& msgs) {
 }
 
 std::wstring SanitizeAiConversationTitle(std::wstring raw) {
+    raw = Trim(raw);
+    if (raw.empty() || !IsUsableConversationTitle(raw)) return {};
     // 去掉常见包装
     while (!raw.empty() && (raw.front() == L'"' || raw.front() == L'\'' || raw.front() == L'「' || raw.front() == L'《'))
         raw.erase(raw.begin());
@@ -2038,6 +2315,7 @@ std::wstring SanitizeAiConversationTitle(std::wstring raw) {
     while (!raw.empty() && iswspace(raw.front())) raw.erase(raw.begin());
     while (!raw.empty() && iswspace(raw.back())) raw.pop_back();
     if (raw.size() > 16) raw = raw.substr(0, 16);
+    if (!IsUsableConversationTitle(raw)) return {};
     return raw;
 }
 
@@ -2056,15 +2334,17 @@ void RequestAiConversationTitleAsync(AgentConfig cfg, std::wstring id,
             ChatMessage u;
             u.role = L"user";
             u.content = L"用户：" + ClipForTitle(userText, 240) + L"\n助手：" + ClipForTitle(replyText, 360);
-            title = SanitizeAiConversationTitle(titleCore.SendMessage(u, cb));
+            const std::wstring raw = titleCore.SendMessage(u, cb);
+            if (IsUsableConversationTitle(raw))
+                title = SanitizeAiConversationTitle(raw);
         } catch (...) {
             title.clear();
         }
-        if (title.empty() || NeedsAiConversationTitle(title)) {
-            // AI 失败：回退本地摘要，避免一直停在「新对话」
+        if (!IsUsableConversationTitle(title)) {
+            // AI 失败：回退本地摘要，避免把「API 请求失败」写进页签名
             title = DeriveConversationTitleFromPrompt(userText);
         }
-        if (title.empty() || NeedsAiConversationTitle(title)) return;
+        if (!IsUsableConversationTitle(title)) return;
         {
             std::lock_guard<std::mutex> lock(g_mu);
             if (g_agent.id == id) g_agent.name = title;
@@ -2527,7 +2807,7 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
             g_agent.busy = false;
         }
 
-        const bool fail = response.empty();
+        const bool fail = response.empty() || response.rfind(L"[错误]", 0) == 0;
         std::ostringstream oss;
         oss << "{\"type\":\"sendAgentMessage.result\",\"ok\":" << (fail ? "false" : "true") << ","
             << "\"id\":\"" << EscapeJson(outId) << "\","
@@ -2817,6 +3097,7 @@ bool ApplyThemeSettings(int themeId, bool useCustom, COLORREF main, COLORREF acc
     std::string& err) {
     EnsureSettingsLoaded();
     auto& s = Ctx().settings;
+    TryLoadAppSettings(s);
     s.other.themeId = std::clamp(themeId, 0, quickscript::kThemeCount - 1);
     s.other.useCustomTheme = useCustom;
     if (useCustom) {
@@ -2940,8 +3221,10 @@ bool SaveScheduledTaskFromJson(const std::string& msgJson, bool isUpdate, std::s
         return false;
     }
     std::wstring path = FromUtf8(pathUtf8);
-    if (path.find(L'\\') == std::wstring::npos && path.find(L'/') == std::wstring::npos) {
-        // try scripts then recordings
+    std::wstring resolved;
+    if (ResolveLibraryScriptPath(path, resolved)) {
+        path = std::move(resolved);
+    } else if (path.find(L'\\') == std::wstring::npos && path.find(L'/') == std::wstring::npos) {
         std::wstring tryPath = ScriptsDir() + L"\\" + path;
         if (GetFileAttributesW(tryPath.c_str()) == INVALID_FILE_ATTRIBUTES)
             tryPath = RecordingsDir() + L"\\" + path;
@@ -3219,19 +3502,19 @@ bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::str
         const bool forMerge = scheme == 2;
         const auto selected = ParseSelectedMask(msgJson, data.actions.size(), false);
         recopt::OptimizeApplyResult applied;
+        std::string waitCalc = "sum";
+        JsonGetStringField(msgJson, "waitCalculation", waitCalc);
+        if (waitCalc.empty()) waitCalc = "sum";
+        double mergeWait = 0.1;
+        JsonGetNumber(msgJson, "mergeWaitValue", mergeWait);
+        JsonGetNumber(msgJson, "waitValue", mergeWait);
         if (forMerge) {
-            std::string waitCalc = "sum";
-            JsonGetStringField(msgJson, "waitCalculation", waitCalc);
-            if (waitCalc.empty()) waitCalc = "sum";
-            double mergeWait = 0.1;
-            JsonGetNumber(msgJson, "mergeWaitValue", mergeWait);
-            JsonGetNumber(msgJson, "waitValue", mergeWait);
             applied = recopt::MergeSelected(data.actions, selected, waitCalc, mergeWait);
         } else {
-            double thr = 5.0, cw = 0.05;
+            double thr = 5.0;
             JsonGetNumber(msgJson, "distanceThreshold", thr);
-            JsonGetNumber(msgJson, "compressWait", cw);
-            applied = recopt::CompressSelected(data.actions, selected, thr, cw);
+            JsonGetNumber(msgJson, "compressWait", mergeWait);
+            applied = recopt::CompressSelected(data.actions, selected, thr, waitCalc, mergeWait);
         }
         if (!applied.collectOk) {
             err = applied.collectErr;
@@ -3540,6 +3823,9 @@ bool RenameLibraryFolder(const std::string& kindUtf8, const std::string& folderU
     } else if (!MoveDirRecursive(src, dst)) {
         err = "重命名文件夹失败";
         return false;
+    } else if (kind == L"macro" || kind == L"rec") {
+        RetargetScheduledTaskFilePathPrefix(src, dst);
+        RetargetNestedLibraryScriptPathPrefix(src, dst);
     }
 
     const std::wstring prefix = folder + L"/";
@@ -3670,6 +3956,8 @@ bool MoveScriptToFolder(const std::string& pathUtf8, const std::string& destFold
         err = "移动失败";
         return false;
     }
+    RetargetScheduledTaskFilePaths(path, newPath);
+    RetargetNestedLibraryScriptPaths(path, newPath);
     InvalidateScriptListCache();
     outNewPathUtf8 = ToUtf8(newPath);
     return true;

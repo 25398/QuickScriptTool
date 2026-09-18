@@ -50,7 +50,7 @@ const selftest::CaseInfo kCases[] = {
     {L"apply_custom_theme_from_settings", L"theme",
         L"ApplyThemeFromSettings(useCustom) updates CurrentTheme"},
     {L"theme_catalog_count", L"theme",
-        L"ThemeCatalog has kThemeCount classic presets; id0=经典绿橙"},
+        L"ThemeCatalog has kThemeCount classic presets; id0=翠绿暖橙"},
     {L"shell_chrome_geometry", L"layout",
         L"Title accent / tab underline / card rail design sizes"},
     {L"home_settings_sizes", L"layout",
@@ -237,7 +237,7 @@ void CaseCatalog() {
     const AppTheme* cat = ThemeCatalog();
     const bool ok = cat
         && kThemeCount == 7
-        && cat[0].name && wcscmp(cat[0].name, L"经典绿橙") == 0
+        && cat[0].name && wcscmp(cat[0].name, L"翠绿暖橙") == 0
         && cat[kThemeCount - 1].name && wcscmp(cat[kThemeCount - 1].name, L"樱花粉") == 0
         && kCustomThemeComboIndex == 0;
     Emit(L"theme_catalog_count", ok, ok ? L"" : L"catalog/name/combo index mismatch");
@@ -316,7 +316,7 @@ void CaseP2RoundRadii() {
     const AppTheme* cat = ThemeCatalog();
     const bool classicBanner = cat
         && cat[0].bannerBg == RGB(255, 244, 138)
-        && cat[0].name && wcscmp(cat[0].name, L"经典绿橙") == 0;
+        && cat[0].name && wcscmp(cat[0].name, L"翠绿暖橙") == 0;
     const bool ok = kHomeCardRadius == 9
         && kHomeCtaRadius == 10
         && kHomePanelRadius == 10

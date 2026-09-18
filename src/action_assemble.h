@@ -31,7 +31,8 @@ struct MergeResult {
 
 inline bool IsMergeContainerType(ActionType type) {
     return type == ActionType::Loop || type == ActionType::If
-        || type == ActionType::Else || type == ActionType::DefineBlock;
+        || type == ActionType::Else || type == ActionType::DefineBlock
+        || type == ActionType::WatchImage;
 }
 
 inline MergeAnalyze FailMergeAnalyze(const std::wstring& error) {
@@ -191,7 +192,8 @@ inline MergeResult MergeSelectedIntoContainer(const std::vector<ScriptAction>& a
         return FailMergeResult(L"所选动作不连续，请选择插入位置");
     }
 
-    const bool asDefine = container.type == ActionType::DefineBlock;
+    const bool asDefine = container.type == ActionType::DefineBlock
+        || container.type == ActionType::WatchImage;
     const int destIndent = asDefine ? 0 : plan.indent;
 
     std::vector<std::pair<int, int>> ranges;

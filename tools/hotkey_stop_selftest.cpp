@@ -8,6 +8,7 @@
 #include "selftest_harness.h"
 
 #include "hotkey_stop.h"
+#include "ime_hotkey_pass.h"
 
 #include <string>
 
@@ -35,16 +36,24 @@ const selftest::CaseInfo kCases[] = {
         L"Busy physical toggle key down must stop"},
     {L"busy_needkeyup_does_not_stop", L"default",
         L"Busy auto-repeat (NeedKeyUp) must not stop"},
-    {L"busy_injected_down_ignored", L"default",
-        L"Injected/tagged key down must not stop"},
+    {L"busy_tagged_down_ignored", L"default",
+        L"Script ExtraInfo key down must not stop"},
+    {L"busy_remote_injected_down_stops", L"default",
+        L"Remote-desktop LLKHF_INJECTED without ExtraInfo must stop"},
     {L"idle_needkeyup_blocks_start", L"default",
         L"Idle NeedKeyUp/pending/handling still blocks start"},
     {L"idle_physical_can_start", L"default",
         L"Idle physical down without latches can start"},
     {L"physical_up_clears_latch", L"default",
         L"Physical KEYUP clears NeedKeyUp even if fingerprint would match"},
-    {L"injected_up_does_not_clear", L"default",
-        L"Injected KEYUP does not clear toggle latch"},
+    {L"tagged_up_does_not_clear", L"default",
+        L"Script ExtraInfo KEYUP does not clear toggle latch"},
+    {L"remote_injected_up_clears", L"default",
+        L"Remote-desktop injected KEYUP clears NeedKeyUp"},
+    {L"idle_remote_injected_can_start", L"default",
+        L"Remote-desktop injected down can start while idle"},
+    {L"idle_tagged_blocks_start", L"default",
+        L"Script ExtraInfo down must not start while idle"},
     {L"poller_hold_start_does_not_fire", L"default",
         L"Poller waits for start-key release before stop"},
     {L"poller_release_then_press_fires", L"default",
@@ -79,6 +88,16 @@ const selftest::CaseInfo kCases[] = {
         L"VHID device or ExtraInfo mouse up is not physical release"},
     {L"dedicated_hold_owns_run", L"default",
         L"Script/recording hold session is not stopped by global hold-release"},
+    {L"ime_pass_idle_native_blocks", L"default",
+        L"Idle Chinese native mode must block hotkeys (not composing-only)"},
+    {L"ime_pass_tsf_english_hkl_blocks", L"default",
+        L"English HKL + native conversion must still block (Win11 TSF)"},
+    {L"ime_pass_composing_blocks", L"default",
+        L"Active composition must block hotkeys"},
+    {L"ime_pass_english_mode_allows", L"default",
+        L"Pinyin Shift-English (open+Chinese HKL, not native) must allow hotkeys"},
+    {L"ime_pass_us_keyboard_allows", L"default",
+        L"US keyboard / IME closed must allow hotkeys"},
 };
 
 void CaseBusyPhysicalDownStops() {
@@ -93,13 +112,20 @@ void CaseBusyNeedKeyUpDoesNotStop() {
         ok ? L"" : L"NeedKeyUp auto-repeat was treated as stop");
 }
 
-void CaseBusyInjectedIgnored() {
-    const bool inj = ShouldStopOnToggleKeyDown(true, false, true, false);
+void CaseBusyTaggedIgnored() {
     const bool tag = ShouldStopOnToggleKeyDown(true, false, false, true);
+    const bool both = ShouldStopOnToggleKeyDown(true, false, true, true);
     const bool idle = ShouldStopOnToggleKeyDown(false, false, false, false);
-    const bool ok = !inj && !tag && !idle;
-    Emit(L"busy_injected_down_ignored", ok,
-        ok ? L"" : L"injected/idle incorrectly treated as stop");
+    const bool ok = !tag && !both && !idle;
+    Emit(L"busy_tagged_down_ignored", ok,
+        ok ? L"" : L"script ExtraInfo incorrectly treated as stop");
+}
+
+void CaseBusyRemoteInjectedStops() {
+    const bool remote = ShouldStopOnToggleKeyDown(true, false, true, false);
+    const bool ok = remote;
+    Emit(L"busy_remote_injected_down_stops", ok,
+        ok ? L"" : L"remote-desktop INJECTED was ignored as if it were script input");
 }
 
 void CaseIdleNeedKeyUpBlocksStart() {
@@ -127,12 +153,36 @@ void CasePhysicalUpClearsLatch() {
         ok ? L"" : L"physical KEYUP did not clear latch");
 }
 
-void CaseInjectedUpDoesNotClear() {
-    const bool inj = ShouldClearToggleLatchOnKeyUp(true, false);
+void CaseTaggedUpDoesNotClear() {
     const bool tag = ShouldClearToggleLatchOnKeyUp(false, true);
-    const bool ok = !inj && !tag;
-    Emit(L"injected_up_does_not_clear", ok,
-        ok ? L"" : L"injected KEYUP cleared latch");
+    const bool both = ShouldClearToggleLatchOnKeyUp(true, true);
+    const bool ok = !tag && !both;
+    Emit(L"tagged_up_does_not_clear", ok,
+        ok ? L"" : L"script ExtraInfo KEYUP cleared latch");
+}
+
+void CaseRemoteInjectedUpClears() {
+    const bool remote = ShouldClearToggleLatchOnKeyUp(true, false);
+    const bool ok = remote;
+    Emit(L"remote_injected_up_clears", ok,
+        ok ? L"" : L"remote-desktop KEYUP did not clear NeedKeyUp");
+}
+
+void CaseIdleRemoteInjectedCanStart() {
+    const bool ok = ShouldStartOnToggleKeyDown(
+        false, false, false, false, true, false);
+    Emit(L"idle_remote_injected_can_start", ok,
+        ok ? L"" : L"remote-desktop INJECTED could not start");
+}
+
+void CaseIdleTaggedBlocksStart() {
+    const bool tag = ShouldStartOnToggleKeyDown(
+        false, false, false, false, false, true);
+    const bool both = ShouldStartOnToggleKeyDown(
+        false, false, false, false, true, true);
+    const bool ok = !tag && !both;
+    Emit(L"idle_tagged_blocks_start", ok,
+        ok ? L"" : L"script ExtraInfo was allowed to start");
 }
 
 void CasePollerHoldStartDoesNotFire() {
@@ -292,6 +342,64 @@ void CaseDedicatedHoldOwnsRun() {
         ok ? L"" : L"dedicated hold ownership gating is wrong");
 }
 
+void CaseImePassIdleNativeBlocks() {
+    ime_hotkey_pass::Snapshot s;
+    s.hasForeground = true;
+    s.native = true;
+    s.composing = false;
+    const bool ok = ime_hotkey_pass::ShouldPassThroughHotkey(s);
+    Emit(L"ime_pass_idle_native_blocks", ok,
+        ok ? L"" : L"idle Chinese native mode did not block hotkey");
+}
+
+void CaseImePassTsfEnglishHklBlocks() {
+    ime_hotkey_pass::Snapshot native;
+    native.hasForeground = true;
+    native.native = true;
+    const bool nativeBlocks = ime_hotkey_pass::ShouldPassThroughHotkey(native);
+    ime_hotkey_pass::Snapshot openOnly;
+    openOnly.hasForeground = true;
+    const bool openDoesNotBlock = !ime_hotkey_pass::ShouldPassThroughHotkey(openOnly);
+    const bool ok = nativeBlocks && openDoesNotBlock;
+    Emit(L"ime_pass_tsf_english_hkl_blocks", ok,
+        ok ? L"" : L"TSF native/open gating is wrong");
+}
+
+void CaseImePassComposingBlocks() {
+    ime_hotkey_pass::Snapshot s;
+    s.hasForeground = true;
+    s.composing = true;
+    const bool ok = ime_hotkey_pass::ShouldPassThroughHotkey(s);
+    Emit(L"ime_pass_composing_blocks", ok,
+        ok ? L"" : L"composition did not block hotkey");
+}
+
+void CaseImePassEnglishModeAllows() {
+    ime_hotkey_pass::Snapshot s;
+    s.hasForeground = true;
+    s.native = false;
+    s.composing = false;
+    const bool pinyinEn = !ime_hotkey_pass::ShouldPassThroughHotkey(s);
+    ime_hotkey_pass::Snapshot own;
+    own.hasForeground = true;
+    own.ownProcess = true;
+    own.native = true;
+    const bool ownAllows = !ime_hotkey_pass::ShouldPassThroughHotkey(own);
+    const bool ok = pinyinEn && ownAllows;
+    Emit(L"ime_pass_english_mode_allows", ok,
+        ok ? L"" : L"Pinyin English / own-process still blocked hotkey");
+}
+
+void CaseImePassUsKeyboardAllows() {
+    ime_hotkey_pass::Snapshot s;
+    s.hasForeground = true;
+    const bool usAllows = !ime_hotkey_pass::ShouldPassThroughHotkey(s);
+    const bool noFg = !ime_hotkey_pass::ShouldPassThroughHotkey({});
+    const bool ok = usAllows && noFg;
+    Emit(L"ime_pass_us_keyboard_allows", ok,
+        ok ? L"" : L"US keyboard / missing foreground blocked hotkey");
+}
+
 void PrintHelp() {
     std::fwprintf(stdout,
         L"HotkeyStopSelfTest — 运行中停止热键不得被闩锁/指纹吞掉\n"
@@ -300,7 +408,7 @@ void PrintHelp() {
         L"  HotkeyStopSelfTest.exe [--json] [--list] [--help]\n"
         L"\n"
         L"Agent: 见 .cursor/skills/module-selftest/SKILL.md\n"
-        L"  源码: src/hotkey_stop.h, src/engine/engine_hotkeys.cpp\n");
+        L"  源码: src/hotkey_stop.h, src/ime_hotkey_pass.h, src/engine/engine_hotkeys.cpp\n");
 }
 
 }  // namespace
@@ -328,11 +436,15 @@ int wmain(int argc, wchar_t** argv) {
 
     CaseBusyPhysicalDownStops();
     CaseBusyNeedKeyUpDoesNotStop();
-    CaseBusyInjectedIgnored();
+    CaseBusyTaggedIgnored();
+    CaseBusyRemoteInjectedStops();
     CaseIdleNeedKeyUpBlocksStart();
     CaseIdlePhysicalCanStart();
+    CaseIdleRemoteInjectedCanStart();
+    CaseIdleTaggedBlocksStart();
     CasePhysicalUpClearsLatch();
-    CaseInjectedUpDoesNotClear();
+    CaseTaggedUpDoesNotClear();
+    CaseRemoteInjectedUpClears();
     CasePollerHoldStartDoesNotFire();
     CasePollerReleaseThenPressFires();
     CasePollerSyntheticSkipped();
@@ -350,6 +462,11 @@ int wmain(int argc, wchar_t** argv) {
     CaseRawMouseUpPhysical();
     CaseRawMouseUpInjectedNotPhysical();
     CaseDedicatedHoldOwnsRun();
+    CaseImePassIdleNativeBlocks();
+    CaseImePassTsfEnglishHklBlocks();
+    CaseImePassComposingBlocks();
+    CaseImePassEnglishModeAllows();
+    CaseImePassUsKeyboardAllows();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

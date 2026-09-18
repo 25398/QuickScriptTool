@@ -3,26 +3,32 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "desktop_tools/desktop_tools.h"
+#include "desktop_tools/float_ball_geom.h"
 
 #include "coord_space.h"
 #include "crosshair_drag.h"
+#include "drag_pick_overlay.h"
 #include "drawing.h"
 #include "findimage_template_crop.h"
 #include "hotkey_dialog.h"
 #include "image_match.h"
 #include "image_var_util.h"
 #include "input/virtual_hid.h"
+#include "opencv_runtime.h"
 #include "macro_debug_window.h"
 #include "ocr_engine.h"
 #include "ocr_overlay.h"
 #include "process_utils.h"
 #include "screenshot_overlay.h"
 #include "utils.h"
+#include "window_mode/window_target.h"
 
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
+#include <urlmon.h>
 
 #include <atomic>
 #include <algorithm>
@@ -57,17 +63,161 @@ void AppendFindImageDiag(const std::wstring& line) {
     fclose(fp);
 }
 
-std::wstring FindInstallCandidate(const std::wstring candidates[], size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        wchar_t full[MAX_PATH]{};
-        if (GetFullPathNameW(candidates[i].c_str(), MAX_PATH, full, nullptr) == 0) {
-            if (GetFileAttributesW(candidates[i].c_str()) != INVALID_FILE_ATTRIBUTES)
-                return candidates[i];
-            continue;
-        }
-        if (GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) return full;
+std::wstring ResolveExistingPath(const std::wstring& path) {
+    if (path.empty()) return {};
+    wchar_t full[MAX_PATH]{};
+    if (GetFullPathNameW(path.c_str(), MAX_PATH, full, nullptr) != 0
+        && GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) {
+        return full;
     }
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return path;
     return {};
+}
+
+bool FileExistsAttr(const std::wstring& path) {
+    return !path.empty()
+        && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring LocalAppQstDir() {
+    wchar_t buf[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf))) return {};
+    const std::wstring d = std::wstring(buf) + L"\\QuickScriptTool";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+bool HidPackageReadyAt(const std::wstring& scriptDir) {
+    if (scriptDir.empty()) return false;
+    const std::wstring pkg = scriptDir + L"\\package";
+    return FileExistsAttr(pkg + L"\\QstVHid.sys")
+        && FileExistsAttr(pkg + L"\\qst_vhid.inf")
+        && FileExistsAttr(pkg + L"\\interception.sys");
+}
+
+std::wstring InterceptionDllBesideExe() {
+    return AppDir() + L"\\interception.dll";
+}
+
+bool RunHiddenProcess(std::wstring cmd, DWORD timeoutMs) {
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    const DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs);
+    DWORD code = 1;
+    if (wait == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return wait == WAIT_OBJECT_0 && code == 0;
+}
+
+bool DownloadUrlToFile(const std::wstring& url, const std::wstring& dest) {
+    DeleteFileW(dest.c_str());
+    const HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), dest.c_str(), 0, nullptr);
+    if (!SUCCEEDED(hr) || !FileExistsAttr(dest)) return false;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(dest.c_str(), GetFileExInfoStandard, &fad)) return false;
+    const ULONGLONG n = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    return n >= 1024;
+}
+
+bool ExtractZipTo(const std::wstring& zip, const std::wstring& dest) {
+    CreateDirectoryW(dest.c_str(), nullptr);
+    std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+        L"\"Expand-Archive -LiteralPath '" + zip + L"' -DestinationPath '" + dest
+        + L"' -Force\"";
+    return RunHiddenProcess(std::move(cmd), 180000);
+}
+
+void PromoteHidExtractLayout(const std::wstring& dest) {
+    if (FileExistsAttr(dest + L"\\driver\\qst_vhid\\_elevate_install.ps1")) return;
+    WIN32_FIND_DATAW fd{};
+    const HANDLE find = FindFirstFileW((dest + L"\\*").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+        const std::wstring child = dest + L"\\" + fd.cFileName;
+        if (FileExistsAttr(child + L"\\driver\\qst_vhid\\_elevate_install.ps1")
+            || FileExistsAttr(child + L"\\_elevate_install.ps1")) {
+            // 单根目录压缩：把内容提升到 dest
+            const std::wstring cmd = L"cmd.exe /c xcopy /E /Y /Q \"" + child
+                + L"\\*\" \"" + dest + L"\\\" >nul";
+            RunHiddenProcess(cmd, 120000);
+            break;
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+}
+
+bool CopyIfPresent(const std::wstring& from, const std::wstring& to) {
+    if (!FileExistsAttr(from)) return false;
+    const auto slash = to.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        const std::wstring dir = to.substr(0, slash);
+        CreateDirectoryW(dir.c_str(), nullptr);
+    }
+    return CopyFileW(from.c_str(), to.c_str(), FALSE) != 0;
+}
+
+bool MergeHidPayloadInto(const std::wstring& extracted, const std::wstring& appDir) {
+    PromoteHidExtractLayout(extracted);
+    CreateDirectoryW((appDir + L"\\driver").c_str(), nullptr);
+    CreateDirectoryW((appDir + L"\\driver\\qst_vhid").c_str(), nullptr);
+    CreateDirectoryW((appDir + L"\\driver\\qst_vhid\\package").c_str(), nullptr);
+    const std::wstring srcRoot = FileExistsAttr(extracted + L"\\driver\\qst_vhid\\_elevate_install.ps1")
+        ? (extracted + L"\\driver\\qst_vhid")
+        : extracted;
+    CopyIfPresent(srcRoot + L"\\_elevate_install.ps1",
+        appDir + L"\\driver\\qst_vhid\\_elevate_install.ps1");
+    CopyIfPresent(srcRoot + L"\\repair_boot.ps1",
+        appDir + L"\\driver\\qst_vhid\\repair_boot.ps1");
+    const std::wstring pkgSrc = srcRoot + L"\\package";
+    CopyIfPresent(pkgSrc + L"\\QstVHid.sys", appDir + L"\\driver\\qst_vhid\\package\\QstVHid.sys");
+    CopyIfPresent(pkgSrc + L"\\qst_vhid.inf", appDir + L"\\driver\\qst_vhid\\package\\qst_vhid.inf");
+    CopyIfPresent(pkgSrc + L"\\qst_vhid.cat", appDir + L"\\driver\\qst_vhid\\package\\qst_vhid.cat");
+    CopyIfPresent(pkgSrc + L"\\interception.sys", appDir + L"\\driver\\qst_vhid\\package\\interception.sys");
+    const std::wstring dllSrc = FileExistsAttr(extracted + L"\\interception.dll")
+        ? (extracted + L"\\interception.dll")
+        : (srcRoot + L"\\interception.dll");
+    CopyIfPresent(dllSrc, appDir + L"\\interception.dll");
+    // 默认 zip 已带安装脚本：不能仅凭脚本存在就当合并成功（Program Files 不可写时 .sys 拷失败）。
+    return FileExistsAttr(appDir + L"\\driver\\qst_vhid\\_elevate_install.ps1")
+        && HidPackageReadyAt(appDir + L"\\driver\\qst_vhid");
+}
+
+bool DownloadAndInstallHidPayload(std::string* err) {
+    const std::wstring url =
+        L"https://www.quickscripttool.cloud/downloads/QuickScriptTool-HidDriver.zip";
+    const std::wstring local = LocalAppQstDir();
+    const std::wstring zip = (local.empty() ? AppDir() : local) + L"\\QuickScriptTool-HidDriver.zip";
+    const std::wstring stage = (local.empty() ? AppDir() : local) + L"\\hid_driver_extract";
+    if (!DownloadUrlToFile(url, zip)) {
+        if (err) *err = "无法从官网下载驱动包。请检查网络，或手动打开 "
+            "https://www.quickscripttool.cloud/downloads/QuickScriptTool-HidDriver.zip";
+        return false;
+    }
+    if (!ExtractZipTo(zip, stage)) {
+        if (err) *err = "驱动包下载成功但解压失败";
+        return false;
+    }
+    std::wstring dest = AppDir();
+    if (!MergeHidPayloadInto(stage, dest)) {
+        dest = local;
+        if (!MergeHidPayloadInto(stage, dest)) {
+            if (err) *err = "驱动包解压后未找到安装脚本";
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string JsonEscapeUtf8(const std::wstring& w) {
@@ -145,7 +295,8 @@ bool IsOwnCaptureUiClass(const wchar_t* cls) {
     return _wcsicmp(cls, L"QstWebViewShellWindow") == 0
         || _wcsicmp(cls, L"KeyMouseDebugWebWindow") == 0
         || _wcsicmp(cls, L"QstAgentWebWindow") == 0
-        || _wcsicmp(cls, L"KeyMouseDebugWnd") == 0;
+        || _wcsicmp(cls, L"KeyMouseDebugWnd") == 0
+        || _wcsicmp(cls, qst::desktop_tools::kFloatBallClass) == 0;
 }
 
 void CollectOwnUiHwnds(HWND mainUi, std::vector<HWND>& out) {
@@ -160,6 +311,7 @@ void CollectOwnUiHwnds(HWND mainUi, std::vector<HWND>& out) {
     add(FindWindowW(L"KeyMouseDebugWnd", nullptr));
     add(FindWindowW(L"QstAgentWebWindow", nullptr));
     add(FindWindowW(L"QstWebViewShellWindow", nullptr));
+    add(FindWindowW(qst::desktop_tools::kFloatBallClass, nullptr));
 
     const DWORD pid = GetCurrentProcessId();
     EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
@@ -190,6 +342,7 @@ bool PreferCloakForCapture(HWND hwnd) {
     // DWM cloak 不拆 HWND/控制器，截屏照样不含本软件窗。
     wchar_t cls[128]{};
     if (GetClassNameW(hwnd, cls, 128) <= 0) return false;
+    if (_wcsicmp(cls, qst::desktop_tools::kFloatBallClass) == 0) return false;
     return IsOwnCaptureUiClass(cls);
 }
 
@@ -255,6 +408,49 @@ ScreenRegionResult PickScreenRegion(HWND owner, const wchar_t* title) {
     return out;
 }
 
+DragPickResult PickScreenDrag(HWND owner) {
+    DragPickResult out;
+    ScopedHideShell hide(owner);
+    const DragPickOutcome r = ShowScreenDragPickOverlay();
+    if (!r.ok) {
+        out.detail = "cancelled";
+        return out;
+    }
+    out.ok = true;
+    out.x1 = r.x1;
+    out.y1 = r.y1;
+    out.x2 = r.x2;
+    out.y2 = r.y2;
+    out.durationSec = r.durationSec;
+    return out;
+}
+
+DragPickResult PickTemplateDrag(HWND owner, const std::wstring& imagePath) {
+    DragPickResult out;
+    ScopedHideShell hide(owner);
+    const std::wstring resolved = ResolveImagePath(imagePath);
+    HBITMAP bmp = LoadBitmapFromFile(resolved);
+    if (!bmp) {
+        out.detail = "无法加载模板图";
+        return out;
+    }
+    BITMAP bm{};
+    GetObjectW(bmp, sizeof(bm), &bm);
+    const DragPickOutcome r = ShowTemplateDragPickOverlay(bmp, bm.bmWidth, bm.bmHeight);
+    DeleteBitmapHandle(bmp);
+    if (!r.ok) {
+        out.detail = "cancelled";
+        return out;
+    }
+    out.ok = true;
+    out.x1 = r.x1;
+    out.y1 = r.y1;
+    out.x2 = r.x2;
+    out.y2 = r.y2;
+    out.durationSec = r.durationSec;
+    return out;
+}
+
 TemplateCaptureResult CaptureTemplateScreenshot(HWND owner, const wchar_t* title) {
     TemplateCaptureResult out;
     ScopedHideShell hide(owner);
@@ -293,9 +489,67 @@ TemplateCaptureResult CaptureTemplateScreenshot(HWND owner, const wchar_t* title
     return out;
 }
 
+namespace {
+bool ResolveBoundWindowClientScreenRect(
+    const std::wstring& className,
+    const std::wstring& title,
+    const std::wstring& exePath,
+    int& x1, int& y1, int& x2, int& y2) {
+    windowmode::WindowTargetQuery q;
+    q.className = className;
+    q.titleContains = title;
+    q.exePath = exePath;
+    HWND hwnd = windowmode::FindMainWindowDefault(q, true);
+    HWND cap = hwnd;
+    if (hwnd) {
+        if (HWND surface = windowmode::FindBrowserCaptureSurface(hwnd)) cap = surface;
+    }
+    RECT rc{};
+    POINT origin{0, 0};
+    if (cap && IsWindow(cap) && GetClientRect(cap, &rc)
+        && (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0
+        && ClientToScreen(cap, &origin)) {
+        x1 = origin.x;
+        y1 = origin.y;
+        x2 = origin.x + (rc.right - rc.left);
+        y2 = origin.y + (rc.bottom - rc.top);
+        return x2 > x1 && y2 > y1;
+    }
+    return false;
+}
+
+bool TryConstrainSearchRectToWindow(
+    int constrainToWindow,
+    const std::wstring& className,
+    const std::wstring& title,
+    const std::wstring& exePath,
+    int& x1, int& y1, int& x2, int& y2,
+    bool& windowConstrained,
+    std::string& err,
+    const char* missingWindowErr) {
+    windowConstrained = false;
+    if (!constrainToWindow) return true;
+    const bool hasIdentity = !className.empty() || !title.empty() || !exePath.empty();
+    if (!hasIdentity) return true;
+    if (!ResolveBoundWindowClientScreenRect(className, title, exePath, x1, y1, x2, y2)) {
+        err = missingWindowErr ? missingWindowErr
+            : "未找到目标窗口，无法在窗口内操作。请先打开并绑定窗口后再测试。";
+        return false;
+    }
+    windowConstrained = true;
+    return true;
+}
+}  // namespace
+
+
 FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& params) {
     FindImageMatchResult out;
     out.modeUtf8 = params.modeUtf8;
+    if (!OpenCvAvailable()) {
+        out.detail = ToUtf8(OpenCvUnavailableMessage());
+        AppendFindImageDiag(L"findImageMatch skipped: OpenCV unavailable");
+        return out;
+    }
     AppendFindImageDiag(std::wstring(L"findImageMatch mode=") + FromUtf8(params.modeUtf8)
         + L" imagePath=" + params.imagePath
         + L" search=(" + std::to_wstring(params.searchX1) + L"," + std::to_wstring(params.searchY1)
@@ -306,11 +560,16 @@ FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& para
         + L" scale=" + std::to_wstring(params.imageScaleMin)
         + L"~" + std::to_wstring(params.imageScaleMax));
 
-    // 变量模式：合成锚框选区（不要求模板文件）
-    if (params.modeUtf8 == "regionBySize") {
+    // 变量模式：合成锚框选区 / 选偏移（不要求当前帧能匹配到模板文件）
+    if (params.modeUtf8 == "regionBySize" || params.modeUtf8 == "offsetBySize") {
         int w = params.syntheticW;
         int h = params.syntheticH;
-        if ((w <= 0 || h <= 0) && !params.imagePath.empty()) {
+        if (params.syntheticUseScreen) {
+            int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+            GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+            w = vsW;
+            h = vsH;
+        } else if ((w <= 0 || h <= 0) && !params.imagePath.empty()) {
             std::wstring resolved = params.imagePath;
             if (resolved.size() < 2 || resolved[1] != L':') {
                 resolved = ResolveImagePath(params.imagePath);
@@ -318,17 +577,23 @@ FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& para
             GetImageFileSize(resolved, w, h);
         }
         if (w <= 0 || h <= 0) {
-            out.detail = "无法确定图片尺寸，请手填相对区域坐标";
+            out.detail = params.modeUtf8 == "offsetBySize"
+                ? "无法确定图片尺寸，无法在屏幕中心画出锚框"
+                : "无法确定图片尺寸，请手填相对区域坐标";
             return out;
         }
         ScopedHideShell hide(owner);
         MatchOverlay overlay;
-        const auto result = overlay.ShowSyntheticAnchor(w, h);
+        const auto result = (params.modeUtf8 == "offsetBySize")
+            ? overlay.ShowSyntheticAnchorOffset(w, h)
+            : overlay.ShowSyntheticAnchor(w, h);
         if (result.cancelled) {
             out.detail = "cancelled";
             return out;
         }
         out.ok = true;
+        out.offsetX = result.offsetX;
+        out.offsetY = result.offsetY;
         out.regionValid = result.regionValid;
         out.regionX1 = result.regionX1;
         out.regionY1 = result.regionY1;
@@ -363,7 +628,20 @@ FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& para
     int x2 = params.searchX2, y2 = params.searchY2;
     int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
     GetVirtualScreenRect(vsX, vsY, vsW, vsH);
-    if (params.searchFullScreen || x2 <= x1 || y2 <= y1) {
+    bool windowConstrained = false;
+    if (!TryConstrainSearchRectToWindow(
+            params.constrainToWindow, params.windowClassName, params.windowTitle,
+            params.targetExePath, x1, y1, x2, y2, windowConstrained, out.detail,
+            "未找到目标窗口，无法在窗口内找图。请先打开并绑定窗口后再测试。")) {
+        AppendFindImageDiag(L"  -> constrainToWindow: 未找到目标窗口");
+        return out;
+    }
+    if (windowConstrained) {
+        AppendFindImageDiag(std::wstring(L"  -> constrainToWindow search=(")
+            + std::to_wstring(x1) + L"," + std::to_wstring(y1)
+            + L")-(" + std::to_wstring(x2) + L"," + std::to_wstring(y2) + L")");
+    }
+    if (!windowConstrained && (params.searchFullScreen || x2 <= x1 || y2 <= y1)) {
         x1 = vsX;
         y1 = vsY;
         x2 = vsX + vsW;
@@ -379,15 +657,21 @@ FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& para
     CoordMeta meta{};
     const TemplateScale ts = ComputeTemplateScale(meta, vsW, vsH);
     ImageMatchOptions findOpt = BuildExecutionFindImageOptions(probe, ts);
-    findOpt.maxMatches = 20;
+    int keep = params.maxMatches > 0 ? params.maxMatches : 20;
+    if (keep < 1) keep = 1;
+    if (keep > 200) keep = 200;
+    findOpt.maxMatches = keep;
     findOpt.maxOverlap = 0.5;
 
     MatchOverlayMode mode = MatchOverlayMode::Test;
     if (params.modeUtf8 == "offset") mode = MatchOverlayMode::OffsetPick;
     else if (params.modeUtf8 == "region") mode = MatchOverlayMode::RelativeRegionPick;
+    if (mode == MatchOverlayMode::OffsetPick || mode == MatchOverlayMode::RelativeRegionPick)
+        findOpt.maxMatches = 1;
 
     ScopedHideShell hide(owner);
     MatchOverlay overlay;
+    if (windowConstrained) overlay.SetAllowExpandSearchToVirtualScreen(false);
     const auto result = overlay.Show(resolved, x1, y1, x2, y2, findOpt, mode);
     if (result.cancelled) {
         out.detail = "cancelled";
@@ -427,6 +711,10 @@ std::atomic_uint g_webCropFileSeq{0};
 FindImageCropResult FindImageCropRect(const std::wstring& imagePathOrStored,
     int offsetX, int offsetY, int cropX, int cropY, int cropW, int cropH) {
     FindImageCropResult out;
+    if (!OpenCvAvailable()) {
+        out.detail = ToUtf8(OpenCvUnavailableMessage());
+        return out;
+    }
     if (imagePathOrStored.empty()) {
         out.detail = "请先截图或选择图片";
         return out;
@@ -761,6 +1049,14 @@ TestOcrResult TestOcr(HWND owner, const TestOcrParams& params) {
         }
     }
 
+    bool windowConstrained = false;
+    if (!TryConstrainSearchRectToWindow(
+            params.constrainToWindow, params.windowClassName, params.windowTitle,
+            params.targetExePath, sx1, sy1, sx2, sy2, windowConstrained, out.detail,
+            "未找到目标窗口，无法在窗口内识别。请先打开并绑定窗口后再测试。")) {
+        return out;
+    }
+
     // 凡需截屏/找图的测试路径：先藏壳再动手（对齐原生 TestOcr）
     ScopedHideShell hide(owner);
 
@@ -768,7 +1064,9 @@ TestOcrResult TestOcr(HWND owner, const TestOcrParams& params) {
         int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
         GetVirtualScreenRect(vsX, vsY, vsW, vsH);
         int findX1 = vsX, findY1 = vsY, findX2 = vsX + vsW, findY2 = vsY + vsH;
-        if (!params.searchFullScreen && sx2 > sx1 && sy2 > sy1) {
+        if (windowConstrained) {
+            findX1 = sx1; findY1 = sy1; findX2 = sx2; findY2 = sy2;
+        } else if (!params.searchFullScreen && sx2 > sx1 && sy2 > sy1) {
             findX1 = sx1; findY1 = sy1; findX2 = sx2; findY2 = sy2;
         }
         HBITMAP tmpl = LoadBitmapFromFile(resolvedImage);
@@ -788,7 +1086,7 @@ TestOcrResult TestOcr(HWND owner, const TestOcrParams& params) {
         CoordMeta meta{};
         const TemplateScale ts = ComputeTemplateScale(meta, vsW, vsH);
         ImageMatchOptions opt = BuildExecutionFindImageOptions(probe, ts);
-        opt.maxMatches = 20;
+        RestrictFindImageToSingleAnchor(opt);
         opt.maxOverlap = 0.5;
         const ImageMatchOutput output = FindTemplateOnScreenMulti(
             findX1, findY1, findX2, findY2, tmpl, opt);
@@ -806,7 +1104,7 @@ TestOcrResult TestOcr(HWND owner, const TestOcrParams& params) {
             out.detail = "相对区域无效。";
             return out;
         }
-    } else if (params.searchFullScreen || (sx2 <= sx1 || sy2 <= sy1)) {
+    } else if (!windowConstrained && (params.searchFullScreen || (sx2 <= sx1 || sy2 <= sy1))) {
         int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
         GetVirtualScreenRect(vsX, vsY, vsW, vsH);
         sx1 = vsX; sy1 = vsY; sx2 = vsX + vsW; sy2 = vsY + vsH;
@@ -862,15 +1160,52 @@ InstallDriverResult InstallDriver(HWND owner, const std::string& kindUtf8,
         return out;
     }
 
-    progress(10, 0, uninstall ? "检查卸载脚本…" : "检查安装脚本…");
+    progress(10, 0, uninstall ? "检查卸载脚本…" : "检查安装文件…");
+    const std::wstring localQst = LocalAppQstDir();
     const std::wstring cands[] = {
         appDir + L"\\driver\\qst_vhid\\_elevate_install.ps1",
+        localQst + L"\\driver\\qst_vhid\\_elevate_install.ps1",
         appDir + L"\\..\\driver\\qst_vhid\\_elevate_install.ps1",
         appDir + L"\\..\\..\\driver\\qst_vhid\\_elevate_install.ps1",
     };
-    const std::wstring script = FindInstallCandidate(cands, 3);
+    auto scriptDirOf = [](const std::wstring& scriptPath) -> std::wstring {
+        std::wstring dir = scriptPath;
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) dir.resize(slash);
+        return dir;
+    };
+    auto pickScript = [&](bool preferPackage) -> std::wstring {
+        std::wstring fallback;
+        for (const auto& cand : cands) {
+            const std::wstring resolved = ResolveExistingPath(cand);
+            if (resolved.empty()) continue;
+            if (fallback.empty()) fallback = resolved;
+            if (!preferPackage || HidPackageReadyAt(scriptDirOf(resolved))) return resolved;
+        }
+        return preferPackage ? std::wstring{} : fallback;
+    };
+    std::wstring script = pickScript(true);
+    if (script.empty()) script = pickScript(false);
+    if (!uninstall) {
+        const std::wstring scriptDir = scriptDirOf(script);
+        const bool needPkg = !HidPackageReadyAt(scriptDir);
+        const bool needDll = isIc && !FileExistsAttr(InterceptionDllBesideExe())
+            && !FileExistsAttr(localQst + L"\\interception.dll");
+        if (script.empty() || needPkg || needDll) {
+            progress(18, 0, "正在下载驱动包…");
+            std::string dlErr;
+            if (!DownloadAndInstallHidPayload(&dlErr)) {
+                out.detail = dlErr.empty()
+                    ? "未找到驱动文件，且官网下载失败"
+                    : dlErr;
+                return out;
+            }
+            script = pickScript(true);
+            if (script.empty()) script = pickScript(false);
+        }
+    }
     if (script.empty()) {
-        out.detail = "未找到驱动安装脚本（driver/qst_vhid）。请使用完整发版包。";
+        out.detail = "未找到驱动安装脚本。请检查网络后重试，或从官网下载 QuickScriptTool-HidDriver.zip";
         return out;
     }
     const auto readLogTail = [&](int maxLines) -> std::string {
@@ -931,7 +1266,8 @@ InstallDriverResult InstallDriver(HWND owner, const std::string& kindUtf8,
             return out;
         }
         if (exitCode == 99) {
-            out.detail = "发版包缺少驱动文件（driver/qst_vhid/package）。请使用完整安装包。";
+            out.detail = "本地缺少驱动内核文件。请再点安装以下载 QuickScriptTool-HidDriver.zip，"
+                         "或从官网手动下载后重试。";
             return out;
         }
         if (exitCode == 3) {
@@ -977,8 +1313,15 @@ VhidInstallStatus QueryVhidInstallStatus() {
     const std::wstring appDir = AppDir();
     const std::wstring scriptDir = appDir + L"\\driver\\qst_vhid";
 
+    const std::wstring scriptDirLocal = LocalAppQstDir() + L"\\driver\\qst_vhid";
     out.installScriptPresent =
-        GetFileAttributesW((scriptDir + L"\\_elevate_install.ps1").c_str()) != INVALID_FILE_ATTRIBUTES;
+        FileExistsAttr(scriptDir + L"\\_elevate_install.ps1")
+        || FileExistsAttr(scriptDirLocal + L"\\_elevate_install.ps1")
+        || FileExistsAttr(appDir + L"\\..\\driver\\qst_vhid\\_elevate_install.ps1");
+    out.packagePresent = HidPackageReadyAt(scriptDir) || HidPackageReadyAt(scriptDirLocal)
+        || HidPackageReadyAt(appDir + L"\\..\\driver\\qst_vhid");
+    out.hidDllPresent = FileExistsAttr(InterceptionDllBesideExe())
+        || FileExistsAttr(LocalAppQstDir() + L"\\interception.dll");
 
     // 内存完整性（HVCI）：与 Windows 安全中心同一注册表开关
     HKEY hvciKey = nullptr;
@@ -1007,6 +1350,21 @@ VhidInstallStatus QueryVhidInstallStatus() {
 
     // 驱动就绪：设备接口可探测即视为可用
     out.driverReady = VirtualHidBackend::Instance().ProbeAvailable(nullptr);
+    out.driverNeedsUpdate = false;
+    if (out.driverReady) {
+        unsigned va = 0, vb = 0, vc = 0, vd = 0;
+        constexpr unsigned kMinA = 1, kMinB = 0, kMinC = 1, kMinD = 0;
+        const bool haveVer = VirtualHidBackend::QueryInstalledDriverVersion(va, vb, vc, vd);
+        auto pack = [](unsigned a, unsigned b, unsigned c, unsigned d) -> unsigned long long {
+            return (static_cast<unsigned long long>(a) << 48)
+                | (static_cast<unsigned long long>(b) << 32)
+                | (static_cast<unsigned long long>(c) << 16)
+                | static_cast<unsigned long long>(d);
+        };
+        if (!haveVer || pack(va, vb, vc, vd) < pack(kMinA, kMinB, kMinC, kMinD)) {
+            out.driverNeedsUpdate = true;
+        }
+    }
 
     // 最近一次安装退出码（供 UI 提示上次失败原因）
     std::ifstream log((scriptDir + L"\\install_log.txt").c_str());

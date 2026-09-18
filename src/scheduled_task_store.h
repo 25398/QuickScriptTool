@@ -17,3 +17,7 @@ bool ParseScheduledTasksJson(const std::wstring& content,
                              bool* globalDisabled = nullptr);
 bool LoadScheduledTasks(std::vector<ScheduledTask>& out, bool* globalDisabled = nullptr);
 bool SaveScheduledTasks(const std::vector<ScheduledTask>& tasks, bool globalDisabled = false);
+/// 脚本被拖进专业模式文件夹后，把仍指向旧路径的任务 filePath 改到 newPath。返回改写条数。
+int RetargetScheduledTaskFilePaths(const std::wstring& oldPath, const std::wstring& newPath);
+/// 文件夹重命名：把 filePath 落在 oldDir 子树内的任务改到 newDir。
+int RetargetScheduledTaskFilePathPrefix(const std::wstring& oldDir, const std::wstring& newDir);

@@ -8,6 +8,7 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <functional>
@@ -51,11 +52,48 @@ bool HasDotDotSegment(const std::wstring& p) {
     return false;
 }
 
+std::wstring StripNtPrefix(std::wstring p) {
+    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) return L"\\\\" + p.substr(8);
+    if (p.rfind(L"\\\\?\\", 0) == 0) return p.substr(4);
+    return p;
+}
+
+std::wstring CanonicalizePath(const std::wstring& path) {
+    wchar_t full[32768]{};
+    const DWORD n = GetFullPathNameW(path.c_str(), 32768, full, nullptr);
+    if (n == 0 || n >= 32768) return NormalizeSlashes(path);
+    std::wstring out = full;
+    auto openPath = [](const std::wstring& p) {
+        return CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    };
+    HANDLE h = openPath(out);
+    if (h != INVALID_HANDLE_VALUE) {
+        wchar_t finalP[32768]{};
+        const DWORD m = GetFinalPathNameByHandleW(h, finalP, 32768, FILE_NAME_NORMALIZED);
+        CloseHandle(h);
+        if (m > 0 && m < 32768) return NormalizeSlashes(StripNtPrefix(finalP));
+        return NormalizeSlashes(out);
+    }
+    const size_t slash = out.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash == 0) return NormalizeSlashes(out);
+    const std::wstring parent = out.substr(0, slash);
+    const std::wstring name = out.substr(slash + 1);
+    HANDLE hp = openPath(parent);
+    if (hp == INVALID_HANDLE_VALUE) return NormalizeSlashes(out);
+    wchar_t finalP[32768]{};
+    const DWORD m = GetFinalPathNameByHandleW(hp, finalP, 32768, FILE_NAME_NORMALIZED);
+    CloseHandle(hp);
+    if (m == 0 || m >= 32768) return NormalizeSlashes(out);
+    return NormalizeSlashes(StripNtPrefix(finalP) + L"\\" + name);
+}
+
 bool IsPathWithin(const std::wstring& root, const std::wstring& path) {
     if (root.empty() || path.empty()) return false;
     if (HasDotDotSegment(path)) return false;
-    std::wstring r = LowerCopy(NormalizeSlashes(root));
-    std::wstring p = LowerCopy(NormalizeSlashes(path));
+    std::wstring r = LowerCopy(CanonicalizePath(root));
+    std::wstring p = LowerCopy(CanonicalizePath(path));
     while (r.size() > 1 && r.back() == L'\\') r.pop_back();
     while (p.size() > 1 && p.back() == L'\\') p.pop_back();
     if (p == r) return true;
@@ -111,11 +149,32 @@ std::vector<std::wstring> AgentWriteRoots() {
     if (!RepoRoot().empty()) {
         roots.push_back(RepoRoot() + L"\\docs");
         roots.push_back(RepoRoot() + L"\\.cursor\\skills");
-        roots.push_back(RepoRoot() + L"\\tools");
-        roots.push_back(RepoRoot() + L"\\ui");
         roots.push_back(RepoRoot() + L"\\skills");
     }
     return roots;
+}
+
+bool IsSensitiveAgentPath(const std::wstring& path) {
+    std::wstring p = LowerCopy(NormalizeSlashes(path));
+    auto has = [&](const wchar_t* s) {
+        return p.find(s) != std::wstring::npos;
+    };
+    auto endsWith = [&](const wchar_t* s) {
+        const size_t n = wcslen(s);
+        return p.size() >= n && p.compare(p.size() - n, n, s) == 0;
+    };
+    if (has(L"\\app_settings.json") || endsWith(L"app_settings.json")) return true;
+    if (has(L"\\scheduled_tasks.json") || endsWith(L"scheduled_tasks.json")) return true;
+    if (has(L"ext_bridge.json") || has(L"bridge_runtime.json")) return true;
+    if (has(L"\\agent_changes\\") || has(L"\\agent_conversations\\")) return true;
+    if (has(L"\\webview2userdata\\") || has(L"\\webview2fixed\\")) return true;
+    if (has(L"\\driver\\")) return true;
+    if (endsWith(L".exe") || endsWith(L".dll") || endsWith(L".sys")
+        || endsWith(L".pem") || endsWith(L".key") || endsWith(L".pfx")
+        || endsWith(L".p12") || endsWith(L".pdb")) {
+        return true;
+    }
+    return false;
 }
 
 bool IsPathInAnyRoot(const std::vector<std::wstring>& roots, const std::wstring& path) {
@@ -277,7 +336,7 @@ bool IsSelfTestTarget(const std::wstring& target) {
         L"ScriptActionBuilderSelfTest", L"CoordSpaceSelfTest", L"ScriptIoSelfTest",
         L"ImageMatchSelfTest", L"AiActionRouterSelfTest", L"AppSettingsStoreSelfTest",
         L"ThemeUiSelfTest", L"RecorderSelfTest", L"VirtualHidSelfTest",
-        L"AgentAssistantSelfTest"
+        L"AgentAssistantSelfTest", L"OcrSelfTest"
     };
     for (const auto* t : kTargets) {
         if (_wcsicmp(target.c_str(), t) == 0) return true;
@@ -440,6 +499,14 @@ std::wstring ValidateCommand(const std::wstring& command, const std::wstring& cw
         for (size_t i = 1; i < parts.size(); ++i) {
             if (ContainsMetaChar(parts[i])) {
                 error = L"参数含禁止字符：" + parts[i];
+                return L"";
+            }
+            const std::wstring a = parts[i];
+            if (a.empty()) continue;
+            const std::wstring low = LowerCopy(a);
+            if (low == L"/r" || low == L"-r" || low.rfind(L"/r:", 0) == 0
+                || HasPathQualifier(a) || a[0] == L'/' || a[0] == L'-') {
+                error = L"where 仅允许查找 PATH 中的裸程序名，禁止 /R 与路径参数";
                 return L"";
             }
         }
@@ -722,6 +789,9 @@ AgentTool MakeReadAgentFileTool() {
         if (!IsPathInAnyRoot(AgentReadRoots(), abs)) {
             return L"[错误] 路径不在允许目录内：" + abs + L"\n" + AllowedRootsHint();
         }
+        if (IsSensitiveAgentPath(abs)) {
+            return L"[错误] 该路径受保护，禁止助手读取：" + abs;
+        }
         std::string bytes;
         if (!ReadFileBytes(abs, bytes)) return L"[错误] 无法读取文件（不存在或过大）：" + abs;
         if (LooksBinary(bytes)) return L"[错误] 二进制文件不支持文本读取：" + abs;
@@ -790,6 +860,7 @@ AgentTool MakeSearchAgentFilesTool() {
                     }
                     const std::wstring name = fd.cFileName;
                     const std::wstring full = dir + L"\\" + name;
+                    if (IsSensitiveAgentPath(full)) continue;
                     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                         walk(full);
                         continue;
@@ -838,7 +909,7 @@ AgentTool MakeWriteAgentFileTool() {
     tool.name = L"writeAgentFile";
     tool.description =
         L"向允许目录写入 UTF-8 文本文件（自动记入撤销日志，可在「撤销」里恢复）。"
-        L"允许写入：scripts / recordings / images / library；开发仓库下仅 docs、.cursor/skills、tools、ui、skills。"
+        L"允许写入：scripts / recordings / images / library；开发仓库下仅 docs、.cursor/skills、skills。"
         L"禁止写入 build、WebView2Fixed、WebView2UserData、agent_conversations、agent_changes 与根级配置文件。";
     tool.parameters_json = LR"({
         "type": "object",
@@ -858,6 +929,9 @@ AgentTool MakeWriteAgentFileTool() {
         if (abs.empty()) return L"[错误] path 不能为空";
         if (!IsPathInAnyRoot(AgentWriteRoots(), abs)) {
             return L"[错误] 目标路径不在可写目录内：" + abs;
+        }
+        if (IsSensitiveAgentPath(abs)) {
+            return L"[错误] 该路径受保护，禁止助手写入：" + abs;
         }
         // 写操作前快照（撤销日志）
         const std::wstring before = ReadAll(abs);

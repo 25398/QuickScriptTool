@@ -11,18 +11,23 @@
 #include "agent_ui_notify.h"
 #include "config.h"
 #include "desktop_tools/desktop_tools.h"
+#include "desktop_tools/float_ball.h"
+#include "mcp_server.h"
 #include "ocr_engine.h"
 #include "process_utils.h"
 #include "taskbar_window.h"
 #include "tray_menu.h"
+#include "ui_scale.h"
 #include "utils.h"
 #include "engine/qst_engine.h"
 #include "webview/webview_bridge_backend.h"
+#include "window_mode/ext_bridge/ext_bridge_server.h"
 #include "window_mode/window_mode_json.h"
 #include "window_mode/window_mode_preview.h"
 #include "input/hid_interception.h"
 #include "input/input_emergency_teardown.h"
 #include "input/virtual_hid.h"
+#include "opencv_runtime.h"
 
 #include <WebView2.h>
 #include <WebView2EnvironmentOptions.h>
@@ -39,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
@@ -88,8 +94,8 @@ namespace {
 constexpr wchar_t kWndClass[] = L"QstWebViewShellWindow";
 constexpr wchar_t kDebugWndClass[] = L"KeyMouseDebugWebWindow";
 constexpr wchar_t kAgentWndClass[] = L"QstAgentWebWindow";
-// 用户指定客户区：主页 1552×960（黄金分割）；鼠标宏编辑器 1800×1230；录制优化 1640×1140（1:1，不按 DPI 放大）
-// 前端组件倍率见 ui/index.html --qst-u / --qst-opt-u，勿在此做 DPI 放大。
+// 用户指定客户区：主页 1552×960（黄金分割）；鼠标宏编辑器 1800×1230；录制优化 1640×1140（不按 DPI 放大）
+// 布局缩放 = 分辨率自适应 × 用户「界面缩放倍率」；前端 --qst-u = 1.5 × 布局缩放。
 constexpr int kHomeClientW = 1552;
 constexpr int kHomeClientH = 960;
 constexpr int kProHomeClientW = 1552;
@@ -106,7 +112,6 @@ constexpr int kDebugClientH = 300;
 constexpr int kAgentClientW = 1170;
 constexpr int kAgentClientH = 820;
 constexpr wchar_t kFixedDirName[] = L"WebView2Fixed";
-constexpr wchar_t kUserDataDirName[] = L"WebView2UserData";
 // 空参数走 GPU。曾强制 SwiftShader 软件光栅：1800×1230 编辑器叠在游戏上会把
 // UI 线程拖死，表现为「编辑时鼠标一顿一顿」。空页已由 cloak + contentReady 兜底。
 constexpr wchar_t kWebViewBrowserArgs[] = L"";
@@ -119,6 +124,7 @@ constexpr UINT WM_AGENT_POST_JS = WM_APP + 95;
 constexpr UINT WM_APP_CAPTURE_PREVIEW = WM_APP + 96; // 异步抓预览首帧（lParam=PreviewCaptureReq*）
 constexpr UINT WM_APP_EVERGREEN_FALLBACK = WM_APP + 97; // 固定运行时失败 -> 回退系统 WebView2
 constexpr UINT WM_APP_LAUNCH_WEBVIEW = WM_APP + 98;     // 后台 ACL 完成后启动 WebView
+constexpr UINT WM_APPLY_UI_SCALE = WM_APP + 99;         // 保存设置后套用界面缩放
 
 enum class UiMode { Home, Editor, Optimize };
 
@@ -188,6 +194,9 @@ std::wstring g_userDataFolder;
 HANDLE g_mutex = nullptr;
 
 UiMode g_mode = UiMode::Home;
+constexpr UINT_PTR kEditorCloseFlushTimerId = 9110;
+bool g_appClosing = false;
+bool g_editorCloseFlushSent = false;
 bool g_trayActive = false;
 bool g_trayRunning = false;
 UINT g_wmTaskbarCreated = 0;
@@ -246,7 +255,12 @@ void InstallQstLocalAccessGuard(ICoreWebView2* webview) {
                 const bool deny = (u.find(L"app_settings.json") != std::wstring::npos)
                     || (u.find(L"/driver/") != std::wstring::npos)
                     || (u.find(L"ext_bridge.json") != std::wstring::npos)
+                    || (u.find(L"bridge_runtime.json") != std::wstring::npos)
                     || (u.find(L"/agent_conversations/") != std::wstring::npos)
+                    || (u.find(L"/agent_changes/") != std::wstring::npos)
+                    || (u.find(L"scheduled_tasks.json") != std::wstring::npos)
+                    || (u.find(L"/webview2userdata/") != std::wstring::npos)
+                    || (u.find(L"/webview2fixed/") != std::wstring::npos)
                     || (u.size() >= 4 && u.compare(u.size() - 4, 4, L".exe") == 0)
                     || (u.size() >= 4 && u.compare(u.size() - 4, 4, L".dll") == 0)
                     || (u.size() >= 4 && u.compare(u.size() - 4, 4, L".pdb") == 0)
@@ -287,6 +301,71 @@ void ClientToOuterSize(int clientW, int clientH, int& outW, int& outH) {
     outW = (std::max)(1, clientW);
     outH = (std::max)(1, clientH);
 }
+
+RECT ShellWorkAreaForHwnd(HWND hwnd) {
+    RECT work{};
+    if (hwnd && IsWindow(hwnd)) {
+        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) return mi.rcWork;
+    }
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    return work;
+}
+
+// 分辨率自适应 × 用户倍率，再按当前窗所在监视器工作区能放下编辑器 1800×1230 封顶
+double ShellLayoutScale() {
+    double s = UiEffectiveScale();
+    const RECT work = ShellWorkAreaForHwnd(g_hwnd);
+    const int workW = (std::max)(1, static_cast<int>(work.right - work.left));
+    const int workH = (std::max)(1, static_cast<int>(work.bottom - work.top));
+    const double fit = (std::min)(workW / static_cast<double>(kEditorClientW),
+        workH / static_cast<double>(kEditorClientH));
+    if (fit > 0.0 && s > fit) s = fit;
+    if (!(s > 0.0)) s = 1.0;
+    return s;
+}
+
+int ScaledDesignPx(int designPx) {
+    return (std::max)(1, static_cast<int>(std::lround(designPx * ShellLayoutScale())));
+}
+
+std::string UiScaleApplyJson() {
+    const double s = ShellLayoutScale();
+    char buf[256]{};
+    snprintf(buf, sizeof(buf),
+        "{\"type\":\"uiScale.apply\",\"ok\":true,\"scale\":%.6g,\"qstU\":%.6g,\"qstOptU\":%.6g}",
+        s, 1.5 * s, 1.491 * s);
+    return buf;
+}
+
+std::wstring UiScaleDocumentInitScript(bool forDebug) {
+    const double s = ShellLayoutScale();
+    wchar_t buf[384]{};
+    if (forDebug) {
+        swprintf_s(buf,
+            L"document.documentElement.style.setProperty('--qst-ui-scale','%.6g');",
+            s);
+    } else {
+        swprintf_s(buf,
+            L"document.documentElement.style.setProperty('--qst-u','%.6g');"
+            L"document.documentElement.style.setProperty('--qst-opt-u','%.6g');",
+            1.5 * s, 1.491 * s);
+    }
+    return buf;
+}
+
+void ClampPopupToWork(HWND hwnd, int& x, int& y, int w, int h) {
+    RECT work = ShellWorkAreaForHwnd(hwnd && IsWindow(hwnd) ? hwnd : g_hwnd);
+    if (x + w > work.right) x = work.right - w;
+    if (y + h > work.bottom) y = work.bottom - h;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+}
+
+void ApplyShellLayoutScale();
+void RequestApplyUiScale();
 
 // 与产品窗体同步：HWND 客户区 = 设计像素（主页 1380×960 / 编辑器 1800×1230）。
 // 不按 DPI 放大窗口；WebView RasterizationScale=1 → CSS 与客户区一致。
@@ -384,22 +463,40 @@ std::wstring BootLogPath() {
     return (std::filesystem::path(ExeDir()) / kBootLogName).wstring();
 }
 
+std::wstring BootLogPathLocalApp() {
+    wchar_t localApp[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localApp)))
+        return {};
+    return (std::filesystem::path(localApp) / L"QuickScriptTool" / kBootLogName).wstring();
+}
+
+void BootLogWriteAll(std::ios::openmode mode, const std::string& line) {
+    auto writeOne = [&](const std::wstring& path) {
+        if (path.empty()) return;
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        std::ofstream f(path, mode | std::ios::binary);
+        if (!f) return;
+        f << line;
+        if (!line.empty() && line.back() != '\n') f << '\n';
+    };
+    writeOne(BootLogPath());
+    writeOne(BootLogPathLocalApp());
+}
+
 void BootLogReset() {
-    std::ofstream f(BootLogPath(), std::ios::trunc | std::ios::binary);
-    if (!f) return;
     const auto now = std::chrono::system_clock::now();
     const std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
     localtime_s(&tm, &t);
     char ts[64]{};
     std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
-    f << "=== QstWebView boot " << ts << " ===\n";
+    BootLogWriteAll(std::ios::out | std::ios::trunc,
+        std::string("=== QstWebView boot ") + ts + " ===\n");
 }
 
 void BootLogLine(const std::string& line) {
-    std::ofstream f(BootLogPath(), std::ios::app | std::ios::binary);
-    if (!f) return;
-    f << line << '\n';
+    BootLogWriteAll(std::ios::out | std::ios::app, line);
 }
 
 void BootLogLineW(const std::wstring& line) {
@@ -448,32 +545,17 @@ struct QstEarlyBootMarker {
     QstEarlyBootMarker() { StartupTrace("crt_static_init"); }
 } g_qstEarlyBootMarker;
 
-static bool MediaFoundationPresent() {
-    static const wchar_t* kMf[] = { L"MFPlat.DLL", L"MF.dll", L"MFReadWrite.dll" };
-    for (const wchar_t* name : kMf) {
-        HMODULE m = GetModuleHandleW(name);
-        if (!m) m = LoadLibraryW(name);
-        if (!m) {
-            char buf[96]{};
-            sprintf_s(buf, "MF missing");
-            StartupTrace(buf);
-            return false;
-        }
-    }
-    return true;
-}
-
-// OpenCV 延迟加载失败时弹窗并退出（含静态构造阶段触发的失败）
+// OpenCV 延迟加载失败：禁用找图，不要把整个壳杀掉
 FARPROC WINAPI QstDelayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pdli) {
     if (dliNotify == dliFailLoadLib || dliNotify == dliFailGetProc) {
         const char* name = (pdli && pdli->szDll) ? pdli->szDll : "dependency";
         StartupTrace((std::string("DELAYLOAD fail: ") + name).c_str());
+        if (name && (strstr(name, "opencv") || strstr(name, "OpenCV"))) {
+            MarkOpenCvUnavailable(L"延迟加载 opencv_world4100.dll 失败");
+            return nullptr;
+        }
         ShowShellError(
-            L"无法加载 opencv_world4100.dll（或其系统依赖）。\n\n"
-            L"请检查：\n"
-            L"1) 软件目录是否有 opencv_world4100.dll（勿只拷 exe）\n"
-            L"2) 杀软隔离区是否隔离了该文件\n"
-            L"3) Win N/KN 是否已安装「媒体功能包」（MFPlat/MF/MFReadWrite）\n\n"
+            L"无法加载运行库依赖。\n\n"
             L"日志：软件目录 shell_startup.log\n"
             L"或 %LOCALAPPDATA%\\QuickScriptTool\\shell_startup.log");
         TerminateProcess(GetCurrentProcess(), 1);
@@ -481,47 +563,14 @@ FARPROC WINAPI QstDelayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pdli) 
     return nullptr;
 }
 
-bool EnsureOpenCvLoadable() {
-    // opencv_world 导入 MFPlat/MF/MFReadWrite；Win N 精简版常缺
-    if (!MediaFoundationPresent()) {
-        ShowShellError(
-            L"无法启动：系统缺少 Media Foundation 组件。\n\n"
-            L"常见于 Windows N/KN 精简版。请安装「媒体功能包」后重试。\n\n"
-            L"日志：软件目录 shell_startup.log\n"
-            L"或 %LOCALAPPDATA%\\QuickScriptTool\\shell_startup.log");
-        return false;
+void ProbeOptionalOpenCv() {
+    std::wstring reason;
+    if (TryInitOpenCv(&reason)) {
+        StartupTrace("opencv_world4100.dll loaded");
+        return;
     }
-    wchar_t exePath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    const std::filesystem::path beside =
-        std::filesystem::path(exePath).parent_path() / L"opencv_world4100.dll";
-    if (GetFileAttributesW(beside.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        StartupTrace("opencv_world4100.dll missing beside exe");
-        ShowShellError(
-            L"无法启动：软件目录缺少 opencv_world4100.dll。\n\n"
-            L"请使用完整安装包/便携包（不要只拷贝 exe）。\n"
-            L"若文件曾在，请检查杀软隔离区并恢复后加入白名单。\n\n"
-            L"日志：软件目录或 %LOCALAPPDATA%\\QuickScriptTool\\shell_startup.log");
-        return false;
-    }
-    // 绝对路径加载，避免工作目录不是 exe 目录时找不到
-    HMODULE cv = LoadLibraryW(beside.c_str());
-    if (!cv) {
-        const DWORD err = GetLastError();
-        char buf[96]{};
-        sprintf_s(buf, "LoadLibrary opencv_world4100.dll failed err=%lu", err);
-        StartupTrace(buf);
-        ShowShellError(
-            L"无法加载 opencv_world4100.dll。\n\n"
-            L"可能原因：\n"
-            L"1) 杀软隔离/删除了该 DLL\n"
-            L"2) 安装包不完整\n"
-            L"3) 系统缺少 Media Foundation（Win N 请装媒体功能包）\n\n"
-            L"日志：软件目录或 %LOCALAPPDATA%\\QuickScriptTool\\shell_startup.log");
-        return false;
-    }
-    StartupTrace("opencv_world4100.dll loaded");
-    return true;
+    const std::string utf8 = ToUtf8(reason);
+    StartupTrace(utf8.empty() ? "opencv optional skip" : utf8.c_str());
 }
 
 // 静默 icacls /T：解压后已有文件也需 AppContainer RX（仅改目录 ACE 不够）
@@ -1135,6 +1184,7 @@ void DisableWebViewContextMenu(ICoreWebView2* webview) {
     ComPtr<ICoreWebView2Settings> settings;
     if (SUCCEEDED(webview->get_Settings(&settings)) && settings) {
         settings->put_AreDefaultContextMenusEnabled(FALSE);
+        settings->put_AreDevToolsEnabled(FALSE);
     }
     // 再挡一层：部分运行时仍可能弹出
     ComPtr<ICoreWebView2_11> wv11;
@@ -1375,12 +1425,19 @@ void PrewarmSecondaryWebViews();
 void RevealMainWindowIfReady();
 void ShowBootPlaceholderIfNeeded();
 void GetCenteredPopupPos(int clientW, int clientH, int& outX, int& outY);
+void UpdateDesktopFloatBallModel();
+void ApplyDesktopFloatBallFromSettings();
+void EnsureDesktopFloatBall();
+void StopAllFromDesktopFloatBall();
+void StartSelectedMacroFromFloatBall();
 
 std::string EscapeJsonUtf8(const std::string& s);
 
 void PushEngineStatusIfChanged(bool force, bool emitRecordingStopped = true) {
     static int lastPacked = -1;
     static int lastSteps = -1;
+    static int lastActionIndex = -1;
+    static int lastActionTotal = -1;
     static int lastRunningMode = -1;
     static bool lastDebugging = false;
     static bool lastDebugPaused = false;
@@ -1397,6 +1454,8 @@ void PushEngineStatusIfChanged(bool force, bool emitRecordingStopped = true) {
     const bool debugPaused = debugging && qst::engine::DebugPaused();
     const bool debugStepMode = debugging && qst::engine::DebugStepMode();
     const int steps = running ? qst::engine::ExecutedSteps() : 0;
+    int actionIndex = 0, actionTotal = 0;
+    if (running) qst::engine::PlaybackProgress(actionIndex, actionTotal);
     const std::string script = running ? qst::engine::RunningScriptNameUtf8() : std::string();
     const int runningMode = running ? qst::engine::RunningMode() : 0;
     std::string wmSummary = "null";
@@ -1423,21 +1482,24 @@ void PushEngineStatusIfChanged(bool force, bool emitRecordingStopped = true) {
         || debugPaused != lastDebugPaused
         || debugStepMode != lastDebugStepMode;
     const bool stepsChanged = steps != lastSteps;
+    const bool progressChanged = actionIndex != lastActionIndex || actionTotal != lastActionTotal;
     // 运行中 executedSteps 高频变化：至少 200ms 才推一次，避免桥接洪水拖慢 UI
     const DWORD nowTick = GetTickCount();
-    const bool stepsDue = stepsChanged && (force || flagsChanged
+    const bool stepsDue = (stepsChanged || progressChanged) && (force || flagsChanged
         || (nowTick - lastStepsPushTick) >= 200u || !running);
     if (!force && !flagsChanged && !stepsDue
         && !(recordingEnded && emitRecordingStopped)) return;
     lastPacked = packed;
     lastSteps = steps;
+    lastActionIndex = actionIndex;
+    lastActionTotal = actionTotal;
     lastScript = script;
     lastRunningMode = runningMode;
     lastDebugging = debugging;
     lastDebugPaused = debugPaused;
     lastDebugStepMode = debugStepMode;
     lastWmSummary = wmSummary;
-    if (stepsChanged) lastStepsPushTick = nowTick;
+    if (stepsChanged || progressChanged) lastStepsPushTick = nowTick;
     PostToJs(std::string("{\"type\":\"getEngineStatus.result\",\"ok\":true,\"clicking\":")
         + (clicking ? "true" : "false")
         + ",\"running\":" + (running ? "true" : "false")
@@ -1469,6 +1531,7 @@ void PushEngineStatusIfChanged(bool force, bool emitRecordingStopped = true) {
             + qst::webview::JsonListRecordings() + "}");
         EnsureTrayIcon();
     }
+    UpdateDesktopFloatBallModel();
 }
 
 std::string EscapeJsonUtf8(const std::string& s) {
@@ -1810,27 +1873,129 @@ void ShowTrayContextMenu() {
     ShowTrayContextMenuAt(pt);
 }
 
+std::wstring FloatBallScriptBaseName(const std::wstring& path) {
+    const wchar_t* f = PathFindFileNameW(path.c_str());
+    std::wstring name = f ? f : path;
+    const auto dot = name.rfind(L'.');
+    if (dot != std::wstring::npos && dot > 0) name = name.substr(0, dot);
+    return name;
+}
+
+void StopAllFromDesktopFloatBall() {
+    if (qst::engine::IsRunning()) qst::engine::StopScript();
+    if (qst::engine::IsClicking()) {
+        qst::engine::StopClicker();
+        qst::webview::StopClicker();
+    }
+    if (qst::engine::IsRecording()) {
+        std::string path, err;
+        int count = 0;
+        qst::engine::StopRecordingEx(path, count, err);
+    }
+    SetTrayRunning(false);
+    EnsureTrayIcon();
+    PushEngineStatusIfChanged(true);
+}
+
+void StartSelectedMacroFromFloatBall() {
+    std::string pathUtf8;
+    JsonGetString(qst::engine::GetHomeStateJson(), "selectedScriptPath", pathUtf8);
+    if (pathUtf8.empty()) return;
+    std::wstring path;
+    std::string err;
+    if (!qst::webview::ResolveScriptPath(pathUtf8, path, err)) return;
+    if (!qst::engine::RunScriptPath(path, err)) return;
+    EnsureTrayIcon();
+    PushEngineStatusIfChanged(true, false);
+}
+
+void UpdateDesktopFloatBallModel() {
+    using qst::desktop_tools::FloatBallActivity;
+    qst::desktop_tools::FloatBallModel m;
+    const bool running = qst::engine::IsRunning();
+    const bool clicking = qst::engine::IsClicking();
+    const bool recording = qst::engine::IsRecording();
+    const bool breakout = running && qst::engine::IsBreakoutPaused();
+    m.busy = running || clicking || recording;
+    if (breakout) {
+        m.activity = FloatBallActivity::BreakoutPaused;
+        m.statusText = L"脱离中";
+        m.title = FromUtf8(qst::engine::RunningScriptNameUtf8());
+    } else if (recording) {
+        m.activity = FloatBallActivity::Recording;
+        m.statusText = L"录制中";
+        m.title = L"录制";
+    } else if (clicking) {
+        m.activity = FloatBallActivity::Clicking;
+        m.statusText = L"连点中";
+        m.title = L"连点";
+    } else if (running) {
+        m.activity = FloatBallActivity::MacroRunning;
+        m.statusText = L"运行中";
+        m.title = FromUtf8(qst::engine::RunningScriptNameUtf8());
+        qst::engine::PlaybackProgress(m.actionIndex, m.actionTotal);
+    } else {
+        m.activity = FloatBallActivity::Idle;
+        std::string pathUtf8;
+        JsonGetString(qst::engine::GetHomeStateJson(), "selectedScriptPath", pathUtf8);
+        const std::wstring path = FromUtf8(pathUtf8);
+        m.canStart = !path.empty();
+        m.title = m.canStart ? FloatBallScriptBaseName(path) : L"";
+        m.statusText = m.canStart ? L"空闲" : L"";
+    }
+    if (m.title.empty() && (m.canStart || m.busy)) m.title = L"键鼠工坊";
+    qst::desktop_tools::FloatBall::Instance().SetModel(m);
+}
+
+void ApplyDesktopFloatBallFromSettings() {
+    const auto& o = qst::webview::Ctx().settings.other;
+    auto& ball = qst::desktop_tools::FloatBall::Instance();
+    ball.SetPlacement(o.floatBallDocked, o.floatBallEdge, o.floatBallXRatio, o.floatBallYRatio,
+        o.floatBallMonitorId);
+    ball.SetVisible(o.showFloatBall);
+    ball.RefreshTheme();
+    UpdateDesktopFloatBallModel();
+}
+
+void EnsureDesktopFloatBall() {
+    auto& ball = qst::desktop_tools::FloatBall::Instance();
+    qst::desktop_tools::FloatBallCallbacks cb;
+    cb.onStartSelectedMacro = [] { StartSelectedMacroFromFloatBall(); };
+    cb.onStopRunning = [] { StopAllFromDesktopFloatBall(); };
+    cb.onShowMainWindow = [] { RestoreMainWindow(); };
+    cb.onHideFromMenu = [] {
+        qst::webview::PersistShowFloatBall(false);
+        qst::desktop_tools::FloatBall::Instance().SetVisible(false);
+    };
+    cb.onPlacementChanged = [](bool docked, int edge, double xRatio, double yRatio,
+        std::wstring monitorId) {
+        qst::webview::PersistFloatBallPlacement(docked, edge, xRatio, yRatio, monitorId);
+    };
+    ball.SetCallbacks(std::move(cb));
+    ball.Create(g_instance, g_hwnd);
+    ApplyDesktopFloatBallFromSettings();
+}
+
 void SetWindowClientSizeCentered(int designW, int designH, bool center = true) {
     if (!g_hwnd) return;
-    // HTML mockup 同步：客户区直接用设计像素，WebView RasterizationScale=1 → CSS=客户区。
-    RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    UiScaleInitFromHwnd(g_hwnd);
+    // 客户区 = 设计像素 × 布局缩放（分辨率自适应 × 用户倍率）；RasterizationScale=1 → CSS=客户区。
+    // 必须用当前窗所在监视器：SPI_GETWORKAREA 只描述主屏，副屏窗口会被拉去主屏并铺满。
+    const RECT work = ShellWorkAreaForHwnd(g_hwnd);
     const int workW = (std::max)(1, static_cast<int>(work.right - work.left));
     const int workH = (std::max)(1, static_cast<int>(work.bottom - work.top));
-    int wantW = (std::min)(designW, workW);
-    int wantH = (std::min)(designH, workH);
+    const int scaledW = ScaledDesignPx(designW);
+    const int scaledH = ScaledDesignPx(designH);
+    int wantW = (std::min)(scaledW, workW);
+    int wantH = (std::min)(scaledH, workH);
 
-    int x = 0, y = 0;
+    RECT wr{};
+    GetWindowRect(g_hwnd, &wr);
+    int x = wr.left, y = wr.top;
     if (center) {
-        // 相对工作区居中（仅启动主界面等显式要求时）
+        // 相对当前监视器工作区居中（仅启动主界面等显式要求时）
         x = work.left + (workW - wantW) / 2;
         y = work.top + (workH - wantH) / 2;
-    } else {
-        // 模式切换等：保持当前位置，仅改尺寸
-        RECT wr{};
-        GetWindowRect(g_hwnd, &wr);
-        x = wr.left;
-        y = wr.top;
     }
     if (x < work.left) x = work.left;
     if (y < work.top) y = work.top;
@@ -1839,19 +2004,20 @@ void SetWindowClientSizeCentered(int designW, int designH, bool center = true) {
 
     // 尺寸未变且不强制居中：跳过，避免无意义挪窗
     if (!center) {
-        RECT cur{};
-        GetWindowRect(g_hwnd, &cur);
-        if ((cur.right - cur.left) == wantW && (cur.bottom - cur.top) == wantH
-            && cur.left == x && cur.top == y) {
+        if ((wr.right - wr.left) == wantW && (wr.bottom - wr.top) == wantH
+            && wr.left == x && wr.top == y) {
             return;
         }
     }
 
+    const bool hidden = !IsWindowVisible(g_hwnd) || IsIconic(g_hwnd);
+    UINT flags = SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING;
+    if (!hidden) flags |= SWP_SHOWWINDOW;
+
     g_applyingModeResize = true;
     for (int i = 0; i < 2; ++i) {
-        SetWindowPos(g_hwnd, HWND_TOP, x, y, wantW, wantH,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED | SWP_NOSENDCHANGING);
-        MoveWindow(g_hwnd, x, y, wantW, wantH, TRUE);
+        SetWindowPos(g_hwnd, HWND_TOP, x, y, wantW, wantH, flags);
+        if (!hidden) MoveWindow(g_hwnd, x, y, wantW, wantH, TRUE);
     }
     g_applyingModeResize = false;
     ResizeWebView();
@@ -1874,6 +2040,9 @@ void SetWindowClientSizeCentered(int designW, int designH, bool center = true) {
         cw, ch, wantW, wantH, designW, designH, dpi,
         (cw == wantW && ch == wantH) ? "true" : "false");
     PostToJs(buf);
+    const std::string scaleJs = UiScaleApplyJson();
+    PostToJs(scaleJs);
+    PostToAgentJs(scaleJs);
 
     // 仅尺寸不符时追加，并限制文件大小，避免长跑占磁盘
     if (cw != wantW || ch != wantH) {
@@ -1924,13 +2093,13 @@ void ApplyUiMode(UiMode mode) {
     // 尺寸变化时 cloak：禁止「主页 UI + 大窗空白底」闪帧；由前端 modeReady 揭开
     const bool sizeChanging = (prev != mode);
     if (sizeChanging) SetShellCloaked(true);
-    SetWindowClientSizeCentered(cw, ch);
+    SetWindowClientSizeCentered(cw, ch, false);
     PostToJs(std::string("{\"type\":\"window.setMode.result\",\"ok\":true,\"mode\":\"")
         + modeName
         + "\",\"clientW\":"
-        + std::to_string(cw)
+        + std::to_string(ScaledDesignPx(cw))
         + ",\"clientH\":"
-        + std::to_string(ch)
+        + std::to_string(ScaledDesignPx(ch))
         + ",\"cloaked\":"
         + (g_shellCloaked ? "true" : "false")
         + "}");
@@ -2088,7 +2257,7 @@ void EnsureDebugWebWindow(bool show) {
             0,
             kDebugWndClass, L"调试信息输出窗口",
             WS_POPUP | WS_MINIMIZEBOX,
-            x, y, kDebugClientW, kDebugClientH,
+            x, y, ScaledDesignPx(kDebugClientW), ScaledDesignPx(kDebugClientH),
             nullptr, nullptr, g_instance, nullptr);
         if (!g_debugHwnd) return;
         ApplyTaskbarWindowStyle(g_debugHwnd, L"调试信息输出窗口", true);
@@ -2172,6 +2341,10 @@ void EnsureDebugWebWindow(bool show) {
                 g_debugReady = false;
                 g_debugContentReady = false;
                 ShowWindow(g_debugHwnd, SW_HIDE);
+                const std::wstring debugBoot = std::wstring(L"(function(){")
+                    + UiScaleDocumentInitScript(true)
+                    + L"})();";
+                g_debugWebview->AddScriptToExecuteOnDocumentCreated(debugBoot.c_str(), nullptr);
                 g_debugWebview->Navigate(L"https://qst.local/ui/debug.html");
                 return S_OK;
             }).Get());
@@ -2230,10 +2403,68 @@ void ApplyAgentTopmost() {
 }
 
 void GetCenteredPopupPos(int clientW, int clientH, int& outX, int& outY) {
-    RECT wa{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    const RECT wa = ShellWorkAreaForHwnd(g_hwnd);
     outX = wa.left + (std::max)(0L, ((wa.right - wa.left) - clientW) / 2);
     outY = wa.top + (std::max)(0L, ((wa.bottom - wa.top) - clientH) / 2);
+}
+
+void ApplyShellLayoutScale() {
+    UiScaleSetUserFactor(qst::webview::Ctx().settings.other.uiScaleFactor);
+    if (g_hwnd && IsWindow(g_hwnd)) UiScaleInitFromHwnd(g_hwnd);
+    else UiScaleInitFromPrimaryMonitor();
+
+    int cw = g_homeClientW;
+    int ch = g_homeClientH;
+    if (g_mode == UiMode::Editor) {
+        cw = kEditorClientW;
+        ch = kEditorClientH;
+    } else if (g_mode == UiMode::Optimize) {
+        cw = kOptClientW;
+        ch = kOptClientH;
+    }
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        SetWindowClientSizeCentered(cw, ch, false);
+    }
+
+    if (g_agentHwnd && IsWindow(g_agentHwnd)) {
+        const int aw = ScaledDesignPx(kAgentClientW);
+        const int ah = ScaledDesignPx(kAgentClientH);
+        RECT wr{};
+        GetWindowRect(g_agentHwnd, &wr);
+        int x = wr.left;
+        int y = wr.top;
+        ClampPopupToWork(g_agentHwnd, x, y, aw, ah);
+        SetWindowPos(g_agentHwnd, nullptr, x, y, aw, ah,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        ResizeAgentWebView();
+    }
+    if (g_debugHwnd && IsWindow(g_debugHwnd)) {
+        const int dw = ScaledDesignPx(kDebugClientW);
+        const int dh = ScaledDesignPx(kDebugClientH);
+        RECT wr{};
+        GetWindowRect(g_debugHwnd, &wr);
+        int x = wr.left;
+        int y = wr.top;
+        ClampPopupToWork(g_debugHwnd, x, y, dw, dh);
+        SetWindowPos(g_debugHwnd, nullptr, x, y, dw, dh,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        ResizeDebugWebView();
+    }
+
+    const std::string js = UiScaleApplyJson();
+    PostToJs(js);
+    PostToAgentJs(js);
+    PostToDebugJs(js);
+}
+
+void RequestApplyUiScale() {
+    if (!g_hwnd) return;
+    const DWORD uiTid = GetWindowThreadProcessId(g_hwnd, nullptr);
+    if (uiTid == GetCurrentThreadId()) {
+        ApplyShellLayoutScale();
+        return;
+    }
+    PostMessageW(g_hwnd, WM_APPLY_UI_SCALE, 0, 0);
 }
 
 void RevealMainWindowIfReady() {
@@ -2246,11 +2477,11 @@ void RevealMainWindowIfReady() {
     }
     // 已在工作区坐标、alpha=0 下完成首绘；此处只揭透明度，避免屏外移入时闪空蓝
     if (g_mode == UiMode::Editor)
-        SetWindowClientSizeCentered(kEditorClientW, kEditorClientH);
+        SetWindowClientSizeCentered(kEditorClientW, kEditorClientH, false);
     else if (g_mode == UiMode::Optimize)
-        SetWindowClientSizeCentered(kOptClientW, kOptClientH);
+        SetWindowClientSizeCentered(kOptClientW, kOptClientH, false);
     else
-        SetWindowClientSizeCentered(g_homeClientW, g_homeClientH);
+        SetWindowClientSizeCentered(g_homeClientW, g_homeClientH, false);
     SetShellCloaked(false);
     SetHwndClickThroughInvisible(g_hwnd, false);
     int cmd = g_mainShowCmd;
@@ -2268,9 +2499,19 @@ void RevealAgentWindowIfReady() {
     SetHwndClickThroughInvisible(g_agentHwnd, false);
     // 用户打开：独立任务栏按钮；预热阶段保持 TOOLWINDOW 不占栏
     ApplyTaskbarWindowStyle(g_agentHwnd, L"AI 助手", true);
-    int x = 0, y = 0;
-    GetCenteredPopupPos(kAgentClientW, kAgentClientH, x, y);
-    SetWindowPos(g_agentHwnd, HWND_TOP, x, y, kAgentClientW, kAgentClientH,
+    const int aw = ScaledDesignPx(kAgentClientW);
+    const int ah = ScaledDesignPx(kAgentClientH);
+    RECT wr{};
+    GetWindowRect(g_agentHwnd, &wr);
+    int x = wr.left;
+    int y = wr.top;
+    // 预热在屏外时才按主窗监视器居中；用户挪过之后再打开保持原位。
+    if (x <= -10000 || y <= -10000) {
+        GetCenteredPopupPos(aw, ah, x, y);
+    } else {
+        ClampPopupToWork(g_agentHwnd, x, y, aw, ah);
+    }
+    SetWindowPos(g_agentHwnd, HWND_TOP, x, y, aw, ah,
         SWP_SHOWWINDOW);
     if (g_agentController) {
         g_agentController->put_IsVisible(TRUE);
@@ -2425,13 +2666,15 @@ void EnsureAgentWebWindow(bool show) {
     if (g_agentCreating) return; // wantShow 已置，创建完成后立刻 Reveal
     if (!g_agentHwnd || !IsWindow(g_agentHwnd)) {
         int ax = 0, ay = 0;
-        GetCenteredPopupPos(kAgentClientW, kAgentClientH, ax, ay);
+        const int aw = ScaledDesignPx(kAgentClientW);
+        const int ah = ScaledDesignPx(kAgentClientH);
+        GetCenteredPopupPos(aw, ah, ax, ay);
         // 预热：TOOLWINDOW + 主窗 owner，不进任务栏；用户打开时再挂 APPWINDOW
         g_agentHwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             kAgentWndClass, L"AI 助手",
             WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
-            ax, ay, kAgentClientW, kAgentClientH,
+            ax, ay, aw, ah,
             g_hwnd, nullptr, g_instance, nullptr);
         if (!g_agentHwnd) return;
         ApplyPopupChrome(g_agentHwnd, nullptr, 0x06, 0x10, 0x18);
@@ -2471,15 +2714,14 @@ void EnsureAgentWebWindow(bool show) {
                                     InstallQstLocalAccessGuard(g_agentWebview.Get());
                                 }
                                 InstallWebViewNavigationGuard(g_agentWebview.Get());
-                                g_agentWebview->AddScriptToExecuteOnDocumentCreated(
-                                    L"(function(){"
-                                    L"document.documentElement.classList.add('qst-webview','agent-shell');"
+                                const std::wstring agentBoot = std::wstring(L"(function(){")
+                                    + UiScaleDocumentInitScript(false)
+                                    + L"document.documentElement.classList.add('qst-webview','agent-shell');"
                     L"document.addEventListener('contextmenu',function(e){e.preventDefault();},true);"
                     L"window.qstBridge={post:function(o){"
                     L"var s=(typeof o==='string')?o:JSON.stringify(o);"
                     L"if(window.chrome&&chrome.webview)chrome.webview.postMessage(s);"
                     L"}};"
-                    // 尽早挂拖拽（不必等 app.js），与主壳同用 mousedown+ReleaseCapture 路径
                     L"document.addEventListener('mousedown',function(e){"
                     L"if(e.button!==0)return;"
                     L"var t=e.target&&e.target.closest?e.target.closest('.dlg-title'):null;"
@@ -2488,8 +2730,10 @@ void EnsureAgentWebWindow(bool show) {
                     L"if(window.chrome&&chrome.webview)chrome.webview.postMessage("
                     L"JSON.stringify({type:'agentWindow.drag'}));"
                     L"},true);"
-                    L"})();",
-                    nullptr);
+                    L"})();";
+                                g_agentWebview->AddScriptToExecuteOnDocumentCreated(
+                                    agentBoot.c_str(),
+                                    nullptr);
                 g_agentWebview->add_NavigationCompleted(
                     Callback<ICoreWebView2NavigationCompletedEventHandler>(
                         [](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
@@ -2508,7 +2752,8 @@ void EnsureAgentWebWindow(bool show) {
                                     }
                                 } else if (!g_agentWantShow && g_agentHwnd) {
                                     SetHwndClickThroughInvisible(g_agentHwnd, false);
-                                    SetWindowPos(g_agentHwnd, nullptr, 160, 100, kAgentClientW, kAgentClientH,
+                                    SetWindowPos(g_agentHwnd, nullptr, 160, 100,
+                                        ScaledDesignPx(kAgentClientW), ScaledDesignPx(kAgentClientH),
                                         SWP_NOZORDER | SWP_NOACTIVATE);
                                     ShowWindow(g_agentHwnd, SW_HIDE);
                                 }
@@ -2565,6 +2810,26 @@ void PrewarmSecondaryWebViews() {
     if (!g_webviewEnv) return;
     if (!g_agentWebview && !g_agentCreating) EnsureAgentWebWindow(false);
     if (!g_debugWebview && !g_debugCreating) EnsureDebugWebWindow(false);
+}
+
+void FinishAppClose(HWND hwnd) {
+    if (g_appClosing) return;
+    g_appClosing = true;
+    if (hwnd && IsWindow(hwnd)) KillTimer(hwnd, kEditorCloseFlushTimerId);
+    qst::engine::StopClicker();
+    qst::engine::StopScript();
+    qst::webview::StopClicker();
+    SetTrayRunning(false);
+    if (hwnd && IsWindow(hwnd)) {
+        KillTimer(hwnd, kStatusTimerId);
+        KillTimer(hwnd, kWindowModePreviewTimerId);
+    }
+    g_wmPreview.Destroy();
+    g_wmPreviewTarget = nullptr;
+    DestroyDebugWebWindow();
+    DestroyAgentWebWindow();
+    RemoveTrayIcon();
+    if (hwnd && IsWindow(hwnd)) DestroyWindow(hwnd);
 }
 
 void HandleBridgeMessage(const std::string& json) {
@@ -2632,10 +2897,11 @@ void HandleBridgeMessage(const std::string& json) {
             EnsureTrayIcon();
             return;
         }
-        qst::webview::StopClicker();
-        SetTrayRunning(false);
-        RemoveTrayIcon();
-        DestroyWindow(g_hwnd);
+        FinishAppClose(g_hwnd);
+        return;
+    }
+    if (type == "app.closingAck") {
+        FinishAppClose(g_hwnd);
         return;
     }
     if (type == "window.drag" || type == "drag") {
@@ -2643,6 +2909,10 @@ void HandleBridgeMessage(const std::string& json) {
         return;
     }
     if (type == "window.setMode" || type == "setMode") {
+        if (g_handlingAgentMsg) {
+            // 独立助手窗与主壳共用 bridge：切模式会改主窗口尺寸。
+            return;
+        }
         std::string mode;
         JsonGetString(json, "mode", mode);
         UiMode next = UiMode::Home;
@@ -2652,6 +2922,10 @@ void HandleBridgeMessage(const std::string& json) {
         return;
     }
     if (type == "window.setHomeSize") {
+        if (g_handlingAgentMsg) {
+            // 助手窗 applyUiMode/setHomeSize 不得改主窗口位置或尺寸（会居中铺满主屏）。
+            return;
+        }
         // 极简 / 专业主窗统一黄金分割；center=0 时不挪到屏幕中央（模式切换）
         int w = kHomeClientW, h = kHomeClientH;
         int center = 1;
@@ -2749,6 +3023,8 @@ void HandleBridgeMessage(const std::string& json) {
             return;
         }
         PostToJs("{\"type\":\"setItemLibraryFolder.result\",\"ok\":true}");
+        if (kind == "macro" || kind == "rec")
+            qst::engine::ReloadScriptsAndHotkeys();
         return;
     }
     if (type == "window.modeReady" || type == "modeReady" || type == "window.uncloak") {
@@ -2884,6 +3160,8 @@ void HandleBridgeMessage(const std::string& json) {
             return;
         }
         qst::engine::ReloadSettings();
+        RequestApplyUiScale();
+        ApplyDesktopFloatBallFromSettings();
         PostToJs("{\"type\":\"saveSettings.result\",\"ok\":true}");
         // 主壳保存后推一份最新设置到独立助手窗，避免仍提示「未配置 API 密钥」
         if (g_agentWebview) {
@@ -2900,6 +3178,8 @@ void HandleBridgeMessage(const std::string& json) {
             return;
         }
         qst::engine::ReloadSettings();
+        RequestApplyUiScale();
+        ApplyDesktopFloatBallFromSettings();
         PostToJs(std::string("{\"type\":\"restoreSettingsDefaults.result\",\"ok\":true,\"settings\":")
             + qst::webview::JsonOpenSettings() + "}");
         return;
@@ -2933,9 +3213,14 @@ void HandleBridgeMessage(const std::string& json) {
                 + EscapeJsonUtf8(reqId) + "\",\"detail\":\"" + EscapeJsonUtf8(err) + "\"}");
             return;
         }
-        const std::string actions = qst::webview::JsonPeekScriptActions(wpath);
-        PostToJs(std::string("{\"type\":\"peekScriptActions.result\",\"ok\":true,\"reqId\":\"")
-            + EscapeJsonUtf8(reqId) + "\",\"actions\":" + actions + "}");
+        const std::string bundle = qst::webview::JsonPeekScriptActions(wpath);
+        if (bundle.size() >= 2 && bundle.front() == '{') {
+            PostToJs(std::string("{\"type\":\"peekScriptActions.result\",\"ok\":true,\"reqId\":\"")
+                + EscapeJsonUtf8(reqId) + "\"," + bundle.substr(1));
+        } else {
+            PostToJs(std::string("{\"type\":\"peekScriptActions.result\",\"ok\":true,\"reqId\":\"")
+                + EscapeJsonUtf8(reqId) + "\",\"actions\":[]}");
+        }
         return;
     }
     if (type == "previewScriptActions") {
@@ -3272,6 +3557,7 @@ void HandleBridgeMessage(const std::string& json) {
         JsonGetInt(json, "tab", tab);
         JsonGetString(json, "path", path);
         qst::engine::SelectHomeItem(tab, FromUtf8(path));
+        UpdateDesktopFloatBallModel();
         PostToJs("{\"type\":\"setHomeSelection.result\",\"ok\":true}");
         return;
     }
@@ -3437,6 +3723,38 @@ void HandleBridgeMessage(const std::string& json) {
         PostToJs(buf);
         return;
     }
+    if (type == "pickScreenDrag") {
+        const auto r = qst::desktop_tools::PickScreenDrag(g_hwnd);
+        if (!r.ok) {
+            const std::string detail = r.detail.empty() ? "cancelled" : r.detail;
+            PostToJs("{\"type\":\"pickScreenDrag.result\",\"ok\":false,\"detail\":\""
+                + EscapeJsonUtf8(detail) + "\"}");
+            return;
+        }
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+            "{\"type\":\"pickScreenDrag.result\",\"ok\":true,\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d,\"duration\":%.4f}",
+            r.x1, r.y1, r.x2, r.y2, r.durationSec);
+        PostToJs(buf);
+        return;
+    }
+    if (type == "pickTemplateDrag") {
+        std::string pathUtf8;
+        JsonGetString(json, "imagePath", pathUtf8);
+        const auto r = qst::desktop_tools::PickTemplateDrag(g_hwnd, FromUtf8(pathUtf8));
+        if (!r.ok) {
+            const std::string detail = r.detail.empty() ? "cancelled" : r.detail;
+            PostToJs("{\"type\":\"pickTemplateDrag.result\",\"ok\":false,\"detail\":\""
+                + EscapeJsonUtf8(detail) + "\"}");
+            return;
+        }
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+            "{\"type\":\"pickTemplateDrag.result\",\"ok\":true,\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d,\"duration\":%.4f}",
+            r.x1, r.y1, r.x2, r.y2, r.durationSec);
+        PostToJs(buf);
+        return;
+    }
     if (type == "getEngineStatus") {
         PushEngineStatusIfChanged(true);
         return;
@@ -3463,6 +3781,7 @@ void HandleBridgeMessage(const std::string& json) {
         }
         PostToJs(std::string("{\"type\":\"applyTheme.result\",\"ok\":true,\"settings\":")
             + qst::webview::JsonOpenSettings() + "}");
+        qst::desktop_tools::FloatBall::Instance().RefreshTheme();
         return;
     }
     if (type == "openThemeCustom") {
@@ -3518,16 +3837,20 @@ void HandleBridgeMessage(const std::string& json) {
     }
     if (type == "queryVhidStatus") {
         const auto st = qst::desktop_tools::QueryVhidInstallStatus();
-        char buf[384];
+        char buf[512];
         snprintf(buf, sizeof(buf),
             "{\"type\":\"queryVhidStatus.result\",\"ok\":true,"
             "\"hvciEnabled\":%s,\"rebootPending\":%s,\"driverReady\":%s,"
-            "\"installScriptPresent\":%s,\"pendingSb\":%s,\"lastExitCode\":%d}",
+            "\"installScriptPresent\":%s,\"packagePresent\":%s,\"hidDllPresent\":%s,"
+            "\"pendingSb\":%s,\"driverNeedsUpdate\":%s,\"lastExitCode\":%d}",
             st.hvciEnabled ? "true" : "false",
             st.rebootPending ? "true" : "false",
             st.driverReady ? "true" : "false",
             st.installScriptPresent ? "true" : "false",
+            st.packagePresent ? "true" : "false",
+            st.hidDllPresent ? "true" : "false",
             st.pendingSb ? "true" : "false",
+            st.driverNeedsUpdate ? "true" : "false",
             st.lastExitCode);
         PostToJs(buf);
         return;
@@ -3544,8 +3867,10 @@ void HandleBridgeMessage(const std::string& json) {
             PostToJs("{\"type\":\"pickImageFile.result\",\"ok\":false,\"detail\":\"cancelled\"}");
             return;
         }
+        const std::wstring copied = EnsureImageInLibrary(r.path);
+        const std::wstring stored = ImagePathForJson(copied.empty() ? r.path : copied);
         PostToJs(std::string("{\"type\":\"pickImageFile.result\",\"ok\":true,\"path\":\"")
-            + EscapeJsonUtf8(ToUtf8(r.path)) + "\"}");
+            + EscapeJsonUtf8(ToUtf8(stored.empty() ? r.path : stored)) + "\"}");
         return;
     }
     if (type == "findImageCrop") {
@@ -3600,6 +3925,16 @@ void HandleBridgeMessage(const std::string& json) {
         JsonGetDouble(json, "imageScaleMax", params.imageScaleMax);
         JsonGetInt(json, "syntheticW", params.syntheticW);
         JsonGetInt(json, "syntheticH", params.syntheticH);
+        JsonGetInt(json, "syntheticUseScreen", params.syntheticUseScreen);
+        JsonGetInt(json, "maxMatches", params.maxMatches);
+        JsonGetInt(json, "constrainToWindow", params.constrainToWindow);
+        std::string classUtf8, titleUtf8, exeUtf8;
+        JsonGetString(json, "windowClassName", classUtf8);
+        JsonGetString(json, "windowTitle", titleUtf8);
+        JsonGetString(json, "targetExePath", exeUtf8);
+        params.windowClassName = FromUtf8(classUtf8);
+        params.windowTitle = FromUtf8(titleUtf8);
+        params.targetExePath = FromUtf8(exeUtf8);
         const auto r = qst::desktop_tools::FindImageMatch(g_hwnd, params);
         if (!r.ok) {
             PostToJs(std::string("{\"type\":\"findImageMatch.result\",\"ok\":false,\"detail\":\"")
@@ -3835,6 +4170,14 @@ void HandleBridgeMessage(const std::string& json) {
         JsonGetDouble(json, "imageScaleMax", params.imageScaleMax);
         JsonGetString(json, "imagePath", imagePathUtf8);
         JsonGetString(json, "ocrSearchText", searchTextUtf8);
+        JsonGetInt(json, "constrainToWindow", params.constrainToWindow);
+        std::string classUtf8, titleUtf8, exeUtf8;
+        JsonGetString(json, "windowClassName", classUtf8);
+        JsonGetString(json, "windowTitle", titleUtf8);
+        JsonGetString(json, "targetExePath", exeUtf8);
+        params.windowClassName = FromUtf8(classUtf8);
+        params.windowTitle = FromUtf8(titleUtf8);
+        params.targetExePath = FromUtf8(exeUtf8);
         params.imagePath = FromUtf8(imagePathUtf8);
         params.ocrSearchText = FromUtf8(searchTextUtf8);
         const auto r = qst::desktop_tools::TestOcr(g_hwnd, params);
@@ -4043,10 +4386,12 @@ void HandleBridgeMessage(const std::string& json) {
 void ShowIncompletePackageError() {
     const std::wstring detail =
         L"安装包不完整或 WebView2 未能启动。\n\n"
-        L"请使用完整便携包（含 WebView2Fixed 文件夹），"
-        L"整夹拷贝后再运行，不要只复制 exe。\n\n"
+        L"请使用完整安装包/便携包（含 WebView2Fixed 文件夹），"
+        L"不要只复制 exe。\n\n"
+        L"若安装在 Program Files，浏览器数据在：\n"
+        L"%LOCALAPPDATA%\\QuickScriptTool\\WebView2UserData\n\n"
         L"本产品不要求也不引导安装系统 WebView2 Runtime。\n\n"
-        L"详见同目录 webview_boot.log / shell_startup.log。";
+        L"日志：同目录或 %LOCALAPPDATA%\\QuickScriptTool\\webview_boot.log";
     ShowShellError(detail.c_str());
 }
 
@@ -4136,9 +4481,7 @@ void InitWebView() {
         qst::webview::PostToWebUi(std::move(j));
     });
     g_browserFolder.clear();
-    g_userDataFolder = (std::filesystem::path(ExeDir()) / kUserDataDirName).wstring();
-    std::error_code ec;
-    std::filesystem::create_directories(g_userDataFolder, ec);
+    g_userDataFolder = WebView2UserDataDir();
     BootLogLineW(L"userData=" + g_userDataFolder);
 
 #if QST_WEBVIEW_USE_FIXED
@@ -4327,15 +4670,17 @@ static void LaunchWebView(const wchar_t* browserFolder, int attempt) {
                                         return S_OK;
                                     }).Get(), nullptr);
 
-                            g_webview->AddScriptToExecuteOnDocumentCreated(
-                                L"(function(){"
-                                L"document.documentElement.classList.add('qst-webview','shell-booting');"
+                            const std::wstring bootJs = std::wstring(L"(function(){")
+                                + UiScaleDocumentInitScript(false)
+                                + L"document.documentElement.classList.add('qst-webview','shell-booting');"
                                 L"document.addEventListener('contextmenu',function(e){e.preventDefault();},true);"
                                 L"window.qstBridge={post:function(o){"
                                 L"var s=(typeof o==='string')?o:JSON.stringify(o);"
                                 L"if(window.chrome&&chrome.webview)chrome.webview.postMessage(s);"
                                 L"}};"
-                                L"})();",
+                                L"})();";
+                            g_webview->AddScriptToExecuteOnDocumentCreated(
+                                bootJs.c_str(),
                                 nullptr);
 
                             ResizeWebView();
@@ -4383,6 +4728,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetAgentUiNotifyHwnd(hwnd);
         return 0;
     case WM_AGENT_SCRIPT_LIBRARY_CHANGED:
+        qst::engine::ReloadScheduledTasks();
+        if (wp != 0) {
+            const std::wstring touchId = ConsumeAgentIntervalTouchId();
+            if (!touchId.empty()) qst::engine::TouchScheduledIntervalClock(touchId);
+        }
         if (g_webview) {
             g_webview->PostWebMessageAsJson(WidenUtf8(
                 std::string("{\"type\":\"listScripts.result\",\"ok\":true,\"scripts\":")
@@ -4390,12 +4740,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_webview->PostWebMessageAsJson(WidenUtf8(
                 std::string("{\"type\":\"listRecordings.result\",\"ok\":true,\"recordings\":")
                 + qst::webview::JsonListRecordings() + "}").c_str());
+            g_webview->PostWebMessageAsJson(WidenUtf8(
+                std::string("{\"type\":\"listScheduledTasks.result\",\"ok\":true,\"data\":")
+                + qst::webview::JsonListScheduledTasks() + "}").c_str());
         }
         return 0;
     case WM_TIMER:
         if (wp == kStatusTimerId) {
             EnsureTrayIcon();
             PushEngineStatusIfChanged(false);
+            // 产品 UI 在可见主窗；headless 引擎窗的 SetTimer 可能被 coalescing 饿死。
+            qst::engine::TickScheduledTasks();
             return 0;
         }
         if (wp == kPrewarmTimerId) {
@@ -4441,6 +4796,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_webviewAttempt == 0 && !g_mainContentReady && !g_mainNavSucceeded) {
                 RequestEvergreenFallback(4);
             }
+            return 0;
+        }
+        if (wp == kEditorCloseFlushTimerId) {
+            KillTimer(hwnd, kEditorCloseFlushTimerId);
+            FinishAppClose(hwnd);
             return 0;
         }
         if (wp == kWebHotkeyHoldTimerId) {
@@ -4494,7 +4854,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             designH = kOptClientH;
         }
         int outerW = 0, outerH = 0;
-        ClientToOuterSize(designW, designH, outerW, outerH);
+        ClientToOuterSize(ScaledDesignPx(designW), ScaledDesignPx(designH), outerW, outerH);
         mmi->ptMinTrackSize.x = outerW;
         mmi->ptMinTrackSize.y = outerH;
         mmi->ptMaxTrackSize.x = outerW;
@@ -4513,6 +4873,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ApplyUiMode(mode);
         return 0;
     }
+    case WM_APPLY_UI_SCALE:
+        ApplyShellLayoutScale();
+        return 0;
     case WM_BRIDGE_POST_JS: {
         auto* payload = reinterpret_cast<std::string*>(lp);
         if (payload) {
@@ -4606,19 +4969,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RestoreMainWindow();
         return 0;
     case WM_CLOSE:
-        qst::engine::StopClicker();
-        qst::engine::StopScript();
-        qst::webview::StopClicker();
-        KillTimer(hwnd, kStatusTimerId);
-        KillTimer(hwnd, kWindowModePreviewTimerId);
-        g_wmPreview.Destroy();
-        g_wmPreviewTarget = nullptr;
-        DestroyDebugWebWindow();
-        DestroyAgentWebWindow();
-        RemoveTrayIcon();
-        DestroyWindow(hwnd);
+        if (g_mode == UiMode::Editor && !g_appClosing && !g_editorCloseFlushSent) {
+            g_editorCloseFlushSent = true;
+            PostToJs("{\"type\":\"app.closing\"}");
+            SetTimer(hwnd, kEditorCloseFlushTimerId, 8000, nullptr);
+            return 0;
+        }
+        FinishAppClose(hwnd);
         return 0;
     case WM_DESTROY:
+        qst::desktop_tools::FloatBall::Instance().Destroy();
         qst::engine::StopClicker();
         qst::webview::StopClicker();
         RemoveTrayIcon();
@@ -4665,11 +5025,45 @@ void HotkeyLogLine(const std::string& line) {
 
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     g_instance = inst;
-    StartupTrace("wWinMain enter");
-    if (!EnsureOpenCvLoadable()) {
-        return 1;
+    // ★--mcp：把产品当 MCP server 跑（stdio，一行一个 JSON-RPC）。
+    // 必须在任何 UI/单实例/WebView2 初始化之前分流：MCP 客户端会以管道方式反复拉起它，
+    // 不能弹窗、不能抢单实例锁、不能初始化 WebView2。
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        bool mcpFlag = false;
+        if (argv) {
+            for (int i = 1; i < argc; ++i) {
+                if (lstrcmpiW(argv[i], L"--mcp") == 0) mcpFlag = true;
+            }
+            LocalFree(argv);
+        }
+        if (mcpFlag) return RunMcpStdioServer();
     }
-    StartupTrace("after opencv");
+    {
+        bool nativeFlag = false;
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            for (int i = 1; i < argc; ++i) {
+                if (lstrcmpiW(argv[i], L"--ext-native-host") == 0) nativeFlag = true;
+            }
+            LocalFree(argv);
+        }
+        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        const bool piped = in && out
+            && in != INVALID_HANDLE_VALUE && out != INVALID_HANDLE_VALUE
+            && GetFileType(in) == FILE_TYPE_PIPE
+            && GetFileType(out) == FILE_TYPE_PIPE;
+        if (nativeFlag || piped) {
+            return windowmode::RunExtNativeMessagingHost();
+        }
+    }
+    StartupTrace("wWinMain enter");
+    RecordLastRunAppDir();
+    ProbeOptionalOpenCv();
+    StartupTrace("after opencv probe");
 
     using SetDpi = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
     if (auto fn = reinterpret_cast<SetDpi>(
@@ -4728,6 +5122,9 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         return 1;
     }
     StartupTrace("engine Start ok");
+    qst::webview::ReloadSettingsFromDisk();
+    UiScaleSetUserFactor(qst::webview::Ctx().settings.other.uiScaleFactor);
+    UiScaleInitFromPrimaryMonitor();
     input_emergency::RegisterExtraTeardown(EmergencyUnhookWebCaptureLl);
     CleanOrphanImages();
     StartupTrace("after CleanOrphanImages");
@@ -4745,7 +5142,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     StartupTrace("wndclass ok");
 
     int ww = 0, wh = 0;
-    ClientToOuterSize(g_homeClientW, g_homeClientH, ww, wh);
+    ClientToOuterSize(ScaledDesignPx(g_homeClientW), ScaledDesignPx(g_homeClientH), ww, wh);
 
     g_hwnd = CreateWindowExW(
         WindowExStyle(),
@@ -4791,6 +5188,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     }
     StartupTrace("window shown/cloaked");
     EnsureTrayIcon();
+    EnsureDesktopFloatBall();
     StartupTrace(g_trayActive ? "tray ok" : "tray failed");
     if (!g_trayActive) {
         // 托盘失败时立刻露出主窗，避免整进程「隐身」
@@ -4814,6 +5212,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         DispatchMessageW(&msg);
     }
     RemoveTrayIcon();
+    qst::desktop_tools::FloatBall::Instance().Destroy();
     qst::engine::Shutdown();
     CoUninitialize();
     if (g_mutex) CloseHandle(g_mutex);

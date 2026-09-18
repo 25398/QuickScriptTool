@@ -15,6 +15,10 @@ bool ActionUsesInterRepeatInterval(ActionType type) {
     case ActionType::MousePlayback:
     case ActionType::RunMacro:
     case ActionType::RunBlock:
+    case ActionType::FindImage:
+    case ActionType::MultiMatch:
+    case ActionType::TextRecognition:
+    case ActionType::FindColor:
         return true;
     default:
         return false;

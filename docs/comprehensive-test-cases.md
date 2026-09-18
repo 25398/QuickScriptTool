@@ -204,6 +204,7 @@ foreach ($t in @(
 | WM-04 | P0 | 选择方式：启动时选择 / 启动时鼠标位置 / 编辑器类名 / 不选择 | 各模式行为符合文案 |
 | WM-05 | P0 | 宏内找图（客户区坐标） | 匹配率正常（非长期 0%）；偏移点击落在客户区正确点 |
 | WM-06 | P0 | 快捷输入到目标 | 文字进入目标；运行中热键停止可取消未打完字符 |
+| WM-06b | P0 | Chromium 壳/CEF（含 WinForms 宿主）里脚本 Ctrl+V 组合键 | 组合键成立（不出现「只出 v 不粘贴」）；`soft_key_combo_state_race` 绿（软键状态不得抢在事件之前） |
 | WM-07 | P1 | IME/工具条干扰 | 不绑到 `SoPY` 等输入法条 |
 | WM-08 | P1 | 目标最小化 / 无渲染 / 权限不匹配 | `WindowModeHealth` 提示；`blockRunWhenUnhealthy` 时阻止运行 |
 | WM-09 | P1 | 预览缩略图开关与刷新间隔 | 设置生效；不影响绑窗 |
@@ -220,6 +221,7 @@ foreach ($t in @(
 | BG-02 | P0 | 绑定已存在含 Edit 的窗；类名指定到子控件 | `TargetHwnd` 为子 Edit，截图非整框错位 |
 | BG-03 | P0 | 后台找图 + 点击 | 目标窗不必前台；点击落在客户区正确位置 |
 | BG-04 | P0 | 后台快捷输入 | 文本进入；前台焦点可保持在其他窗（无 fallback） |
+| BG-04b | P0 | 游戏/Qt 类窗口（走窗口消息）后台快捷输入连打两个相同数字 | 两字都进；`posted_quick_keys_timing` 绿（逐字 `DOWN→按住≥1帧→UP→间隔`，禁止零间隔连发，否则吞字） |
 | BG-05 | P1 | `allowForegroundInputFallback=false` 时输入失败场景 | 不抢焦点；有明确失败/健康状态 |
 | BG-06 | P1 | fallback=true | 仅「后台全失败」时短暂前台输入 |
 | BG-07 | P1 | 取消/停止 | 与桌面同样迅速响应 |

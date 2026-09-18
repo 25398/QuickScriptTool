@@ -68,6 +68,7 @@ inline const wchar_t* ContainerTypeLabel(ActionType type) {
     if (type == ActionType::If) return L"条件-如果";
     if (type == ActionType::Else) return L"条件-否则";
     if (type == ActionType::DefineBlock) return L"定义宏指令块";
+    if (type == ActionType::WatchImage) return L"找图监视";
     return L"容器";
 }
 

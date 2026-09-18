@@ -77,14 +77,24 @@ using StatusCallback = std::function<void(const std::wstring& status)>;
 
 struct AiHttpAbortSlot {
     std::atomic<HINTERNET> request{nullptr};
+    /// Abort() 已经关过句柄（所有权已转移给它）→ RAII 守卫不要再关一次：
+    /// 重复关同一个句柄值有误关「已被系统复用给别人的句柄」的风险。
+    std::atomic_bool closed{false};
 
-    void Set(HINTERNET h) { request.store(h); }
+    void Set(HINTERNET h) {
+        closed.store(false, std::memory_order_release);
+        request.store(h, std::memory_order_release);
+    }
     void Clear() { request.store(nullptr); }
-    // 用户强制中断：关闭进行中的请求句柄以解除 WinHTTP 阻塞
+    // 用户强制中断 / 看门狗策略超时：关闭进行中的请求句柄以解除 WinHTTP 阻塞
     void Abort() {
         HINTERNET h = request.exchange(nullptr);
-        if (h) WinHttpCloseHandle(h);
+        if (!h) return;
+        closed.store(true, std::memory_order_release);
+        WinHttpCloseHandle(h);
     }
+    /// 一次性取走「已被 Abort 关闭」标记（RAII 守卫用）
+    bool ConsumeClosed() { return closed.exchange(false, std::memory_order_acq_rel); }
 };
 
 struct AgentSendCallbacks {
@@ -179,3 +189,17 @@ private:
     std::vector<AgentTool> tools_;
     AiHttpAbortSlot* activeHttpAbort_ = nullptr;
 };
+
+/// 终态工具结果转成对用户可见的短回复：去掉动作一览与内部约束提示。
+std::wstring AgentUserFacingToolReply(const std::wstring& toolResult);
+
+/// 是否对当前网关/模型下发 `thinking.type=disabled`。
+/// 2026-09-16 起默认**允许思考**（准确率优先；复杂任务如办公文档/多步规划明显受益），
+/// 「只想不调工具」由上一轮未调工具就催的机制兜底；设环境变量 QST_FAST_THINKING=1
+/// 可恢复旧的「强制快速执行」行为（仅对原本支持该开关的网关生效）。
+bool ShouldDisableThinking(const std::wstring& apiUrl, const std::wstring& model);
+
+/// 「上一轮只想不干」→ 接下来 N 轮关掉思考，强制直接动手（通用提速）。
+/// 由工具循环在检测到「长思考但没调工具」时调用；每发出一次请求消费一轮。
+void SuppressThinkingForNextRounds(int rounds);
+void NoteThinkingRoundConsumed();

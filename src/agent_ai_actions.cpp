@@ -62,10 +62,17 @@ bool ModelSupportsVision(const std::wstring& modelName) {
     const std::wstring lower = ToLowerCopy(Trim(modelName));
     if (lower.empty()) return false;
 
-    // 纯文本 DeepSeek 聊天/推理系列（勿因名字含其它词误判）
-    if (lower.find(L"deepseek") != std::wstring::npos
-        && lower.find(L"vl") == std::wstring::npos
-        && lower.find(L"vision") == std::wstring::npos) {
+    // DeepSeek：**v4 起是原生多模态**（v4-flash / v4.1-flash / *-vision 都能收图），
+    // 而 V3.x / R1 / chat / reasoner 仍是纯文本。
+    // ★这里曾经是「名字里带 deepseek 且没有 vl/vision 就一律纯文本」——于是用户选的
+    //   「deepseek v4.1 flash」被判成不能识图，动作模型被静默换成豆包（用户实测报障）。
+    if (lower.find(L"deepseek") != std::wstring::npos) {
+        if (lower.find(L"vl") != std::wstring::npos
+            || lower.find(L"vision") != std::wstring::npos
+            || lower.find(L"v4") != std::wstring::npos
+            || lower.find(L"v5") != std::wstring::npos) {
+            return true;
+        }
         return false;
     }
 
@@ -114,11 +121,18 @@ std::wstring ResolveAiModelName(const quickscript::AiApiSettings& ai,
         if (!requireVision || ModelSupportsVision(pref)) return pref;
     }
 
+    // ★用户当前配置的模型（设置→AI助手）优先于「列表里的第一个」：
+    // 动作没写模型名时，用户的期望显然是「就用我设置里选的那个」，
+    // 而不是「我添加过的第一个模型」（实测：动作没写模型 → 跑成列表第 1 个的豆包）。
+    if (!ai.modelName.empty() && (!requireVision || ModelSupportsVision(ai.modelName))) {
+        return ai.modelName;
+    }
+
     if (requireVision) {
         for (const auto& m : ai.savedModels) {
             if (ModelSupportsVision(m.modelName)) return m.modelName;
         }
-        if (ModelSupportsVision(ai.modelName)) return ai.modelName;
+        return L"";
     }
 
     for (const auto& m : ai.savedModels) {
@@ -168,6 +182,8 @@ bool ApplyResolvedAiModelToActionParams(nlohmann::json& params) {
         && (!ActionRequiresVisionModel(type, params) || ModelSupportsVision(preferred))) {
         return false;
     }
+    // AI 动作执行同样不在这里改写模型（识图由运行时按能力决定，见 EnsureAiModelOnAction）
+    if (type == L"aiActionExecute") return false;
 
     const quickscript::AppSettings settings = LoadAgentAppSettings();
     const std::wstring resolved = ResolveAiModelName(
@@ -189,6 +205,10 @@ void EnsureAiModelOnAction(ScriptAction& action) {
         && (!ActionRequiresVisionModel(action) || ModelSupportsVision(action.aiModelName))) {
         return;
     }
+    // ★AI 动作执行不改写模型：识图需要由**运行时**按模型能力决定（`RunAiActionExecuteForAction`
+    // 会在带图执行时改用识图模型并打诊断），写库时静默替换会把用户选的模型永久换成别的
+    //（用户实测：选了 deepseek-v4.1-flash，脚本里被存成豆包，之后再也不会用回自己选的模型）。
+    if (action.type == ActionType::AiActionExecute) return;
     action.aiModelName = ResolveAiModelName(
         settings.ai, ActionRequiresVisionModel(action), action.aiModelName);
 }

@@ -40,6 +40,9 @@
     actionSel: -1,
     batchMode: false,
     batchSel: {},
+    editorUndo: [],
+    editorRedo: [],
+    editorClipboard: null,
     // 对齐原生 popupAction_ 默认 sel=0（移动鼠标）；打开已有宏时由首条动作覆盖
     addActionType: "moveMouse",
     addPreview: null,
@@ -94,10 +97,27 @@
     { t: "相对坐标", mode: 2 },
     { t: "图片定位", mode: 3 },
   ];
+  // 假焦点注入技术（仅展示“独立”方案与“复合”方案；
+  // 被复合覆盖的单独项不再上菜单，命令行/自测仍可用）
+  const WM_TECH_LIST = [
+    { v: 0, t: "经典远线程", d: "最普通的注入方式，先拿它做基线对照" },
+    { v: 1, t: "NtCreateThreadEx", d: "换种方式建线程，能绕过一部分 API 检测" },
+    { v: 2, t: "APC 注入", d: "借目标自己的线程干活，不新建线程" },
+    { v: 6, t: "窗口消息钩子", d: "走系统消息钩子路径，看起来像正常软件" },
+    { v: 7, t: "手动映射+线程劫持", d: "组合拳：不新建线程，模块列表也看不到" },
+    { v: 8, t: "XOR+映射+劫持", d: "最隐蔽全套：加密文件+手动映射+借线程执行" },
+    { v: 10, t: "映像节映射+线程劫持", d: "按系统映像方式映射，内存里像正常加载的 DLL，也不新建线程" },
+  ];
   const ED_MODES = [
     { t: "默认模式", v: 0 },
     { t: "窗口模式", v: 1 },
     { t: "后台窗口模式", v: 2 },
+  ];
+  const NESTED_USE_MODES = [
+    { t: "默认模式", v: 0 },
+    { t: "窗口模式", v: 1 },
+    { t: "后台窗口模式", v: 2 },
+    { t: "继承模式", v: 3 },
   ];
   const WM_METHODS = [
     { t: "启动时使用当前所在窗口", v: "selectOnStartup" },
@@ -115,7 +135,7 @@
     { t: "移动鼠标到", v: "moveMouse" },
     { t: "等待", v: "wait" },
     { t: "鼠标点击", v: "mouseClick" },
-    { t: "鼠标回放", v: "mousePlayback" },
+    { t: "运行录制回放", v: "mousePlayback" },
     { t: "运行鼠标宏", v: "runMacro" },
     { t: "鼠标按下", v: "mouseDown" },
     { t: "鼠标松开", v: "mouseUp" },
@@ -152,6 +172,102 @@
     { t: "跳转", v: "goto" },
     { t: "相对移动鼠标", v: "moveMouseRelative" },
   ];
+  const MERGE_CONTAINER_TYPES = ACTION_TYPES.filter(
+    (a) => a.v === "loop" || a.v === "defineBlock" || a.v === "if" || a.v === "else"
+  );
+  let _mergeUiOn = false;
+
+  function knownActionTypeMap() {
+    const m = new Map();
+    ACTION_TYPES.forEach((a) => m.set(a.v, a));
+    return m;
+  }
+
+  function normalizeActionCatalog(other) {
+    const known = ACTION_TYPES.map((a) => a.v);
+    const knownSet = new Set(known);
+    const rawOrder = Array.isArray(other && other.editorActionOrder) ? other.editorActionOrder : [];
+    const order = [];
+    const seen = new Set();
+    for (const t of rawOrder) {
+      if (typeof t !== "string" || !knownSet.has(t) || seen.has(t)) continue;
+      seen.add(t);
+      order.push(t);
+    }
+    for (const t of known) {
+      if (!seen.has(t)) order.push(t);
+    }
+    const rawHidden = Array.isArray(other && other.editorHiddenActions)
+      ? other.editorHiddenActions
+      : [];
+    const hidden = [];
+    const hiddenSeen = new Set();
+    for (const t of rawHidden) {
+      if (typeof t !== "string" || !knownSet.has(t) || hiddenSeen.has(t)) continue;
+      hiddenSeen.add(t);
+      hidden.push(t);
+    }
+    if (hidden.length >= order.length && order.length) {
+      const keep = order[0];
+      const idx = hidden.indexOf(keep);
+      if (idx >= 0) hidden.splice(idx, 1);
+    }
+    return { order, hidden };
+  }
+
+  function pickerActionTypes(extraType) {
+    const other = (state.settings && state.settings.other) || {};
+    const { order, hidden } = normalizeActionCatalog(other);
+    const hiddenSet = new Set(hidden);
+    const byV = knownActionTypeMap();
+    const list = [];
+    for (const v of order) {
+      if (hiddenSet.has(v) && v !== extraType) continue;
+      const a = byV.get(v);
+      if (a) list.push(a);
+    }
+    if (extraType && !list.some((a) => a.v === extraType)) {
+      const a = byV.get(extraType);
+      if (a) list.push(a);
+    }
+    return list.length ? list : ACTION_TYPES.slice();
+  }
+
+  function pickerMergeContainerTypes() {
+    const allowed = new Set(["loop", "defineBlock", "if", "else"]);
+    const list = pickerActionTypes().filter((a) => allowed.has(a.v));
+    return list.length ? list : MERGE_CONTAINER_TYPES.slice();
+  }
+
+  function firstVisibleActionType() {
+    const t = pickerActionTypes()[0];
+    return (t && t.v) || "moveMouse";
+  }
+
+  function syncEditorActionTypeCombo() {
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const keep = shown && shown.type ? String(shown.type) : "";
+    const hidden = new Set(
+      normalizeActionCatalog((state.settings && state.settings.other) || {}).hidden
+    );
+    const prev = state.addActionType;
+    if (state.addActionType && hidden.has(state.addActionType) && state.addActionType !== keep) {
+      state.addActionType = firstVisibleActionType();
+    }
+    const typeCombo = $("#edActionType");
+    if (!typeCombo) return;
+    const mergeOn = typeof isMergeEligible === "function" && isMergeEligible();
+    const types = mergeOn ? pickerMergeContainerTypes() : pickerActionTypes(state.addActionType);
+    let cur = types.find((a) => a.v === state.addActionType);
+    if (!cur) {
+      cur = types[0];
+      if (cur) state.addActionType = cur.v;
+    }
+    if (cur) typeCombo.textContent = cur.t;
+    if (state.editor && state.addPreview && prev !== state.addActionType && prev !== keep) {
+      showAddTypePreview();
+    }
+  }
 
   function toast(msg) {
     const el = $("#toast");
@@ -279,7 +395,7 @@
       stopMacro: "结束宏运行",
       endLoop: "跳出循环",
       moveMouse: "移动鼠标到",
-      mousePlayback: "鼠标回放",
+      mousePlayback: "运行录制回放",
       runMacro: "运行鼠标宏",
       hotkeyShortcut: "快捷按键",
       defineBlock: "定义宏指令块",
@@ -422,11 +538,11 @@
       case "defineBlock":
         return "定义宏指令块[" + (a.blockName || "未命名") + "]";
       case "runBlock":
-        return "运行宏指令块[" + (a.blockName || "未命名") + "]";
+        return "运行宏指令块[" + (a.blockName || "未命名") + "]" + repeatInfo(a);
       case "runMacro":
-        return "运行鼠标宏[" + (a.blockName || "未选择") + "]";
+        return "运行鼠标宏[" + (a.blockName || "未选择") + "]" + repeatInfo(a);
       case "mousePlayback":
-        return "鼠标回放[" + (a.blockName || "未选择") + "]" + repeatInfo(a);
+        return "运行录制回放[" + (a.blockName || "未选择") + "]" + repeatInfo(a);
       case "hotkeyShortcut": {
         const idx = Math.max(0, Math.min(SHORTCUT_LABELS.length - 1, a.shortcutPreset | 0));
         return "快捷按键[" + SHORTCUT_LABELS[idx] + "]" + repeatInfo(a);
@@ -541,6 +657,8 @@
     if (i < 0 || !state.editorActions[i]) return;
     const row = document.querySelector(`#actionList .arow[data-i="${i}"] .aname-text`);
     if (row) row.textContent = displayActionName(state.editorActions[i]);
+    const V = window.QstVisualEditor;
+    if (V && typeof V.refreshCard === "function") V.refreshCard(i);
     const remarkCell = document.querySelector(`#actionList .arow[data-i="${i}"] span:nth-child(3)`);
     // 备注列在 aname 后；批量/选中时 class 不同，稳妥用整行刷新时更新
     void remarkCell;
@@ -554,6 +672,19 @@
     state.editDraft = JSON.parse(JSON.stringify(state.editorActions[state.actionSel]));
     delete state.editDraft._preview;
     return state.editDraft;
+  }
+
+  function captureParamPanelIntoDraft() {
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    if (state.addPreview) {
+      readParamPanelInto(state.addPreview);
+      state.addPreview.remark = remark;
+      return;
+    }
+    if (state.actionSel >= 0 && state.editDraft) {
+      readParamPanelInto(state.editDraft);
+      state.editDraft.remark = remark;
+    }
   }
 
   /** 当前参数面板动作：添加预览 或 选中项草稿（未点修改前不碰列表） */
@@ -583,6 +714,8 @@
     }
     const next = Object.assign({}, state.editDraft);
     next.indent = prev.indent;
+    if (typeof prev._vx === "number") next._vx = prev._vx;
+    if (typeof prev._vy === "number") next._vy = prev._vy;
     if (prev.no != null) next.no = prev.no;
     if (prev.originalNo != null) next.originalNo = prev.originalNo;
     next.name = typeLabel(next.type);
@@ -615,6 +748,8 @@
     }
     const next = Object.assign({}, state.editDraft);
     next.indent = prev.indent;
+    if (typeof prev._vx === "number") next._vx = prev._vx;
+    if (typeof prev._vy === "number") next._vy = prev._vy;
     if (prev.no != null) next.no = prev.no;
     if (prev.originalNo != null) next.originalNo = prev.originalNo;
     next.name = typeLabel(next.type);
@@ -649,7 +784,8 @@
       if (copy.type === "timerRecordTime" && !copy.loopVarName && copy.matchVarName) {
         copy.loopVarName = copy.matchVarName;
       }
-      // matchThreshold: disk may be 0~1 or 0~100; panel uses percent
+      // parseEscapes：缺省 0；旧 JSON 缺字段时按不解析
+      if (copy.parseEscapes == null) copy.parseEscapes = 0;
       if (copy.matchThreshold != null) {
         let thr = Number(copy.matchThreshold);
         if (thr > 0 && thr <= 1) thr *= 100;
@@ -698,6 +834,7 @@
       offsetY: 0,
       inputText: "",
       charInterval: 0.01,
+      parseEscapes: 0,
       scrollSteps: 1,
       scrollDirection: 0,
       scrollVertical: 1,
@@ -739,21 +876,38 @@
       base.duration = 0.01;
       base.randomDuration = 0;
       base.playbackSpeed = 1;
+      base.useMode = 3;
+      base.breakoutTimeSeconds = 0;
+      base.nestedWindowMode = {};
     }
     if (t === "runMacro") {
       base.blockName = "";
       base.targetPath = "";
+      base.clickCount = 1;
+      base.duration = 0.01;
+      base.randomDuration = 0;
+      base.useMode = 3;
+      base.breakoutTimeSeconds = 0;
+      base.nestedWindowMode = {};
     }
     if (t === "loop") base.loopCount = -1;
     if (t === "quickInput") {
       base.inputText = "hello";
       base.charInterval = 0.01;
+      base.parseEscapes = 0;
     }
     if (t === "hotkeyShortcut") {
       base.keyText = "Ctrl+C";
       base.shortcutPreset = 0;
     }
-    if (t === "defineBlock" || t === "runBlock") base.blockName = "block1";
+    if (t === "defineBlock" || t === "runBlock") {
+      base.blockName = "block1";
+      if (t === "runBlock") {
+        base.clickCount = 1;
+        base.duration = 0.01;
+        base.randomDuration = 0;
+      }
+    }
     if (t === "runProgram" || t === "closeProgram" || t === "openFile" || t === "activateWindow")
       base.targetPath = "";
     if (t === "activateWindow") base.targetPath = "Excel";
@@ -884,6 +1038,7 @@
     const keepAgent = opts && opts.keepAgent;
     if (state.pendingKind === "askInput") {
       state._askInputOk = null;
+      state._askInputAllowEmpty = false;
       state.pendingKind = null;
     }
     const closingHotkey = !!$("#ov-hotkey")?.classList.contains("show");
@@ -898,6 +1053,7 @@
       if (o.id === "ov-agent") o.classList.remove("agent-min");
     });
     hidePopup();
+    state._nestedWmPick = false;
     requestAnimationFrame(syncTypingHotkeyMute);
     if (closingHotkey) stopWebHotkeyCapture();
     if (closingActionKey) stopActionKeyCapture();
@@ -922,14 +1078,16 @@
     $$("#settingsTabs .st-tab").forEach((t) =>
       t.classList.toggle("active", t.dataset.stab === stab)
     );
-    // 专业模式会把设置 dlg 挪出 #ov-settings，不能只查 overlay 下的 pane
-    document.querySelectorAll(".set-pane[data-pane]").forEach((p) =>
-      p.classList.toggle("active", p.dataset.pane === stab)
-    );
+    // 专业模式会把设置 dlg 挪出 #ov-settings，不能只查 overlay 下的 pane。
+    // 勿动 #ov-editor-settings：否则会把编辑器设置页的 .active 清掉，内容 display:none。
+    document.querySelectorAll(".set-pane[data-pane]").forEach((p) => {
+      if (p.closest("#ov-editor-settings")) return;
+      p.classList.toggle("active", p.dataset.pane === stab);
+    });
   }
 
   function quietSaveSettings(partial) {
-    if (!window.qst) return;
+    if (!window.qst || partial == null) return;
     state._quietSaveSettings = true;
     qst.saveSettings(partial || {});
   }
@@ -959,17 +1117,20 @@
     state._progressiveToken = (state._progressiveToken | 0) + 1;
     document.body.classList.remove("progressive-editor", "progressive-opt");
     document.body.classList.add("progressive-load", "progressive-" + kind);
+    state._actionListRendering = false;
     if (kind === "editor") {
       showContentSkeleton("actionList", 10);
       if ($("#edCount")) $("#edCount").textContent = "…";
       // 右栏立刻清晰显示固定「移动鼠标」预览（不参与列表模糊）
-      state.addActionType = "moveMouse";
+      state.addActionType = firstVisibleActionType();
       state.actionSel = -1;
       state.addPreview = null;
       state.editDraft = null;
       const typeCombo = $("#edActionType");
       if (typeCombo) {
-        const cur = ACTION_TYPES.find((a) => a.v === "moveMouse") || ACTION_TYPES[0];
+        const cur =
+          pickerActionTypes(state.addActionType).find((a) => a.v === state.addActionType) ||
+          ACTION_TYPES[0];
         typeCombo.textContent = cur.t;
       }
       showAddTypePreview();
@@ -1314,6 +1475,17 @@
     } else {
       titleEl.textContent = PRODUCT_NAME;
     }
+    syncSettingsGear();
+  }
+
+  function syncSettingsGear() {
+    const btn = $("#btnSettings");
+    if (!btn) return;
+    const inEditor = !!state.editor;
+    const pro = (window.ProMode ? window.ProMode.mode() : state.uiMode) === "pro";
+    btn.hidden = pro && !inEditor;
+    btn.title = inEditor ? "鼠标宏编辑设置" : "设置";
+    btn.setAttribute("aria-label", btn.title);
   }
 
   /** 极简 / 专业模式切换：只切壳与可见区域，两套交互逻辑互不触碰 */
@@ -1351,10 +1523,8 @@
     const views = $("#views");
     if (nav) nav.style.display = pro ? "none" : "";
     if (views) views.style.display = pro ? "none" : "";
-    // 专业模式顶栏已有「设置」Tab，隐藏标题栏重复齿轮
     document.documentElement.classList.toggle("pro-ui", !!pro);
-    const btnSet = $("#btnSettings");
-    if (btnSet) btnSet.hidden = !!pro;
+    syncSettingsGear();
     // 仅首次打开主界面居中；之后（含模式切换）保持原位
     const center =
       opts && Object.prototype.hasOwnProperty.call(opts, "center")
@@ -1376,7 +1546,15 @@
       }
     }
     syncUiModeRadios();
-    if (window.qst && typeof quietSaveSettings === "function") {
+    // 只由主壳 + ProMode 写回 uiMode。助手窗没有 pro-mode.js，state 默认 simple，
+    // 若这里静默保存会把专业模式冲成极简，录制倍速勾选失效。
+    if (
+      !AGENT_SHELL &&
+      window.ProMode &&
+      window.qst &&
+      typeof quietSaveSettings === "function" &&
+      state._gotSettings
+    ) {
       quietSaveSettings({ uiMode: pro ? "pro" : "simple" });
     }
   }
@@ -1578,6 +1756,7 @@
           ? `「${mac.name}」· 专属 ${own}`
           : `「${mac.name}」· 未设专属热键`;
       }
+      // 底栏键位 = 全局启停（点它改全局）。专属热键只在卡片上改，避免改了 F12 却仍显示脚本的 →。
       if (ctaMacroKey) {
         ctaMacroKey.hidden = false;
         ctaMacroKey.textContent = hk;
@@ -1816,6 +1995,15 @@
     if (i) i.textContent = "";
   }
 
+  function syncWmInjectUi() {
+    const on = !!$("#setWmEnableInject")?.classList.contains("on");
+    const tech = $("#setWmInjectTech");
+    if (tech) {
+      tech.style.opacity = on ? "" : "0.45";
+      tech.style.pointerEvents = on ? "" : "none";
+    }
+  }
+
   const PLAYBACK_SPEED_NODES = [0.25, 0.5, 0.75, 1, 1.25, 2, 4];
   const PLAYBACK_SPEED_SNAP = 0.035;
 
@@ -1923,7 +2111,6 @@
     quietSaveSettings({
       playbackSpeed: readPlaybackSpeedValue(),
       enablePlaybackSpeed: !!$("#setPlaySpeedEn")?.classList.contains("on"),
-      uiMode: (window.ProMode ? window.ProMode.mode() : state.uiMode) || "simple",
     });
   }
 
@@ -1934,6 +2121,7 @@
     let dragging = false;
     const readVal = opts.readValue || readPlaybackSpeedValue;
     const writeVal = opts.setValue || setPlaybackSpeedValue;
+
     function posFromEvent(ev) {
       const r = track.getBoundingClientRect();
       if (r.width <= 0) return 0.5;
@@ -1942,11 +2130,14 @@
     function applyFromEvent(ev, snap) {
       writeVal(playbackPosToSpeed(posFromEvent(ev), snap));
     }
+
     root.addEventListener("pointerdown", (ev) => {
       if (ev.button != null && ev.button !== 0) return;
       ev.preventDefault();
       dragging = true;
-      try { root.setPointerCapture(ev.pointerId); } catch (e) {}
+      try {
+        root.setPointerCapture(ev.pointerId);
+      } catch (e) {}
       applyFromEvent(ev, true);
     });
     root.addEventListener("pointermove", (ev) => {
@@ -1961,6 +2152,29 @@
     };
     root.addEventListener("pointerup", endDrag);
     root.addEventListener("pointercancel", endDrag);
+    root.addEventListener("keydown", (ev) => {
+      const cur = readVal();
+      const last = PLAYBACK_SPEED_NODES.length - 1;
+      const pos = playbackSpeedToPos(cur);
+      const step = 1 / last / 8;
+      let next = null;
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowDown") {
+        ev.preventDefault();
+        next = playbackPosToSpeed(pos - step, true);
+      } else if (ev.key === "ArrowRight" || ev.key === "ArrowUp") {
+        ev.preventDefault();
+        next = playbackPosToSpeed(pos + step, true);
+      } else if (ev.key === "Home") {
+        ev.preventDefault();
+        next = 0.25;
+      } else if (ev.key === "End") {
+        ev.preventDefault();
+        next = 4;
+      }
+      if (next == null) return;
+      writeVal(next);
+      if (typeof opts.onCommit === "function") opts.onCommit();
+    });
     writeVal(readVal());
   }
 
@@ -1972,6 +2186,227 @@
         onCommit: persistPlaybackSpeedSettings,
       });
     });
+  }
+
+  function otherFlag(other, key, defaultOn) {
+    if (!other || other[key] == null) return !!defaultOn;
+    return !!other[key];
+  }
+
+  function editorDefaultViewOf(other) {
+    return other && other.editorDefaultView === "visual" ? "visual" : "code";
+  }
+
+  function editorVisualFromState() {
+    const other = (state.settings && state.settings.other) || {};
+    return {
+      editorDefaultView: editorDefaultViewOf(other),
+      visualLoopWrap: otherFlag(other, "visualLoopWrap", true),
+      visualBlockCallWires: otherFlag(other, "visualBlockCallWires", true),
+      visualIfWrap: otherFlag(other, "visualIfWrap", true),
+      visualBlockWrap: otherFlag(other, "visualBlockWrap", true),
+      visualJumpWires: otherFlag(other, "visualJumpWires", true),
+      visualShowGrid: otherFlag(other, "visualShowGrid", true),
+      visualShowCardId: otherFlag(other, "visualShowCardId", true),
+      editorActionOrder: Array.isArray(other.editorActionOrder) ? other.editorActionOrder.slice() : [],
+      editorHiddenActions: Array.isArray(other.editorHiddenActions)
+        ? other.editorHiddenActions.slice()
+        : [],
+    };
+  }
+
+  function setEditorSettingsTab(tab) {
+    const t = tab === "general" ? "general" : "visual";
+    $$("#editorSettingsTabs .st-tab").forEach((el) =>
+      el.classList.toggle("active", el.dataset.edtab === t)
+    );
+    $$("#ov-editor-settings .ed-set-pane").forEach((p) =>
+      p.classList.toggle("active", p.dataset.edpane === t)
+    );
+  }
+
+  function renderEditorActionCatalog(other) {
+    const host = $("#edActionCatalog");
+    if (!host) return;
+    const { order, hidden } = normalizeActionCatalog(other);
+    const hiddenSet = new Set(hidden);
+    const byV = knownActionTypeMap();
+    host.innerHTML = order
+      .map((v) => {
+        const a = byV.get(v);
+        if (!a) return "";
+        const on = !hiddenSet.has(v);
+        return (
+          `<div class="ed-cat-row${on ? "" : " is-hidden-type"}" data-type="${esc(v)}" draggable="true">` +
+          `<span class="ed-cat-handle" title="拖动排序">⋮⋮</span>` +
+          `<span class="chk${on ? " on" : ""}" data-ed-cat-vis draggable="false"><i></i></span>` +
+          `<span class="ed-cat-name">${esc(a.t)}</span>` +
+          `<span class="ed-cat-btns">` +
+          `<button type="button" class="btn ghost" data-ed-cat-up title="上移" draggable="false">▲</button>` +
+          `<button type="button" class="btn ghost" data-ed-cat-dn title="下移" draggable="false">▼</button>` +
+          `</span></div>`
+        );
+      })
+      .join("");
+  }
+
+  function collectEditorCatalogPartial() {
+    const rows = $$("#edActionCatalog .ed-cat-row");
+    if (!rows.length) {
+      const other = (state.settings && state.settings.other) || {};
+      return {
+        editorActionOrder: Array.isArray(other.editorActionOrder) ? other.editorActionOrder.slice() : [],
+        editorHiddenActions: Array.isArray(other.editorHiddenActions)
+          ? other.editorHiddenActions.slice()
+          : [],
+      };
+    }
+    const order = [];
+    const hidden = [];
+    rows.forEach((row) => {
+      const v = row.dataset.type;
+      if (!v) return;
+      order.push(v);
+      if (!row.querySelector(".chk")?.classList.contains("on")) hidden.push(v);
+    });
+    if (hidden.length >= order.length && order.length) {
+      const idx = hidden.indexOf(order[0]);
+      if (idx >= 0) hidden.splice(idx, 1);
+    }
+    return { editorActionOrder: order, editorHiddenActions: hidden };
+  }
+
+  function bindEditorActionCatalog() {
+    const host = $("#edActionCatalog");
+    if (!host || host._boundCat) return;
+    host._boundCat = true;
+    let dragEl = null;
+    host.addEventListener("click", (e) => {
+      const row = e.target.closest(".ed-cat-row");
+      if (!row || !host.contains(row)) return;
+      const up = e.target.closest("[data-ed-cat-up]");
+      const dn = e.target.closest("[data-ed-cat-dn]");
+      if (up) {
+        e.preventDefault();
+        const prev = row.previousElementSibling;
+        if (prev) host.insertBefore(row, prev);
+        return;
+      }
+      if (dn) {
+        e.preventDefault();
+        const next = row.nextElementSibling;
+        if (next) host.insertBefore(next, row);
+        return;
+      }
+      const chk = e.target.closest(".chk");
+      if (!chk) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const turningOff = chk.classList.contains("on");
+      if (turningOff) {
+        const others = $$("#edActionCatalog .ed-cat-row").filter(
+          (r) => r !== row && r.querySelector(".chk.on")
+        );
+        if (!others.length) {
+          toast("至少保留一种可添加的动作");
+          return;
+        }
+      }
+      chk.classList.toggle("on");
+      const i = chk.querySelector("i");
+      if (i) i.textContent = "";
+      row.classList.toggle("is-hidden-type", !chk.classList.contains("on"));
+    });
+    host.addEventListener("dragstart", (e) => {
+      const row = e.target.closest(".ed-cat-row");
+      if (!row) return;
+      if (e.target.closest(".chk, button")) {
+        e.preventDefault();
+        return;
+      }
+      dragEl = row;
+      row.classList.add("dragging");
+      try {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", row.dataset.type || "");
+      } catch (_) {}
+    });
+    host.addEventListener("dragend", () => {
+      if (dragEl) dragEl.classList.remove("dragging");
+      dragEl = null;
+    });
+    host.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      try {
+        e.dataTransfer.dropEffect = "move";
+      } catch (_) {}
+      const over = e.target.closest(".ed-cat-row");
+      if (!over || !dragEl || over === dragEl) return;
+      const rect = over.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      host.insertBefore(dragEl, before ? over : over.nextSibling);
+    });
+    host.addEventListener("drop", (e) => {
+      e.preventDefault();
+    });
+  }
+
+  function fillEditorSettingsForm(other) {
+    other = other || (state.settings && state.settings.other) || {};
+    const edView = editorDefaultViewOf(other);
+    $$("#edSetViewRadios .radio").forEach((r) => {
+      r.classList.toggle("on", (r.dataset.editorView || "code") === edView);
+    });
+    setChk($("#edSetLoopWrap"), otherFlag(other, "visualLoopWrap", true));
+    setChk($("#edSetCallWires"), otherFlag(other, "visualBlockCallWires", true));
+    setChk($("#edSetIfWrap"), otherFlag(other, "visualIfWrap", true));
+    setChk($("#edSetBlockWrap"), otherFlag(other, "visualBlockWrap", true));
+    setChk($("#edSetJumpWires"), otherFlag(other, "visualJumpWires", true));
+    setChk($("#edSetShowGrid"), otherFlag(other, "visualShowGrid", true));
+    setChk($("#edSetShowCardId"), otherFlag(other, "visualShowCardId", true));
+    renderEditorActionCatalog(other);
+  }
+
+  function collectEditorSettingsPartial() {
+    return {
+      editorDefaultView:
+        $("#edSetViewRadios .radio.on")?.dataset.editorView === "visual" ? "visual" : "code",
+      visualLoopWrap: !!$("#edSetLoopWrap")?.classList.contains("on"),
+      visualBlockCallWires: !!$("#edSetCallWires")?.classList.contains("on"),
+      visualIfWrap: !!$("#edSetIfWrap")?.classList.contains("on"),
+      visualBlockWrap: !!$("#edSetBlockWrap")?.classList.contains("on"),
+      visualJumpWires: !!$("#edSetJumpWires")?.classList.contains("on"),
+      visualShowGrid: !!$("#edSetShowGrid")?.classList.contains("on"),
+      visualShowCardId: !!$("#edSetShowCardId")?.classList.contains("on"),
+      ...collectEditorCatalogPartial(),
+    };
+  }
+
+  function applyEditorVisualPrefs() {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.applyDisplayPrefs === "function") V.applyDisplayPrefs();
+    else if (V && typeof V.render === "function") V.render();
+  }
+
+  function persistEditorSettings(partial, announce) {
+    if (!state.settings) state.settings = {};
+    if (!state.settings.other) state.settings.other = {};
+    Object.assign(state.settings.other, partial);
+    applyEditorVisualPrefs();
+    syncEditorActionTypeCombo();
+    if (window.qst) {
+      if (announce) state._announceSettingsSave = true;
+      quietSaveSettings(partial);
+    } else if (announce) {
+      toast("设置已保存");
+    }
+  }
+
+  function openEditorSettings() {
+    fillEditorSettingsForm((state.settings && state.settings.other) || {});
+    setEditorSettingsTab("visual");
+    bindEditorActionCatalog();
+    openOv("editor-settings");
   }
 
   function fillSettings(s) {
@@ -2043,11 +2478,16 @@
     setChk($("#setSchedResumeEn"), !!playback.scheduledTaskAutoResume);
 
     setChk($("#setAutoHide"), other.autoHideMainWindow == null ? true : !!other.autoHideMainWindow);
-    setChk($("#setPlaySound"), !!other.playSoundOnStart);
+    setChk($("#setPlaySound"), other.playSoundOnStart == null ? true : !!other.playSoundOnStart);
+    setChk($("#setPlaySoundEnd"), other.playSoundOnEnd == null ? true : !!other.playSoundOnEnd);
     setChk($("#setHideTip"), other.hideBottomRightTip == null ? true : !!other.hideBottomRightTip);
     setChk($("#setCloseTray"), other.closeToTray == null ? true : !!other.closeToTray);
+    setChk($("#setFloatBall"), other.showFloatBall == null ? true : !!other.showFloatBall);
     setChk($("#setAutoBoot"), !!other.autoStartOnBoot);
     setChk($("#setImeConflict"), !!other.resolveImeConflict);
+    fillEditorSettingsForm(other);
+    syncEditorActionTypeCombo();
+    applyEditorVisualPrefs();
     if ($("#setHoldSec") && other.holdThresholdSeconds != null)
       $("#setHoldSec").textContent = String(other.holdThresholdSeconds);
     state.hideBottomRightTip =
@@ -2064,6 +2504,19 @@
       windowMode.blockRunWhenUnhealthy == null ? true : !!windowMode.blockRunWhenUnhealthy
     );
     setChk($("#setWmFgFallback"), !!windowMode.allowForegroundInputFallback);
+    setChk(
+      $("#setWmEnableInject"),
+      windowMode.enableFakeFocusInjection == null ? true : !!windowMode.enableFakeFocusInjection
+    );
+    const wmTechV =
+      typeof windowMode.injectionTechnique === "number" ? windowMode.injectionTechnique : 0;
+    // 旧设置可能存了已下架的单独项（线程劫持/手动映射/XOR），一律回退基线
+    const wmTechItem = WM_TECH_LIST.find((x) => x.v === wmTechV);
+    state._wmInjectTech = wmTechItem ? wmTechV : 0;
+    const wmTechEl = $("#setWmInjectTech");
+    if (wmTechEl) wmTechEl.textContent = (wmTechItem || WM_TECH_LIST[0]).t;
+    setChk($("#setWmHideModule"), !!windowMode.hideInjectedModule);
+    syncWmInjectUi();
 
     if (typeof home.clickerButton === "number") state.clickBtn = home.clickerButton;
     if (typeof home.clickerIntervalMode === "number")
@@ -2117,6 +2570,7 @@
     syncRecModeUi();
     updateCtas();
     applyThemeFromSettings(s);
+    if (state.editor) applyEditorVisualPrefs();
   }
 
   function findAiSavedProfile(modelName) {
@@ -2214,6 +2668,7 @@
   function persistAiSavedModels() {
     if (!window.qst) return;
     const payload = collectSettings();
+    if (!payload) return;
     // 显式删除最后一个模型时置清除标志；其余场合空数组只表示页面状态未加载，
     // 后端会保留磁盘上已保存的模型（避免 DeepSeek/豆包配置被空列表冲掉）。
     if (!Array.isArray(state._aiSavedModels) || state._aiSavedModels.length === 0) {
@@ -2222,6 +2677,8 @@
     quietSaveSettings(payload);
     refreshAiModelCombos();
   }
+
+  const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/tB60fYgiAw";
 
   function applyAppBranding(b) {
     state._branding = b || {};
@@ -2247,12 +2704,19 @@
       }`;
     }
     if (aboutPane) {
-      const websiteEl = aboutPane.querySelector('[data-about="website"]');
-      if (websiteEl) websiteEl.textContent = `官网地址：${website || "—"}`;
-      const contactEl = aboutPane.querySelector('[data-about="contact"]');
-      if (contactEl) contactEl.textContent = `联系方式：${contact || "—"}`;
-      const qqEl = aboutPane.querySelector('[data-about="qq"]');
-      if (qqEl) qqEl.textContent = `QQ 交流群：${qq || "2163074732"}`;
+      const websiteEl = aboutPane.querySelector('[data-about-val="website"]');
+      if (websiteEl) {
+        websiteEl.textContent = website || "—";
+        if (website) websiteEl.setAttribute("href", website);
+        else websiteEl.removeAttribute("href");
+      }
+      const contactEl = aboutPane.querySelector('[data-about-val="contact"]');
+      if (contactEl) contactEl.textContent = contact || "—";
+      const qqEl = aboutPane.querySelector('[data-about-val="qq"]');
+      if (qqEl) {
+        qqEl.textContent = qq || "2163074732";
+        qqEl.setAttribute("href", QQ_GROUP_JOIN_URL);
+      }
     }
   }
 
@@ -2336,6 +2800,45 @@
       return `"${stem}"`;
     }
     return cur;
+  }
+
+  function applyWindowPickToNestedAction(pick, pending) {
+    pick = pick || {};
+    const a = editorParamAction();
+    if (!a || (a.type !== "runMacro" && a.type !== "mousePlayback")) return;
+    readParamPanelInto(a);
+    const wm = ensureNestedWindowMode(a);
+    if (pick.processPath) wm.targetExePath = pick.processPath;
+    if (pick.windowTitle) {
+      wm.windowTitle = pick.windowTitle;
+      wm.windowName = pick.windowTitle;
+      wm.targetWindowTitle = pick.windowTitle;
+    }
+    if (pick.windowClassName) wm.windowClassName = pick.windowClassName;
+    if (pick.childWindowClassName != null)
+      wm.childWindowClassName = pick.childWindowClassName || "";
+    if (pick.x != null) {
+      wm.pickX = pick.x | 0;
+      wm.targetPickX = pick.x | 0;
+    }
+    if (pick.y != null) {
+      wm.pickY = pick.y | 0;
+      wm.targetPickY = pick.y | 0;
+    }
+    const nextArgs = launchArgsFromWindowPick(pick, wm.launchArgs);
+    if (nextArgs) wm.launchArgs = nextArgs;
+    if (
+      pending === "nestedWmClass" ||
+      pending === "nestedWm" ||
+      wm.windowClassName ||
+      wm.windowName ||
+      wm.windowTitle
+    ) {
+      wm.selectMethod = "useEditorWindowClass";
+    }
+    a.nestedWindowMode = wm;
+    if ((a.useMode | 0) !== 1 && (a.useMode | 0) !== 2) a.useMode = 1;
+    renderParamPanel(a);
   }
 
   /** 对齐原生 ApplyWindowModeTargetFromPoint：写入身份并切到 useEditorWindowClass */
@@ -2750,6 +3253,7 @@
   }
 
   function collectSettings() {
+    if (!state._gotSettings) return null;
     const aiCfg = resolveActiveAiConfig();
     const out = {
       enableRandomInterval: false,
@@ -2771,10 +3275,13 @@
         (state.settings && state.settings.other && state.settings.other.customAccentColor) || 0,
       autoHideMainWindow: !!$("#setAutoHide")?.classList.contains("on"),
       playSoundOnStart: !!$("#setPlaySound")?.classList.contains("on"),
+      playSoundOnEnd: !!$("#setPlaySoundEnd")?.classList.contains("on"),
       hideBottomRightTip: !!$("#setHideTip")?.classList.contains("on"),
       closeToTray: !!$("#setCloseTray")?.classList.contains("on"),
+      showFloatBall: !!$("#setFloatBall")?.classList.contains("on"),
       autoStartOnBoot: !!$("#setAutoBoot")?.classList.contains("on"),
       resolveImeConflict: !!$("#setImeConflict")?.classList.contains("on"),
+      ...editorVisualFromState(),
       // Direct2D 开关已移除：保留磁盘既有值
       preferDirect2D: !!(state.settings && state.settings.other && state.settings.other.preferDirect2D),
       holdThresholdSeconds: parseFloat($("#setHoldSec")?.textContent || "0.2") || 0.2,
@@ -2843,11 +3350,42 @@
     }
     out.blockRunWhenUnhealthy = !!$("#setWmBlockUnhealthy")?.classList.contains("on");
     out.allowForegroundInputFallback = !!$("#setWmFgFallback")?.classList.contains("on");
+    {
+      const injectEl = $("#setWmEnableInject");
+      // 设置页未挂载时不得写成 false，否则下次运行冒险岛只会 PostMessage、角色不动。
+      out.enableFakeFocusInjection = injectEl ? injectEl.classList.contains("on") : true;
+    }
+    out.injectionTechnique =
+      typeof state._wmInjectTech === "number" ? state._wmInjectTech : 0;
+    out.hideInjectedModule = !!$("#setWmHideModule")?.classList.contains("on");
 
     out.clickerScrollOffset = state._clickerScrollOffset | 0;
     out.macroScrollOffset = state._macroScrollOffset | 0;
     out.recorderScrollOffset = state._recScrollOffset | 0;
     out.scriptCustomScrollOffset = state._aiScrollOffset | 0;
+
+    if (AGENT_SHELL) {
+      delete out.uiMode;
+      delete out.playbackSpeed;
+      delete out.enablePlaybackSpeed;
+    }
+
+    if (!state.settings) state.settings = {};
+    if (!state.settings.other) state.settings.other = {};
+    state.settings.other.editorDefaultView = out.editorDefaultView;
+    state.settings.other.visualLoopWrap = out.visualLoopWrap;
+    state.settings.other.visualBlockCallWires = out.visualBlockCallWires;
+    state.settings.other.visualIfWrap = out.visualIfWrap;
+    state.settings.other.visualBlockWrap = out.visualBlockWrap;
+    state.settings.other.visualJumpWires = out.visualJumpWires;
+    state.settings.other.visualShowGrid = out.visualShowGrid;
+    state.settings.other.visualShowCardId = out.visualShowCardId;
+    state.settings.other.editorActionOrder = Array.isArray(out.editorActionOrder)
+      ? out.editorActionOrder
+      : [];
+    state.settings.other.editorHiddenActions = Array.isArray(out.editorHiddenActions)
+      ? out.editorHiddenActions
+      : [];
 
     return out;
   }
@@ -2952,6 +3490,12 @@
     else if (w === "full") cls = "ed-full";
     else if (w && w >= 160) cls = "ed-lg";
     return `<div class="inp ${cls}" contenteditable="true" data-k="${esc(key)}">${esc(val)}</div>`;
+  }
+
+  function area3rowHtml(key, val) {
+    return `<div class="fline"><div class="inp ed-area fixed-3row" contenteditable="true" data-k="${esc(
+      key
+    )}">${esc(val || "")}</div></div>`;
   }
 
   /** X:[主=剩余区φ] ±随机:[占同行剩余]；与变量表达式主框同宽 */
@@ -3085,13 +3629,23 @@
     if (!useVar) return "";
     const key = isAi ? "aiTargetImagePath" : "imagePath";
     const val = isAi ? a.aiTargetImagePath || "" : a.imagePath || "";
-    return flineStack("变量/路径", inpField(key, val, "full"));
+    return labOnly("变量/路径") + area3rowHtml(key, val);
   }
 
   function findImageHasTemplate(a, mode) {
     const isAi = mode === "ai";
     const path = String(isAi ? a.aiTargetImagePath || "" : a.imagePath || "").trim();
     return !!path;
+  }
+
+  function findImageShowsFindTime(a) {
+    const fu = a.findImageFollowUp | 0;
+    if (fu === 2 || fu === 3) return findImageHasTemplate(a);
+    return true;
+  }
+
+  function findImageTimeRowHtml(a) {
+    return fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
   }
 
   function looksLikeFilePath(s) {
@@ -3271,6 +3825,17 @@
           action.scrollDirection = v.includes("下") || v.includes("右") ? 1 : 0;
           return;
         }
+        if (k === "useMode") {
+          if (v.includes("继承")) action.useMode = 3;
+          else if (v.includes("后台")) action.useMode = 2;
+          else if (v.includes("窗口")) action.useMode = 1;
+          else action.useMode = 0;
+          return;
+        }
+        if (k === "_nwmSelectMethod") {
+          action._nwmSelectMethod = v;
+          return;
+        }
         if (k === "findImageFollowUp") {
           if (action.type === "findColor") {
             if (v.includes("变量")) action.findImageFollowUp = 2;
@@ -3359,6 +3924,7 @@
           "aiSearchRegion",
           "moveFromVar",
           "loopFromVar",
+          "parseEscapes",
           "scrollVertical",
           "scrollHorizontal",
           "ocrRegionByImage",
@@ -3392,6 +3958,7 @@
           "aiImageScale",
           "imageScaleMin",
           "imageScaleMax",
+          "breakoutTimeSeconds",
         ].includes(k)
       ) {
         let n = parseFloat(v);
@@ -3456,10 +4023,145 @@
     }
     if (
       action.type === "findImage" &&
-      ((action.findImageFollowUp | 0) === 2 || (action.findImageFollowUp | 0) === 3)
+      (action.findImageFollowUp | 0) === 3 &&
+      !findImageHasTemplate(action)
     ) {
       action.findTimeExpr = "0";
     }
+    if (action.type === "runMacro" || action.type === "mousePlayback") {
+      applyNestedWmTempFields(action);
+    }
+  }
+
+  function nestedUseModeLabel(mode) {
+    const m = NESTED_USE_MODES.find((x) => x.v === (mode | 0));
+    return (m || NESTED_USE_MODES[3]).t;
+  }
+
+  function ensureNestedWindowMode(a) {
+    if (!a.nestedWindowMode || typeof a.nestedWindowMode !== "object") {
+      a.nestedWindowMode = {};
+    }
+    const wm = a.nestedWindowMode;
+    wm.selectMethod = normalizeWmSelectMethod(wm.selectMethod);
+    if (wm.targetExePath == null) wm.targetExePath = "";
+    if (wm.windowTitle == null) wm.windowTitle = wm.windowName || "";
+    if (wm.windowName == null) wm.windowName = wm.windowTitle || "";
+    if (wm.windowClassName == null) wm.windowClassName = "";
+    if (wm.childWindowClassName == null) wm.childWindowClassName = "";
+    if (wm.fakeFocusEnabled == null) wm.fakeFocusEnabled = 0;
+    return wm;
+  }
+
+  function applyNestedWmTempFields(action) {
+    const wm = ensureNestedWindowMode(action);
+    if (action._nwmSelectMethod != null) {
+      wm.selectMethod = resolveWmSelectMethodForSave(
+        wm.selectMethod,
+        action._nwmSelectMethod
+      );
+    }
+    if (action._nwmTargetExePath != null)
+      wm.targetExePath = String(action._nwmTargetExePath || "").trim();
+    if (action._nwmWindowTitle != null) {
+      const title = String(action._nwmWindowTitle || "").trim();
+      wm.windowTitle = title;
+      wm.windowName = title;
+      wm.targetWindowTitle = title;
+    }
+    if (action._nwmWindowClassName != null)
+      wm.windowClassName = String(action._nwmWindowClassName || "").trim();
+    if (action._nwmFakeFocus != null)
+      wm.fakeFocusEnabled = action._nwmFakeFocus ? 1 : 0;
+    delete action._nwmSelectMethod;
+    delete action._nwmTargetExePath;
+    delete action._nwmWindowTitle;
+    delete action._nwmWindowClassName;
+    delete action._nwmFakeFocus;
+    action.nestedWindowMode = wm;
+  }
+
+  function applyTargetScriptUseMode(a, meta) {
+    if (!a || !meta) return;
+    const mode = typeof meta.mode === "number" ? meta.mode | 0 : 0;
+    if (mode === 1 || mode === 2) {
+      a.useMode = mode;
+      const src = meta.windowMode && typeof meta.windowMode === "object" ? meta.windowMode : {};
+      a.nestedWindowMode = Object.assign({}, src);
+      a.nestedWindowMode.enabled = 1;
+      a.nestedWindowMode.executionKind =
+        mode === 2 ? "backgroundWindow" : "hiddenDesktop";
+      a.nestedWindowMode.selectMethod = normalizeWmSelectMethod(
+        a.nestedWindowMode.selectMethod
+      );
+      const title =
+        src.windowTitle ||
+        src.windowName ||
+        src.targetWindowTitle ||
+        "";
+      a.nestedWindowMode.windowTitle = title;
+      if (!a.nestedWindowMode.windowName) {
+        a.nestedWindowMode.windowName = title;
+      }
+    } else {
+      a.useMode = 0;
+      a.nestedWindowMode = {};
+      if (meta.breakoutTimeSeconds != null) {
+        const n = parseFloat(meta.breakoutTimeSeconds);
+        a.breakoutTimeSeconds = Number.isFinite(n) && n > 0 ? n : 0;
+      }
+    }
+  }
+
+  function nestedUseModeHtml(a) {
+    const mode = a.useMode == null ? 3 : a.useMode | 0;
+    let html = flineStack("使用模式", comboField("useMode", nestedUseModeLabel(mode)));
+    if (mode === 3) {
+      html += `<p class="hint">*继承当前主鼠标宏的模式与窗口绑定</p>`;
+      return html;
+    }
+    if (mode === 0) {
+      html += flineStack(
+        "脱离时间",
+        inpField("breakoutTimeSeconds", a.breakoutTimeSeconds ?? 0, "sm") +
+          `<span class="tl">秒</span>`
+      );
+      return html;
+    }
+    const wm = ensureNestedWindowMode(a);
+    const method = WM_METHODS.find((m) => m.v === wm.selectMethod) || WM_METHODS[0];
+    const targetLab = mode === 2 ? "目标窗口" : "目标程序";
+    html += flineStack("选择窗口方式", comboField("_nwmSelectMethod", method.t));
+    html += `<div class="fline-stack nwm-full"><div class="stack-lab nwm-lab"><span>${esc(
+      targetLab
+    )}</span>${chkLabeled(
+      "_nwmFakeFocus",
+      "聚焦",
+      !!wm.fakeFocusEnabled,
+      ' title="向目标进程注入假焦点（联机/反作弊游戏请勿使用，易被扫描）。远程桌面(mstsc)请勿开启——会搞挂客户端；mstsc 回放会自动改用前台本机键鼠"'
+    )}</div><div class="stack-ctrl">${inpField(
+      "_nwmTargetExePath",
+      wm.targetExePath || "",
+      "full"
+    )}</div></div>`;
+    html += `<div class="fline wrap nwm-btns">`;
+    html += `<button type="button" class="btn ghost sm" data-fi="nwmBrowse">浏览</button>`;
+    html += `<button type="button" class="btn ghost sm" data-fi="nwmPick">${
+      mode === 2 ? "准星绑定窗口" : "准星找程序"
+    }</button>`;
+    html += `<button type="button" class="btn ghost sm" data-fi="nwmClass">指定窗口类</button>`;
+    html += `</div>`;
+    html += `<div class="fline-stack nwm-full"><div class="stack-lab">窗口标题</div><div class="stack-ctrl">${inpField(
+      "_nwmWindowTitle",
+      wm.windowTitle || wm.windowName || "",
+      "full"
+    )}</div></div>`;
+    html += `<div class="fline-stack nwm-full"><div class="stack-lab">窗口类名</div><div class="stack-ctrl">${inpField(
+      "_nwmWindowClassName",
+      wm.windowClassName || "",
+      "full"
+    )}</div></div>`;
+    return html;
   }
 
   function chkField(key, on) {
@@ -3601,7 +4303,8 @@
         const saveImg =
           !a.matchVarName || a.matchVarName === "matchRet" ? "image" : a.matchVarName;
         if (a.matchVarName !== saveImg) a.matchVarName = saveImg;
-        html += flineStack("图片保存到", inpField("matchVarName", saveImg));
+        html += labOnly("图片保存到");
+        html += area3rowHtml("matchVarName", saveImg);
       } else {
         html += flineXy(
           "X偏",
@@ -3610,14 +4313,18 @@
           inpField("offsetY", a.offsetY ?? 0)
         );
         html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="offset">选择偏移点击位置</button></div>`;
-        html += fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
       }
+      if (findImageShowsFindTime(a)) html += findImageTimeRowHtml(a);
     } else if (t === "quickInput") {
-      html += labOnly("要输入的文字");
-      html += `<div class="fline"><div class="inp ed-area fixed-3row" contenteditable="true" data-k="inputText">${esc(
-        a.inputText || ""
-      )}</div></div>`;
+      const parseOn = a.parseEscapes == null ? false : !!a.parseEscapes;
+      html += `<div class="fline"><span class="tl">要输入的文字</span>${chkLabeled(
+        "parseEscapes",
+        "解析转义符",
+        parseOn
+      )}</div>`;
+      html += area3rowHtml("inputText", a.inputText || "");
       html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="insertVar" data-target="inputText">插入变量</button></div>`;
+      html += `<p class="hint">*解析转义同时作用于插入的变量。未勾选时，变量里的换行/Tab 会丢掉，不输入。</p>`;
       html += flineStack(
         "字输入间隔(秒)",
         inpField("charInterval", a.charInterval ?? 0.01)
@@ -3759,8 +4466,9 @@
       const recLabel =
         a.blockName ||
         (a.targetPath ? a.targetPath.split(/[/\\]/).pop() : "") ||
-        "请选择用于回放的鼠标录制";
+        "请选择用于回放的键鼠录制";
       html += flineStack("录制脚本", comboField("blockName", recLabel));
+      html += nestedUseModeHtml(a);
       const spd = a.playbackSpeed == null ? 1 : a.playbackSpeed;
       html +=
         `<div class="fline-stack ed-speed-stack"><div class="stack-lab">回放倍速</div>` +
@@ -3773,6 +4481,8 @@
         (a.targetPath ? a.targetPath.split(/[/\\]/).pop() : "") ||
         "请选择用于运行的鼠标宏";
       html += flineStack("鼠标宏", comboField("blockName", macLabel));
+      html += nestedUseModeHtml(a);
+      html += repeatBlock(a);
     } else if (t === "defineBlock") {
       html += flineStack(
         "宏指令块名称",
@@ -3798,6 +4508,7 @@
         html += `<p class="hint">*当前名称不在已定义块中</p>`;
         html += fline("手输块名", inpField("_runBlockTyped", cur, 160));
       }
+      html += repeatBlock(a);
     } else if (t === "runProgram") {
       const RUN_PRESETS = [
         { t: "选择文件", v: 0, path: "" },
@@ -4238,11 +4949,62 @@
         else pickMacroInto(a, pbCombo);
       });
     }
+    const useModeCombo = panel.querySelector('[data-k="useMode"]');
+    if (useModeCombo && (t === "mousePlayback" || t === "runMacro")) {
+      useModeCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const cur = a.useMode == null ? 3 : a.useMode | 0;
+        const selectedIndex = Math.max(
+          0,
+          NESTED_USE_MODES.findIndex((m) => m.v === cur)
+        );
+        showPopup(
+          useModeCombo,
+          NESTED_USE_MODES,
+          (it) => {
+            readParamPanelInto(a);
+            a.useMode = it.v | 0;
+            if (a.useMode === 1 || a.useMode === 2) ensureNestedWindowMode(a);
+            renderParamPanel(a);
+          },
+          { selectedIndex }
+        );
+      });
+    }
+    const nwmMethodCombo = panel.querySelector('[data-k="_nwmSelectMethod"]');
+    if (nwmMethodCombo && (t === "mousePlayback" || t === "runMacro")) {
+      nwmMethodCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wm = ensureNestedWindowMode(a);
+        const cur = normalizeWmSelectMethod(wm.selectMethod);
+        const selectedIndex = Math.max(
+          0,
+          WM_METHODS.findIndex((m) => m.v === cur)
+        );
+        showPopup(
+          nwmMethodCombo,
+          WM_METHODS,
+          (it) => {
+            readParamPanelInto(a);
+            const next = ensureNestedWindowMode(a);
+            next.selectMethod = it.v;
+            a.nestedWindowMode = next;
+            nwmMethodCombo.textContent = it.t;
+            renderParamPanel(a);
+          },
+          { selectedIndex, minWidth: 260 }
+        );
+      });
+    }
     $$(".chk[data-k]", panel).forEach((el) => {
       el.addEventListener("click", (e) => {
         e.stopPropagation();
         el.classList.toggle("on");
         a[el.dataset.k] = el.classList.contains("on") ? 1 : 0;
+        if (el.dataset.k === "_nwmFakeFocus") {
+          const wm = ensureNestedWindowMode(a);
+          wm.fakeFocusEnabled = el.classList.contains("on") ? 1 : 0;
+        }
         if (el.dataset.k === "ocrRegionByImage") {
           if (el.classList.contains("on")) {
             ensureFullScreenCoordsVisible(a);
@@ -4374,7 +5136,10 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          else renderParamPanel(a);
+          peekScriptActions(a.targetPath).then((msg) => {
+            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
+            renderParamPanel(a);
+          });
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -4408,7 +5173,10 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          else renderParamPanel(a);
+          peekScriptActions(a.targetPath).then((msg) => {
+            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
+            renderParamPanel(a);
+          });
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -4431,6 +5199,14 @@
       }
       if (act === "pickProg") {
         wireCrosshairPointerDown(btn, "programPath", "program", () => readParamPanelInto(a));
+        return;
+      }
+      if (act === "nwmPick") {
+        wireCrosshairPointerDown(btn, "windowTarget", "nestedWm", () => readParamPanelInto(a));
+        return;
+      }
+      if (act === "nwmClass") {
+        wireCrosshairPointerDown(btn, "windowTarget", "nestedWmClass", () => readParamPanelInto(a));
         return;
       }
       btn.addEventListener("click", (e) => {
@@ -4456,6 +5232,12 @@
         if (act === "browseExe") {
           state._pendingBrowse = "exe";
           a.shortcutPreset = 0;
+          if (window.qst) qst.browsePath(true);
+          else toast("无桥接");
+          return;
+        }
+        if (act === "nwmBrowse") {
+          state._pendingBrowse = "nestedWmTarget";
           if (window.qst) qst.browsePath(true);
           else toast("无桥接");
           return;
@@ -4683,6 +5465,7 @@
             perfectMatch: a.perfectMatch ? 1 : 0,
             imageScaleMin: a.imageScaleMin ?? 0.9,
             imageScaleMax: a.imageScaleMax ?? 1.1,
+            maxMatches: 1,
           });
           return;
         }
@@ -4712,6 +5495,7 @@
             perfectMatch: a.perfectMatch ? 1 : 0,
             imageScaleMin: a.imageScaleMin ?? 0.9,
             imageScaleMax: a.imageScaleMax ?? 1.1,
+            maxMatches: act === "offset" || act === "region" ? 1 : 20,
           });
         }
       });
@@ -4759,7 +5543,7 @@
     if ($("#edWmMethod")) $("#edWmMethod").textContent = method.t;
 
     const methodV = method.v;
-    // 对齐 UpdateEditorWindowModeChrome：启动时选择/鼠标位置不显示整行目标路径
+    // 对齐 UpdateEditorWindowModeChrome：启动时使用当前所在窗口不显示整行目标路径
     const showPathChrome =
       showWm &&
       (methodV === "useEditorWindowClass" || methodV === "noSelect");
@@ -4865,12 +5649,14 @@
       wm.coordSpace = "windowClient";
       wm.windowRelativeCoordinates = 1;
     }
+    // 以 state 为准；仅当 state 无效时才回退读 combo 文案（含合并前旧文案）
     wm.selectMethod = resolveWmSelectMethodForSave(
       wm.selectMethod,
       ($("#edWmMethod")?.textContent || "").trim()
     );
 
-    // 「不选择窗口」：清绑定身份；「启动时使用当前所在窗口」不落盘上次拾取身份
+    // 「不选择窗口」：清绑定身份，避免残留 pick 浮层字段绑错窗
+    // 「启动时使用当前所在窗口」：运行时取前台窗，不得把上次拾取的类名/路径写进脚本
     if (wm.selectMethod === "noSelect") {
       wm.windowName = "";
       wm.windowTitle = "";
@@ -5958,16 +6744,30 @@
     const normalBar = $("#normalBar");
     if (batchBar) batchBar.classList.toggle("show", batch);
     if (normalBar) normalBar.style.display = batch ? "none" : "flex";
+    const list = $("#actionList");
+    if (list) list.classList.toggle("is-batch", batch);
   }
 
   function enterEditorBatch(on) {
     state.batchMode = !!on;
     state.batchSel = {};
+    state._batchAnchor = -1;
+    resetMergeUiChrome();
     if (on) {
       state.actionSel = -1;
       state.editDraft = null;
       state.addPreview = null;
       renderParamPanel(null);
+    }
+    // 列表已在时只改勾选/选中态，禁止 innerHTML 把滚动条拆掉重建
+    if (!state._actionListRendering && patchActionListBatchMode(on)) {
+      syncEditorBatchChrome();
+      syncEditorActionCount();
+      if (on) syncMergeModeUi();
+      else if (state.addPreview) renderParamPanel(state.addPreview);
+      else showAddTypePreview();
+      syncEdRemarkFromSelection();
+      return;
     }
     renderEditorActions(state.editorActions);
   }
@@ -5980,11 +6780,142 @@
     return out;
   }
 
+  function mergeBatchSelectionBefore() {
+    if (!isMergeEligible()) {
+      toast("请勾选至少两个同级动作");
+      return false;
+    }
+    runMergeWithPlacement("before");
+    return true;
+  }
+
+  function debugSelectedBatch(stepMode) {
+    const idx = selectedBatchIndices();
+    if (!idx.length) {
+      toast("请先勾选动作");
+      return false;
+    }
+    startDebugFrom(idx[0], !!stepMode);
+    return true;
+  }
+
+  function prepareBatchContextSelection(index) {
+    if (index < 0 || index >= (state.editorActions || []).length) return;
+    if (state.batchSel && state.batchSel[index]) return;
+    state.batchSel = {};
+    state.batchSel[index] = true;
+    state._batchAnchor = index;
+    refreshEditorBatchSelectionUi();
+  }
+
+  function showEditorBatchContextMenu(clientX, clientY) {
+    const hasSel = selectedBatchIndices().length > 0;
+    const items = [
+      { t: "剪切", v: "cut", disabled: !hasSel },
+      { t: "复制", v: "copy", disabled: !hasSel },
+      { t: "合并到动作", v: "merge", disabled: !isMergeEligible() },
+      { t: "调试选中的步骤（单步）", v: "step", disabled: !hasSel },
+      { t: "调试选中的步骤（运行）", v: "run", disabled: !hasSel },
+    ];
+    requestAnimationFrame(() => {
+      showPopup(
+        { clientX: clientX, clientY: clientY },
+        items,
+        (it) => {
+          if (!it) return;
+          if (it.v === "cut") {
+            if (!cutSelectedEditorActions()) toast("请先勾选动作");
+          } else if (it.v === "copy") {
+            if (!copySelectedEditorActions()) toast("请先勾选动作");
+          } else if (it.v === "merge") mergeBatchSelectionBefore();
+          else if (it.v === "step") debugSelectedBatch(true);
+          else if (it.v === "run") debugSelectedBatch(false);
+        },
+        { preferUp: true }
+      );
+    });
+  }
+
+  function setEditorVisualSelection(indices) {
+    const n = (state.editorActions || []).length;
+    const uniq = [];
+    const seen = {};
+    (indices || []).forEach((i) => {
+      const v = i | 0;
+      if (v >= 0 && v < n && !seen[v]) {
+        seen[v] = true;
+        uniq.push(v);
+      }
+    });
+    if (uniq.length >= 2) {
+      state.batchMode = true;
+      state.batchSel = {};
+      uniq.forEach((i) => { state.batchSel[i] = true; });
+      state.actionSel = -1;
+      state.editDraft = null;
+      state.addPreview = null;
+      syncEditorBatchChrome();
+      syncMergeModeUi();
+      return;
+    }
+    enterEditorBatch(false);
+    if (uniq.length === 1) selectEditorAction(uniq[0]);
+    else {
+      state.actionSel = -1;
+      renderParamPanel(null);
+      showAddTypePreview();
+    }
+  }
+
+  function mergeVisualSelection(ordered) {
+    const n = (state.editorActions || []).length;
+    const uniq = [];
+    const seen = {};
+    (ordered || []).forEach((i) => {
+      const v = i | 0;
+      if (v >= 0 && v < n && !seen[v]) {
+        seen[v] = true;
+        uniq.push(v);
+      }
+    });
+    if (uniq.length < 2) {
+      toast("请先选中至少两个动作", "warn");
+      return;
+    }
+    state._mergeRootOrder = uniq.slice();
+    state.batchMode = true;
+    state.batchSel = {};
+    uniq.forEach((i) => { state.batchSel[i] = true; });
+    state.actionSel = -1;
+    syncEditorBatchChrome();
+    syncMergeModeUi();
+    if (!isMergeEligible()) {
+      const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
+      toast((plan && plan.error) || "当前选择无法并入", "warn");
+      state._mergeRootOrder = null;
+      return;
+    }
+    const type = (state.addPreview && state.addPreview.type) || state.addActionType;
+    const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
+    if (type === "defineBlock" || (plan && plan.contiguous)) {
+      runMergeWithPlacement(type === "defineBlock" ? "first" : "inplace");
+      return;
+    }
+    const pop = $("#mergePlacementPopup");
+    if (pop) {
+      pop.classList.remove("hidden");
+      const firstBtn = pop.querySelector("[data-place]");
+      if (firstBtn) firstBtn.focus();
+    }
+  }
+
   function syncEdRemarkFromSelection() {
     const el = $("#edRemark");
     if (!el) return;
     if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
       el.textContent = state.editorActions[state.actionSel].remark || "";
+    } else {
+      el.textContent = "";
     }
   }
 
@@ -6078,6 +7009,542 @@
       next[idx >= pos ? idx + 1 : idx] = true;
     }
     state.collapsedContainers = next;
+  }
+
+  function remapIndexDictAfterReplace(dict, start, oldCount, newCount) {
+    const next = {};
+    const oldEnd = start + oldCount;
+    const delta = newCount - oldCount;
+    for (const k of Object.keys(dict || {})) {
+      if (!dict[k]) continue;
+      const idx = Number(k);
+      if (idx === start) continue;
+      if (idx > start && idx < oldEnd) {
+        // 拆容器：去掉壳后，原子节点整体前移 1
+        next[idx - 1] = dict[k];
+        continue;
+      }
+      next[idx >= oldEnd ? idx + delta : idx] = dict[k];
+    }
+    return next;
+  }
+
+  function isDisassemblableType(type) {
+    return (
+      type === "loop" ||
+      type === "if" ||
+      type === "else" ||
+      type === "defineBlock" ||
+      type === "runBlock" ||
+      type === "runMacro" ||
+      type === "mousePlayback"
+    );
+  }
+
+  function cloneActionForInline(src) {
+    const a = JSON.parse(JSON.stringify(src || {}));
+    delete a.no;
+    delete a.originalNo;
+    delete a._preview;
+    delete a._runBlockTyped;
+    a.name = typeLabel(a.type);
+    return a;
+  }
+
+  function remapCopiedIndents(list, destIndent) {
+    if (!list.length) return list;
+    let srcMin = clampIndent(list[0].indent);
+    for (const a of list) srcMin = Math.min(srcMin, clampIndent(a.indent));
+    const delta = (destIndent | 0) - srcMin;
+    for (const a of list) a.indent = clampIndent((a.indent | 0) + delta);
+    return list;
+  }
+
+  function findLastDefineBlockIndex(actions, name) {
+    const key = String(name || "").trim();
+    let found = -1;
+    if (!key) return found;
+    for (let i = 0; i < actions.length; ++i) {
+      if (actions[i] && actions[i].type === "defineBlock" && String(actions[i].blockName || "").trim() === key) {
+        found = i;
+      }
+    }
+    return found;
+  }
+
+  function copyContainerBody(actions, containerIndex) {
+    const end = subtreeEnd(containerIndex);
+    if (end <= containerIndex + 1) return [];
+    return actions.slice(containerIndex + 1, end).map(cloneActionForInline);
+  }
+
+  function applyDisassemblePatch(start, oldCount, inserted) {
+    visualNoteUndo();
+    state.collapsedContainers = remapIndexDictAfterReplace(
+      state.collapsedContainers,
+      start,
+      oldCount,
+      inserted.length
+    );
+    state.editorBreakpoints = remapIndexDictAfterReplace(
+      state.editorBreakpoints,
+      start,
+      oldCount,
+      inserted.length
+    );
+    state.editorActions.splice(start, oldCount, ...inserted);
+    visualOnReplace(start, oldCount, inserted.length);
+    state.actionSel = inserted.length ? start : -1;
+    state.editDraft = null;
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    if (state.actionSel >= 0) {
+      loadEditDraftFromSelection();
+      const a = state.editDraft;
+      if (a && a.type) {
+        state.addActionType = a.type;
+        const typeCombo = $("#edActionType");
+        const cur = ACTION_TYPES.find((x) => x.v === a.type);
+        if (typeCombo && cur) typeCombo.textContent = cur.t;
+      }
+    } else {
+      showAddTypePreview();
+    }
+  }
+
+  function peekScriptActions(path) {
+    return new Promise((resolve) => {
+      if (!window.qst || typeof qst.peekScriptActions !== "function") {
+        resolve({ ok: false, detail: "当前环境无法读取脚本" });
+        return;
+      }
+      const reqId = "peek-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+      if (!state._peekWaiters) state._peekWaiters = {};
+      const timer = setTimeout(() => {
+        if (state._peekWaiters && state._peekWaiters[reqId]) {
+          delete state._peekWaiters[reqId];
+          resolve({ ok: false, detail: "读取超时" });
+        }
+      }, 8000);
+      state._peekWaiters[reqId] = (msg) => {
+        clearTimeout(timer);
+        resolve(msg || { ok: false, detail: "读取失败" });
+      };
+      qst.peekScriptActions(path, reqId);
+    });
+  }
+
+  async function disassembleEditorAction(index) {
+    const actions = state.editorActions || [];
+    const target = actions[index];
+    if (!target || !isDisassemblableType(target.type)) {
+      toast("该动作不能拆解");
+      return;
+    }
+    const destIndent = clampIndent(target.indent);
+    const t = target.type;
+    if (t === "loop" || t === "if" || t === "else" || t === "defineBlock") {
+      const body = copyContainerBody(actions, index);
+      if (!body.length) {
+        toast("没有可拆解的子动作");
+        return;
+      }
+      remapCopiedIndents(body, destIndent);
+      applyDisassemblePatch(index, subtreeEnd(index) - index, body);
+      return;
+    }
+    if (t === "runBlock") {
+      const name = String(target.blockName || "").trim();
+      if (!name) {
+        toast("请先选择要运行的宏指令块");
+        return;
+      }
+      const def = findLastDefineBlockIndex(actions, name);
+      if (def < 0) {
+        toast("未找到宏指令块「" + name + "」的定义");
+        return;
+      }
+      const body = copyContainerBody(actions, def);
+      if (!body.length) {
+        toast("宏指令块「" + name + "」没有可拆解的动作");
+        return;
+      }
+      remapCopiedIndents(body, destIndent);
+      applyDisassemblePatch(index, 1, body);
+      return;
+    }
+    const path = String(target.targetPath || "").trim();
+    if (!path) {
+      toast(t === "mousePlayback" ? "请先选择用于回放的键鼠录制" : "请先选择要运行的鼠标宏");
+      return;
+    }
+    const peeked = await peekScriptActions(path);
+    if (!peeked || !peeked.ok) {
+      toast((peeked && peeked.detail) || (t === "mousePlayback" ? "找不到要拆解的录制" : "找不到要拆解的鼠标宏"));
+      return;
+    }
+    const nested = Array.isArray(peeked.actions) ? peeked.actions.map(cloneActionForInline) : [];
+    if (!nested.length) {
+      toast(t === "mousePlayback" ? "录制没有可拆解的动作" : "鼠标宏没有可拆解的动作");
+      return;
+    }
+    remapCopiedIndents(nested, destIndent);
+    applyDisassemblePatch(index, 1, nested);
+  }
+
+  function resetMergeUiChrome() {
+    _mergeUiOn = false;
+    const lbl = $("#edActionTypeLbl");
+    if (lbl) lbl.textContent = "请选择要添加的宏";
+  }
+
+  function isMergeContainerType(type) {
+    return type === "loop" || type === "if" || type === "else" || type === "defineBlock";
+  }
+
+  function mergeSubtreeEndOn(actions, fromIdx) {
+    if (fromIdx < 0 || fromIdx >= actions.length) return fromIdx;
+    if (!isSubtreeContainerType(actions[fromIdx].type)) return fromIdx + 1;
+    return containerBodyEndOn(actions, fromIdx);
+  }
+
+  function containerBodyEndOn(actions, containerIndex) {
+    if (containerIndex < 0 || containerIndex >= actions.length) return containerIndex + 1;
+    const level = clampIndent(actions[containerIndex].indent);
+    let i = containerIndex + 1;
+    while (i < actions.length && clampIndent(actions[i].indent) > level) i += 1;
+    return i;
+  }
+
+  function findDirectParentIndexOn(actions, index) {
+    const indent = clampIndent(actions[index].indent);
+    if (indent <= 0) return -1;
+    for (let i = index - 1; i >= 0; --i) {
+      if (clampIndent(actions[i].indent) < indent) return i;
+    }
+    return -1;
+  }
+
+  function mergeSelectedRoots(actions, selected) {
+    const n = actions.length;
+    const seen = {};
+    const uniq = [];
+    (selected || []).forEach((i) => {
+      const idx = i | 0;
+      if (idx >= 0 && idx < n && !seen[idx]) {
+        seen[idx] = true;
+        uniq.push(idx);
+      }
+    });
+    uniq.sort((a, b) => a - b);
+    const sel = {};
+    uniq.forEach((i) => {
+      sel[i] = true;
+    });
+    const roots = [];
+    uniq.forEach((i) => {
+      let covered = false;
+      let p = findDirectParentIndexOn(actions, i);
+      while (p >= 0) {
+        if (sel[p]) {
+          covered = true;
+          break;
+        }
+        p = findDirectParentIndexOn(actions, p);
+      }
+      if (!covered) roots.push(i);
+    });
+    return roots;
+  }
+
+  function directSiblingIndices(actions, parent, childIndent) {
+    const out = [];
+    if (parent < 0) {
+      for (let i = 0; i < actions.length; ++i) {
+        if (clampIndent(actions[i].indent) === childIndent) out.push(i);
+      }
+      return out;
+    }
+    if (parent >= actions.length) return out;
+    const expect = clampIndent(actions[parent].indent) + 1;
+    if (expect !== childIndent) return out;
+    const end = containerBodyEndOn(actions, parent);
+    for (let i = parent + 1; i < end; ++i) {
+      if (clampIndent(actions[i].indent) === expect) out.push(i);
+    }
+    return out;
+  }
+
+  function analyzeMergeSelection(actions, selected) {
+    const roots = mergeSelectedRoots(actions, selected);
+    if (roots.length < 2) {
+      return { ok: false, error: "请勾选至少两个同级动作", roots: [] };
+    }
+    const indent = clampIndent(actions[roots[0]].indent);
+    const parent = findDirectParentIndexOn(actions, roots[0]);
+    for (let k = 1; k < roots.length; ++k) {
+      const ind = clampIndent(actions[roots[k]].indent);
+      const p = findDirectParentIndexOn(actions, roots[k]);
+      if (ind !== indent || p !== parent) {
+        return { ok: false, error: "请勾选同一父节点下的同级动作", roots };
+      }
+    }
+    const siblings = directSiblingIndices(actions, parent, indent);
+    const sib = {};
+    siblings.forEach((i) => {
+      sib[i] = true;
+    });
+    for (let r = 0; r < roots.length; ++r) {
+      if (!sib[roots[r]]) {
+        return { ok: false, error: "请勾选同一父节点下的同级动作", roots };
+      }
+    }
+    const rootSet = {};
+    roots.forEach((i) => {
+      rootSet[i] = true;
+    });
+    let firstK = -1;
+    let lastK = -1;
+    for (let k = 0; k < siblings.length; ++k) {
+      if (!rootSet[siblings[k]]) continue;
+      if (firstK < 0) firstK = k;
+      lastK = k;
+    }
+    let contiguous = firstK >= 0;
+    if (contiguous) {
+      for (let k = firstK; k <= lastK; ++k) {
+        if (!rootSet[siblings[k]]) {
+          contiguous = false;
+          break;
+        }
+      }
+    }
+    return { ok: true, error: "", roots, parent, indent, contiguous };
+  }
+
+  function isMergeEligible() {
+    if (!state.batchMode) return false;
+    const plan = analyzeMergeSelection(state.editorActions || [], selectedBatchIndices());
+    return !!(plan && plan.ok);
+  }
+
+  function elseHasPrecedingIf(actions, insertPos, elseIndent) {
+    for (let i = insertPos - 1; i >= 0; --i) {
+      const ind = clampIndent(actions[i].indent);
+      if (ind < elseIndent) return false;
+      if (ind === elseIndent) return actions[i].type === "if";
+    }
+    return false;
+  }
+
+  function remainingCountBefore(origIndex, ranges) {
+    let count = 0;
+    for (let i = 0; i < origIndex; ++i) {
+      let extracted = false;
+      for (let r = 0; r < ranges.length; ++r) {
+        if (i >= ranges[r].start && i < ranges[r].end) {
+          extracted = true;
+          break;
+        }
+      }
+      if (!extracted) count += 1;
+    }
+    return count;
+  }
+
+  function mergeSelectedIntoContainer(actions, selected, container, placement) {
+    if (!isMergeContainerType(container.type)) {
+      return { ok: false, error: "该动作不能作为并入容器" };
+    }
+    const plan = analyzeMergeSelection(actions, selected);
+    if (!plan.ok) return { ok: false, error: plan.error };
+    if (placement === "inplace" && !plan.contiguous) {
+      return { ok: false, error: "所选动作不连续，请选择插入位置" };
+    }
+    const asDefine = container.type === "defineBlock";
+    const destIndent = asDefine ? 0 : plan.indent;
+    const ranges = [];
+    const body = [];
+    let roots = plan.roots.slice();
+    if (state._mergeRootOrder && state._mergeRootOrder.length) {
+      const keep = {};
+      roots.forEach((i) => {
+        keep[i] = true;
+      });
+      const ordered = [];
+      state._mergeRootOrder.forEach((i) => {
+        if (keep[i]) {
+          ordered.push(i);
+          delete keep[i];
+        }
+      });
+      roots.forEach((i) => {
+        if (keep[i]) ordered.push(i);
+      });
+      roots = ordered;
+    }
+    for (let r = 0; r < roots.length; ++r) {
+      const root = roots[r];
+      const end = mergeSubtreeEndOn(actions, root);
+      ranges.push({ start: root, end });
+      for (let i = root; i < end; ++i) body.push(cloneActionForInline(actions[i]));
+    }
+    remapCopiedIndents(body, destIndent + 1);
+    const n = actions.length;
+    let extracted = 0;
+    ranges.forEach((rg) => {
+      extracted += rg.end - rg.start;
+    });
+    let insertPos = 0;
+    if (asDefine) insertPos = 0;
+    else if (placement === "last") insertPos = n - extracted;
+    else if (placement === "first") insertPos = 0;
+    else if (placement === "after") {
+      insertPos = remainingCountBefore(
+        mergeSubtreeEndOn(actions, plan.roots[plan.roots.length - 1]),
+        ranges
+      );
+    } else {
+      insertPos = remainingCountBefore(plan.roots[0], ranges);
+    }
+    insertPos = Math.max(0, Math.min(insertPos, n - extracted));
+
+    const next = actions.slice();
+    for (let i = ranges.length - 1; i >= 0; --i) {
+      next.splice(ranges[i].start, ranges[i].end - ranges[i].start);
+    }
+    if (container.type === "else" && !elseHasPrecedingIf(next, insertPos, destIndent)) {
+      return { ok: false, error: "请将「条件-否则」放在同级「条件-如果」后面" };
+    }
+    const head = cloneActionForInline(container);
+    head.indent = destIndent;
+    delete head.no;
+    delete head.originalNo;
+    next.splice(insertPos, 0, head, ...body);
+    const endLoopErr = validateEndLoopPlacements(next);
+    if (endLoopErr) return { ok: false, error: endLoopErr };
+    return {
+      ok: true,
+      actions: next,
+      containerIndex: insertPos,
+      ranges,
+      insertPos,
+      insertedCount: 1 + body.length,
+    };
+  }
+
+  function remapIndexDictAfterMerge(dict, ranges, insertPos, insertedCount) {
+    const next = {};
+    for (const k of Object.keys(dict || {})) {
+      if (!dict[k]) continue;
+      const oldIdx = Number(k);
+      let offsetInBody = 0;
+      let moved = false;
+      for (let r = 0; r < ranges.length; ++r) {
+        const rg = ranges[r];
+        if (oldIdx >= rg.start && oldIdx < rg.end) {
+          next[insertPos + 1 + offsetInBody + (oldIdx - rg.start)] = dict[k];
+          moved = true;
+          break;
+        }
+        offsetInBody += rg.end - rg.start;
+      }
+      if (moved) continue;
+      let removedBefore = 0;
+      for (let r = 0; r < ranges.length; ++r) {
+        if (ranges[r].end <= oldIdx) removedBefore += ranges[r].end - ranges[r].start;
+      }
+      let idx = oldIdx - removedBefore;
+      if (idx >= insertPos) idx += insertedCount;
+      next[idx] = dict[k];
+    }
+    return next;
+  }
+
+  function applyMergeResult(result) {
+    if (!result || !result.ok) return;
+    state.collapsedContainers = remapIndexDictAfterMerge(
+      state.collapsedContainers,
+      result.ranges,
+      result.insertPos,
+      result.insertedCount
+    );
+    state.editorBreakpoints = remapIndexDictAfterMerge(
+      state.editorBreakpoints,
+      result.ranges,
+      result.insertPos,
+      result.insertedCount
+    );
+    delete state.collapsedContainers[result.containerIndex];
+    state.editorActions = result.actions;
+    state.actionSel = -1;
+    state.editDraft = null;
+    state.batchSel = {};
+    state.batchSel[result.containerIndex] = true;
+    renderEditorActions(state.editorActions);
+    state._mergeRootOrder = null;
+    const V = window.QstVisualEditor;
+    if (V && typeof V.isVisual === "function" && V.isVisual() && typeof V.afterMerge === "function") {
+      V.afterMerge(result.containerIndex, result);
+    }
+  }
+
+  function syncMergeModeUi() {
+    const lbl = $("#edActionTypeLbl");
+    if (!state.batchMode) {
+      _mergeUiOn = false;
+      if (lbl) lbl.textContent = "请选择要添加的宏";
+      return "normal";
+    }
+    const on = isMergeEligible();
+    const was = _mergeUiOn;
+    _mergeUiOn = on;
+    if (lbl) lbl.textContent = on ? "请选择要并入的宏" : "请选择要添加的宏";
+    if (on && !was) {
+      if (!isMergeContainerType(state.addActionType)) state.addActionType = "loop";
+      showAddTypePreview();
+      return "enter";
+    }
+    if (!on && was) {
+      state.addPreview = null;
+      renderParamPanel(null);
+      return "leave";
+    }
+    if (!on) {
+      renderParamPanel(null);
+      return "batch";
+    }
+    return "stay";
+  }
+
+  function runMergeWithPlacement(placement) {
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    if (state.addPreview) readParamPanelInto(state.addPreview);
+    const src =
+      state.addPreview && isMergeContainerType(state.addPreview.type)
+        ? state.addPreview
+        : defaultAction(state.addActionType, remark);
+    const container = cloneActionForInline(src);
+    container.remark = remark;
+    container.name = typeLabel(container.type);
+    if (container.type === "defineBlock" && !validateDefineBlockName(container.blockName, -1)) {
+      return;
+    }
+    const result = mergeSelectedIntoContainer(
+      state.editorActions.slice(),
+      selectedBatchIndices(),
+      container,
+      placement
+    );
+    if (!result.ok) {
+      toast(result.error || "并入失败");
+      return;
+    }
+    visualNoteUndo();
+    applyMergeResult(result);
+    state._mergeRootOrder = null;
+    const remarkEl = $("#edRemark");
+    if (remarkEl) remarkEl.textContent = "";
   }
 
   function visibleActionIndices() {
@@ -6201,6 +7668,552 @@
     return true;
   }
 
+  const EDITOR_UNDO_MAX = 50;
+
+  function cloneEditorJson(v) {
+    return JSON.parse(JSON.stringify(v));
+  }
+
+  function isEditorVisualMode() {
+    const V = window.QstVisualEditor;
+    return !!(V && typeof V.isVisual === "function" && V.isVisual());
+  }
+
+  function resetEditorHistory(opts) {
+    state.editorUndo = [];
+    state.editorRedo = [];
+    if (!(opts && opts.keepClipboard)) state.editorClipboard = null;
+  }
+
+  function captureEditorHistory() {
+    const V = window.QstVisualEditor;
+    let visual = null;
+    try {
+      visual = V && typeof V.collectHistory === "function" ? V.collectHistory() : null;
+    } catch (_) {
+      visual = null;
+    }
+    return {
+      actions: cloneEditorJson(state.editorActions || []),
+      actionSel: state.actionSel | 0,
+      batchMode: !!state.batchMode,
+      batchSel: cloneEditorJson(state.batchSel || {}),
+      collapsed: cloneEditorJson(state.collapsedContainers || {}),
+      breakpoints: cloneEditorJson(state.editorBreakpoints || {}),
+      visual: visual,
+    };
+  }
+
+  function applyEditorSnapshot(snap) {
+    if (!snap) return;
+    state.editorActions = Array.isArray(snap.actions) ? cloneEditorJson(snap.actions) : [];
+    state.actionSel = snap.actionSel | 0;
+    if (state.actionSel >= state.editorActions.length) state.actionSel = -1;
+    state.batchMode = !!snap.batchMode;
+    state.batchSel = snap.batchSel && typeof snap.batchSel === "object" ? cloneEditorJson(snap.batchSel) : {};
+    state.collapsedContainers =
+      snap.collapsed && typeof snap.collapsed === "object" ? cloneEditorJson(snap.collapsed) : {};
+    state.editorBreakpoints =
+      snap.breakpoints && typeof snap.breakpoints === "object" ? cloneEditorJson(snap.breakpoints) : {};
+    state.addPreview = null;
+    const V = window.QstVisualEditor;
+    if (V && typeof V.applyHistory === "function") {
+      try {
+        V.applyHistory(snap.visual || null);
+      } catch (_) {}
+    }
+    if (state.batchMode) {
+      state.editDraft = null;
+      syncEditorBatchChrome();
+      syncMergeModeUi();
+    } else {
+      resetMergeUiChrome();
+      state._mergeRootOrder = null;
+      syncEditorBatchChrome();
+      if (state.actionSel >= 0) loadEditDraftFromSelection();
+      else {
+        state.editDraft = null;
+        showAddTypePreview();
+      }
+    }
+    renderEditorActions(state.editorActions);
+  }
+
+  function pushEditorHistory() {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.isHistoryHeld === "function" && V.isHistoryHeld()) return false;
+    try {
+      if (!state.editorUndo) state.editorUndo = [];
+      state.editorUndo.push(captureEditorHistory());
+      if (state.editorUndo.length > EDITOR_UNDO_MAX) state.editorUndo.shift();
+      state.editorRedo = [];
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function undoEditorHistory() {
+    if (!state.editorUndo || !state.editorUndo.length) return false;
+    if (!state.editorRedo) state.editorRedo = [];
+    const current = captureEditorHistory();
+    const prev = state.editorUndo.pop();
+    state.editorRedo.push(current);
+    if (state.editorRedo.length > EDITOR_UNDO_MAX) state.editorRedo.shift();
+    applyEditorSnapshot(prev);
+    return true;
+  }
+
+  function redoEditorHistory() {
+    if (!state.editorRedo || !state.editorRedo.length) return false;
+    if (!state.editorUndo) state.editorUndo = [];
+    const current = captureEditorHistory();
+    const next = state.editorRedo.pop();
+    state.editorUndo.push(current);
+    if (state.editorUndo.length > EDITOR_UNDO_MAX) state.editorUndo.shift();
+    applyEditorSnapshot(next);
+    return true;
+  }
+
+  function revertLastEditorHistory() {
+    if (!state.editorUndo || !state.editorUndo.length) return false;
+    const prev = state.editorUndo.pop();
+    applyEditorSnapshot(prev);
+    return true;
+  }
+
+  function discardEditorHistory() {
+    if (state.editorUndo && state.editorUndo.length) state.editorUndo.pop();
+  }
+
+  function visualNoteUndo() {
+    return pushEditorHistory();
+  }
+
+  function selectedEditorActionRoots() {
+    const list = state.editorActions || [];
+    let idxs = [];
+    if (state.batchMode) idxs = selectedBatchIndices();
+    if (!idxs.length && state.actionSel >= 0 && state.actionSel < list.length) {
+      idxs = [state.actionSel];
+    }
+    if (!idxs.length) return [];
+    const roots = [];
+    for (let i = 0; i < idxs.length; i++) {
+      const idx = idxs[i];
+      let covered = false;
+      for (let j = 0; j < idxs.length; j++) {
+        const other = idxs[j];
+        if (other < idx && subtreeEnd(other) > idx) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered) roots.push(idx);
+    }
+    return roots;
+  }
+
+  function uniquifyPastedBlockName(name, used) {
+    let base = String(name || "Block").trim();
+    if (!isValidBlockName(base)) base = "Block";
+    let n = base;
+    let i = 2;
+    while (used[n] || isBlockNameDuplicate(n, -1)) {
+      n = base + i;
+      i += 1;
+    }
+    used[n] = true;
+    return n;
+  }
+
+  function pasteAnchorIndex() {
+    const list = state.editorActions || [];
+    if (state.batchMode) {
+      const roots = selectedEditorActionRoots();
+      if (roots.length) return roots[roots.length - 1];
+      return -1;
+    }
+    if (state.actionSel >= 0 && state.actionSel < list.length) return state.actionSel;
+    return -1;
+  }
+
+  function editorHasClipboard() {
+    const blocks = state.editorClipboard;
+    if (!blocks || !blocks.length) return false;
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i] && blocks[i].length) return true;
+    }
+    return false;
+  }
+
+  function resolveEditorOpRoots(opts) {
+    opts = opts || {};
+    const list = state.editorActions || [];
+    let roots;
+    if (Array.isArray(opts.roots) && opts.roots.length) roots = opts.roots.slice();
+    else if (opts.index != null && opts.index >= 0) roots = [opts.index | 0];
+    else roots = selectedEditorActionRoots();
+    return roots.filter((i) => i >= 0 && i < list.length);
+  }
+
+  function copySelectedEditorActions(opts) {
+    opts = opts || {};
+    if (isEditorVisualMode() && !opts.allowVisual) return false;
+    const roots = resolveEditorOpRoots(opts);
+    if (!roots.length) return false;
+    const blocks = [];
+    for (let r = 0; r < roots.length; r++) {
+      const i = roots[r];
+      const end = subtreeEnd(i);
+      const block = (state.editorActions || []).slice(i, end).map((a) => {
+        const c = cloneEditorJson(a);
+        delete c._preview;
+        return c;
+      });
+      if (block.length) blocks.push(block);
+    }
+    if (!blocks.length) return false;
+    state.editorClipboard = blocks;
+    const V = window.QstVisualEditor;
+    if (V && typeof V.setClipboard === "function") V.setClipboard(blocks[0][0]);
+    const n = blocks.reduce((s, b) => s + b.length, 0);
+    if (!opts.silent) toast(n > 1 ? "已复制 " + n + " 条动作" : "已复制");
+    return true;
+  }
+
+  function cutSelectedEditorActions(opts) {
+    opts = opts || {};
+    const visual = isEditorVisualMode();
+    const V = window.QstVisualEditor;
+    const roots = resolveEditorOpRoots(opts);
+    if (!roots.length) return false;
+    if (visual && !state.batchMode && roots.length === 1 && typeof V.cutCard === "function") {
+      return !!V.cutCard(roots[0]);
+    }
+    if (!copySelectedEditorActions({ silent: true, allowVisual: true, roots })) return false;
+    const n = (state.editorClipboard || []).reduce((s, b) => s + ((b && b.length) || 0), 0);
+    if (!deleteSelectedEditorActions({ skipEdge: true, roots })) return false;
+    toast(n > 1 ? "已剪切 " + n + " 条动作" : "已剪切");
+    return true;
+  }
+
+  function pasteEditorClipboardAfterSelection(opts) {
+    opts = opts || {};
+    if (isEditorVisualMode()) return false;
+    const blocks = state.editorClipboard;
+    if (!blocks || !blocks.length) return false;
+    const list = state.editorActions || [];
+    let pos;
+    let destIndent;
+    if (!list.length) {
+      pos = 0;
+      destIndent = 0;
+    } else {
+      const sel = opts.index != null && opts.index >= 0 ? opts.index | 0 : pasteAnchorIndex();
+      if (sel < 0 || sel >= list.length) return false;
+      pos = subtreeEnd(sel);
+      destIndent = clampIndent(list[sel].indent);
+    }
+    const toInsert = [];
+    const usedNames = {};
+    for (let b = 0; b < blocks.length; b++) {
+      const copy = cloneEditorJson(blocks[b]);
+      remapCopiedIndents(copy, destIndent);
+      for (let i = 0; i < copy.length; i++) {
+        const a = copy[i];
+        delete a._preview;
+        a.name = typeLabel(a.type);
+        if (a.type === "defineBlock") a.blockName = uniquifyPastedBlockName(a.blockName, usedNames);
+        toInsert.push(a);
+      }
+    }
+    if (!toInsert.length) return false;
+    const combined = list.slice(0, pos).concat(toInsert).concat(list.slice(pos));
+    const err = validateEndLoopPlacements(combined);
+    if (err) {
+      toast(err);
+      return false;
+    }
+    visualNoteUndo();
+    for (let i = 0; i < toInsert.length; i++) {
+      list.splice(pos + i, 0, toInsert[i]);
+      visualOnInsert(pos + i);
+      shiftCollapsedAfterInsert(pos + i);
+      if (isSubtreeContainerType(toInsert[i].type)) delete state.collapsedContainers[pos + i];
+    }
+    if (state.batchMode) {
+      state.batchMode = false;
+      state.batchSel = {};
+      resetMergeUiChrome();
+      syncEditorBatchChrome();
+    }
+    state.actionSel = pos;
+    state.addPreview = null;
+    loadEditDraftFromSelection();
+    renderEditorActions(state.editorActions);
+    focusEditorActionList();
+    return true;
+  }
+
+  function deleteSelectedEditorActions(opts) {
+    opts = opts || {};
+    const V = window.QstVisualEditor;
+    const visual = isEditorVisualMode();
+    if (!opts.skipEdge && visual && typeof V.deleteSelectedEdgeIfAny === "function" && V.deleteSelectedEdgeIfAny()) {
+      return true;
+    }
+    const roots = resolveEditorOpRoots(opts);
+    if (!roots.length) return false;
+    if (visual && !state.batchMode && roots.length === 1 && typeof V.deleteCard === "function") {
+      V.deleteCard(roots[0]);
+      return true;
+    }
+    visualNoteUndo();
+    const sorted = roots.slice().sort((a, b) => b - a);
+    for (let k = 0; k < sorted.length; k++) {
+      const idx = sorted[k];
+      if (idx < 0 || idx >= (state.editorActions || []).length) continue;
+      deleteSubtreeAt(idx, { skipUndo: true });
+    }
+    if (state.batchMode) {
+      state.batchMode = false;
+      state.batchSel = {};
+      resetMergeUiChrome();
+      syncEditorBatchChrome();
+    }
+    if (visual && typeof V.afterListDelete === "function") V.afterListDelete();
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    if (state.actionSel < 0 && !state.batchMode) showAddTypePreview();
+    return true;
+  }
+
+  function editorShortcutBlockedByOverlay() {
+    const ids = [
+      "ov-hotkey",
+      "ov-action-key",
+      "ov-prompt",
+      "ov-rename",
+      "ov-crop",
+      "ov-pick",
+      "ov-ocr",
+      "ov-opt",
+      "ov-theme",
+      "ov-settings",
+      "ov-sched",
+      "ov-sched-create",
+      "ov-editor-settings",
+      "ov-driver-ic",
+      "ov-driver-vhid",
+      "ov-interval",
+    ];
+    for (let i = 0; i < ids.length; i++) {
+      const el = document.getElementById(ids[i]);
+      if (el && el.classList.contains("show")) return true;
+    }
+    if ($("#ov-agent")?.classList.contains("show") && !state.agentMinimized) return true;
+    const imgV = $("#agentImgViewer");
+    if (imgV && !imgV.hidden && imgV.classList.contains("show")) return true;
+    if (document.querySelector(".popup-menu.show")) return true;
+    return false;
+  }
+
+  function onEditorActionShortcut(ev) {
+    if (!state.editor) return;
+    const visEd = window.QstVisualEditor;
+    if (visEd && typeof visEd.isInteracting === "function" && visEd.isInteracting()) return;
+    const ctrl = !!(ev.ctrlKey || ev.metaKey);
+    const key = ev.key || "";
+    if (!ctrl && !ev.altKey && key === "Escape") {
+      if (document.querySelector(".popup-menu.show")) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        hidePopup();
+        return;
+      }
+      if (editorShortcutBlockedByOverlay()) return;
+      if (state.batchMode) {
+        ev.preventDefault();
+        enterEditorBatch(false);
+      }
+      return;
+    }
+    if (isEditableTypingTarget(ev.target) || isEditableTypingTarget(document.activeElement)) {
+      if (
+        !ctrl &&
+        !ev.altKey &&
+        (key === "Delete" || key === "Backspace") &&
+        isEditorVisualMode()
+      ) {
+        const V = window.QstVisualEditor;
+        if (V && typeof V.deleteSelectedEdgeIfAny === "function" && V.deleteSelectedEdgeIfAny()) {
+          ev.preventDefault();
+          ev.stopPropagation();
+        }
+      }
+      return;
+    }
+    if (editorShortcutBlockedByOverlay()) return;
+    if (ctrl && !ev.altKey && (key === "z" || key === "Z") && !ev.shiftKey) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      undoEditorHistory();
+      return;
+    }
+    if (
+      (ctrl && !ev.altKey && (key === "y" || key === "Y") && !ev.shiftKey) ||
+      (ctrl && ev.shiftKey && (key === "z" || key === "Z"))
+    ) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      redoEditorHistory();
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "c" || key === "C")) {
+      if (copySelectedEditorActions()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "x" || key === "X")) {
+      if (cutSelectedEditorActions()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "v" || key === "V")) {
+      if (pasteEditorClipboardAfterSelection()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (!ctrl && !ev.altKey && key === "Delete") {
+      if (deleteSelectedEditorActions()) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ctrl && !ev.altKey && (key === "a" || key === "A")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      selectAllEditorActions();
+    }
+  }
+
+  function bindEditorActionShortcuts() {
+    if (document._qstEditorShortcuts) return;
+    document._qstEditorShortcuts = true;
+    document.addEventListener("keydown", onEditorActionShortcut, true);
+  }
+
+  function focusEditorActionList() {
+    try {
+      if (isEditableTypingTarget(document.activeElement)) return;
+      if (isEditorVisualMode()) {
+        const host = $("#visualCanvasHost");
+        if (host) host.focus({ preventScroll: true });
+        return;
+      }
+      const list = $("#actionList");
+      if (!list) return;
+      if (list.tabIndex < 0) list.tabIndex = -1;
+      list.focus({ preventScroll: true });
+    } catch (_) {}
+  }
+
+  function visualOnInsert(pos) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onInsert === "function") V.onInsert(pos);
+  }
+
+  function visualOnDelete(index, count) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onDelete === "function") V.onDelete(index, count);
+  }
+
+  function visualOnMove(fromIdx, end, insert) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onMove === "function") V.onMove(fromIdx, end, insert);
+  }
+
+  function visualOnReplace(start, oldCount, newCount) {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onReplace === "function") V.onReplace(start, oldCount, newCount);
+  }
+
+  function visualDiscardUndo() {
+    discardEditorHistory();
+  }
+
+  function visualActionsChanged() {
+    const V = window.QstVisualEditor;
+    if (V && typeof V.onActionsChanged === "function") V.onActionsChanged();
+  }
+
+  function collectVisualLayoutForSave() {
+    const V = window.QstVisualEditor;
+    if (!V) return undefined;
+    if (typeof V.collectLayoutIfAny === "function") return V.collectLayoutIfAny();
+    if (typeof V.collectLayout === "function") return V.collectLayout();
+    return undefined;
+  }
+
+  function editorPrefersVisual() {
+    return !!(
+      state.settings &&
+      state.settings.other &&
+      state.settings.other.editorDefaultView === "visual"
+    );
+  }
+
+  function applyEditorDefaultView() {
+    const V = window.QstVisualEditor;
+    if (!V || !editorPrefersVisual()) return;
+    if (typeof V.applyOpenView === "function") V.applyOpenView(true);
+    else if (typeof V.setMode === "function") V.setMode(true);
+  }
+
+  function selectEditorAction(i, opts) {
+    i = i | 0;
+    if (i < 0 || i >= (state.editorActions || []).length) return;
+    opts = opts || {};
+    if (
+      opts.keepDraft &&
+      state.actionSel === i &&
+      state.editDraft &&
+      !state.addPreview
+    ) {
+      captureParamPanelIntoDraft();
+      const V = window.QstVisualEditor;
+      if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
+      return;
+    }
+    const prevSel = state.actionSel;
+    state.actionSel = i;
+    state.addPreview = null;
+    loadEditDraftFromSelection();
+    {
+      const a = state.editDraft;
+      if (a && a.type) {
+        state.addActionType = a.type;
+        const typeCombo = $("#edActionType");
+        const cur = ACTION_TYPES.find((x) => x.v === a.type);
+        if (typeCombo && cur) typeCombo.textContent = cur.t;
+      }
+    }
+    state._skipReadback = true;
+    updateEditorSelectionUi(prevSel, i);
+    state._skipReadback = false;
+    const row = $("#actionList")?.querySelector('.arow[data-i="' + i + '"]');
+    if (row && row.scrollIntoView) row.scrollIntoView({ block: "nearest" });
+    focusEditorActionList();
+  }
+
   function insertEditorAction(action, pos, indentOverride) {
     const a = Object.assign({}, action);
     delete a._preview;
@@ -6222,28 +8235,34 @@
       toast(END_LOOP_NEEDS_LOOP_MSG);
       return false;
     }
+    visualNoteUndo();
     list.splice(pos, 0, a);
+    visualOnInsert(pos);
     shiftCollapsedAfterInsert(pos);
     if (isSubtreeContainerType(a.type)) delete state.collapsedContainers[pos];
     return true;
   }
 
-  function deleteSubtreeAt(index) {
+  function deleteSubtreeAt(index, opts) {
+    if (!(opts && opts.skipUndo)) visualNoteUndo();
     const end = subtreeEnd(index);
     state.editorActions.splice(index, end - index);
+    visualOnDelete(index, end - index);
     remapCollapsedAfterDelete(index, end);
     if (state.actionSel >= index && state.actionSel < end) state.actionSel = -1;
     else if (state.actionSel >= end) state.actionSel -= end - index;
   }
 
-  function batchDeleteSelectedSubtrees() {
+  function batchDeleteSelectedSubtrees(opts) {
     const selected = new Set(selectedBatchIndices());
     if (!selected.size) return 0;
+    if (!(opts && opts.skipUndo)) visualNoteUndo();
     let removed = 0;
     for (let i = state.editorActions.length - 1; i >= 0; --i) {
       if (!selected.has(i)) continue;
       const end = subtreeEnd(i);
       state.editorActions.splice(i, end - i);
+      visualOnDelete(i, end - i);
       remapCollapsedAfterDelete(i, end);
       removed += 1;
       // 落在已删子树内的勾选索引随之失效
@@ -6279,6 +8298,28 @@
       if (n && !defined.has(n)) {
         toast(`警告：运行块「${n}」未在本脚本中定义（仍可保存）`);
         break;
+      }
+    }
+    for (let i = 0; i < state.editorActions.length; ++i) {
+      const a = state.editorActions[i];
+      if (!a || (a.type !== "runMacro" && a.type !== "mousePlayback")) continue;
+      const mode = a.useMode == null ? 3 : a.useMode | 0;
+      if (mode !== 1 && mode !== 2) continue;
+      const wm = a.nestedWindowMode || {};
+      const method = normalizeWmSelectMethod(wm.selectMethod);
+      const hasIdentity = !!(
+        (wm.windowClassName && String(wm.windowClassName).trim()) ||
+        (wm.windowName && String(wm.windowName).trim()) ||
+        (wm.windowTitle && String(wm.windowTitle).trim())
+      );
+      const hasExe = !!(wm.targetExePath && String(wm.targetExePath).trim());
+      if (method === "useEditorWindowClass" && !hasIdentity) {
+        toast("嵌套动作请先点击「指定窗口类」配置目标窗口，或改用其他选择窗口方式。");
+        return false;
+      }
+      if (method === "noSelect" && !hasExe) {
+        toast("嵌套动作请填写目标程序路径，可使用「浏览」或「准星找程序」。");
+        return false;
       }
     }
     return true;
@@ -6373,8 +8414,10 @@
       toast(END_LOOP_NEEDS_LOOP_MSG);
       return false;
     }
+    visualNoteUndo();
     remapCollapsedAfterMove(fromIdx, end, insert, end - fromIdx);
     state.editorActions = combined;
+    visualOnMove(fromIdx, end, insert);
     if (state.actionSel >= fromIdx && state.actionSel < end) {
       state.actionSel = insert + (state.actionSel - fromIdx);
     } else if (state.actionSel >= end) {
@@ -6437,16 +8480,158 @@
     "rgba(251,113,133,0.10)",
   ];
 
-  function nestTintStyle(rowIdx) {
-    const covering = nestTintContainers(rowIdx);
-    if (!covering.length) return "";
-    const bg = covering
+  function applyRowNestTint(row, idx, selected, covering) {
+    if (!row) return;
+    if (selected) {
+      row.classList.remove("nest-tint");
+      row.style.backgroundImage = "";
+      return;
+    }
+    const layers = covering || nestTintContainers(idx);
+    if (!layers || !layers.length) {
+      row.classList.remove("nest-tint");
+      row.style.backgroundImage = "";
+      return;
+    }
+    row.classList.add("nest-tint");
+    const bg = layers
       .map((ci) => {
         const c = NEST_TINTS[ci % NEST_TINTS.length];
         return `linear-gradient(${c},${c})`;
       })
       .join(",");
-    return `background-image:${bg};`;
+    row.style.backgroundImage = bg;
+  }
+
+  function editorBatchPickedCount() {
+    if (!state.batchSel) return 0;
+    let n = 0;
+    for (const k in state.batchSel) {
+      if (state.batchSel[k]) n += 1;
+    }
+    return n;
+  }
+
+  function syncEditorActionCount() {
+    const count = $("#edCount");
+    if (!count) return;
+    const n = state.editorActions.length;
+    count.textContent = state.batchMode
+      ? n + " 项 · 已选 " + editorBatchPickedCount()
+      : n + " 项";
+  }
+
+  function patchBatchRowSelected(row, selected, covering) {
+    if (!row) return;
+    const i = row.dataset.i | 0;
+    row.classList.toggle("sel", !!selected);
+    const chk = row.querySelector("[data-act='batch-toggle']");
+    if (chk) chk.classList.toggle("on", !!selected);
+    applyRowNestTint(row, i, selected, covering);
+  }
+
+  function refreshEditorBatchSelectionUi() {
+    const list = $("#actionList");
+    const rows = list ? list.querySelectorAll(".arow") : [];
+    if (state._actionListRendering || (!rows.length && (state.editorActions || []).length)) {
+      renderEditorActions(state.editorActions);
+      return;
+    }
+    const layout = precomputeRowLayout();
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      const i = row.dataset.i | 0;
+      patchBatchRowSelected(row, !!(state.batchSel && state.batchSel[i]), layout.cover[i]);
+    }
+    syncEditorActionCount();
+    syncMergeModeUi();
+  }
+
+  function toggleEditorBatchRow(index) {
+    if (!state.batchSel) state.batchSel = {};
+    state.batchSel[index] = !state.batchSel[index];
+    state._batchAnchor = index;
+    const list = $("#actionList");
+    const row = list && list.querySelector(`.arow[data-i="${index}"]`);
+    if (!row || state._actionListRendering) {
+      renderEditorActions(state.editorActions);
+      return;
+    }
+    const layout = precomputeRowLayout();
+    patchBatchRowSelected(row, !!state.batchSel[index], layout.cover[index]);
+    syncEditorActionCount();
+    syncMergeModeUi();
+  }
+
+  function applyEditorBatchRowClick(index, ev) {
+    if (!state.batchSel) state.batchSel = {};
+    const n = (state.editorActions || []).length;
+    if (index < 0 || index >= n) return;
+    if (ev && ev.shiftKey && state._batchAnchor >= 0 && state._batchAnchor < n) {
+      const a = Math.min(state._batchAnchor, index);
+      const b = Math.max(state._batchAnchor, index);
+      for (let i = a; i <= b; i++) {
+        if (isRowVisibleInTree(i)) state.batchSel[i] = true;
+      }
+      refreshEditorBatchSelectionUi();
+      return;
+    }
+    toggleEditorBatchRow(index);
+  }
+
+  function setEditorBatchSelectedAll(on) {
+    state.batchSel = {};
+    if (on) {
+      for (let i = 0; i < state.editorActions.length; i++) state.batchSel[i] = true;
+      state._batchAnchor = Math.max(0, state.editorActions.length - 1);
+    } else {
+      state._batchAnchor = -1;
+    }
+    refreshEditorBatchSelectionUi();
+  }
+
+  function selectAllEditorActions() {
+    const n = (state.editorActions || []).length;
+    if (!n) return false;
+    if (isEditorVisualMode()) {
+      const idxs = [];
+      for (let i = 0; i < n; i++) idxs.push(i);
+      setEditorVisualSelection(idxs);
+      const V = window.QstVisualEditor;
+      if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
+      if (V && typeof V.render === "function") V.render();
+      return true;
+    }
+    if (!state.batchMode) enterEditorBatch(true);
+    setEditorBatchSelectedAll(true);
+    return true;
+  }
+
+  /** 进出批量：CSS 显隐勾选框，只清行选中态，不重绘整表 */
+  function patchActionListBatchMode(on) {
+    const list = $("#actionList");
+    if (!list || !list.querySelector(".arow")) return false;
+    if (!list.querySelector("[data-act='batch-toggle']")) return false;
+    const layout = precomputeRowLayout();
+    $$(".arow", list).forEach((row) => {
+      const i = row.dataset.i | 0;
+      const chk = row.querySelector("[data-act='batch-toggle']");
+      if (chk) chk.classList.remove("on");
+      const nowSel = !on && i === state.actionSel;
+      row.classList.toggle("sel", nowSel);
+      const remark = row.children[2];
+      if (remark) remark.classList.toggle("muted", !(nowSel && !on));
+      applyRowNestTint(row, i, nowSel, layout.cover[i]);
+      if (!on) {
+        const opN = row.querySelector(".op-normal");
+        if (opN) {
+          opN.innerHTML = nowSel
+            ? '<span class="op-drag">拖动改变位置</span>'
+            : '<span class="op-a" data-act="copy">复制</span><span class="op-a" data-act="del">删除</span>';
+        }
+      }
+    });
+    return true;
   }
 
   function editorTreeStepPx() {
@@ -6472,15 +8657,19 @@
     if (state.actionSel >= state.editorActions.length) state.actionSel = -1;
     if (!state.batchSel) state.batchSel = {};
     const list = $("#actionList");
-    const count = $("#edCount");
-    if (count) {
-      const n = state.editorActions.length;
-      const picked = Object.keys(state.batchSel).filter((k) => state.batchSel[k]).length;
-      count.textContent = state.batchMode
-        ? n + " 项 · 已选 " + picked
-        : n + " 项";
+    syncEditorActionCount();
+    if (window.QstVisualEditor && typeof QstVisualEditor.isVisual === "function" && QstVisualEditor.isVisual()) {
+      if (state.actionSel >= 0) {
+        if (!state.editDraft) loadEditDraftFromSelection();
+        if (state.editDraft) renderParamPanel(state.editDraft);
+      } else if (state.addPreview) renderParamPanel(state.addPreview);
+      else showAddTypePreview();
+      syncEdRemarkFromSelection();
+      visualActionsChanged();
+      return;
     }
     if (!list) return;
+    list.classList.toggle("is-batch", !!state.batchMode);
     const keepScroll =
       state._actionListScrollTop != null ? state._actionListScrollTop : list.scrollTop;
     if (!list._qstScrollWired) {
@@ -6488,23 +8677,28 @@
       list.addEventListener(
         "scroll",
         () => {
+          if (state._actionListRendering) return;
           state._actionListScrollTop = list.scrollTop | 0;
         },
         { passive: true }
       );
     }
+    state._actionListRendering = true;
     if (!state.editorActions.length) {
       list.innerHTML = "";
       ensureActionInsertLine(list);
-      if (state.addPreview) renderParamPanel(state.addPreview);
-      else if (!state.batchMode) showAddTypePreview();
-      else renderParamPanel(null);
+      if (state.batchMode) {
+        syncMergeModeUi();
+      } else if (state.addPreview) renderParamPanel(state.addPreview);
+      else showAddTypePreview();
       syncEdRemarkFromSelection();
       syncEditorBatchChrome();
       wireActionListDrag();
       list.scrollTop = keepScroll;
+      state._actionListRendering = false;
       state._actionListScrollTop = list.scrollTop | 0;
       if (document.body.classList.contains("progressive-editor")) endProgressiveLoad();
+      visualActionsChanged();
       return;
     }
     // 数据已写入：揭开动作区模糊；首开可跳过错开 reveal，避免「有计数无行」闪帧
@@ -6528,7 +8722,8 @@
     const rowHtml = [];
     state.editorActions.forEach((a, i) => {
       if (!layout.visible[i]) return;
-      const sel = i === state.actionSel;
+      const batchOn = !!state.batchSel[i];
+      const sel = state.batchMode ? batchOn : i === state.actionSel;
       const num = String(i + 1);
       const ind = clampIndent(a.indent);
       const namePad = `padding-left:${ind * step.name}px`;
@@ -6536,7 +8731,7 @@
       const expanded = !expandable || isContainerExpanded(i);
       const covering = layout.cover[i];
       const tint = sel ? "" : tintStyle(i);
-      const nestCls = !sel && covering.length ? " nest-tint" : "";
+      const nestCls = !sel && covering && covering.length ? " nest-tint" : "";
       const revealCls = revealLoad ? " reveal-in" : "";
       const revealDelay = revealLoad
         ? `animation-delay:${Math.min(revealOrd++, 36) * 14}ms;`
@@ -6550,32 +8745,23 @@
         ? '<span class="bp-dot" title="断点：执行完该动作后结束调试"></span>'
         : "";
       const anoHtml = `<span class="ano">${bpDot}<span class="anum">${num}</span></span>`;
-      if (state.batchMode) {
-        const on = !!state.batchSel[i];
-        rowHtml.push(`<div class="arow ${on ? "sel" : ""}${editorBreakpointAt(i) ? " bp" : ""}${nestCls}${revealCls}" data-i="${i}" style="${revealDelay}${on ? "" : tint}">
-          ${anoHtml}
-          <span class="aname" style="${namePad}">${expHtml}<span class="chk ${on ? "on" : ""}" data-act="batch-toggle"><i></i></span><span class="aname-text">${esc(displayActionName(a))}</span></span>
-          <span class="muted">${esc(a.remark || "")}</span>
-          <span class="op muted">批量</span>
-        </div>`);
-        return;
-      }
-      const op = sel
-        ? '<span class="op-drag">拖动改变位置</span>'
-        : '<span class="op-a" data-act="copy">复制</span><span class="op-a" data-act="del">删除</span>';
+      const opNormal =
+        sel && !state.batchMode
+          ? '<span class="op-drag">拖动改变位置</span>'
+          : '<span class="op-a" data-act="copy">复制</span><span class="op-a" data-act="del">删除</span>';
       rowHtml.push(`<div class="arow ${sel ? "sel" : ""}${editorBreakpointAt(i) ? " bp" : ""}${nestCls}${revealCls}" data-i="${i}" style="${revealDelay}${sel ? "" : tint}">
-        ${anoHtml}
-        <span class="aname" style="${namePad}">${expHtml}<span class="aname-text">${esc(displayActionName(a))}</span></span>
-        <span class="${sel ? "" : "muted"}">${esc(a.remark || "")}</span>
-        <span class="op">${op}</span>
-      </div>`);
+          ${anoHtml}
+          <span class="aname" style="${namePad}">${expHtml}<span class="chk ${batchOn ? "on" : ""}" data-act="batch-toggle"><i></i></span><span class="aname-text">${esc(displayActionName(a))}</span></span>
+          <span class="${sel && !state.batchMode ? "" : "muted"}">${esc(a.remark || "")}</span>
+          <span class="op"><span class="op-normal">${opNormal}</span><span class="op-batch">批量</span></span>
+        </div>`);
     });
 
     const finishRender = () => {
       if (onProgressive) endProgressiveLoad();
       ensureActionInsertLine(list);
       if (state.batchMode) {
-        renderParamPanel(null);
+        syncMergeModeUi();
       } else if (state.actionSel >= 0 && !state.addPreview) {
         if (!state.editDraft) loadEditDraftFromSelection();
         renderParamPanel(state.editDraft);
@@ -6588,7 +8774,9 @@
       syncEditorBatchChrome();
       wireActionListDrag();
       list.scrollTop = keepScroll;
+      state._actionListRendering = false;
       state._actionListScrollTop = list.scrollTop | 0;
+      visualActionsChanged();
     };
 
     const CHUNK = 48;
@@ -6611,12 +8799,10 @@
   /** 仅切换选中态：避免整表 innerHTML 造成连点卡顿 */
   function updateEditorSelectionUi(prevSel, nextSel) {
     const list = $("#actionList");
-    if (!list || state.batchMode) {
-      renderEditorActions(state.editorActions);
-      return;
-    }
-    const count = $("#edCount");
-    if (count) count.textContent = state.editorActions.length + " 项";
+    if (!list) return;
+    if (state.batchMode) return;
+    syncEditorActionCount();
+    const layout = precomputeRowLayout();
     const patchRow = (idx, selected) => {
       if (idx < 0) return;
       const row = list.querySelector(`.arow[data-i="${idx}"]`);
@@ -6624,7 +8810,8 @@
       row.classList.toggle("sel", !!selected);
       const remark = row.children[2];
       if (remark) remark.classList.toggle("muted", !selected);
-      const op = row.querySelector(".op");
+      applyRowNestTint(row, idx, selected, layout.cover[idx]);
+      const op = row.querySelector(".op-normal") || row.querySelector(".op");
       if (op) {
         op.innerHTML = selected
           ? '<span class="op-drag">拖动改变位置</span>'
@@ -6633,6 +8820,8 @@
     };
     patchRow(prevSel, false);
     patchRow(nextSel, true);
+    const V = window.QstVisualEditor;
+    if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
     if (nextSel >= 0 && !state.addPreview) {
       if (!state.editDraft) loadEditDraftFromSelection();
       renderParamPanel(state.editDraft);
@@ -6740,7 +8929,8 @@
     state.editorName = name || "";
     state.editorActions = [];
     state.editDraft = null;
-    state.addActionType = "moveMouse";
+    state.addActionType = firstVisibleActionType();
+    resetEditorHistory();
     document.body.classList.add("editor-open", "editor-booting");
     const app = $("#app");
     if (app) app.classList.add("editor-mode");
@@ -6756,10 +8946,13 @@
     }
     const edName = $("#edName");
     if (edName) edName.textContent = state.editorName || "…";
+    resetMergeUiChrome();
+    if (window.QstVisualEditor && typeof QstVisualEditor.reset === "function") {
+      QstVisualEditor.reset();
+    }
     const typeCombo = $("#edActionType");
     if (typeCombo) {
-      const cur = ACTION_TYPES.find((a) => a.v === "moveMouse") || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      syncEditorActionTypeCombo();
     }
     if (!state.addPreview) showAddTypePreview();
     syncEditorBatchChrome();
@@ -6781,18 +8974,26 @@
     } else {
       renderEditorActions([]);
       showAddTypePreview();
+      applyEditorDefaultView();
       document.body.classList.remove("editor-booting");
       endModeTransition("force");
     }
   }
 
   function captureEditorSnapshot() {
+    const scrub = (a) => {
+      const c = Object.assign({}, a);
+      delete c._vx;
+      delete c._vy;
+      return c;
+    };
     return JSON.stringify({
       name: state.editorName || "",
       mode: state.editorMode | 0,
       breakout: ($("#edBreakout")?.textContent || "").trim(),
       windowMode: state.windowMode || {},
-      actions: state.editorActions || [],
+      actions: (state.editorActions || []).map(scrub),
+      visualLayout: collectVisualLayoutForSave() || null,
     });
   }
 
@@ -6824,6 +9025,8 @@
     state.collapsedContainers = {};
     state.addActionType = "moveMouse";
     state.editorActions = [];
+    resetEditorHistory();
+    resetMergeUiChrome();
     // 调试缓存随编辑器关闭清理干净
     state.editorBreakpoints = {};
     state.debugHotkey = { text: "F9", vk: 0x78, modifiers: 0 };
@@ -6906,30 +9109,46 @@
       toast("已有宏/调试在运行");
       return;
     }
-    if (index < 0 || index >= state.editorActions.length) index = 0;
-    // 保存前把右栏草稿同步进选中动作，调试用的就是当前所见内容
-    syncFormIntoSelectedBeforeSave();
-    const bp = Object.keys(state.editorBreakpoints)
-      .map((k) => Number(k))
-      .filter(
-        (k) => Number.isFinite(k) && k >= 0 && k < state.editorActions.length
-      )
-      .sort((a, b) => a - b);
-    const name =
-      ($("#edName")?.textContent || "").trim() || state.editorName || "调试";
-    state.debugging = true;
-    state.debugPaused = false;
-    state.debugStepMode = !!stepMode;
-    qst.debugScript({
-      path: state.editorPath || "",
-      name,
-      actions: state.editorActions,
-      startIndex: index | 0,
-      mode: stepMode ? "step" : "run",
-      breakpoints: bp,
-      hotkeyVk: (state.debugHotkey && state.debugHotkey.vk) | 0,
-      hotkeyModifiers: (state.debugHotkey && state.debugHotkey.modifiers) | 0,
-    });
+    const go = (idx) => {
+      if (idx < 0 || idx >= state.editorActions.length) idx = 0;
+      syncFormIntoSelectedBeforeSave();
+      const bp = Object.keys(state.editorBreakpoints)
+        .map((k) => Number(k))
+        .filter(
+          (k) => Number.isFinite(k) && k >= 0 && k < state.editorActions.length
+        )
+        .sort((a, b) => a - b);
+      const name =
+        ($("#edName")?.textContent || "").trim() || state.editorName || "调试";
+      state.debugging = true;
+      state.debugPaused = false;
+      state.debugStepMode = !!stepMode;
+      qst.debugScript({
+        path: state.editorPath || "",
+        name,
+        actions: state.editorActions,
+        startIndex: idx | 0,
+        mode: stepMode ? "step" : "run",
+        editorMode: state.editorMode | 0,
+        windowMode: collectWindowModeForSave(),
+        breakpoints: bp,
+        hotkeyVk: (state.debugHotkey && state.debugHotkey.vk) | 0,
+        hotkeyModifiers: (state.debugHotkey && state.debugHotkey.modifiers) | 0,
+      });
+    };
+    const V = window.QstVisualEditor;
+    if (V && typeof V.isVisual === "function" && V.isVisual() && typeof V.commitGraphToList === "function") {
+      const act =
+        index >= 0 && index < state.editorActions.length ? state.editorActions[index] : null;
+      V.commitGraphToList(function (ok) {
+        if (!ok) return;
+        let idx = act ? state.editorActions.indexOf(act) : 0;
+        if (idx < 0) idx = 0;
+        go(idx);
+      }, "与初始节点无关的流程会直接删除，确定调试？");
+      return;
+    }
+    go(index);
   }
 
   function itemPath(item) {
@@ -6944,7 +9163,7 @@
   }
 
   /** 统一文本输入（替代 window.prompt），复用 ov-rename */
-  function askInput(title, defaultVal, onOk) {
+  function askInput(title, defaultVal, onOk, opts) {
     const titleEl = $("#ov-rename .dlg-title");
     if (titleEl) {
       titleEl.innerHTML =
@@ -6958,6 +9177,7 @@
     // 必须先 openOv（内部 closeAllOv 会清 askInput），再写入 pending 状态
     openOv("rename");
     state._askInputOk = typeof onOk === "function" ? onOk : null;
+    state._askInputAllowEmpty = !!(opts && opts.allowEmpty);
     state.pendingKind = "askInput";
     state.pendingPath = "";
     if (inp) {
@@ -7507,6 +9727,7 @@
     _hotkeyLastLlTick = Date.now();
     const hold = !!msg.hotkeyHold;
     const edge = String(msg.hotkeyEdge || "");
+    // 缺 edge 时不得把 hold=false 当成 down：旧壳的 keyup 会再次武装，约 200ms 后误标长按。
     if (edge === "down") {
       armHotkeyHoldTimer(vk, msg.hotkeyModifiers | 0);
     } else if (edge === "up") {
@@ -8045,6 +10266,7 @@
     $$(".chk", root || document).forEach((c) => {
       if (c._bound) return;
       if (c.closest("#optList")) return;
+      if (c.closest("#edActionCatalog")) return;
       if (c.id === "schedGlobalDisable") return;
       c._bound = true;
       c.addEventListener("click", (e) => {
@@ -8055,7 +10277,7 @@
         if (i) i.textContent = "";
       });
     });
-    $$(".sched-resume-pair", root || document).forEach((p) => {
+    $$(".sched-resume-pair, .sound-chk-pair", root || document).forEach((p) => {
       if (p._boundResume) return;
       p._boundResume = true;
       p.addEventListener("click", (e) => {
@@ -8142,9 +10364,15 @@
           hideDebugFloat();
         }
       }
+      const other = msg.other || {};
+      if (other.showFloatBall != null) {
+        setChk($("#setFloatBall"), !!other.showFloatBall);
+        if (!state.settings) state.settings = {};
+        if (!state.settings.other) state.settings.other = {};
+        state.settings.other.showFloatBall = !!other.showFloatBall;
+      }
       return;
     }
-    if (type === "engine.toast") {
       if (msg.text) toast(String(msg.text));
       return;
     }
@@ -8377,12 +10605,26 @@
         } else {
           toast(pick.processPath || "未获取路径");
         }
-      } else if (mode === "windowTarget" || pending === "windowClass" || pending === "window") {
-        applyWindowPickToEditor(pick, pending);
-        fillPickOverlay(pick);
-        // 指定窗口类：打开浮层细调；准星绑定：已写入编辑器字段，仅在无路径时再开浮层
-        if (pending === "windowClass" || !pick.processPath) openOv("pick");
-        else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
+      } else if (
+        mode === "windowTarget" ||
+        pending === "windowClass" ||
+        pending === "window" ||
+        pending === "nestedWm" ||
+        pending === "nestedWmClass"
+      ) {
+        if (pending === "nestedWm" || pending === "nestedWmClass") {
+          applyWindowPickToNestedAction(pick, pending);
+          fillPickOverlay(pick);
+          if (pending === "nestedWmClass" || !pick.processPath) {
+            state._nestedWmPick = true;
+            openOv("pick");
+          } else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
+        } else {
+          applyWindowPickToEditor(pick, pending);
+          fillPickOverlay(pick);
+          if (pending === "windowClass" || !pick.processPath) openOv("pick");
+          else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
+        }
       } else {
         fillPickOverlay(pick);
         openOv("pick");
@@ -8414,6 +10656,20 @@
         state._pendingBrowse = "";
         return;
       }
+      if (state._pendingBrowse === "nestedWmTarget") {
+        const a = editorParamAction();
+        if (a && (a.type === "runMacro" || a.type === "mousePlayback") && msg.path) {
+          readParamPanelInto(a);
+          const wm = ensureNestedWindowMode(a);
+          wm.targetExePath = msg.path;
+          a.nestedWindowMode = wm;
+          renderParamPanel(a);
+          toast("已选择程序路径");
+        }
+        state._pendingBrowse = "";
+        return;
+      }
+      // 助手窗开着时 browse 回包也会到主壳：无本页待处理选择则忽略，避免写进编辑器路径
       if (!state._pendingBrowse) return;
       const a = editorParamAction();
       if (a && msg.path) {
@@ -9001,6 +11257,15 @@
       }
       return;
     }
+    if (type === "peekScriptActions.result") {
+      const reqId = String(msg.reqId || "");
+      const waiter = state._peekWaiters && state._peekWaiters[reqId];
+      if (waiter) {
+        delete state._peekWaiters[reqId];
+        waiter(msg);
+      }
+      return;
+    }
     if (type === "openEditor.result") {
       if (state._editorOpenWatchdog) {
         clearTimeout(state._editorOpenWatchdog);
@@ -9055,18 +11320,22 @@
       state.actionSel = -1;
       state.addPreview = null;
       state.editDraft = null;
-      state.addActionType = "moveMouse";
+      state.addActionType = firstVisibleActionType();
       const typeCombo = $("#edActionType");
       if (typeCombo) {
-        const cur = ACTION_TYPES.find((x) => x.v === "moveMouse") || ACTION_TYPES[0];
-        typeCombo.textContent = cur.t;
+        syncEditorActionTypeCombo();
       }
       // 首屏一次性写入，跳过错开 reveal（避免「有计数无行」闪帧）
       state._skipOpenReveal = true;
       renderEditorActions(loaded);
       state._skipOpenReveal = false;
+      if (window.QstVisualEditor && typeof QstVisualEditor.applyLayout === "function" && script.visualLayout) {
+        QstVisualEditor.applyLayout(script.visualLayout);
+      }
+      applyEditorDefaultView();
       syncDebugHotkeyUi();
       showAddTypePreview();
+      resetEditorHistory({ keepClipboard: true });
       state._editorSnapshot = captureEditorSnapshot();
       // 内容已齐：再放大窗体（cloak 中），setMode.result 里揭开
       state._pendingModeReveal = "editor";
@@ -9219,19 +11488,23 @@
       type === "setScheduledTasksGlobalDisabled.result"
     ) {
       if (!msg.ok) {
+        state.schedStatusBusy = false;
         toast(msg.detail || "定时任务操作失败");
         return;
       }
       renderSchedTable(msg.data || {});
       if (window.ProMode) window.ProMode.onDataChanged();
       if (type === "saveScheduledTask.result") {
-        toast("任务已保存");
-        closeAllOv();
-        // 专业模式：留在定时资源管理器页，不弹任务列表窗
-        if (state.uiMode === "pro" && window.ProMode && typeof window.ProMode.switchPage === "function") {
-          window.ProMode.switchPage("sched");
-        } else {
-          openOv("sched");
+        state.schedStatusBusy = false;
+        if (!msg.statusOnly) {
+          toast("任务已保存");
+          closeAllOv();
+          // 专业模式：留在定时资源管理器页，不弹任务列表窗
+          if (state.uiMode === "pro" && window.ProMode && typeof window.ProMode.switchPage === "function") {
+            window.ProMode.switchPage("sched");
+          } else {
+            openOv("sched");
+          }
         }
         // 列表已由本次 result.data 填充；再拉一次以防引擎 Reload 后需同步
         if (window.qst) setTimeout(() => qst.listScheduledTasks(), 60);
@@ -9966,9 +12239,18 @@
     if (bar) bar.style.width = "100%";
   }
 
-  const FREQ_LABELS = ["每小时", "每日", "每周", "自定义"];
+  const FREQ_LABELS = ["每小时", "每日", "每周", "自定义", "间隔"];
   function stripSchedFileLabel(name) {
     return String(name || "").replace(/\.json$/i, "");
+  }
+  function syncSchedFreqUi(freq) {
+    const hourWrap = $("#schedHourWrap");
+    if (hourWrap) hourWrap.style.display = freq === 0 ? "none" : "contents";
+    const dateRow = $("#schedDateRow");
+    if (dateRow) dateRow.style.display = freq === 3 ? "" : "none";
+    $$("#ov-sched-create [data-wd]").forEach((el) => {
+      el.style.display = freq === 2 ? "" : "none";
+    });
   }
   function renderSchedTable(data) {
     state.schedTasks = Array.isArray(data.tasks) ? data.tasks : [];
@@ -9981,13 +12263,14 @@
       '<div class="th"><span>任务名称</span><span>类型</span><span>文件</span><span>频率</span><span>时间</span><span>状态</span><span>操作</span></div>';
     const rows = state.schedTasks
       .map((t) => {
-        const kind = (t.kind | 0) === 0 ? "鼠标录制" : "鼠标宏";
+        const kind = (t.kind | 0) === 0 ? "键鼠录制" : "鼠标宏";
         const freq = FREQ_LABELS[t.frequency | 0] || "自定义";
         const st = (t.status | 0) === 0 ? "启用" : "禁用";
         return `<div class="tr" data-id="${esc(t.id || "")}">
           <span>${esc(t.name || "")}</span><span>${kind}</span>
           <span>${esc(stripSchedFileLabel(t.fileDisplayName || t.filePath || ""))}</span>
-          <span>${freq}</span><span>${esc(t.timeLabel || "")}</span><span>${st}</span>
+          <span>${freq}</span><span>${esc(t.timeLabel || "")}</span>
+          <span class="act" data-sched="status" title="点击切换启用/禁用">${st}</span>
           <span class="act"><span data-sched="edit">编辑</span> <span data-sched="del">删除</span></span>
         </div>`;
       })
@@ -10039,12 +12322,21 @@
       $("#schedFile").textContent = fileLabel;
       $("#schedFile").dataset.path = (task && task.filePath) || "";
     }
-    const dateRow = $("#schedDateRow");
-    if (dateRow) dateRow.style.display = freq === 3 ? "" : "none";
-    $$("#ov-sched-create [data-wd]").forEach((el) => {
-      el.style.display = freq === 2 ? "" : "none";
-    });
+    syncSchedFreqUi(freq);
     openOv("sched-create");
+  }
+
+  function toggleSchedTaskStatus(task) {
+    if (!task || !task.id || !window.qst) return;
+    if (state.schedStatusBusy) return;
+    const next = (task.status | 0) === 0 ? 1 : 0;
+    state.schedStatusBusy = true;
+    qst.saveScheduledTask({
+      update: 1,
+      statusOnly: 1,
+      id: task.id,
+      status: next,
+    });
   }
 
   function collectSchedForm() {
@@ -10122,7 +12414,7 @@
   const OPT_MOVE_WAIT_CONTIG_COMPRESS =
     "鼠标移动压缩时只能选择连续的移动和等待操作，其中不允许夹杂其他操作。";
 
-  /** 与后端 CollectSelectedMoveWaitRanges 对齐 */
+  /** 与后端 recopt::CollectMoveWaitRanges 对齐 */
   function collectOptMoveWaitRanges(actions, selected) {
     const acts = actions || [];
     const sel = (selected || [])
@@ -10501,10 +12793,14 @@
 
   function init() {
     window.addEventListener("qst:bridge", onBridge);
-    window.addEventListener("qst:open-settings", () => openOv("settings"));
+    window.addEventListener("qst:open-settings", () => {
+      if (state.editor) openEditorSettings();
+      else openOv("settings");
+    });
     window.addEventListener("qst:exit-editor", () => exitEditor());
     installPlainTextPaste();
     bindTypingHotkeyMute();
+    bindEditorActionShortcuts();
     // 极简 / 专业双模式：默认极简；切换仅在设置「保存」后生效
     if (window.ProMode) state.uiMode = window.ProMode.mode();
     applyUiMode({ center: true });
@@ -10531,8 +12827,7 @@
 
     const typeCombo = $("#edActionType");
     if (typeCombo) {
-      const cur = ACTION_TYPES.find((a) => a.v === state.addActionType) || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      syncEditorActionTypeCombo();
     }
 
     $$("#homeNav .tab").forEach((t) =>
@@ -10542,6 +12837,10 @@
     $$("#settingsTabs .st-tab").forEach((t) =>
       t.addEventListener("click", () => setSettingsTab(t.dataset.stab))
     );
+    $$("#editorSettingsTabs .st-tab").forEach((t) =>
+      t.addEventListener("click", () => setEditorSettingsTab(t.dataset.edtab))
+    );
+    bindEditorActionCatalog();
 
     document.addEventListener("click", (e) => {
       const open = e.target.closest("[data-open]");
@@ -10763,6 +13062,24 @@
           quietSaveSettings(collectSettings());
         }
       );
+    });
+
+    $("#setWmEnableInject")?.addEventListener("click", () => {
+      // bindDynamic 已 toggle；下一帧同步禁用态（保证 class 已更新）
+      queueMicrotask(() => {
+        syncWmInjectUi();
+      });
+    });
+
+    $("#setWmInjectTech")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!$("#setWmEnableInject")?.classList.contains("on")) return;
+      showPopup(e.currentTarget, WM_TECH_LIST, (it) => {
+        state._wmInjectTech = it.v | 0;
+        const el = $("#setWmInjectTech");
+        if (el) el.textContent = it.t;
+        quietSaveSettings(collectSettings());
+      });
     });
 
     $("#btnIntervalOk")?.addEventListener("click", () => {
@@ -11247,16 +13564,24 @@
       e.preventDefault();
       e.stopPropagation();
       const anchor = e.currentTarget;
+      const mergeOn = isMergeEligible();
       const shown = editorParamAction();
       const curType = (shown && shown.type) || state.addActionType;
-      const sel = ACTION_TYPES.findIndex((a) => a.v === curType);
+      const types = mergeOn
+        ? pickerMergeContainerTypes()
+        : pickerActionTypes(curType);
+      const sel = types.findIndex((a) => a.v === curType);
       showPopup(
         anchor,
-        ACTION_TYPES,
+        types,
         (it) => {
           if (!it) return;
           state.addActionType = it.v;
           anchor.textContent = it.t;
+          if (mergeOn) {
+            showAddTypePreview();
+            return;
+          }
           // 选中动作时：切换类型 = 转换当前动作草稿（对齐原生 ActionFromForm +
           // ModifySelected）。未选中时保持“添加新动作”预览语义。
           if (
@@ -11286,29 +13611,71 @@
       );
     });
 
-    // 右键动作：断点 / 从这里开始调试（单步或运行）
+    // 右键动作：剪切/复制/粘贴 + 断点 / 从这里开始调试
     $("#actionList")?.addEventListener("contextmenu", (e) => {
-      if (state.batchMode || state.debugging) return;
+      if (state.debugging) return;
+      if (state.batchMode) {
+        e.preventDefault();
+        e.stopPropagation();
+        const row = e.target.closest(".arow");
+        const i = row ? +row.dataset.i : -1;
+        prepareBatchContextSelection(i);
+        showEditorBatchContextMenu(e.clientX, e.clientY);
+        return;
+      }
       const row = e.target.closest(".arow");
-      if (!row) return;
       e.preventDefault();
       e.stopPropagation();
-      const i = +row.dataset.i;
-      const isBp = editorBreakpointAt(i);
-      const items = [
-        { t: isBp ? "取消断点" : "设为断点（执行后结束调试）", v: "bp" },
-        { t: "从这里开始调试（单步）", v: "step" },
-        { t: "从这里开始调试（运行）", v: "run" },
-      ];
+      const hasClip = editorHasClipboard();
+      const i = row ? +row.dataset.i : -1;
+      const items = [];
+      if (row && i >= 0) {
+        items.push(
+          { t: "剪切 (Ctrl+X)", v: "cut" },
+          { t: "复制 (Ctrl+C)", v: "copy" },
+          { t: "粘贴 (Ctrl+V)", v: "paste", disabled: !hasClip }
+        );
+        const isBp = editorBreakpointAt(i);
+        items.push(
+          { t: isBp ? "取消断点" : "设为断点（执行后结束调试）", v: "bp" },
+          { t: "从这里开始调试（单步）", v: "step" },
+          { t: "从这里开始调试（运行）", v: "run" },
+          { t: "转到可视化", v: "visual" }
+        );
+        const act = state.editorActions[i];
+        if (act && isDisassemblableType(act.type)) {
+          items.push({ t: "拆解为动作", v: "disassemble" });
+        }
+      } else if (hasClip) {
+        items.push({ t: "粘贴 (Ctrl+V)", v: "paste" });
+      } else {
+        return;
+      }
       requestAnimationFrame(() => {
         showPopup(
           { clientX: e.clientX, clientY: e.clientY },
           items,
           (it) => {
             if (!it) return;
-            if (it.v === "bp") toggleEditorBreakpoint(i);
+            if (it.v === "cut") cutSelectedEditorActions({ index: i });
+            else if (it.v === "copy") copySelectedEditorActions({ index: i });
+            else if (it.v === "paste") {
+              if (i >= 0) pasteEditorClipboardAfterSelection({ index: i });
+              else if (!(state.editorActions || []).length) pasteEditorClipboardAfterSelection();
+              else pasteEditorClipboardAfterSelection({ index: state.editorActions.length - 1 });
+            } else if (it.v === "bp") toggleEditorBreakpoint(i);
             else if (it.v === "step") startDebugFrom(i, true);
             else if (it.v === "run") startDebugFrom(i, false);
+            else if (it.v === "visual") {
+              const V = window.QstVisualEditor;
+              if (V && typeof V.enterVisual === "function") V.enterVisual(i);
+              else if (V && typeof V.setMode === "function") {
+                V.setMode(true);
+                if (typeof V.selectAction === "function") {
+                  requestAnimationFrame(() => V.selectAction(i));
+                }
+              }
+            } else if (it.v === "disassemble") disassembleEditorAction(i);
           },
           { preferUp: true }
         );
@@ -11325,18 +13692,21 @@
       if (!row) return;
       const i = +row.dataset.i;
       const act = e.target.closest("[data-act]")?.dataset.act;
-      if (state.batchMode) {
-        if (act === "batch-toggle" || !act) {
-          state.batchSel[i] = !state.batchSel[i];
-          renderEditorActions(state.editorActions);
-        }
-        return;
-      }
       if (act === "expand-toggle") {
         toggleContainerExpand(i);
         renderEditorActions(state.editorActions);
         return;
       }
+      if (!state.debugging && (e.ctrlKey || e.metaKey) && !state.batchMode && act !== "copy" && act !== "del") {
+        enterEditorBatch(true);
+        toggleEditorBatchRow(i);
+        return;
+      }
+      if (state.batchMode) {
+        if (act === "batch-toggle" || !act) applyEditorBatchRowClick(i, e);
+        return;
+      }
+      if (act === "batch-toggle") return;
       if (act === "copy") {
         const src = state.editorActions[i];
         if (!src) return;
@@ -11355,12 +13725,17 @@
             if (!it) return;
             const copy = JSON.parse(JSON.stringify(src));
             copy.name = typeLabel(copy.type);
+            if (copy.type === "defineBlock") {
+              copy.blockName = uniquifyPastedBlockName(copy.blockName, {});
+            }
             let pos = state.editorActions.length;
             if (it.v === "first") pos = 0;
             else if (it.v === "before") pos = i;
             else if (it.v === "after") pos = subtreeEnd(i);
             else pos = state.editorActions.length;
+            visualNoteUndo();
             state.editorActions.splice(pos, 0, copy);
+            visualOnInsert(pos);
             shiftCollapsedAfterInsert(pos);
             if (isSubtreeContainerType(copy.type)) delete state.collapsedContainers[pos];
             state.actionSel = pos;
@@ -11371,13 +13746,7 @@
         return;
       }
       if (act === "del") {
-        const end = subtreeEnd(i);
-        state.editorActions.splice(i, end - i);
-        remapCollapsedAfterDelete(i, end);
-        if (state.actionSel >= i && state.actionSel < end) {
-          state.actionSel = -1;
-          state.editDraft = null;
-        } else if (state.actionSel >= end) state.actionSel -= end - i;
+        deleteSubtreeAt(i);
         state.addPreview = null;
         renderEditorActions(state.editorActions);
         if (state.actionSel < 0) showAddTypePreview();
@@ -11389,6 +13758,8 @@
         state.actionSel = -1;
         state.editDraft = null;
         state.addPreview = null;
+        const remarkEl = $("#edRemark");
+        if (remarkEl) remarkEl.textContent = "";
         showAddTypePreview();
         state._skipReadback = true;
         updateEditorSelectionUi(prev, -1);
@@ -11411,9 +13782,39 @@
       state._skipReadback = true;
       updateEditorSelectionUi(prevSel, i);
       state._skipReadback = false;
+      focusEditorActionList();
     });
 
     $("#btnEdAdd")?.addEventListener("click", (e) => {
+      if (e.button !== 0) return;
+      if (state.batchMode && isMergeEligible()) {
+        const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
+        const type =
+          (state.addPreview && state.addPreview.type) || state.addActionType;
+        if (type === "defineBlock" || (plan && plan.contiguous)) {
+          runMergeWithPlacement(type === "defineBlock" ? "first" : "inplace");
+          return;
+        }
+        const point = { clientX: e.clientX, clientY: e.clientY };
+        requestAnimationFrame(() => {
+          showPopup(
+            point,
+            [
+              { t: "添加到最后", v: "last" },
+              { t: "插入到最前", v: "first" },
+              { t: "插入到选择项前", v: "before" },
+              { t: "插入到选择项后", v: "after" },
+            ],
+            (it) => {
+              if (!it) return;
+              runMergeWithPlacement(it.v);
+            },
+            { preferUp: true }
+          );
+        });
+        return;
+      }
+
       const remark = ($("#edRemark")?.textContent || "").trim();
       let a;
       if (state.addPreview && state.addPreview.type === state.addActionType) {
@@ -11457,53 +13858,97 @@
         return;
       }
 
-      // 无选中：直接末尾（与原生一致）
+      // 无选中：直接末尾，顶层缩进（勿因上一条是容器而变成其子节点）
       if (state.actionSel < 0 || state.actionSel >= state.editorActions.length) {
-        let indent = 0;
-        if (state.editorActions.length) {
-          const prev = state.editorActions[state.editorActions.length - 1];
-          const container = isSubtreeContainerType(prev.type);
-          indent = clampIndent(container ? (prev.indent | 0) + 1 : prev.indent | 0);
-        }
-        // Else：作为可展开兄弟容器，默认与末尾同级（勿自动 +1）
-        if (a.type === "else" && state.editorActions.length) {
-          indent = clampIndent(state.editorActions[state.editorActions.length - 1].indent);
-        }
-        finishInsert(state.editorActions.length, indent);
+        finishInsert(state.editorActions.length, 0);
         return;
       }
 
       const sel = state.actionSel;
       const selAct = state.editorActions[sel];
-      const items = [
-        { t: "添加到最后", v: "last" },
-        { t: "插入到最前", v: "first" },
-        { t: "插入到选择项前", v: "before" },
-        { t: "插入到选择项后", v: "after" },
-      ];
-      if (isSubtreeContainerType(selAct.type)) {
+      finishInsert(subtreeEnd(sel), selAct.indent | 0);
+    });
+    $("#btnEdAdd")?.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const remark = ($("#edRemark")?.textContent || "").trim();
+      let a;
+      if (state.addPreview && state.addPreview.type === state.addActionType) {
+        readParamPanelInto(state.addPreview);
+        a = Object.assign({}, state.addPreview);
+        delete a._preview;
+        a.remark = remark;
+        a.name = typeLabel(a.type);
+      } else if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
+        if (!state.editDraft) loadEditDraftFromSelection();
+        if (state.editDraft) {
+          readParamPanelInto(state.editDraft);
+          a = Object.assign({}, state.editDraft);
+          delete a._preview;
+          a.remark = remark;
+          a.name = typeLabel(a.type);
+        } else {
+          a = defaultAction(state.addActionType, remark);
+        }
+      } else {
+        a = defaultAction(state.addActionType, remark);
+      }
+
+      const finishInsert = (pos, indent) => {
+        if (!insertEditorAction(a, pos, indent)) return;
+        state.actionSel = -1;
+        state.batchMode = false;
+        state.addPreview = null;
+        renderEditorActions(state.editorActions);
+        const remarkEl = $("#edRemark");
+        if (remarkEl) remarkEl.textContent = "";
+        showAddTypePreview();
+      };
+
+      const hasSel = state.actionSel >= 0 && state.actionSel < state.editorActions.length;
+      const sel = hasSel ? state.actionSel : -1;
+      const selAct = hasSel ? state.editorActions[sel] : null;
+      const items = hasSel
+        ? [
+            { t: "添加到最后", v: "last" },
+            { t: "插入到最前", v: "first" },
+            { t: "插入到选择项前", v: "before" },
+            { t: "插入到选择项后", v: "after" },
+          ]
+        : [
+            { t: "添加到最后", v: "last" },
+            { t: "插入到最前", v: "first" },
+          ];
+      if (hasSel && selAct && isSubtreeContainerType(selAct.type)) {
         items.push({ t: "添加为子节点", v: "asChild" });
       }
       const point = { clientX: e.clientX, clientY: e.clientY };
       requestAnimationFrame(() => {
         showPopup(point, items, (it) => {
           if (!it) return;
+          if (a.type === "defineBlock") {
+            if (it.v !== "betweenKey") {
+              finishInsert(0, 0);
+              return;
+            }
+          }
           let pos = state.editorActions.length;
           let indent = -1;
           if (it.v === "first") {
             pos = 0;
-          } else if (it.v === "before") {
+            indent = 0;
+          } else if (it.v === "before" && selAct) {
             pos = sel;
             indent = selAct.indent | 0;
-          } else if (it.v === "after") {
+          } else if (it.v === "after" && selAct) {
             pos = subtreeEnd(sel);
             indent = selAct.indent | 0;
-          } else if (it.v === "asChild") {
+          } else if (it.v === "asChild" && selAct) {
             pos = subtreeEnd(sel);
             indent = (selAct.indent | 0) + 1;
-          } else if (it.v === "last") {
+          } else {
             pos = state.editorActions.length;
-            indent = -1;
+            indent = 0;
           }
           finishInsert(pos, indent);
         }, { preferUp: true });
@@ -11513,10 +13958,14 @@
       commitModifySelected();
     });
     $("#btnEdClear")?.addEventListener("click", () => {
-      askConfirm("确定清空动作列表？", () => {
-        state.editorActions = [];
-        state.actionSel = -1;
-        state.batchSel = {};
+        askConfirm("确定清空动作列表？", () => {
+          visualNoteUndo();
+          const n = state.editorActions.length;
+          state.editorActions = [];
+          if (n) visualOnDelete(0, n);
+          state.actionSel = -1;
+          state.batchMode = false;
+          state.batchSel = {};
         renderEditorActions(state.editorActions);
         closeAllOv();
       });
@@ -11529,16 +13978,11 @@
       const label = (btn.textContent || "").trim();
       if (btn.id === "btnExitBatch") return;
       if (label === "全选") {
-        state.batchSel = {};
-        state.editorActions.forEach((_, i) => {
-          state.batchSel[i] = true;
-        });
-        renderEditorActions(state.editorActions);
+        setEditorBatchSelectedAll(true);
         return;
       }
       if (label === "取消选择") {
-        state.batchSel = {};
-        renderEditorActions(state.editorActions);
+        setEditorBatchSelectedAll(false);
         return;
       }
       if (label === "删除所选项") {
@@ -11562,7 +14006,17 @@
         const copies = idx.map((i) =>
           JSON.parse(JSON.stringify(state.editorActions[i]))
         );
-        state.editorActions.push(...copies);
+        const usedNames = {};
+        visualNoteUndo();
+        const start = state.editorActions.length;
+        copies.forEach((a, i) => {
+          delete a._preview;
+          a.name = typeLabel(a.type);
+          if (a.type === "defineBlock") a.blockName = uniquifyPastedBlockName(a.blockName, usedNames);
+          state.editorActions.push(a);
+          visualOnInsert(start + i);
+          shiftCollapsedAfterInsert(start + i);
+        });
         state.batchSel = {};
         renderEditorActions(state.editorActions);
         toast("已复制 " + copies.length + " 条到列表末尾");
@@ -11590,18 +14044,21 @@
       const doc = ($("#pickDoc")?.textContent || "").trim();
       const cls = ($("#pickClass")?.textContent || "").trim();
       const title = ($("#pickTitle")?.textContent || "").trim();
-      applyWindowPickToEditor(
-        {
-          processPath: path,
-          documentPath: doc,
-          windowClassName: cls,
-          windowTitle: title,
-          childWindowClassName: ($("#pickChild")?.textContent || "").trim(),
-          x: parseInt($("#pickX")?.textContent || "0", 10) || 0,
-          y: parseInt($("#pickY")?.textContent || "0", 10) || 0,
-        },
-        "windowClass"
-      );
+      const payload = {
+        processPath: path,
+        documentPath: doc,
+        windowClassName: cls,
+        windowTitle: title,
+        childWindowClassName: ($("#pickChild")?.textContent || "").trim(),
+        x: parseInt($("#pickX")?.textContent || "0", 10) || 0,
+        y: parseInt($("#pickY")?.textContent || "0", 10) || 0,
+      };
+      if (state._nestedWmPick) {
+        applyWindowPickToNestedAction(payload, "nestedWmClass");
+        state._nestedWmPick = false;
+      } else {
+        applyWindowPickToEditor(payload, "windowClass");
+      }
       closeAllOv();
       toast("已填入目标窗口");
     });
@@ -11669,14 +14126,25 @@
         toast("无桥接环境");
         return;
       }
-      qst.saveEditor({
-        path: state.editorPath || "",
-        name,
-        breakoutTimeSeconds: parseFloat(($("#edBreakout")?.textContent || "0")) || 0,
-        mode: state.editorMode | 0,
-        windowMode: wm,
-        actions: state.editorActions,
-      });
+      const doSave = () => {
+        qst.saveEditor({
+          path: state.editorPath || "",
+          name,
+          breakoutTimeSeconds: parseFloat(($("#edBreakout")?.textContent || "0")) || 0,
+          mode: state.editorMode | 0,
+          windowMode: wm,
+          actions: state.editorActions,
+          visualLayout: collectVisualLayoutForSave(),
+        });
+      };
+      const V = window.QstVisualEditor;
+      if (V && typeof V.isVisual === "function" && V.isVisual() && typeof V.commitGraphToList === "function") {
+        V.commitGraphToList(function (ok) {
+          if (ok) doSave();
+        }, "与初始节点无关的流程会直接删除，确定保存？");
+        return;
+      }
+      doSave();
     });
     $$("[data-exit-editor]").forEach((b) =>
       b.addEventListener("click", () => exitEditor())
@@ -11689,7 +14157,9 @@
         state._askInputOk = null;
         state.pendingKind = null;
         closeAllOv();
-        if (!name) {
+        const allowEmpty = !!state._askInputAllowEmpty;
+        state._askInputAllowEmpty = false;
+        if (!name && !allowEmpty) {
           toast("名称无效");
           return;
         }
@@ -11808,6 +14278,7 @@
       const wantDebug = !!$("#setDebugWin")?.classList.contains("on");
       state._announceSettingsSave = true;
       const payload = collectSettings();
+      if (!payload) return;
       payload.uiMode = readUiModeDraft();
       qst.saveSettings(payload);
       commitUiModeFromDraft();
@@ -11819,6 +14290,30 @@
         qst.showDebugWindow(); // ReloadSettings → HideDebugWindow
       }
       closeAllOv();
+    });
+    $("#btnSaveEditorSettings")?.addEventListener("click", () => {
+      persistEditorSettings(collectEditorSettingsPartial(), true);
+      closeAllOv();
+    });
+    $("#btnRestoreEditorDefaults")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      askConfirm("确定将鼠标宏编辑设置恢复为默认？", () => {
+        const defaults = {
+          editorDefaultView: "code",
+          visualLoopWrap: true,
+          visualBlockCallWires: true,
+          visualIfWrap: true,
+          visualBlockWrap: true,
+          visualJumpWires: true,
+          visualShowGrid: true,
+          visualShowCardId: true,
+          editorActionOrder: [],
+          editorHiddenActions: [],
+        };
+        fillEditorSettingsForm(defaults);
+        persistEditorSettings(defaults, true);
+        closeAllOv();
+      });
     });
     $("#btnRestoreDefaults")?.addEventListener("click", (e) => {
       e.preventDefault();
@@ -11868,6 +14363,7 @@
       const act = e.target.closest("[data-sched]")?.dataset.sched;
       const task = (state.schedTasks || []).find((t) => t.id === id);
       if (act === "edit" && task) openSchedEditor(task);
+      if (act === "status" && task) toggleSchedTaskStatus(task);
       if (act === "del" && id) {
         askConfirm("确定删除该定时任务？", () => {
           if (window.qst) qst.deleteScheduledTask(id);
@@ -11882,15 +14378,15 @@
     $("#schedFreqRow")?.addEventListener("click", (e) => {
       const r = e.target.closest(".radio");
       if (!r) return;
+      const prev = $("#schedFreqRow .radio.on");
+      const prevFreq = prev ? prev.dataset.freq | 0 : -1;
       $$("#schedFreqRow .radio").forEach((x) => x.classList.remove("on"));
       r.classList.add("on");
       const freq = r.dataset.freq | 0;
-      const dateRow = $("#schedDateRow");
-      if (dateRow) dateRow.style.display = freq === 3 ? "" : "none";
-      // 仅每周显示星期勾选
-      $$('#ov-sched-create [data-wd]').forEach((el) => {
-        el.style.display = freq === 2 ? "" : "none";
-      });
+      // 从钟点频率切到间隔时不要沿用「8 点」当成 8 小时
+      if (freq === 4 && prevFreq !== 4 && $("#schedHour"))
+        $("#schedHour").textContent = "0";
+      syncSchedFreqUi(freq);
     });
     $("#schedKindRow")?.addEventListener("click", (e) => {
       const r = e.target.closest(".radio");
@@ -11937,6 +14433,17 @@
       if ((payload.frequency | 0) === 2 && !(payload.weekDays | 0)) {
         toast("请至少选择一个星期。");
         return;
+      }
+      if ((payload.frequency | 0) === 4) {
+        const total =
+          (payload.hour | 0) * 3600000 +
+          (payload.minute | 0) * 60000 +
+          (payload.second | 0) * 1000 +
+          (payload.millisecond | 0);
+        if (total <= 0) {
+          toast("间隔时间必须大于 0。");
+          return;
+        }
       }
       if ((payload.frequency | 0) === 3 && !payload.id) {
         // 自定义：新建时不可早于现在
@@ -12315,6 +14822,12 @@
         r.classList.add("on");
       });
     });
+    $$("#edSetViewRadios .radio").forEach((r) => {
+      r.addEventListener("click", () => {
+        $$("#edSetViewRadios .radio").forEach((x) => x.classList.remove("on"));
+        r.classList.add("on");
+      });
+    });
 
     // 点击设置：定点准星已 wireCrosshairPointerDown(#btnFixedCrosshair)
 
@@ -12472,5 +14985,35 @@
     itemPath,
     openAgentSession,
     openSchedEditor,
+    toggleSchedTaskStatus,
+    ACTION_TYPES,
+    displayActionName,
+    clampIndent,
+    subtreeEnd,
+    isSubtreeContainerType,
+    insertEditorAction,
+    moveActionSubtree,
+    deleteSubtreeAt,
+    defaultAction,
+    renderEditorActions,
+    renderParamPanel,
+    loadEditDraftFromSelection,
+    updateEditorSelectionUi,
+    selectEditorAction,
+    startDebugFrom,
+    showPopup,
+    showAddTypePreview,
+    enterEditorBatch,
+    setEditorVisualSelection,
+    mergeVisualSelection,
+    commitModifySelected,
+    syncEdRemarkFromSelection,
+    editorParamAction,
+    readParamPanelInto,
+    pushEditorHistory,
+    undoEditorHistory,
+    redoEditorHistory,
+    revertLastEditorHistory,
+    discardEditorHistory,
   };
 })();

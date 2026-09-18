@@ -135,6 +135,21 @@ std::wstring ActionName(const ScriptAction& action) {
         }
         return s + RepeatInfo(action);
     }
+    case ActionType::MouseDrag: {
+        const auto holds = HoldText(action);
+        std::wstring s = L"鼠标拖拽"
+            + (holds.empty() ? L"" : holds + L"+")
+            + ButtonText(action.button);
+        if (action.imageLocate) {
+            s += L" 相对图(" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y)
+                + L")→(" + std::to_wstring(action.endX) + L"," + std::to_wstring(action.endY) + L")";
+        } else {
+            s += L" (" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y)
+                + L")→(" + std::to_wstring(action.endX) + L"," + std::to_wstring(action.endY) + L")";
+        }
+        s += L" " + F3(action.duration) + L"秒";
+        return s;
+    }
     case ActionType::KeyDown: {
         const auto holds = HoldText(action);
         return L"键盘按下"
@@ -179,7 +194,26 @@ std::wstring ActionName(const ScriptAction& action) {
             + (action.blockName.empty() ? L"未选择" : action.blockName) + L"]" + RepeatInfo(action);
     case ActionType::HotkeyShortcut: {
         const int idx = std::clamp(action.shortcutPreset, 0, ShortcutPresetCount() - 1);
-        return L"快捷按键[" + std::wstring(ShortcutPresetAt(idx).label) + L"]" + RepeatInfo(action);
+        const auto& preset = ShortcutPresetAt(idx);
+        // ★动作里的实键可能与预设不一致（AI 走 hotkeyShortcut 工具直接给组合键时就是这样），
+        // 此时**必须按实键显示**：否则日志/编辑器会写「Ctrl+C(拷贝)」而实际发的是 Ctrl+S
+        //（实测日志里「计划执行 快捷按键[Ctrl+C(拷贝)] / 执行 快捷按键[Ctrl+S(保存)]」，
+        //  编辑器和脚本备注也跟着错，是实打实的误导）。
+        const bool sameAsPreset = action.keyVk == preset.vk
+            && (action.holdLeftCtrl || action.holdRightCtrl) == preset.ctrl
+            && (action.holdLeftAlt || action.holdRightAlt) == preset.alt
+            && (action.holdLeftShift || action.holdRightShift) == preset.shift
+            && (action.holdLeftWin || action.holdRightWin) == preset.win;
+        if (sameAsPreset) {
+            return L"快捷按键[" + std::wstring(preset.label) + L"]" + RepeatInfo(action);
+        }
+        std::wstring combo;
+        if (action.holdLeftCtrl || action.holdRightCtrl) combo += L"Ctrl+";
+        if (action.holdLeftAlt || action.holdRightAlt) combo += L"Alt+";
+        if (action.holdLeftShift || action.holdRightShift) combo += L"Shift+";
+        if (action.holdLeftWin || action.holdRightWin) combo += L"Win+";
+        combo += VkName(action.keyVk);
+        return L"快捷按键[" + combo + L"]" + RepeatInfo(action);
     }
     case ActionType::QuickInput: {
         std::wstring preview = action.inputText;
@@ -208,6 +242,38 @@ std::wstring ActionName(const ScriptAction& action) {
                 ? L"完美匹配"
                 : (L"匹配>" + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%"))
             + L",缩放" + scaleText + L"]";
+    }
+    case ActionType::MultiMatch: {
+        const wchar_t* mode = action.multiMatchMode == 1 ? L"一图多处" : L"多图择一";
+        const wchar_t* follow = action.findImageFollowUp == 1 ? L"移动到"
+            : action.findImageFollowUp == 2
+                ? (action.multiMatchMode == 1 ? L"保存全部" : L"保存匹配度")
+            : (action.multiMatchMode == 1 ? L"依次点击" : L"点击");
+        std::wstring scaleText = F3(action.imageScaleMin) + L"-" + F3(action.imageScaleMax);
+        return std::wstring(L"多图匹配[") + mode + L"," + follow + L","
+            + (action.perfectMatch
+                ? L"完美匹配"
+                : (L"匹配>" + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%"))
+            + L",缩放" + scaleText + L"]";
+    }
+    case ActionType::WatchImage: {
+        std::wstring scaleText = F3(action.imageScaleMin) + L"-" + F3(action.imageScaleMax);
+        std::wstring modeText = action.watchMode != 0
+            ? (L"时间监视" + F3(action.watchPollSeconds) + L"秒")
+            : L"动作监视";
+        return std::wstring(L"找图监视[匹配>")
+            + std::to_wstring(static_cast<int>(action.matchThreshold)) + L"%,"
+            + modeText + L","
+            + (action.resumeAfterWatch ? L"从原处继续" : L"从监视后继续")
+            + L",缩放" + scaleText + L"]";
+    }
+    case ActionType::VarCompute: {
+        std::wstring preview = action.computeCode;
+        if (preview.size() > 24) preview = preview.substr(0, 24) + L"...";
+        for (wchar_t& ch : preview) {
+            if (ch == L'\r' || ch == L'\n') ch = L' ';
+        }
+        return L"变量运算[" + preview + L"]";
     }
     case ActionType::TextRecognition: {
         const wchar_t* mode = action.ocrResultMode == 1 ? L"文字查找" : L"获取文字";
@@ -282,13 +348,17 @@ std::wstring ActionName(const ScriptAction& action) {
     case ActionType::GetCursorPos:
         return L"获取当前光标位置→[" + (action.matchVarName.empty() ? L"未命名" : action.matchVarName) + L"]";
     case ActionType::GetColor:
-        return L"获取颜色@" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y)
+        return std::wstring(L"获取颜色")
+            + (action.imageLocate ? L"（找图定位）" : L"")
+            + L"@" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y)
             + L"→[" + action.matchVarName + L"]";
     case ActionType::FindColor:
-        return L"找色" + FormatColorHex(action.colorR, action.colorG, action.colorB)
-            + L"容差" + std::to_wstring(action.colorTolerance);
+        return std::wstring(L"找色") + FormatColorHex(action.colorR, action.colorG, action.colorB)
+            + L"容差" + std::to_wstring(action.colorTolerance)
+            + (action.imageLocate ? L"（找图定位）" : L"");
     case ActionType::ColorMatch:
-        return L"颜色匹配" + FormatColorHex(action.colorR, action.colorG, action.colorB)
+        return std::wstring(L"颜色匹配") + FormatColorHex(action.colorR, action.colorG, action.colorB)
+            + (action.imageLocate ? L"（找图定位）" : L"")
             + L"@" + std::to_wstring(action.x) + L"," + std::to_wstring(action.y);
     case ActionType::CustomText:
         return action.customText;
@@ -302,6 +372,7 @@ std::wstring ActionTypeBriefLabel(ActionType type) {
     case ActionType::MoveMouseRelative: return L"相对移动鼠标";
     case ActionType::Wait: return L"等待";
     case ActionType::MouseClick: return L"鼠标点击";
+    case ActionType::MouseDrag: return L"鼠标拖拽";
     case ActionType::MouseDown: return L"鼠标按下";
     case ActionType::MouseUp: return L"鼠标松开";
     case ActionType::MousePlayback: return L"运行录制回放";
@@ -317,6 +388,9 @@ std::wstring ActionTypeBriefLabel(ActionType type) {
     case ActionType::DefineBlock: return L"定义宏指令块";
     case ActionType::RunBlock: return L"运行宏指令块";
     case ActionType::FindImage: return L"找图";
+    case ActionType::MultiMatch: return L"多图匹配";
+    case ActionType::WatchImage: return L"找图监视";
+    case ActionType::VarCompute: return L"变量运算";
     case ActionType::TextRecognition: return L"文字识别";
     case ActionType::If: return L"条件-如果";
     case ActionType::Else: return L"条件-否则";
@@ -347,14 +421,18 @@ std::wstring JsonTypeBriefLabel(const std::wstring& jsonType) {
         {L"moveMouse", ActionType::MoveMouse},
         {L"moveMouseRelative", ActionType::MoveMouseRelative},
         {L"wait", ActionType::Wait},
-        {L"mouseClick", ActionType::MouseClick}, {L"mouseDown", ActionType::MouseDown},
+        {L"mouseClick", ActionType::MouseClick}, {L"mouseDrag", ActionType::MouseDrag},
+        {L"mouseDown", ActionType::MouseDown},
         {L"mouseUp", ActionType::MouseUp}, {L"mousePlayback", ActionType::MousePlayback},
         {L"runMacro", ActionType::RunMacro}, {L"keyClick", ActionType::KeyClick},
         {L"keyDown", ActionType::KeyDown}, {L"keyUp", ActionType::KeyUp},
         {L"hotkeyShortcut", ActionType::HotkeyShortcut}, {L"quickInput", ActionType::QuickInput},
         {L"scrollWheel", ActionType::ScrollWheel}, {L"loop", ActionType::Loop},
         {L"endLoop", ActionType::EndLoop}, {L"defineBlock", ActionType::DefineBlock},
-        {L"runBlock", ActionType::RunBlock}, {L"findImage", ActionType::FindImage},
+        {L"runBlock", ActionType::RunBlock},         {L"findImage", ActionType::FindImage},
+        {L"multiMatch", ActionType::MultiMatch},
+        {L"watchImage", ActionType::WatchImage},
+        {L"varCompute", ActionType::VarCompute},
         {L"textRecognition", ActionType::TextRecognition}, {L"if", ActionType::If},
         {L"else", ActionType::Else}, {L"lockScreenshot", ActionType::LockScreenshot},
         {L"unlockScreenshot", ActionType::UnlockScreenshot}, {L"stopMacro", ActionType::StopMacro},
@@ -380,8 +458,7 @@ std::wstring JsonTypeBriefLabel(const std::wstring& jsonType) {
 std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions,
     size_t maxLines) {
     if (actions.empty()) return L"";
-    std::wstring out =
-        L"【动作一览 — 缩进表示父子（循环/条件体内）；对用户说明时必须用下列名称（与编辑器动作列一致），禁止说英文 type】\n";
+    std::wstring out = L"动作一览（缩进=循环/条件体内）：\n";
 
     auto appendOne = [&](size_t i) {
         const int no = actions[i].originalNo > 0
@@ -411,12 +488,12 @@ std::wstring FormatScriptActionsOutline(const std::vector<ScriptAction>& actions
 
 std::wstring ActionTypeReplyCatalog() {
     return LR"(【动作 type 对用户的中文说法 — 与编辑器一致，禁止在回复中出现英文 type】
-wait→等待  moveMouse→移动鼠标到  moveMouseRelative→相对移动鼠标  mouseClick→鼠标点击  mouseDown→鼠标按下  mouseUp→鼠标松开
+wait→等待  moveMouse→移动鼠标到  moveMouseRelative→相对移动鼠标  mouseClick→鼠标点击  mouseDrag→鼠标拖拽  mouseDown→鼠标按下  mouseUp→鼠标松开
 mousePlayback→运行录制回放  runMacro→运行鼠标宏  keyClick→按键点击  keyDown→键盘按下  keyUp→键盘松开
 hotkeyShortcut→快捷按键  quickInput→快捷输入  scrollWheel→滚动滚轮
 loop→循环  endLoop→跳出循环  defineBlock→定义宏指令块  runBlock→运行宏指令块
 if→条件-如果  else→条件-否则  goto→跳转  stopMacro→结束宏运行
-findImage→找图  textRecognition→文字识别  lockScreenshot→锁定截屏  unlockScreenshot→解锁截屏
+findImage→找图  watchImage→找图监视  multiMatch→多图匹配  varCompute→变量运算  textRecognition→文字识别  getColor→获取颜色  findColor→找色  colorMatch→颜色匹配  lockScreenshot→锁定截屏  unlockScreenshot→解锁截屏
 runProgram→运行程序  closeProgram→关闭程序  openWebpage→打开网页  openFile→打开文件
 timerRecordTime→计时器记录时间  getCursorPos→获取当前光标位置
 aiTextAnalysis→AI文字分析  aiImageAnalysis→AI图片分析  aiActionExecute→AI动作执行
@@ -458,6 +535,7 @@ bool ScriptIsTimedInputSequence(const std::vector<ScriptAction>& actions) {
         case ActionType::MouseDown:
         case ActionType::MouseUp:
         case ActionType::MouseClick:
+        case ActionType::MouseDrag:
         case ActionType::KeyDown:
         case ActionType::KeyUp:
         case ActionType::KeyClick:
@@ -469,6 +547,7 @@ bool ScriptIsTimedInputSequence(const std::vector<ScriptAction>& actions) {
         case ActionType::StopMacro:
         case ActionType::Goto:
         case ActionType::FindImage:
+        case ActionType::MultiMatch:
         case ActionType::MousePlayback: // 嵌套录制回放须走精密轴
         case ActionType::RunMacro:
         case ActionType::RunBlock:
@@ -491,6 +570,10 @@ bool ActionUsesInterRepeatInterval(ActionType type) {
     case ActionType::MousePlayback:
     case ActionType::RunMacro:
     case ActionType::RunBlock:
+    case ActionType::FindImage:
+    case ActionType::MultiMatch:
+    case ActionType::TextRecognition:
+    case ActionType::FindColor:
         return true;
     default:
         return false;
@@ -510,6 +593,7 @@ std::wstring JsonType(ActionType type) {
     case ActionType::MouseDown:   return L"mouseDown";
     case ActionType::MouseUp:     return L"mouseUp";
     case ActionType::MouseClick:  return L"mouseClick";
+    case ActionType::MouseDrag:   return L"mouseDrag";
     case ActionType::KeyDown:     return L"keyDown";
     case ActionType::KeyUp:       return L"keyUp";
     case ActionType::KeyClick:    return L"keyClick";
@@ -524,6 +608,9 @@ std::wstring JsonType(ActionType type) {
     case ActionType::QuickInput:     return L"quickInput";
     case ActionType::ScrollWheel:    return L"scrollWheel";
     case ActionType::FindImage:      return L"findImage";
+    case ActionType::MultiMatch:     return L"multiMatch";
+    case ActionType::WatchImage:     return L"watchImage";
+    case ActionType::VarCompute:     return L"varCompute";
     case ActionType::TextRecognition: return L"textRecognition";
     case ActionType::If:             return L"if";
     case ActionType::Else:           return L"else";
@@ -588,33 +675,40 @@ bool IsExtendedVirtualKey(UINT vk) {
     }
 }
 
+/// 方向/编辑键的 Set-1 扫描码（不含 0xE0 前缀）。
+/// MapVirtualKey 在部分环境会给出 DirectInput 的 0xCB，不能直接塞进 SendInput wScan。
+WORD OemScanForNavKey(UINT vk) {
+    switch (vk) {
+    case VK_UP: return 0x48;
+    case VK_LEFT: return 0x4B;
+    case VK_RIGHT: return 0x4D;
+    case VK_DOWN: return 0x50;
+    case VK_INSERT: return 0x52;
+    case VK_DELETE: return 0x53;
+    case VK_HOME: return 0x47;
+    case VK_END: return 0x4F;
+    case VK_PRIOR: return 0x49;
+    case VK_NEXT: return 0x51;
+    default: return 0;
+    }
+}
+
 }  // namespace
 
 void SendKeyboardKey(UINT vk, bool down) {
+    vk = NormalizeScriptKeyVk(vk, L"");
     if (vk == 0) return;
     UINT scanEx = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
     if (scanEx == 0) scanEx = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     if (scanEx == 0 && !IsExtendedVirtualKey(vk)) return;
 
-    // 方向键等：强制按扩展扫描码处理（低 8 位 + EXTENDED 标志）
     WORD scan = static_cast<WORD>(scanEx & 0xFF);
+    if (scan >= 0x80) scan = static_cast<WORD>(scan & 0x7F);
     bool extended = ((scanEx & 0xFF00) == 0xE000) || ((scanEx & 0xFF00) == 0xE100)
         || IsExtendedVirtualKey(vk);
-    if (scan == 0 && IsExtendedVirtualKey(vk)) {
-        // 个别环境 MAPVK 失败时仍给出常见扫描码，避免静默跳过
-        switch (vk) {
-        case VK_UP: scan = 0x48; break;
-        case VK_LEFT: scan = 0x4B; break;
-        case VK_RIGHT: scan = 0x4D; break;
-        case VK_DOWN: scan = 0x50; break;
-        case VK_INSERT: scan = 0x52; break;
-        case VK_DELETE: scan = 0x53; break;
-        case VK_HOME: scan = 0x47; break;
-        case VK_END: scan = 0x4F; break;
-        case VK_PRIOR: scan = 0x49; break;
-        case VK_NEXT: scan = 0x51; break;
-        default: break;
-        }
+    if (const WORD oem = OemScanForNavKey(vk)) {
+        scan = oem;
+        extended = true;
     }
     if (scan == 0) return;
 
@@ -642,6 +736,8 @@ void MouseButtonEvent(MouseButtonType button, bool down) {
 
 void MouseClick(MouseButtonType button) {
     MouseButtonEvent(button, true);
+    // 连点器同样保底 1ms。许多 DirectX 客户端把同一时刻的 down/up 当成没点。
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     MouseButtonEvent(button, false);
 }
 
@@ -651,6 +747,41 @@ void SendMouseMoveRelative(int dx, int dy) {
 
 bool SetCursorScreenPos(int x, int y) {
     return ForegroundInputRouter::Instance().SetCursorScreen(x, y);
+}
+
+namespace {
+
+void FillVirtualDeskAbsoluteMove(INPUT& input, int x, int y) {
+    input = {};
+    input.type = INPUT_MOUSE;
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw > 1 && vh > 1) {
+        input.mi.dx = static_cast<LONG>(
+            (static_cast<long long>(x - vx) * 65535) / (vw - 1));
+        input.mi.dy = static_cast<LONG>(
+            (static_cast<long long>(y - vy) * 65535) / (vh - 1));
+    }
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    input.mi.dwExtraInfo = synthetic_input::kSyntheticExtraInfo;
+}
+
+}  // namespace
+
+void SendMouseMoveAbsoluteScreen(int x, int y) {
+    SetCursorScreenPos(x, y);
+    if (ForegroundInputRouter::Instance().IsHidActive()) return;
+    synthetic_input::NoteMouseMove();
+    INPUT move{};
+    FillVirtualDeskAbsoluteMove(move, x, y);
+    SendInput(1, &move, sizeof(INPUT));
+}
+
+void SendMouseClickAtScreen(int x, int y, MouseButtonType button) {
+    SendMouseMoveAbsoluteScreen(x, y);
+    MouseClick(button);
 }
 
 MouseBallisticsGuard::MouseBallisticsGuard(bool enable) {
@@ -721,9 +852,13 @@ PlaybackThreadAffinityGuard::~PlaybackThreadAffinityGuard() {
     if (active_ && thread_) SetThreadAffinityMask(thread_, prevMask_);
 }
 
-MultimediaTimerGuard::MultimediaTimerGuard(bool enable) {
+MultimediaTimerGuard::MultimediaTimerGuard(bool enable, bool highResolution) {
     if (!enable) return;
+    // timeBeginPeriod(1) 是 Sleep 类等待（自旋间隔/按住时长）精度的下限保障，必须留；
+    // NtSetTimerResolution(0.5ms) 是**全系统**定时器分辨率，会让整机无法进深度 C-state ——
+    // 长时间挂机时这是隐形发热源，所以低性能模式（highResolution=false）跳过它。
     if (timeBeginPeriod(1) == TIMERR_NOERROR) activePeriod_ = true;
+    if (!highResolution) return;
 
     using NtSetTimerResolutionFn = LONG (WINAPI*)(ULONG, BOOLEAN, ULONG*);
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -824,6 +959,25 @@ void SendQuickInputText(const std::wstring& text, double charInterval,
     auto cancelled = [cancelFlag]() {
         return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
     };
+    // ★首字符保护：SendUnicodeChar 注入的是 KEYEVENTF_UNICODE + wVk=0 的「纯字符」事件。
+    // 若此刻物理上还按着 Ctrl/Alt/Win（上一条 keyClick 的 keyup 还没被目标处理完，
+    // 或用户手按着），目标会把它当**控制字符/快捷键**吞掉 —— 实测地址栏里
+    // "edge://history" 变成 "dge://history"（'e' 被 Ctrl+E 吃掉），Edge 于是把它当搜索词，
+    // 直接进了必应搜索页；模型却以为历史记录已打开。文本输入前显式抬起修饰键即可根治。
+    {
+        static const int kMods[] = {
+            VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN,
+            VK_LSHIFT, VK_RSHIFT,
+        };
+        bool releasedAny = false;
+        for (const int vk : kMods) {
+            if ((GetAsyncKeyState(vk) & 0x8000) != 0) {
+                SendKeyboardKey(static_cast<UINT>(vk), false);
+                releasedAny = true;
+            }
+        }
+        if (releasedAny) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     auto delay = [charInterval, &cancelled]() {
         if (charInterval <= 0 || cancelled()) return;
         const auto end = std::chrono::steady_clock::now()

@@ -61,4 +61,6 @@ bool DeleteAgentConversation(const std::wstring& id);
 std::wstring SummarizeConversationName(const std::vector<ChatMessage>& messages);
 /// Cursor 风格：首条用户消息截断为标题（trim、首行、100 字上限；过短则「新对话」）
 std::wstring DeriveConversationTitleFromPrompt(const std::wstring& prompt);
+/// 可用作列表/页签名：非空、不是「新对话」，也不是 API 错误/提示原文
+bool IsUsableConversationTitle(const std::wstring& name);
 int CountConversationRounds(const std::vector<ChatMessage>& messages);

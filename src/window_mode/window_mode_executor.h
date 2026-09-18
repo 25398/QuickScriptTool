@@ -49,13 +49,15 @@ public:
     /// docs/anticheat-injection-testing.md）。
     void SetInjectionTechnique(inject::Technique t) { fakeFocus_.SetInjectionTechnique(t); }
     void SetHideInjectedModule(bool hide) { fakeFocus_.SetHideModule(hide); }
-    /// 全局设置：关闭后 TryInstallFakeFocus 不注入 DLL。
+    /// 全局设置：关闭后 TryInstallFakeFocus 不注入 DLL（微信 4.x 后台仍强制精简注入）。
     void SetEnableFakeFocusInjection(bool enable) { enableFakeFocusInjection_ = enable; }
 
     HWND TargetHwnd() const;
     WindowModeHealth Health() const;
-    /// 绑窗后目标 HWND 仍在、且 PID 未退出。游戏闪退后必须停脚本，禁止对失效窗口继续记步。
+    /// 绑窗后目标 HWND 仍在、且输入窗进程未退出。游戏闪退后必须停脚本。
+    /// UWP：输入窗 PID 与 ApplicationFrameHost 不同，不算闪退。
     bool TargetStillAlive() const;
+    std::wstring TargetAliveDebug() const;
 
     bool RefreshTarget(std::wstring& err);
 
@@ -145,7 +147,7 @@ private:
     void TryInstallFakeFocus();
     /// Chromium/Electron/CEF 壳且假焦点已注入：键鼠走进程内队列（勿宿主外 PostMessage）。
     bool UsesChromiumShellInProcInput() const;
-    /// 冒险岛假焦点已注入：键鼠只写软状态，宿主 PostMessage 只会让边框闪。
+    /// 恒 false：冒险岛技能键必须 PostMessage。走路靠 mapleSafe 注入写共享内存/DI，不走这条。
     bool UsesMapleStoryFakeFocusInput() const;
     bool UsesInProcFakeFocusSoftInput() const;
     void SyncFakeFocusCursor(int cx, int cy) const;

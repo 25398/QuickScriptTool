@@ -38,6 +38,8 @@ const selftest::CaseInfo kCases[] = {
         L"NormalizeActionCoords maps pixel move to nx/ny"},
     {L"normalize_relative_skip", L"default",
         L"MoveMouseRelative is not screen-normalized"},
+    {L"normalize_mousedrag_end_nstar", L"default",
+        L"NormalizeActionCoords maps mouseDrag endX/endY to nEndX/nEndY"},
     {L"migrate_legacy_half", L"default",
         L"MigrateLegacyScriptToNormalized 1280,720 @2560x1440 -> 0.5,0.5"},
     {L"template_scale_half", L"default",
@@ -68,6 +70,10 @@ const selftest::CaseInfo kCases[] = {
         L"two crops preserve click vs original"},
     {L"crop_noffset_roundtrip", L"crop",
         L"Sync then round(nOffset*W)==offset"},
+    {L"getcolor_imagelocate_xy_roundtrip", L"default",
+        L"getColor imageLocate x/y 按模板 Sync/Denorm 往返"},
+    {L"var_image_offset_norm_from_producer", L"default",
+        L"变量图 offset 按前序保存图片搜索区归一化，不按屏幕宽高"},
 };
 
 bool Near(double a, double b, double eps = 1e-6) {
@@ -158,6 +164,22 @@ void CaseNormalizeRelativeSkip() {
     Emit(L"normalize_relative_skip", ok, ok ? L"" : L"relative should keep dx/dy");
 }
 
+void CaseNormalizeMouseDragEnd() {
+    CoordMeta meta = StandardScriptCoordMeta();
+    ScriptAction a{};
+    a.type = ActionType::MouseDrag;
+    a.x = 1280;
+    a.y = 720;
+    a.endX = 2560;
+    a.endY = 0;
+    NormalizeActionCoords(a, meta);
+    const bool ok = a.coordsAreNormalized
+        && Near(a.nx, 0.5) && Near(a.ny, 0.5)
+        && Near(a.nEndX, 1.0) && Near(a.nEndY, 0.0);
+    Emit(L"normalize_mousedrag_end_nstar", ok,
+        ok ? L"" : (L"nEndX=" + std::to_wstring(a.nEndX) + L" nEndY=" + std::to_wstring(a.nEndY)).c_str());
+}
+
 void CaseMigrateLegacy() {
     CoordMeta meta = StandardScriptCoordMeta();
     std::vector<ScriptAction> actions(1);
@@ -216,6 +238,26 @@ void CaseResolveClick() {
     // center=(30,40); nOffset*(origTpl) => +10,-10 -> (40,30)
     const bool ok = tx == 40 && ty == 30;
     Emit(L"resolve_click_point_offset", ok,
+        ok ? L"" : (L"tx=" + std::to_wstring(tx) + L" ty=" + std::to_wstring(ty)).c_str());
+}
+
+void CaseResolveClickRemappedBox() {
+    // 窗口模式把命中从截图 80x80 映射到客户区 40x40 后，偏移必须跟框缩放，
+    // 不能仍按 origTpl=80 × scale=1 加到客户区中心。
+    ImageMatchResult m{};
+    m.found = true;
+    m.topLeftX = 10;
+    m.topLeftY = 20;
+    m.bottomRightX = 50;
+    m.bottomRightY = 60; // 40x40 客户区框
+    m.scale = 1.0;
+    TemplateScale ts{1.0, 1.0};
+    int tx = 0, ty = 0;
+    ResolveFindImageClickPoint(m, 80, 80, 0.25, -0.25, ts, false, tx, ty);
+    // center=(30,40); nOffset×box => +10,-10 -> (40,30)
+    // 若误用 origTpl×scale 会得到 +20,-20 -> (50,20)
+    const bool ok = tx == 40 && ty == 30;
+    Emit(L"resolve_click_point_remapped_box", ok,
         ok ? L"" : (L"tx=" + std::to_wstring(tx) + L" ty=" + std::to_wstring(ty)).c_str());
 }
 
@@ -339,6 +381,78 @@ void CaseCropNOffsetRoundtrip() {
     Emit(L"crop_noffset_roundtrip", rx == 5 && ry == -4, L"");
 }
 
+void CaseGetColorImageLocateXyRoundtrip() {
+    const std::wstring path = AppDir() + L"\\selftest_getcolor_locate.bmp";
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 20;
+    bi.bmiHeader.biHeight = -10;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool wrote = false;
+    if (bmp && bits) {
+        memset(bits, 0x40, static_cast<size_t>(20) * 10 * 4);
+        wrote = SaveBitmapToFile(bmp, path);
+        DeleteBitmapHandle(bmp);
+    }
+    if (!wrote) {
+        Emit(L"getcolor_imagelocate_xy_roundtrip", false, L"failed to write stub bmp");
+        return;
+    }
+    ScriptAction a{};
+    a.type = ActionType::GetColor;
+    a.imageLocate = true;
+    a.imagePath = path;
+    a.x = 8;
+    a.y = -2;
+    SyncMouseDragNorm(a);
+    const CoordMeta meta = StandardScriptCoordMeta();
+    DenormalizeActionCoords(a, meta, meta.refWidth, meta.refHeight);
+    DeleteFileW(path.c_str());
+    const bool ok = Near(a.nx, 8.0 / 20.0) && Near(a.ny, -2.0 / 10.0)
+        && a.x == 8 && a.y == -2;
+    Emit(L"getcolor_imagelocate_xy_roundtrip", ok, ok ? L"" : L"template-relative xy lost");
+}
+
+void CaseVarImageOffsetNormFromProducer() {
+    ScriptAction save{};
+    save.type = ActionType::FindImage;
+    save.findImageFollowUp = 3;
+    save.matchVarName = L"image";
+    save.searchFullScreen = false;
+    save.searchX1 = 10;
+    save.searchY1 = 20;
+    save.searchX2 = 90;
+    save.searchY2 = 60; // 80x40 保存区
+
+    ScriptAction click{};
+    click.type = ActionType::FindImage;
+    click.imageUseVar = true;
+    click.imagePath = L"image";
+    click.findImageFollowUp = 0;
+    click.offsetX = 10;
+    click.offsetY = -4;
+
+    std::vector<ScriptAction> acts{save, click};
+    const CoordMeta meta = StandardScriptCoordMeta();
+    SyncNormFieldsFromPixels(acts, meta);
+    const bool normOk = Near(acts[1].nOffsetX, 10.0 / 80.0)
+        && Near(acts[1].nOffsetY, -4.0 / 40.0)
+        && !Near(acts[1].nOffsetX, 10.0 / static_cast<double>(meta.refWidth));
+    DenormalizeScriptCoords(acts, meta, meta.refWidth, meta.refHeight);
+    const bool denormOk = acts[1].offsetX == 10 && acts[1].offsetY == -4;
+    Emit(L"var_image_offset_norm_from_producer", normOk && denormOk,
+        (normOk && denormOk)
+            ? L""
+            : (L"n=(" + std::to_wstring(acts[1].nOffsetX) + L","
+                + std::to_wstring(acts[1].nOffsetY) + L") px=("
+                + std::to_wstring(acts[1].offsetX) + L","
+                + std::to_wstring(acts[1].offsetY) + L")").c_str());
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -373,11 +487,13 @@ int wmain(int argc, wchar_t** argv) {
     CaseHasCoordMeta();
     CaseNormalizeMove();
     CaseNormalizeRelativeSkip();
+    CaseNormalizeMouseDragEnd();
     CaseMigrateLegacy();
     CaseTemplateScale();
     CaseExecOptsSameRes();
     CaseExecOptsCrossIso();
     CaseResolveClick();
+    CaseResolveClickRemappedBox();
     CaseCropNormalize();
     CaseCropClamp();
     CaseCropFullIdentity();
@@ -388,6 +504,8 @@ int wmain(int argc, wchar_t** argv) {
     CaseCropOddCenter();
     CaseCropChainTwice();
     CaseCropNOffsetRoundtrip();
+    CaseGetColorImageLocateXyRoundtrip();
+    CaseVarImageOffsetNormFromProducer();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

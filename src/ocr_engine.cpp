@@ -1,6 +1,7 @@
 #include "ocr_engine.h"
 
 #include "image_match.h"
+#include "opencv_runtime.h"
 #include "utils.h"
 
 #include <urlmon.h>
@@ -9,12 +10,21 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <vector>
+#include <initializer_list>
+#include <string>
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #pragma comment(lib, "urlmon.lib")
 
@@ -41,20 +51,53 @@ bool EnsureDirectory(const std::wstring& path) {
         || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+constexpr wchar_t kOcrVenvDir[] = L"C:\\paddle_env\\venv";
 constexpr wchar_t kOcrVenvPythonExe[] = L"C:\\paddle_env\\venv\\Scripts\\python.exe";
 constexpr wchar_t kOcrBasePythonExe[] = L"C:\\paddle_env\\python312\\python.exe";
 constexpr wchar_t kOcrBasePythonDir[] = L"C:\\paddle_env\\python312";
 constexpr wchar_t kOcrPythonInstallerName[] = L"python-3.12.10-amd64.exe";
+constexpr wchar_t kOcrPythonNugetName[] = L"python.3.12.10.nupkg";
 constexpr wchar_t kOcrPythonInstallerUrl[] =
     L"https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe";
+
+const wchar_t* kOcrPythonInstallerUrls[] = {
+    L"https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe",
+    L"https://mirrors.huaweicloud.com/python/3.12.10/python-3.12.10-amd64.exe",
+    kOcrPythonInstallerUrl,
+};
+
+const wchar_t* kOcrPythonNugetUrls[] = {
+    L"https://globalcdn.nuget.org/packages/python.3.12.10.nupkg",
+    L"https://api.nuget.org/v3-flatcontainer/python/3.12.10/python.3.12.10.nupkg",
+};
+
+const wchar_t* kOcrPipIndexes[] = {
+    L"https://pypi.tuna.tsinghua.edu.cn/simple",
+    L"https://mirrors.aliyun.com/pypi/simple",
+    L"https://pypi.org/simple",
+};
 
 bool FileExists(const std::wstring& path) {
     return !path.empty()
         && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+bool FileExistsNonEmpty(const std::wstring& path, ULONGLONG minBytes = 1) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (path.empty()
+        || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        return false;
+    }
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;
+    ULARGE_INTEGER size{};
+    size.LowPart = data.nFileSizeLow;
+    size.HighPart = data.nFileSizeHigh;
+    return size.QuadPart >= minBytes;
+}
+
+bool RunProcessCaptureStdout(const std::wstring& commandLine, std::string& stdoutText, DWORD& exitCode);
+
 std::wstring DetectPythonExecutable() {
-    if (FileExists(kOcrVenvPythonExe)) return kOcrVenvPythonExe;
     return kOcrVenvPythonExe;
 }
 
@@ -83,10 +126,11 @@ bool RunProcessWait(const std::wstring& commandLine, DWORD& exitCode, bool showW
     return true;
 }
 
-bool DownloadFileUrl(const std::wstring& url, const std::wstring& destPath) {
+bool DownloadFileUrl(const std::wstring& url, const std::wstring& destPath, ULONGLONG minBytes = 1) {
     DeleteFileW(destPath.c_str());
     const HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), destPath.c_str(), 0, nullptr);
-    return SUCCEEDED(hr) && FileExists(destPath);
+    if (!SUCCEEDED(hr) || !FileExists(destPath)) return false;
+    return FileExistsNonEmpty(destPath, minBytes);
 }
 
 bool CopyDirectoryTree(const std::wstring& srcDir, const std::wstring& destDir) {
@@ -99,6 +143,91 @@ bool CopyDirectoryTree(const std::wstring& srcDir, const std::wstring& destDir) 
     return exitCode < 8;
 }
 
+bool RemovePathTree(const std::wstring& path) {
+    if (path.empty() || !FileExists(path)) return true;
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::path(path), ec);
+    return !std::filesystem::exists(std::filesystem::path(path), ec);
+}
+
+std::wstring TrimAscii(const std::string& value) {
+    size_t begin = 0;
+    while (begin < value.size() && (value[begin] == ' ' || value[begin] == '\t' || value[begin] == '\r')) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t' || value[end - 1] == '\r')) {
+        --end;
+    }
+    return FromUtf8(value.substr(begin, end - begin));
+}
+
+std::wstring ReadVenvCfgHome() {
+    const std::filesystem::path cfg(L"C:\\paddle_env\\venv\\pyvenv.cfg");
+    std::ifstream in(cfg);
+    if (!in) return {};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.size() < 4) continue;
+        if (line.compare(0, 4, "home") != 0) continue;
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        return TrimAscii(line.substr(eq + 1));
+    }
+    return {};
+}
+
+bool VenvLooksUsable() {
+    if (!FileExists(kOcrVenvPythonExe)) return false;
+    const std::wstring home = ReadVenvCfgHome();
+    if (home.empty()) return false;
+    if (home.find(L"WindowsApps") != std::wstring::npos) return false;
+    return FileExistsNonEmpty(home + L"\\python.exe", 4096);
+}
+
+bool PythonExecutableWorks(const std::wstring& pythonExe) {
+    if (!FileExists(pythonExe)) return false;
+    DWORD exitCode = 1;
+    std::string out;
+    const std::wstring cmd = QuoteArg(pythonExe) + L" -c \"import sys; print(sys.version_info[0])\"";
+    if (!RunProcessCaptureStdout(cmd, out, exitCode) || exitCode != 0) return false;
+    return out.find('3') != std::string::npos;
+}
+
+bool WriteVenvCfgForBasePython() {
+    EnsureDirectory(kOcrVenvDir);
+    const std::filesystem::path cfg(L"C:\\paddle_env\\venv\\pyvenv.cfg");
+    std::ofstream out(cfg, std::ios::binary);
+    if (!out) return false;
+    out << "home = C:\\paddle_env\\python312\n"
+        << "include-system-site-packages = false\n"
+        << "version = 3.12.10\n"
+        << "executable = C:\\paddle_env\\python312\\python.exe\n"
+        << "command = C:\\paddle_env\\python312\\python.exe -m venv C:\\paddle_env\\venv\n";
+    return static_cast<bool>(out);
+}
+
+bool WriteOcrSitecustomize() {
+    const std::wstring dir = L"C:\\paddle_env\\venv\\Lib\\site-packages";
+    if (!EnsureDirectory(dir)) return false;
+    const std::filesystem::path path(dir + L"\\sitecustomize.py");
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    const char* body =
+        "# Generated by QuickScriptTool OCR installer.\n"
+        "import collections\n"
+        "import collections.abc\n"
+        "import os\n"
+        "os.environ.setdefault(\"KMP_DUPLICATE_LIB_OK\", \"TRUE\")\n"
+        "os.environ.setdefault(\"PADDLEOCR_HOME\", r\"C:\\paddle_env\\models\")\n"
+        "for _name in (\"Mapping\", \"MutableMapping\", \"Sequence\", \"Callable\", "
+        "\"Iterable\", \"MutableSequence\"):\n"
+        "    if not hasattr(collections, _name) and hasattr(collections.abc, _name):\n"
+        "        setattr(collections, _name, getattr(collections.abc, _name))\n";
+    out.write(body, std::strlen(body));
+    return static_cast<bool>(out);
+}
+
 bool InstallPython312FromInstaller(const std::wstring& installerPath, std::wstring& errorOut) {
     errorOut.clear();
     if (!FileExists(installerPath)) {
@@ -107,79 +236,347 @@ bool InstallPython312FromInstaller(const std::wstring& installerPath, std::wstri
     }
 
     const std::wstring cmd = QuoteArg(installerPath)
-        + L" /passive InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0 Include_doc=0"
-        + L" TargetDir=" + QuoteArg(kOcrBasePythonDir);
+        + L" /passive InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=0"
+        + L" Include_launcher=0 Include_test=0 Include_doc=0 Include_pip=1"
+        + L" AssociateFiles=0 Shortcuts=0 TargetDir=" + QuoteArg(kOcrBasePythonDir);
     DWORD exitCode = 1;
     if (!RunProcessWait(cmd, exitCode, true) || exitCode != 0) {
         errorOut = L"Python 3.12 安装程序执行失败";
         return false;
     }
-    if (!FileExists(kOcrBasePythonExe)) {
-        errorOut = L"Python 3.12 安装完成但未找到 python.exe";
+    if (!PythonExecutableWorks(kOcrBasePythonExe)) {
+        errorOut = L"Python 3.12 安装完成但无法启动 python.exe";
         return false;
     }
     return true;
 }
 
+std::wstring FindExtractedPythonDir(const std::wstring& extractDir) {
+    if (FileExists(extractDir + L"\\tools\\python.exe")) return extractDir + L"\\tools";
+    if (FileExists(extractDir + L"\\python.exe")) return extractDir;
+    return {};
+}
+
+bool DeployPythonFromNuget(std::wstring& errorOut, const OcrInstallProgressFn& onProgress) {
+    auto report = [&](int percent, const wchar_t* status) {
+        if (onProgress) onProgress(percent, status);
+    };
+
+    const std::wstring nupkgPath = L"C:\\paddle_env\\" + std::wstring(kOcrPythonNugetName);
+    report(10, L"正在下载独立 Python 3.12...");
+    bool downloaded = false;
+    for (const wchar_t* url : kOcrPythonNugetUrls) {
+        if (DownloadFileUrl(url, nupkgPath, 5ull * 1024ull * 1024ull)) {
+            downloaded = true;
+            break;
+        }
+    }
+    if (!downloaded) {
+        errorOut = L"无法下载 Python 3.12 运行时，请检查网络后重试。";
+        return false;
+    }
+
+    const std::wstring extractDir = L"C:\\paddle_env\\_py_nupkg";
+    RemovePathTree(extractDir);
+    EnsureDirectory(extractDir);
+    report(14, L"正在解压 Python 3.12...");
+    const std::wstring tarCmd = QuoteArg(L"C:\\Windows\\System32\\tar.exe")
+        + L" -xf " + QuoteArg(nupkgPath) + L" -C " + QuoteArg(extractDir);
+    DWORD tarExit = 1;
+    if (!RunProcessWait(tarCmd, tarExit) || tarExit != 0) {
+        errorOut = L"解压 Python 运行时失败";
+        return false;
+    }
+
+    const std::wstring srcDir = FindExtractedPythonDir(extractDir);
+    if (srcDir.empty()) {
+        errorOut = L"Python 运行时压缩包内容无效";
+        return false;
+    }
+
+    report(16, L"正在部署 Python 3.12...");
+    if (FileExists(kOcrBasePythonDir) && !PythonExecutableWorks(kOcrBasePythonExe)) {
+        RemovePathTree(kOcrBasePythonDir);
+    }
+    if (!CopyDirectoryTree(srcDir, kOcrBasePythonDir) || !PythonExecutableWorks(kOcrBasePythonExe)) {
+        errorOut = L"部署 Python 3.12 失败";
+        RemovePathTree(extractDir);
+        return false;
+    }
+    RemovePathTree(extractDir);
+    return true;
+}
+
 bool EnsurePython312Base(std::wstring& errorOut, const OcrInstallProgressFn& onProgress) {
     errorOut.clear();
-    if (FileExists(kOcrBasePythonExe)) return true;
+    if (PythonExecutableWorks(kOcrBasePythonExe)) return true;
 
     auto report = [&](int percent, const wchar_t* status) {
         if (onProgress) onProgress(percent, status);
     };
 
+    if (FileExists(kOcrBasePythonDir) && !PythonExecutableWorks(kOcrBasePythonExe)) {
+        RemovePathTree(kOcrBasePythonDir);
+    }
+
     const std::wstring bundledPortable = AppDir() + L"\\tools\\python312";
     if (FileExists(bundledPortable + L"\\python.exe")) {
         report(10, L"正在部署内置 Python 3.12...");
         if (CopyDirectoryTree(bundledPortable, kOcrBasePythonDir)
-            && FileExists(kOcrBasePythonExe)) {
+            && PythonExecutableWorks(kOcrBasePythonExe)) {
             return true;
         }
     }
 
+    if (DeployPythonFromNuget(errorOut, onProgress)) return true;
+    const std::wstring nugetError = errorOut;
+
     std::wstring installerPath;
     const std::wstring bundledInstaller = AppDir() + L"\\tools\\" + kOcrPythonInstallerName;
-    if (FileExists(bundledInstaller)) {
+    if (FileExistsNonEmpty(bundledInstaller, 10ull * 1024ull * 1024ull)) {
         installerPath = bundledInstaller;
         report(10, L"正在安装内置 Python 3.12...");
+        if (InstallPython312FromInstaller(installerPath, errorOut)) return true;
     } else {
-        report(10, L"正在下载 Python 3.12...");
+        report(10, L"正在下载 Python 3.12 安装程序...");
         installerPath = L"C:\\paddle_env\\" + std::wstring(kOcrPythonInstallerName);
-        if (!DownloadFileUrl(kOcrPythonInstallerUrl, installerPath)) {
-            errorOut = L"无法下载 Python 3.12，请检查网络连接后重试。";
-            return false;
+        for (const wchar_t* url : kOcrPythonInstallerUrls) {
+            if (DownloadFileUrl(url, installerPath, 20ull * 1024ull * 1024ull)) {
+                report(18, L"正在安装 Python 3.12...");
+                if (InstallPython312FromInstaller(installerPath, errorOut)) return true;
+                break;
+            }
         }
-        report(18, L"正在安装 Python 3.12...");
     }
 
-    return InstallPython312FromInstaller(installerPath, errorOut);
+    if (errorOut.empty()) {
+        errorOut = nugetError.empty()
+            ? L"无法安装 Python 3.12，请检查网络连接后重试。"
+            : nugetError;
+    }
+    return false;
 }
 
 bool CreateOcrVirtualEnv(std::wstring& errorOut, const OcrInstallProgressFn& onProgress) {
     errorOut.clear();
-    if (FileExists(kOcrVenvPythonExe)) return true;
-
     auto report = [&](int percent, const wchar_t* status) {
         if (onProgress) onProgress(percent, status);
     };
 
     if (!EnsurePython312Base(errorOut, onProgress)) return false;
 
+    if (FileExists(kOcrVenvPythonExe)) {
+        if (PythonExecutableWorks(kOcrVenvPythonExe)) {
+            WriteOcrSitecustomize();
+            return true;
+        }
+        report(20, L"正在修复已损坏的 Python 虚拟环境...");
+        if (WriteVenvCfgForBasePython() && PythonExecutableWorks(kOcrVenvPythonExe)) {
+            WriteOcrSitecustomize();
+            return true;
+        }
+        report(22, L"正在重建 Python 虚拟环境...");
+        const std::wstring backup = std::wstring(kOcrVenvDir) + L"_broken_"
+            + std::to_wstring(GetTickCount64());
+        std::error_code ec;
+        std::filesystem::rename(std::filesystem::path(kOcrVenvDir),
+            std::filesystem::path(backup), ec);
+        if (ec) RemovePathTree(kOcrVenvDir);
+    }
+
     report(22, L"正在创建 Python 虚拟环境...");
     const std::wstring venvCmd = QuoteArg(kOcrBasePythonExe)
-        + L" -m venv " + QuoteArg(L"C:\\paddle_env\\venv");
+        + L" -m venv " + QuoteArg(kOcrVenvDir);
     DWORD venvExit = 1;
     if (!RunProcessWait(venvCmd, venvExit) || venvExit != 0
-        || !FileExists(kOcrVenvPythonExe)) {
-        errorOut = L"无法创建 Python 虚拟环境，请重试或联系技术支持。";
+        || !PythonExecutableWorks(kOcrVenvPythonExe)) {
+        errorOut = L"无法创建 Python 虚拟环境，请重试。";
         return false;
+    }
+    WriteOcrSitecustomize();
+    return true;
+}
+
+bool InferenceModelReady(const std::wstring& dir) {
+    return FileExistsNonEmpty(dir + L"\\inference.pdmodel", 1024);
+}
+
+bool EnsureOcrModels(const OcrInstallProgressFn& onProgress) {
+    struct Spec { const wchar_t* rel; };
+    const Spec specs[] = {
+        {L"det\\ch\\ch_PP-OCRv4_det_infer"},
+        {L"rec\\ch\\ch_PP-OCRv4_rec_infer"},
+        {L"cls\\ch_ppocr_mobile_v2.0_cls_infer"},
+    };
+    const std::wstring destRoot = L"C:\\paddle_env\\models\\whl";
+    wchar_t profile[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    const std::wstring userProfile = (n > 0 && n < MAX_PATH) ? std::wstring(profile) : std::wstring();
+
+    bool copied = false;
+    for (const auto& spec : specs) {
+        const std::wstring dest = destRoot + L"\\" + spec.rel;
+        if (InferenceModelReady(dest)) continue;
+        if (userProfile.empty()) continue;
+        const std::wstring src = userProfile + L"\\.paddleocr\\whl\\" + spec.rel;
+        if (!InferenceModelReady(src)) continue;
+        if (!copied && onProgress) onProgress(28, L"正在复制本地 OCR 模型...");
+        copied = true;
+        CopyDirectoryTree(src, dest);
     }
     return true;
 }
 
 std::wstring TempOcrImagePath() {
-    return AppDir() + L"\\temp_ocr_" + std::to_wstring(GetTickCount64()) + L".bmp";
+    return AppDir() + L"\\temp_ocr_" + std::to_wstring(GetTickCount64()) + L".png";
+}
+
+struct RawOcrBitmap {
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> pixels;
+};
+
+bool ReadOcrBitmapPixels(HBITMAP bitmap, RawOcrBitmap& out) {
+    if (!bitmap) return false;
+    BITMAP bm{};
+    if (!GetObjectW(bitmap, sizeof(bm), &bm)) return false;
+    out.width = bm.bmWidth;
+    out.height = bm.bmHeight;
+    if (out.width <= 0 || out.height <= 0) return false;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = out.width;
+    bi.bmiHeader.biHeight = -out.height;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    out.pixels.resize(static_cast<size_t>(out.width) * out.height * 4);
+
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    const int lines = GetDIBits(dc, bitmap, 0, out.height, out.pixels.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    return lines > 0;
+}
+
+cv::Mat OcrBitmapToBgr(HBITMAP bitmap) {
+    if (!bitmap || !OpenCvAvailable()) return {};
+    RawOcrBitmap raw{};
+    if (!ReadOcrBitmapPixels(bitmap, raw)) return {};
+    const cv::Mat bgra(raw.height, raw.width, CV_8UC4, raw.pixels.data());
+    cv::Mat bgr;
+    cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+    return bgr.clone();
+}
+
+bool EncodeHbitmapPng(HBITMAP bitmap, std::vector<uchar>& pngOut) {
+    pngOut.clear();
+    if (!OpenCvAvailable()) return false;
+    const cv::Mat bgr = OcrBitmapToBgr(bitmap);
+    if (bgr.empty()) return false;
+    return cv::imencode(".png", bgr, pngOut);
+}
+
+std::string Base64Encode(const unsigned char* data, size_t len) {
+    static const char kTbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < len) {
+        const unsigned n = (static_cast<unsigned>(data[i]) << 16)
+            | (static_cast<unsigned>(data[i + 1]) << 8)
+            | static_cast<unsigned>(data[i + 2]);
+        out.push_back(kTbl[(n >> 18) & 63]);
+        out.push_back(kTbl[(n >> 12) & 63]);
+        out.push_back(kTbl[(n >> 6) & 63]);
+        out.push_back(kTbl[n & 63]);
+        i += 3;
+    }
+    if (i < len) {
+        unsigned n = static_cast<unsigned>(data[i]) << 16;
+        if (i + 1 < len) n |= static_cast<unsigned>(data[i + 1]) << 8;
+        out.push_back(kTbl[(n >> 18) & 63]);
+        out.push_back(kTbl[(n >> 12) & 63]);
+        if (i + 1 < len) {
+            out.push_back(kTbl[(n >> 6) & 63]);
+            out.push_back('=');
+        } else {
+            out.push_back('=');
+            out.push_back('=');
+        }
+    }
+    return out;
+}
+
+bool EncodeHbitmapPngBase64(HBITMAP bitmap, std::string& b64Out) {
+    b64Out.clear();
+    std::vector<uchar> png;
+    if (!EncodeHbitmapPng(bitmap, png) || png.empty()) return false;
+    b64Out = Base64Encode(png.data(), png.size());
+    return !b64Out.empty();
+}
+
+bool SaveHbitmapPng(HBITMAP bitmap, const std::wstring& path) {
+    std::vector<uchar> png;
+    if (!EncodeHbitmapPng(bitmap, png) || png.empty()) return false;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"wb") != 0 || !fp) return false;
+    const size_t wrote = fwrite(png.data(), 1, png.size(), fp);
+    fclose(fp);
+    return wrote == png.size();
+}
+
+std::wstring NormalizeOcrSearchText(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (wchar_t ch : text) {
+        if (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n' || ch == 0x3000)
+            continue;
+        if (ch >= 0xFF10 && ch <= 0xFF19) ch = static_cast<wchar_t>(L'0' + (ch - 0xFF10));
+        else if (ch >= 0xFF21 && ch <= 0xFF3A) ch = static_cast<wchar_t>(L'A' + (ch - 0xFF21));
+        else if (ch >= 0xFF41 && ch <= 0xFF5A) ch = static_cast<wchar_t>(L'a' + (ch - 0xFF41));
+        out.push_back(ch);
+    }
+    return out;
+}
+
+int LevenshteinDistance(const std::wstring& a, const std::wstring& b) {
+    const size_t n = a.size();
+    const size_t m = b.size();
+    if (n == 0) return static_cast<int>(m);
+    if (m == 0) return static_cast<int>(n);
+    std::vector<int> prev(m + 1), cur(m + 1);
+    for (size_t j = 0; j <= m; ++j) prev[j] = static_cast<int>(j);
+    for (size_t i = 1; i <= n; ++i) {
+        cur[0] = static_cast<int>(i);
+        for (size_t j = 1; j <= m; ++j) {
+            const int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            cur[j] = (std::min)({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+        }
+        prev.swap(cur);
+    }
+    return prev[m];
+}
+
+double OcrTextSimilarity(const std::wstring& a, const std::wstring& b) {
+    const int denom = static_cast<int>((std::max)(a.size(), b.size()));
+    if (denom <= 0) return 1.0;
+    const int dist = LevenshteinDistance(a, b);
+    return 1.0 - (static_cast<double>(dist) / static_cast<double>(denom));
+}
+
+OcrTextLine UnionOcrLines(const OcrTextLine& a, const OcrTextLine& b) {
+    OcrTextLine out = a;
+    out.text += b.text;
+    out.x1 = (std::min)(a.x1, b.x1);
+    out.y1 = (std::min)(a.y1, b.y1);
+    out.x2 = (std::max)(a.x2, b.x2);
+    out.y2 = (std::max)(a.y2, b.y2);
+    out.confidence = (std::min)(a.confidence, b.confidence);
+    return out;
 }
 
 bool RunProcessCaptureStdout(const std::wstring& commandLine, std::string& stdoutText, DWORD& exitCode) {
@@ -481,6 +878,11 @@ OcrEnvStatus CheckOcrEnvironmentImpl(bool verifyImport) {
         status.detail = L"未检测到 Python 虚拟环境";
         return status;
     }
+    if (!VenvLooksUsable()) {
+        status.state = OcrEnvState::NotInstalled;
+        status.detail = L"Python 环境已损坏（例如依赖已卸载的微软商店 Python），请点击安装/修复";
+        return status;
+    }
     const std::wstring helperPath = OcrHelperScriptPath();
     if (GetFileAttributesW(helperPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         status.state = OcrEnvState::MissingHelper;
@@ -491,16 +893,95 @@ OcrEnvStatus CheckOcrEnvironmentImpl(bool verifyImport) {
         status.state = OcrEnvState::Ready;
         return status;
     }
-    const std::wstring testCmd = QuoteArg(pythonExe) + L" -c \"import paddleocr\"";
-    std::string stdoutText;
-    DWORD exitCode = 1;
-    if (!RunProcessCaptureStdout(testCmd, stdoutText, exitCode) || exitCode != 0) {
+    if (!PythonExecutableWorks(pythonExe)) {
+        status.state = OcrEnvState::NotInstalled;
+        status.detail = L"Python 环境无法启动，请点击安装/修复";
+        return status;
+    }
+    auto importOk = [&](const wchar_t* snippet) {
+        std::string stdoutText;
+        DWORD exitCode = 1;
+        const std::wstring testCmd = QuoteArg(pythonExe) + L" -c " + QuoteArg(snippet);
+        return RunProcessCaptureStdout(testCmd, stdoutText, exitCode) && exitCode == 0;
+    };
+    if (!importOk(L"from rapidocr import RapidOCR") && !importOk(L"import paddleocr")) {
         status.state = OcrEnvState::MissingDeps;
-        status.detail = L"PaddleOCR 依赖未完整安装";
+        status.detail = L"RapidOCR 依赖未完整安装";
         return status;
     }
     status.state = OcrEnvState::Ready;
     return status;
+}
+
+std::wstring HostFromUrl(const wchar_t* url) {
+    std::wstring u(url ? url : L"");
+    const auto scheme = u.find(L"://");
+    if (scheme != std::wstring::npos) u = u.substr(scheme + 3);
+    const auto slash = u.find(L'/');
+    if (slash != std::wstring::npos) u.resize(slash);
+    return u;
+}
+
+std::wstring SummarizeCmdOutput(const std::string& text, size_t maxChars = 360) {
+    if (text.empty()) return {};
+    std::string slice = text;
+    const auto errPos = slice.find("ERROR");
+    if (errPos == std::string::npos) {
+        const auto err2 = slice.find("Error");
+        if (err2 != std::string::npos && slice.size() > maxChars) {
+            slice = slice.substr(err2);
+        } else if (slice.size() > maxChars) {
+            slice = slice.substr(slice.size() - maxChars);
+        }
+    } else if (slice.size() - errPos > maxChars) {
+        slice = slice.substr(errPos, maxChars);
+    } else if (errPos > 0) {
+        slice = slice.substr(errPos);
+    }
+    for (char& ch : slice) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+        else if (static_cast<unsigned char>(ch) < 32) ch = ' ';
+    }
+    while (!slice.empty() && slice.front() == ' ') slice.erase(slice.begin());
+    while (!slice.empty() && slice.back() == ' ') slice.pop_back();
+    if (slice.size() > maxChars) slice.resize(maxChars);
+    return FromUtf8(slice);
+}
+
+bool PipInstallRequirements(const std::wstring& pythonExe, const std::wstring& reqPath,
+    std::wstring& errorOut, const OcrInstallProgressFn& onProgress) {
+    errorOut.clear();
+    auto report = [&](int percent, const wchar_t* status) {
+        if (onProgress) onProgress(percent, status);
+    };
+
+    report(32, L"正在准备 pip...");
+    {
+        DWORD pipExit = 1;
+        std::string pipOut;
+        const std::wstring upgradeCmd = QuoteArg(pythonExe)
+            + L" -m pip install -U pip setuptools wheel --disable-pip-version-check --timeout 120";
+        RunProcessCaptureStdout(upgradeCmd, pipOut, pipExit);
+    }
+
+    for (const wchar_t* indexUrl : kOcrPipIndexes) {
+        report(40, L"正在下载并安装依赖，请稍候...");
+        const std::wstring host = HostFromUrl(indexUrl);
+        const std::wstring installCmd = QuoteArg(pythonExe)
+            + L" -m pip install -r " + QuoteArg(reqPath)
+            + L" --disable-pip-version-check --timeout 180"
+            + L" -i " + QuoteArg(indexUrl)
+            + L" --trusted-host " + QuoteArg(host);
+        std::string installOut;
+        DWORD installExit = 1;
+        if (RunProcessCaptureStdout(installCmd, installOut, installExit) && installExit == 0) {
+            return true;
+        }
+        errorOut = SummarizeCmdOutput(installOut);
+    }
+    if (errorOut.empty()) errorOut = L"依赖安装失败，请检查网络连接后重试。";
+    else errorOut = L"依赖安装失败：" + errorOut;
+    return false;
 }
 
 bool RunOcrInstallImpl(std::wstring& messageOut, const OcrInstallProgressFn& onProgress) {
@@ -511,10 +992,13 @@ bool RunOcrInstallImpl(std::wstring& messageOut, const OcrInstallProgressFn& onP
     report(5, L"正在准备安装...");
     EnsureDirectory(L"C:\\paddle_env");
     EnsureDirectory(L"C:\\paddle_env\\models");
+    EnsureDirectory(L"C:\\paddle_env\\models\\whl");
 
     if (!CreateOcrVirtualEnv(messageOut, onProgress)) {
         return false;
     }
+    WriteOcrSitecustomize();
+    EnsureOcrModels(onProgress);
 
     const std::wstring reqPath = AppDir() + L"\\tools\\requirements-ocr.txt";
     if (GetFileAttributesW(reqPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -522,30 +1006,33 @@ bool RunOcrInstallImpl(std::wstring& messageOut, const OcrInstallProgressFn& onP
         return false;
     }
 
-    report(30, L"正在下载并安装依赖，请稍候...");
-    const std::wstring pipExe = L"C:\\paddle_env\\venv\\Scripts\\pip.exe";
-    const std::wstring installCmd = QuoteArg(pipExe)
-        + L" install -r " + QuoteArg(reqPath)
-        + L" --disable-pip-version-check";
-    std::string installOut;
-    DWORD installExit = 1;
-    if (!RunProcessCaptureStdout(installCmd, installOut, installExit) || installExit != 0) {
-        messageOut = L"依赖安装失败，请检查网络连接后重试。";
-        return false;
+    report(30, L"正在检查已有依赖...");
+    if (CheckOcrEnvironmentImpl(true).state == OcrEnvState::Ready) {
+        messageOut = L"文字识别组件已就绪，可直接使用。";
+        report(100, L"安装完成");
+        return true;
     }
+
+    std::wstring pipError;
+    const bool pipOk = PipInstallRequirements(kOcrVenvPythonExe, reqPath, pipError, onProgress);
+    WriteOcrSitecustomize();
     report(85, L"正在验证安装...");
 
     const OcrEnvStatus verified = CheckOcrEnvironmentImpl(true);
-    if (verified.state != OcrEnvState::Ready) {
-        messageOut = verified.detail.empty()
-            ? L"安装完成但验证失败，请尝试点击「修复/更新」重试。"
-            : verified.detail;
-        return false;
+    if (verified.state == OcrEnvState::Ready) {
+        messageOut = pipOk
+            ? L"文字识别组件安装完成，可直接使用。"
+            : L"文字识别组件已可用（在线更新依赖未完成，可稍后再次修复）。";
+        report(100, L"安装完成");
+        return true;
     }
 
-    messageOut = L"文字识别组件安装完成，可直接使用。";
-    report(100, L"安装完成");
-    return true;
+    messageOut = pipOk
+        ? (verified.detail.empty()
+            ? L"安装完成但验证失败，请尝试点击「安装 / 修复」重试。"
+            : verified.detail)
+        : pipError;
+    return false;
 }
 
 struct OcrSessionState {
@@ -555,34 +1042,52 @@ struct OcrSessionState {
     HANDLE stdinWrite = nullptr;
     HANDLE stdoutRead = nullptr;
     HANDLE stderrNull = nullptr;
+    std::string stdoutBuf;
 };
 
 OcrSessionState g_ocrSession;
 
-bool ReadStdoutLine(HANDLE pipe, std::string& line, DWORD timeoutMs) {
+bool ReadStdoutLine(OcrSessionState& session, std::string& line, DWORD timeoutMs) {
     line.clear();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    while (std::chrono::steady_clock::now() < deadline) {
+    while (true) {
+        const size_t nl = session.stdoutBuf.find('\n');
+        if (nl != std::string::npos) {
+            line = session.stdoutBuf.substr(0, nl);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            session.stdoutBuf.erase(0, nl + 1);
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (!session.stdoutRead) return false;
         DWORD available = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return false;
+        if (!PeekNamedPipe(session.stdoutRead, nullptr, 0, nullptr, &available, nullptr)) return false;
         if (available > 0) {
-            char ch = 0;
+            std::vector<char> buf(available);
             DWORD readBytes = 0;
-            if (!ReadFile(pipe, &ch, 1, &readBytes, nullptr) || readBytes == 0) return false;
-            if (ch == '\n') return true;
-            if (ch != '\r') line.push_back(ch);
+            if (!ReadFile(session.stdoutRead, buf.data(), available, &readBytes, nullptr) || readBytes == 0) {
+                return false;
+            }
+            session.stdoutBuf.append(buf.data(), buf.data() + readBytes);
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
-    return !line.empty();
 }
 
 bool WriteStdinLine(HANDLE pipe, const std::string& text) {
     std::string payload = text;
     if (payload.empty() || payload.back() != '\n') payload.push_back('\n');
-    DWORD written = 0;
-    return WriteFile(pipe, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) != FALSE;
+    size_t offset = 0;
+    while (offset < payload.size()) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(payload.size() - offset, static_cast<size_t>(32 * 1024)));
+        DWORD written = 0;
+        if (!WriteFile(pipe, payload.data() + offset, chunk, &written, nullptr) || written == 0) {
+            return false;
+        }
+        offset += written;
+    }
+    return true;
 }
 
 void CloseSessionHandles(OcrSessionState& session) {
@@ -602,6 +1107,7 @@ void CloseSessionHandles(OcrSessionState& session) {
         CloseHandle(session.process);
         session.process = nullptr;
     }
+    session.stdoutBuf.clear();
 }
 
 void StopSessionLocked(OcrSessionState& session) {
@@ -661,20 +1167,20 @@ bool StartSessionLocked(OcrSessionState& session, std::wstring& errorOut) {
 
     const std::wstring pythonExe = DetectPythonExecutable();
     const std::wstring scriptPath = OcrHelperScriptPath();
-    const std::wstring commandLine = pythonExe + L" " + QuoteArg(scriptPath) + L" --serve --lang ch";
+    const std::wstring commandLine = QuoteArg(pythonExe) + L" " + QuoteArg(scriptPath) + L" --serve --lang ch";
 
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmdLine(commandLine.begin(), commandLine.end());
     cmdLine.push_back(L'\0');
 
     const BOOL ok = CreateProcessW(
-        nullptr, cmdLine.data(), nullptr, nullptr, TRUE,
+        pythonExe.c_str(), cmdLine.data(), nullptr, nullptr, TRUE,
         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(stdinRead);
     CloseHandle(stdoutWrite);
     if (!ok) {
         StopSessionLocked(session);
-        errorOut = L"无法启动 Python/PaddleOCR，请检查依赖是否已安装";
+        errorOut = L"无法启动 OCR 服务，请检查依赖是否已安装";
         return false;
     }
 
@@ -682,7 +1188,7 @@ bool StartSessionLocked(OcrSessionState& session, std::wstring& errorOut) {
     CloseHandle(pi.hThread);
 
     std::string readyLine;
-    if (!ReadStdoutLine(session.stdoutRead, readyLine, 180000)) {
+    if (!ReadStdoutLine(session, readyLine, 180000)) {
         StopSessionLocked(session);
         errorOut = L"OCR 服务启动超时";
         return false;
@@ -712,8 +1218,8 @@ std::string EscapeJsonPathUtf8(const std::string& value) {
     return out;
 }
 
-bool SessionRequestLocked(OcrSessionState& session, const std::wstring& imagePath,
-    bool digitsOnly, std::string& jsonOut, std::wstring& errorOut) {
+bool SessionRequestLocked(OcrSessionState& session, const std::string& imageB64,
+    const std::wstring& imagePath, bool digitsOnly, std::string& jsonOut, std::wstring& errorOut) {
     jsonOut.clear();
     errorOut.clear();
     if (!session.process || !session.stdinWrite || !session.stdoutRead) {
@@ -721,12 +1227,17 @@ bool SessionRequestLocked(OcrSessionState& session, const std::wstring& imagePat
         return false;
     }
 
-    std::string requestLine;
-    if (digitsOnly) {
-        const std::string pathUtf8 = ToUtf8(imagePath);
-        requestLine = "{\"image\":\"" + EscapeJsonPathUtf8(pathUtf8) + "\",\"digits_only\":true}";
+    std::string requestLine = "{\"digits_only\":";
+    requestLine += digitsOnly ? "true" : "false";
+    if (!imageB64.empty()) {
+        requestLine += ",\"image_b64\":\"";
+        requestLine += imageB64;
+        requestLine += "\"}";
     } else {
-        requestLine = ToUtf8(imagePath);
+        const std::string pathUtf8 = ToUtf8(imagePath);
+        requestLine += ",\"image\":\"";
+        requestLine += EscapeJsonPathUtf8(pathUtf8);
+        requestLine += "\"}";
     }
     if (!WriteStdinLine(session.stdinWrite, requestLine)) {
         errorOut = L"无法向 OCR 服务发送请求";
@@ -734,7 +1245,7 @@ bool SessionRequestLocked(OcrSessionState& session, const std::wstring& imagePat
     }
     FlushFileBuffers(session.stdinWrite);
 
-    if (!ReadStdoutLine(session.stdoutRead, jsonOut, 120000)) {
+    if (!ReadStdoutLine(session, jsonOut, 120000)) {
         errorOut = L"OCR 服务响应超时";
         StopSessionLocked(session);
         return false;
@@ -746,17 +1257,57 @@ OcrEngineOutput RunOcrOnImagePathOneShot(const std::wstring& imagePath, bool dig
     OcrEngineOutput output;
     const std::wstring pythonExe = DetectPythonExecutable();
     const std::wstring scriptPath = OcrHelperScriptPath();
-    std::wstring commandLine = pythonExe + L" " + QuoteArg(scriptPath)
+    std::wstring commandLine = QuoteArg(pythonExe) + L" " + QuoteArg(scriptPath)
         + L" --image " + QuoteArg(imagePath) + L" --lang ch";
     if (digitsOnly) commandLine += L" --digits-only";
 
     std::string stdoutText;
     DWORD exitCode = 1;
     if (!RunProcessCaptureStdout(commandLine, stdoutText, exitCode)) {
-        output.error = L"无法启动 Python/PaddleOCR，请检查依赖是否已安装";
+        output.error = L"无法启动 OCR 服务，请检查依赖是否已安装";
         return output;
     }
     return ParseOcrJson(stdoutText);
+}
+
+OcrEngineOutput RequestOcrOnHbitmap(HBITMAP bmp, bool digitsOnly) {
+    OcrEngineOutput output;
+    std::string imageB64;
+    const bool haveB64 = EncodeHbitmapPngBase64(bmp, imageB64);
+    std::wstring imagePath;
+    if (!haveB64) {
+        imagePath = TempOcrImagePath();
+        if (!SaveHbitmapPng(bmp, imagePath) && !SaveBitmapToFile(bmp, imagePath)) {
+            output.error = L"无法编码识别截图";
+            return output;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ocrSession.mu);
+        if (g_ocrSession.process) {
+            std::string jsonOut;
+            std::wstring sessionError;
+            if (SessionRequestLocked(g_ocrSession, imageB64, imagePath, digitsOnly, jsonOut, sessionError)) {
+                output = ParseOcrJson(jsonOut);
+            } else {
+                output.error = sessionError.empty() ? L"OCR 服务请求失败" : sessionError;
+            }
+        } else if (g_ocrSession.refCount > 0) {
+            output.error = L"OCR 服务不可用";
+        } else if (!imagePath.empty()) {
+            output = RunOcrOnImagePathOneShot(imagePath, digitsOnly);
+        } else {
+            imagePath = TempOcrImagePath();
+            if (SaveHbitmapPng(bmp, imagePath)) {
+                output = RunOcrOnImagePathOneShot(imagePath, digitsOnly);
+            } else {
+                output.error = L"无法保存临时截图";
+            }
+        }
+    }
+    if (!imagePath.empty()) DeleteFileW(imagePath.c_str());
+    return output;
 }
 
 }  // namespace
@@ -770,6 +1321,11 @@ OcrEnvStatus CheckOcrEnvironment(bool verifyImport) {
 }
 
 bool RunOcrInstall(std::wstring& messageOut, OcrInstallProgressFn onProgress) {
+    {
+        std::lock_guard<std::mutex> lock(g_ocrSession.mu);
+        StopSessionLocked(g_ocrSession);
+        g_ocrSession.refCount = 0;
+    }
     return RunOcrInstallImpl(messageOut, onProgress);
 }
 
@@ -796,6 +1352,10 @@ bool IsOcrSessionActive() {
     return g_ocrSession.process != nullptr;
 }
 
+OcrEngineOutput ParseOcrEngineJson(const std::string& jsonRaw) {
+    return ParseOcrJson(jsonRaw);
+}
+
 OcrEngineOutput RunOcrOnScreenRegion(
     int searchX1, int searchY1, int searchX2, int searchY2,
     HBITMAP frozenScreen, int frozenVirtX, int frozenVirtY, bool digitsOnly) {
@@ -809,31 +1369,8 @@ OcrEngineOutput RunOcrOnScreenRegion(
         return output;
     }
 
-    const std::wstring imagePath = TempOcrImagePath();
-    if (!SaveBitmapToFile(bmp, imagePath)) {
-        DeleteBitmapHandle(bmp);
-        output.error = L"无法保存临时截图";
-        return output;
-    }
+    output = RequestOcrOnHbitmap(bmp, digitsOnly);
     DeleteBitmapHandle(bmp);
-
-    {
-        std::lock_guard<std::mutex> lock(g_ocrSession.mu);
-        if (g_ocrSession.process) {
-            std::string jsonOut;
-            std::wstring sessionError;
-            if (SessionRequestLocked(g_ocrSession, imagePath, digitsOnly, jsonOut, sessionError)) {
-                output = ParseOcrJson(jsonOut);
-            } else {
-                output.error = sessionError.empty() ? L"OCR 服务请求失败" : sessionError;
-            }
-        } else if (g_ocrSession.refCount > 0) {
-            output.error = L"OCR 服务不可用";
-        } else {
-            output = RunOcrOnImagePathOneShot(imagePath, digitsOnly);
-        }
-    }
-    DeleteFileW(imagePath.c_str());
 
     const auto elapsedMs = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -871,29 +1408,7 @@ OcrEngineOutput RunOcrOnBitmap(HBITMAP bmp, int coordOffsetX, int coordOffsetY, 
     }
 
     const auto start = std::chrono::steady_clock::now();
-    const std::wstring imagePath = TempOcrImagePath();
-    if (!SaveBitmapToFile(bmp, imagePath)) {
-        output.error = L"无法保存临时截图";
-        return output;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_ocrSession.mu);
-        if (g_ocrSession.process) {
-            std::string jsonOut;
-            std::wstring sessionError;
-            if (SessionRequestLocked(g_ocrSession, imagePath, digitsOnly, jsonOut, sessionError)) {
-                output = ParseOcrJson(jsonOut);
-            } else {
-                output.error = sessionError.empty() ? L"OCR 服务请求失败" : sessionError;
-            }
-        } else if (g_ocrSession.refCount > 0) {
-            output.error = L"OCR 服务不可用";
-        } else {
-            output = RunOcrOnImagePathOneShot(imagePath, digitsOnly);
-        }
-    }
-    DeleteFileW(imagePath.c_str());
+    output = RequestOcrOnHbitmap(bmp, digitsOnly);
 
     const auto elapsedMs = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -939,10 +1454,52 @@ std::wstring ConcatOcrLines(const OcrEngineOutput& output) {
 
 std::optional<OcrTextLine> FindTextInOcrLines(
     const OcrEngineOutput& output, const std::wstring& target) {
-    if (target.empty()) return std::nullopt;
+    if (target.empty() || output.lines.empty()) return std::nullopt;
+
     for (const auto& line : output.lines) {
         if (line.text.find(target) != std::wstring::npos) return line;
     }
+
+    const std::wstring needle = NormalizeOcrSearchText(target);
+    if (!needle.empty()) {
+        for (const auto& line : output.lines) {
+            if (NormalizeOcrSearchText(line.text).find(needle) != std::wstring::npos) return line;
+        }
+        const size_t n = output.lines.size();
+        for (size_t i = 0; i < n; ++i) {
+            OcrTextLine acc = output.lines[i];
+            std::wstring norm = NormalizeOcrSearchText(acc.text);
+            for (size_t j = i + 1; j < n && j < i + 4; ++j) {
+                acc = UnionOcrLines(acc, output.lines[j]);
+                norm = NormalizeOcrSearchText(acc.text);
+                if (norm.find(needle) != std::wstring::npos) return acc;
+            }
+        }
+    }
+
+    if (needle.size() < 2) return std::nullopt;
+    constexpr double kMinFuzzy = 0.82;
+    const OcrTextLine* best = nullptr;
+    double bestScore = kMinFuzzy;
+    for (const auto& line : output.lines) {
+        const std::wstring hay = NormalizeOcrSearchText(line.text);
+        if (hay.empty()) continue;
+        const double score = OcrTextSimilarity(hay, needle);
+        if (score > bestScore) {
+            bestScore = score;
+            best = &line;
+        }
+        if (hay.size() > needle.size()) {
+            for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+                const double win = OcrTextSimilarity(hay.substr(i, needle.size()), needle);
+                if (win > bestScore) {
+                    bestScore = win;
+                    best = &line;
+                }
+            }
+        }
+    }
+    if (best) return *best;
     return std::nullopt;
 }
 

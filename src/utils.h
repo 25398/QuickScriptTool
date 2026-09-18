@@ -20,6 +20,33 @@ std::wstring Trim(const std::wstring& value);
 
 // ── 路径工具 ──────────────────────────────────────────────────────
 std::wstring AppDir();
+/// 路径是否位于某根目录下（大小写不敏感；根目录本身也算）
+bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root);
+/// 安装在 Program Files 时，WebView2 沙箱无法写 exe 旁目录，须漫游到 LocalAppData
+bool InstallDirNeedsRoamingWebView2Data(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86);
+/// 纯函数：解析 WebView2 用户数据目录（自检用）
+std::wstring ResolveWebView2UserDataDir(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86,
+    const std::wstring& localAppData);
+std::wstring ResolveWebView2FetchDataDir(const std::wstring& exeDir,
+    const std::wstring& programFiles, const std::wstring& programFilesX86,
+    const std::wstring& localAppData);
+/// 运行时用户数据：便携/自定义目录用 exe 旁；Program Files 用 %LOCALAPPDATA%\QuickScriptTool\...
+std::wstring WebView2UserDataDir();
+std::wstring WebView2FetchDataDir();
+/// 写入 HKCU\Software\QuickScriptTool\LastRunDir，供安装包定位正在使用的副本
+void RecordLastRunAppDir();
+/// 启动提示音路径：exe 旁 startup.wav
+std::wstring AppStartupSoundFilePath();
+/// 结束提示音路径：exe 旁 finish.wav
+std::wstring AppFinishSoundFilePath();
+/// 存在且含 RIFF/WAVE 头则视为可播放（损坏/空文件返回 false）
+bool IsPlayableWavFile(const std::wstring& path);
+/// 播放自定义启动提示音；文件缺失或 PlaySound 失败时回退 MessageBeep(MB_OK)
+void PlayAppStartupSound();
+/// 播放自定义结束提示音；文件缺失或 PlaySound 失败时回退 MessageBeep(MB_OK)
+void PlayAppFinishSound();
 std::wstring ScriptsDir();
 std::wstring RecordingsDir();
 std::wstring FindImagesDir();
@@ -37,6 +64,18 @@ struct ScriptFileEntry {
 };
 /// 递归枚举 rootDir 下所有 .json（跳过 images 等保留名）
 void EnumerateScriptJsonFiles(const std::wstring& rootDir, std::vector<ScriptFileEntry>& out);
+/// 在 rootDir 子树中按文件名查找 .json（缺扩展名时补 .json）。多个同名时取先遇到的。
+bool FindScriptJsonByFileName(const std::wstring& rootDir, const std::wstring& fileName,
+    std::wstring& outPath);
+/// 解析脚本/录制路径：现存完整路径优先；拖进专业模式子文件夹后仍按文件名找回。
+/// 只返回 scripts/ 或 recordings/ 目录内的文件，不会打开目录外路径。
+bool ResolveLibraryScriptPath(const std::wstring& pathOrName, std::wstring& outPath);
+/// 规范化后大小写不敏感比较（缺失文件仍可比较弱规范路径）。
+bool LibraryPathsEqual(const std::wstring& a, const std::wstring& b);
+/// Win32 完整路径前缀判断（去 \\?\；缺失文件仍可判断是否落在目录树下）。
+bool PathIsUnderDir(const std::wstring& path, const std::wstring& dir);
+/// 若 path 在 oldDir 子树内，改写为 newDir 下的对应路径。用于文件夹重命名后重定向引用。
+bool RelocatePathUnderDir(std::wstring& path, const std::wstring& oldDir, const std::wstring& newDir);
 /// 递归枚举 rootDir 下所有子目录（相对路径，/ 分隔；不含 root 自身）
 void EnumerateRelativeFolders(const std::wstring& rootDir, std::vector<std::wstring>& out);
 /// 校验相对文件夹路径：禁止 ..、绝对路径、非法字符
@@ -69,9 +108,16 @@ std::vector<std::wstring> ExtractJsonActionBlocks(const std::wstring& content);
 size_t FindMatchingJsonBrace(const std::wstring& src, size_t openPos);
 size_t FindMatchingJsonBrace(const std::string& src, size_t openPos);
 size_t FindMatchingJsonBracket(const std::string& src, size_t openPos);
+size_t FindMatchingJsonBracket(const std::wstring& src, size_t openPos);
+/// 解析 JSON 字符串数组字段（如 imagePaths）；找不到返回空
+std::vector<std::wstring> ExtractJsonStringArray(const std::wstring& src, const std::wstring& key);
+/// 解析 JSON 整数数组（如 imageUseVars）；支持 0/1 与 true/false
+std::vector<int> ExtractJsonIntArray(const std::wstring& src, const std::wstring& key);
 
 // ── 文件操作 ──────────────────────────────────────────────────────
 std::wstring ReadAll(const std::wstring& path);
+/// 当前 JSON 对象顶层键的冒号位置（跳过嵌套对象/数组；同名键 last-wins）。
+size_t FindTopLevelJsonKeyColon(const std::wstring& src, const std::wstring& key);
 std::wstring ExtractString(const std::wstring& src, const std::wstring& key);
 double      ExtractNumber(const std::wstring& src, const std::wstring& key, double fallback);
 /// 解析 JSON 布尔：支持 true/false 与 1/0（ExtractNumber 无法解析 true/false）
@@ -87,7 +133,7 @@ std::wstring UpdateJsonStringField(const std::wstring& content,
 bool IsPathInImageDir(const std::wstring& path);
 /// 将 JSON 中存储的路径（相对或绝对）解析为运行时绝对路径
 std::wstring ResolveImagePath(const std::wstring& stored);
-/// 将绝对路径转为 JSON 存储用的相对路径（images\xxx.bmp）
+/// 将绝对路径转为 JSON 存储用的相对路径（images/xxx.bmp，正斜杠避免 \t 被当转义）
 std::wstring ImagePathForJson(const std::wstring& absolutePath);
 /// 确保图片位于 scripts/images 下，必要时从外部路径复制进去
 std::wstring EnsureImageInLibrary(const std::wstring& path);
@@ -121,6 +167,10 @@ std::string ReadTextFromZip(const std::wstring& zipPath, const std::string& arch
 
 // ── 热键与按键名称 ────────────────────────────────────────────────
 std::wstring VkName(UINT vk);
+/// 脚本 keyText（←/空格键 等）→ 虚拟键；无法识别返回 0。
+UINT VirtualKeyFromKeyText(const std::wstring& keyText);
+/// 把误存的 Unicode 箭头（U+2190 等）或缺 keyVk 的动作纠正为真正的 VK。
+UINT NormalizeScriptKeyVk(UINT vk, const std::wstring& keyText);
 std::wstring HotkeyText(UINT modifiers, UINT vk);
 /// 展开文本中的 %环境变量%（如 %USERPROFILE%）；未定义变量保持原样。
 /// 用于动作路径等字段，让脚本可用 %USERPROFILE%\Desktop 这类写法。

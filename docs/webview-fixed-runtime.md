@@ -19,12 +19,14 @@ CAB 来源：官方 Fixed Version 包（与 Microsoft 网站同名 cab）。因�
 
 ## 运行时定位
 
-`QstWebViewShell` 调用：
+产品壳（`QuickScriptTool.exe`）调用：
 
 ```text
 CreateCoreWebView2EnvironmentWithOptions(
   <exe>\WebView2Fixed,      // browserExecutableFolder（内含 msedgewebview2.exe）
-  <exe>\WebView2UserData,   // userDataFolder（可写）
+  <userDataFolder>,         // 便携/自定义目录：<exe>\WebView2UserData
+                            // Program Files：%LOCALAPPDATA%\QuickScriptTool\WebView2UserData
+                            // （Edge 沙箱无法写 Program Files）
   ...
 )
 ```
@@ -49,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File tools\package_webview_portable.ps1
 
 ```text
 dist/QstWebViewShell-Portable/
-  QstWebViewShell.exe
+  QuickScriptTool.exe
   ui\...
   WebView2Fixed\...
   WebView2UserData\

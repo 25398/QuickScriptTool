@@ -23,8 +23,9 @@ struct AgentOptimizeOptions {
     std::wstring mergeMode = L"merge";
     std::wstring waitCalculation = L"sum";
     double distanceThreshold = 5.0;
+    /// 兼容旧 compressPath 参数；waitCalculation=fixed 且未传 mergeWaitValue 时使用
     double compressWait = 0.05;
-    /// waitCalculation 为 fixed/custom/specified 时使用
+    /// waitCalculation 为 fixed/custom/specified 时使用（合并与压缩相同）
     double mergeWaitValue = 0.1;
 };
 

@@ -937,7 +937,7 @@
       '<div class="pro-sched-table">' +
         '<div class="th"><span>任务名称</span><span>类型</span><span>文件</span><span>频率</span><span>时间</span><span>状态</span><span>操作</span></div>';
     var rows = tasks.map(function (t) {
-      var kind = (t.kind | 0) === 0 ? "鼠标录制" : "鼠标宏";
+      var kind = (t.kind | 0) === 0 ? "键鼠录制" : "鼠标宏";
       var freq = FREQ[t.frequency | 0] || "自定义";
       var st = (t.status | 0) === 0 ? "启用" : "禁用";
       return '<div class="tr" data-sched-id="' + escAttr(String(t.id || "")) + '">' +

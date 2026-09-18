@@ -1,8 +1,10 @@
 #include "ui_scale.h"
 
+#include "app_settings.h"
 #include "config.h"
 
 #include <algorithm>
+#include <cmath>
 
 #ifndef ENUM_CURRENT_SETTINGS
 #define ENUM_CURRENT_SETTINGS ((DWORD)-1)
@@ -15,6 +17,7 @@ constexpr int kUiRefScreenW = 2560;
 constexpr int kUiRefScreenH = 1440;
 
 int g_uiScalePercent = 100;
+double g_uiUserScale = 1.0;
 
 bool MonitorPixelSize(HMONITOR monitor, int* outW, int* outH) {
     if (!outW || !outH) return false;
@@ -84,12 +87,25 @@ void UiScaleSetPercent(int percent) {
     g_uiScalePercent = std::max(50, std::min(percent, 100));
 }
 
+void UiScaleSetUserFactor(double factor) {
+    g_uiUserScale = quickscript::NormalizeUiScaleFactor(factor);
+}
+
+double UiUserScaleFactor() {
+    return g_uiUserScale;
+}
+
+double UiEffectiveScale() {
+    return (g_uiScalePercent / 100.0) * g_uiUserScale;
+}
+
 int UiScalePercent() {
     return g_uiScalePercent;
 }
 
 int UiLen(int designPx) {
-    return MulDiv(designPx, g_uiScalePercent, 100);
+    return static_cast<int>(std::lround(
+        static_cast<double>(designPx) * UiEffectiveScale()));
 }
 
 int UiHomeWidth() {

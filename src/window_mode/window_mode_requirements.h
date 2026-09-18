@@ -37,4 +37,26 @@
 //       异桌裸还原会在鼠标时切屏（已证伪）。观看 UnPin+迁回宏桌面；已展开禁再 Placement。
 //    B) softMessage / 假焦点：宏桌面 + Win32；绑后可最小化。
 //    详见 .cursor/skills/window-mode-debug/cdp-requirements.md / cdp-lessons.md
+//
+// 7) 后台逐字投递（快捷输入）时序 —— 禁止零间隔连发
+//    - 走窗口消息（LCA/未登记游戏/Qt/AIR/Chromium 壳）时，目标线程自己的 TranslateMessage
+//      会把 WM_CHAR 排到**所有已投递消息之后**：DOWN 紧跟 UP ⇒ 字符在「键已抬起」后才到，
+//      按帧取键/只在键仍按下时收字的游戏就**吞字**（实测后台输入 "11" 只进一个 1，前台 SendInput 正常）。
+//    - 硬规则：必须保证「本键已被目标处理（键处于按下态）且它的 WM_CHAR 已排在 UP 之前」。
+//      默认实现是**队列屏障**（`queueBarrier()`：跨线程同步 `SendMessageTimeoutW(top, WM_NULL)`，
+//      排在已投递消息之后、目标补发的 WM_CHAR 之前被处理），与目标帧率无关；
+//      屏障不可用（UIPI/进程内灌键队列/超时）才回落到 `DOWN→按住≥1帧→UP→间隔` 固定时序。
+//    - 用户字间隔只能加大、不得小于兜底下限；修饰键（Ctrl+V）同样先按住再发字符键。
+//    - 现场旋钮：`QST_LCA_NO_BARRIER=1`（关屏障 A/B）、`QST_LCA_KEY_MS=0~500`（兜底按住/间隔）。
+//    - 对应用例：`posted_quick_keys_timing`（WindowModeSelfTest）。
+//
+// 8) 软键（假焦点灌键队列）必须「状态跟着事件走」
+//    - `down[]` 是**当前值**，事件由 DLL 灌键线程稍后 PostMessage：宿主一次把 DOWN/UP 全写完，
+//      目标才在自己的节奏里处理键消息 —— 目标在处理 `WM_KEYDOWN(V)` 时读到的是「Ctrl 已抬起」，
+//      Chromium 的 `IsKeyDown(GetKeyboardState(), modifiers)` 判 Ctrl 不在 → **Ctrl+V 退化成普通字符**
+//      （实测症状：只出 v 不粘贴；WinForms 宿主 + CEF 的壳同样中招）。
+//    - 硬规则：软键每投递一笔必须用 `WaitSoftKeyPostTurn()`（跨线程同步 `WM_NULL` 队列屏障）
+//      等目标处理完，再让调用方写下一步键态；冒险岛 DirectInput 共享内存路径除外。
+//    - 现场旋钮：`QST_NO_SOFT_KEY_BARRIER=1`（关屏障 A/B，恢复旧行为）。
+//    - 对应用例：`soft_key_combo_state_race`（WindowModeSelfTest）。
 // =============================================================================

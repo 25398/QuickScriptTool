@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 namespace windowmode {
 
@@ -43,5 +44,54 @@ ForegroundDialogInfo ProbeForegroundDialog();
 
 /// 单行摘要（给模型看）；前台没有系统对话框时返回空串。
 std::wstring FormatForegroundDialogProbe();
+
+// ── UIA 控件枚举 / 调用（桌面侧「UIA 优先定位」）────────────────────
+// 为什么需要：Vision 定位一次要截屏 + 上传 + VLM（1~2 轮 API），而 UIA 树是本地、免费、
+/// 且能给「按钮文字」这种语义完全一致的目标。对齐微软 UFO 的做法：
+/// 枚举控件 → 编号 → 选中 → 校验 name 与 id 一致 → Invoke（不打像素）。
+struct UiControlInfo {
+    /// 1 起，给模型看的编号（与列表顺序一致）
+    int id = 0;
+    std::wstring name;
+    /// 中文类型标签（按钮/输入框/菜单项…）
+    std::wstring controlType;
+    /// 原始 UIA 控件类型 id（CONTROLTYPEID，避免在头文件里拉 COM 头）
+    int controlTypeId = 0;
+    RECT rect{};
+    bool enabled = true;
+    bool offscreen = false;
+    /// 支持 InvokePattern（可不打像素直接触发）
+    bool invokable = false;
+    /// 支持 ValuePattern（可直接填值）
+    bool valuePattern = false;
+    std::wstring automationId;
+};
+
+/// 枚举窗口（hwnd=nullptr → 前台窗口）里可交互的 UIA 控件，最多 maxCount 个。
+/// 只收有名字的可交互类型；按屏幕阅读顺序排序后编号。
+std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd = nullptr, int maxCount = 60);
+
+/// 把控件列表格式化成给模型看的紧凑文本（编号 + 类型 + 名字 + 状态），超预算截断。
+std::wstring FormatUiControlListForAgent(const std::vector<UiControlInfo>& items,
+    size_t maxChars = 1800);
+
+/// 在给定列表里按名字挑一个控件：
+/// 完全同名 > 前缀 > 包含（大小写不敏感）；同分时取阅读顺序最前。
+/// 返回命中的下标；ambiguous=true 表示存在近似竞争项（调用方应回退 Vision）。
+/// outIndex 越界/无命中时返回 -1。
+int PickUiControlByName(const std::vector<UiControlInfo>& items, const std::wstring& name,
+    bool* ambiguous = nullptr);
+
+/// 按名字（而不是编号）重新枚举并触发控件：name 是模型真正推理过的语义，
+/// 编号可能因界面变化而错位——以 name 定位、以 id 校验，两者不一致时写入 outWarn。
+/// 优先 InvokePattern；不可 Invoke 时返回 false 并给出矩形（调用方点中心）。
+bool InvokeUiControlByName(const std::wstring& name, int expectedId,
+    std::wstring& outActualName, int& outActualId, RECT& outRect, bool& outInvoked,
+    std::wstring& outWarn);
+
+/// 遮挡校验：屏幕点是否落在「前台顶层窗口本身 / 其后代 / 其拥有的弹窗」上。
+/// false = 该点属于别的程序（或被子窗口挡住），此时点击会打错目标，应拦截。
+/// 用 GA_ROOT + 同进程 + owner 链判定，避免把菜单/下拉这类弹窗误判为遮挡。
+bool IsScreenPointOnForegroundWindow(int screenX, int screenY);
 
 }  // namespace windowmode

@@ -29,6 +29,7 @@ const selftest::CaseInfo kCases[] = {
     {L"product_no_firmware_reboot", L"install", L"Web shell must not shutdown /r /fw"},
     {L"product_no_official_ic_exe_msg", L"install", L"Must not tell users to run install-interception.exe"},
     {L"release_pack_no_lab_installers", L"install", L"package_release must not ship official IC exe or lab sign scripts"},
+    {L"inf_driverver_acl_bump", L"install", L"qst_vhid.inf DriverVer is 1.0.1.0 (ACL bump)"},
     {L"device_open", L"driver", L"Open QST Virtual HID device interface"},
     {L"key_press_release", L"inject", L"SendKey Esc down/up via boot keyboard report"},
     {L"key_caps_and_f1", L"inject", L"CapsLock(0x3A) and F1(0x3B) map/submit"},
@@ -227,10 +228,29 @@ void RunProductBootSafetyGates() {
     const bool copiesIcExe = Contains(lower, "copy-item $interceptioninstaller")
         || Contains(lower, "fatal: install-interception.exe missing");
     const bool forbidsLab = Contains(lower, "sign_and_install.ps1 must not ship")
-        && Contains(lower, "install-interception.exe must not ship");
+        && Contains(lower, "install-interception.exe must not ship")
+        && Contains(lower, "default zip must not contain driver\\qst_vhid\\package");
     const bool ok = !copiesIcExe && forbidsLab;
     Emit(L"release_pack_no_lab_installers", ok,
         ok ? L"" : L"package_release still ships or requires lab/official kernel installers");
+}
+
+void RunInfDriverVerGate() {
+    const std::wstring script = FindElevateScript();
+    if (script.empty()) {
+        Emit(L"inf_driverver_acl_bump", false, L"script missing, cannot locate INF");
+        return;
+    }
+    const std::wstring inf = JoinPath(DirName(script), L"qst_vhid.inf");
+    const std::wstring portable = JoinPath(DirName(script), L"portable\\qst_vhid.inf");
+    std::string raw;
+    std::string portRaw;
+    const bool infOk = ReadAllBytes(inf, &raw) && Contains(raw, "1.0.1.0");
+    const bool portOk = ReadAllBytes(portable, &portRaw) && Contains(portRaw, "1.0.1.0");
+    std::wstring detail;
+    if (!infOk) detail += L"qst_vhid.inf missing 1.0.1.0 ";
+    if (!portOk) detail += L"portable/qst_vhid.inf missing 1.0.1.0";
+    Emit(L"inf_driverver_acl_bump", infOk && portOk, detail.c_str());
 }
 
 }  // namespace
@@ -261,6 +281,7 @@ int wmain(int argc, wchar_t** argv) {
 
     RunInstallScriptGates();
     RunProductBootSafetyGates();
+    RunInfDriverVerGate();
 
     auto& vh = VirtualHidBackend::Instance();
     std::wstring err;

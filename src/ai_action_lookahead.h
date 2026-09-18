@@ -26,6 +26,14 @@ using AiLookaheadDefaultFetchFn = std::function<std::vector<ToolCallRecord>(
 /// Register product default (call once from ai_action_service).
 void RegisterAiLookaheadDefaultFetch(AiLookaheadDefaultFetchFn fn);
 
+/// 预规划等待上限：观察后 400ms、SKIP_OBSERVE 150ms。
+/// 预规划是「猜测」，绝不值得让主链路等它：预取通常在观察/settle 的 0.3–2s 里就跑完，
+/// 跑不完就以当前画面为准丢弃（对齐 Midscene「规划以最新观察为准」）。
+inline constexpr int kAiLookaheadAfterObserveWaitMs = 400;
+inline constexpr int kAiLookaheadSkipObserveWaitMs = 150;
+/// 单次 AI 动作执行最多做几次预规划（每次都是一次完整 API 请求）
+inline constexpr int kAiLookaheadMaxStartsPerAction = 2;
+
 struct AiLookaheadCachedPlan {
     bool ready = false;
     std::vector<ToolCallRecord> toolCalls;
@@ -63,14 +71,19 @@ public:
         AiHttpAbortSlot* httpAbort);
 
     /// Wait briefly for prefetch; discard if unacceptable; return hint for next instruction.
+    /// waitMs 只吃「观察/settle 期间已经跑完」的红利：超时即丢弃并真正中断预取，
+    /// 不再让 join 卡在在途 API 上（旧实现 wait 6s + join 最长可再等 25s）。
     std::wstring TakeHintAfterObserve(
         bool observeUnchanged,
         bool onlyDynamicChanged,
         bool dialogBlocking,
-        int waitMs = 6000);
+        int waitMs = kAiLookaheadAfterObserveWaitMs);
 
     /// For SKIP_OBSERVE rounds: take hint if ready (no UI surprise assumed).
-    std::wstring TakeHintSkipObserve(int waitMs = 4000);
+    std::wstring TakeHintSkipObserve(int waitMs = kAiLookaheadSkipObserveWaitMs);
+
+    /// 上一次 Take 是否因为预取未就绪而丢弃（调用方据此记日志/统计）
+    bool LastTakeDiscardedNotReady() const { return lastTakeDiscarded_; }
 
     void SetFetchOverrideForTest(AiLookaheadFetchFn fn);
     void SetCachedForTest(AiLookaheadCachedPlan plan);
@@ -86,6 +99,10 @@ private:
     std::atomic_bool cancelWorker_{false};
     AiLookaheadCachedPlan cached_;
     AiLookaheadFetchFn fetchOverride_;
+    /// 预取专用 HTTP 中断槽：绝不能复用主链路的槽（复用会把主请求也一起掐掉），
+    /// 同时让 Cancel/丢弃能立刻中断在途请求，join 不再阻塞到 API 超时。
+    AiHttpAbortSlot ownAbort_;
+    bool lastTakeDiscarded_ = false;
     /// Prevent nested lookahead from lookahead itself
     bool inFlightPrefetch_ = false;
 };

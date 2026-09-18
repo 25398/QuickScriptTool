@@ -8,7 +8,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
 CatalogFile = qst_vhid.cat
-DriverVer   = 07/25/2026,1.0.0.0
+DriverVer   = 09/12/2026,1.0.1.0
 PnpLockdown = 1
 
 [DestinationDirs]

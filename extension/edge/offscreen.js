@@ -69,6 +69,59 @@ function closeWs() {
   ws = null;
 }
 
+async function loadBridgeRuntimeFromNative() {
+  return await new Promise((resolve) => {
+    let port;
+    try {
+      port = chrome.runtime.connectNative("com.quickscripttool.bridge");
+    } catch (_) {
+      resolve(null);
+      return;
+    }
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try {
+        port.disconnect();
+      } catch (_) {
+        /* ignore */
+      }
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(null), 1500);
+    port.onMessage.addListener((msg) => {
+      clearTimeout(timer);
+      if (msg && msg.ok && msg.token && msg.port) finish(msg);
+      else finish(null);
+    });
+    port.onDisconnect.addListener(() => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    try {
+      port.postMessage({ type: "getBridge" });
+    } catch (_) {
+      finish(null);
+    }
+  });
+}
+
+async function loadBridgeRuntime() {
+  try {
+    const res = await fetch(chrome.runtime.getURL("bridge_runtime.json"), {
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const info = await res.json();
+      if (info && info.ok && info.token && info.port) return info;
+    }
+  } catch (_) {
+    /* packed CRX has no host-written json */
+  }
+  return loadBridgeRuntimeFromNative();
+}
+
 async function tryDiscoverAndConnect() {
   if (discoverBusy) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -76,8 +129,14 @@ async function tryDiscoverAndConnect() {
   }
   discoverBusy = true;
   try {
-    for (let port = PORT_LO; port <= PORT_HI; ++port) {
-      try {
+    const runtime = await loadBridgeRuntime();
+    if (!runtime) {
+      setStatus("waiting", "等待宿主写入桥凭证");
+      return;
+    }
+    const port = Number(runtime.port);
+    if (port < PORT_LO || port > PORT_HI) return;
+    try {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 400);
         const res = await fetch(`http://127.0.0.1:${port}/qst/status`, {
@@ -85,12 +144,13 @@ async function tryDiscoverAndConnect() {
           cache: "no-store",
         });
         clearTimeout(timer);
-        if (!res.ok) continue;
+        if (!res.ok) return;
         const info = await res.json();
-        if (!info || !info.ok || !info.token || !info.ws) continue;
+        if (!info || !info.ok) return;
+        const wsBase = info.ws || `ws://127.0.0.1:${port}/qst/ws`;
         setStatus("connecting", `port=${port}`);
         await new Promise((resolve) => {
-          const socket = new WebSocket(`${info.ws}?token=${encodeURIComponent(info.token)}`);
+          const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(runtime.token)}`);
           let settled = false;
           const done = () => {
             if (!settled) {
@@ -101,11 +161,13 @@ async function tryDiscoverAndConnect() {
           socket.onopen = () => {
             ws = socket;
             setStatus("connected", `ws port=${port} (offscreen)`);
-            socket.send(JSON.stringify({ id: 0, type: "hello", token: info.token }));
+            socket.send(JSON.stringify({ id: 0, type: "hello", token: runtime.token }));
             done();
           };
           socket.onmessage = (ev) => {
-            forwardToSw(String(ev.data || ""));
+            const raw = String(ev.data || "");
+            chrome.runtime.sendMessage({ type: "bridgeRecv", raw }).catch(() => {});
+            forwardToSw(raw);
           };
           socket.onclose = () => {
             if (ws === socket) ws = null;
@@ -123,9 +185,8 @@ async function tryDiscoverAndConnect() {
           setTimeout(done, 1500);
         });
         if (ws && ws.readyState === WebSocket.OPEN) return;
-      } catch (_) {
-        /* next port */
-      }
+    } catch (_) {
+      /* status/ws failed this round */
     }
     setStatus("waiting", "未发现键鼠工坊桥（请先运行键鼠工坊并启动窗口模式）");
   } finally {
@@ -136,7 +197,15 @@ async function tryDiscoverAndConnect() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "offscreenReconnect") {
     closeWs();
-    tryDiscoverAndConnect().then(() => sendResponse({ ok: true }));
+    tryDiscoverAndConnect().then(() =>
+      sendResponse({ ok: true, ws: !!(ws && ws.readyState === WebSocket.OPEN) })
+    );
+    return true;
+  }
+  if (msg && msg.type === "offscreenEnsure") {
+    tryDiscoverAndConnect().then(() =>
+      sendResponse({ ok: true, ws: !!(ws && ws.readyState === WebSocket.OPEN) })
+    );
     return true;
   }
   if (msg && msg.type === "offscreenPing") {
@@ -144,6 +213,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       ok: true,
       ws: !!(ws && ws.readyState === WebSocket.OPEN),
     });
+    return false;
+  }
+  if (msg && msg.type === "bridgeSend") {
+    const raw = typeof msg.raw === "string" ? msg.raw : JSON.stringify(msg.raw || {});
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(raw);
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e && e.message ? e.message : e) });
+      }
+    } else {
+      sendResponse({ ok: false, error: "no_ws" });
+    }
     return false;
   }
   return false;

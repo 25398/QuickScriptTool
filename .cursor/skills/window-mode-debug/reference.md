@@ -51,6 +51,12 @@
 - **用户症状**：最大化时录制，窗口缩小后回放点偏 / 找图 0%。  
 - **代码**：`window_coords.cpp`、`window_mode_json.cpp`、`MapScriptPointToClient`；找图 `FindImageSurfaceScale` / `BuildExecutionFindImageOptions`  
 
+### `window_findimage_full_client`
+
+- **测什么**：窗口/后台窗口模式 `ResolveClientSearchRect` 忽略绝对选取区域（含整屏 3840×2160），始终返回 `0,0,clientW,clientH`。`MapClientRect` 在默认 `screenAbsolute` 下仍把客户区映射为屏幕坐标（禁止原样拷贝）。纯函数 `EffectiveWindowModeClientSearchRect` 同步校验。  
+- **用户症状**：窗口模式找图搜到全屏/其它窗口；或「选取区域」把搜索框裁到屏幕坐标；或 OCR/AI/保存图片截到虚拟屏左上角。  
+- **代码**：`window_coords.cpp` `EffectiveWindowModeClientSearchRect`；`window_mode_executor.cpp` `ResolveClientSearchRect` / `MapClientRect`  
+
 ### `window_relative_playback_enables_wm`
 
 - **测什么**：`FinalizeWindowModeForPlayback(..., reviveEnabled=true)` 仅在录制回放把 `enabled=0` + 身份复活为后台窗口模式；`reviveEnabled=false` 时编辑器默认模式保持关闭；写盘 `enabled=0` 仍保留类名/路径。  
@@ -96,8 +102,38 @@
 
 ### `soft_message_exe_gates`
 
-- **测什么**：Notepad 等 Win32 → softMessage、绑后可最小化；Unity / 传奇 `TFrmMain` 类名自动假焦点并保持还原；显式 softMessage 不走 CDP。  
+- **测什么**：Notepad 等 Win32 → softMessage、绑后可最小化；Unity / 传奇 `TFrmMain` 类名自动假焦点并保持还原；显式 softMessage 不走 CDP。Discord/`Weixin.exe`+`Chrome_WidgetWin` 仍是 Chromium 壳；`Weixin.exe`+`Qt51514QWindowIcon` 不是壳、不是 MuMu。  
 - **代码**：`window_mode_types.h`、绑定分支 `window_mode_session.cpp`（勿对 exe 调 `PrepareMacroDesktopForExtVision`）  
+
+### `weixin_qt_fake_focus`
+
+- **测什么**：`Weixin.exe` / 标题「微信」+ `Qt*QWindowIcon` → `NeedsFakeFocusInjection` / `UsesFakeFocus`，不是 Electron 壳、不是 `ConfigLooksLikeEmulatorTarget`、不走 LCA；输入子窗绑顶层。纯 Qt 类名仍当 MuMu 模拟器。`微信开发者工具` 不是微信客户端。探针窗：`PostKeyToWindow` 只到 `KEYDOWN`/`KEYUP`，**零** `WM_CHAR`/`WM_ACTIVATE`/`WM_SETFOCUS`/`WM_PASTE`；快捷输入「h」走 KEY*；左键消息到达且不激活。  
+- **用户症状**：后台窗口模式对微信无效；日志「安卓模拟器…未注入假焦点」；或「设置未启用假焦点注入」后按键把微信切到前台、一次变两次；或按键 OK 但找图点击/快捷输入没反应。  
+- **代码**：`LooksLikeWeixin*`；`TryInstallFakeFocus` 微信忽略关闭注入设置；`PrimeWindowSoftFocus` / `PostKeyToWindow` 不发激活/CHAR；快捷输入 `SendQuickInputViaPostedKeys`；`fake_focus_dll.cpp` `weixinSafe` 前景查询+软光标/键态；`FindBackgroundInputChild` 顶层。  
+
+### `weixin_qt_mouse_hooks`
+
+- **测什么**：标题「微信」+ `Qt*QWindowIcon` 上 `FakeFocus_InstallLite`：`GetCursorPos` 读软光标、`SetCursorPos` 不挪真光标、`GetAsyncKeyState(VK_LBUTTON)` 跟共享内存、不改 WndProc。  
+- **代码**：`InstallWeixinMouseStateHooks`；禁止 `MaybePostFakeWmInput` / `SoftRefreshFocusMessages`。  
+
+### `quick_input_skips_paste_non_edit`
+
+- **测什么**：非 Edit 探针（Qt `QWindowIcon`、AIR、`MapleStoryClass`、`Chrome_WidgetWin`、普通自定义类）`PostQuickInputToWindow("h")` **零** `WM_PASTE`。Qt/冒险岛走 KEY* 且不附带宿主 `WM_CHAR`；普通自定义类走 `WM_CHAR`。跨进程记事本仍可 `WM_PASTE`（`post_quick_input`）。
+- **用户症状**：后台快捷输入在微信/Qt/AIR/游戏里没反应，记事本却正常；或 Chromium 壳一次打出两个字。
+- **代码**：`background_window_input.cpp` `WindowAcceptsWmPaste` / `WindowPrefersPostedQuickKeys` / `SendQuickInputViaPostedKeys`；Chromium 进程内灌键时只 `SetKey`，禁止再宿主 `PostMessage`。
+
+### `posted_quick_keys_timing`
+
+- **测什么**：后台逐字投递（LCA / 游戏类名）必须按真实键盘时序落地：`WM_KEYDOWN` →（键已按下且它的 `WM_CHAR` 已排在 UP 之前）→ `WM_KEYUP`。探针窗口按**每帧一次**的节奏取消息，模拟「按帧取键 + 只在键仍按下时接受目标自己 `TranslateMessage` 出的 `WM_CHAR`」的游戏：文本 `"11"` 必须两字都进、`丢=0`、`同键重叠=0`。`QST_LCA_NO_BARRIER=1`（关队列屏障，回落到固定按住）与 `QST_LCA_KEY_MS=0~500`（兜底按住/间隔）可现场 A/B。
+- **用户症状**：后台窗口模式下快捷输入**吞字**（实测 `"11"` 只进一个 `1`，前台 SendInput 正常）：DOWN/UP 零间隔连发 → 整串挤进目标同一帧，且目标自己 `TranslateMessage` 出的 `WM_CHAR` 全被排到所有 `KEYUP` 之后，按「键仍按下」判定的游戏整串吞掉。
+- **代码**：`background_window_input.cpp` `PostedKeyStepMs` / `PostedKeyBarrierEnabled` / `SendQuickInputViaPostedKeys`（`queueBarrier()` = 跨线程同步 `SendMessageTimeoutW(top, WM_NULL)`；Ctrl+V 分支同样先按住修饰键）。日志：`[窗口模式] 快捷输入逐字投递 N 字 按住=队列屏障/24ms 间隔=… 文本="…"`。
+
+### `soft_key_combo_state_race`
+
+- **测什么**：软键（假焦点灌键队列：Chromium 壳/Qt/微信）投递组合键时，目标在**处理字符键 KEYDOWN 的那一刻**读 `GetKeyState(VK_CONTROL)` 必须仍是「按下」。探针窗口按真实链路跑 `PostQuickInputToWindow(中文)`（非 Edit → Ctrl+V），断言 `V-DOWN=1 且其中读到 Ctrl 仍按下=1`。`QST_NO_SOFT_KEY_BARRIER=1` 关屏障做 A/B（用例即变红：读到 Ctrl 仍按下=0）。
+- **用户症状**：Chromium 壳/CEF（含 WinForms 宿主）里脚本 **Ctrl+V 异常**：**只出 v 不粘贴**，或组合键被当成普通字符。
+- **根因**：软键的**状态**（共享内存 `down[]`，宿主一次写完 DOWN/UP）与**事件**（DLL 灌键线程稍后 `PostMessage`）是两条路 → 宿主早已把 Ctrl 写回「抬起」，目标才处理 `WM_KEYDOWN(V)` → Chromium 的 `IsKeyDown(GetKeyboardState(), modifiers)` 判定 Ctrl 不在 → 快捷键退化成字符。
+- **代码**：`background_window_input.cpp` `WaitSoftKeyPostTurn`（跨线程 `WM_NULL` 队列屏障，等目标处理完这一笔再写下一步键态）；调用点 `SendQuickInputViaPostedKeys`（Ctrl+V 分支）与 `window_mode_executor.cpp` `SendKey`（`UsesInProcFakeFocusSoftInput` 分支，冒险岛 DirectInput 除外）。日志：`[窗口模式] 软键屏障无应答：本会话改为不等待…`。
 
 ### `restore_prefer_maximized`
 
@@ -111,15 +147,26 @@
 
 ### `game_hardware_without_inject`
 
-- **测什么**：窗口模式 + `UnrealWindow` 且未注入假焦点 → `GameTargetNeedsHardwareWithoutFakeFocus`；不得 `CanParkHardwareInputTargetOffscreen`（玩游戏时不能把窗挪到屏外）。普通 Notepad 类窗不走这条，仍可屏外停放。  
-- **用户症状**：SCUM/UE5 窗口模式日志 `SendInput ok=0`、脚本点击不跳转；或回放时游戏窗消失。**调试 F9 能点、主页/热键不能点**：旧调试不传 `windowMode`（走前台 SendInput 假绿）；且窗口模式假前台须在 UI 线程先隐藏 Web 壳，工作线程 `SetForegroundWindow` 抢不到游戏。
-- **代码**：`window_mode_types.cpp` `GameTargetNeedsHardwareWithoutFakeFocus`；`window_mode_executor.cpp` `PreferHardwareInput` / `TryInstallFakeFocus`（本机输入时从「鼠标宏」迁回用户桌面）；`window_target.cpp` `CanParkHardwareInputTargetOffscreen`；`ui/app.js` `startDebugFrom`；`EngineDebugRunActions`；`ResolveWindowModeSelectMethod`（SelectOnStartup 若前台是本进程则先隐藏）；`StartActionsWorker` 窗口模式隐藏壳。  
+- **测什么**：窗口/后台窗口 + `UnrealWindow` / `LaunchUnrealUWindowsClient` 且未注入假焦点 → `GameTargetNeedsHardwareWithoutFakeFocus`；不得 `CanParkHardwareInputTargetOffscreen`（玩游戏时不能把窗挪到屏外）。普通 Notepad 类窗不走这条，仍可屏外停放。  
+- **用户症状**：SCUM/UE5/枪神纪窗口模式日志 `SendInput ok=0`、脚本点击不跳转；或回放时游戏窗消失。**调试 F9 能点、主页/热键不能点**：旧调试不传 `windowMode`（走前台 SendInput 假绿）；且窗口模式假前台须在 UI 线程先隐藏 Web 壳，工作线程 `SetForegroundWindow` 抢不到游戏。  
+- **代码**：`window_mode_types.cpp` `GameTargetNeedsHardwareWithoutFakeFocus` / `LooksLikeUnrealEngineWindowClass`；`window_mode_executor.cpp` `PreferHardwareInput`（后台窗口未注入时假前台，找图不抢前台）；`window_target.cpp` `CanParkHardwareInputTargetOffscreen`；`ui/app.js` `startDebugFrom`；`EngineDebugRunActions`；`ResolveWindowModeSelectMethod`（SelectOnStartup 若前台是本进程则先隐藏）；`StartActionsWorker` 窗口模式隐藏壳。  
 
 ### `hardware_offscreen_park`
 
-- **测什么**：窗口化目标可 `ParkHardwareInputTargetOffscreen`（屏外 + `HWND_TOPMOST`，尺寸不缩小），再 `Restore` 回原位置。铺满监视器不得 park。  
-- **用户症状**：国王大道 / 远程桌面回放挡住屏幕；或结束后窗口消失在屏外。  
+- **测什么**：窗口化目标可 `ParkHardwareInputTargetOffscreen`（屏外 + `HWND_TOPMOST`，尺寸不缩小），再 `Restore` 回原位置。铺满监视器不得 park。系统把 `-32000` 钳回可见区时必须还原原位置，禁止留在左上角。  
+- **用户症状**：国王大道 / 远程桌面回放挡住屏幕；或结束后窗口消失在屏外；挂机时桌面上其它窗口被挪到左上角。  
 - **代码**：`window_target.cpp` `ParkHardwareInputTargetOffscreen`；`window_mode_executor.cpp` BeginRun/EndRun  
+
+### `clamp_rect_keeps_bottom_right`
+
+- **测什么**：`ClampRectToContainingWorkArea` 保持工作区右下角小窗的位置，不得改写到主屏原点。  
+- **用户症状**：脚本运行后无关窗口从右下角飞到左上角。  
+- **代码**：`window_target.cpp` `ClampRectToContainingWorkArea` / `FitRectIntoWorkArea`
+
+### `clamp_rect_shrinks_into_work`
+
+- **测什么**：超大矩形只缩小进所在监视器工作区，不把窗口铺成整块工作区。  
+- **代码**：`ClampRectToContainingWorkArea`
 
 ### `fake_focus_json_roundtrip`
 
@@ -169,8 +216,8 @@
 ### `fake_focus_maplestory_focus_only`
 
 - **测什么**：`MapleStoryClass` 上 `InstallLite` 后 `GetForegroundWindow` 指向目标，**不改 WndProc**、不往队列塞 `WM_INPUT`；写入软输入后 **`GetCursorPos` / `GetAsyncKeyState` 反映软状态**（IAT 导出名 / 可写节指针扫描，**禁止 user32 方法体 JMP**）；`FakeFocus_MapleIatCount` 低 16 位 ≥ 1，且 **`u32jmp`/`diData` 位必须为 0**（`diag & 0x3000 == 0`）；`FakeFocus_MapleHookHits` 在自检里 GetAsyncKeyState 后低字节 > 0。  
-- **用户症状**：后台窗口模式一点运行冒险岛无响应；或注入成功、`slots≥1` 但角色不动、只有边框闪；或跑 2–3 秒后游戏消失、软件自动停止（`目标窗口已消失`）。`slots=0` = 没补到 GetCursorPos；`setFg=1 flash=0` 仍边框闪 = 缓存的 SetForegroundWindow（禁止再打 user32 JMP 修这个）；`u32jmp=1` 或 `diData=1` 后闪退换 pid = 又打了 user32/GetDeviceData 方法体；**18 方法表槽/JMP**（`155136`/`21:25:14`）会等几秒闪退。`0xCFA3`/`slots=2` 仍无键：看 `钩命中 hitReady/gfw/gaks`。`gaks=diState=0` 且 `hitReady=1` = 游戏失焦后根本不轮询我们钩的 API。  
-- **代码**：`fake_focus_dll.cpp` `InstallMapleIatHooks`：主程序 IAT 导出名 + 可写节指针扫描，并始终 PEB 扫游戏目录 IAT（SetFG/FlashWindow）；辅助 DLL 可写节只补前景/闪框（禁止 poll API，`slots=17`/`0xCFA7` 会闪退；大模块不要跳过）。已加载 `dinput8`/`dinput` 则只改 **27–32 方法**设备 vtable 槽（含 Unacquire 槽返回 OK，禁止 JMP Unacquire 方法体）；仅 hookable 的 Acquire/GetDeviceState **方法体** JMP。禁止 18 方法表。禁止 Poll 虚表、禁止 GetDeviceData 方法体 JMP、禁止 user32/win32u 方法体 JMP。命中计数写共享内存（`FILE_MAP_READ|WRITE`，禁止 ALL_ACCESS），禁止运行中 CreateRemoteThread。软输入映射用 NULL DACL。宿主已注入则不 PostMessage。  
+- **用户症状**：后台窗口模式一点运行冒险岛无响应；或注入成功、`slots≥1` 但角色不动、只有边框闪；或跑 2–3 秒后游戏消失、软件自动停止（`目标窗口已消失`）。`slots=0` = 没补到 GetCursorPos；`setFg=1 flash=0` 仍边框闪 = 缓存的 SetForegroundWindow（禁止再打 user32 JMP 修这个）；`u32jmp=1` 或 `diData=1` 后闪退换 pid = 又打了 user32/GetDeviceData 方法体；**18 方法表槽/JMP**（`155136`/`21:25:14`）会等几秒闪退。`0xCFE3`/`slots=2` 且首键后钩命中全 0：本地 dinput8 失焦后靠 `WM_ACTIVATE` 停轮询——IAT 吞失活也救不了键（失焦后不轮询）。**禁止**再灌假 `WM_INPUT`：`164352` / `FakeFocus32.raw.dll` 注入后立刻闪退（`目标窗口已消失` + `CreateRemoteThread Win32=5`）。**禁止** GetGUIThreadInfo IAT / 游戏目录上一级（`156160`/`00:04:24` 立刻闪退）。**禁止**改 dinput8 的 GetProcAddress/DirectInputCreate* IAT 或可写节（`155648`/`23:00:38` 立刻闪退）。
+- **代码**：`fake_focus_dll.cpp` `InstallMapleIatHooks`：主程序/本地 dinput8 IAT 钩 Peek/Dispatch/CallWindowProc **只吞失活**（禁止塞 `WM_INPUT`）。27–36 方法表槽（Acquire/GetDeviceState/GetDeviceData/SetCooperativeLevel）；**禁止**因 foundN>4 整表放弃（2009 dinput8 常有 5 张键盘/鼠标表）。虚表在 `.rdata` 即可，**不要**再要求模块内第二份指针（设备对象只在堆上）。相邻 Device8 表会把方法计数顶过 32，**不要**用 n>32/36 丢掉真表（仍拒绝 <27 的 18 方法跳转表）。找不到镜像表时才扫堆上的现有设备（仅 32 位）。辅助 DLL 可写节只补前景/闪框。**禁止**代理 dinput8、禁止假前台、禁止改 dinput8 的 GetProcAddress/DirectInputCreate* IAT。**禁止 Unacquire 槽**。禁止 18 方法表、user32/win32u 方法体 JMP、假 WM_INPUT、注入线程 `RegisterRawInputDevices` / heap `SetCooperativeLevel`。宿主方向键 **SetKey + SendKeyboardKey**（虚表没挂上时前台仍能走；`lastCb=256` 且 diState>0 后停 SendInput，免得打进当前前台窗）。禁止运行中 `CreateRemoteThread` 查 IAT 计数；安装诊断走共享内存 `mapleDiag/mapleIatPoll/mapleDiVt`。键盘 `GetDeviceState(256)` 的 lastCb 必须记 256，禁止再截成 255。
 - **用户症状**：后台窗口模式一点运行，冒险岛客户端无响应，只能任务管理器强制结束（软件本身正常）。日志里曾出现「精简假焦点已注入（GetAsyncKeyState/光标/RawInput）」。  
 - **代码**：`fake_focus_dll.cpp` `LooksLikeMapleStoryClassName` / `g_mapleSafe`；与 AIR 一样禁止 Phase2。禁止再给冒险岛开光标 inline / RawInput / 子类化。  
 
@@ -196,17 +243,47 @@
 - **用户症状**：已用管理员运行本工具，点运行仍提示「请以相同权限运行本工具与目标程序」（窗口模式 / Chrome 游戏页）。  
 - **代码**：`window_mode_permission.cpp` `CheckPermissionMatch`；`window_mode_executor.cpp` CDP 路径跳过 UIPI 硬拦  
 
+### `permission_mismatch_no_autolaunch`
+
+- **测什么**：`PermissionMismatch` / `DesktopNotReady` 必须 `ShouldAbortAutoLaunchOnBindFailure`；`TargetNotFound` 仍允许自动打开。提示文案须含「管理员」。  
+- **用户症状**：冒险岛已在跑、本工具未提权时，日志先「目标完整性更高」再「未找到目标窗口，自动打开 MapleStoryt.exe」，已开着的游戏闪退。  
+- **代码**：`window_mode_types.h` `ShouldAbortAutoLaunchOnBindFailure`；`window_mode_executor.cpp` `BeginRun` / `CheckRunHealth`  
+
 ### `maplestory_bg_fake_focus`
 
-- **测什么**：`MapleStoryClass` / `MapleStory.exe` / 标题含冒险岛 识别为游戏；后台窗口模式 `UsesFakeFocus`，绑后不最小化。  
-- **用户症状**：后台窗口模式已绑定 `MapleStory(星辰冒险岛)` 立刻 EndRun。  
-- **代码**：`window_mode_types.cpp` `LooksLikeMapleStory*`；卡死游戏见 `fake_focus_maplestory_focus_only`  
+- **测什么**：`MapleStoryClass` / `MapleStory.exe` / 标题含冒险岛 识别为游戏；后台 **不** `UsesFakeFocus`、绑后不最小化；`MapleNeedsSafeFakeFocusLite` 为 true。  
+- **用户症状**：游戏必须前台才会走，切走后原地 A。技能键走 WndProc/PostMessage；走路走 DirectInput，失焦后停轮询。  
+- **代码**：`UsesFakeFocus` / `UsesFakeFocusForTarget` 仍 false（保持 PostMessage）；`TryInstallFakeFocus` 对冒险岛注入 mapleSafe `InstallLite`（吞失活 + DI 填键）。`UsesMapleStoryFakeFocusInput` 恒 false。方向键**始终** `SendKeyboardKey`（防 DI 虚表未挂上时前台也不走）+ 已注入时写 SoftInput。`fake_focus_maplestory_focus_only` 约束 DLL：禁止假 WM_INPUT / 18 方法表 / user32 JMP。  
+
+### `lca_arrow_key_lparam`
+
+- **测什么**：`BuildWindowKeyLParam(VK_LEFT)` 扫描码 0x4B + KF_EXTENDED；`←` / U+2190 规整为 `VK_LEFT`；LCA PostMessage 探针窗收到同样 lParam。  
+- **用户症状**：后台空格/C 有效，方向键没反应。  
+- **代码**：`background_window_input.cpp` `BuildWindowKeyLParam` / `PostKeyToWindow`；`NormalizeScriptKeyVk`。  
+
+### `lca_bg_unknown_game`
+
+- **测什么**：未登记类名（如 `IWWindowClass`）即使打开假焦点开关也走 LCA 窗口消息、不最小化；Unity/UE/GLFW 仍 `NeedsFakeFocusInjection`；记事本不走 LCA。  
+- **用户症状**：未知 2D/DirectX 客户端被注入后闪退，或假焦点失败后改抢前台。  
+- **代码**：`PrefersLcaBackgroundMessages`；注入失败时 `SetLcaBackgroundMessageMode`。方向键兼写本机键态（`ShouldMirrorLcaNavKeyState`，TOOLWINDOW 探针除外）。**禁止**给未登记游戏注入 mapleSafe。  
+
+### `tianlong_bg_fake_focus`
+
+- **测什么**：`TianLongBaBuHJ WndClass` / 路径含「开心天龙」/ 标题「天龙八部」→ `NeedsFakeFocusInjection`、`UsesFakeFocus`，**不是** `PrefersLcaBackgroundMessages`。`IWWindowClass` 仍走 LCA。  
+- **用户症状**：后台窗口模式找图 60%+ 并打出「点击 → 客户区」但 NPC 没反应；日志「未登记游戏：跳过假焦点注入」。  
+- **代码**：`LooksLikeTianLongBaBu*`；`TryInstallFakeFocus` 精简注入 + 软光标播种；DLL 钩 `GetCursorPos`/`GetAsyncKeyState`，禁止子类化/假 `WM_INPUT`/RawInput。  
 
 ### `window_mode_target_lost_stops`
 
 - **测什么**：后台 `BeginRun` 后 `DestroyWindow`，`TargetStillAlive` 必须为 false。  
 - **用户症状**：冒险岛已闪退，软件仍显示「宏运行中」且步数继续涨（精密时间轴对失效 HWND 静默 PostMessage）。  
 - **代码**：`window_mode_executor.cpp` `TargetStillAlive`；`engine_script_run.cpp` 每步/精密等待检测目标，置 `stopFlag_`。  
+
+### `uwp_frame_bind_pid_still_alive`
+
+- **测什么**：`TargetBindPidStillMatches`：UWP 顶层 ApplicationFrameHost PID ≠ CoreWindow PID 仍算存活；HWND 被其它进程复用必须判死。  
+- **用户症状**：窗口模式录制计算器后回放立刻「目标窗口已消失」，时间轴 SendInput ok=0。  
+- **代码**：`window_mode_types.h` `TargetBindPidStillMatches`；`ApplyBoundTargetState` 记录 `bindPid`；`TargetStillAlive` 按输入窗进程判定。  
 
 ### `invisible_child_class_bind`
 

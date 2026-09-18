@@ -417,7 +417,7 @@ inline UILayout MousePress() {
 inline UILayout MousePlayback() {
     return UILayout(kParamPanelLeft, 174, kPanelWidth)
         .AddRow({
-            UIComponent::EditorLabel(L"请选择用于回放的鼠标录制", -1, kPanelWidth, 22),
+            UIComponent::EditorLabel(L"请选择用于回放的键鼠录制", -1, kPanelWidth, 22),
         }, 0, 0, 8)
         .AddRow({
             UIComponent::Combo(L"", EID_MousePlaybackCombo, kPanelWidth, 21),

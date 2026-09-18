@@ -34,12 +34,19 @@ third_party/
 # Reference / analysis code
 flameshot_analysis/
 fetched_*.cpp
+.cvresearch/
+
+# Garbled / backup doc variants (e.g. *.md.fixed)
+*.md.fixed
 
 # Legacy stub
 QuickScript/
 
 # Temp source files
 *.tmp
+
+# Host-written extension bridge token (unpacked sideload)
+extension/edge/bridge_runtime.json
 
 # Website download binaries (generated; upload with site deploy)
 website/downloads/*.exe

@@ -1,5 +1,5 @@
 /* 键鼠工坊网页键鼠桥 — MV3 service worker（WebSocket 直接连本机桥） */
-const BRIDGE_VERSION = "1.0.0";
+const BRIDGE_VERSION = "1.0.20";
 const PORT_LO = 19228;
 const PORT_HI = 19240;
 const RECONNECT_MS = 1500;
@@ -412,9 +412,97 @@ async function listTargets() {
   }
 }
 
+async function pickBrowsePage(titleHint, opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const pages = (await listTargets()).filter(
+    (t) => t.type === "page" && typeof t.tabId === "number" && !isUtilityTarget(t)
+  );
+  const candidates = pages.map((p) => p.title || p.url || "(无标题)");
+  const urlHint = String(o.urlHint || "").trim().toLowerCase();
+  const hintCore = urlHint.replace(/^https?:\/\//, "").replace(/\/$/, "");
+
+  let focusedWinId = -1;
+  let activeTabId = -1;
+  try {
+    const fw = await chrome.windows.getLastFocused({ populate: true });
+    if (fw && typeof fw.id === "number") focusedWinId = fw.id;
+    const act = (fw.tabs || []).find((t) => t.active);
+    if (act && typeof act.id === "number") activeTabId = act.id;
+  } catch (_) {
+    /* ignore */
+  }
+
+  const urlScore = (p) => {
+    if (!urlHint) return 0;
+    const u = String(p.url || "").toLowerCase();
+    if (!u) return 0;
+    const strip = (s) => String(s || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+    if (strip(u) === strip(urlHint)) return 200;
+    try {
+      const wantRaw = urlHint.startsWith("http") ? urlHint : "https://" + urlHint;
+      const want = new URL(wantRaw);
+      const got = new URL(u);
+      if (want.host === got.host) {
+        const wp = (want.pathname || "/").replace(/\/$/, "") || "/";
+        const gp = (got.pathname || "/").replace(/\/$/, "") || "/";
+        if (wp === gp) return 180;
+        if (wp === "/" && gp !== "/") return 15;
+        if (wp !== "/" && gp.startsWith(wp)) return 120;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    if (hintCore && hintCore.length > 16 && u.includes(hintCore)) return 50;
+    return 0;
+  };
+
+  const attachedId = Number(attachMeta.pageTabId) || 0;
+  const scored = pages.map((p) => {
+    const us = urlScore(p);
+    const ts = titleHint ? titleMatchScore(titleHint, p.title || "") : 0;
+    const active = p.tabId === activeTabId ? 50 : 0;
+    // clickRef/search 导航时 urlHint 是「要去的地址」，尚未打开；优先留在已附着的标签，避免 tabs.create。
+    const stay = attachedId && p.tabId === attachedId ? 90 : 0;
+    return { page: p, total: us + ts + active + stay, us, ts };
+  });
+  scored.sort((a, b) => b.total - a.total);
+  if (scored.length && scored[0].total > 0) {
+    return {
+      page: scored[0].page,
+      candidates,
+      pickNote: `browse score=${scored[0].total} url=${scored[0].us} title=${scored[0].ts} active=${activeTabId} win=${focusedWinId}`,
+    };
+  }
+
+  if (activeTabId > 0) {
+    let page = pages.find((p) => p.tabId === activeTabId);
+    if (!page) {
+      try {
+        const t = await chrome.tabs.get(activeTabId);
+        if (t && typeof t.id === "number" && !isUtilityTarget({ url: t.url || "", title: t.title || "" })) {
+          page = { tabId: t.id, title: t.title || "", url: t.url || "", type: "page" };
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    if (page) {
+      return { page, candidates, pickNote: "browse:activeTab" };
+    }
+  }
+  if (pages.length === 1) return { page: pages[0], candidates, pickNote: "browse:only" };
+  return {
+    page: null,
+    candidates,
+    error: pages.length ? "AMBIGUOUS" : "NO_TAB",
+    message: "未找到可抓取的网页标签（打开目标页后重试）",
+  };
+}
+
 async function pickPage(titleHint, opts) {
   const hint = (titleHint || "").trim();
   const o = opts && typeof opts === "object" ? opts : {};
+  if (o.preferPage) return pickBrowsePage(hint, o);
   const pages = (await listTargets()).filter(
     (t) => t.type === "page" && typeof t.tabId === "number" && !isUtilityTarget(t)
   );
@@ -782,6 +870,7 @@ async function prepareFocusAndMetrics(pageDebuggee) {
 
 async function attachTab(titleHint, opts) {
   const o = opts && typeof opts === "object" ? opts : {};
+  const preferPage = !!o.preferPage;
   const wantTabId = Number(o.tabId);
   let page = null;
   let candidates = [];
@@ -832,7 +921,7 @@ async function attachTab(titleHint, opts) {
     return {
       ok: false,
       error: errCode,
-      message: message || "未找到匹配的游戏标签页",
+      message: message || (preferPage ? "未找到可抓取的网页标签" : "未找到匹配的游戏标签页"),
       candidates: (candidates || []).slice(0, 12),
       version: BRIDGE_VERSION,
     };
@@ -873,7 +962,9 @@ async function attachTab(titleHint, opts) {
     }
   }
 
+  // 网页 Agent（observePage）要壳页 DOM：禁止被游戏 iframe 抢走 debugger。
   // 先点一下游戏 iframe 中心，尽量激活（仍可能因跨域不够，后面会挂 iframe target）
+  if (!preferPage) {
   try {
     const ix = (Number(meta.iframeCssX) || 0) + Math.max(10, (Number(meta.iframeCssW) || 0) / 2);
     const iy = (Number(meta.iframeCssY) || 0) + Math.max(10, (Number(meta.iframeCssH) || 0) / 2);
@@ -893,10 +984,15 @@ async function attachTab(titleHint, opts) {
   } catch (_) {
     /* ignore */
   }
+  }
 
   // 4399 游戏在跨域 iframe：必须 chrome.debugger.attach(targetId)，否则键鼠只打在壳页。
   // 关键：父页仍 attach 时，Edge 常拒绝再挂 iframe → 必须先 detach 壳页再挂 targetId。
   try {
+    if (preferPage) {
+      attachNote += "|preferPage";
+      throw new Error("skip-iframe");
+    }
     const { list, notes } = await collectGameTargets(pageDebuggee, page.tabId, meta.url || "");
     attachNote = notes.join(";");
     const topUrls = list.slice(0, 5).map((t) => `${t.type}:${t.score}:${(t.url || "").slice(0, 80)}`);
@@ -983,7 +1079,9 @@ async function attachTab(titleHint, opts) {
       meta.offsetY = 0;
     }
   } catch (e) {
-    attachNote = "collect:" + (e && e.message ? e.message : e);
+    const msg = String(e && e.message ? e.message : e);
+    if (msg !== "skip-iframe")
+      attachNote = "collect:" + msg;
   }
 
   attachedDebuggee = debuggee;
@@ -2304,9 +2402,1206 @@ async function sendCdp(method, params) {
   }
 }
 
+function qstBuildPageSnapshot(opts) {
+  const light = !!(opts && opts.light);
+  const maxNodes = Math.min(80, Math.max(8, (opts && opts.maxNodes) || 64));
+  const query = String((opts && opts.query) || "")
+    .trim()
+    .toLowerCase();
+  const vw = Math.max(1, window.innerWidth || 1);
+  const vh = Math.max(1, window.innerHeight || 1);
+  const viewport = Math.max(1, vw * vh);
+  const SEL =
+    'a[href],button,input:not([type="hidden"]),select,textarea,summary,option,[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="radio"],[role="tab"],[role="menuitem"],[role="option"],[role="combobox"],[role="switch"],[role="searchbox"],[contenteditable="true"],[tabindex]:not([tabindex="-1"])';
+  const isRenderable = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return false;
+      const st = window.getComputedStyle(el);
+      if (st.visibility === "hidden" || st.display === "none" || Number(st.opacity) === 0)
+        return false;
+      if (el.disabled || el.getAttribute("aria-hidden") === "true") return false;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  const isVisible = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      if (!isRenderable(el)) return false;
+      if (r.bottom < 0 || r.right < 0 || r.top > vh || r.left > vw) return false;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  const onSpaceHost = String(location.hostname || "").toLowerCase().indexOf("space.bilibili.com") >= 0;
+  const hrefNow = String(location.href || "").toLowerCase();
+  const onSearch = hrefNow.indexOf("search.") >= 0
+    || hrefNow.indexOf("/search") >= 0
+    || (hrefNow.indexOf("keyword=") >= 0
+      && (hrefNow.indexOf("search") >= 0 || hrefNow.indexOf("/all?") >= 0));
+  const pathNow = String(location.pathname || "").toLowerCase();
+  const onWatch = /(?:^|\/)video\/[^/]+/.test(pathNow)
+    || pathNow.indexOf("/bangumi/") >= 0
+    || pathNow === "/watch"
+    || pathNow.indexOf("/watch/") === 0;
+  const borderX = Math.max(0, ((window.outerWidth || 0) - vw) / 2);
+  const chromeY = Math.max(0, (window.outerHeight || 0) - vh - borderX);
+  const originX = (window.screenX || 0) + borderX;
+  const originY = (window.screenY || 0) + chromeY;
+  const isSpaceVideoLink = (el) => {
+    if (!onSpaceHost) return false;
+    try {
+      const href = String((el.href && String(el.href)) || el.getAttribute("href") || "");
+      return /\/video\/|\/bangumi\//.test(href);
+    } catch (_) {
+      return false;
+    }
+  };
+  const accName = (el) => {
+    try {
+      const al = el.getAttribute("aria-label");
+      if (al) return String(al).trim();
+      const labelled = el.getAttribute("aria-labelledby");
+      if (labelled) {
+        const t = labelled
+          .split(/\s+/)
+          .map((id) => {
+            const n = document.getElementById(id);
+            return n ? String(n.innerText || n.textContent || "").trim() : "";
+          })
+          .filter(Boolean)
+          .join(" ");
+        if (t) return t;
+      }
+      if (el.labels && el.labels[0]) {
+        const t = String(el.labels[0].innerText || "").trim();
+        if (t) return t;
+      }
+      const ph = el.getAttribute("placeholder");
+      if (ph) return String(ph).trim();
+      const alt = el.getAttribute("alt");
+      if (alt) return String(alt).trim();
+      const title = el.getAttribute("title");
+      if (title) return String(title).trim();
+      const tx = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      return tx;
+    } catch (_) {
+      return "";
+    }
+  };
+  const roleOf = (el) => {
+    const role = (el.getAttribute("role") || "").trim().toLowerCase();
+    if (role) return role;
+    const tag = String(el.tagName || "").toLowerCase();
+    if (tag === "a") return "link";
+    if (tag === "button") return "button";
+    if (tag === "select") return "combobox";
+    if (tag === "textarea") return "textbox";
+    if (tag === "summary") return "button";
+    if (tag === "option") return "option";
+    if (tag === "input") {
+      const t = String(el.type || "text").toLowerCase();
+      if (t === "checkbox") return "checkbox";
+      if (t === "radio") return "radio";
+      if (t === "submit" || t === "button" || t === "reset") return "button";
+      if (t === "search") return "searchbox";
+      return "textbox";
+    }
+    if (el.isContentEditable) return "textbox";
+    return "generic";
+  };
+  const sectionPath = (el) => {
+    try {
+      let n = el;
+      for (let i = 0; i < 10 && n; i++) {
+        n = n.parentElement;
+        if (!n) break;
+        const role = String(n.getAttribute && n.getAttribute("role") || "").toLowerCase();
+        const tag = String(n.tagName || "");
+        if (role === "dialog" || role === "alertdialog" || tag === "DIALOG") {
+          return (accName(n) || "对话框").slice(0, 24);
+        }
+        if (/^H[1-6]$/.test(tag)) {
+          const t = String(n.innerText || "").replace(/\s+/g, " ").trim();
+          if (t) return t.slice(0, 24);
+        }
+      }
+    } catch (_) {}
+    return "";
+  };
+  const inputValue = (el) => {
+    try {
+      const tag = String(el.tagName || "").toLowerCase();
+      if (tag === "select") {
+        const opt = el.selectedOptions && el.selectedOptions[0];
+        return String((opt && (opt.text || opt.value)) || el.value || "").trim();
+      }
+      if (tag === "input" || tag === "textarea") return String(el.value || "").trim();
+      if (el.isContentEditable) return String(el.innerText || "").replace(/\s+/g, " ").trim();
+    } catch (_) {}
+    return "";
+  };
+  const looksLikeIconControl = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width < 16 || r.height < 12 || r.width > 220 || r.height > 96) return false;
+      const st = window.getComputedStyle(el);
+      if ((st.cursor || "") !== "pointer" && String(el.getAttribute("role") || "") !== "button")
+        return false;
+      if (st.visibility === "hidden" || st.display === "none" || Number(st.opacity) === 0)
+        return false;
+      return !!el.querySelector("svg, i, img");
+    } catch (_) {
+      return false;
+    }
+  };
+  const collectInteractive = (root, into, seen) => {
+    try {
+      root.querySelectorAll(SEL).forEach((el) => {
+        if (!seen.has(el)) {
+          seen.add(el);
+          into.push(el);
+        }
+      });
+    } catch (_) {}
+    let walked = 0;
+    try {
+      const all = root.querySelectorAll("*");
+      for (let i = 0; i < all.length && walked < 2500; i++) {
+        walked++;
+        const el = all[i];
+        if (el.shadowRoot) collectInteractive(el.shadowRoot, into, seen);
+        if (String(el.tagName || "") === "IFRAME") {
+          try {
+            const doc = el.contentDocument;
+            if (doc) collectInteractive(doc, into, seen);
+          } catch (_) {}
+        }
+        if (!seen.has(el) && looksLikeIconControl(el)) {
+          seen.add(el);
+          into.push(el);
+        }
+      }
+    } catch (_) {}
+  };
+  let mediaArea = 0;
+  try {
+    document.querySelectorAll("canvas,video").forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width >= 64 && r.height >= 64) mediaArea += r.width * r.height;
+    });
+  } catch (_) {}
+  const canvasRatio = mediaArea / viewport;
+  const raw = [];
+  const seen = new Set();
+  collectInteractive(document, raw, seen);
+  try {
+    document.querySelectorAll("[aria-label],[title]").forEach((el) => {
+      const al = String(el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
+      if (!al || al.length > 40) return;
+      const r = el.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return;
+      if (r.width > 320 && r.height > 80) return;
+      if (!seen.has(el)) {
+        seen.add(el);
+        raw.push(el);
+      }
+    });
+  } catch (_) {}
+  const candidates = raw.filter((el) => isVisible(el) || (isSpaceVideoLink(el) && isRenderable(el)));
+  let pageKind = "dom";
+  if (canvasRatio >= 0.5 && candidates.length <= 6) pageKind = "canvas";
+  else if (canvasRatio >= 0.22) pageKind = "mixed";
+
+  const overlayRe = /进入|开始|登录|同意|进游戏|开始游戏|进入游戏/;
+  let take = candidates;
+  if (pageKind === "canvas") {
+    take = candidates.filter((el) => overlayRe.test(accName(el)));
+    if (take.length === 0) {
+      window.__qstA11y = { gen: Date.now(), pageKind: "canvas", nodes: new Map() };
+      return {
+        pageKind: "canvas",
+        canvasRatio: Math.round(canvasRatio * 1000) / 1000,
+        interactive: candidates.length,
+        skippedHtml: true,
+        url: String(location.href || ""),
+        title: String(document.title || ""),
+        vw,
+        vh,
+        nodes: [],
+      };
+    }
+    pageKind = "mixed";
+  }
+  if (light && pageKind === "canvas") {
+    window.__qstA11y = { gen: Date.now(), pageKind: "canvas", nodes: new Map() };
+    return {
+      pageKind: "canvas",
+      canvasRatio: Math.round(canvasRatio * 1000) / 1000,
+      interactive: candidates.length,
+      skippedHtml: true,
+      url: String(location.href || ""),
+      title: String(document.title || ""),
+      vw,
+      vh,
+      nodes: [],
+    };
+  }
+
+  const headerH = Math.min(140, vh * 0.18);
+  const viewportIntersect = (r) =>
+    r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+  const isChromeEl = (el, r, role) => {
+    if (role === "tab" || role === "searchbox") return true;
+    if (r.y >= headerH || r.height >= 80) return false;
+    try {
+      let n = el;
+      for (let i = 0; i < 8 && n; i++) {
+        const st = window.getComputedStyle(n);
+        if (st.position === "fixed" || st.position === "sticky") return true;
+        n = n.parentElement;
+      }
+    } catch (_) {}
+    return r.y < 64;
+  };
+
+  const scored = take.map((el) => {
+    const name = accName(el);
+    const path = sectionPath(el);
+    const r = el.getBoundingClientRect();
+    const inView = viewportIntersect(r);
+    let href = "";
+    try {
+      href = String((el.href && String(el.href)) || el.getAttribute("href") || "");
+    } catch (_) {}
+    const hay = (name + " " + path + " " + href).toLowerCase();
+    const hrefLow = href.toLowerCase();
+    const role = roleOf(el);
+    const chrome = isChromeEl(el, r, role);
+    const isUserSpace = /space\.bilibili\.com\/\d+/.test(hrefLow)
+      || /\/space\/\d+/.test(hrefLow);
+    const isVideo = /\/video\/|\/bangumi\/|\/watch\?/.test(hrefLow);
+    let score = 0;
+    if (inView) score += 100;
+    if (overlayRe.test(name)) score += 40;
+    if (role === "tab") score -= 520;
+    // 搜人/搜片加分只在搜索结果页；放到任意页会把作者名/推荐链抬成 e1。
+    if (onSearch) {
+      if (isUserSpace) score += 480;
+      if (isVideo) score += 90;
+    }
+    if (r.width > Math.min(vw * 0.45, 420) && r.height > 80) score -= 180;
+    if (query) {
+      const nameHit = name.toLowerCase().indexOf(query) >= 0;
+      const hayHit = hay.indexOf(query) >= 0;
+      if (nameHit) {
+        score += 1000;
+        if (role === "link" || role === "button") score += 120;
+        if (r.width > 200) score -= 350;
+        if (role === "searchbox" || role === "textbox") score -= 450;
+      } else if (hayHit) {
+        score += 120;
+      }
+    } else if (role === "searchbox" || role === "textbox" || role === "combobox") {
+      score += 35;
+    }
+    score -= Math.round(r.y / 20);
+    return { el, name, path, r, href, score, inView, chrome, role, isUserSpace, isVideo };
+  });
+  const isMainItem = (s) => {
+    if (!s.inView || s.chrome) return false;
+    if (s.href && s.r.height >= 48) return true;
+    return String(s.name || "").trim().length >= 4;
+  };
+  let contentInView = 0;
+  scored.forEach((s) => {
+    if (isMainItem(s)) contentInView++;
+  });
+  const byRead = (a, b) => a.r.y - b.r.y || a.r.x - b.r.x || b.score - a.score;
+  const isHeroCard = (s) =>
+    s.r.width > Math.min(vw * 0.45, 420) && s.r.height > 80;
+  let queryHits = query ? 0 : -1;
+  if (query) {
+    scored.sort((a, b) => b.score - a.score || a.r.y - b.r.y || a.r.x - b.r.x);
+    const nameHits = scored.filter(
+      (s) => String(s.name || "").toLowerCase().indexOf(query) >= 0
+    );
+    queryHits = nameHits.length;
+    if (nameHits.length) {
+      const rest = scored.filter((s) => nameHits.indexOf(s) < 0);
+      take = nameHits.concat(rest);
+    } else {
+      // 关键字不在树上：空树，让宿主走识图兜底（勿把「网页全屏」当命中）。
+      take = [];
+    }
+  } else {
+    const content = scored.filter((s) => s.inView && !s.chrome);
+    const chromeNodes = scored.filter((s) => s.inView && s.chrome);
+    const off = scored.filter((s) => !s.inView);
+    const compactMedia = content.filter((s) => s.isVideo && !isHeroCard(s));
+    if (onSearch) {
+      content.sort((a, b) => {
+        const aBoost = (a.isUserSpace ? 2 : 0) + (a.isVideo ? 1 : 0);
+        const bBoost = (b.isUserSpace ? 2 : 0) + (b.isVideo ? 1 : 0);
+        if (aBoost !== bBoost) return bBoost - aBoost;
+        return byRead(a, b);
+      });
+      chromeNodes.sort(byRead);
+      off.sort(byRead);
+      take = content.concat(chromeNodes).concat(off);
+    } else if (onWatch) {
+      const actions = content.filter((s) => !s.isVideo && !isHeroCard(s));
+      const related = content.filter((s) => s.isVideo && !isHeroCard(s));
+      const heroes = content.filter((s) => isHeroCard(s));
+      actions.sort(byRead);
+      related.sort(byRead);
+      heroes.sort(byRead);
+      chromeNodes.sort(byRead);
+      off.sort(byRead);
+      take = actions.concat(related).concat(heroes).concat(chromeNodes).concat(off);
+    } else if (compactMedia.length >= 2) {
+      compactMedia.sort(byRead);
+      const other = content.filter((s) => compactMedia.indexOf(s) < 0 && !isHeroCard(s));
+      const heroes = content.filter((s) => isHeroCard(s));
+      other.sort(byRead);
+      heroes.sort(byRead);
+      chromeNodes.sort(byRead);
+      off.sort(byRead);
+      take = compactMedia.concat(other).concat(heroes).concat(chromeNodes).concat(off);
+    } else {
+      content.sort((a, b) => {
+        const ao = overlayRe.test(a.name) ? 1 : 0;
+        const bo = overlayRe.test(b.name) ? 1 : 0;
+        if (ao !== bo) return bo - ao;
+        const ah = isHeroCard(a) ? 1 : 0;
+        const bh = isHeroCard(b) ? 1 : 0;
+        if (ah !== bh) return ah - bh;
+        return byRead(a, b);
+      });
+      chromeNodes.sort(byRead);
+      off.sort(byRead);
+      take = content.concat(chromeNodes).concat(off);
+    }
+  }
+  take = take.slice(0, maxNodes);
+  const store = { gen: Date.now(), pageKind, nodes: new Map() };
+  const nodes = [];
+  take.forEach((item, i) => {
+    const el = item.el;
+    const ref = "e" + (i + 1);
+    const r = item.r;
+    store.nodes.set(ref, el);
+    const role = roleOf(el);
+    const node = {
+      ref,
+      role,
+      name: String(item.name || "").slice(0, 80),
+      path: String(item.path || "").slice(0, 24),
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+      inView: !!item.inView,
+    };
+    if (item.href) {
+      let href = String(item.href);
+      if (href.length > 80) href = href.slice(0, 77) + "...";
+      if (!/^javascript:/i.test(href) && !/^mailto:/i.test(href)) node.href = href;
+    }
+    node.sx = Math.round(originX + r.x + r.width / 2);
+    node.sy = Math.round(originY + r.y + r.height / 2);
+    const val = inputValue(el);
+    if (val && (role === "textbox" || role === "searchbox" || role === "combobox"))
+      node.value = val.slice(0, 32);
+    if (role === "checkbox" || role === "radio" || role === "switch") {
+      try {
+        node.checked = !!(el.checked || el.getAttribute("aria-checked") === "true");
+      } catch (_) {}
+    }
+    try {
+      const ap = String(el.getAttribute("aria-pressed") || "").toLowerCase();
+      const ac = String(el.getAttribute("aria-checked") || "").toLowerCase();
+      const asel = String(el.getAttribute("aria-selected") || "").toLowerCase();
+      if (ap === "true" || ac === "true" || asel === "true") node.checked = true;
+    } catch (_) {}
+    nodes.push(node);
+  });
+  const scrollY = Math.round(window.scrollY || document.documentElement.scrollTop || 0);
+  const pageHeight = Math.max(
+    document.documentElement.scrollHeight || 0,
+    document.body ? document.body.scrollHeight : 0,
+    vh
+  );
+  window.__qstA11y = store;
+  return {
+    pageKind,
+    canvasRatio: Math.round(canvasRatio * 1000) / 1000,
+    interactive: candidates.length,
+    skippedHtml: false,
+    url: String(location.href || ""),
+    title: String(document.title || ""),
+    vw,
+    vh,
+    scrollY,
+    pageHeight,
+    contentInView,
+    query: query || "",
+    queryHits,
+    nodes,
+  };
+}
+
+function qstClickRef(ref, doubleClick, doClick) {
+  const store = window.__qstA11y;
+  if (!store || !store.nodes) return { ok: false, stale: true, reason: "no-store" };
+  if (store.pageKind === "canvas") return { ok: false, reason: "canvas" };
+  const el = store.nodes.get(ref);
+  if (!el || !el.isConnected) return { ok: false, stale: true, reason: "stale" };
+  try {
+    el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  } catch (_) {}
+  const r = el.getBoundingClientRect();
+  const x = Math.round(r.x + r.width / 2);
+  const y = Math.round(r.y + r.height / 2);
+  const vw = Math.max(1, window.innerWidth || 1);
+  const vh = Math.max(1, window.innerHeight || 1);
+  const borderX = Math.max(0, ((window.outerWidth || 0) - vw) / 2);
+  const chromeY = Math.max(0, (window.outerHeight || 0) - vh - borderX);
+  const screenX = Math.round((window.screenX || 0) + borderX + x);
+  const screenY = Math.round((window.screenY || 0) + chromeY + y);
+  let name = "";
+  try {
+    name = String(el.getAttribute("aria-label") || el.getAttribute("title") || el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  } catch (_) {}
+  try {
+    el.focus({ preventScroll: true });
+  } catch (_) {}
+  let href = "";
+  try {
+    href = String((el.href && String(el.href)) || el.getAttribute("href") || "");
+  } catch (_) {}
+  if (doClick === false) {
+    return { ok: true, x, y, screenX, screenY, name, tag: String(el.tagName || ""), href };
+  }
+  try {
+    const opts = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0,
+    };
+    el.dispatchEvent(new PointerEvent("pointerdown", Object.assign({ pointerId: 1 }, opts)));
+    el.dispatchEvent(new MouseEvent("mousedown", opts));
+    el.dispatchEvent(new PointerEvent("pointerup", Object.assign({ pointerId: 1 }, opts)));
+    el.dispatchEvent(new MouseEvent("mouseup", opts));
+    el.click();
+    if (doubleClick) {
+      el.dispatchEvent(new MouseEvent("dblclick", opts));
+      el.click();
+    }
+  } catch (e) {
+    return { ok: false, reason: String(e && e.message ? e.message : e) };
+  }
+  return { ok: true, x, y, screenX, screenY, name };
+}
+
+function qstFillRef(ref, text, clearFirst) {
+  const store = window.__qstA11y;
+  if (!store || !store.nodes) return { ok: false, stale: true, reason: "no-store" };
+  if (store.pageKind === "canvas") return { ok: false, reason: "canvas" };
+  const el = store.nodes.get(ref);
+  if (!el || !el.isConnected) return { ok: false, stale: true, reason: "stale" };
+  const value = String(text || "");
+  try {
+    el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  } catch (_) {}
+  try {
+    el.focus({ preventScroll: true });
+  } catch (_) {}
+  const tag = String(el.tagName || "").toLowerCase();
+  try {
+    if (tag === "select") {
+      const want = value.trim().toLowerCase();
+      let matched = false;
+      const opts = el.options || [];
+      for (let i = 0; i < opts.length; i++) {
+        const o = opts[i];
+        const label = String(o.text || o.value || "").trim();
+        if (label.toLowerCase() === want || String(o.value || "").toLowerCase() === want) {
+          el.selectedIndex = i;
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        for (let i = 0; i < opts.length; i++) {
+          const label = String(opts[i].text || "").toLowerCase();
+          if (want && label.indexOf(want) >= 0) {
+            el.selectedIndex = i;
+            matched = true;
+            break;
+          }
+        }
+      }
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return { ok: true, kind: "select", matched };
+    }
+    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+      if (clearFirst) el.textContent = "";
+      try {
+        document.execCommand("insertText", false, value);
+      } catch (_) {}
+      if (clearFirst && String(el.innerText || "").indexOf(value) < 0) el.textContent = value;
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+      return { ok: true, kind: "contenteditable" };
+    }
+    const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    const apply = (v) => {
+      if (desc && desc.set) desc.set.call(el, v);
+      else el.value = v;
+    };
+    if (clearFirst) {
+      try {
+        el.select();
+      } catch (_) {}
+      apply("");
+    }
+    apply(clearFirst ? value : String(el.value || "") + value);
+    el.dispatchEvent(
+      new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" })
+    );
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true, kind: "input" };
+  } catch (e) {
+    return { ok: false, reason: String(e && e.message ? e.message : e) };
+  }
+}
+
+async function classifyAttachedFrame() {
+  if (!attachedDebuggee) return null;
+  try {
+    const res = await chrome.debugger.sendCommand(attachedDebuggee, "Runtime.evaluate", {
+      expression: `(() => {
+        const vw = Math.max(1, (innerWidth || 1) * (innerHeight || 1));
+        let area = 0;
+        try {
+          document.querySelectorAll("canvas,video").forEach((el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 64 && r.height >= 64) area += r.width * r.height;
+          });
+        } catch (e) {}
+        return { canvasRatio: area / vw, href: String(location.href || "") };
+      })()`,
+      returnByValue: true,
+      awaitPromise: false,
+    });
+    return (res && res.result && res.result.value) || null;
+  } catch (e) {
+    return { err: String(e && e.message ? e.message : e) };
+  }
+}
+
+function mergePageKind(pageKind, pageInteractive, frameRatio) {
+  if (pageKind === "mixed") return "mixed";
+  if (frameRatio >= 0.5 && pageKind !== "dom") {
+    if ((pageInteractive || 0) <= 6) return "canvas";
+    return "mixed";
+  }
+  if (frameRatio >= 0.5 && (pageInteractive || 0) <= 6) return "canvas";
+  if (frameRatio >= 0.22 && pageKind === "dom") return "mixed";
+  return pageKind || "dom";
+}
+
+async function injectPageSnapshot(tabId, opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const inj = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    func: qstBuildPageSnapshot,
+    args: [{
+      light: !!o.light,
+      maxNodes: 64,
+      query: String(o.query || ""),
+    }],
+  });
+  return inj && inj[0] && inj[0].result;
+}
+
+function snapshotHrefVideoCount(snap) {
+  const nodes = (snap && snap.nodes) || [];
+  let n = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    const h = String((nodes[i] && nodes[i].href) || "").toLowerCase();
+    if (h.indexOf("/video/") >= 0 || h.indexOf("/watch") >= 0 || h.indexOf("/bangumi/") >= 0)
+      n++;
+  }
+  return n;
+}
+
+function snapshotLooksListing(url) {
+  const u = String(url || "").toLowerCase();
+  return u.indexOf("space.") >= 0 || u.indexOf("/upload") >= 0 || u.indexOf("search.") >= 0;
+}
+
+async function waitHydratedSnapshot(tabId, opts) {
+  let last = null;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 2400) {
+    try {
+      last = await injectPageSnapshot(tabId, opts);
+    } catch (_) {
+      /* keep last */
+    }
+    const url = String((last && last.url) || "");
+    const videos = snapshotHrefVideoCount(last);
+    const civ = Number(last && last.contentInView) || 0;
+    const n = (last && last.nodes && last.nodes.length) || 0;
+    if (snapshotLooksListing(url) && videos >= 2) return last;
+    if (!snapshotLooksListing(url) && civ >= 1 && n >= 6) return last;
+    await sleepMs(200);
+  }
+  return last;
+}
+
+async function handleObservePage(msg) {
+  const force = !!msg.force;
+  const light = !!msg.light && !force;
+  let attachedNow = false;
+  const hintIn = typeof msg.titleHint === "string" ? msg.titleHint.trim() : "";
+  const urlHintIn = typeof msg.urlHint === "string" ? msg.urlHint.trim() : "";
+  // ★跟随前台标签：宿主传来的 titleHint 是「当前前台标签的标题」（已剥掉窗口装饰）。
+  // 若它和已附着的标签对不上，说明用户/脚本换了标签页——必须重新 attach，
+  // 否则 observePage 会一直回旧标签的 DOM 树：前台明明是「历史记录」，
+  // 树却是上一个页面，模型据此决策必然走错（实测连续 10 轮对着错页面操作）。
+  const curTitle = String((attachMeta && attachMeta.title) || "").trim();
+  const curUrl = String((attachMeta && attachMeta.url) || "").trim();
+  const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, "");
+  const titleMismatch = !!hintIn && !!curTitle
+    && !norm(curTitle).includes(norm(hintIn))
+    && !norm(hintIn).includes(norm(curTitle));
+  const urlMismatch = !!urlHintIn && !!curUrl
+    && norm(curUrl) !== norm(urlHintIn)
+    && !norm(curUrl).startsWith(norm(urlHintIn))
+    && !norm(urlHintIn).startsWith(norm(curUrl));
+  const sameHintAsLastFollow = hintIn && attachMeta && attachMeta.followHint === hintIn;
+  const needFollow = !msg.preferStay && (titleMismatch || urlMismatch) && !sameHintAsLastFollow;
+  if (needFollow) {
+    setStatus("attached", `跟随前台标签：${hintIn || urlHintIn || "(无提示)"}`);
+  }
+  if (!attachedDebuggee || (!msg.preferStay && attachMeta.via === "iframe") || needFollow) {
+    const hint = hintIn;
+    const tabId = Number(msg.tabId);
+    const urlHint = urlHintIn;
+    const att = await attachTab(hint, {
+      preferPage: true,
+      urlHint,
+      tabId: Number.isFinite(tabId) && tabId > 0 ? tabId : undefined,
+    });
+    if (!att || !att.ok) {
+      // 跟随失败不致命：保留原附着，让宿主拿到「可能是旧树」的结果而不是直接报错
+      if (!needFollow) {
+        return {
+          ok: false,
+          error: (att && att.error) || "NO_TAB",
+          message: (att && att.message) || "observePage 未能 attach 标签（请确认已加载配套扩展且打开了网页）",
+          version: BRIDGE_VERSION,
+        };
+      }
+    } else {
+      attachedNow = true;
+      if (needFollow && attachMeta) attachMeta.followHint = hintIn;
+    }
+  }
+  const tabId = Number(attachMeta.pageTabId) || (attachedDebuggee && attachedDebuggee.tabId) || 0;
+  let frame = null;
+  if (attachMeta.via === "iframe" || attachMeta.focus === "iframe-target") {
+    frame = await classifyAttachedFrame();
+  }
+  let pageSnap = null;
+  if (tabId > 0) {
+    try {
+      const snapOpts = { light, query: String(msg.query || "") };
+      pageSnap = msg.waitHydrate
+        ? await waitHydratedSnapshot(tabId, snapOpts)
+        : await injectPageSnapshot(tabId, snapOpts);
+    } catch (e) {
+      return {
+        ok: false,
+        error: "SNAPSHOT_FAIL",
+        message: String(e && e.message ? e.message : e),
+        version: BRIDGE_VERSION,
+      };
+    }
+  }
+  if (!pageSnap || typeof pageSnap !== "object") {
+    return {
+      ok: false,
+      error: "SNAPSHOT_FAIL",
+      message: "页面快照为空（受限页或尚未加载）",
+      version: BRIDGE_VERSION,
+    };
+  }
+  const frameRatio = frame && Number(frame.canvasRatio) ? Number(frame.canvasRatio) : 0;
+  const pageKind = mergePageKind(
+    String(pageSnap.pageKind || "dom"),
+    Number(pageSnap.interactive) || 0,
+    frameRatio
+  );
+  const skippedHtml = pageKind === "canvas" || !!pageSnap.skippedHtml;
+  const nodes = skippedHtml ? [] : pageSnap.nodes || [];
+  return {
+    ok: true,
+    pageKind,
+    canvasRatio: Number(pageSnap.canvasRatio) || 0,
+    interactive: Number(pageSnap.interactive) || 0,
+    skippedHtml,
+    url: String(pageSnap.url || ""),
+    title: String(pageSnap.title || ""),
+    vw: Number(pageSnap.vw) || 0,
+    vh: Number(pageSnap.vh) || 0,
+    scrollY: Number(pageSnap.scrollY) || 0,
+    pageHeight: Number(pageSnap.pageHeight) || 0,
+    contentInView: Number.isFinite(Number(pageSnap.contentInView))
+      ? Number(pageSnap.contentInView)
+      : -1,
+    query: String(pageSnap.query || ""),
+    queryHits: Number.isFinite(Number(pageSnap.queryHits))
+      ? Number(pageSnap.queryHits)
+      : -1,
+    nodes,
+    attachedNow,
+    frameCanvasRatio: frameRatio,
+    version: BRIDGE_VERSION,
+  };
+}
+
+function debuggerIsPage() {
+  if (!attachedDebuggee) return false;
+  if (attachMeta.via === "iframe" || attachMeta.focus === "iframe-target") return false;
+  return true;
+}
+
+async function trustedPageClick(x, y, doubleClick) {
+  if (!debuggerIsPage()) return false;
+  const nx = Number(x);
+  const ny = Number(y);
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) return false;
+  try {
+    await dispatchMouse("mouseMoved", nx, ny, "none");
+    const n = doubleClick ? 2 : 1;
+    for (let c = 1; c <= n; c++) {
+      await chrome.debugger.sendCommand(attachedDebuggee, "Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: nx,
+        y: ny,
+        button: "left",
+        buttons: 1,
+        clickCount: c,
+        pointerType: "mouse",
+      });
+      await chrome.debugger.sendCommand(attachedDebuggee, "Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: nx,
+        y: ny,
+        button: "left",
+        buttons: 0,
+        clickCount: c,
+        pointerType: "mouse",
+      });
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function waitTabUrlChange(tabId, prevUrl, timeoutMs) {
+  const prev = String(prevUrl || "").split("#")[0];
+  const t0 = Date.now();
+  while (Date.now() - t0 < (timeoutMs || 2000)) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const u = String((t && t.url) || "").split("#")[0];
+      if (u && prev && u !== prev) return u;
+    } catch (_) {
+      /* ignore */
+    }
+    await sleepMs(150);
+  }
+  return "";
+}
+
+async function waitTabComplete(tabId, timeoutMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (timeoutMs || 8000)) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t && t.status === "complete") {
+        await sleepMs(280);
+        return true;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    await sleepMs(120);
+  }
+  return false;
+}
+
+async function handleNavigatePage(msg) {
+  const url = String(msg.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return {
+      ok: false,
+      error: "BAD_URL",
+      message: "url 须为 http(s)",
+      version: BRIDGE_VERSION,
+    };
+  }
+  const query = String(msg.query || "");
+  const hint = typeof msg.titleHint === "string" ? msg.titleHint : "";
+  const urlHint = typeof msg.urlHint === "string" ? msg.urlHint : url;
+  const stayTab = Number(msg.tabId);
+  let tabId = Number.isFinite(stayTab) && stayTab > 0 ? stayTab : 0;
+  if (!tabId) {
+    tabId = Number(attachMeta.pageTabId) || (attachedDebuggee && attachedDebuggee.tabId) || 0;
+  }
+  if (tabId) {
+    try {
+      await chrome.tabs.get(tabId);
+    } catch (_) {
+      tabId = 0;
+    }
+  }
+  if (!tabId) {
+    const att = await attachTab(hint, { preferPage: true, urlHint });
+    if (att && att.ok) {
+      tabId = Number(attachMeta.pageTabId) || (attachedDebuggee && attachedDebuggee.tabId) || 0;
+    }
+  }
+  if (!tabId) {
+    try {
+      const created = await chrome.tabs.create({ url, active: true });
+      tabId = created && created.id;
+      if (tabId) {
+        await attachTab("", { preferPage: true, tabId, urlHint: url });
+      }
+    } catch (e) {
+      return {
+        ok: false,
+        error: "NAV_FAIL",
+        message: String(e && e.message ? e.message : e),
+        version: BRIDGE_VERSION,
+      };
+    }
+    await waitTabComplete(tabId, 10000);
+    return handleObservePage({ force: false, preferStay: true, query, urlHint: url, waitHydrate: true });
+  }
+  if (Number(attachMeta.pageTabId) !== tabId) {
+    await attachTab("", { preferPage: true, tabId, urlHint: url });
+  }
+  let prevUrl = "";
+  try {
+    const t = await chrome.tabs.get(tabId);
+    prevUrl = (t && t.url) || "";
+  } catch (_) {
+    /* ignore */
+  }
+  try {
+    await chrome.tabs.update(tabId, { url });
+  } catch (e) {
+    return {
+      ok: false,
+      error: "NAV_FAIL",
+      message: String(e && e.message ? e.message : e),
+      version: BRIDGE_VERSION,
+    };
+  }
+  await waitTabUrlChange(tabId, prevUrl, 8000);
+  await waitTabComplete(tabId, 8000);
+  return handleObservePage({ force: false, preferStay: true, query, urlHint: url, waitHydrate: true });
+}
+
+async function dispatchTrustedEnter() {
+  if (!attachedDebuggee) return false;
+  try {
+    for (const type of ["keyDown", "keyUp"]) {
+      await chrome.debugger.sendCommand(attachedDebuggee, "Input.dispatchKeyEvent", {
+        type,
+        key: "Enter",
+        code: "Enter",
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+        unmodifiedText: "\r",
+        text: "\r",
+      });
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function snapshotAfterAction(opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  if (o.waitNav && o.tabId && o.prevUrl) {
+    await waitTabUrlChange(o.tabId, o.prevUrl, 2200);
+  } else {
+    await sleepMs(400);
+  }
+  try {
+    return await handleObservePage({ force: false, light: false, preferStay: true });
+  } catch (_) {
+    return null;
+  }
+}
+
+function refFailBody(v, fallback) {
+  const stale = !!(v && v.stale);
+  const reason = (v && v.reason) || fallback;
+  return {
+    ok: false,
+    error: stale ? "STALE_REF" : reason === "canvas" ? "CANVAS" : "CLICK_FAIL",
+    message: reason === "canvas" ? "canvas 页禁止 clickRef/typeRef" : String(reason),
+    stale,
+    version: BRIDGE_VERSION,
+  };
+}
+
+function resolveNavigableHref(href, pageUrl) {
+  const raw = String(href || "").trim();
+  if (!raw || raw.startsWith("#") || /^javascript:/i.test(raw) || /^mailto:/i.test(raw))
+    return "";
+  let abs = "";
+  try {
+    abs = new URL(raw, pageUrl || undefined).href;
+  } catch (_) {
+    return "";
+  }
+  if (!/^https?:/i.test(abs)) return "";
+  let destHost = "";
+  let destPath = "/";
+  let curHost = "";
+  let curPath = "/";
+  try {
+    const dest = new URL(abs);
+    destHost = String(dest.hostname || "").toLowerCase();
+    destPath = dest.pathname || "/";
+    const cur = new URL(String(pageUrl || abs));
+    curHost = String(cur.hostname || "").toLowerCase();
+    curPath = cur.pathname || "/";
+  } catch (_) {
+    return abs;
+  }
+  const onBili = curHost.indexOf("bilibili.com") >= 0 || destHost.indexOf("bilibili.com") >= 0;
+  if (onBili) {
+    if (/^\/space\/\d+/.test(destPath) && destHost.indexOf("space.") < 0) {
+      abs = "https://space.bilibili.com/" + destPath.replace(/^\/space\//, "");
+      destHost = "space.bilibili.com";
+      destPath = "/" + destPath.replace(/^\/space\//, "");
+    }
+    if (/^\/video\//.test(destPath) && destHost.indexOf("search.") >= 0) {
+      abs = "https://www.bilibili.com" + destPath;
+      destHost = "www.bilibili.com";
+    }
+    if (/^\/bangumi\//.test(destPath) && destHost.indexOf("search.") >= 0) {
+      abs = "https://www.bilibili.com" + destPath;
+      destHost = "www.bilibili.com";
+    }
+    if (destHost.indexOf("search.") >= 0 && /^\/\d+$/.test(destPath)) return "";
+  }
+  if (curHost === destHost && curPath === destPath) return "";
+  return abs;
+}
+
+async function handleClickRef(msg) {
+  const ref = String(msg.ref || "");
+  if (!/^e[1-9][0-9]{0,3}$/.test(ref)) {
+    return { ok: false, error: "BAD_REF", message: "ref 无效", version: BRIDGE_VERSION };
+  }
+  const tabId = Number(attachMeta.pageTabId) || (attachedDebuggee && attachedDebuggee.tabId) || 0;
+  if (!tabId) {
+    return {
+      ok: false,
+      error: "NO_TAB",
+      message: "尚未 observePage / attach",
+      version: BRIDGE_VERSION,
+    };
+  }
+  try {
+    const prepInj = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: qstClickRef,
+      args: [ref, false, false],
+    });
+    const prep = prepInj && prepInj[0] && prepInj[0].result;
+    if (!prep || !prep.ok) return refFailBody(prep, "clickRef 失败");
+    let tabUrl = "";
+    try {
+      const t = await chrome.tabs.get(tabId);
+      tabUrl = (t && t.url) || "";
+    } catch (_) {}
+    const navUrl = resolveNavigableHref(prep.href, tabUrl);
+    if (navUrl && !msg.doubleClick) {
+      const nav = await handleNavigatePage({ url: navUrl, query: "", tabId });
+      if (nav && nav.ok) {
+        return Object.assign({}, nav, {
+          ok: true,
+          ref,
+          clicked: true,
+          navigated: true,
+          screenX: prep.screenX,
+          screenY: prep.screenY,
+          clickName: prep.name || "",
+          version: BRIDGE_VERSION,
+        });
+      }
+    }
+    let trusted = await trustedPageClick(prep.x, prep.y, !!msg.doubleClick);
+    if (!trusted) {
+      const inj = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        func: qstClickRef,
+        args: [ref, !!msg.doubleClick, true],
+      });
+      const v = inj && inj[0] && inj[0].result;
+      if (!v || !v.ok) return refFailBody(v, "clickRef 失败");
+    }
+    const snap = await snapshotAfterAction();
+    if (snap && snap.ok) {
+      return Object.assign({}, snap, {
+        ok: true,
+        ref,
+        clicked: true,
+        trusted,
+        screenX: prep.screenX,
+        screenY: prep.screenY,
+        clickName: prep.name || "",
+        version: BRIDGE_VERSION,
+      });
+    }
+    return {
+      ok: true,
+      ref,
+      x: prep.x,
+      y: prep.y,
+      trusted,
+      version: BRIDGE_VERSION,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: "CLICK_FAIL",
+      message: String(e && e.message ? e.message : e),
+      version: BRIDGE_VERSION,
+    };
+  }
+}
+
+async function handleTypeRef(msg) {
+  const ref = String(msg.ref || "");
+  if (!/^e[1-9][0-9]{0,3}$/.test(ref)) {
+    return { ok: false, error: "BAD_REF", message: "ref 无效", version: BRIDGE_VERSION };
+  }
+  const tabId = Number(attachMeta.pageTabId) || (attachedDebuggee && attachedDebuggee.tabId) || 0;
+  if (!tabId) {
+    return {
+      ok: false,
+      error: "NO_TAB",
+      message: "尚未 observePage / attach",
+      version: BRIDGE_VERSION,
+    };
+  }
+  const text = String(msg.text || "");
+  const clearFirst = msg.clearFirst !== false;
+  try {
+    const inj = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: qstFillRef,
+      args: [ref, text, clearFirst],
+    });
+    const v = inj && inj[0] && inj[0].result;
+    if (!v || !v.ok) return refFailBody(v, "typeRef 失败");
+    let prevUrl = "";
+    try {
+      const t = await chrome.tabs.get(tabId);
+      prevUrl = (t && t.url) || "";
+    } catch (_) {
+      /* ignore */
+    }
+    if (msg.submit) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [0] },
+          func: (r) => {
+            const store = window.__qstA11y;
+            const el = store && store.nodes && store.nodes.get(r);
+            if (!el) return;
+            try {
+              if (el.form && typeof el.form.requestSubmit === "function") el.form.requestSubmit();
+            } catch (_) {}
+            el.dispatchEvent(
+              new KeyboardEvent("keydown", {
+                key: "Enter",
+                code: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true,
+              })
+            );
+            el.dispatchEvent(
+              new KeyboardEvent("keyup", {
+                key: "Enter",
+                code: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true,
+              })
+            );
+          },
+          args: [ref],
+        });
+      } catch (_) {}
+      await dispatchTrustedEnter();
+    }
+    const snap = await snapshotAfterAction(
+      msg.submit ? { waitNav: true, tabId, prevUrl } : {}
+    );
+    if (snap && snap.ok) {
+      return Object.assign({}, snap, {
+        ok: true,
+        ref,
+        typed: true,
+        version: BRIDGE_VERSION,
+      });
+    }
+    return { ok: true, ref, typed: true, version: BRIDGE_VERSION };
+  } catch (e) {
+    return {
+      ok: false,
+      error: "TYPE_FAIL",
+      message: String(e && e.message ? e.message : e),
+      version: BRIDGE_VERSION,
+    };
+  }
+}
+
 function reply(msg, body) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify(Object.assign({ id: msg.id, type: "result" }, body)));
+  const payload = JSON.stringify(Object.assign({ id: msg.id, type: "result" }, body));
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(payload);
+    return;
+  }
+  chrome.runtime.sendMessage({ type: "bridgeSend", raw: payload }).catch(() => {});
 }
 
 async function onMessage(raw) {
@@ -2327,7 +3622,7 @@ async function onMessage(raw) {
       version: BRIDGE_VERSION,
       role: "extension",
       vision: true,
-      capabilities: ["vision", "mouse", "keys", "layout"],
+      capabilities: ["vision", "mouse", "keys", "layout", "pageSnapshot", "typeRef", "navigatePage"],
     });
     setStatus("ready", `已握手 v${BRIDGE_VERSION} vision`);
     return;
@@ -2382,6 +3677,22 @@ async function onMessage(raw) {
     reply(msg, await sendCdp(msg.method || "", msg.params || {}));
     return;
   }
+  if (type === "observePage") {
+    reply(msg, await handleObservePage(msg));
+    return;
+  }
+  if (type === "clickRef") {
+    reply(msg, await handleClickRef(msg));
+    return;
+  }
+  if (type === "typeRef") {
+    reply(msg, await handleTypeRef(msg));
+    return;
+  }
+  if (type === "navigatePage") {
+    reply(msg, await handleNavigatePage(msg));
+    return;
+  }
   reply(msg, { ok: false, error: "UNKNOWN", message: type });
 }
 
@@ -2396,6 +3707,147 @@ function closeWs() {
   ws = null;
 }
 
+async function loadBridgeRuntimeFromNative() {
+  return await new Promise((resolve) => {
+    let port;
+    try {
+      port = chrome.runtime.connectNative("com.quickscripttool.bridge");
+    } catch (_) {
+      resolve(null);
+      return;
+    }
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try {
+        port.disconnect();
+      } catch (_) {
+        /* ignore */
+      }
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(null), 3000);
+    port.onMessage.addListener((msg) => {
+      clearTimeout(timer);
+      if (msg && msg.ok && msg.token && msg.port) finish(msg);
+      else finish(null);
+    });
+    port.onDisconnect.addListener(() => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    try {
+      port.postMessage({ type: "getBridge" });
+    } catch (_) {
+      finish(null);
+    }
+  });
+}
+
+async function loadBridgeRuntime() {
+  try {
+    const res = await fetch(chrome.runtime.getURL("bridge_runtime.json"), {
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const info = await res.json();
+      if (info && info.ok && info.token && info.port) return info;
+    }
+  } catch (_) {
+    /* packed CRX has no host-written json */
+  }
+  return loadBridgeRuntimeFromNative();
+}
+
+async function loadAllBridgeRuntimes() {
+  const out = [];
+  const seen = new Set();
+  const add = (info) => {
+    if (!info || !info.ok || !info.token) return;
+    const port = Number(info.port);
+    if (port < PORT_LO || port > PORT_HI) return;
+    const key = port + ":" + String(info.token);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ port, token: String(info.token) });
+  };
+  try {
+    add(await loadBridgeRuntimeFromNative());
+  } catch (_) {
+    /* native host is optional for unpacked */
+  }
+  try {
+    const res = await fetch(chrome.runtime.getURL("bridge_runtime.json"), {
+      cache: "no-store",
+    });
+    if (res.ok) add(await res.json());
+  } catch (_) {
+    /* packed CRX has no host-written json */
+  }
+  return out;
+}
+
+function connectWebSocket(port, token) {
+  return new Promise((resolve) => {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      resolve(true);
+      return;
+    }
+    let settled = false;
+    const done = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(!!v);
+      }
+    };
+    let socket;
+    try {
+      socket = new WebSocket(
+        `ws://127.0.0.1:${port}/qst/ws?token=${encodeURIComponent(token)}`
+      );
+    } catch (e) {
+      setStatus("error", `WebSocket 创建失败: ${e && e.message ? e.message : e}`);
+      done(false);
+      return;
+    }
+    socket.onopen = () => {
+      ws = socket;
+      bridgePort = port;
+      bridgeToken = token;
+      setStatus("connected", `ws port=${port} v${BRIDGE_VERSION}`);
+      socket.send(JSON.stringify({ id: 0, type: "hello", token }));
+      done(true);
+    };
+    socket.onmessage = (ev) => {
+      onMessage(ev.data);
+    };
+    socket.onclose = (ev) => {
+      if (ws === socket) {
+        ws = null;
+        bridgePort = 0;
+        bridgeToken = "";
+      }
+      setStatus(
+        "disconnected",
+        `WS关闭 code=${ev.code} reason=${ev.reason || ""} wasClean=${ev.wasClean}`
+      );
+      void detachDebugger();
+      done(false);
+    };
+    socket.onerror = () => {
+      setStatus("error", `WS错误 port=${port}`);
+      try {
+        socket.close();
+      } catch (_) {
+        /* ignore */
+      }
+      done(false);
+    };
+    setTimeout(() => done(!!(ws && ws === socket && ws.readyState === WebSocket.OPEN)), 2500);
+  });
+}
+
 async function tryDiscoverAndConnect() {
   if (discoverBusy) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -2403,78 +3855,16 @@ async function tryDiscoverAndConnect() {
   }
   discoverBusy = true;
   try {
-    for (let port = PORT_LO; port <= PORT_HI; ++port) {
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 350);
-        const res = await fetch(`http://127.0.0.1:${port}/qst/status`, {
-          signal: ctrl.signal,
-          cache: "no-store",
-        });
-        clearTimeout(timer);
-        if (!res.ok) continue;
-        const info = await res.json();
-        if (!info || !info.ok || !info.token || !info.ws) continue;
-
-        setStatus("connecting", `port=${port} v${BRIDGE_VERSION}`);
-        // token 放在 URL hash 易被丢掉；query + hello 双校验。显式 ws:// 已在 manifest 授权。
-        const wsUrl = `${info.ws}?token=${encodeURIComponent(info.token)}`;
-        const ok = await new Promise((resolve) => {
-          let settled = false;
-          const done = (v) => {
-            if (!settled) {
-              settled = true;
-              resolve(v);
-            }
-          };
-          let socket;
-          try {
-            socket = new WebSocket(wsUrl);
-          } catch (e) {
-            setStatus("error", `WebSocket 创建失败: ${e && e.message ? e.message : e}`);
-            done(false);
-            return;
-          }
-          socket.onopen = () => {
-            ws = socket;
-            bridgePort = port;
-            bridgeToken = String(info.token || "");
-            setStatus("connected", `ws port=${port} v${BRIDGE_VERSION}`);
-            socket.send(JSON.stringify({ id: 0, type: "hello", token: info.token }));
-            done(true);
-          };
-          socket.onmessage = (ev) => {
-            onMessage(ev.data);
-          };
-          socket.onclose = (ev) => {
-            if (ws === socket) {
-              ws = null;
-              bridgePort = 0;
-              bridgeToken = "";
-            }
-            const why = `WS关闭 code=${ev.code} reason=${ev.reason || ""} wasClean=${ev.wasClean}`;
-            setStatus("disconnected", why);
-            // 宿主退出/脚本结束断桥：立刻卸 debugger，去掉「已开始调试此浏览器」黄条。
-            void detachDebugger();
-            done(false);
-          };
-          socket.onerror = () => {
-            setStatus("error", `WS错误 port=${port}（若反复出现请确认 manifest 含 ws://127.0.0.1/*）`);
-            try {
-              socket.close();
-            } catch (_) {
-              /* ignore */
-            }
-            done(false);
-          };
-          setTimeout(() => done(!!(ws && ws.readyState === WebSocket.OPEN)), 2000);
-        });
-        if (ok && ws && ws.readyState === WebSocket.OPEN) return;
-      } catch (_) {
-        /* next */
-      }
+    const runtimes = await loadAllBridgeRuntimes();
+    if (!runtimes.length) {
+      setStatus("disconnected", "等待宿主写入桥凭证");
+      return;
     }
-    setStatus("waiting", "未发现键鼠工坊桥（请先运行键鼠工坊并启动窗口模式）");
+    setStatus("connecting", `v${BRIDGE_VERSION} 直连本机桥`);
+    for (const runtime of runtimes) {
+      if (await connectWebSocket(runtime.port, runtime.token)) return;
+    }
+    setStatus("waiting", "未发现键鼠工坊桥（请先运行键鼠工坊）");
   } finally {
     discoverBusy = false;
   }
@@ -2552,6 +3942,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse(lastStatus);
     return false;
   }
+  if (msg && msg.type === "kickBridge") {
+    kickBridgeConnect();
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg && msg.type === "bridgeRecv") {
+    onMessage(msg.raw);
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg && msg.type === "reconnect") {
     closeWs();
     tryDiscoverAndConnect().then(() => sendResponse(lastStatus));
@@ -2559,6 +3959,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   return false;
 });
+
+let connectKickTimer = 0;
+function kickBridgeConnect() {
+  if (connectKickTimer) return;
+  connectKickTimer = setTimeout(() => {
+    connectKickTimer = 0;
+    tryDiscoverAndConnect();
+  }, 250);
+}
+
+if (chrome.tabs && chrome.tabs.onUpdated) {
+  chrome.tabs.onUpdated.addListener((_id, info) => {
+    if (info && (info.status === "complete" || info.url)) kickBridgeConnect();
+  });
+}
+if (chrome.windows && chrome.windows.onCreated) {
+  chrome.windows.onCreated.addListener(() => kickBridgeConnect());
+}
 
 // 保活：避免长时间无事件后 SW 彻底睡死（仍可能短睡，靠轮询恢复）
 setInterval(() => {

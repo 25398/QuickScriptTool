@@ -8,6 +8,7 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 namespace windowmode {
 
@@ -30,28 +31,6 @@ std::wstring FormatWin32Error(DWORD err) {
         text.pop_back();
     }
     return text;
-}
-
-std::wstring FormatLaunchArgs(const std::wstring& args) {
-    if (args.empty()) return L"";
-    std::wstring a = args;
-    while (!a.empty() && (a.front() == L' ' || a.front() == L'\t')) a.erase(a.begin());
-    while (!a.empty() && (a.back() == L' ' || a.back() == L'\t')) a.pop_back();
-    // JSON / 编辑器可能已带一层引号；再包一层会变成 \"C:\...\文件.txt\" → 记事本「文件名无效」。
-    if (a.size() >= 2 && a.front() == L'"' && a.back() == L'"') {
-        a = a.substr(1, a.size() - 2);
-    }
-    const bool needQuote = a.find_first_of(L" \t") != std::wstring::npos
-        || a.find(L'"') != std::wstring::npos;
-    if (!needQuote) return a;
-
-    std::wstring escaped;
-    escaped.reserve(a.size() + 8);
-    for (wchar_t ch : a) {
-        if (ch == L'"') escaped += L"\\\"";
-        else escaped.push_back(ch);
-    }
-    return L"\"" + escaped + L"\"";
 }
 
 HWND TopLevelWindow(HWND hwnd) {
@@ -415,9 +394,19 @@ bool MacroVirtualDesktop::LaunchProcess(const std::wstring& exe, const std::wstr
     GetSystemTimeAsFileTime(&launchTimeUtc);
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
-    if (!args.empty()) {
-        cmdLine += L" ";
-        cmdLine += FormatLaunchArgs(args);
+    std::wstring arg = args;
+    while (!arg.empty() && (arg.front() == L' ' || arg.front() == L'\t')) arg.erase(arg.begin());
+    while (!arg.empty() && (arg.back() == L' ' || arg.back() == L'\t')) arg.pop_back();
+    if (arg.size() >= 2 && arg.front() == L'"' && arg.back() == L'"') {
+        arg = arg.substr(1, arg.size() - 2);
+    }
+    arg.erase(std::remove(arg.begin(), arg.end(), L'"'), arg.end());
+    if (!arg.empty()) {
+        if (arg.find_first_of(L" \t") != std::wstring::npos) {
+            cmdLine += L" \"" + arg + L"\"";
+        } else {
+            cmdLine += L" " + arg;
+        }
     }
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
     cmdBuf.push_back(L'\0');
@@ -425,7 +414,6 @@ bool MacroVirtualDesktop::LaunchProcess(const std::wstring& exe, const std::wstr
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
-    // Minimized + no activate from the start. Hosts that ignore this still get squashed below.
     si.wShowWindow = SW_SHOWMINNOACTIVE;
 
     std::wstring workDir;
@@ -433,7 +421,7 @@ bool MacroVirtualDesktop::LaunchProcess(const std::wstring& exe, const std::wstr
     if (slash != std::wstring::npos) workDir = exe.substr(0, slash);
 
     const BOOL created = CreateProcessW(
-        nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+        exe.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE,
         CREATE_DEFAULT_ERROR_MODE, nullptr,
         workDir.empty() ? nullptr : workDir.c_str(), &si, &outPi);
 

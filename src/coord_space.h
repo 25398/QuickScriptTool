@@ -85,6 +85,9 @@ void SyncNormFieldsFromPixels(std::vector<ScriptAction>& actions, const CoordMet
 /// 找图 offset 像素 → nOffset（相对模板宽高）
 void SyncFindImageOffsetNorm(ScriptAction& a);
 
+/// 鼠标拖拽终点 / 找图定位偏移的归一化（与 x/y 成对）
+void SyncMouseDragNorm(ScriptAction& a);
+
 /// 执行前：从 n* 反算到目标分辨率像素（深拷贝 actions 后调用，即运行副本）
 std::vector<ScriptAction> PrepareScriptActionsForExecution(
     const std::vector<ScriptAction>& actions, const CoordMeta& scriptMeta);
@@ -104,7 +107,7 @@ struct PreparedFindImageMatch {
 };
 PreparedFindImageMatch PrepareFindImageMatch(const ScriptAction& action, const TemplateScale& ts);
 
-/// 找图后点击/移动落点
+/// 找图后点击/移动落点。偏移按命中框宽高（与中心同一坐标系）；框无效时回退 origTpl×scale。
 void ResolveFindImageClickPoint(const ImageMatchResult& match,
     int origTplW, int origTplH, double nOffsetX, double nOffsetY,
     const TemplateScale& tmplScale, bool templatePreScaled, int& tx, int& ty);

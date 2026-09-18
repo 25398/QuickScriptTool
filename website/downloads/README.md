@@ -4,9 +4,10 @@
 |------|------|
 | `QuickScriptTool-Setup.exe` | **官网固定链接**（安装包最新版；发版覆盖即可） |
 | `QuickScriptTool-Release.zip` | **官网固定链接**（便携版最新版；发版覆盖即可） |
-| `QuickScriptTool-1.1.10.exe` | 带版本号安装包（归档 / 外链可用） |
-| `QuickScriptTool-Setup-1.1.10.exe` | 同上（旧 Setup- 命名别名） |
-| `QuickScriptTool-Release-1.1.10.zip` | 带版本号便携包 |
+| `QuickScriptTool-1.3.3.exe` | 带版本号安装包（归档 / 外链可用） |
+| `QuickScriptTool-Setup-1.3.3.exe` | 同上（旧 Setup- 命名别名） |
+| `QuickScriptTool-Release-1.3.3.zip` | 带版本号便携包 |
+| `QuickScriptTool-HidDriver.zip` | 可选：Interception.dll + 内核驱动样本（设置里按需下载；不进默认安装包） |
 
 官网 HTML 请链到无版本号的固定名，避免每次发版改网页。
 

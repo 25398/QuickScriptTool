@@ -83,4 +83,14 @@ void ScaleWindowClientRect(int recordW, int recordH, int liveW, int liveH,
     ScaleWindowClientPoint(recordW, recordH, liveW, liveH, x2, y2);
 }
 
+bool EffectiveWindowModeClientSearchRect(int clientW, int clientH,
+    int& x1, int& y1, int& x2, int& y2) {
+    if (clientW <= 0 || clientH <= 0) return false;
+    x1 = 0;
+    y1 = 0;
+    x2 = clientW;
+    y2 = clientH;
+    return x2 > x1 && y2 > y1;
+}
+
 }  // namespace windowmode

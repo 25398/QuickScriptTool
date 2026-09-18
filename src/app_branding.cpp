@@ -3,7 +3,7 @@
 namespace quickscript {
 
 std::wstring AppBranding::appDisplayName_ = L"键鼠工坊";
-std::wstring AppBranding::version_ = L"v1.1.10";
+std::wstring AppBranding::version_ = L"v1.3.3";
 std::wstring AppBranding::tagline_;
 std::wstring AppBranding::websiteUrl_ = L"https://www.quickscripttool.cloud/";
 std::wstring AppBranding::contactInfo_ = L"24353623@qq.com";

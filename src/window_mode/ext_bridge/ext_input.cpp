@@ -7,6 +7,7 @@
 #include "window_mode/window_mode_log.h"
 #include "window_mode/window_mode_types.h"
 #include "window_mode/window_target.h"
+#include "opencv_runtime.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -152,35 +153,6 @@ void ExtInputSession::Disconnect() {
     contentW_ = contentH_ = 0;
     surfaceW_ = surfaceH_ = 0;
     dpr_ = 1.5;
-}
-
-namespace {
-
-int ExtVersionCode(const std::string& ver) {
-    int a = 0, b = 0, c = 0;
-    if (sscanf_s(ver.c_str(), "%d.%d.%d", &a, &b, &c) < 1) return 0;
-    return a * 10000 + b * 100 + c;
-}
-
-}  // namespace
-
-bool ExtInputSession::SupportsSafeExtScreenshot() const {
-    // 1.0.17 screenshot 会断 WS；1.0.19+ 为 iframe canvas 路径。
-    // 版本尚未写入时按新扩展处理（attach 校验截图）。
-    if (extVersion_.empty()) return true;
-    return ExtVersionCode(extVersion_) >= ExtVersionCode("1.0.19");
-}
-
-bool ExtInputSession::SupportsExtVision() const {
-    // 1.0.21+：vision 协议 + lifecycle wake；宿主 CDP 找图只走扩展、禁止 Win32 展开。
-    if (extVersion_.empty()) return true;
-    return ExtVersionCode(extVersion_) >= ExtVersionCode("1.0.21");
-}
-
-bool ExtInputSession::SupportsStableBridgeApi() const {
-    // 1.1.15+：vision=CDP 截图经 HTTP /qst/shot；1.1.16+ 含 lifecycle wake。
-    if (extVersion_.empty()) return false;
-    return ExtVersionCode(extVersion_) >= ExtVersionCode("1.1.15");
 }
 
 bool ExtInputSession::HasValidIframeLayout() const {
@@ -356,7 +328,7 @@ std::wstring Utf8SnippetToWide(const std::string& u) {
 }
 
 cv::Mat HbitmapToGrayMatLocal(HBITMAP bmp) {
-    if (!bmp) return {};
+    if (!bmp || !OpenCvAvailable()) return {};
     BITMAP bm{};
     if (!GetObjectW(bmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) return {};
     BITMAPINFO bi{};
@@ -599,7 +571,8 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
                         if (!ver.empty()) extVersion_ = ver;
                     }
                 }
-                if (extVersion_.empty()) extVersion_ = "1.1.5";
+                // 读不到版本号就留空：不再猜一个「像是新版本」的号（猜出来的号会让
+                // 日志和诊断骗人；能力判断已改为只看命令是否可用）。
             }
 
             if (!needVerify) {
@@ -747,16 +720,8 @@ bool ExtInputSession::FinishAttachFromResult(const std::string& result, int tabI
                 Utf8SnippetToWide(pickNote).c_str());
         }
     }
-    if (!SupportsSafeExtScreenshot()) {
-        WindowModeLog(L"[窗口模式] 警告: 扩展需 v1.0.21+ 才能扩展视觉找图；"
-            L"请在 edge://extensions 对「键鼠工坊」点「重新加载」"
-            L"（目录 extension\\\\edge 或 build\\\\Release\\\\extension\\\\edge）");
-    }
-    if (!SupportsStableBridgeApi()) {
-        // 仅日志：勿 MessageBox 抢焦点打断键鼠；找图需 1.1.15，输入仍可继续。
-        WindowModeLog(L"[窗口模式] ★请重载扩展到 v1.1.43+★（HTTP 截图找图；轻量保活防卡帧）"
-            L" edge://extensions → 键鼠工坊 → 重新加载（build\\\\Release\\\\extension\\\\edge）");
-    }
+    // 版本号门禁已移除（扩展版本号重置为 1.0.0 起，比较大小不再代表能力）：
+    // 截图/找图能力以命令是否成功为准，失败时由下方向上返回明确错误。
     const std::string via = extractStr("via");
     const std::string focus = extractStr("focus");
     const std::string url = extractStr("url");
@@ -1134,16 +1099,16 @@ bool ExtInputSession::CaptureScreenshot(HBITMAP* outBmp, int* outW, int* outH, s
             return false;
         }
     }
-    if (!SupportsSafeExtScreenshot()) {
-        err = L"扩展版本过旧(需 v1.0.21+)，跳过 screenshot 以免断桥";
-        return false;
-    }
     if (ExtBridgeServer::Instance().IsAborted()) {
         err = L"已取消";
         return false;
     }
 
     auto decodeJpegBytesToBmp = [&](const std::vector<uint8_t>& bytes) -> bool {
+        if (!OpenCvAvailable()) {
+            err = L"找图引擎不可用（缺少 OpenCV）";
+            return false;
+        }
         if (bytes.size() < 64) {
             err = L"扩展截图无 data";
             return false;
@@ -1182,8 +1147,8 @@ bool ExtInputSession::CaptureScreenshot(HBITMAP* outBmp, int* outW, int* outH, s
     std::string result;
     std::wstring reqErr;
 
-    // 1.1.15：vision 经 HTTP /qst/shot 回传 JPEG，WS 仅小 JSON（不断桥）。
-    const char* cmd = SupportsExtVision() ? "vision" : "screenshot";
+    // vision 经 HTTP /qst/shot 回传 JPEG，WS 仅小 JSON（不断桥）。
+    const char* cmd = "vision";
     if (bridge.IsAborted()) {
         err = L"已取消";
         return false;
@@ -1375,7 +1340,7 @@ bool ExtInputSession::CaptureScreenshotForClientMatch(int clientW, int clientH,
     // attach 已有 iframe 时禁止再打 layout：旧路径会与 vision 叠在一起弄死 MV3 桥。
     // pageCss 缺失时用 iframe 外框推算，不够再走 canvas 空间匹配。
     if (iframeCssW_ <= 0 || iframeCssH_ <= 0) {
-        if (SupportsStableBridgeApi()) {
+        {
             std::wstring layoutErr;
             RefreshLayout(layoutErr);
         }

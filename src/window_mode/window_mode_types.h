@@ -27,6 +27,13 @@ enum class WindowModeHealth {
     PermissionMismatch,
 };
 
+/// 已找到目标但因权限/桌面失败：禁止当成「未找到」再自动打开 exe。
+/// 冒险岛等客户端重复启动同一 exe 会直接把已开着的游戏搞崩。
+inline bool ShouldAbortAutoLaunchOnBindFailure(WindowModeHealth health) {
+    return health == WindowModeHealth::PermissionMismatch
+        || health == WindowModeHealth::DesktopNotReady;
+}
+
 enum class WindowModeCoordinateSpace {
     ScreenAbsolute,
     WindowClient,
@@ -152,7 +159,8 @@ inline void StripRuntimeOnlySelectTarget(WindowModeScriptConfig& cfg) {
 }
 
 bool LooksLikeChromiumBrowserClass(const std::wstring& className);
-/// 真浏览器进程（msedge/chrome 等）。Electron/CEF 壳（QQ/微信/Discord/VS Code）同为 Chrome_WidgetWin，但不能走配套扩展。
+/// 真浏览器进程（msedge/chrome 等）。Electron/CEF 壳（QQ/Discord/VS Code）同为 Chrome_WidgetWin，但不能走配套扩展。
+/// 微信 4.x（Weixin.exe + Qt*QWindowIcon）不是 Chromium 壳。
 bool LooksLikeChromiumBrowserExecutable(const std::wstring& exePath);
 /// 类名为 Chromium 且（无 exe 或 exe 为真浏览器）→ 可走扩展桥 / CDP。
 bool ConfigLooksLikeExtBridgeBrowser(const WindowModeScriptConfig& config);
@@ -165,12 +173,38 @@ bool HwndLooksLikeChromiumShell(HWND hwnd);
 bool LooksLikeChromiumShellTarget(const WindowModeScriptConfig& config, HWND hwnd);
 /// Adobe AIR（造梦西游等）：窗口类 ApolloRuntimeContentWindow，PostMessage 不够，需假焦点。
 bool LooksLikeAdobeAirWindowClass(const std::wstring& className);
-/// Unity / Unreal / SDL / GLFW / Godot / AIR / 传奇 Delphi(TFrmMain) / 冒险岛 MapleStoryClass 等：PostMessage 不够，需假焦点注入。
+/// Unity / Unreal / SDL / GLFW / Godot / AIR / 传奇 Delphi(TFrmMain) / 天龙八部 / 冒险岛 MapleStoryClass 等游戏类名。
+/// 冒险岛识别仍走此类名；UsesFakeFocus 为 false（技能键 PostMessage），走路另走 mapleSafe 精简注入。
 bool LooksLikeGameWindowClass(const std::wstring& className);
+/// 新天龙八部：类名 `TianLongBaBuHJ WndClass`（含空格）。PostMessage 鼠标不够，须精简假焦点钩光标/键态。
+bool LooksLikeTianLongBaBuWindowClass(const std::wstring& className);
+bool LooksLikeTianLongBaBuExecutable(const std::wstring& exePath);
+bool LooksLikeTianLongBaBuTitle(const std::wstring& title);
+bool LooksLikeTianLongBaBuTarget(const WindowModeScriptConfig& config, HWND hwnd);
 /// 冒险岛客户端：窗口类 MapleStoryClass；exe MapleStory.exe；标题含 MapleStory/冒险岛。
 bool LooksLikeMapleStoryWindowClass(const std::wstring& className);
 bool LooksLikeMapleStoryExecutable(const std::wstring& exePath);
 bool LooksLikeMapleStoryTitle(const std::wstring& title);
+/// 配置或直播 HWND 任一命中冒险岛。技能键走 LCA 窗口消息；走路须 mapleSafe 精简注入。
+bool LooksLikeMapleStoryTarget(const WindowModeScriptConfig& config, HWND hwnd);
+/// 后台走路：IAT 吞 WM_ACTIVATE + DirectInput 填键。UsesFakeFocus 仍为 false，禁止跳过 PostMessage。
+bool MapleNeedsSafeFakeFocusLite(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
+/// 记事本/资源管理器等标准桌面程序：走 Edit 子控件 + WM_CHAR，不要当成游戏。
+bool LooksLikeStandardDesktopAppClass(const std::wstring& className);
+/// Unity/UE/GLFW/SDL/Godot/AIR/传奇/天龙八部：PostMessage 不够，须假焦点（不含冒险岛）。
+bool LooksLikeInjectRequiredGameClass(const std::wstring& className);
+/// 已知引擎需要注入假焦点（Unity/UE/GLFW/SDL/Godot/AIR/传奇/桌面模拟器/Chromium 壳/微信 4.x Qt）。
+bool NeedsFakeFocusInjection(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
+/// 微信 PC 客户端：Weixin.exe / WeChat.exe（不含开发者工具）。
+bool LooksLikeWeixinExecutable(const std::wstring& exePath);
+/// 标题为「微信」或 WeChat/Weixin；「微信开发者工具」除外。
+bool LooksLikeWeixinTitle(const std::wstring& title);
+/// 配置或直播 HWND 命中微信 PC 客户端（4.x Qt 或 3.x）。Chromium 子窗仍由壳路径优先。
+bool LooksLikeWeixinTarget(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
+/// 直播 HWND 像未登记的游戏窗（自定义类名、无 Edit）：对齐 LCA 后台一。
+bool HwndPrefersLcaBackgroundMessages(HWND hwnd);
+/// 冒险岛 + 未登记游戏：PostMessage KEY*、不发 WM_ACTIVATE。冒险岛仍可叠加 mapleSafe 精简注入。
+bool PrefersLcaBackgroundMessages(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
 /// 英雄联盟 / Valorant 等 Riot Vanguard 内核反作弊：后台窗口无法注入、PostMessage 无效。
 bool LooksLikeKernelAntiCheatToken(const std::wstring& text);
 bool LooksLikeKernelAntiCheatProtectedTarget(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
@@ -189,7 +223,8 @@ bool LooksLikeAndroidEmulatorWindowClass(const std::wstring& className);
 bool LooksLikeAndroidEmulatorExecutable(const std::wstring& exePath);
 /// 窗口标题含 MuMu/雷电 等安卓壳特征。
 bool LooksLikeAndroidEmulatorWindowTitle(const std::wstring& title);
-/// MuMu 等 Qt 壳渲染子窗：Qt5156QWindowIcon / Qt5QWindowIcon。
+/// MuMu / 微信 4.x 等 Qt 顶层或渲染子窗：Qt51514QWindowIcon / Qt5QWindowIcon。
+/// 单凭类名不能当安卓模拟器；须再看 exe/标题（微信 4.x 与 MuMu 同类名）。
 bool LooksLikeQtRenderWindowClass(const std::wstring& className);
 /// 配置或已绑定 HWND 是否为桌面模拟器（非安卓壳）。
 bool LooksLikeEmulatorTarget(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
@@ -218,13 +253,13 @@ inline bool UsesFakeFocus(const WindowModeScriptConfig& config) {
         && config.executionKind != WindowModeExecutionKind::BackgroundWindow) {
         return false;
     }
+    // 冒险岛 / 未登记游戏：LCA 后台窗口消息。UsesFakeFocus=false 以免注入失败后抢前台 SendInput。
+    if (PrefersLcaBackgroundMessages(config, nullptr)) return false;
     if (config.fakeFocusEnabled) return true;
     if (ConfigLooksLikeElectronShell(config)) return true;
+    if (LooksLikeWeixinTarget(config, nullptr)) return true;
     return LooksLikeGameWindowClass(config.windowClassName)
         || LooksLikeGameWindowClass(config.childWindowClassName)
-        || LooksLikeMapleStoryExecutable(config.targetExePath)
-        || LooksLikeMapleStoryTitle(config.windowName)
-        || LooksLikeMapleStoryTitle(config.targetWindowTitle)
         || LooksLikeEmulatorWindowClass(config.windowClassName)
         || LooksLikeEmulatorWindowClass(config.childWindowClassName)
         || LooksLikeEmulatorExecutable(config.targetExePath);
@@ -234,13 +269,14 @@ inline bool UsesFakeFocus(const WindowModeScriptConfig& config) {
 bool UsesFakeFocusForTarget(const WindowModeScriptConfig& config, HWND hwnd);
 /// UsesFakeFocus 或 MuMu 等无 TheRender 的 Qt 安卓壳（须假焦点键鼠）。
 bool UsesFakeFocusOrAndroidQt(const WindowModeScriptConfig& config, HWND hwnd = nullptr);
-/// 窗口模式：游戏/UE5 等 Raw Input 目标在未注入假焦点时必须假前台 SendInput。
+/// 窗口模式 / 后台窗口：游戏/UE5 等 Raw Input 目标在未注入假焦点时必须假前台 SendInput。
 /// PostMessage 进不了 Unreal/Unity；安卓壳与 Chromium 壳除外（另有路径）。
 bool GameTargetNeedsHardwareWithoutFakeFocus(const WindowModeScriptConfig& config, HWND hwnd);
 
 /// CDP：绑窗后由 Park 自行 Minimize→Move 宏桌面（勿再二次最小化）；假焦点保持可见。
 /// hwnd 非空时按直播窗口再判一次（配置类名为空、TForm1+TDXDraw 子窗）。
 inline bool ShouldMinimizeTargetAfterBind(const WindowModeScriptConfig& config, HWND hwnd = nullptr) {
+    if (PrefersLcaBackgroundMessages(config, hwnd)) return false;
     if (LooksLikeRemoteDesktopWindowClass(config.windowClassName)
         || LooksLikeRemoteDesktopWindowClass(config.childWindowClassName)
         || LooksLikeRemoteDesktopExePath(config.targetExePath)) {
@@ -248,7 +284,9 @@ inline bool ShouldMinimizeTargetAfterBind(const WindowModeScriptConfig& config, 
     }
     // Chromium 壳须可见以便焦点欺骗 + 进程内灌入；绑后最小化会导致键鼠无效。
     // 禁止对 Chromium 安静 ShowWindow「还原」——只会得到空白合成窗（已证伪）。
+    // 微信 4.x Qt Quick 最小化同样停合成，绑后保持已还原可被遮挡。
     if (ConfigLooksLikeElectronShell(config)) return false;
+    if (LooksLikeWeixinTarget(config, hwnd)) return false;
     if (UsesFakeFocus(config) || UsesCdpInput(config)) return false;
     if (hwnd && UsesFakeFocusForTarget(config, hwnd)) return false;
     return true;
@@ -258,7 +296,10 @@ struct WindowModeSessionState {
     GUID macroDesktopId{};
     int macroDesktopIndex = -1;
     HWND targetHwnd = nullptr;
+    /// 顶层窗进程（UWP 计算器 = ApplicationFrameHost）。
     DWORD targetPid = 0;
+    /// 输入绑定窗进程（UWP CoreWindow = CalculatorApp，可与 targetPid 不同）。
+    DWORD bindPid = 0;
 
     RECT clientRectScreen = {};
     int clientW = 0;
@@ -267,6 +308,19 @@ struct WindowModeSessionState {
     WindowModeHealth health = WindowModeHealth::Unknown;
     std::wstring lastError;
 };
+
+/// 存活判定：输入 HWND 的当前 PID 须对上绑定时的 bindPid。
+/// 禁止用顶层 ApplicationFrameHost PID 去对 CoreWindow——UWP 分进程会被误判成闪退。
+/// storedBindPid=0 时回退：同进程 Win32，或顶层仍是原宿主（旧会话）。
+inline bool TargetBindPidStillMatches(DWORD storedBindPid, DWORD liveBindPid,
+    DWORD storedTopPid, DWORD liveTopPid) {
+    if (liveBindPid == 0) return true;
+    if (storedBindPid != 0) return liveBindPid == storedBindPid;
+    if (storedTopPid == 0) return true;
+    if (liveBindPid == storedTopPid) return true;
+    if (liveTopPid != 0 && liveTopPid == storedTopPid) return true;
+    return false;
+}
 
 const wchar_t* HealthToDisplayText(WindowModeHealth health);
 const wchar_t* HealthToUserHint(WindowModeHealth health);

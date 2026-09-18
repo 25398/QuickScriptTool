@@ -727,6 +727,16 @@ body.editor-open .guide,body.editor-open .palette-strip,body.editor-open .migrat
   display:block;
   overflow:visible;
 }
+.dlg.settings-size .row.sound-pair-row{
+  flex-wrap:nowrap;
+  align-items:center;
+  gap:10px 22px;
+}
+.dlg.settings-size .row.sound-pair-row .sound-chk-pair{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
 .dlg.settings-size .row{
   display:flex;
   flex-wrap:wrap;
@@ -933,7 +943,7 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
     </div>
     <div class="tab" data-tab="recorder">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 12h6"/></svg>
-      鼠标录制
+      键鼠录制
     </div>
     <div class="tab" data-tab="macro">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 7h10v4H7zM7 13h6v4H7z"/></svg>
@@ -1181,9 +1191,13 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
         <div class="set-pane" data-pane="other">
           <div class="panel"><div class="panel-head"><div><h3>行为与外观</h3></div></div>
             <div class="row"><span class="chk on"><i>✓</i></span><span class="lbl-w">运行后自动隐藏主窗口</span></div>
-            <div class="row"><span class="chk on"><i>✓</i></span><span class="lbl-w">启动时播放声音</span></div>
+            <div class="row sound-pair-row">
+              <span class="sound-chk-pair"><span class="chk on"><i>✓</i></span><span class="lbl-w">脚本启动时播放声音</span></span>
+              <span class="sound-chk-pair"><span class="chk on"><i>✓</i></span><span class="lbl-w">脚本结束时播放声音</span></span>
+            </div>
             <div class="row"><span class="chk"><i>✓</i></span><span class="lbl-w">关闭右下角运行提示</span></div>
             <div class="row"><span class="chk on"><i>✓</i></span><span class="lbl-w">关闭按钮隐藏到托盘</span></div>
+            <div class="row"><span class="chk on"><i>✓</i></span><span class="lbl-w">显示桌面悬浮球</span></div>
             <div class="row"><span class="chk"><i>✓</i></span><span class="lbl-w">开机自动启动</span></div>
             <div class="row"><span class="chk on"><i>✓</i></span><span class="lbl-w">中文输入法不触发热键</span></div>
             <div class="row"><span class="lbl-w">长按判定</span><div class="inp sm">0.5</div><span class="lbl">秒</span></div>
@@ -1256,7 +1270,7 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
         <div class="table">
           <div class="th"><span>任务名称</span><span>类型</span><span>文件</span><span>频率</span><span>时间</span><span>状态</span><span>操作</span></div>
           <div class="tr"><span>早间挂机</span><span>鼠标宏</span><span>日常挂机</span><span>每日</span><span>08:00</span><span>等待</span><span class="act" data-open="sched-create">编辑</span></div>
-          <div class="tr"><span>整点录制</span><span>鼠标录制</span><span>登录流程</span><span>每小时</span><span>:00</span><span>已禁用</span><span class="act" data-open="prompt" data-msg="确定删除任务「整点录制」吗？">删除</span></div>
+          <div class="tr"><span>整点录制</span><span>键鼠录制</span><span>登录流程</span><span>每小时</span><span>:00</span><span>已禁用</span><span class="act" data-open="prompt" data-msg="确定删除任务「整点录制」吗？">删除</span></div>
         </div>
       </div>
     </div>
@@ -1268,7 +1282,7 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
       <div class="dlg-body">
         <div class="panel" style="padding:6px 0">
           <div class="row"><span class="lbl" style="width:72px">任务名称</span><div class="inp grow">早间挂机</div></div>
-          <div class="row"><span class="lbl" style="width:72px">类型</span><div class="radio on"><i></i>鼠标录制</div><div class="radio"><i></i>鼠标宏</div></div>
+          <div class="row"><span class="lbl" style="width:72px">类型</span><div class="radio on"><i></i>键鼠录制</div><div class="radio"><i></i>鼠标宏</div></div>
           <div class="row"><span class="lbl" style="width:72px">文件</span><div class="combo" style="flex:1">日常挂机 · 主循环</div></div>
           <div class="row"><span class="lbl" style="width:72px">频率</span>
             <div class="radio"><i></i>每小时</div><div class="radio on"><i></i>每日</div>
@@ -1625,7 +1639,7 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
       }
     },
     {
-      id: 'classic', name: '经典绿橙', map: 'AppTheme[0] main=#40A863',
+      id: 'classic', name: '翠绿暖橙', map: 'AppTheme[0] main=#40A863',
       sw: ['#2f7a4a','#40a863','#ff9a48','#e8f8ef'],
       vars: {
         '--navy-950':'#143528','--navy-900':'#1b4d34','--navy-800':'#246b45','--navy-700':'#2f7a4a','--navy-600':'#3a8f58',
@@ -2130,7 +2144,7 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
     MouseUp: () => flow(lab('选择鼠标键') + fline(combo('左键', 218)) + lab('同时按住') + modBlock()),
     /* 6. MousePlayback */
     MousePlayback: () => flow(
-        lab('请选择用于回放的鼠标录制')
+        lab('请选择用于回放的键鼠录制')
       + fline(combo('登录流程录制', 218))
       + repeatBlock()
     ),
@@ -2218,8 +2232,10 @@ html:not(.pro-ui) .dlg.settings-size .row.speed-row{display:none !important}
         tail += fline(tl('图片保存到'), ed('image','ed-lg'));
       } else {
         tail += xy('X偏','0','Y偏','0')
-          + fline(btnFull('选择偏移点击位置', false))
-          + fline(tl('时间'), ed('0','ed-md'));
+          + fline(btnFull('选择偏移点击位置', false));
+      }
+      if (state.findFollow < 2 || hasTpl) {
+        tail += fline(tl('时间'), ed('0','ed-md'));
       }
       const useVar = !!state.findUseVar;
       let mod = findImageModule({

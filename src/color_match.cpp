@@ -112,6 +112,40 @@ bool GetScreenPixelRgb(int x, int y, int& outR, int& outG, int& outB,
     return true;
 }
 
+bool SampleClickColorGrid(int cx, int cy, int* outR, int* outG, int* outB,
+    HBITMAP frozenScreen, int frozenVirtX, int frozenVirtY) {
+    if (!outR || !outG || !outB) return false;
+    int i = 0;
+    const int step = 8;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (!GetScreenPixelRgb(cx + dx * step, cy + dy * step,
+                    outR[i], outG[i], outB[i],
+                    frozenScreen, frozenVirtX, frozenVirtY)) {
+                return false;
+            }
+            ++i;
+        }
+    }
+    return i == kClickColorGridN;
+}
+
+bool ClickColorGridChanged(
+    const int* beforeR, const int* beforeG, const int* beforeB,
+    const int* afterR, const int* afterG, const int* afterB,
+    int tolerance, int minChanged) {
+    if (!beforeR || !beforeG || !beforeB || !afterR || !afterG || !afterB)
+        return false;
+    int changed = 0;
+    for (int i = 0; i < kClickColorGridN; ++i) {
+        if (!ColorsMatch(beforeR[i], beforeG[i], beforeB[i],
+                afterR[i], afterG[i], afterB[i], tolerance)) {
+            ++changed;
+        }
+    }
+    return changed >= std::max(1, minChanged);
+}
+
 namespace {
 
 struct ColorScanBitmap {

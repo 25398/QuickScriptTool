@@ -13,6 +13,7 @@ inline bool IsDisassemblableAction(ActionType type) {
     case ActionType::If:
     case ActionType::Else:
     case ActionType::DefineBlock:
+    case ActionType::WatchImage:
     case ActionType::RunBlock:
     case ActionType::RunMacro:
     case ActionType::MousePlayback:
@@ -132,7 +133,7 @@ inline DisassemblePatch DisassembleActionAt(const std::vector<ScriptAction>& act
     const bool playback = target.type == ActionType::MousePlayback;
     if (target.targetPath.empty()) {
         return FailDisassemble(playback
-            ? L"请先选择用于回放的鼠标录制"
+            ? L"请先选择用于回放的键鼠录制"
             : L"请先选择要运行的鼠标宏");
     }
     if (!loadNested) {

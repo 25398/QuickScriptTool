@@ -503,8 +503,16 @@ inline void ShowHwndCloakedOnTaskbar(HWND hwnd, BreakoutTaskbarPlacement* placem
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
     int w = 400;
     int h = 300;
-    int x = -32000;
-    int y = -32000;
+    int x = 0;
+    int y = 0;
+    RECT cur{};
+    if (GetWindowRect(hwnd, &cur) && cur.right > cur.left && cur.bottom > cur.top
+        && cur.left > -10000 && cur.top > -10000) {
+        x = cur.left;
+        y = cur.top;
+        w = cur.right - cur.left;
+        h = cur.bottom - cur.top;
+    }
     if (placement && placement->saved) {
         w = placement->rect.right - placement->rect.left;
         h = placement->rect.bottom - placement->rect.top;

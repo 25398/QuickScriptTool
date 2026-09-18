@@ -61,7 +61,15 @@ const selftest::CaseInfo kCases[] = {
     {L"inter_repeat_interval_semantics", L"default",
         L"ShouldWaitAfterRepeat: gap only between repeats; count=1 never waits"},
     {L"build_findimage_save_image", L"default",
-        L"followUp saveImage → findImageFollowUp=3, matchVarName default image"},
+        L"followUp saveImage → findImageFollowUp=3；有模板保留 findTimeExpr；无模板清 0"},
+    {L"build_multimatch_ok", L"default",
+        L"multiMatch 缺图失败；imagePaths+mode+duration=0.05；saveImage 钳 2；保留 findTimeExpr"},
+    {L"build_multimatch_image_use_var", L"default",
+        L"multiMatch imageUseVar / imageUseVars 不被强制关掉"},
+    {L"build_multimatch_hole_use_vars", L"default",
+        L"imagePaths 中间空槽不得把后面的 imageUseVars 错位"},
+    {L"lookup_multimatch", L"default",
+        L"lookupMacroAction type=multiMatch 含 imagePaths / matchRet[0]"},
     {L"build_quickinput_parse_escapes", L"default",
         L"quickInput parseEscapes default 0; 1 enables decode"},
     {L"resolve_key_nav_names", L"default",
@@ -72,6 +80,8 @@ const selftest::CaseInfo kCases[] = {
         L"runBlock accepts clickCount/duration/randomDuration"},
     {L"build_mouseplayback_speed", L"default",
         L"mousePlayback playbackSpeed default 1; clamp 0.25~4"},
+    {L"build_nested_use_mode", L"default",
+        L"runMacro/mousePlayback useMode inherit default; window+nestedWindowMode"},
     {L"disassemble_unwrap_loop", L"default",
         L"拆解循环：去掉循环壳，循环体一次放出并继承缩进"},
     {L"disassemble_run_block_keeps_define", L"default",
@@ -100,6 +110,28 @@ const selftest::CaseInfo kCases[] = {
         L"循环内同级子动作并入后仍挂在原循环下"},
     {L"merge_first_differs_from_before", L"default",
         L"离散时「最前」与「选择项前」在首个勾选非列表开头时不同"},
+    {L"flatten_watchimage_children", L"default",
+        L"watchImage children 展开为 indent+1 子动作"},
+    {L"flatten_watchimage_nested_rejected", L"default",
+        L"watchImage 写在 loop children 里必须失败"},
+    {L"lookup_watchimage_resume", L"default",
+        L"lookupMacroAction type=watchImage 含 resumeAfterWatch 续行"},
+    {L"build_watchimage_time_mode", L"default",
+        L"BuildScriptActionFromJson watchImage watchMode=time + watchPollSeconds"},
+    {L"build_varcompute_code", L"default",
+        L"BuildScriptActionFromJson type=varCompute 读 computeCode"},
+    {L"build_mousedrag_abs", L"default",
+        L"BuildScriptActionFromJson mouseDrag 绝对坐标 duration 为拖拽时长"},
+    {L"build_mousedrag_image_locate_requires_path", L"default",
+        L"mouseDrag imageLocate=1 缺 imagePath 失败"},
+    {L"lookup_mousedrag", L"default",
+        L"lookupMacroAction type=mouseDrag 含 imageLocate/endX/duration 拖拽时长"},
+    {L"build_color_image_locate_requires_path", L"default",
+        L"getColor/colorMatch/findColor imageLocate=1 缺 imagePath 失败"},
+    {L"build_findcolor_followup_clamped", L"default",
+        L"findColor followUp=saveImage 钳到 2（保存到变量）"},
+    {L"lookup_getcolor", L"default",
+        L"lookupMacroAction type=getColor 含 imageLocate"},
 };
 
 void CaseBuildWait() {
@@ -381,7 +413,10 @@ void CaseInterRepeatIntervalSemantics() {
         && ActionUsesInterRepeatInterval(ActionType::HotkeyShortcut)
         && ActionUsesInterRepeatInterval(ActionType::QuickInput)
         && ActionUsesInterRepeatInterval(ActionType::RunMacro)
-        && ActionUsesInterRepeatInterval(ActionType::RunBlock);
+        && ActionUsesInterRepeatInterval(ActionType::RunBlock)
+        && ActionUsesInterRepeatInterval(ActionType::FindImage)
+        && ActionUsesInterRepeatInterval(ActionType::MultiMatch)
+        && !ActionUsesInterRepeatInterval(ActionType::MouseDrag);
 
     const std::wstring schema = ScriptActionBuilderSchema();
     const bool schemaOk = schema.find(L"相邻两次之间的间隔") != std::wstring::npos
@@ -408,7 +443,132 @@ void CaseBuildFindImageSaveImage() {
         && r.action.imageUseVar
         && r.action.matchVarName == L"image"
         && r.action.findTimeExpr == L"0";
-    Emit(L"build_findimage_save_image", ok, r.ok ? L"" : r.error.c_str());
+
+    json timed = {
+        {"type", "findImage"},
+        {"followUp", "saveVar"},
+        {"imagePath", "images\\a.bmp"},
+        {"findTimeExpr", "5"}
+    };
+    auto rTime = BuildScriptActionFromJson(timed);
+    const bool saveMatchTimeOk = rTime.ok && rTime.action.findImageFollowUp == 2
+        && rTime.action.findTimeExpr == L"5";
+
+    json saveImgTimed = {
+        {"type", "findImage"},
+        {"followUp", "saveImage"},
+        {"imagePath", "images\\a.bmp"},
+        {"findTimeExpr", "3"}
+    };
+    auto rImg = BuildScriptActionFromJson(saveImgTimed);
+    const bool saveImgTimeOk = rImg.ok && rImg.action.findImageFollowUp == 3
+        && rImg.action.findTimeExpr == L"3";
+
+    json noTpl = {
+        {"type", "findImage"},
+        {"followUp", "saveImage"},
+        {"findTimeExpr", "8"}
+    };
+    auto rNoTpl = BuildScriptActionFromJson(noTpl);
+    const bool noTplOk = rNoTpl.ok && rNoTpl.action.findImageFollowUp == 3
+        && rNoTpl.action.imagePath.empty()
+        && rNoTpl.action.findTimeExpr == L"0";
+
+    const bool all = ok && saveMatchTimeOk && saveImgTimeOk && noTplOk;
+    std::wstring detail;
+    if (!ok) detail += r.ok ? L"defaults " : r.error + L" ";
+    if (!saveMatchTimeOk) detail += L"saveVar-time ";
+    if (!saveImgTimeOk) detail += L"saveImage-time ";
+    if (!noTplOk) detail += L"no-tpl-not-cleared";
+    Emit(L"build_findimage_save_image", all, all ? L"" : detail.c_str());
+}
+
+void CaseBuildMultiMatch() {
+    json miss = {{"type", "multiMatch"}};
+    auto rMiss = BuildScriptActionFromJson(miss);
+    const bool rejected = !rMiss.ok && rMiss.error.find(L"imagePaths") != std::wstring::npos;
+
+    json p = {
+        {"type", "multiMatch"},
+        {"imagePaths", json::array({"images\\a.png", "images\\b.png"})},
+        {"multiMatchMode", 1},
+        {"followUp", "saveVar"},
+        {"duration", 0.05}
+    };
+    auto r = BuildScriptActionFromJson(p);
+    const bool ok = r.ok && r.action.type == ActionType::MultiMatch
+        && r.action.imagePaths.size() == 2
+        && r.action.multiMatchMode == 1
+        && r.action.findImageFollowUp == 2
+        && std::abs(r.action.duration - 0.05) < 1e-9;
+
+    json clamp = {
+        {"type", "multiMatch"},
+        {"imagePaths", json::array({"images\\a.png"})},
+        {"followUp", "saveImage"}
+    };
+    auto rClamp = BuildScriptActionFromJson(clamp);
+    const bool clamped = rClamp.ok && rClamp.action.findImageFollowUp == 2;
+
+    json timeKeep = {
+        {"type", "multiMatch"},
+        {"imagePaths", json::array({"images\\a.png"})},
+        {"followUp", "saveVar"},
+        {"findTimeExpr", "5"}
+    };
+    auto rTime = BuildScriptActionFromJson(timeKeep);
+    const bool timeOk = rTime.ok && rTime.action.findTimeExpr == L"5";
+
+    const bool all = rejected && ok && clamped && timeOk;
+    std::wstring detail;
+    if (!rejected) detail += L"missing-path-not-rejected ";
+    if (!ok) detail += (r.ok ? L"fields " : r.error + L" ");
+    if (!clamped) detail += L"saveImage-not-clamped ";
+    if (!timeOk) detail += L"findTimeExpr-cleared";
+    Emit(L"build_multimatch_ok", all, all ? L"" : detail.c_str());
+}
+
+void CaseBuildMultiMatchImageUseVar() {
+    json p = {
+        {"type", "multiMatch"},
+        {"imagePaths", json::array({"fooVar", "images\\b.png"})},
+        {"imageUseVar", 1},
+        {"imageUseVars", json::array({1, 0})}
+    };
+    auto r = BuildScriptActionFromJson(p);
+    const bool ok = r.ok
+        && r.action.imageUseVar
+        && r.action.imagePaths.size() == 2
+        && r.action.imagePaths[0] == L"fooVar"
+        && r.action.imageUseVars.size() == 2
+        && r.action.imageUseVars[0] != 0
+        && r.action.imageUseVars[1] == 0;
+    Emit(L"build_multimatch_image_use_var", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseBuildMultiMatchHoleUseVars() {
+    json p = {
+        {"type", "multiMatch"},
+        {"imagePaths", json::array({"aaVar", "", "images\\c.png"})},
+        {"imageUseVars", json::array({1, 0, 0})}
+    };
+    auto r = BuildScriptActionFromJson(p);
+    const bool ok = r.ok
+        && r.action.imagePaths.size() == 2
+        && r.action.imagePaths[0] == L"aaVar"
+        && r.action.imagePaths[1].find(L"c.png") != std::wstring::npos
+        && r.action.imageUseVars.size() == 2
+        && r.action.imageUseVars[0] != 0
+        && r.action.imageUseVars[1] == 0;
+    Emit(L"build_multimatch_hole_use_vars", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseLookupMultiMatch() {
+    const std::wstring d = LookupMacroActionSchema(L"multiMatch");
+    const bool ok = d.find(L"imagePaths") != std::wstring::npos
+        && d.find(L"[0].x") != std::wstring::npos
+        && d.find(L"一图多处") != std::wstring::npos;
+    Emit(L"lookup_multimatch", ok, ok ? L"" : d.substr(0, 220).c_str());
 }
 
 void CaseBuildQuickInputParseEscapes() {
@@ -475,6 +635,19 @@ void CaseResolveKeyNavNames() {
             detail += L")";
         }
     }
+    const json arrow = json::parse("{\"type\":\"keyClick\",\"keyText\":\"\\u2190\"}");
+    auto ra = BuildScriptActionFromJson(arrow);
+    if (!ra.ok || ra.action.keyVk != VK_LEFT) {
+        ok = false;
+        detail += L" glyph←";
+    }
+    const json arrowBad = json::parse(
+        "{\"type\":\"keyClick\",\"keyText\":\"\\u2190\",\"keyVk\":8592}");
+    auto rb = BuildScriptActionFromJson(arrowBad);
+    if (!rb.ok || rb.action.keyVk != VK_LEFT) {
+        ok = false;
+        detail += L" vk=8592";
+    }
     Emit(L"resolve_key_nav_names", ok, detail.empty() ? L"" : detail.c_str());
 }
 
@@ -531,6 +704,40 @@ void CaseBuildMousePlaybackSpeed() {
         && rd.ok && std::abs(rd.action.playbackSpeed - 1.0) < 1e-9
         && rh.ok && std::abs(rh.action.playbackSpeed - 4.0) < 1e-9;
     Emit(L"build_mouseplayback_speed", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseBuildNestedUseMode() {
+    json def = {{"type", "runMacro"}, {"targetPath", "a.json"}};
+    auto rd = BuildScriptActionFromJson(def);
+    json win = {
+        {"type", "mousePlayback"},
+        {"targetPath", "rec.json"},
+        {"useMode", "window"},
+        {"breakoutTimeSeconds", 0.8},
+        {"nestedWindowMode", {
+            {"enabled", 1},
+            {"executionKind", "hiddenDesktop"},
+            {"selectMethod", "useEditorWindowClass"},
+            {"targetExePath", "game.exe"},
+            {"windowClassName", "Wnd"}
+        }}
+    };
+    auto rw = BuildScriptActionFromJson(win);
+    json bg = {
+        {"type", "runMacro"},
+        {"targetPath", "b.json"},
+        {"useMode", 2}
+    };
+    auto rb = BuildScriptActionFromJson(bg);
+    const bool ok = rd.ok && rd.action.useMode == kNestedUseModeInherit
+        && rw.ok && rw.action.useMode == kNestedUseModeWindow
+        && rw.action.nestedWindowMode.windowClassName == L"Wnd"
+        && rw.action.nestedWindowMode.targetExePath == L"game.exe"
+        && std::abs(rw.action.breakoutTimeSeconds - 0.8) < 1e-9
+        && rb.ok && rb.action.useMode == kNestedUseModeBackground
+        && rb.action.nestedWindowMode.executionKind
+            == windowmode::WindowModeExecutionKind::BackgroundWindow;
+    Emit(L"build_nested_use_mode", ok, rw.ok ? L"" : rw.error.c_str());
 }
 
 void CaseDisassembleUnwrapLoop() {
@@ -829,6 +1036,210 @@ void CaseMergeFirstDiffersFromBefore() {
     Emit(L"merge_first_differs_from_before", okBefore && okFirst, before.error.c_str());
 }
 
+void CaseFlattenWatchImageChildren() {
+    json watch = {
+        {"type", "watchImage"},
+        {"imagePath", "images\\\\d.bmp"},
+        {"matchThreshold", 80},
+        {"resumeAfterWatch", 1},
+        {"children", json::array({
+            {{"type", "wait"}, {"duration", 1}}
+        })}
+    };
+    std::wstring error;
+    std::vector<json> flat;
+    const bool flattened = FlattenNestedActionParamList({watch}, flat, error);
+    const bool ok = flattened && error.empty() && flat.size() == 2
+        && flat[0]["type"] == "watchImage"
+        && flat[1]["type"] == "wait"
+        && flat[1].value("indent", -1) == 1;
+    Emit(L"flatten_watchimage_children", ok,
+        ok ? L"" : (error.empty() ? L"flatten mismatch" : error.c_str()));
+}
+
+void CaseFlattenWatchImageNestedRejected() {
+    json loop = {
+        {"type", "loop"},
+        {"loopCount", 2},
+        {"children", json::array({
+            {
+                {"type", "watchImage"},
+                {"imagePath", "images\\\\d.bmp"},
+                {"children", json::array({
+                    {{"type", "wait"}, {"duration", 1}}
+                })}
+            }
+        })}
+    };
+    std::wstring error;
+    std::vector<json> flat;
+    const bool flattened = FlattenNestedActionParamList({loop}, flat, error);
+    json watchIndent = {
+        {"type", "watchImage"},
+        {"imagePath", "images\\\\d.bmp"},
+        {"indent", 1}
+    };
+    std::wstring error2;
+    std::vector<json> flat2;
+    const bool flattened2 = FlattenNestedActionParamList({watchIndent}, flat2, error2);
+    const bool ok = !flattened && !error.empty() && !flattened2 && !error2.empty();
+    Emit(L"flatten_watchimage_nested_rejected", ok,
+        ok ? L"" : (error + L" | " + error2).c_str());
+}
+
+void CaseLookupWatchImageResume() {
+    const std::wstring d = LookupMacroActionSchema(L"watchImage");
+    const std::wstring v = LookupMacroActionSchema(L"varCompute");
+    const bool ok = d.find(L"resumeAfterWatch") != std::wstring::npos
+        && d.find(L"imagePath") != std::wstring::npos
+        && d.find(L"watchMode") != std::wstring::npos
+        && d.find(L"watchPollSeconds") != std::wstring::npos
+        && v.find(L"computeCode") != std::wstring::npos
+        && v.find(L"ctrl:Clipboard()") != std::wstring::npos;
+    Emit(L"lookup_watchimage_resume", ok,
+        ok ? L"" : (d.substr(0, 180) + L" | " + v.substr(0, 180)).c_str());
+}
+
+void CaseBuildWatchImageTimeMode() {
+    json p = {
+        {"type", "watchImage"},
+        {"imagePath", "images\\\\e.bmp"},
+        {"watchMode", "time"},
+        {"watchPollSeconds", 2.5},
+        {"resumeAfterWatch", 1}
+    };
+    auto r = BuildScriptActionFromJson(p);
+    json numeric = {
+        {"type", "watchImage"},
+        {"imagePath", "images\\\\e.bmp"},
+        {"watchMode", 1},
+        {"watchPollInterval", 3.0}
+    };
+    auto rNum = BuildScriptActionFromJson(numeric);
+    std::wstring planErr;
+    json planItem = {
+        {"type", "watchImage"},
+        {"watchMode", "time"},
+        {"children", json::array({ {{"type", "wait"}, {"remark", "命中"}} })}
+    };
+    const std::wstring outline = PlanScriptActionsOutline({planItem}, planErr);
+    const bool ok = r.ok && r.action.type == ActionType::WatchImage
+        && r.action.watchMode == 1
+        && std::abs(r.action.watchPollSeconds - 2.5) < 1e-9
+        && rNum.ok && rNum.action.watchMode == 1
+        && std::abs(rNum.action.watchPollSeconds - 3.0) < 1e-9
+        && planErr.empty() && outline.find(L"时间监视") != std::wstring::npos;
+    Emit(L"build_watchimage_time_mode", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseBuildVarComputeCode() {
+    json p = {{"type", "varCompute"}, {"computeCode", "combo = 1;\nreturn combo;"}};
+    auto r = BuildScriptActionFromJson(p);
+    const bool ok = r.ok && r.action.type == ActionType::VarCompute
+        && r.action.computeCode.find(L"return combo") != std::wstring::npos;
+    Emit(L"build_varcompute_code", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseBuildMouseDragAbs() {
+    json p = {
+        {"type", "mouseDrag"},
+        {"x", 10}, {"y", 20}, {"endX", 30}, {"endY", 40},
+        {"duration", 0.4}, {"button", "right"}
+    };
+    auto r = BuildScriptActionFromJson(p);
+    const bool ok = r.ok && r.action.type == ActionType::MouseDrag
+        && r.action.x == 10 && r.action.endX == 30
+        && std::abs(r.action.duration - 0.4) < 1e-9
+        && r.action.button == MouseButtonType::Right
+        && !r.action.imageLocate
+        && r.action.clickCount == 1;
+    Emit(L"build_mousedrag_abs", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseBuildMouseDragImageLocateRequiresPath() {
+    json p = {{"type", "mouseDrag"}, {"imageLocate", 1}, {"x", 0}, {"y", 0}, {"endX", 1}, {"endY", 1}};
+    auto r = BuildScriptActionFromJson(p);
+    const bool rejected = !r.ok && r.error.find(L"imagePath") != std::wstring::npos;
+    json p2 = {
+        {"type", "mouseDrag"}, {"imageLocate", 1},
+        {"imagePath", "images\\\\btn.bmp"},
+        {"x", -2}, {"y", 3}, {"endX", 4}, {"endY", -5},
+        {"duration", 0.2}
+    };
+    auto r2 = BuildScriptActionFromJson(p2);
+    const bool ok2 = r2.ok && r2.action.imageLocate
+        && r2.action.imagePath.find(L"btn.bmp") != std::wstring::npos
+        && r2.action.endY == -5
+        && std::abs(r2.action.duration - 0.2) < 1e-9;
+    Emit(L"build_mousedrag_image_locate_requires_path", rejected && ok2,
+        rejected && ok2 ? L"" : (r.error + L" | " + r2.error).c_str());
+}
+
+void CaseLookupMouseDrag() {
+    const std::wstring d = LookupMacroActionSchema(L"mouseDrag");
+    const bool ok = d.find(L"imageLocate") != std::wstring::npos
+        && d.find(L"endX") != std::wstring::npos
+        && d.find(L"拖拽时长") != std::wstring::npos
+        && d.find(L"不是重复间隔") != std::wstring::npos;
+    Emit(L"lookup_mousedrag", ok, ok ? L"" : d.substr(0, 220).c_str());
+}
+
+void CaseBuildColorImageLocateRequiresPath() {
+    json g = {{"type", "getColor"}, {"imageLocate", 1}, {"x", 0}, {"y", 0}};
+    auto rg = BuildScriptActionFromJson(g);
+    const bool gReject = !rg.ok && rg.error.find(L"imagePath") != std::wstring::npos;
+    json g2 = {
+        {"type", "getColor"}, {"imageLocate", 1},
+        {"imagePath", "images\\\\c.bmp"}, {"x", -2}, {"y", 3}
+    };
+    auto rg2 = BuildScriptActionFromJson(g2);
+    const bool gOk = rg2.ok && rg2.action.imageLocate
+        && rg2.action.imagePath.find(L"c.bmp") != std::wstring::npos
+        && rg2.action.x == -2;
+
+    json c = {{"type", "colorMatch"}, {"imageLocate", 1},
+        {"x", 0}, {"y", 0}, {"color", "#ff0000"}};
+    auto rc = BuildScriptActionFromJson(c);
+    const bool cReject = !rc.ok && rc.error.find(L"imagePath") != std::wstring::npos;
+    json c2 = {
+        {"type", "colorMatch"}, {"imageLocate", 1},
+        {"imagePath", "images\\\\m.bmp"}, {"x", 1}, {"y", 2}, {"color", "#00ff00"}
+    };
+    auto rc2 = BuildScriptActionFromJson(c2);
+    const bool cOk = rc2.ok && rc2.action.imageLocate
+        && rc2.action.imagePath.find(L"m.bmp") != std::wstring::npos;
+
+    json f = {{"type", "findColor"}, {"imageLocate", 1}, {"color", "#0000ff"}};
+    auto rf = BuildScriptActionFromJson(f);
+    const bool fReject = !rf.ok && rf.error.find(L"imagePath") != std::wstring::npos;
+    json f2 = {
+        {"type", "findColor"}, {"imageLocate", 1},
+        {"imagePath", "images\\\\f.bmp"}, {"color", "#0000ff"}
+    };
+    auto rf2 = BuildScriptActionFromJson(f2);
+    const bool fOk = rf2.ok && rf2.action.imageLocate
+        && rf2.action.imagePath.find(L"f.bmp") != std::wstring::npos;
+
+    const bool ok = gReject && gOk && cReject && cOk && fReject && fOk;
+    Emit(L"build_color_image_locate_requires_path", ok,
+        ok ? L"" : (rg.error + L" | " + rc.error + L" | " + rf.error).c_str());
+}
+
+void CaseBuildFindColorFollowUpClamped() {
+    json p = {{"type", "findColor"}, {"color", "#ff0000"}, {"followUp", "saveImage"}};
+    auto r = BuildScriptActionFromJson(p);
+    const bool ok = r.ok && r.action.type == ActionType::FindColor
+        && r.action.findImageFollowUp == 2;
+    Emit(L"build_findcolor_followup_clamped", ok, r.ok ? L"" : r.error.c_str());
+}
+
+void CaseLookupGetColor() {
+    const std::wstring d = LookupMacroActionSchema(L"getColor");
+    const bool ok = d.find(L"imageLocate") != std::wstring::npos
+        && d.find(L"相对图中心") != std::wstring::npos;
+    Emit(L"lookup_getcolor", ok, ok ? L"" : d.substr(0, 220).c_str());
+}
+
 void PrintHelp() {
     std::fwprintf(stderr,
         L"ScriptActionBuilderSelfTest — 脚本动作构建自检\n"
@@ -882,11 +1293,16 @@ int wmain(int argc, wchar_t** argv) {
     CaseBuildMoveMouseRelative();
     CaseInterRepeatIntervalSemantics();
     CaseBuildFindImageSaveImage();
+    CaseBuildMultiMatch();
+    CaseBuildMultiMatchImageUseVar();
+    CaseBuildMultiMatchHoleUseVars();
+    CaseLookupMultiMatch();
     CaseBuildQuickInputParseEscapes();
     CaseResolveKeyNavNames();
     CaseRejectUnknownKeyText();
     CaseBuildRunBlockRepeatFields();
     CaseBuildMousePlaybackSpeed();
+    CaseBuildNestedUseMode();
     CaseDisassembleUnwrapLoop();
     CaseDisassembleRunBlockKeepsDefine();
     CaseDisassembleNestedIndent();
@@ -901,6 +1317,17 @@ int wmain(int argc, wchar_t** argv) {
     CaseMergeInplaceDiscreteRejected();
     CaseMergeNestedInsideLoop();
     CaseMergeFirstDiffersFromBefore();
+    CaseFlattenWatchImageChildren();
+    CaseFlattenWatchImageNestedRejected();
+    CaseLookupWatchImageResume();
+    CaseBuildWatchImageTimeMode();
+    CaseBuildVarComputeCode();
+    CaseBuildMouseDragAbs();
+    CaseBuildMouseDragImageLocateRequiresPath();
+    CaseLookupMouseDrag();
+    CaseBuildColorImageLocateRequiresPath();
+    CaseBuildFindColorFollowUpClamped();
+    CaseLookupGetColor();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

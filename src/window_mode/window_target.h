@@ -110,7 +110,10 @@ bool IsFakeFocusInjectionUnsupported(HWND hwnd);
 /// 真铺满监视器（独占 DXGI）禁止挪窗。
 bool CanParkHardwareInputTargetOffscreen(HWND hwnd);
 /// 保持客户区尺寸挪到屏外并 HWND_TOPMOST。savedWp/savedTopmost 供结束时还原。
+/// 若系统把屏外坐标钳回可见区，必须还原原位置并返回 false（禁止把窗口留在左上角）。
 bool ParkHardwareInputTargetOffscreen(HWND hwnd, WINDOWPLACEMENT* savedWp, bool* savedTopmost);
+/// 把 dest 钳进其所在监视器工作区：只缩小/平移到可见，禁止吸到主屏左上角或铺满整块工作区。
+void ClampRectToContainingWorkArea(RECT& dest, int& destW, int& destH);
 /// 去掉我们加的顶置并还原 placement（不抢前台）。
 bool RestoreHardwareInputTargetOffscreen(HWND hwnd, const WINDOWPLACEMENT& savedWp, bool savedTopmost);
 

@@ -1,5 +1,7 @@
 #include "input_timeline_scheduler.h"
 
+#include "low_power_mode.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -10,7 +12,12 @@
 namespace {
 // FPS 相对包常见 ~8ms：整段自旋，避免 waitable timer 唤醒抖动导致每次回放相位不同。
 constexpr uint64_t kSpinRemainUs = 12000;
+// ★低性能模式：把自旋压到 ~800us，其余交给高精度 waitable timer
+//（Win10 1803+ 实测唤醒精度约 0.5ms）。代价是注入节奏可能出现亚毫秒级抖动，
+// 换来的是回放期间不再长时间占满一个核 —— 用户实测「挂机脚本 CPU 温度 80°C」。
+constexpr uint64_t kLowPowerSpinRemainUs = 800;
 constexpr uint64_t kTightSpinUs = 1500;
+constexpr uint64_t kLowPowerTightSpinUs = 300;
 // 收尾接近 deadline 时用短切片；长等待若整段 500us 切片，4 秒会进内核近万次，自己把时间轴卡变形。
 constexpr uint64_t kNearTimerSliceUs = 500;
 constexpr uint64_t kLongTimerSliceUs = 10000;
@@ -19,6 +26,8 @@ constexpr uint64_t kLongWaitRemainUs = 50000;
 // 大于此值：真实卡顿。若仍追赶，后面所有 2~8ms 等待会连发，键盘按住被压短。
 constexpr uint64_t kRebaseLateUs = 8000;
 constexpr uint64_t kRebaseKeepLateUs = 500;
+
+/// 低性能模式开关见 low_power_mode.h（进程级原子量，设置保存后立即生效）
 }
 
 PrecisionInputTimeline::PrecisionInputTimeline() {
@@ -77,17 +86,20 @@ void PrecisionInputTimeline::RebaseIfVeryLate() {
 
 bool PrecisionInputTimeline::WaitUntilDeadlineQpc(
     int64_t deadlineQpc, const std::function<bool()>& cancelled) {
+    const bool lowPower = LowPerformanceMode();
+    const uint64_t spinRemainUs = lowPower ? kLowPowerSpinRemainUs : kSpinRemainUs;
+    const uint64_t tightSpinUs = lowPower ? kLowPowerTightSpinUs : kTightSpinUs;
     for (;;) {
         if (cancelled()) return false;
         const int64_t now = NowQpc();
         if (now >= deadlineQpc) break;
         const uint64_t remainingUs = QpcDeltaToUs(deadlineQpc - now);
 
-        if (timer_ && remainingUs > kSpinRemainUs) {
+        if (timer_ && remainingUs > spinRemainUs) {
             const uint64_t maxSlice = remainingUs > kLongWaitRemainUs
                 ? kLongTimerSliceUs : kNearTimerSliceUs;
             const uint64_t sliceUs = std::min<uint64_t>(
-                remainingUs - (kSpinRemainUs / 2), maxSlice);
+                remainingUs - (spinRemainUs / 2), maxSlice);
             LARGE_INTEGER due{};
             due.QuadPart = -static_cast<LONGLONG>(sliceUs * 10);
             if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
@@ -97,7 +109,7 @@ bool PrecisionInputTimeline::WaitUntilDeadlineQpc(
             }
         }
 
-        if (remainingUs <= kTightSpinUs) {
+        if (remainingUs <= tightSpinUs) {
             for (;;) {
                 if (cancelled()) return false;
                 if (NowQpc() >= deadlineQpc) {

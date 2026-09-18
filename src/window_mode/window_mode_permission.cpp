@@ -90,18 +90,12 @@ bool CheckPermissionMatch(DWORD targetPid) {
 
     const DWORD selfRid = CurrentProcessIntegrityRid();
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, targetPid);
-    if (!process) {
-        // 查不到目标：可能是 UIPI，也可能是受保护进程。
-        // 已高完整性时不是「请以相同权限」这类 UAC 问题，放行给后续路径报更具体的错。
-        return selfRid >= SECURITY_MANDATORY_HIGH_RID;
-    }
+    if (!process) return false;
 
     DWORD targetRid = SECURITY_MANDATORY_MEDIUM_RID;
     const bool known = QueryProcessIntegrityRid(process, targetRid);
     CloseHandle(process);
-    if (!known) {
-        return selfRid >= SECURITY_MANDATORY_HIGH_RID;
-    }
+    if (!known) return false;
     return selfRid >= targetRid;
 }
 

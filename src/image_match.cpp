@@ -1,22 +1,30 @@
-// image_match.cpp — OpenCV pyramid + multi-engine consensus template matching
+// image_match.cpp — Template matching with pixel-tolerance accept
 //
-// Primary path: 3 independent pyramid matchers (NCC / SQDIFF / CCORR) run in
-// parallel, plus SIMD SAD patch verification. A location is accepted only when
-// all engines agree within tolerance.
+// Locate with one OpenCV matcher (NCC / SQDIFF). A location is accepted only
+// after pixel-agree verification. PNG alpha is preserved and used as a mask.
 
 #include "image_match.h"
 
 #include "image_match_engines.h"
 #include "image_match_internal.h"
+#include "findimage_gpu.h"
 #include "input/mouse_input_backend.h"
+#include "low_power_mode.h"
+#include "opencv_runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
+#include <opencv2/core/ocl.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -54,13 +62,35 @@ bool ReadBitmapPixels(HBITMAP bitmap, RawBitmap& out) {
     return lines > 0;
 }
 
-cv::Mat BitmapToBgrMat(HBITMAP bitmap) {
+void BitmapToBgrAndMask(HBITMAP bitmap, cv::Mat& bgr, cv::Mat& mask) {
+    bgr.release();
+    mask.release();
+    if (!OpenCvAvailable()) return;
     RawBitmap raw{};
-    if (!ReadBitmapPixels(bitmap, raw)) return {};
+    if (!ReadBitmapPixels(bitmap, raw)) return;
     cv::Mat bgra(raw.height, raw.width, CV_8UC4, raw.pixels.data());
-    cv::Mat bgr;
     cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
-    return bgr.clone();
+    bgr = bgr.clone();
+
+    std::vector<cv::Mat> ch;
+    cv::split(bgra, ch);
+    if (ch.size() < 4) return;
+    cv::Mat opaque;
+    cv::compare(ch[3], 128, opaque, cv::CMP_GE);
+    const int opaqueCount = cv::countNonZero(opaque);
+    const int total = raw.width * raw.height;
+    const int transparentCount = total - opaqueCount;
+    // GDI compatible bitmaps typically have A=0 everywhere — treat as opaque.
+    if (opaqueCount >= 8 && transparentCount >= 8) {
+        mask = opaque.clone();
+    }
+}
+
+cv::Mat BitmapToBgrMat(HBITMAP bitmap) {
+    cv::Mat bgr;
+    cv::Mat mask;
+    BitmapToBgrAndMask(bitmap, bgr, mask);
+    return bgr;
 }
 
 cv::Mat BitmapToGrayMat(HBITMAP bitmap) {
@@ -93,8 +123,29 @@ ImageMatchOptions NormalizeLegacyOptions(double thresholdPercent, double scale, 
     return opt;
 }
 
+cv::Mat NormalizeDecodedImage(cv::Mat img) {
+    if (img.empty()) return {};
+    if (img.channels() == 1) {
+        cv::Mat bgr;
+        cv::cvtColor(img, bgr, cv::COLOR_GRAY2BGR);
+        return bgr;
+    }
+    if (img.channels() == 2) {
+        std::vector<cv::Mat> ch;
+        cv::split(img, ch);
+        cv::Mat bgra;
+        cv::cvtColor(ch[0], bgra, cv::COLOR_GRAY2BGRA);
+        std::vector<cv::Mat> bgraCh;
+        cv::split(bgra, bgraCh);
+        bgraCh[3] = ch[1];
+        cv::merge(bgraCh, bgra);
+        return bgra;
+    }
+    return img;
+}
+
 cv::Mat ImReadW(const std::wstring& path) {
-    if (path.empty()) return {};
+    if (path.empty() || !OpenCvAvailable()) return {};
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return {};
     if (fseek(fp, 0, SEEK_END) != 0) {
@@ -116,13 +167,121 @@ cv::Mat ImReadW(const std::wstring& path) {
         return {};
     }
     fclose(fp);
-    return cv::imdecode(buf, cv::IMREAD_COLOR);
+    return NormalizeDecodedImage(cv::imdecode(buf, cv::IMREAD_UNCHANGED));
 }
 
-HBITMAP BgrMatToHBitmap(const cv::Mat& bgr) {
-    if (bgr.empty()) return nullptr;
+/// 模板解码缓存：按（路径 + 文件大小 + 修改时间）失效。
+///
+/// 为什么要缓存：`findImage` 每一步都走 `PrepareFindImageMatch` → `LoadBitmapFromFile`，
+/// 而在 `loop` 里同一步每秒要跑十几次 —— 每次都重新开文件 + 解码（PNG 更贵）纯属白给。
+/// 缓存**只记忆 `ImReadW` 的解码结果**（`cv::Mat`），返回给调用方的仍是新建的 HBITMAP，
+/// 因此句柄所有权语义与之前完全一致（调用方照旧 `DeleteBitmapHandle`）。
+///
+/// 失效判据是「大小 + 修改时间」：模板被重新裁剪/替换（写盘）后 `ftLastWriteTime` 必然变化。
+/// 注意时间戳粒度：Windows 文件时间随系统时钟更新（约 15.6ms 一跳），
+/// **同一 tick 内用同尺寸内容覆盖同名文件**理论上可能漏判 —— 实际使用（人改图/编辑器另存）
+/// 不可能落在同一 tick，自检里用 `SetFileTime` 显式改时间戳来覆盖这条路径。
+struct TemplateCacheEntry {
+    ULONGLONG size = 0;
+    ULONGLONG writeTime = 0;
+    cv::Mat image;
+    uint64_t lastUseStamp = 0;
+};
+
+constexpr size_t kTemplateCacheMaxEntries = 24;
+constexpr size_t kTemplateCacheMaxBytes = 24u * 1024u * 1024u;
+
+std::mutex g_templateCacheMu;
+std::unordered_map<std::wstring, TemplateCacheEntry> g_templateCache;
+size_t g_templateCacheBytes = 0;
+uint64_t g_templateCacheStamp = 0;
+std::atomic<uint64_t> g_templateCacheLookups{0};
+std::atomic<uint64_t> g_templateCacheHits{0};
+std::atomic<uint64_t> g_templateCacheEvictions{0};
+
+/// 找图 GPU（OpenCL）加速开关见 findimage_gpu.h（进程级原子量，设置保存后立即生效）
+constexpr long long kFindImageGpuMinAreaPx = 500 * 1000;
+
+bool StatTemplateFile(const std::wstring& path, ULONGLONG& size, ULONGLONG& writeTime) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return false;
+    size = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    writeTime = (static_cast<ULONGLONG>(fad.ftLastWriteTime.dwHighDateTime) << 32)
+        | fad.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
+size_t TemplateMatBytes(const cv::Mat& m) {
+    return m.empty() ? 0u : m.total() * m.elemSize();
+}
+
+void DropTemplateCacheEntryLocked(
+    std::unordered_map<std::wstring, TemplateCacheEntry>::iterator it) {
+    g_templateCacheBytes -= TemplateMatBytes(it->second.image);
+    g_templateCache.erase(it);
+    ++g_templateCacheEvictions;
+}
+
+/// 命中则返回深拷贝（避免调用方拿到共享像素后被误改），未命中返回空。
+cv::Mat TryGetCachedTemplateImage(const std::wstring& path) {
+    if (path.empty()) return {};
+    ULONGLONG size = 0;
+    ULONGLONG writeTime = 0;
+    if (!StatTemplateFile(path, size, writeTime)) return {};
+    g_templateCacheLookups.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_templateCacheMu);
+    const auto it = g_templateCache.find(path);
+    if (it == g_templateCache.end()) return {};
+    if (it->second.size != size || it->second.writeTime != writeTime) {
+        DropTemplateCacheEntryLocked(it);
+        return {};
+    }
+    it->second.lastUseStamp = ++g_templateCacheStamp;
+    g_templateCacheHits.fetch_add(1, std::memory_order_relaxed);
+    return it->second.image.clone();
+}
+
+void StoreCachedTemplateImage(const std::wstring& path, const cv::Mat& image) {
+    if (path.empty() || image.empty()) return;
+    ULONGLONG size = 0;
+    ULONGLONG writeTime = 0;
+    if (!StatTemplateFile(path, size, writeTime)) return;
+    const size_t bytes = TemplateMatBytes(image);
+    if (bytes == 0 || bytes > kTemplateCacheMaxBytes) return;
+    std::lock_guard<std::mutex> lock(g_templateCacheMu);
+    auto it = g_templateCache.find(path);
+    if (it != g_templateCache.end()) DropTemplateCacheEntryLocked(it);
+    while ((g_templateCache.size() >= kTemplateCacheMaxEntries
+            || g_templateCacheBytes + bytes > kTemplateCacheMaxBytes)
+        && !g_templateCache.empty()) {
+        auto oldest = g_templateCache.begin();
+        for (auto cur = g_templateCache.begin(); cur != g_templateCache.end(); ++cur) {
+            if (cur->second.lastUseStamp < oldest->second.lastUseStamp) oldest = cur;
+        }
+        DropTemplateCacheEntryLocked(oldest);
+    }
+    TemplateCacheEntry entry;
+    entry.size = size;
+    entry.writeTime = writeTime;
+    entry.image = image;
+    entry.lastUseStamp = ++g_templateCacheStamp;
+    g_templateCacheBytes += bytes;
+    g_templateCache.emplace(path, std::move(entry));
+}
+
+HBITMAP MatToHBitmap(const cv::Mat& img) {
+    if (img.empty()) return nullptr;
     cv::Mat bgra;
-    cv::cvtColor(bgr, bgra, cv::COLOR_BGR2BGRA);
+    if (img.channels() == 4) {
+        if (img.type() != CV_8UC4) return nullptr;
+        bgra = img;
+    } else if (img.channels() == 1) {
+        cv::cvtColor(img, bgra, cv::COLOR_GRAY2BGRA);
+    } else if (img.channels() == 3) {
+        cv::cvtColor(img, bgra, cv::COLOR_BGR2BGRA);
+    } else {
+        return nullptr;
+    }
 
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -138,8 +297,16 @@ HBITMAP BgrMatToHBitmap(const cv::Mat& bgr) {
     ReleaseDC(nullptr, dc);
     if (!bmp || !bits) return nullptr;
 
-    const size_t bytes = static_cast<size_t>(bgra.cols) * bgra.rows * 4;
-    memcpy(bits, bgra.data, bytes);
+    const int w = bgra.cols;
+    const int h = bgra.rows;
+    auto* dst = static_cast<uint8_t*>(bits);
+    if (bgra.isContinuous() && static_cast<int>(bgra.step) == w * 4) {
+        memcpy(dst, bgra.data, static_cast<size_t>(w) * h * 4);
+    } else {
+        for (int y = 0; y < h; ++y) {
+            memcpy(dst + static_cast<size_t>(y) * w * 4, bgra.ptr(y), static_cast<size_t>(w) * 4);
+        }
+    }
     return bmp;
 }
 
@@ -147,10 +314,171 @@ HBITMAP BgrMatToHBitmap(const cv::Mat& bgr) {
 
 HBITMAP LoadBitmapFromFile(const std::wstring& path) {
     if (path.empty()) return nullptr;
+    const cv::Mat cached = TryGetCachedTemplateImage(path);
+    if (!cached.empty()) return MatToHBitmap(cached);
     const cv::Mat img = ImReadW(path);
-    if (!img.empty()) return BgrMatToHBitmap(img);
+    if (!img.empty()) {
+        StoreCachedTemplateImage(path, img);
+        return MatToHBitmap(img);
+    }
     return static_cast<HBITMAP>(LoadImageW(nullptr, path.c_str(), IMAGE_BITMAP, 0, 0,
                                            LR_LOADFROMFILE | LR_CREATEDIBSECTION));
+}
+
+bool TryGetCachedTemplateImageSize(const std::wstring& path, int& outW, int& outH) {
+    outW = 0;
+    outH = 0;
+    if (path.empty()) return false;
+    ULONGLONG size = 0;
+    ULONGLONG writeTime = 0;
+    if (!StatTemplateFile(path, size, writeTime)) return false;
+    std::lock_guard<std::mutex> lock(g_templateCacheMu);
+    const auto it = g_templateCache.find(path);
+    if (it == g_templateCache.end()) return false;
+    if (it->second.size != size || it->second.writeTime != writeTime) return false;
+    if (it->second.image.empty()) return false;
+    outW = it->second.image.cols;
+    outH = it->second.image.rows;
+    return outW > 0 && outH > 0;
+}
+
+namespace image_match_internal {
+
+bool TryMatchTemplateOnGpu(const cv::Mat& src, const cv::Mat& tpl,
+    int method, cv::Mat& outResult) {
+    outResult.release();
+    static std::atomic<int> state{0};   // 0=未探测 1=可用 2=不可用
+    if (FindImageGpuAccelFlag().load(std::memory_order_relaxed) != true) return false;
+    // 低性能模式优先：宁可慢一点也不额外拉 GPU（笔记本上 dGPU 功耗/发热比 CPU 更凶）
+    if (LowPerformanceMode()) return false;
+    if (src.empty() || tpl.empty() || src.type() != CV_8UC1 || tpl.type() != CV_8UC1) return false;
+    // 面积门槛：480x360 附近 CPU/GPU 打平，低于此纯属白付传输开销
+    if (static_cast<long long>(src.cols) * src.rows < kFindImageGpuMinAreaPx) return false;
+    if (tpl.cols > src.cols || tpl.rows > src.rows) return false;
+
+    if (state.load(std::memory_order_relaxed) == 0) {
+        int probed = 2;
+        try {
+            if (cv::ocl::haveOpenCL() && cv::ocl::Context::getDefault().ndevices() > 0) {
+                cv::ocl::setUseOpenCL(true);
+                probed = cv::ocl::useOpenCL() ? 1 : 2;
+            }
+        } catch (const cv::Exception&) {
+            probed = 2;
+        }
+        state.store(probed, std::memory_order_relaxed);
+        if (probed != 1) {
+            OutputDebugStringW(L"[找图] OpenCL 不可用，GPU 加速自动回落 CPU\n");
+            return false;
+        }
+    }
+    if (state.load(std::memory_order_relaxed) != 1) return false;
+
+    try {
+        cv::UMat usrc;
+        cv::UMat utpl;
+        cv::UMat ures;
+        src.copyTo(usrc);
+        tpl.copyTo(utpl);
+        cv::matchTemplate(usrc, utpl, ures, method);
+        ures.copyTo(outResult);
+    } catch (const cv::Exception&) {
+        // GPU 路径出问题就地永久回落：绝不因为加速把找图搞坏
+        state.store(2, std::memory_order_relaxed);
+        cv::ocl::setUseOpenCL(false);
+        outResult.release();
+        OutputDebugStringW(L"[找图] OpenCL 计算失败，本进程改为 CPU 找图\n");
+        return false;
+    }
+    return !outResult.empty();
+}
+
+}  // namespace image_match_internal
+
+bool PlanFindImageFastPath(const FindImageFastPathParams& params,
+    int roiX1, int roiY1, int roiX2, int roiY2,
+    int prevTLX, int prevTLY, int tplW, int tplH,
+    double lastFullSearchMs, long long ageMs,
+    int& winX1, int& winY1, int& winX2, int& winY2) {
+    winX1 = winY1 = winX2 = winY2 = 0;
+    if (tplW <= 0 || tplH <= 0) return false;
+    if (roiX2 <= roiX1 || roiY2 <= roiY1) return false;
+    // 上帧本来很快（区域找图）→ 不值得再来一次小窗口调度
+    if (!(lastFullSearchMs >= params.minFullSearchMs)) return false;
+    if (ageMs < 0 || ageMs > params.maxAgeMs) return false;
+    if (params.maxDriftPx < 0) return false;
+    // 上一帧命中必须在搜索区内，且整块模板放得下
+    if (prevTLX < roiX1 || prevTLY < roiY1) return false;
+    if (prevTLX + tplW > roiX2 || prevTLY + tplH > roiY2) return false;
+
+    // 余量至少覆盖漂移带，否则「接受区间」会有一部分落在窗口外 →
+    // 那部分漂移找不到就会白回退（宁可现在就回退）
+    const int drift = params.maxDriftPx;
+    const int margin = (std::max)(drift, (std::min)(64, (std::max)(tplW, tplH) / 4));
+    const int cx1 = (std::max)(roiX1, prevTLX - margin);
+    const int cy1 = (std::max)(roiY1, prevTLY - margin);
+    const int cx2 = (std::min)(roiX2, prevTLX + tplW + margin);
+    const int cy2 = (std::min)(roiY2, prevTLY + tplH + margin);
+    if (cx2 - cx1 < tplW || cy2 - cy1 < tplH) return false;
+    // 覆盖检查：窗口内可放置的左上角范围必须完整包含 [prev-drift, prev+drift]
+    if (cx1 > prevTLX - drift) return false;
+    if (cy1 > prevTLY - drift) return false;
+    if (cx2 - tplW < prevTLX + drift) return false;
+    if (cy2 - tplH < prevTLY + drift) return false;
+    // 窗口几乎等于整个搜索区 → 没有收益，还不如直接全屏搜（避免「假快速路径」）
+    const long long winArea = static_cast<long long>(cx2 - cx1) * (cy2 - cy1);
+    const long long roiArea = static_cast<long long>(roiX2 - roiX1) * (roiY2 - roiY1);
+    if (winArea * 10 >= roiArea * 7) return false;
+
+    winX1 = cx1;
+    winY1 = cy1;
+    winX2 = cx2;
+    winY2 = cy2;
+    return true;
+}
+
+bool AcceptFindImageFastPathHit(const FindImageFastPathParams& params,
+    int prevTLX, int prevTLY, int newTLX, int newTLY,
+    double thresholdPercent, double newScore) {
+    if (params.maxDriftPx < 0) return false;
+    if (std::abs(newTLX - prevTLX) > params.maxDriftPx) return false;
+    if (std::abs(newTLY - prevTLY) > params.maxDriftPx) return false;
+    return newScore >= thresholdPercent + params.scoreMarginPct;
+}
+
+std::wstring FindImageGpuDeviceName() {
+    try {
+        if (!cv::ocl::haveOpenCL()) return {};
+        if (cv::ocl::Context::getDefault().ndevices() == 0) return {};
+        const std::string name = cv::ocl::Device::getDefault().name();
+        return std::wstring(name.begin(), name.end());
+    } catch (const cv::Exception&) {
+        return {};
+    }
+}
+
+uint64_t TemplateImageCacheLookups() {
+    return g_templateCacheLookups.load(std::memory_order_relaxed);
+}
+
+uint64_t TemplateImageCacheHits() {
+    return g_templateCacheHits.load(std::memory_order_relaxed);
+}
+
+uint64_t TemplateImageCacheEvictions() {
+    return g_templateCacheEvictions.load(std::memory_order_relaxed);
+}
+
+size_t TemplateImageCacheEntries() {
+    std::lock_guard<std::mutex> lock(g_templateCacheMu);
+    return g_templateCache.size();
+}
+
+void ClearTemplateImageCache() {
+    std::lock_guard<std::mutex> lock(g_templateCacheMu);
+    g_templateCache.clear();
+    g_templateCacheBytes = 0;
+    g_templateCacheStamp = 0;
 }
 
 bool SaveCroppedTemplateRegion(const std::wstring& srcPath,
@@ -163,7 +491,7 @@ bool SaveCroppedTemplateRegion(const std::wstring& srcPath,
     if (full.empty()) return false;
     const cv::Mat crop = CropBgrMat(full, L, T, cw, ch);
     if (crop.empty()) return false;
-    HBITMAP bmp = BgrMatToHBitmap(crop);
+    HBITMAP bmp = MatToHBitmap(crop);
     if (!bmp) return false;
     const bool ok = SaveBitmapToFile(bmp, destPath);
     DeleteBitmapHandle(bmp);
@@ -281,10 +609,13 @@ ImageMatchOutput FindTemplateInFrozenScreenMulti(
     int searchX1, int searchY1, int searchX2, int searchY2,
     HBITMAP templateBmp, const ImageMatchOptions& options) {
     ImageMatchOutput out{};
-    if (!frozenScreen || !templateBmp) return out;
+    if (!frozenScreen || !templateBmp || !OpenCvAvailable()) return out;
+    SyncImageMatchThreadBudget();
 
     const cv::Mat fullBgr = BitmapToBgrMat(frozenScreen);
-    const cv::Mat templBgr = BitmapToBgrMat(templateBmp);
+    cv::Mat templBgr;
+    cv::Mat templMask;
+    BitmapToBgrAndMask(templateBmp, templBgr, templMask);
     if (fullBgr.empty() || templBgr.empty()) return out;
 
     cv::Mat fullGray;
@@ -305,14 +636,16 @@ ImageMatchOutput FindTemplateInFrozenScreenMulti(
     cv::Mat cropBgr = CropBgrMat(fullBgr, cx, cy, rw, rh);
     if (cropGray.empty()) return out;
 
-    return MatchInGrayMatsMultiVerify(cropGray, templGray, cropBgr, templBgr, options, left, top);
+    return MatchInGrayMatsMultiVerify(
+        cropGray, templGray, cropBgr, templBgr, options, left, top, templMask);
 }
 
 ImageMatchOutput FindTemplateOnScreenMulti(
     int searchX1, int searchY1, int searchX2, int searchY2,
     HBITMAP templateBmp, const ImageMatchOptions& options) {
     ImageMatchOutput out{};
-    if (!templateBmp) return out;
+    if (!templateBmp || !OpenCvAvailable()) return out;
+    SyncImageMatchThreadBudget();
 
     const int left = std::min(searchX1, searchX2);
     const int top = std::min(searchY1, searchY2);
@@ -323,7 +656,9 @@ ImageMatchOutput FindTemplateOnScreenMulti(
     if (!regionBmp) return out;
 
     const cv::Mat screenBgr = BitmapToBgrMat(regionBmp);
-    const cv::Mat templBgr = BitmapToBgrMat(templateBmp);
+    cv::Mat templBgr;
+    cv::Mat templMask;
+    BitmapToBgrAndMask(templateBmp, templBgr, templMask);
     DeleteBitmapHandle(regionBmp);
 
     if (screenBgr.empty() || templBgr.empty()) return out;
@@ -333,7 +668,8 @@ ImageMatchOutput FindTemplateOnScreenMulti(
     cv::cvtColor(screenBgr, screenGray, cv::COLOR_BGR2GRAY);
     cv::cvtColor(templBgr, templGray, cv::COLOR_BGR2GRAY);
 
-    return MatchInGrayMatsMultiVerify(screenGray, templGray, screenBgr, templBgr, options, left, top);
+    return MatchInGrayMatsMultiVerify(
+        screenGray, templGray, screenBgr, templBgr, options, left, top, templMask);
 }
 
 ImageMatchResult FindTemplateInFrozenScreen(
@@ -342,6 +678,7 @@ ImageMatchResult FindTemplateInFrozenScreen(
     HBITMAP templateBmp, double thresholdPercent, double scale,
     int* outTemplateW, int* outTemplateH, double scaleMax) {
     ImageMatchOptions opt = NormalizeLegacyOptions(thresholdPercent, scale, scaleMax);
+    if (!OpenCvAvailable()) return {};
     if (outTemplateW || outTemplateH) {
         cv::Mat templ = BitmapToGrayMat(templateBmp);
         if (!templ.empty()) {
@@ -453,7 +790,7 @@ ScreenBusyMask BuildBusyMaskFromTripleFrames(
     HBITMAP f0, HBITMAP f1, HBITMAP f2,
     int channelTol, int cellSize, double cellChangeFrac) {
     ScreenBusyMask out;
-    if (!f0 || !f1 || !f2) return out;
+    if (!f0 || !f1 || !f2 || !OpenCvAvailable()) return out;
     channelTol = std::clamp(channelTol, 0, 64);
     cellSize = std::clamp(cellSize, 16, 96);
     cellChangeFrac = std::clamp(cellChangeFrac, 0.02, 0.5);
@@ -501,7 +838,7 @@ ScreenChangeDiffResult DiffBitmapsChangedRegions(
     HBITMAP a, HBITMAP b, int channelTol, int minBlobArea, int maxRois,
     const ScreenBusyMask* busyMask) {
     ScreenChangeDiffResult out;
-    if (!a || !b) return out;
+    if (!a || !b || !OpenCvAvailable()) return out;
     channelTol = std::clamp(channelTol, 0, 64);
     minBlobArea = std::max(1, minBlobArea);
     maxRois = std::clamp(maxRois, 1, 32);

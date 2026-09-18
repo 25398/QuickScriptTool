@@ -10,10 +10,12 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cwctype>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +41,19 @@ struct WinHttpHandle {
         handle = nullptr;
         return h;
     }
+};
+
+/// 请求句柄守卫：Abort（用户停止 / 看门狗策略超时）可能已经在别的线程把它关了，
+/// 那种情况下这里不能再关一次。
+struct AbortAwareRequestGuard {
+    WinHttpHandle req;
+    AiHttpAbortSlot* slot = nullptr;
+    AbortAwareRequestGuard(HINTERNET h, AiHttpAbortSlot* s) : req(h), slot(s) {}
+    ~AbortAwareRequestGuard() {
+        if (slot && slot->ConsumeClosed()) req.Detach();  // 所有权已归 Abort，勿重复关闭
+    }
+    operator HINTERNET() const { return req.handle; }
+    HINTERNET operator->() const { return req.handle; }
 };
 
 // ── URL 解析 ──────────────────────────────────────────────────────
@@ -99,9 +114,13 @@ std::wstring WinHttpErrorText(DWORD err) {
     return buf;
 }
 
-constexpr DWORD kHttpBodyPollMs = 250;
-// 5s 轮询：等待期间可打心跳/响应取消；超时当临时错误重试（见 IsTransientHttpReceiveError）
-constexpr DWORD kHttpReceivePollMs = 5000;
+// 读 body 的轮询切片。**别调小**：WinHTTP 的 RECEIVE_TIMEOUT 一旦触发，
+// 这次请求基本就废了（后续 QueryDataAvailable 报 12019 句柄状态错误，
+// 见 IsTransientHttpReceiveError 的注释），而 thinking 模型吐字间隙、SSE keepalive
+// 间隔都可能到几百毫秒 —— 250ms 切片等于每轮都在赌命，实测表现为
+// 「思考 8s → 流式失败 → 再发一次完整请求（又多 90s）」。
+// 1500ms 兼顾两件事：正常间隙不再误杀；停止/取消最多多等 1.5s。
+constexpr DWORD kHttpBodyPollMs = 1500;
 
 bool HttpSendJsonBody(HINTERNET hRequest, const std::wstring& headers, const std::string& body,
                       const std::atomic_bool* cancelFlag, std::wstring* errorOut,
@@ -148,13 +167,14 @@ bool HttpSendJsonBody(HINTERNET hRequest, const std::wstring& headers, const std
 }
 
 bool IsTransientHttpReceiveError(DWORD err) {
+    // 读 body / QueryDataAvailable 的短轮询：仅超时/连接闪断可在同一句柄上继续等。
+    // 12019（句柄状态错误）等不可重试：WinHTTP 超时后句柄已作废。
+    // ★调用方必须先试「已攒到可用内容就直接采用」（见 CallApiStream 读循环），
+    //   因为 SSE 正常收尾时 QueryDataAvailable 也可能报 12019 —— 那不是故障。
     if (err == 0) return true;
-    if (err >= 12000 && err <= 12180) return true;
     return err == ERROR_WINHTTP_TIMEOUT
         || err == ERROR_WINHTTP_CONNECTION_ERROR
-        || err == ERROR_OPERATION_ABORTED
-        || err == ERROR_INVALID_HANDLE
-        || err == 12119; // ERROR_WINHTTP_INVALID_OPERATION
+        || err == ERROR_OPERATION_ABORTED;
 }
 
 // 调用方显式设置了 recvTimeoutMs 时必须尊重，禁止再用 maxTokens 抬到数分钟
@@ -185,29 +205,6 @@ int ClampApiMaxTokens(int value, const std::wstring& model) {
     return std::min(value, maxCap);
 }
 
-// 需要强制关闭默认深度思考的网关：DeepSeek 官方、火山方舟（豆包 seed/pro 等）。
-// 实测这些模型默认/显式 enabled 都会长思考（单轮数十秒~数分钟），
-// 而 thinking.type=disabled 可把单轮压到 1~3s 且保持正确流程。
-bool ShouldForceFastThinking(const std::wstring& apiUrl, const std::wstring& model) {
-    const std::wstring lowUrl = Trim(apiUrl);
-    std::wstring url;
-    url.reserve(lowUrl.size());
-    for (wchar_t c : lowUrl) url.push_back(static_cast<wchar_t>(std::towlower(c)));
-    if (url.find(L"deepseek") != std::wstring::npos) return true;
-    if (url.find(L"volces.com") == std::wstring::npos
-        && url.find(L"ark") == std::wstring::npos) {
-        return false;
-    }
-    // 方舟网关：只对思考型模型（seed/pro/max/ultra）下发，避免其它模型拒参。
-    const std::wstring lowModel = Trim(model);
-    std::wstring m;
-    m.reserve(lowModel.size());
-    for (wchar_t c : lowModel) m.push_back(static_cast<wchar_t>(std::towlower(c)));
-    return m.find(L"seed") != std::wstring::npos
-        || m.find(L"pro") != std::wstring::npos
-        || m.find(L"max") != std::wstring::npos
-        || m.find(L"ultra") != std::wstring::npos;
-}
 
 // 指定范围内的对话是否已调用过 readAgentSkill section=scriptStrategy。
 // 用于工具层强制「先读脚本生成规范，再构建/创建」，避免模型逐条翻参考绕圈。
@@ -229,55 +226,53 @@ bool SkillScriptStrategyRead(const std::vector<ChatMessage>& history, size_t end
 bool ReceiveResponseWithPolling(HINTERNET hRequest, const std::atomic_bool* cancelFlag,
                                 int maxWaitMs, std::wstring* errorOut,
                                 StatusCallback onStatus = nullptr) {
-    DWORD pollMs = kHttpReceivePollMs;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &pollMs, sizeof(pollMs));
-    const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds(std::max(5000, maxWaitMs));
+    // WinHTTP：ReceiveResponse 一旦超时，句柄进入不确定状态，必须关掉重开，
+    // 不能在同一句柄上把 5s 超时当「临时错误」空转（表现为 12019 空等到满超时）。
+    const int waitMs = std::max(5000, maxWaitMs);
+    DWORD recvMs = static_cast<DWORD>(waitMs);
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &recvMs, sizeof(recvMs));
     const auto waitStart = std::chrono::steady_clock::now();
-    int lastReportSec = 0;
-    DWORD lastErr = 0;
-    for (;;) {
-        if (cancelFlag && cancelFlag->load()) {
-            if (errorOut) *errorOut = L"已取消";
-            return false;
-        }
-        const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - waitStart).count());
-        if (onStatus && waitedSec >= lastReportSec + 5) {
-            lastReportSec = waitedSec - (waitedSec % 5);
-            const int remainSec = std::max(0, maxWaitMs / 1000 - waitedSec);
-            onStatus(L"等待响应 " + std::to_wstring(waitedSec) + L"s（剩余约 "
-                + std::to_wstring(remainSec) + L"s）…");
-        }
-        if (WinHttpReceiveResponse(hRequest, nullptr)) return true;
-        lastErr = GetLastError();
-        if (cancelFlag && cancelFlag->load()) {
-            if (errorOut) *errorOut = L"已取消";
-            return false;
-        }
-        if (IsTransientHttpReceiveError(lastErr)) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                if (errorOut) {
-                    *errorOut = L"等待服务器响应超时（已超过 "
-                        + std::to_wstring(maxWaitMs) + L" ms，最后错误="
-                        + WinHttpErrorText(lastErr)
-                        + L" code=" + std::to_wstring(lastErr) + L"）";
+
+    std::atomic<bool> stopBeat{false};
+    std::thread beat;
+    if (onStatus) {
+        beat = std::thread([&, waitMs]() {
+            int lastReportSec = 0;
+            while (!stopBeat.load()) {
+                for (int i = 0; i < 10 && !stopBeat.load(); ++i)
+                    Sleep(500);
+                if (stopBeat.load()) break;
+                const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - waitStart).count());
+                if (waitedSec >= lastReportSec + 5) {
+                    lastReportSec = waitedSec - (waitedSec % 5);
+                    const int remainSec = std::max(0, waitMs / 1000 - waitedSec);
+                    onStatus(L"等待响应 " + std::to_wstring(waitedSec) + L"s（剩余约 "
+                        + std::to_wstring(remainSec) + L"s）…");
                 }
-                if (onStatus)
-                    onStatus(L"接收超时: " + WinHttpErrorText(lastErr) + L" (code=" + std::to_wstring(lastErr) + L")");
-                return false;
             }
-            continue;
-        }
-        // 非临时错误 — 立即返回
-        if (errorOut) {
-            *errorOut = L"接收响应失败：" + WinHttpErrorText(lastErr)
-                + L" (code=" + std::to_wstring(lastErr) + L")";
-        }
-        if (onStatus)
-            onStatus(L"接收失败(非临时): " + WinHttpErrorText(lastErr) + L" (code=" + std::to_wstring(lastErr) + L")");
+        });
+    }
+
+    const bool ok = WinHttpReceiveResponse(hRequest, nullptr);
+    const DWORD lastErr = ok ? 0 : GetLastError();
+    stopBeat.store(true);
+    if (beat.joinable()) beat.join();
+
+    if (cancelFlag && cancelFlag->load()) {
+        if (errorOut) *errorOut = L"已取消";
         return false;
     }
+    if (ok) return true;
+    if (errorOut) {
+        *errorOut = L"等待服务器响应超时（已超过 "
+            + std::to_wstring(waitMs) + L" ms，最后错误="
+            + WinHttpErrorText(lastErr)
+            + L" code=" + std::to_wstring(lastErr) + L"）";
+    }
+    if (onStatus)
+        onStatus(L"接收超时: " + WinHttpErrorText(lastErr) + L" (code=" + std::to_wstring(lastErr) + L")");
+    return false;
 }
 
 bool HostLooksValid(const std::wstring& host) {
@@ -355,6 +350,86 @@ bool ToolResultIsSuccess(const std::wstring& result) {
 }
 
 }  // namespace
+
+// 思考开关策略（2026-09-16 用户拍板改为「允许思考 + 保留工具催促」）。
+//
+// 背景：早期为了治「只想不调工具 / 单轮数分钟」一律下发 thinking.type=disabled，
+// 单轮能压到 1~3s。但任务复杂度上来后（读办公文档、Office COM 编排、多步规划、
+// 游戏/动态画面判断），关思考会明显压低准确率——日志里模型经常选错路线。
+//
+// 现在：**默认允许思考**（不下发 thinking 字段，交给网关/模型自己决定），
+// 「只想不调工具」继续由既有的 toolNudgePending 机制兜（上轮没调工具就催一轮），
+// 那才是这个问题的正解。
+// 若某台机器/某次演示需要回到快速执行：设环境变量 QST_FAST_THINKING=1。
+// 「上一轮只想不干」→ 接下来 N 轮**关掉思考**，强制直接动手。
+// ★通用提速：实测一轮可以连续思考 45s、吐 36KB 推理（第十五/十六次日志），
+//   而它想的东西上一轮已经想过一遍了 —— 越读自己的旧推理越不肯动手。
+//   关掉思考只省时间、不损正确性（需要回放思考的网关走 requires_reasoning_content 另一条路）。
+std::atomic<int> g_thinkingSuppressedRounds{0};
+
+void SuppressThinkingForNextRounds(int rounds) {
+    if (rounds < 1) return;
+    g_thinkingSuppressedRounds.store(std::clamp(rounds, 1, 8));
+}
+
+void NoteThinkingRoundConsumed() {
+    int cur = g_thinkingSuppressedRounds.load();
+    while (cur > 0 && !g_thinkingSuppressedRounds.compare_exchange_weak(cur, cur - 1)) {
+    }
+}
+
+namespace {
+/// 旧行为（保留给 QST_FAST_THINKING=1 的逃生阀）：按网关/模型判定是否下发 thinking。
+bool ThinkingDisabledByGateway(const std::wstring& apiUrl, const std::wstring& model) {
+    const std::wstring lowUrl = Trim(apiUrl);
+    std::wstring url;
+    url.reserve(lowUrl.size());
+    for (wchar_t c : lowUrl) url.push_back(static_cast<wchar_t>(std::towlower(c)));
+    if (url.find(L"deepseek") != std::wstring::npos) return true;
+    if (url.find(L"volces.com") == std::wstring::npos
+        && url.find(L"ark") == std::wstring::npos) {
+        return false;
+    }
+    // 方舟网关：只对思考型模型（seed/pro/max/ultra）下发，避免其它模型拒参。
+    const std::wstring lowModel = Trim(model);
+    std::wstring m;
+    m.reserve(lowModel.size());
+    for (wchar_t c : lowModel) m.push_back(static_cast<wchar_t>(std::towlower(c)));
+    return m.find(L"seed") != std::wstring::npos
+        || m.find(L"pro") != std::wstring::npos
+        || m.find(L"max") != std::wstring::npos
+        || m.find(L"ultra") != std::wstring::npos;
+}
+}  // namespace
+
+bool ShouldDisableThinking(const std::wstring& apiUrl, const std::wstring& model) {
+    // ① 动态抑制：上一轮「只想不干」→ 接下来几轮直接关思考（通用提速主力）
+    if (g_thinkingSuppressedRounds.load() > 0) return true;
+    // ② 逃生阀：QST_FAST_THINKING=1 恢复旧的「按网关判定」行为
+    wchar_t envBuf[8]{};
+    if (GetEnvironmentVariableW(L"QST_FAST_THINKING", envBuf, 8) > 0 && envBuf[0] == L'1')
+        return ThinkingDisabledByGateway(apiUrl, model);
+    return false;
+}
+
+std::wstring AgentUserFacingToolReply(const std::wstring& toolResult) {
+    std::wstring out = toolResult;
+    auto cutAt = [&](const wchar_t* marker) {
+        const size_t pos = out.find(marker);
+        if (pos != std::wstring::npos) out.resize(pos);
+    };
+    cutAt(L"【动作一览");
+    cutAt(L"【动作 type");
+    cutAt(L"动作一览（缩进");
+    cutAt(L"动作一览：");
+    cutAt(L"对用户说明时必须");
+    cutAt(L"禁止说英文");
+    while (!out.empty() && (out.back() == L'\n' || out.back() == L'\r'
+        || out.back() == L' ' || out.back() == L'\t')) {
+        out.pop_back();
+    }
+    return out;
+}
 
 // ── 构造 / 析构 ───────────────────────────────────────────────────
 AgentCore::AgentCore(const AgentConfig& config,
@@ -481,8 +556,12 @@ json AgentCore::BuildRequest(bool stripLastUserImages,
                     parts.push_back({{"type", "text"}, {"text", ToUtf8(p.text)}});
                 } else if (p.type == L"image_url") {
                     if (stripThis) {
+                        // ★别写「请根据文字描述直接调用工具」——模型会理解成「我没有图，只能瞎猜」，
+                        // 实测它因此反复 screenshot / 反复自问「我看不到画面吗」，白烧好几轮。
+                        // 明确告诉它：这是省 token 的历史图，要看当前画面就主动取。
                         const char* hint = (stripLastUserImages && mi == lastUserIdx)
-                            ? "(截图已在上一轮流式请求中发送，请根据文字描述直接调用工具完成脚本，勿重复长篇思考)"
+                            ? "(本轮未附截图以省 token；需要看当前画面请调用 computer(action=screenshot)，"
+                              "或直接用 locateAndClick 让宿主识图定位)"
                             : "(历史截图已省略)";
                         parts.push_back({{"type", "text"}, {"text", hint}});
                     } else {
@@ -503,8 +582,21 @@ json AgentCore::BuildRequest(bool stripLastUserImages,
         }
         if (m.requires_reasoning_content)
             msg["reasoning_content"] = ToUtf8(m.reasoning_content);
-        else if (!m.reasoning_content.empty())
-            msg["reasoning_content"] = ToUtf8(m.reasoning_content);
+        else if (!m.reasoning_content.empty()) {
+            // ★通用提速：**不要把模型自己的长推理整段回灌**。
+            //   实测一轮能吐 36KB 推理，回灌后每一轮的请求体都把它重发一遍
+            //   （日志里请求体一路涨到 314~330KB），而且模型读到自己的旧推理会**接着纠结**
+            //   （第十六次日志里它把同一个决定反复推了十几遍）。
+            //   网关明确要求回放的，走上面 requires_reasoning_content 那条不变；
+            //   其余只留一小截尾巴（有些网关要看到 non-empty 才肯走同一分支）。
+            constexpr size_t kReasoningEchoMaxChars = 400;
+            std::wstring tail = m.reasoning_content;
+            if (tail.size() > kReasoningEchoMaxChars) {
+                tail = L"…(前文思考已省略)…"
+                    + tail.substr(tail.size() - kReasoningEchoMaxChars);
+            }
+            msg["reasoning_content"] = ToUtf8(tail);
+        }
         if (!m.tool_call_id.empty())
             msg["tool_call_id"] = ToUtf8(m.tool_call_id);
         if (!m.tool_calls.empty()) {
@@ -565,13 +657,12 @@ json AgentCore::BuildRequest(bool stripLastUserImages,
         if (!toolChoice.empty() && toolChoice != "auto")
             req["tool_choice"] = toolChoice;
     }
-    // DeepSeek V4 / 豆包 seed 等思考型模型：默认就会长思考（单轮可达数分钟，
-    // 还受 max_tokens 预算放大），表现为「卡死」。助手流程的正确性由
-    // Skill + 工具校验保证（实测关思考后 3s 内正确调出 readAgentSkill →
-    // planScriptActions → createMacroScript），因此一律显式 disabled 走快速执行。
+    // DeepSeek V4 / 豆包 seed 等思考型模型：默认就会长思考。现在**允许思考**
+    // （准确率优先，见 ShouldDisableThinking 注释）；只在显式设了
+    // QST_FAST_THINKING=1 时才恢复旧的「强制快速执行」。
     // 原生推理模型（R1/Reasoner、o 系列）不接受该开关，不发送避免 400；
     // 其它网关（OpenAI 等）保持默认。
-    if (ShouldForceFastThinking(config_.apiUrl, config_.model)
+    if (ShouldDisableThinking(config_.apiUrl, config_.model)
         && !ModelIsReasoningType(config_.model)) {
         req["thinking"] = json::object({{"type", "disabled"}});
     }
@@ -1031,8 +1122,15 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
 
     if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
 
-    DWORD pollRecvTimeoutMs = kHttpBodyPollMs;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &pollRecvTimeoutMs, sizeof(pollRecvTimeoutMs));
+    // ★读 body 的超时**必须给足**：WinHTTP 的 RECEIVE_TIMEOUT 一旦触发，这次请求句柄就废了
+    //（后续 QueryDataAvailable 报 12019），而 thinking 模型在图片请求上「看图 + 想」的间隙
+    // 常常好几秒 —— 之前用 250ms/1500ms 短切片轮询，等于每一轮都在赌，实测就是
+    // 「思考 4s → 流式失败 → 再发一次完整请求（又多 90s）」。
+    // 现在改成：读给足超时，**由看门狗线程**负责心跳、策略超时与取消；
+    // 需要打断阻塞读时用 Abort()（与「停止热键」同一条已验证的路径）。
+    DWORD bodyRecvTimeoutMs = static_cast<DWORD>((std::max)(30000, effectiveTimeoutMs));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT,
+        &bodyRecvTimeoutMs, sizeof(bodyRecvTimeoutMs));
 
     DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
@@ -1046,105 +1144,159 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
     const auto streamDeadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(effectiveTimeoutMs);
     const auto streamStart = std::chrono::steady_clock::now();
-    auto lastByteTime = streamStart;
-    bool receivedAnyByte = false;
     bool announcedStreamConnected = false;
-    int lastBeatSec = 0;
+    bool receivedAnyByte = false;
 
-    // 必须在「QueryDataAvailable 超时 continue」路径也会跑：否则无数据时永久跳过心跳/强制收束
-    auto checkStreamProgress = [&]() -> bool {
-        const auto now = std::chrono::steady_clock::now();
-        const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-            now - streamStart).count());
-        if (callbacks.onStatus && waitedSec >= lastBeatSec + 3) {
-            lastBeatSec = waitedSec;
-            std::wstring beat = L"流式等待 " + std::to_wstring(waitedSec) + L"s";
-            if (!state.reasoning.empty())
-                beat += L"，思考 " + std::to_wstring(state.reasoning.size()) + L" 字节";
-            if (!state.content.empty())
-                beat += L"，回复 " + std::to_wstring(state.content.size()) + L" 字节";
-            if (state.hasToolCalls || !state.toolCallParts.empty())
-                beat += L"，工具调用组装中";
-            callbacks.onStatus(beat + L"…");
+    // 看门狗只能读原子量（state 归读线程独占，跨线程读 std::wstring 是数据竞争）
+    std::atomic<long long> lastByteTickMs{0};
+    std::atomic<size_t> reasoningBytes{0};
+    std::atomic<size_t> contentBytes{0};
+    std::atomic<bool> toolAssemblyStarted{false};
+    std::atomic<bool> sawUsableToolCalls{false};
+    std::atomic<bool> streamDone{false};
+    // 0=继续 1=收束（采用已收内容）2=放弃（改完整响应）
+    std::atomic<int> stopKind{0};
+    std::atomic<bool> watchdogStop{false};
+    std::wstring stopReason;
+    std::mutex stopReasonMu;
+
+    auto TicksMs = []() -> long long {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    lastByteTickMs.store(TicksMs());
+
+    auto setStop = [&](int kind, const std::wstring& reason) {
+        int expected = 0;
+        if (!stopKind.compare_exchange_strong(expected, kind)) return;
+        {
+            std::lock_guard<std::mutex> lock(stopReasonMu);
+            stopReason = reason;
         }
-        if (expectTools
-            && state.content.empty()
-            && !HasUsableStreamToolCalls(state)
-            && !state.reasoning.empty()) {
-            const bool hitAbs = now - streamStart >= std::chrono::milliseconds(kReasoningOnlyForceMs);
-            const bool hitPlateau = receivedAnyByte
-                && now - lastByteTime >= std::chrono::milliseconds(kReasoningPlateauIdleMs);
-            if (hitAbs || hitPlateau) {
-                if (callbacks.onStatus) {
-                    callbacks.onStatus(hitPlateau
-                        ? L"思考已停顿仍未调用工具，结束流式并强制调工具…"
-                        : L"思考过久未调用工具，结束流式并强制调工具…");
+        if (callbacks.onStatus && !reason.empty()) callbacks.onStatus(reason);
+        // 解除阻塞读：只有 Abort 关句柄才能让 WinHttpQueryDataAvailable 立刻返回
+        if (callbacks.httpAbort) callbacks.httpAbort->Abort();
+    };
+
+    std::thread watchdog;
+    if (callbacks.onStatus || callbacks.httpAbort) {
+        watchdog = std::thread([&]() {
+            int lastBeatSec = -3;
+            while (!watchdogStop.load()) {
+                for (int i = 0; i < 25 && !watchdogStop.load(); ++i) Sleep(200);
+                if (watchdogStop.load()) break;
+                const auto now = std::chrono::steady_clock::now();
+                const int waitedSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                    now - streamStart).count());
+                const bool gotAny = lastByteTickMs.load() > 0;
+                const long long idleMs = TicksMs() - lastByteTickMs.load();
+                const size_t rBytes = reasoningBytes.load();
+                const size_t cBytes = contentBytes.load();
+                if (callbacks.onStatus && waitedSec >= lastBeatSec + 3) {
+                    lastBeatSec = waitedSec;
+                    std::wstring beat = L"流式等待 " + std::to_wstring(waitedSec) + L"s";
+                    if (rBytes > 0) beat += L"，思考 " + std::to_wstring(rBytes) + L" 字节";
+                    if (cBytes > 0) beat += L"，回复 " + std::to_wstring(cBytes) + L" 字节";
+                    if (toolAssemblyStarted.load()) beat += L"，工具调用组装中";
+                    callbacks.onStatus(beat + L"…");
                 }
-                state.done = true;
-                return true;
+                if (stopKind.load() != 0) break;
+
+                // ① 思考很久却始终不调工具 → 收束（采用已有内容，交给上层催工具）
+                if (expectTools && cBytes == 0 && !sawUsableToolCalls.load() && rBytes > 0) {
+                    const bool hitAbs = now - streamStart >= std::chrono::milliseconds(kReasoningOnlyForceMs);
+                    const bool hitPlateau = gotAny
+                        && idleMs >= kReasoningPlateauIdleMs;
+                    if (hitAbs || hitPlateau) {
+                        setStop(1, hitPlateau
+                            ? L"思考已停顿仍未调用工具，结束流式并强制调工具…"
+                            : L"思考过久未调用工具，结束流式并强制调工具…");
+                        break;
+                    }
+                }
+                // ② 工具调用组装超时 → 改完整响应
+                if (expectTools && toolAssemblyStarted.load()
+                    && !sawUsableToolCalls.load()
+                    && now - streamStart >= std::chrono::milliseconds(kToolCallAssemblyCapMs)) {
+                    setStop(2, L"工具调用组装超时，改用完整响应…");
+                    break;
+                }
+                // ③ 工具轮空流（只有 keepalive / 没有首包）→ 改完整响应
+                if (expectTools && rBytes == 0 && cBytes == 0 && !sawUsableToolCalls.load()
+                    && now - streamStart >= std::chrono::milliseconds(emptyStreamCapMs)) {
+                    setStop(2, gotAny
+                        ? L"流式空闲无内容（可能仅 keepalive），改用完整响应…"
+                        : L"流式首包超时，改用完整响应…");
+                    break;
+                }
+                // ④ 非工具轮首包
+                if (!expectTools && !gotAny
+                    && now - streamStart >= std::chrono::milliseconds(45000)) {
+                    setStop(2, L"流式首包超时，结束等待…");
+                    break;
+                }
+                // ⑤ 整体超时
+                if (now >= streamDeadline) {
+                    setStop((rBytes > 0 || cBytes > 0 || sawUsableToolCalls.load()) ? 1 : 2,
+                        L"流式接收超时（已超过 " + std::to_wstring(effectiveTimeoutMs) + L" ms）");
+                    break;
+                }
+                // ⑥ 有内容但长时间没有新字节 → 收束
+                if (gotAny && (rBytes > 0 || cBytes > 0 || sawUsableToolCalls.load())
+                    && idleMs >= kStreamIdleTimeoutMs) {
+                    setStop(1, L"流式空闲超时，采用已收内容");
+                    break;
+                }
             }
+        });
+    }
+    struct WatchdogGuard {
+        std::thread* t;
+        std::atomic<bool>* stop;
+        ~WatchdogGuard() {
+            if (stop) stop->store(true);
+            if (t && t->joinable()) t->join();
         }
-        // 工具轮：已在「工具调用组装中」但迟迟凑不齐完整 tool_calls → 放弃流式，
-        // 改走完整响应兜底（比继续空挂快）。
-        if (expectTools
-            && (state.hasToolCalls || !state.toolCallParts.empty())
-            && !HasUsableStreamToolCalls(state)
-            && now - streamStart >= std::chrono::milliseconds(kToolCallAssemblyCapMs)) {
-            if (callbacks.onStatus)
-                callbacks.onStatus(L"工具调用组装超时，改用完整响应…");
-            return false; // 调用方 fail → 上层改用完整响应
-        }
-        // 工具轮空流：无思考/正文/可用工具。含「已收到字节但只是 ping/空行」——原先只拦
-        // !receivedAnyByte，keepalive 会空挂到整段 API 超时。
-        if (expectTools
-            && !HasMeaningfulStreamPayload(state)
-            && now - streamStart >= std::chrono::milliseconds(emptyStreamCapMs)) {
-            if (callbacks.onStatus)
-                callbacks.onStatus(receivedAnyByte
-                    ? L"流式空闲无内容（可能仅 keepalive），改用完整响应…"
-                    : L"流式首包超时，改用完整响应…");
-            return false;
-        }
-        // 非工具轮：仍要求尽快有首包，避免无限空等
-        if (!expectTools && !receivedAnyByte
-            && now - streamStart >= std::chrono::milliseconds(45000)) {
-            if (callbacks.onStatus)
-                callbacks.onStatus(L"流式首包超时，结束等待…");
-            return false;
-        }
-        if (now >= streamDeadline) {
-            if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
-                state.done = true;
-                return true;
-            }
-            return false;
-        }
-        if (bytesAvailable == 0 && receivedAnyByte && HasMeaningfulStreamPayload(state)
-            && now - lastByteTime >= std::chrono::milliseconds(kStreamIdleTimeoutMs)) {
-            if (!state.reasoning.empty() || !state.content.empty() || HasUsableStreamToolCalls(state)) {
-                state.done = true;
-                return true;
-            }
-            return false;
-        }
-        return true; // 继续读
+    } watchdogGuard{&watchdog, &watchdogStop};
+
+    auto currentStopReason = [&]() -> std::wstring {
+        std::lock_guard<std::mutex> lock(stopReasonMu);
+        return stopReason;
     };
 
     while (!state.done) {
         if (callbacks.cancelFlag && callbacks.cancelFlag->load())
             return fail(L"已取消");
+        if (stopKind.load() == 2) {
+            const std::wstring reason = currentStopReason();
+            return fail(reason.empty() ? L"流式接收中断" : reason);
+        }
         if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable)) {
             const DWORD err = GetLastError();
-            // 热键 StopRun → Abort 关句柄：优先按取消退出，勿干等超时
+            // 热键 StopRun / 看门狗 → Abort 关句柄：优先按取消/策略退出，勿干等超时
             if (callbacks.cancelFlag && callbacks.cancelFlag->load())
                 return fail(L"已取消");
-            if (ShouldFinalizeStream(state, expectTools)) break;
+            if (stopKind.load() == 1) break;
+            if (stopKind.load() == 2) {
+                const std::wstring reason = currentStopReason();
+                return fail(reason.empty() ? L"流式接收中断" : reason);
+            }
+            // ★句柄已作废 / 流已结束（12019 等）：只要已经攒到可用内容就**直接采用**。
+            // 旧实现一律 fail → 上层丢掉整段流式结果、再发一次完整请求
+            //（思考模型一次 ~90s，日志里每轮都翻倍）。SSE 在最后一个 chunk 之后
+            // QueryDataAvailable 本来就可能返回句柄状态错误，那是正常收尾，不是故障。
+            if (ShouldFinalizeStream(state, expectTools)) {
+                if (callbacks.onStatus)
+                    callbacks.onStatus(L"流式已结束（句柄收尾），直接采用已收内容…");
+                break;
+            }
             if (IsTransientHttpReceiveError(err)) {
-                const bool ok = checkStreamProgress();
-                if (state.done) break;
-                if (!ok) {
-                    return fail(L"流式接收超时（已超过 "
-                        + std::to_wstring(effectiveTimeoutMs) + L" ms / 首包或空闲）");
+                // 超时只是「这一窗没数据」：长超时下极少发生；句柄若真废了，下一轮
+                // 会以 12019 走到上面的「已攒到内容就直接采用」分支。
+                if (stopKind.load() == 1) break;
+                if (stopKind.load() == 2) {
+                    const std::wstring reason = currentStopReason();
+                    return fail(reason.empty() ? L"流式接收中断" : reason);
                 }
                 Sleep(50);
                 continue;
@@ -1152,22 +1304,27 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
             return fail(L"读取流失败：" + WinHttpErrorText(err)
                 + L" (code=" + std::to_wstring(err) + L")");
         }
-        {
-            const bool ok = checkStreamProgress();
-            if (state.done) break;
-            if (!ok) {
-                return fail(L"流式接收超时（已超过 "
-                    + std::to_wstring(effectiveTimeoutMs) + L" ms）");
-            }
+        if (stopKind.load() == 1) {
+            if (callbacks.onStatus) callbacks.onStatus(L"按看门狗策略收束流式，采用已收内容…");
+            break;
+        }
+        if (stopKind.load() == 2) {
+            const std::wstring reason = currentStopReason();
+            return fail(reason.empty() ? L"流式接收中断" : reason);
         }
         if (bytesAvailable == 0) {
             if (ShouldFinalizeStream(state, expectTools)) break;
             if (callbacks.cancelFlag && callbacks.cancelFlag->load()) return fail(L"已取消");
+            if (stopKind.load() == 1) break;
+            if (stopKind.load() == 2) {
+                const std::wstring reason = currentStopReason();
+                return fail(reason.empty() ? L"流式接收中断" : reason);
+            }
             Sleep(50);
             continue;
         }
         receivedAnyByte = true;
-        lastByteTime = std::chrono::steady_clock::now();
+        lastByteTickMs.store(TicksMs());
         if (callbacks.onStatus && !announcedStreamConnected) {
             announcedStreamConnected = true;
             callbacks.onStatus(L"已连接，接收流式响应…");
@@ -1176,16 +1333,25 @@ AgentCore::StreamApiResult AgentCore::CallApiStream(const json& requestBodyIn,
         DWORD bytesRead = 0;
         if (!WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead) || bytesRead == 0) {
             if (ShouldFinalizeStream(state, expectTools)) break;
-            const bool ok = checkStreamProgress();
-            if (state.done) break;
-            if (!ok) {
-                return fail(L"流式接收超时（已超过 "
-                    + std::to_wstring(effectiveTimeoutMs) + L" ms）");
+            if (stopKind.load() == 1) break;
+            if (stopKind.load() == 2) {
+                const std::wstring reason = currentStopReason();
+                return fail(reason.empty() ? L"流式接收中断" : reason);
             }
             continue;
         }
         FeedStreamBytes(state, buffer.data(), bytesRead, callbacks);
+        // 看门狗只读原子量：这里把读线程独占的 state 投影出去
+        reasoningBytes.store(state.reasoning.size());
+        contentBytes.store(state.content.size());
+        if (!toolAssemblyStarted.load() && (state.hasToolCalls || !state.toolCallParts.empty()))
+            toolAssemblyStarted.store(true);
+        if (!sawUsableToolCalls.load() && HasUsableStreamToolCalls(state))
+            sawUsableToolCalls.store(true);
+        if (state.done) streamDone.store(true);
     }
+    watchdogStop.store(true);
+    if (watchdog.joinable()) watchdog.join();
     if (!state.lineBuffer.empty())
         ProcessStreamSseLine(state.lineBuffer, state, callbacks);
 
@@ -1327,8 +1493,12 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                         L"（如 buildScriptActions / createMacroScript）或给出最终回答；"
                         L"不要重复查询同一参考，也不要把思考内容当作最终回答。";
                     messages_.push_back(nudge);
+                    // ★只想不干 → 接下来两轮**关掉思考**：实测「空转思考」会连着来
+                    //   （一轮 45s、36KB 推理，内容还都是上一轮已经想过的），
+                    //   越读自己的旧推理越不肯动手。关掉思考直接逼它出手。
+                    SuppressThinkingForNextRounds(2);
                     if (callbacks.onStatus)
-                        callbacks.onStatus(L"思考中未调工具，已提示继续推进…");
+                        callbacks.onStatus(L"思考中未调工具，已提示继续推进（下两轮关闭思考）…");
                     continue;
                 } else if (needsNonStreamRetry(streamed, assistantMsg)) {
                     parsed = false;
@@ -1357,8 +1527,32 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                 : requestBody;
             apiBody["stream"] = false;
             std::wstring apiError;
-            const std::wstring responseText = CallApi(
-                apiBody, &apiError, callbacks.cancelFlag, callbacks.httpAbort, callbacks.onStatus);
+            std::wstring responseText;
+            // ★「服务器返回空响应」是网关侧的间歇故障（思考型模型尤其常见：整段回复都是
+            //   思考、正文为空时网关会回空体）。原来一次空响应就直接 return 错误 →
+            //   AI 动作判失败 → **整个宏当场结束**（用户实测第十三次日志）。
+            //   这里对「空响应/可重试传输错误」静默重试两次，仍然拿不到内容才报错。
+            constexpr int kEmptyRetry = 2;
+            for (int attempt = 0; attempt <= kEmptyRetry; ++attempt) {
+                apiError.clear();
+                responseText = CallApi(
+                    apiBody, &apiError, callbacks.cancelFlag, callbacks.httpAbort,
+                    callbacks.onStatus);
+                const bool emptyResp = apiError.empty() && responseText.empty();
+                if (apiError.empty() && !responseText.empty()) break;
+                const bool retryable = emptyResp
+                    || apiError.find(L"空响应") != std::wstring::npos
+                    || apiError.find(L"连接") != std::wstring::npos
+                    || apiError.find(L"超时") != std::wstring::npos
+                    || apiError.find(L"timeout") != std::wstring::npos;
+                if (!retryable || attempt == kEmptyRetry) break;
+                if (callbacks.cancelFlag && callbacks.cancelFlag->load()) break;
+                if (callbacks.onStatus) {
+                    callbacks.onStatus(L"空响应/连接中断，静默重试 " + std::to_wstring(attempt + 1)
+                        + L"/" + std::to_wstring(kEmptyRetry) + L"…");
+                }
+                Sleep(1200);
+            }
             if (!apiError.empty()) {
                 if (callbacks.stopToolLoopAfterTools && callbacks.stopToolLoopAfterTools())
                     return L"";
@@ -1562,13 +1756,20 @@ std::wstring AgentCore::SendMessage(const ChatMessage& userMessage,
                 lastToolResult.clear();
                 repeatedPairCount.clear();
             }
-            // 终态工具成功：脚本/录制已保存 → 直接收尾，不再发起下一轮 API
+            // 终态工具成功：脚本/录制已保存 → 直接收尾，不再发起下一轮 API。
+            // 对用户只给短摘要（去掉动作一览/内部约束），并写入历史，关窗重开才看得到。
             if (terminalSucceeded) {
+                std::wstring userReply = AgentUserFacingToolReply(terminalResult);
+                if (userReply.empty()) userReply = L"已完成。";
+                ChatMessage visible;
+                visible.role = L"assistant";
+                visible.content = userReply;
+                messages_.push_back(std::move(visible));
                 if (callbacks.onContentDelta)
-                    callbacks.onContentDelta(terminalResult);
+                    callbacks.onContentDelta(userReply);
                 else if (callbacks.onChunk)
-                    callbacks.onChunk(terminalResult);
-                return terminalResult;
+                    callbacks.onChunk(userReply);
+                return userReply;
             }
             if (callbacks.stopToolLoopAfterTools && callbacks.stopToolLoopAfterTools())
                 return L"";

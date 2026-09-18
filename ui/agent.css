@@ -807,23 +807,23 @@ html.agent-shell.agent-ready #ov-agent .dlg {
   flex-wrap: wrap;
 }
 .aiv-toolbar button {
-  height: 42px;
-  min-width: 42px;
-  padding: 0 16px;
-  border-radius: 10px;
+  height: calc(42px * var(--qst-u));
+  min-width: calc(42px * var(--qst-u));
+  padding: 0 calc(16px * var(--qst-u));
+  border-radius: calc(10px * var(--qst-u));
   border: 1px solid rgba(255, 255, 255, .2);
   background: rgba(255, 255, 255, .12);
   color: #fff;
-  font-size: 15px;
+  font-size: calc(15px * var(--qst-u));
   font-weight: 600;
   cursor: pointer;
 }
 .aiv-toolbar button:hover { background: rgba(255, 255, 255, .22); }
 .aiv-zoom-wrap {
-  height: 42px;
-  min-width: 88px;
-  padding: 0 12px;
-  border-radius: 10px;
+  height: calc(42px * var(--qst-u));
+  min-width: calc(88px * var(--qst-u));
+  padding: 0 calc(12px * var(--qst-u));
+  border-radius: calc(10px * var(--qst-u));
   border: 1px solid rgba(255, 255, 255, .2);
   background: rgba(255, 255, 255, .12);
   display: inline-flex;
@@ -838,12 +838,12 @@ html.agent-shell.agent-ready #ov-agent .dlg {
   background: rgba(255, 255, 255, .18);
 }
 .aiv-zoom-wrap input {
-  width: 48px;
+  width: calc(48px * var(--qst-u));
   border: none;
   outline: none;
   background: transparent;
   color: #fff;
-  font-size: 15px;
+  font-size: calc(15px * var(--qst-u));
   font-weight: 600;
   text-align: center;
   font-family: inherit;

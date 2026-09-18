@@ -30,6 +30,100 @@ bool PathExists(const std::wstring& path) {
         && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+bool ReadFileStamp(const std::wstring& path, ULONGLONG& bytes, FILETIME& writeTime) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return false;
+    bytes = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    writeTime = fad.ftLastWriteTime;
+    return true;
+}
+
+// 游戏进程常锁住 FakeFocus32.dll，新编译产物先落到 FakeFocus32.next.dll。
+// 选时间戳最新那份；禁止按文件大小黑名单（164352 的 raw 包与现行 mapleSafe 同尺寸）。
+std::wstring PickPreferredFakeFocusDll(const std::wstring& dir, const wchar_t* dllName) {
+    if (!dllName || !*dllName) return {};
+    if (lstrcmpiW(dllName, L"FakeFocus32.dll") == 0) {
+        const std::wstring nextPath = dir + L"FakeFocus32.next.dll";
+        if (PathExists(nextPath)) return nextPath;
+    }
+    std::wstring chosen;
+    ULONGLONG chosenBytes = 0;
+    FILETIME chosenTime{};
+    if (lstrcmpiW(dllName, L"FakeFocus32.dll") == 0) {
+        WIN32_FIND_DATAW fd{};
+        const std::wstring glob = dir + L"FakeFocus32*.dll";
+        HANDLE find = FindFirstFileW(glob.c_str(), &fd);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                // 仅按文件名排除 crashy raw 包；勿按 164352 字节整类跳过（会误伤现行 mapleSafe）。
+                if (wcsstr(fd.cFileName, L".raw.") != nullptr) continue;
+                const std::wstring cand = dir + fd.cFileName;
+                const ULONGLONG candBytes =
+                    (static_cast<ULONGLONG>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+                const LONG newer = chosen.empty()
+                    ? 1
+                    : CompareFileTime(&fd.ftLastWriteTime, &chosenTime);
+                const bool candWins = chosen.empty()
+                    || newer > 0
+                    || (newer == 0 && candBytes > chosenBytes)
+                    || (chosenBytes == 155136ull && candBytes != 155136ull);
+                if (candWins) {
+                    chosen = cand;
+                    chosenBytes = candBytes;
+                    chosenTime = fd.ftLastWriteTime;
+                }
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+    } else {
+        const std::wstring primary = dir + dllName;
+        if (PathExists(primary)) chosen = primary;
+    }
+    return chosen;
+}
+
+void WarnIfStaleFakeFocus32Choice(const std::wstring& dir, const std::wstring& chosen) {
+    if (chosen.empty()) return;
+    const auto slash = chosen.find_last_of(L"\\/");
+    const std::wstring base =
+        (slash == std::wstring::npos) ? chosen : chosen.substr(slash + 1);
+    if (lstrcmpiW(base.c_str(), L"FakeFocus32.dll") != 0) return;
+    ULONGLONG chosenBytes = 0;
+    FILETIME chosenTime{};
+    if (!ReadFileStamp(chosen, chosenBytes, chosenTime)) return;
+    std::wstring newerPath;
+    ULONGLONG newerBytes = 0;
+    FILETIME newerTime{};
+    WIN32_FIND_DATAW fd{};
+    const std::wstring glob = dir + L"FakeFocus32*.dll";
+    HANDLE find = FindFirstFileW(glob.c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (wcsstr(fd.cFileName, L".raw.") != nullptr) continue;
+        const std::wstring cand = dir + fd.cFileName;
+        if (cand == chosen) continue;
+        const ULONGLONG candBytes =
+            (static_cast<ULONGLONG>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+        const LONG newer = CompareFileTime(&fd.ftLastWriteTime, &chosenTime);
+        if (newer <= 0 && !(newer == 0 && candBytes > chosenBytes)) continue;
+        if (newerPath.empty()
+            || CompareFileTime(&fd.ftLastWriteTime, &newerTime) > 0
+            || (CompareFileTime(&fd.ftLastWriteTime, &newerTime) == 0 && candBytes > newerBytes)) {
+            newerPath = cand;
+            newerBytes = candBytes;
+            newerTime = fd.ftLastWriteTime;
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    if (newerPath.empty()) return;
+    WindowModeLogf(
+        L"[窗口模式] 警告：将注入旧 FakeFocus32（%llu 字节 %s），同目录有更新副本 %s（%llu 字节）。"
+        L"请先退出 MapleStoryt.exe，覆盖 FakeFocus32.dll 或改用 FakeFocus32.next.dll",
+        chosenBytes, chosen.c_str(), newerPath.c_str(), newerBytes);
+}
+
 bool IsTargetWow64(HANDLE process, bool& outWow64, std::wstring& err) {
     outWow64 = false;
 #if defined(_WIN64)
@@ -149,10 +243,13 @@ bool FakeFocusInjector::ResolveDllPathForPid(DWORD pid, std::wstring& outPath, s
         err = L"无法解析主程序目录以定位假焦点 DLL";
         return false;
     }
-    outPath = dir + dllName;
-    if (!PathExists(outPath)) {
-        err = std::wstring(L"找不到假焦点 DLL: ") + outPath;
+    outPath = PickPreferredFakeFocusDll(dir, dllName);
+    if (outPath.empty() || !PathExists(outPath)) {
+        err = std::wstring(L"找不到假焦点 DLL: ") + dir + dllName;
         return false;
+    }
+    if (lstrcmpiW(dllName, L"FakeFocus32.dll") == 0) {
+        WarnIfStaleFakeFocus32Choice(dir, outPath);
     }
     return true;
 }
@@ -401,6 +498,15 @@ bool FakeFocusInjector::InjectAndInstall(DWORD windowPid, HWND targetTop, std::w
             static_cast<unsigned>(local.wDay), static_cast<unsigned>(local.wHour),
             static_cast<unsigned>(local.wMinute), static_cast<unsigned>(local.wSecond),
             inject::TechniqueName(technique_));
+        if (bytes == 155136ull) {
+            WindowModeLog(
+                L"[窗口模式] 仍在用旧 FakeFocus32（155136，缺本地 dinput8 的 user32 IAT）。"
+                L"请先退出 MapleStoryt.exe，再用同目录 FakeFocus32.next.dll / 覆盖后的新 DLL");
+        } else if (bytes == 163840ull) {
+            WindowModeLog(
+                L"[窗口模式] 仍在用旧 FakeFocus32（163840，无 DI 虚表修复/共享内存 v7）。"
+                L"请覆盖 exe 目录下 FakeFocus32.dll（现行约 164352 字节）并重启 MapleStoryt.exe");
+        }
     } else {
         WindowModeLogf(L"[窗口模式] 假焦点注入完成 processes=%d windowPid=%lu dll=%s tech=%s",
             okCount, static_cast<unsigned long>(windowPid), dllPath_.c_str(),

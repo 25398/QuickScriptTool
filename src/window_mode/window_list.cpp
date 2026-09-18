@@ -4,6 +4,7 @@
 #include <dwmapi.h>
 
 #include <algorithm>
+#include <cwchar>
 
 #ifndef DWMWA_CLOAKED
 #define DWMWA_CLOAKED 14
@@ -255,6 +256,25 @@ bool ActivateWindow(HWND hwnd, std::wstring& error) {
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
     if (GetForegroundWindow() == hwnd) return true;
     if (tryAttachForeground(true)) return true;
+    // ★模态对话框挡着时 SetForegroundWindow 必然失败（系统禁止把窗口切到模态框前面）。
+    // 这时如实说明并给出**能用的**下一步——否则模型会反复 activateWindow / Alt+Tab 空转
+    //（实测「卡在保存界面反复切窗」就是这么来的）。
+    {
+        HWND fgNow = GetForegroundWindow();
+        wchar_t cls[64]{};
+        if (fgNow) GetClassNameW(fgNow, cls, 64);
+        if (fgNow && wcscmp(cls, L"#32770") == 0) {
+            wchar_t title[256]{};
+            GetWindowTextW(fgNow, title, 256);
+            error = L"前台有模态对话框";
+            if (title[0]) error += L"「" + std::wstring(title) + L"」";
+            error += L"，它挡着时系统不允许把别的窗口切到前面（不是你的操作错了）。"
+                     L"先把这个框处理掉：另存为/打开框 → quickInput 文件名/路径 → Enter；"
+                     L"确认框 → locateAndClick(确定/取消) 或看图处理。"
+                     L"处理完再 activateWindow。不要反复切窗或按 Alt+Tab。";
+            return false;
+        }
+    }
     error = L"系统未把该窗口切到前台（可能被全屏独占或 UAC 窗口挡住）";
     return false;
 }

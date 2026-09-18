@@ -8,6 +8,7 @@
 #include "selftest_harness.h"
 
 #include "macro_variables.h"
+#include "var_compute.h"
 
 #include <string>
 #include <unordered_map>
@@ -16,6 +17,11 @@ namespace {
 
 using selftest::Emit;
 
+std::wstring Exported(const VarComputeResult& r, const wchar_t* name) {
+    const auto it = r.exported.find(name);
+    return it == r.exported.end() ? L"" : it->second;
+}
+
 const selftest::CaseInfo kCases[] = {
     {L"resolve_match_var_brace", L"default",
         L"{matchRet.x}/{matchRet.cx} expand from ImageMatchResult"},
@@ -23,6 +29,8 @@ const selftest::CaseInfo kCases[] = {
         L"{ctrl:CurLoops()} expands ctx.curLoops"},
     {L"decode_quick_input_escapes", L"default",
         L"\\\\n \\\\t \\\\\\\\ decode for quick input"},
+    {L"resolve_quick_input_var_escapes", L"default",
+        L"parseEscapes=0 strips newlines/tabs from {var}; 1 decodes \\\\n in var values"},
     {L"find_image_time_sec", L"default",
         L"ResolveFindImageTimeSec: -1 / 0 / positive / non-numeric->0"},
     {L"condition_compare_and_or", L"default",
@@ -51,6 +59,24 @@ const selftest::CaseInfo kCases[] = {
         L"ctrl:Clipboard() 条件 0/1；文本展开路径；AI 模式见附图占位"},
     {L"user_var_beats_magic_name", L"default",
         L"条件裸名优先用户变量，避免 clipboard/cursor.x 盖住脚本变量"},
+    {L"var_compute_return_exports", L"default",
+        L"变量运算 return 导出；未 return 的局部不保留"},
+    {L"var_compute_clipboard_string", L"default",
+        L"变量运算中 ctrl:Clipboard() 为文本或文件路径，不是 0/1"},
+    {L"var_compute_user_var_roundtrip", L"default",
+        L"导出变量可被后续运算和条件读取"},
+    {L"var_compute_optional_semi_newline", L"default",
+        L"变量运算换行可省略分号，return 导出可供条件读取"},
+    {L"var_compute_string_compare_sign", L"default",
+        L"OCR 符号用 '+' / \"+\" 比较；裸写 + 是加法运算符"},
+    {L"var_compute_split_string", L"default",
+        L"split(s, sep) / [i] / count / toInt 按分隔符拆分字符串"},
+    {L"collect_varcompute_return_names", L"default",
+        L"CollectVarComputeReturnNames / BuildQuickInputVarItems 收集 return 导出名"},
+    {L"resolve_match_list_index", L"default",
+        L"{matchRet[0].x}/{matchRet.count}/{matchRet[n]} 多图匹配数组下标"},
+    {L"build_quick_input_multimatch", L"default",
+        L"BuildQuickInputVarItems 注册 matchRet[n] / [0].x / count"},
 };
 
 void CaseResolveMatchVar() {
@@ -81,6 +107,58 @@ void CaseDecodeEscapes() {
         && out[0] == L'a' && out[1] == L'\n' && out[2] == L'b'
         && out[3] == L'\t' && out[4] == L'c' && out[5] == L'\\' && out[6] == L'd';
     Emit(L"decode_quick_input_escapes", ok, out.c_str());
+}
+
+void CaseResolveQuickInputVarEscapes() {
+    std::wstring withNl = L"x";
+    withNl.push_back(L'\n');
+    withNl += L"y";
+    std::unordered_map<std::wstring, std::wstring> userNl{{L"a", withNl}};
+    MacroVariableContext ctx;
+    ctx.userVars = &userNl;
+
+    const std::wstring offNl = ResolveQuickInputText(L"{a}", ctx, false);
+    const bool offNlOk = offNl == L"xy";
+
+    const std::wstring onNl = ResolveQuickInputText(L"{a}", ctx, true);
+    const bool onNlOk = onNl.size() == 3
+        && onNl[0] == L'x' && onNl[1] == L'\n' && onNl[2] == L'y';
+
+    std::unordered_map<std::wstring, std::wstring> userEsc{{L"b", L"p\\nq"}};
+    ctx.userVars = &userEsc;
+    const std::wstring offEsc = ResolveQuickInputText(L"{b}", ctx, false);
+    const bool offEscOk = offEsc == L"p\\nq";
+    const std::wstring onEsc = ResolveQuickInputText(L"{b}", ctx, true);
+    const bool onEscOk = onEsc.size() == 3
+        && onEsc[0] == L'p' && onEsc[1] == L'\n' && onEsc[2] == L'q';
+
+    std::wstring justNl(1, L'\n');
+    std::unordered_map<std::wstring, std::wstring> userJust{{L"c", justNl}};
+    ctx.userVars = &userJust;
+    const std::wstring mixOff = ResolveQuickInputText(L"A\\n{c}", ctx, false);
+    const bool mixOk = mixOff == L"A\\n";
+
+    std::wstring tmplNl = L"A";
+    tmplNl.push_back(L'\n');
+    tmplNl += L"{c}";
+    const std::wstring litOff = ResolveQuickInputText(tmplNl, ctx, false);
+    const bool litOk = litOff.size() == 2
+        && litOff[0] == L'A' && litOff[1] == L'\n';
+
+    OcrVarResult ocr{};
+    ocr.mode = OcrVarMode::Text;
+    ocr.text = L"1";
+    ocr.text.push_back(L'\t');
+    ocr.text += L"2";
+    std::unordered_map<std::wstring, OcrVarResult> ocrVars{{L"ocr", ocr}};
+    MacroVariableContext ocrCtx;
+    ocrCtx.ocrVars = &ocrVars;
+    const std::wstring ocrOff = ResolveQuickInputText(L"{ocr}", ocrCtx, false);
+    const bool ocrOk = ocrOff == L"12";
+
+    const bool ok = offNlOk && onNlOk && offEscOk && onEscOk && mixOk && litOk && ocrOk;
+    Emit(L"resolve_quick_input_var_escapes", ok,
+        ok ? L"" : L"parseEscapes must apply to expanded variable values");
 }
 
 void CaseFindImageTimeSec() {
@@ -349,6 +427,272 @@ void CaseUserVarBeatsMagicName() {
         ok ? L"" : (L"cursor.x=" + cx).c_str());
 }
 
+void CaseVarComputeReturnExports() {
+    MacroVariableContext ctx;
+    const auto r1 = RunVarCompute(L"int n = 4;\ncombo = n + 2;\nreturn combo;", ctx);
+    const bool ok1 = r1.ok && Exported(r1, L"combo") == L"6" && r1.exported.find(L"n") == r1.exported.end();
+    const auto r2 = RunVarCompute(L"int n = 9;\ncombo = n;", ctx);
+    const bool ok2 = r2.ok && r2.exported.empty();
+    const auto r3 = RunVarCompute(
+        L"int s = 0;\nfor (int i = 0; i < 4; ++i) s += i;\nreturn s;", ctx);
+    const bool ok3 = r3.ok && Exported(r3, L"s") == L"6";
+    std::wstring err;
+    const bool parsed = ParseVarCompute(L"if (1) { combo = 1; } return combo;", err);
+    Emit(L"var_compute_return_exports", ok1 && ok2 && ok3 && parsed,
+        (ok1 && ok2 && ok3 && parsed) ? L"" : (r1.error + L" | " + r2.error + L" | "
+            + r3.error + L" s=" + Exported(r3, L"s") + L" | " + err).c_str());
+}
+
+void CaseVarComputeClipboardString() {
+    MacroClipboardSnapshot snap;
+    snap.text = L"hello clip";
+    MacroVariableContext ctx;
+    ctx.clipboardSnapshot = &snap;
+    const auto rText = RunVarCompute(
+        L"string s = ctrl:Clipboard();\nreturn s;", ctx);
+    snap.text.clear();
+    snap.files = { L"C:\\tmp\\a.txt", L"D:\\b.png" };
+    const auto rFiles = RunVarCompute(
+        L"string s = ctrl:Clipboard();\nreturn s;", ctx);
+    const bool ok = rText.ok && Exported(rText, L"s") == L"hello clip"
+        && rFiles.ok && Exported(rFiles, L"s") == L"C:\\tmp\\a.txt\nD:\\b.png";
+    Emit(L"var_compute_clipboard_string", ok,
+        ok ? L"" : (rText.error + L" | " + rFiles.error + L" t=" + Exported(rText, L"s")
+            + L" f=" + Exported(rFiles, L"s")).c_str());
+}
+
+void CaseVarComputeUserVarRoundtrip() {
+    std::unordered_map<std::wstring, std::wstring> user{ {L"combo", L"10"} };
+    MacroVariableContext ctx;
+    ctx.userVars = &user;
+    const auto r = RunVarCompute(L"combo = combo + 1;\nreturn combo;", ctx);
+    const bool exported = r.ok && Exported(r, L"combo") == L"11";
+    if (exported) user[L"combo"] = Exported(r, L"combo");
+    const bool cond = EvaluateConditionExpr(L"combo == 11", ctx);
+    Emit(L"var_compute_user_var_roundtrip", exported && cond,
+        (exported && cond) ? L"" : (r.error + L" v=" + Exported(r, L"combo")).c_str());
+}
+
+void CaseVarComputeOptionalSemiNewline() {
+    MacroVariableContext ctx;
+    const auto rNl = RunVarCompute(L"int a = 2\nreturn a", ctx);
+    const bool okNl = rNl.ok && Exported(rNl, L"a") == L"2";
+    const auto rFlat = RunVarCompute(L"int a = 2               return a", ctx);
+    const bool okFlat = rFlat.ok && Exported(rFlat, L"a") == L"2";
+    std::unordered_map<std::wstring, std::wstring> user;
+    if (okNl) user[L"a"] = Exported(rNl, L"a");
+    ctx.userVars = &user;
+    const bool cond = EvaluateConditionExpr(L"a == 2", ctx);
+    const auto rNeed = RunVarCompute(L"int a = 2 a = 3\nreturn a", ctx);
+    const bool stillNeedSemi = !rNeed.ok;
+    Emit(L"var_compute_optional_semi_newline", okNl && okFlat && cond && stillNeedSemi,
+        (okNl && okFlat && cond && stillNeedSemi) ? L""
+            : (rNl.error + L" | " + rFlat.error + L" | " + rNeed.error
+                + L" n=" + Exported(rNl, L"a") + L" f=" + Exported(rFlat, L"a")).c_str());
+}
+
+void CaseVarComputeStringCompareSign() {
+    std::unordered_map<std::wstring, OcrVarResult> ocr{
+        {L"a", OcrVarResult{OcrVarMode::Text, L"1"}},
+        {L"sign", OcrVarResult{OcrVarMode::Text, L"+"}},
+        {L"b", OcrVarResult{OcrVarMode::Text, L"5"}},
+    };
+    MacroVariableContext ctx;
+    ctx.ocrVars = &ocr;
+    auto runWith = [&](const wchar_t* lit) {
+        std::wstring src = L"int res = 0\nif (sign == ";
+        src += lit;
+        src += L") { res = a + b }\nelse { res = a - b }\nreturn res\n";
+        return RunVarCompute(src, ctx);
+    };
+    const auto rSq = runWith(L"'+'");
+    const auto rDq = runWith(L"\"+\"");
+    const auto rFancy = runWith(L"\u2018+\u2019");
+    std::wstring parseErr;
+    const bool bareFails = !ParseVarCompute(
+        L"int res = 0\nif (sign == +) { res = a + b }\nreturn res", parseErr)
+        && parseErr.find(L"加法") != std::wstring::npos;
+    const bool ok = rSq.ok && Exported(rSq, L"res") == L"6"
+        && rDq.ok && Exported(rDq, L"res") == L"6"
+        && rFancy.ok && Exported(rFancy, L"res") == L"6"
+        && bareFails;
+    std::wstring detail = rSq.error + L" | " + rDq.error + L" | " + rFancy.error
+        + L" sq=" + Exported(rSq, L"res")
+        + L" dq=" + Exported(rDq, L"res")
+        + L" fancy=" + Exported(rFancy, L"res")
+        + L" bare=" + parseErr;
+    Emit(L"var_compute_string_compare_sign", ok, ok ? L"" : detail.c_str());
+}
+
+void CaseVarComputeSplitString() {
+    MacroVariableContext ctx;
+    const auto r = RunVarCompute(
+        L"p = split('24150/24159', '/')\n"
+        L"a = p[0]\n"
+        L"b = p[1]\n"
+        L"n = p.count\n"
+        L"last = p[-1]\n"
+        L"sum = toInt(a) + toInt(b)\n"
+        L"return a, b, n, last, sum\n", ctx);
+    const bool mainOk = r.ok
+        && Exported(r, L"a") == L"24150"
+        && Exported(r, L"b") == L"24159"
+        && Exported(r, L"n") == L"2"
+        && Exported(r, L"last") == L"24159"
+        && Exported(r, L"sum") == L"48309";
+
+    const auto rChain = RunVarCompute(
+        L"a = split('24150/24159', '/')[0]\n"
+        L"n = split('24150/24159', '/').count\n"
+        L"return a, n\n", ctx);
+    const bool chainOk = rChain.ok
+        && Exported(rChain, L"a") == L"24150"
+        && Exported(rChain, L"n") == L"2";
+
+    const auto rMax = RunVarCompute(
+        L"p = split('a/b/c', '/', 2)\n"
+        L"x = p[0]\n"
+        L"y = p[1]\n"
+        L"n = p.length\n"
+        L"return x, y, n\n", ctx);
+    const bool maxOk = rMax.ok
+        && Exported(rMax, L"x") == L"a"
+        && Exported(rMax, L"y") == L"b/c"
+        && Exported(rMax, L"n") == L"2";
+
+    const auto rChar = RunVarCompute(
+        L"p = split('ab', '')\n"
+        L"a = p[0]\n"
+        L"b = p[1]\n"
+        L"c = 'xyz'[1]\n"
+        L"return a, b, c\n", ctx);
+    const bool charOk = rChar.ok
+        && Exported(rChar, L"a") == L"a"
+        && Exported(rChar, L"b") == L"b"
+        && Exported(rChar, L"c") == L"y";
+
+    const auto rTrim = RunVarCompute(
+        L"t = trim('  12 ')\n"
+        L"n = toInt(t)\n"
+        L"s = toString(n + 1)\n"
+        L"return t, n, s\n", ctx);
+    const bool convOk = rTrim.ok
+        && Exported(rTrim, L"t") == L"12"
+        && Exported(rTrim, L"n") == L"12"
+        && Exported(rTrim, L"s") == L"13";
+
+    std::unordered_map<std::wstring, OcrVarResult> ocr{
+        {L"s", OcrVarResult{OcrVarMode::Text, L"24150/24159"}},
+    };
+    ctx.ocrVars = &ocr;
+    const auto rOcr = RunVarCompute(
+        L"p = split(s, '/')\nleft = p[0]\nright = p[1]\nreturn left, right\n", ctx);
+    const bool ocrOk = rOcr.ok
+        && Exported(rOcr, L"left") == L"24150"
+        && Exported(rOcr, L"right") == L"24159";
+
+    ctx.ocrVars = nullptr;
+    const auto rOob = RunVarCompute(L"x = split('a', '/')[1]\nreturn x\n", ctx);
+    const bool oob = !rOob.ok && rOob.error.find(L"下标") != std::wstring::npos;
+    const auto rUnk = RunVarCompute(L"x = foo(1)\nreturn x\n", ctx);
+    const bool unk = !rUnk.ok && rUnk.error.find(L"未知函数") != std::wstring::npos;
+
+    const bool ok = mainOk && chainOk && maxOk && charOk && convOk && ocrOk && oob && unk;
+    std::wstring detail = r.error
+        + L" a=" + Exported(r, L"a")
+        + L" sum=" + Exported(r, L"sum")
+        + L" chain=" + rChain.error
+        + L" max=" + rMax.error + L" y=" + Exported(rMax, L"y")
+        + L" char=" + rChar.error
+        + L" trim=" + rTrim.error
+        + L" ocr=" + rOcr.error
+        + L" oob=" + rOob.error
+        + L" unk=" + rUnk.error;
+    Emit(L"var_compute_split_string", ok, ok ? L"" : detail.c_str());
+}
+
+void CaseCollectVarComputeReturnNames() {
+    const auto fromAst = CollectVarComputeReturnNames(L"int a = 1;\nint b = 2;\nreturn a, b;");
+    const bool astOk = fromAst.size() == 2 && fromAst[0] == L"a" && fromAst[1] == L"b";
+    const auto fromFallback = CollectVarComputeReturnNames(L"@@@ return hp, combo");
+    bool fallbackOk = false;
+    if (fromFallback.size() >= 2) {
+        fallbackOk = fromFallback[0] == L"hp" && fromFallback[1] == L"combo";
+    }
+    std::vector<ScriptAction> acts(1);
+    acts[0].type = ActionType::VarCompute;
+    acts[0].computeCode = L"int combo = 1\nreturn combo";
+    const auto items = BuildQuickInputVarItems(acts);
+    bool listed = false;
+    for (const auto& it : items) {
+        if (it.display == L"combo") { listed = true; break; }
+    }
+    const bool ok = astOk && fallbackOk && listed;
+    Emit(L"collect_varcompute_return_names", ok,
+        ok ? L"" : (L"ast=" + std::to_wstring(fromAst.size())
+            + L" fb=" + std::to_wstring(fromFallback.size())
+            + L" listed=" + (listed ? L"1" : L"0")).c_str());
+}
+
+void CaseResolveMatchListIndex() {
+    ImageMatchResult m0{};
+    m0.found = true;
+    m0.score = 90.0;
+    m0.topLeftX = 10;
+    m0.topLeftY = 20;
+    m0.bottomRightX = 30;
+    m0.bottomRightY = 40;
+    ImageMatchResult m1{};
+    m1.found = true;
+    m1.score = 80.0;
+    m1.topLeftX = 100;
+    m1.topLeftY = 200;
+    m1.bottomRightX = 130;
+    m1.bottomRightY = 240;
+    ImageMatchListVar list;
+    ImageMatchListHit h0;
+    h0.match = m0;
+    h0.templateIndex = 0;
+    h0.templateName = L"a.png";
+    ImageMatchListHit h1;
+    h1.match = m1;
+    h1.templateIndex = 1;
+    h1.templateName = L"b.png";
+    list.hits.push_back(h0);
+    list.hits.push_back(h1);
+    std::unordered_map<std::wstring, ImageMatchListVar> lists{{L"matchRet", list}};
+    MacroVariableContext ctx;
+    ctx.matchListVars = &lists;
+    const std::wstring x0 = ResolveMacroVariables(L"{matchRet[0].x}", ctx);
+    const std::wstring x1 = ResolveMacroVariables(L"{matchRet[1].x}", ctx);
+    const std::wstring count = ResolveMacroVariables(L"{matchRet.count}", ctx);
+    const std::wstring miss = ResolveMacroVariables(L"{matchRet[9].x}", ctx);
+    const std::wstring ph = ResolveMacroVariables(L"{matchRet[n]}", ctx);
+    const std::wstring hit0 = ResolveMacroVariables(L"{matchRet[0]}", ctx);
+    const std::wstring name0 = ResolveMacroVariables(L"{matchRet[0].hitName}", ctx);
+    const bool ok = x0 == L"10" && x1 == L"100" && count == L"2"
+        && miss == L"0" && ph.empty() && hit0 == L"1" && name0 == L"a.png";
+    std::wstring detail = L"x0=" + x0 + L" x1=" + x1 + L" count=" + count
+        + L" miss=" + miss + L" ph=[" + ph + L"] hit0=" + hit0 + L" name=" + name0;
+    Emit(L"resolve_match_list_index", ok, ok ? L"" : detail.c_str());
+}
+
+void CaseBuildQuickInputMultiMatch() {
+    std::vector<ScriptAction> acts(1);
+    acts[0].type = ActionType::MultiMatch;
+    acts[0].matchVarName = L"matchRet";
+    const auto items = BuildQuickInputVarItems(acts);
+    bool hasN = false, has0x = false, hasCount = false;
+    for (const auto& it : items) {
+        if (it.display == L"matchRet[n]") hasN = true;
+        if (it.display == L"matchRet[0].x") has0x = true;
+        if (it.display == L"matchRet.count") hasCount = true;
+    }
+    const bool ok = hasN && has0x && hasCount;
+    Emit(L"build_quick_input_multimatch", ok,
+        ok ? L"" : L"missing matchRet[n] / [0].x / count in quick-input list");
+}
+
 void PrintHelp() {
     std::fwprintf(stderr,
         L"MacroVariablesSelfTest — 宏变量自检\n"
@@ -387,6 +731,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseResolveMatchVar();
     CaseResolveCurLoops();
     CaseDecodeEscapes();
+    CaseResolveQuickInputVarEscapes();
     CaseFindImageTimeSec();
     CaseConditionAndOr();
     CaseGotoStep();
@@ -401,6 +746,15 @@ int wmain(int argc, wchar_t** argv) {
     CaseResolveCtrlHourMinute();
     CaseResolveCtrlClipboard();
     CaseUserVarBeatsMagicName();
+    CaseVarComputeReturnExports();
+    CaseVarComputeClipboardString();
+    CaseVarComputeUserVarRoundtrip();
+    CaseVarComputeOptionalSemiNewline();
+    CaseVarComputeStringCompareSign();
+    CaseVarComputeSplitString();
+    CaseCollectVarComputeReturnNames();
+    CaseResolveMatchListIndex();
+    CaseBuildQuickInputMultiMatch();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

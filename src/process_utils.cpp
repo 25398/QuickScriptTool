@@ -423,7 +423,7 @@ bool ProcessMatchesTarget(const std::wstring& processNameLower,
         if (inDirectory(parentDir)) return true;
     }
 
-    return FileNameFromPath(processPathLower) == targetFileLower && !targetFileLower.empty();
+    return false;
 }
 
 struct CloseWindowsContext {
@@ -505,6 +505,10 @@ std::vector<DWORD> CollectMatchingPids(const std::wstring& targetLower,
 }
 
 } // namespace
+
+std::wstring ProcessImageNameByPid(unsigned long pid) {
+    return ProcessNameByPid(static_cast<DWORD>(pid));
+}
 
 std::wstring GetProcessPathFromPoint(int x, int y) {
     HWND hwnd = WindowFromScreenPoint(x, y);
@@ -714,17 +718,30 @@ bool LaunchProgram(const std::wstring& path, const std::wstring& args) {
         return false;
     }
     const std::wstring resolved = ResolveProgramLaunchPath(path);
-    // 拦截危险 URL scheme（ms-msdt / search-ms / javascript 等）
-    const auto schemeEnd = resolved.find(L"://");
-    if (schemeEnd != std::wstring::npos) {
-        std::wstring scheme = resolved.substr(0, schemeEnd);
+    auto extractScheme = [](const std::wstring& p, std::wstring& scheme) -> bool {
+        const size_t colon = p.find(L':');
+        if (colon == std::wstring::npos || colon == 0) return false;
+        if (colon == 1) {
+            const wchar_t d = p[0];
+            if ((d >= L'A' && d <= L'Z') || (d >= L'a' && d <= L'z')) return false;
+        }
+        for (size_t i = 0; i < colon; ++i) {
+            const wchar_t c = p[i];
+            const bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')
+                || (c >= L'0' && c <= L'9') || c == L'+' || c == L'.' || c == L'-';
+            if (!ok) return false;
+        }
+        scheme = p.substr(0, colon);
         for (auto& ch : scheme) {
             if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
         }
-        if (scheme != L"http" && scheme != L"https" && scheme != L"file") {
-            g_lastLaunchProgramError = L"拒绝启动危险协议「" + scheme + L"」";
-            return false;
-        }
+        return true;
+    };
+    std::wstring scheme;
+    if (extractScheme(resolved, scheme)
+        && scheme != L"http" && scheme != L"https" && scheme != L"file") {
+        g_lastLaunchProgramError = L"拒绝启动危险协议「" + scheme + L"」";
+        return false;
     }
     if (resolved.find(L"://") == std::wstring::npos
         && GetFileAttributesW(resolved.c_str()) == INVALID_FILE_ATTRIBUTES) {

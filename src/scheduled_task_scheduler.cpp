@@ -1,6 +1,7 @@
 #include "scheduled_task_scheduler.h"
 
 #include "scheduled_task_store.h"
+#include "utils.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -158,6 +159,22 @@ void ScheduledTaskScheduler::Reload() {
     std::lock_guard<std::mutex> lock(mutex_);
     const bool wasDisabled = globalDisabled_;
     LoadScheduledTasks(tasks_, &globalDisabled_);
+    bool pathsDirty = false;
+    for (auto& task : tasks_) {
+        if (task.filePath.empty()) continue;
+        if (GetFileAttributesW(task.filePath.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        if (!PathIsUnderDir(task.filePath, ScriptsDir())
+            && !PathIsUnderDir(task.filePath, RecordingsDir())) continue;
+        std::wstring resolved;
+        if (!ResolveLibraryScriptPath(task.filePath, resolved)) continue;
+        if (LibraryPathsEqual(task.filePath, resolved)) continue;
+        task.filePath = std::move(resolved);
+        const auto slash = task.filePath.find_last_of(L"\\/");
+        task.fileDisplayName = (slash == std::wstring::npos)
+            ? task.filePath : task.filePath.substr(slash + 1);
+        pathsDirty = true;
+    }
+    if (pathsDirty) SaveScheduledTasks(tasks_, globalDisabled_);
     PruneLastFireKeysLocked();
     // 全局禁用期间 elapsed 仍在走；解除时重锚，避免一开闸所有间隔任务同时补火。
     if (wasDisabled && !globalDisabled_) intervalClocks_.clear();

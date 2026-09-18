@@ -26,14 +26,9 @@ public:
     void Disconnect();
     bool IsConnected() const { return attached_; }
 
-    /// 扩展版本号（attach 时写入），如 "1.0.21"。
+    /// 扩展版本号（attach 时写入），仅供日志/诊断——勿再用它做能力门禁：
+    /// 版本号已重置为 1.0.0 起重新计数，比较大小不再代表能力（会把可用路径误判为不可用）。
     const std::string& ExtensionVersion() const { return extVersion_; }
-    /// v1.0.19+：iframe canvas 截图（不断桥）。
-    bool SupportsSafeExtScreenshot() const;
-    /// v1.0.21+：扩展视觉协议（vision/screenshot + lifecycle wake），宿主找图禁止 Win32 展开。
-    bool SupportsExtVision() const;
-    /// v1.1.9+：layout/清戳记用 scripting，禁止 debugger soft-swap（否则 MV3 断桥）。
-    bool SupportsStableBridgeApi() const;
     /// attach/layout 后已有可用 iframe CSS 矩形。
     bool HasValidIframeLayout() const;
     int ContentW() const { return contentW_; }

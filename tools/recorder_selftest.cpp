@@ -4,6 +4,7 @@
 #include "coord_space.h"
 #include "input/mouse_rel_split.h"
 #include "input_timeline_scheduler.h"
+#include "low_power_mode.h"
 #include "recorder_timeline.h"
 #include "recording_to_findimage.h"
 #include "recorder.h"
@@ -46,6 +47,9 @@ const selftest::CaseInfo kCases[] = {
     {L"timeline_wait_until_rebases", L"default", L"WaitUntilElapsedUs overshoot also rebases origin"},
     {L"timeline_long_wait_wall", L"default", L"200ms wait keeps wall time (adaptive timer slices)"},
     {L"timeline_gap_from_now_no_catchup", L"default", L"WaitGapUs sleeps from now like 大漠 Delay"},
+    {L"timeline_low_power_keeps_deadlines", L"default",
+        L"低性能模式：自旋压到 800us 后仍按 deadline 命中（抖动 <=2ms），且关掉后恢复原行为"},
+    {L"low_power_flag_toggles", L"default", L"低性能模式开关可开可关（进程级原子量）"},
     {L"scheduler_cancel_interrupts", L"default", L"precision scheduler responds to cancellation"},
     {L"scheduler_wait_until_elapsed", L"default", L"absolute WaitUntilElapsedUs is interruptible"},
     {L"click_capture_rect_clamped", L"findimage", L"near-edge clamp + exclusive rect + offset"},
@@ -661,6 +665,35 @@ void CaseTimelineGapFromNowNoCatchup() {
     Emit(L"timeline_gap_from_now_no_catchup", wallMs > 12.0, L"");
 }
 
+void CaseTimelineLowPowerKeepsDeadlines() {
+    // 低性能模式只把忙自旋从 12ms 压到 800us：绝对时间轴仍必须按 deadline 命中，
+    // 抖动放大到亚毫秒级可以接受，但不能退化成「整段睡过头」。
+    PrecisionInputTimeline tl;
+    SetLowPerformanceMode(true);
+    tl.Reset();
+    LARGE_INTEGER freq{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    for (int i = 0; i < 12; ++i)
+        tl.WaitDeltaUs(1000, [] { return false; });   // 计划 12ms
+    tl.WaitDeltaUs(20000, [] { return false; });      // 再加 20ms → 计划 32ms
+    QueryPerformanceCounter(&t1);
+    const double wallMs = (t1.QuadPart - t0.QuadPart) * 1000.0
+        / static_cast<double>(freq.QuadPart);
+    const auto st = tl.Stats();
+    SetLowPerformanceMode(false);
+
+    const bool wallOk = wallMs > 28.0 && wallMs < 80.0;
+    // p99 迟到 <= 3ms：高精度 waitable timer 唤醒误差约 0.5ms，机器忙时会被调度推迟，
+    // 断言留足余量（只保证不退化，不追求亚毫秒）
+    const bool jitterOk = st.p99LateUs <= 3000;
+    Emit(L"timeline_low_power_keeps_deadlines", wallOk && jitterOk,
+        (L"wall=" + std::to_wstring(static_cast<int>(wallMs)) + L"ms p99迟到="
+            + std::to_wstring(st.p99LateUs) + L"us 事件=" + std::to_wstring(st.eventCount))
+            .c_str());
+    Emit(L"low_power_flag_toggles", !LowPerformanceMode(), L"关闭后开关已复位");
+}
+
 void CaseSchedulerCancel() {
     PrecisionInputTimeline timeline;
     timeline.Reset();
@@ -1103,6 +1136,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseTimelineWaitUntilRebases();
     CaseTimelineLongWaitWall();
     CaseTimelineGapFromNowNoCatchup();
+    CaseTimelineLowPowerKeepsDeadlines();
     CaseSchedulerCancel();
     CaseSchedulerWaitUntil();
     CaseClickCaptureRect();

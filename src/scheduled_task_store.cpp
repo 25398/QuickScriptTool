@@ -110,7 +110,11 @@ ScheduledTask ParseTaskObject(const std::wstring& obj) {
     task.time.minute = ParseIntField(obj, L"minute", 0);
     task.time.second = ParseIntField(obj, L"second", 0);
     task.time.millisecond = ParseIntField(obj, L"millisecond", 0);
-    task.time.weekDays = static_cast<uint8_t>(ParseIntField(obj, L"weekDays", 0));
+    task.time.weekDays = 0;
+    {
+        const int wd = ParseIntField(obj, L"weekDays", 0);
+        task.time.weekDays = static_cast<uint8_t>(std::clamp(wd, 0, 127));
+    }
     task.folder = NormalizeRelativeFolder(ExtractString(obj, L"folder"));
     if (task.id.empty()) task.id = GenerateScheduledTaskId();
     if (task.name.empty()) task.name = DefaultScheduledTaskName();
@@ -222,4 +226,38 @@ bool SaveScheduledTasks(const std::vector<ScheduledTask>& tasks, bool globalDisa
         }
     }
     return true;
+}
+
+int RetargetScheduledTaskFilePaths(const std::wstring& oldPath, const std::wstring& newPath) {
+    if (oldPath.empty() || newPath.empty() || LibraryPathsEqual(oldPath, newPath)) return 0;
+    std::vector<ScheduledTask> tasks;
+    bool globalDisabled = false;
+    if (!LoadScheduledTasks(tasks, &globalDisabled)) return 0;
+    int n = 0;
+    for (auto& t : tasks) {
+        if (t.filePath.empty() || !LibraryPathsEqual(t.filePath, oldPath)) continue;
+        t.filePath = newPath;
+        const auto slash = newPath.find_last_of(L"\\/");
+        t.fileDisplayName = (slash == std::wstring::npos) ? newPath : newPath.substr(slash + 1);
+        ++n;
+    }
+    if (n == 0) return 0;
+    return SaveScheduledTasks(tasks, globalDisabled) ? n : 0;
+}
+
+int RetargetScheduledTaskFilePathPrefix(const std::wstring& oldDir, const std::wstring& newDir) {
+    if (oldDir.empty() || newDir.empty() || LibraryPathsEqual(oldDir, newDir)) return 0;
+    std::vector<ScheduledTask> tasks;
+    bool globalDisabled = false;
+    if (!LoadScheduledTasks(tasks, &globalDisabled)) return 0;
+    int n = 0;
+    for (auto& t : tasks) {
+        if (t.filePath.empty()) continue;
+        if (!RelocatePathUnderDir(t.filePath, oldDir, newDir)) continue;
+        const auto slash = t.filePath.find_last_of(L"\\/");
+        t.fileDisplayName = (slash == std::wstring::npos) ? t.filePath : t.filePath.substr(slash + 1);
+        ++n;
+    }
+    if (n == 0) return 0;
+    return SaveScheduledTasks(tasks, globalDisabled) ? n : 0;
 }

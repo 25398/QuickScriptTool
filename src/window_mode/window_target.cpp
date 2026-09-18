@@ -500,9 +500,10 @@ WindowTargetQuery BuildTargetQuery(const WindowModeScriptConfig& config) {
     const std::wstring& title = !config.windowName.empty() ? config.windowName : config.targetWindowTitle;
     query.titleContains = title;
     // MuMu 等：模拟器换位置后旧 pick 点会落在窗外，导致找不到新窗。
-    if (LooksLikeAndroidEmulatorWindowTitle(query.titleContains)
-        || LooksLikeQtRenderWindowClass(query.className)
-        || LooksLikeAndroidEmulatorExecutable(query.exePath)) {
+    if (!LooksLikeWeixinTarget(config, nullptr)
+        && (LooksLikeAndroidEmulatorWindowTitle(query.titleContains)
+            || LooksLikeQtRenderWindowClass(query.className)
+            || LooksLikeAndroidEmulatorExecutable(query.exePath))) {
         query.pickX = 0;
         query.pickY = 0;
     }
@@ -893,8 +894,8 @@ void EnsureWindowAtSavedNormalRect(HWND hwnd) {
     int x = wp.rcNormalPosition.left;
     int y = wp.rcNormalPosition.top;
     if (x < -20000 || y < -20000) {
-        x = 80;
-        y = 80;
+        // 屏外停放坐标：禁止吸到 (80,80)，否则会把无关窗口钉到左上角。
+        return;
     }
 
     // Always pin to bottom while resizing — never let the window pop above the user.
@@ -1603,10 +1604,15 @@ bool ParkHardwareInputTargetOffscreen(HWND hwnd, WINDOWPLACEMENT* savedWp, bool*
 
     const int x = alreadyOff ? wr.left : kHardwareOffscreenOrigin;
     const int y = alreadyOff ? wr.top : kHardwareOffscreenOrigin;
-    // 顶置只保证 Z 序；SendInput 仍要求该窗是前台。尺寸不得缩小（客户区坐标会偏）。
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    // 禁止 SWP_SHOWWINDOW：系统常把屏外坐标钳回工作区原点，表现为「别的窗口飞到左上角」。
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h,
+        SWP_NOACTIVATE | SWP_NOSENDCHANGING);
     RECT after{};
-    if (!GetWindowRect(hwnd, &after) || after.left > -10000) return false;
+    if (!GetWindowRect(hwnd, &after) || after.left > -10000) {
+        WindowModeLog(L"[窗口模式] 屏外停放被系统钳回，已还原原位置");
+        RestoreHardwareInputTargetOffscreen(hwnd, *savedWp, *savedTopmost);
+        return false;
+    }
     return true;
 }
 
@@ -1734,6 +1740,33 @@ WindowModeHealth EvaluateTargetHealth(HWND hwnd, HDC /*probeDc*/) {
     return WindowModeHealth::Ok;
 }
 
+void ClampRectToContainingWorkArea(RECT& dest, int& destW, int& destH) {
+    if (destW < 1) destW = 1;
+    if (destH < 1) destH = 1;
+    RECT probe = dest;
+    if (probe.right <= probe.left) probe.right = probe.left + destW;
+    if (probe.bottom <= probe.top) probe.bottom = probe.top + destH;
+    HMONITOR mon = MonitorFromRect(&probe, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    RECT wa{0, 0, 1280, 800};
+    if (GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+    else {
+        HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (GetMonitorInfoW(primary, &mi)) wa = mi.rcWork;
+    }
+    const int waW = (std::max)(1, static_cast<int>(wa.right - wa.left));
+    const int waH = (std::max)(1, static_cast<int>(wa.bottom - wa.top));
+    if (destW > waW) destW = waW;
+    if (destH > waH) destH = waH;
+    if (dest.left + destW > wa.right) dest.left = wa.right - destW;
+    if (dest.top + destH > wa.bottom) dest.top = wa.bottom - destH;
+    if (dest.left < wa.left) dest.left = wa.left;
+    if (dest.top < wa.top) dest.top = wa.top;
+    dest.right = dest.left + destW;
+    dest.bottom = dest.top + destH;
+}
+
 // =============================================================================
 // CDP / 扩展停放与展开（≥1.1.39：不 Cloak/α=1，只 Move）
 // =============================================================================
@@ -1793,23 +1826,35 @@ RECT WorkAreaFallbackRect() {
     return RECT{0, 0, 1280, 800};
 }
 
-/// 观看展开用：把目标矩形钳进工作区，避免 2582x1390@40,40 溢出屏幕「像没展开」。
+/// 观看展开用：把目标矩形钳进其所在监视器工作区，避免超大框溢出。
+/// 不得改写到主屏左上角，也不得把小窗放大成整块工作区。
 void FitRectIntoWorkArea(RECT& dest, int& destW, int& destH) {
-    const RECT wa = WorkAreaFallbackRect();
-    const int waW = (std::max)(640, static_cast<int>(wa.right - wa.left));
-    const int waH = (std::max)(400, static_cast<int>(wa.bottom - wa.top));
-    if (destW > waW) destW = waW;
-    if (destH > waH) destH = waH;
-    if (destW < 640) destW = (std::min)(1280, waW);
-    if (destH < 400) destH = (std::min)(800, waH);
-    dest.left = wa.left;
-    dest.top = wa.top;
-    if (dest.left + destW > wa.right) dest.left = wa.right - destW;
-    if (dest.top + destH > wa.bottom) dest.top = wa.bottom - destH;
-    if (dest.left < wa.left) dest.left = wa.left;
-    if (dest.top < wa.top) dest.top = wa.top;
+    ClampRectToContainingWorkArea(dest, destW, destH);
+}
+
+RECT ModestRestoreRect(HWND hwnd) {
+    RECT wr{};
+    if (hwnd && IsWindow(hwnd) && GetWindowRect(hwnd, &wr) && PlacementLooksOnScreen(wr)) {
+        return wr;
+    }
+    HMONITOR mon = (hwnd && IsWindow(hwnd))
+        ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    RECT wa = WorkAreaFallbackRect();
+    if (GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+    const int waW = (std::max)(1, static_cast<int>(wa.right - wa.left));
+    const int waH = (std::max)(1, static_cast<int>(wa.bottom - wa.top));
+    int destW = (std::min)(1280, (std::max)(640, waW * 2 / 3));
+    int destH = (std::min)(800, (std::max)(400, waH * 2 / 3));
+    RECT dest{};
+    dest.left = wa.left + (std::max)(0, (waW - destW) / 2);
+    dest.top = wa.top + (std::max)(0, (waH - destH) / 2);
     dest.right = dest.left + destW;
     dest.bottom = dest.top + destH;
+    ClampRectToContainingWorkArea(dest, destW, destH);
+    return dest;
 }
 
 bool SoftRestoreNonActivating(HWND hwnd);
@@ -1838,7 +1883,7 @@ void RememberCdpParkPlacement(HWND hwnd) {
             && PlacementLooksOnScreen(it->second.rcNormalPosition)) {
             return;
         }
-        wp.rcNormalPosition = WorkAreaFallbackRect();
+        wp.rcNormalPosition = ModestRestoreRect(hwnd);
     }
     wp.flags = static_cast<UINT>(wp.flags & ~WPF_RESTORETOMAXIMIZED);
     g_cdpParkPlacement[hwnd] = wp;
@@ -1873,7 +1918,7 @@ bool RestoreCdpParkPlacementThenMinimize(HWND hwnd) {
         if (!GetWindowPlacement(hwnd, &wp)) return false;
     }
     if (!PlacementLooksOnScreen(wp.rcNormalPosition)) {
-        wp.rcNormalPosition = WorkAreaFallbackRect();
+        wp.rcNormalPosition = ModestRestoreRect(hwnd);
     }
     wp.length = sizeof(WINDOWPLACEMENT);
     wp.flags = static_cast<UINT>(wp.flags & ~WPF_RESTORETOMAXIMIZED);
@@ -1991,6 +2036,33 @@ bool CdpHideLiveOffscreen(HWND hwnd, int viewBefore) {
 
     if (viewBefore >= 0) vda.HoldView(viewBefore, 80);
 
+    RECT afterPark{};
+    if (!GetWindowRect(hwnd, &afterPark) || afterPark.left > -10000) {
+        WindowModeLog(L"[窗口模式] CDP 屏外停放被系统钳回，还原以免窗口留在左上角");
+        if (vda.IsPinnedWindow(hwnd) > 0) vda.UnPinWindow(hwnd);
+        WINDOWPLACEMENT saved{};
+        bool haveSaved = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cdpParkMu);
+            auto it = g_cdpParkPlacement.find(hwnd);
+            if (it != g_cdpParkPlacement.end()) {
+                saved = it->second;
+                haveSaved = PlacementLooksOnScreen(saved.rcNormalPosition);
+            }
+            g_cdpPinned.erase(hwnd);
+        }
+        if (haveSaved) {
+            saved.length = sizeof(WINDOWPLACEMENT);
+            saved.showCmd = SW_SHOWNOACTIVATE;
+            SetWindowPlacement(hwnd, &saved);
+            const RECT& rc = saved.rcNormalPosition;
+            SetWindowPos(hwnd, HWND_BOTTOM, rc.left, rc.top,
+                rc.right - rc.left, rc.bottom - rc.top,
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+        }
+        return false;
+    }
+
     const bool live = !IsIconic(hwnd);
     WindowModeLogf(L"[窗口模式] CDP 出帧隐藏: iconic=%d pin=%d offscreen=1 size=%dx%d",
         live ? 0 : 1, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, w, h);
@@ -2020,7 +2092,7 @@ bool CdpRevealOnMacroForWatch(HWND hwnd) {
         desk.MoveWindowToMacroDesktop(hwnd);
     }
 
-    RECT dest = WorkAreaFallbackRect();
+    RECT dest = ModestRestoreRect(hwnd);
     int destW = dest.right - dest.left;
     int destH = dest.bottom - dest.top;
     {
@@ -2055,14 +2127,19 @@ bool CdpRevealOnMacroForWatch(HWND hwnd) {
         }
         StripCloakAndNearInvisibleAlpha(hwnd);
         ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
-        // 已在屏上但尺寸大于工作区（停放冻结的超大框）：收拢，否则像「展不开」。
+        // 已在屏上但尺寸大于所在监视器工作区（停放冻结的超大框）：收拢。
+        // 禁止用主屏工作区判断位置——副屏窗口会被误判「跑出工作区」并吸到左上角。
         {
             int w = wr.right - wr.left;
             int h = wr.bottom - wr.top;
-            const RECT wa = WorkAreaFallbackRect();
+            HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            RECT wa = WorkAreaFallbackRect();
+            if (GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
             const int waW = wa.right - wa.left;
             const int waH = wa.bottom - wa.top;
-            if (w > waW + 8 || h > waH + 8 || wr.left < wa.left - 8 || wr.top < wa.top - 8) {
+            if (w > waW + 8 || h > waH + 8) {
                 RECT fit = wr;
                 FitRectIntoWorkArea(fit, w, h);
                 SetWindowPos(hwnd, HWND_TOP, fit.left, fit.top, w, h,

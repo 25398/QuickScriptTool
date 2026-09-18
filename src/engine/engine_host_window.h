@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // ──────────────────────────────────────────────────────────────────
 // engine_host_window.h — 引擎宿主窗（原 main_window.h 主体）
 // 产品 WebView 路径：headless EngineHost + Engine* 门面；GDI 主页仅 QST_GDI_LEGACY=1
@@ -46,6 +46,7 @@
 #include "input/mouse_input_backend.h"
 #include "input/synthetic_input_filter.h"
 #include "hotkey_stop.h"
+#include "ime_hotkey_pass.h"
 #include "input_timeline_scheduler.h"
 #include "macro_variables.h"
 #include "macro_debug_window.h"
@@ -197,6 +198,9 @@ inline std::atomic<bool> ghStopPollerExit{false};
 inline std::atomic<HANDLE> ghStopPollerThread{nullptr};
 constexpr UINT_PTR kHotkeyLatchSyncTimerId = 0x48534B31u; // 'HSK1'
 constexpr UINT_PTR kHotkeyHookWatchdogTimerId = 0x48534B32u; // 'HSK2'
+constexpr UINT_PTR kImeHotkeyPassTimerId = 0x48534B33u; // 'HSK3'
+/// UI 线程远程查询的中文模式缓存。LL 钩子禁止 SendMessage，只读这个标志。
+inline std::atomic<bool> ghImeHotkeyPassCache{false};
 /// LL 钩子最后一次收到事件的时间戳（GetTickCount）；配套 Raw 输入 tick 作为
 /// 「系统确实有键盘/鼠标输入」的参照，用于识别 Windows 按 LowLevelHooksTimeout
 /// 静默卸载 LL 钩子后自动重装（引擎看门狗，见 engine_hotkeys.cpp）。
@@ -277,6 +281,27 @@ constexpr DWORD kHoldRawUpConfirmMs = 0;
 /// 长按阈值定时器（Timer Queue，不受隐藏窗 WM_TIMER coalescing 影响）
 inline std::atomic<HANDLE> ghHoldFireTimer{nullptr};
 inline std::atomic<HANDLE> ghHoldReleaseTimer{nullptr};
+/// 定时任务 Tick（headless 引擎窗隐藏后 SetTimer 常被饿死，间隔任务会一直不跑）
+inline std::atomic<HANDLE> ghScheduledTaskQueueTimer{nullptr};
+
+inline void StopScheduledTaskQueueTimer() {
+    HANDLE t = ghScheduledTaskQueueTimer.exchange(nullptr, std::memory_order_acq_rel);
+    if (t) DeleteTimerQueueTimer(nullptr, t, INVALID_HANDLE_VALUE);
+}
+
+inline void CALLBACK ScheduledTaskQueueTimerCb(PVOID, BOOLEAN) {
+    const HWND hwnd = ghHotkeyHwnd;
+    if (hwnd) PostMessageW(hwnd, WM_APP_SCHEDULED_TICK, 0, 0);
+}
+
+inline void StartScheduledTaskQueueTimer() {
+    StopScheduledTaskQueueTimer();
+    HANDLE t = nullptr;
+    if (CreateTimerQueueTimer(&t, nullptr, ScheduledTaskQueueTimerCb, nullptr, 1000, 1000,
+            WT_EXECUTEDEFAULT)) {
+        ghScheduledTaskQueueTimer.store(t, std::memory_order_relaxed);
+    }
+}
 
 inline void CancelHoldThresholdTimer() {
     HANDLE t = ghHoldFireTimer.exchange(nullptr, std::memory_order_acq_rel);
@@ -850,6 +875,12 @@ inline void EnsureHotkeyAuxTimers() {
     if (anyHold || busy) SetTimer(hwnd, kHotkeyLatchSyncTimerId, 16, nullptr);
     else KillTimer(hwnd, kHotkeyLatchSyncTimerId);
     SetTimer(hwnd, kHotkeyHookWatchdogTimerId, busy ? 1000u : 10000u, nullptr);
+    if (ghPassThroughTypingHotkeys.load(std::memory_order_relaxed)) {
+        SetTimer(hwnd, kImeHotkeyPassTimerId, 250, nullptr);
+    } else {
+        ghImeHotkeyPassCache.store(false, std::memory_order_relaxed);
+        KillTimer(hwnd, kImeHotkeyPassTimerId);
+    }
 }
 
 /// 长按从首击起吞键（避免「放行 KEYDOWN + 达阈值再注入 KEYUP」与同键脚本抢键态导致一卡一卡）。
@@ -1048,86 +1079,24 @@ inline void PollHoldReleaseConfirm() {
 /// 现改为禁止注入 ActiveHoldSessionVk，KEYUP 即可可靠停。
 inline void PollHoldPhysDownWatchdog() {}
 
-inline bool QueryRemoteImeOpenFree(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd)) return false;
-    const HWND imeWnd = ImmGetDefaultIMEWnd(hwnd);
-    if (!imeWnd) return false;
-    DWORD_PTR status = 0;
-    if (SendMessageTimeoutW(imeWnd, WM_IME_CONTROL, 0x5, 0,
-            SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &status) == 0) {
-        return false;
+inline void RefreshImeHotkeyPassCache() {
+    if (!ghPassThroughTypingHotkeys.load(std::memory_order_relaxed)) {
+        ghImeHotkeyPassCache.store(false, std::memory_order_relaxed);
+        return;
     }
-    return status != 0;
-}
-
-inline bool QueryRemoteImeNativeModeFree(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd)) return false;
-    const HWND imeWnd = ImmGetDefaultIMEWnd(hwnd);
-    if (!imeWnd) return false;
-    DWORD_PTR mode = 0;
-    // 标准查询：WM_IME_CONTROL IMC_GETCONVERSIONMODE(0x1)，返回值 & IME_CMODE_NATIVE(0x1) 非零即中文模式
-    // 注意 IMC_GETCONVERSIONMODE = 0x0001；0x7 是 IMC_GETCANDIDATEPOS，查询的是候选窗位置，
-    // 会把「位置坐标 & 1」当成中文模式，导致中文输入法检测几乎永远失败、热键误触发。
-    if (SendMessageTimeoutW(imeWnd, WM_IME_CONTROL, 0x1, 0,
-            SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &mode) == 0) {
-        return false;
+    const ime_hotkey_pass::NativeProbe probe =
+        ime_hotkey_pass::ProbeForegroundNativeMode(GetForegroundWindow());
+    if (probe == ime_hotkey_pass::NativeProbe::Unknown) return;
+    const bool block = (probe == ime_hotkey_pass::NativeProbe::Chinese);
+    const bool prev = ghImeHotkeyPassCache.exchange(block, std::memory_order_relaxed);
+    if (prev != block) {
+        HotkeyDiagLog(std::string("IME pass cache=") + (block ? "1" : "0"));
     }
-    return (mode & 0x1) != 0;
 }
 
-/// 兼容路径：直接读焦点窗口 Imm 上下文的转换模式（经典 Win32 应用有效；
-/// 现代 TSF 应用 ImmGetContext 常返回空，走上面的 WM_IME_CONTROL 查询）。
-inline bool QueryImeNativeModeImm(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd)) return false;
-    HIMC himc = ImmGetContext(hwnd);
-    if (!himc) return false;
-    DWORD conv = 0, sent = 0;
-    const BOOL ok = ImmGetConversionStatus(himc, &conv, &sent);
-    ImmReleaseContext(hwnd, himc);
-    return ok && (conv & IME_CMODE_NATIVE) != 0;
-}
-
-/// 仅当中文输入法正在组字时放行热键字符、不触发宏。
-/// 判定只看输入法状态，不按窗口类/壳窗加例外。
-/// 不能仅凭「IME 打开 + 中文模式」抑制——微软拼音等空闲时也常报 native，
-/// 会导致勾选本选项后 F8/脚本热键长期哑火（取消勾选又正常）。
+/// LL 钩子 / 轮询只读缓存。禁止在热路径里 Imm/SendMessage。
 inline bool IsChineseImeActiveForHotkeyPass() {
-    HWND fg = GetForegroundWindow();
-    if (!fg || !IsWindow(fg)) return false;
-
-    DWORD fgPid = 0;
-    GetWindowThreadProcessId(fg, &fgPid);
-    if (fgPid == GetCurrentProcessId()) return false;
-
-    DWORD tid = GetWindowThreadProcessId(fg, nullptr);
-    if (!tid) return false;
-
-    const HKL hkl = GetKeyboardLayout(tid);
-    const LANGID lang = static_cast<LANGID>(reinterpret_cast<ULONG_PTR>(hkl) & 0xFFFF);
-    if (PRIMARYLANGID(lang) != LANG_CHINESE) return false;
-
-    HWND focus = fg;
-    GUITHREADINFO gi{};
-    gi.cbSize = sizeof(gi);
-    if (GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) focus = gi.hwndFocus;
-
-    // 仅「正在组字」才抑制；切到中文键盘但空闲时仍允许热键启停宏。
-    auto imeComposing = [](HWND hwnd) -> bool {
-        if (!hwnd || !IsWindow(hwnd)) return false;
-        HIMC himc = ImmGetContext(hwnd);
-        HWND used = hwnd;
-        if (!himc) {
-            const HWND imeWnd = ImmGetDefaultIMEWnd(hwnd);
-            if (!imeWnd) return false;
-            himc = ImmGetContext(imeWnd);
-            used = imeWnd;
-        }
-        if (!himc) return false;
-        const LONG comp = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
-        ImmReleaseContext(used, himc);
-        return comp > 0;
-    };
-    return imeComposing(focus) || (focus != fg && imeComposing(fg));
+    return ghImeHotkeyPassCache.load(std::memory_order_relaxed);
 }
 
 inline bool CheckHotkeyModifiers(UINT required, bool requireNoExtras) {
@@ -1298,13 +1267,15 @@ inline bool IsAnyHoldHotkeyVk(UINT vk) {
 }
 
 /// 长按热键上的脚本注入：可放行到目标。
-/// INJECTED/ExtraInfo 命中时也要排空 Expect，否则信用残留会把下一次真人松手当成注入。
+/// 仅 ExtraInfo 标签视为本进程注入。远控 SendInput 也带 LLKHF_INJECTED，
+/// 不得据此 Consume Expect，否则真人/远控松手会被当成脚本回声。
 inline bool IsHoldHotkeySyntheticPass(UINT vk, bool down, bool injected, bool taggedSynthetic) {
-    if (injected || taggedSynthetic) {
+    if (hotkey_stop::IsScriptTaggedInjection(taggedSynthetic)) {
         if (down) (void)synthetic_input::ConsumeSyntheticKeyDown(vk);
         else (void)synthetic_input::ConsumeSyntheticKeyUp(vk);
         return true;
     }
+    if (injected) return false;
     return down ? synthetic_input::ConsumeSyntheticKeyDown(vk)
                 : synthetic_input::ConsumeSyntheticKeyUp(vk);
 }
@@ -1360,15 +1331,17 @@ inline LRESULT HotkeyKbProcBody(int code, WPARAM wp, LPARAM lp) {
 
             // ── 首击起吞键 + 同键可注入 + LL 立刻停 ──────────────────────────
             // Interception：注入常无 LLKHF_INJECTED；靠 ExtraInfo + Expect(100ms TTL)。
-            // 松手：注入滤掉后立刻 PostHoldStopNow，不再拖延确认窗。
+            // 松手：脚本 ExtraInfo 滤掉后立刻停；远控 INJECTED 当作用户松手。
             if (up && sessionActive) {
-                // 仅 INJECTED / ExtraInfo 视为注入抬起。软件路径已不再 Expect；
-                // VHID 仍用 Expect，但真人松手以 Raw physicalKeyUp 为主（见 WM_INPUT）。
-                if (injected || taggedSynthetic) {
+                // 仅 ExtraInfo 视为脚本抬起。软件路径已不再 Expect；
+                // VHID 仍用 Expect，但真人/远控松手以 Raw physicalKeyUp 或未打标签的 UP 为主。
+                if (hotkey_stop::IsScriptTaggedInjection(taggedSynthetic)) {
                     (void)synthetic_input::ConsumeSyntheticKeyUp(vkCode);
                     return CallNextHookEx(nullptr, code, wp, lp);
                 }
-                if (ForegroundInputRouter::Instance().IsHidActive()
+                // 远控 INJECTED 不得去 Consume Expect：否则 VHID 同键信用会把 ToDesk 松手吃掉。
+                if (!injected
+                    && ForegroundInputRouter::Instance().IsHidActive()
                     && ForegroundInputRouter::Instance().ActiveBackend()
                         == quickscript::ForegroundInputBackend::VirtualHid
                     && IsHoldHotkeySyntheticPass(vkCode, false, false, false)) {
@@ -1504,15 +1477,16 @@ inline LRESULT HotkeyKbProcBody(int code, WPARAM wp, LPARAM lp) {
         }
 
         // ── 非长按热键：原逻辑（单击启停等）────────────────────────────────
-        // 忙碌时物理按下必须能停：MatchesKey 会把「脚本刚注入的同 VK」当成回声。
+        // 忙碌时用户按下必须能停：MatchesKey 会把「脚本刚注入的同 VK」当成回声。
         // 启动键仍按着（NeedKeyUp）时 Windows 会自动连发 KEYDOWN，不得当成停止；
         // 真丢 KEYUP 由 16ms SyncHotkeyLatches + 松手后再按的轮询兜底。
-        const bool physicalToggle = !injected && !taggedSynthetic;
-        if (physicalToggle && up) {
+        // 远控 SendInput 带 LLKHF_INJECTED 但无 ExtraInfo，必须当作用户键，否则能开不能停。
+        const bool userToggle = !hotkey_stop::IsScriptTaggedInjection(taggedSynthetic);
+        if (userToggle && up) {
             ClearScriptToggleNeedKeyUpForVk(vkCode);
             ClearToggleConsumedForVk(vkCode);
         }
-        if (physicalToggle && ghHotkeyEnabled && !IsMouseVk(ghHotkeyVk)
+        if (userToggle && ghHotkeyEnabled && !IsMouseVk(ghHotkeyVk)
             && vkCode == ghHotkeyVk) {
             if (up && hotkey_stop::ShouldClearToggleLatchOnKeyUp(injected, taggedSynthetic)) {
                 ghHotkeyPending = false;
@@ -1530,7 +1504,7 @@ inline LRESULT HotkeyKbProcBody(int code, WPARAM wp, LPARAM lp) {
         }
 
         // 脚本/录制单击热键：忙碌停也必须在 MatchesKey 之外，否则同 VK 注入回声会吞掉停止。
-        if (physicalToggle && busy && down && ghHotkeyHwnd && !passToApp) {
+        if (userToggle && busy && down && ghHotkeyHwnd && !passToApp) {
             for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
                 auto& h = ghPlaybackScriptHooks[i];
                 if (!h.vk || IsMouseVk(h.vk) || vkCode != h.vk || h.holdMode) continue;
@@ -1543,7 +1517,7 @@ inline LRESULT HotkeyKbProcBody(int code, WPARAM wp, LPARAM lp) {
             }
         }
 
-        if (!injected && !taggedSynthetic && !synthetic_input::MatchesKey(
+        if (userToggle && !synthetic_input::MatchesKey(
                 vkCode,
                 static_cast<unsigned short>(ks->scanCode),
                 extended,
@@ -1656,9 +1630,9 @@ inline LRESULT HotkeyMouseProcBody(int code, WPARAM wp, LPARAM lp) {
     const bool injected = (ms->flags & LLMHF_INJECTED) != 0;
     const bool taggedSynthetic = synthetic_input::IsSyntheticExtraInfo(ms->dwExtraInfo);
     const bool syntheticBtn = synthetic_input::MatchesMouseButton(btnVk, down);
-    const bool injectLike = injected || taggedSynthetic;
 
-    // 忙碌时物理鼠标热键必须能停，不被指纹回声挡住；启动键未抬起则忽略。
+    // 忙碌时用户鼠标热键必须能停，不被指纹回声挡住；启动键未抬起则忽略。
+    // 远控 SendInput 带 LLMHF_INJECTED 但无 ExtraInfo，与键盘同一条规则。
     if (down && ghHotkeyEnabled && IsMouseVk(ghHotkeyVk) && btnVk == ghHotkeyVk
         && !NeedsHoldHotkey()
         && hotkey_stop::ShouldStopOnToggleKeyDown(
@@ -1671,12 +1645,12 @@ inline LRESULT HotkeyMouseProcBody(int code, WPARAM wp, LPARAM lp) {
         }
     }
 
-    // 注入（INJECTED / ExtraInfo）一律放行。MatchesMouseButton 在连点时会持续命中同键，
-    // 不能单独挡住「按住即停」的真人抬起；VHID 注入无 ExtraInfo，指纹仍要挡，真人改走 Raw。
+    // 仅 ExtraInfo 标签一律放行（本进程脚本注入）。MatchesMouseButton 在连点时会持续命中同键，
+    // 不能单独挡住「按住即停」的真人/远控抬起；VHID 注入无 ExtraInfo，指纹仍要挡，真人改走 Raw。
     const bool vhidActive = ForegroundInputRouter::Instance().IsHidActive()
         && ForegroundInputRouter::Instance().ActiveBackend()
             == quickscript::ForegroundInputBackend::VirtualHid;
-    if (injectLike) {
+    if (hotkey_stop::IsScriptTaggedInjection(taggedSynthetic)) {
         return CallNextHookEx(nullptr, code, wp, lp);
     }
     if (syntheticBtn && !(up && MouseHoldShouldAcceptPhysicalUp(btnVk) && !vhidActive)) {
@@ -1893,6 +1867,10 @@ public:
             && debugStepMode_.load(std::memory_order_relaxed);
     }
     int EngineExecutedSteps() const { return executedSteps_.load(std::memory_order_relaxed); }
+    void EnginePlaybackProgress(int& current, int& total) const {
+        current = playbackActionIndex_.load(std::memory_order_relaxed);
+        total = playbackActionTotal_.load(std::memory_order_relaxed);
+    }
     std::wstring EngineRunningScriptName() const {
         std::lock_guard<std::mutex> lock(extScriptStateMu_);
         return runningScriptName_;
@@ -1967,11 +1945,12 @@ public:
             err = L"busy";
             return false;
         }
-        if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::wstring resolved;
+        if (!ResolveLibraryScriptPath(path, resolved)) {
             err = L"script not found";
             return false;
         }
-        const ScriptFileData data = LoadScriptFileData(path, false);
+        const ScriptFileData data = LoadScriptFileData(resolved, false);
         if (data.actions.empty()) {
             err = L"脚本无有效动作";
             return false;
@@ -1981,7 +1960,7 @@ public:
         for (const auto& a : data.actions) {
             if (a.windowRelative) { anyRel = true; break; }
         }
-        windowmode::FinalizeWindowModeForPlayback(wmCfg, anyRel, IsRecordingScriptPath(path));
+        windowmode::FinalizeWindowModeForPlayback(wmCfg, anyRel, IsRecordingScriptPath(resolved));
         if (!ResolveWindowModeSelectMethod(wmCfg)) {
             err = L"窗口模式未就绪或已取消";
             return false;
@@ -1989,10 +1968,10 @@ public:
         CoordMeta execMeta = ScriptCoordMetaForExecution(data.coordMeta);
         std::vector<ScriptAction> execActions =
             PrepareScriptActionsForExecution(data.actions, execMeta);
-        if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(execActions))
+        if (IsRecordingScriptPath(resolved) || ScriptIsTimedInputSequence(execActions))
             RepairCompressedRelativeGaps(execActions);
         const double breakoutTime = EffectiveBreakoutTimeSeconds(data);
-        StartActionsWorker(execActions, path, wmCfg, execMeta, breakoutTime, data.hotkey);
+        StartActionsWorker(execActions, resolved, wmCfg, execMeta, breakoutTime, data.hotkey);
         return running_;
     }
 
@@ -2189,7 +2168,8 @@ public:
     }
 
     void EngineReloadSettings() {
-        LoadAppSettings(appSettings_);
+        quickscript::AppSettings loaded;
+        if (TryLoadAppSettings(loaded)) appSettings_ = std::move(loaded);
         quickscript::ApplyThemeFromSettings(appSettings_);
         clickerSettings_.button = static_cast<quickscript::MouseButtonChoice>(
             std::clamp(appSettings_.home.clickerButton, 0, 2));
@@ -2220,6 +2200,7 @@ public:
     void EngineTouchScheduledIntervalClock(const std::wstring& id) {
         scheduledTasks_.TouchIntervalClock(id);
     }
+    void EngineTickScheduledTasks() { scheduledTasks_.Tick(); }
 
     Hotkey EngineGlobalHotkey() const { return globalHotkey_; }
 
@@ -2237,7 +2218,7 @@ public:
         appSettings_.home.globalHotkeyVk = static_cast<int>(globalHotkey_.vk);
         appSettings_.home.globalHotkeyModifiers = static_cast<int>(globalHotkey_.modifiers);
         appSettings_.home.globalHotkeyHold = globalHotkey_.holdMode;
-        SaveAppSettings(appSettings_);
+        SaveAppSettingsPreserveUserSettings(appSettings_, true);
         RegisterAllHotkeys();
     }
 
@@ -2447,6 +2428,10 @@ private:
                 PollHoldHotkeys();
                 return 0;
             }
+            if (wp == kImeHotkeyPassTimerId) {
+                RefreshImeHotkeyPassCache();
+                return 0;
+            }
             if (wp == kHotkeyHookWatchdogTimerId) {
                 TickHotkeyHookWatchdog();
                 return 0;
@@ -2471,6 +2456,9 @@ private:
             if (wp == kQuickInputTipTimerId) { OnQuickInputTipTimer(); return 0; }
             if (wp == kScheduledTaskTimerId) { scheduledTasks_.Tick(); return 0; }
             return DefWindowProcW(hwnd_, msg, wp, lp);
+        case WM_APP_SCHEDULED_TICK:
+            scheduledTasks_.Tick();
+            return 0;
         case WM_APP_HOTKEY_WATCHDOG:
             TickHotkeyHookWatchdog();
             return 0;
@@ -2923,6 +2911,7 @@ private:
         scheduledTasks_.Reload();
         scheduledTasks_.SetRunCallback([this](const std::wstring& path) { OnScheduledTaskFire(path); });
         SetTimer(hwnd_, kScheduledTaskTimerId, 1000, nullptr);
+        StartScheduledTaskQueueTimer();
         // 延迟到 Show()/WM_APP_ENSURE_TRAY：WM_CREATE 阶段 NIM_ADD 不可靠
         PostMessageW(hwnd_, WM_APP_ENSURE_TRAY, 0, 0);
         SetAgentUiNotifyHwnd(hwnd_);
@@ -3018,7 +3007,7 @@ private:
                 bridgeErr.empty() ? L"(unknown)" : bridgeErr.c_str());
             HotkeyDiagLog("engine: ExtBridge Start failed");
         } else {
-            windowmode::WindowModeLogf(L"[扩展桥] 常开监听 port=%d",
+            windowmode::WindowModeLogEventf(L"[扩展桥] 常开监听 port=%d",
                 ExtBridgeServer::Instance().Port());
             HotkeyDiagLog("engine: ExtBridge Start ok");
         }
@@ -3028,55 +3017,13 @@ private:
         HotkeyDiagLog("engine: VDA Warmup end");
     }
 
-    static bool IsPathInsideScriptsDir(const std::wstring& path) {
-        wchar_t fullBuf[MAX_PATH]{};
-        wchar_t scriptsBuf[MAX_PATH]{};
-        if (!GetFullPathNameW(path.c_str(), MAX_PATH, fullBuf, nullptr)) return false;
-        if (!GetFullPathNameW(ScriptsDir().c_str(), MAX_PATH, scriptsBuf, nullptr)) return false;
-        std::wstring full = fullBuf;
-        std::wstring scripts = scriptsBuf;
-        while (!scripts.empty() && (scripts.back() == L'\\' || scripts.back() == L'/')) {
-            scripts.pop_back();
-        }
-        if (full.size() <= scripts.size()) return false;
-        if (_wcsnicmp(full.c_str(), scripts.c_str(), scripts.size()) != 0) return false;
-        const wchar_t sep = full[scripts.size()];
-        return sep == L'\\' || sep == L'/';
-    }
-
     bool ResolveExtScriptPath(const std::string& pathOrFileUtf8, std::wstring& outPath,
         std::string& err) const {
         if (pathOrFileUtf8.empty()) {
             err = "bad_path";
             return false;
         }
-        std::wstring input = FromUtf8(pathOrFileUtf8);
-        const bool looksLikeFile = input.find(L'\\') == std::wstring::npos
-            && input.find(L'/') == std::wstring::npos
-            && (input.size() < 2 || input[1] != L':');
-        std::wstring candidate;
-        if (looksLikeFile) {
-            std::wstring file = input;
-            if (file.size() < 5
-                || _wcsicmp(file.c_str() + file.size() - 5, L".json") != 0) {
-                file += L".json";
-            }
-            candidate = ScriptsDir() + L"\\" + file;
-        } else {
-            candidate = input;
-        }
-        wchar_t fullBuf[MAX_PATH]{};
-        if (!GetFullPathNameW(candidate.c_str(), MAX_PATH, fullBuf, nullptr)) {
-            err = "bad_path";
-            return false;
-        }
-        outPath = fullBuf;
-        if (!IsPathInsideScriptsDir(outPath)) {
-            err = "bad_path";
-            return false;
-        }
-        const DWORD attrs = GetFileAttributesW(outPath.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (!ResolveLibraryScriptPath(FromUtf8(pathOrFileUtf8), outPath)) {
             err = "bad_path";
             return false;
         }
@@ -5448,7 +5395,17 @@ private:
             popupAiModel_.items.push_back(appSettings_.ai.modelName);
         }
         if (popupAiModel_.sel < 0 || popupAiModel_.sel >= static_cast<int>(popupAiModel_.items.size())) {
-            popupAiModel_.sel = popupAiModel_.items.empty() ? -1 : 0;
+            // ★默认选「设置→AI助手」里的当前模型，而不是列表第 1 个：
+            // 列表顺序是用户添加顺序，默认第 1 个会让新建 AI 动作在用户不知情的情况下
+            // 用上另一个模型（实测：用户选了 deepseek-v4.1-flash，新建动作却默认了豆包）。
+            int defIdx = 0;
+            const std::wstring& def = appSettings_.ai.modelName;
+            if (!def.empty()) {
+                for (size_t i = 0; i < popupAiModel_.items.size(); ++i) {
+                    if (popupAiModel_.items[i] == def) { defIdx = static_cast<int>(i); break; }
+                }
+            }
+            popupAiModel_.sel = popupAiModel_.items.empty() ? -1 : defIdx;
         }
         SetText(aiModelCombo_, popupAiModel_.sel >= 0 && popupAiModel_.sel < static_cast<int>(popupAiModel_.items.size())
             ? popupAiModel_.items[static_cast<size_t>(popupAiModel_.sel)] : L"");
@@ -6219,6 +6176,7 @@ private:
         if (popupOcrResultMode_.sel == 1) {
             MacroVariableContext ctx;
             ctx.matchVars = &matchVars_;
+            ctx.matchListVars = &matchListVars_;
             ctx.ocrVars = &ocrVars_;
             ctx.loopVars = &loopVars_;
             ctx.timerStarts = &timerStarts_;
@@ -6393,6 +6351,7 @@ private:
         case ActionType::GetCursorPos: return 32;
         case ActionType::Goto: return 33;
         case ActionType::MoveMouseRelative: return 34;
+        case ActionType::MultiMatch: return 17;
         default: return 14;
         }
     }
@@ -7316,7 +7275,7 @@ private:
         probe.imageRegionX2 = relX2;
         probe.imageRegionY2 = relY2;
         ImageMatchOptions opt = BuildExecutionFindImageOptions(probe, ts);
-        opt.maxMatches = 20;
+        RestrictFindImageToSingleAnchor(opt);
         opt.maxOverlap = 0.5;
         const ImageMatchOutput output = FindTemplateOnScreenMulti(
             findX1, findY1, findX2, findY2, tmpl, opt);
@@ -7569,6 +7528,7 @@ private:
         if (searchMode) {
             MacroVariableContext ctx;
             ctx.matchVars = &matchVars_;
+            ctx.matchListVars = &matchListVars_;
             ctx.ocrVars = &ocrVars_;
             ctx.loopVars = &loopVars_;
             ctx.timerStarts = &timerStarts_;
@@ -8201,7 +8161,7 @@ private:
         }
         if (Trim(data.scriptName).empty()) {
             data.scriptName = IsRecordingScriptPath(path)
-                ? (L"鼠标录制-" + TimestampName())
+                ? (L"键鼠录制-" + TimestampName())
                 : (L"鼠标宏-" + TimestampName());
         }
         data.recordTime = currentRecordTime_.empty() ? NowText() : currentRecordTime_;
@@ -10456,7 +10416,7 @@ private:
             }
             if (x >= hot.left && x <= hot.right && y >= hot.top && y <= hot.bottom) { CaptureScriptHotkey(i); return; }
             selectedScript_ = selectedScript_ == i ? -1 : i;
-            if (selectedScript_ >= 0) selectedRecording_ = -1;  // 与鼠标录制选择互斥
+            if (selectedScript_ >= 0) selectedRecording_ = -1;  // 与键鼠录制选择互斥
             InvalidateRect(hwnd_, nullptr, FALSE);
             return;
         }
@@ -10927,11 +10887,17 @@ private:
 
     void RunActionsFromPath(const std::wstring& path) {
         if (running_ && workerFinished_.load(std::memory_order_relaxed)) OnRunDone();
-        if (running_ || path.empty()) {
+        std::wstring resolved;
+        if (running_ || path.empty() || !ResolveLibraryScriptPath(path, resolved)) {
             nextRunFromScheduled_ = false;
+            if (!path.empty() && !running_) {
+                const std::wstring msg = L"运行失败：找不到脚本（可能已拖入专业模式文件夹） " + path;
+                AppendDebugLog(msg);
+                windowmode::WindowModeLog(msg);
+            }
             return;
         }
-        const ScriptFileData data = LoadScriptFileData(path, false);
+        const ScriptFileData data = LoadScriptFileData(resolved, false);
         if (data.actions.empty()) {
             nextRunFromScheduled_ = false;
             return;
@@ -10941,7 +10907,7 @@ private:
         for (const auto& a : data.actions) {
             if (a.windowRelative) { anyRel = true; break; }
         }
-        windowmode::FinalizeWindowModeForPlayback(wmCfg, anyRel, IsRecordingScriptPath(path));
+        windowmode::FinalizeWindowModeForPlayback(wmCfg, anyRel, IsRecordingScriptPath(resolved));
         if (!ResolveWindowModeSelectMethod(wmCfg)) {
             nextRunFromScheduled_ = false;
             return;
@@ -10950,11 +10916,11 @@ private:
         CoordMeta execMeta = ScriptCoordMetaForExecution(data.coordMeta);
         std::vector<ScriptAction> execActions =
             PrepareScriptActionsForExecution(data.actions, execMeta);
-        if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(execActions))
+        if (IsRecordingScriptPath(resolved) || ScriptIsTimedInputSequence(execActions))
             RepairCompressedRelativeGaps(execActions);
 
         const double breakoutTime = EffectiveBreakoutTimeSeconds(data);
-        StartActionsWorker(execActions, path, wmCfg, execMeta, breakoutTime,
+        StartActionsWorker(execActions, resolved, wmCfg, execMeta, breakoutTime,
             data.hotkey);
     }
 
@@ -11024,13 +10990,14 @@ private:
     std::wstring ResolveQuickInputText(const std::wstring& text, bool parseEscapes = false) {
         MacroVariableContext ctx;
         ctx.matchVars = &matchVars_;
+        ctx.matchListVars = &matchListVars_;
         ctx.ocrVars = workerUsesOcrVars_ ? &ocrVars_ : nullptr;
         ctx.aiVars = &aiVars_;
+        ctx.userVars = &userVars_;
         ctx.loopVars = &loopVars_;
         ctx.timerStarts = &timerStarts_;
         ctx.curLoops = curLoops_;
-        const std::wstring resolved = ResolveMacroVariables(text, ctx);
-        return parseEscapes ? DecodeQuickInputEscapes(resolved) : resolved;
+        return ::ResolveQuickInputText(text, ctx, parseEscapes);
     }
 
     void SendKey(UINT vk, bool down) {
@@ -11533,7 +11500,7 @@ private:
 
     void SaveRecording() {
         EnsureScriptsDir();
-        const std::wstring baseName = L"鼠标录制-" + TimestampName();
+        const std::wstring baseName = L"键鼠录制-" + TimestampName();
         std::wstring name = baseName;
         std::wstring path = RecordingsDir() + L"\\" + name + L".json";
         for (int suffix = 1; GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++suffix) {
@@ -11984,7 +11951,7 @@ private:
         SelectObject(hdc, homeTabFont_);
         DrawTextIn(hdc, L"键鼠工坊", RECT{UiLen(14), 0, UiLen(120), UiLen(kTitleH)}, kWhite);
         DrawNavTab(hdc, ClickerTabRect(), quickscript::MainTab::Clicker, L"鼠标连点", 0);
-        DrawNavTab(hdc, RecorderTabRect(), quickscript::MainTab::Recorder, L"鼠标录制", 1);
+        DrawNavTab(hdc, RecorderTabRect(), quickscript::MainTab::Recorder, L"键鼠录制", 1);
         DrawNavTab(hdc, MacroTabRect(), quickscript::MainTab::Macro, L"鼠标宏", 2);
         DrawNavTab(hdc, ScriptCustomTabRect(), quickscript::MainTab::ScriptCustom, L"脚本定制", 3);
     }
@@ -13463,6 +13430,14 @@ private:
         const int effectiveTimeoutSec = ResolveAiActionExecuteTimeoutSec(a.aiTimeoutSec, withImage);
         const int timeoutMs = effectiveTimeoutSec * 1000;
 
+        // 模型来源必须可见：曾经「静默换成识图模型」让用户以为软件用错了模型
+        if (!modelName.empty() && !appSettings_.ai.modelName.empty()
+            && modelName != appSettings_.ai.modelName) {
+            AppendAiDebugLog(L"  [诊断] 本动作使用模型「" + modelName
+                + L"」（动作里指定的），与设置→AI助手的当前模型「"
+                + appSettings_.ai.modelName + L"」不同；要改请在编辑器 AI 动作的模型下拉里换");
+        }
+
         // 带图执行：工具 Agent 保留文本主模型（识图走 locate 子模型）；
         // Vision/Composite 改用列表识图模型；皆无则终止本步。
         ScriptAction prepAction = a;
@@ -13527,6 +13502,7 @@ private:
         debugWindowSettingKnown_ = true;
         debugWindowSettingApplied_ = false;
         if (!appSettings_.playback.enableDebugOutputWindow) return;
+        SaveAppSettingsPreserveUserSettings(appSettings_, false);
         appSettings_.playback.enableDebugOutputWindow = false;
         SaveAppSettings(appSettings_);
         NotifyActiveSettingsDialogSync();
@@ -13568,6 +13544,7 @@ private:
         ghHoldThresholdMs.store(
             HoldThresholdMsFromSeconds(appSettings_.other.holdThresholdSeconds),
             std::memory_order_relaxed);
+        UiScaleSetUserFactor(appSettings_.other.uiScaleFactor);
         // 「中文输入法不触发热键」：切换 RegisterHotKey / LL 放行模式
         RegisterAllHotkeys();
     }
@@ -13594,7 +13571,7 @@ private:
         if (statusTipWindow_) ShowWindow(statusTipWindow_, SW_HIDE);
     }
 
-    void Cleanup() { EndHotkeyCaptureRelease(); ClearAllHoldSessionLatches(); FlushHomeStatePersist(); SaveHomeState(); outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); KillTimer(hwnd_, kScheduledTaskTimerId); KillTimer(hwnd_, kHotkeyLatchSyncTimerId); KillTimer(hwnd_, kHomeStatePersistTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } qst::desktop_tools::DestroyMacroDebug(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); ForceEndBreakoutUiState(); breakout_input::UninstallBreakoutHooks(); synthetic_input::UnregisterRawInputSink(hwnd_); ghWorkerCancelFlag = nullptr; stopFlag_ = true; if (worker_.joinable()) worker_.detach(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } ghPlaybackHotkeySuspended = false; ghPassThroughTypingHotkeys.store(false, std::memory_order_relaxed); ghPlaybackScriptHookCount = 0; UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) { UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UnregisterHotKey(hwnd_, HOTKEY_RECORDING_BASE + i); } UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
+    void Cleanup() { EndHotkeyCaptureRelease(); ClearAllHoldSessionLatches(); FlushHomeStatePersist(); SaveHomeState(); outerShadow_.Detach(); FiDbgShutdown(); if (crosshairDrag_.IsActive()) crosshairDrag_.End(); CloseEditorPopup(); CloseClickerDropPopup(); CancelQuickInputTip(); StopScheduledTaskQueueTimer(); KillTimer(hwnd_, kScheduledTaskTimerId); KillTimer(hwnd_, kHotkeyLatchSyncTimerId); KillTimer(hwnd_, kHomeStatePersistTimerId); if (editorDropPopup_) { DestroyWindow(editorDropPopup_); editorDropPopup_ = nullptr; } if (clickerDropPopup_) { DestroyWindow(clickerDropPopup_); clickerDropPopup_ = nullptr; } if (editorTipPopup_) { DestroyWindow(editorTipPopup_); editorTipPopup_ = nullptr; } qst::desktop_tools::DestroyMacroDebug(); if (statusTipWindow_) { DestroyWindow(statusTipWindow_); statusTipWindow_ = nullptr; } StopClickerCleanup(); StopRecordingCleanup(); ForceEndBreakoutUiState(); breakout_input::UninstallBreakoutHooks(); synthetic_input::UnregisterRawInputSink(hwnd_); ghWorkerCancelFlag = nullptr; stopFlag_ = true; if (worker_.joinable()) worker_.detach(); ReleaseAllHeldInputs(); if (trayActive_) { NOTIFYICONDATAW nid{}; nid.cbSize = sizeof(nid); nid.hWnd = hwnd_; nid.uID = 1; Shell_NotifyIconW(NIM_DELETE, &nid); trayActive_ = false; } ghPlaybackHotkeySuspended = false; ghPassThroughTypingHotkeys.store(false, std::memory_order_relaxed); ghPlaybackScriptHookCount = 0; UnregisterHotKey(hwnd_, HOTKEY_GLOBAL_ID); for (int i = 0; i < 100; ++i) { UnregisterHotKey(hwnd_, HOTKEY_SCRIPT_BASE + i); UnregisterHotKey(hwnd_, HOTKEY_RECORDING_BASE + i); } UninstallGlobalHotkeyHooks(); if (crosshairDragCursor_) { DestroyCursor(crosshairDragCursor_); crosshairDragCursor_ = nullptr; } if (findImagePreviewBitmap_) { DeleteBitmapHandle(findImagePreviewBitmap_); findImagePreviewBitmap_ = nullptr; } if (ocrFindImagePreviewBitmap_) { DeleteBitmapHandle(ocrFindImagePreviewBitmap_); ocrFindImagePreviewBitmap_ = nullptr; } if (aiFindImagePreviewBitmap_) { DeleteBitmapHandle(aiFindImagePreviewBitmap_); aiFindImagePreviewBitmap_ = nullptr; } DeleteObject(font_); DeleteObject(editorFont_); DeleteObject(bigFont_); DeleteObject(titleFont_); DeleteObject(hotFont_); DeleteObject(closeFont_); DeleteObject(homeFont_); DeleteObject(homeTabFont_); DeleteObject(whiteBrush_); DeleteObject(panelBrush_); DeleteObject(lineGreenBrush_); }
     void StopClickerCleanup();
     void StopRecordingCleanup() {
         if (recording_) {
@@ -13826,8 +13803,10 @@ private:
     std::unique_ptr<SettingsDialog> settingsDialog_;
 #endif
     std::unordered_map<std::wstring, ImageMatchResult> matchVars_;
+    std::unordered_map<std::wstring, ImageMatchListVar> matchListVars_;
     std::unordered_map<std::wstring, OcrVarResult> ocrVars_;
     std::unordered_map<std::wstring, std::wstring> aiVars_;
+    std::unordered_map<std::wstring, std::wstring> userVars_;
     std::unordered_map<std::wstring, std::wstring> imageVars_;
     std::unordered_map<std::wstring, int> loopVars_;
     std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> timerStarts_;
@@ -13873,6 +13852,8 @@ private:
     std::wstring runningScriptName_;
     windowmode::WindowModeScriptConfig runningWindowMode_{};
     std::atomic<int> executedSteps_{0};
+    std::atomic<int> playbackActionIndex_{0};
+    std::atomic<int> playbackActionTotal_{0};
     windowmode::WindowModeScriptConfig scriptWindowMode_{};
     CoordMeta loadedCoordMeta_{};  // 当前加载脚本的 coordMeta，供保存时复用
 #if (QST_GDI_LEGACY == 1)

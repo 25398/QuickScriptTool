@@ -4,7 +4,7 @@
  * - 主界面客户区 1552×960；鼠标宏编辑界面 1800×1230
  * - 键鼠录制优化弹窗 1640×1140（壳 setMode opt 改客户区）
  * - 动作详情对齐原生窄栏 218 / 找图 120+90，按 --qst-u 等比，勿拉满
- * - 设置 / AI 助手组件与主界面同一倍率 --qst-u = 1.5（见 index.html）
+ * - 设置 / AI 助手组件与主界面同一基准倍率 --qst-u = 1.5，再乘布局缩放（分辨率自适应 × 用户倍率）
  * - #app 铺满 WebView；禁止再用 zoom 把界面缩成左上角小窗
  */
 html, body {
@@ -162,6 +162,27 @@ body::after {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.app.editor-mode .left-col.is-visual .action-table,
+.app.editor-mode .left-col.is-visual .add-bar,
+.app.editor-mode .editor-chrome.is-visual .action-table,
+.app.editor-mode .editor-chrome.is-visual .add-bar,
+.app.visual-editor .action-table,
+.app.visual-editor .add-bar {
+  display: none !important;
+}
+body.editor-no-modify #btnEdRemark {
+  display: none !important;
+}
+body.editor-autosave #btnEdSave {
+  display: none !important;
+}
+.app.editor-mode .left-col.is-visual #visualCanvasHost,
+.app.editor-mode .editor-chrome.is-visual #visualCanvasHost,
+.app.visual-editor #visualCanvasHost {
+  display: block !important;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .app .editor-chrome .col-headers {
   overflow-y: auto;
@@ -393,4 +414,55 @@ body::after {
   width: 100%;
   max-width: 100%;
   min-width: 0;
+}
+.param-block textarea.inp.ed-code,
+.param-block .fline textarea.inp.ed-code {
+  display: block !important;
+  align-items: unset !important;
+  justify-content: unset !important;
+  flex: 1 1 auto;
+  align-self: stretch;
+  width: 100%;
+  min-width: 0;
+  height: auto !important;
+  min-height: calc(13px * var(--qst-u, 1.5) * 1.45 * 8 + 16px * var(--qst-u, 1.5));
+  max-height: none !important;
+  line-height: 1.45 !important;
+  padding: calc(8px * var(--qst-u, 1.5)) calc(10px * var(--qst-u, 1.5)) !important;
+  font-family: var(--mono, Consolas, monospace);
+  font-size: calc(13px * var(--qst-u, 1.5));
+  font-weight: 500;
+  white-space: pre;
+  overflow: auto;
+  resize: vertical;
+  tab-size: 4;
+  cursor: text;
+  box-sizing: border-box;
+}
+.param-block .fline.nwm-btns {
+  width: 100%;
+  gap: calc(6px * var(--qst-u, 1.5));
+  align-items: center;
+}
+.param-block .fline.nwm-btns > button.btn {
+  width: auto;
+  max-width: none;
+  flex: 0 0 auto;
+  min-width: calc(72px * var(--qst-u, 1.5));
+  margin: 0;
+  white-space: nowrap;
+}
+.param-block .fline-stack.nwm-full .stack-ctrl > .inp {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 100%;
+}
+.param-block .fline-stack.nwm-full .stack-lab.nwm-lab {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--qst-u, 1.5));
+}
+.param-block .fline-stack.nwm-full .stack-lab.nwm-lab > .chk {
+  flex: 0 0 auto;
+  font-weight: 500;
 }

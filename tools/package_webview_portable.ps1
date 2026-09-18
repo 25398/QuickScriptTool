@@ -48,8 +48,8 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 }
 
-$exe = Join-Path $ReleaseDir "QstWebViewShell.exe"
-if (-not (Test-Path -LiteralPath $exe)) { throw "Missing $exe" }
+$exe = Join-Path $ReleaseDir "QuickScriptTool.exe"
+if (-not (Test-Path -LiteralPath $exe)) { throw "Missing $exe (CMake target QstWebViewShell, OUTPUT_NAME QuickScriptTool)" }
 
 Write-Host "Staging portable tree: $StageDir"
 if (Test-Path -LiteralPath $StageDir) { Remove-Item -LiteralPath $StageDir -Recurse -Force }
@@ -65,6 +65,7 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\agent.css") -Destination (Join-P
 Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\shell.css") -Destination (Join-Path $StageDir "ui") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\bridge.js") -Destination (Join-Path $StageDir "ui") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\app.js") -Destination (Join-Path $StageDir "ui") -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\visual_editor.js") -Destination (Join-Path $StageDir "ui") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\pro-mode.css") -Destination (Join-Path $StageDir "ui") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\pro-mode.js") -Destination (Join-Path $StageDir "ui") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "ui\app_icon.ico") -Destination (Join-Path $StageDir "ui") -Force
@@ -74,19 +75,31 @@ if (Test-Path -LiteralPath $vendorSrc) {
 }
 Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\app_icon.ico") -Destination $StageDir -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\tray_running.ico") -Destination $StageDir -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\startup.wav") -Destination $StageDir -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\finish.wav") -Destination $StageDir -Force
 
 # Agent Skills（文件化 Skill：对话编辑 / 撤销 / 命令行），随包分发到 skills\agent\
 $skillsStage = Join-Path $StageDir "skills\agent"
 New-Item -ItemType Directory -Force -Path $skillsStage | Out-Null
-foreach ($skillName in @("agent-conversation", "agent-revert", "agent-shell", "agent-script", "agent-optimize")) {
+foreach ($skillName in @("agent-conversation", "agent-revert", "agent-shell", "agent-script", "agent-optimize", "agent-command", "agent-office", "agent-game")) {
+    $section = $skillName -replace "^agent-", ""
+    if ($skillName -eq "agent-script") { $section = "scriptstrategy" }
+    # 产品 Skill 优先从 skills/agent/<section>.md 取（我们的资产）；
+    # 老的五份仍以 .cursor/skills/agent-*/SKILL.md 为源，作为过渡。
+    $productSrc = Join-Path $RepoRoot (Join-Path "skills\agent" ($section + ".md"))
     $skillSrc = Join-Path $RepoRoot (Join-Path ".cursor\skills" (Join-Path $skillName "SKILL.md"))
-    if (Test-Path -LiteralPath $skillSrc) {
-        $section = $skillName -replace "^agent-", ""
-        if ($skillName -eq "agent-script") { $section = "scriptstrategy" }
+    if (Test-Path -LiteralPath $productSrc) {
+        Copy-Item -LiteralPath $productSrc -Destination (Join-Path $skillsStage ($section + ".md")) -Force
+    } elseif (Test-Path -LiteralPath $skillSrc) {
         Copy-Item -LiteralPath $skillSrc -Destination (Join-Path $skillsStage ($section + ".md")) -Force
     }
 }
 
+# 办公文档提取脚本：readDocument 工具的运行必需项（缺了会报「找不到 office\read_doc.ps1」）
+$officeStage = Join-Path $StageDir "office"
+New-Item -ItemType Directory -Force -Path $officeStage | Out-Null
+Copy-Item -LiteralPath (Join-Path $RepoRoot "tools\office\read_doc.ps1") `
+    -Destination (Join-Path $officeStage "read_doc.ps1") -Force
 # Prefer POST_BUILD copy if present; else cache
 $builtFixed = Join-Path $ReleaseDir "WebView2Fixed"
 $srcFixed = if (Test-Path -LiteralPath (Join-Path $builtFixed "msedgewebview2.exe")) { $builtFixed } else { $FixedCache }
@@ -108,7 +121,7 @@ $readme = @"
 本包不包含、也不需要 QuickScriptTool.Gdi.exe（旧 GDI 界面仅为开发可选逃生舱）。
 
 目录说明：
-  QstWebViewShell.exe   — 启动程序（产品）
+  QuickScriptTool.exe   — 启动程序（产品）
   ui\                   — 界面资源（勿删）
   WebView2Fixed\        — 内置 WebView2 Fixed Runtime（勿删）
   WebView2UserData\     — 运行时用户数据（可删，下次自动重建）

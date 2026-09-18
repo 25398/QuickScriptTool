@@ -9,14 +9,24 @@
 
 ## 一键安装（推荐）
 
-发版目录需包含：
+发版默认包只含安装/修复脚本，不含 `package\*.sys` / `interception.dll`（降低杀软误报）。
+设置里点安装会先下载官网 `QuickScriptTool-HidDriver.zip` 再 UAC。开发目录或已手动放下内核文件的用户可直接装。
+
+发版目录（默认 zip）：
 
 ```
 driver\qst_vhid\_elevate_install.ps1
 driver\qst_vhid\repair_boot.ps1
+```
+
+可选 HidDriver zip 另含：
+
+```
+interception.dll
 driver\qst_vhid\package\QstVHid.sys
 driver\qst_vhid\package\qst_vhid.inf
 driver\qst_vhid\package\qst_vhid.cat
+driver\qst_vhid\package\interception.sys
 ```
 
 用法：打开 QuickScriptTool → 设置 → **安装虚拟 HID / Interception 驱动**（管理员）。

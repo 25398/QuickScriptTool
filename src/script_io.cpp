@@ -6,10 +6,95 @@
 #include "recorder_timeline.h"
 #include "window_mode/window_mode_json.h"
 
+#include <cwctype>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+
+std::wstring ExtractNamedJsonObject(const std::wstring& content, const wchar_t* key) {
+    if (!key || !*key) return {};
+    const std::wstring pat = std::wstring(L"\"") + key + L"\"";
+    size_t search = 0;
+    while (search < content.size()) {
+        const auto k = content.find(pat, search);
+        if (k == std::wstring::npos) return {};
+        size_t i = k + pat.size();
+        while (i < content.size() && (content[i] == L' ' || content[i] == L'\t'
+            || content[i] == L'\n' || content[i] == L'\r')) {
+            ++i;
+        }
+        if (i >= content.size() || content[i] != L':') {
+            search = k + pat.size();
+            continue;
+        }
+        ++i;
+        while (i < content.size() && (content[i] == L' ' || content[i] == L'\t'
+            || content[i] == L'\n' || content[i] == L'\r')) {
+            ++i;
+        }
+        if (i >= content.size() || content[i] != L'{') return {};
+        const auto end = FindMatchingJsonBrace(content, i);
+        if (end == std::wstring::npos) return {};
+        return content.substr(i, end - i + 1);
+    }
+    return {};
+}
+
+namespace {
+
+bool VisualLayoutLooksValid(const std::wstring& json) {
+    if (json.size() < 2 || json.front() != L'{') return false;
+    const auto end = FindMatchingJsonBrace(json, 0);
+    return end != std::wstring::npos && end + 1 == json.size();
+}
+
+// 勿用 ExtractString 读 watchMode：值为数字时会误取到下一个键名。
+int ParseWatchModeField(const std::wstring& block) {
+    const std::wstring key = L"\"watchMode\"";
+    const auto pos = block.find(key);
+    if (pos == std::wstring::npos) return 0;
+    const auto colon = block.find(L':', pos + key.size());
+    if (colon == std::wstring::npos) return 0;
+    size_t i = colon + 1;
+    while (i < block.size() && (block[i] == L' ' || block[i] == L'\t'
+        || block[i] == L'\n' || block[i] == L'\r')) {
+        ++i;
+    }
+    if (i >= block.size()) return 0;
+    if (block[i] == L'"') {
+        ++i;
+        std::wstring s;
+        bool esc = false;
+        for (; i < block.size(); ++i) {
+            const wchar_t c = block[i];
+            if (esc) {
+                s.push_back(c);
+                esc = false;
+                continue;
+            }
+            if (c == L'\\') {
+                esc = true;
+                continue;
+            }
+            if (c == L'"') break;
+            s.push_back(c);
+        }
+        if (s == L"time" || s == L"timed" || s == L"interval"
+            || s == L"1" || s == L"true") return 1;
+        return 0;
+    }
+    const auto end = block.find_first_of(L",}\n", i);
+    try {
+        return std::stod(Trim(block.substr(i, end == std::wstring::npos
+            ? std::wstring::npos : end - i))) != 0.0 ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+} // namespace
 
 bool IsRecordingScriptPath(const std::wstring& path) {
     if (path.empty()) return false;
@@ -36,6 +121,7 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     else if (type == L"mouseDown") a.type = ActionType::MouseDown;
     else if (type == L"mouseUp") a.type = ActionType::MouseUp;
     else if (type == L"mouseClick") a.type = ActionType::MouseClick;
+    else if (type == L"mouseDrag") a.type = ActionType::MouseDrag;
     else if (type == L"mousePlayback") a.type = ActionType::MousePlayback;
     else if (type == L"runMacro") a.type = ActionType::RunMacro;
     else if (type == L"keyDown") a.type = ActionType::KeyDown;
@@ -45,6 +131,9 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     else if (type == L"quickInput") a.type = ActionType::QuickInput;
     else if (type == L"scrollWheel") a.type = ActionType::ScrollWheel;
     else if (type == L"findImage") a.type = ActionType::FindImage;
+    else if (type == L"multiMatch") a.type = ActionType::MultiMatch;
+    else if (type == L"watchImage") a.type = ActionType::WatchImage;
+    else if (type == L"varCompute") a.type = ActionType::VarCompute;
     else if (type == L"textRecognition") a.type = ActionType::TextRecognition;
     else if (type == L"wait") a.type = ActionType::Wait;
     else if (type == L"loop") a.type = ActionType::Loop;
@@ -73,6 +162,12 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     else a.type = ActionType::CustomText;
     a.customText = ExtractString(block, L"text");
     a.remark = ExtractString(block, L"remark");
+    if (a.type == ActionType::CustomText && type != L"customText") {
+        const std::wstring tag = L"[未知动作] " + type;
+        if (a.remark.empty()) a.remark = tag;
+        else if (a.remark.find(L"[未知动作]") == std::wstring::npos)
+            a.remark = tag + L" " + a.remark;
+    }
     a.originalNo = static_cast<int>(ExtractNumber(block, L"no", static_cast<double>(fallbackNo + 1)));
     a.indent = static_cast<int>(ExtractNumber(block, L"indent", 0));
 
@@ -144,6 +239,18 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
         a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
     }
+    if (a.coordsAreNormalized) {
+        a.nEndX = ExtractNumber(block, L"endX", 0.0);
+        a.nEndY = ExtractNumber(block, L"endY", 0.0);
+        a.nRandomEndX = ExtractNumber(block, L"randomEndX", 0.0);
+        a.nRandomEndY = ExtractNumber(block, L"randomEndY", 0.0);
+    } else {
+        a.endX = static_cast<int>(ExtractNumber(block, L"endX", 0));
+        a.endY = static_cast<int>(ExtractNumber(block, L"endY", 0));
+        a.randomEndX = static_cast<int>(ExtractNumber(block, L"randomEndX", 0));
+        a.randomEndY = static_cast<int>(ExtractNumber(block, L"randomEndY", 0));
+    }
+    a.imageLocate = ExtractBool(block, L"imageLocate", false);
     a.moveFromVar = ExtractNumber(block, L"moveFromVar", 0) != 0;
     a.moveVarExprX = ExtractString(block, L"moveVarExprX");
     a.moveVarExprY = ExtractString(block, L"moveVarExprY");
@@ -161,8 +268,10 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
             || a.type == ActionType::KeyUp)) {
         a.keyText = L"7";
     }
-    a.keyVk = static_cast<UINT>(ExtractNumber(block, L"keyVk",
-        a.keyText.size() == 1 ? towupper(a.keyText[0]) : 0));
+    a.keyVk = NormalizeScriptKeyVk(
+        static_cast<UINT>(ExtractNumber(block, L"keyVk",
+            a.keyText.size() == 1 ? towupper(a.keyText[0]) : 0)),
+        a.keyText);
     a.holdLeftWin = ExtractNumber(block, L"holdLeftWin", 0) != 0;
     a.holdRightWin = ExtractNumber(block, L"holdRightWin", 0) != 0;
     a.holdLeftCtrl = ExtractNumber(block, L"holdLeftCtrl", 0) != 0;
@@ -190,6 +299,31 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.targetPath = ExtractString(block, L"targetPath");
     a.playbackSpeed = quickscript::ClampPlaybackSpeed(
         ExtractNumber(block, L"playbackSpeed", 1.0));
+    if (a.type == ActionType::RunMacro || a.type == ActionType::MousePlayback) {
+        const auto useModePos = block.find(L"\"useMode\"");
+        if (useModePos == std::wstring::npos) {
+            a.useMode = kNestedUseModeInherit;
+        } else {
+            const auto colon = block.find(L':', useModePos + 9);
+            size_t i = (colon == std::wstring::npos) ? block.size() : colon + 1;
+            while (i < block.size() && (block[i] == L' ' || block[i] == L'\t'
+                || block[i] == L'\n' || block[i] == L'\r')) {
+                ++i;
+            }
+            if (i < block.size() && block[i] == L'"') {
+                a.useMode = NestedUseModeFromText(ExtractString(block, L"useMode"));
+            } else {
+                a.useMode = NormalizeNestedUseMode(
+                    static_cast<int>(ExtractNumber(block, L"useMode", kNestedUseModeInherit)));
+            }
+        }
+        a.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
+            ExtractNumber(block, L"breakoutTimeSeconds", 0.0));
+        const std::wstring nestedWm = ExtractNamedJsonObject(block, L"nestedWindowMode");
+        if (!nestedWm.empty()) {
+            a.nestedWindowMode = windowmode::ParseWindowModeConfigObject(nestedWm, false);
+        }
+    }
     a.shortcutPreset = static_cast<int>(ExtractNumber(block, L"shortcutPreset", 0));
     a.inputText = ExtractString(block, L"inputText");
     a.charInterval = ExtractNumber(block, L"charInterval", 0.01);
@@ -207,9 +341,31 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.searchFullScreen = ExtractNumber(block, L"searchFullScreen", 1) != 0;
     a.imageUseVar = ExtractNumber(block, L"imageUseVar", 0) != 0;
     a.imagePath = ExtractString(block, L"imagePath");
-    if (!a.imagePath.empty() && !a.imageUseVar) {
+    a.imagePaths = ExtractJsonStringArray(block, L"imagePaths");
+    a.imageUseVars.clear();
+    for (int flag : ExtractJsonIntArray(block, L"imageUseVars")) {
+        a.imageUseVars.push_back(flag != 0 ? 1 : 0);
+    }
+    if (a.imageUseVars.empty() && a.imageUseVar) {
+        a.imageUseVars.push_back(1);
+    }
+    while (a.imageUseVars.size() < a.imagePaths.size()) a.imageUseVars.push_back(0);
+    if (a.imageUseVars.size() > a.imagePaths.size()) {
+        a.imageUseVars.resize(a.imagePaths.size());
+    }
+    const bool pathIsVar = a.imageUseVar || (!a.imageUseVars.empty() && a.imageUseVars[0] != 0);
+    if (!a.imagePath.empty() && !pathIsVar) {
         a.imagePath = ResolveImagePath(a.imagePath);
     }
+    for (size_t i = 0; i < a.imagePaths.size(); ++i) {
+        const bool useVar = i < a.imageUseVars.size() && a.imageUseVars[i] != 0;
+        if (!useVar && !a.imagePaths[i].empty()) {
+            a.imagePaths[i] = ResolveImagePath(a.imagePaths[i]);
+        }
+    }
+    a.multiMatchMode = static_cast<int>(ExtractNumber(block, L"multiMatchMode", 0));
+    a.multiMatchMax = static_cast<int>(ExtractNumber(block, L"multiMatchMax", kMultiMatchMaxHits));
+    a.multiMatchSort = static_cast<int>(ExtractNumber(block, L"multiMatchSort", 0));
     a.matchThreshold = ExtractNumber(block, L"matchThreshold", 65.0);
     a.perfectMatch = ExtractNumber(block, L"perfectMatch", 0) != 0;
     a.imageScale = ExtractNumber(block, L"imageScale", 1.0);
@@ -217,7 +373,13 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.imageScaleMax = ExtractNumber(block, L"imageScaleMax", a.imageScale);
     a.findImageFollowUp = static_cast<int>(ExtractNumber(block, L"findImageFollowUp", 0));
     if (a.findImageFollowUp < 0) a.findImageFollowUp = 0;
-    if (a.findImageFollowUp > 3) a.findImageFollowUp = 3;
+    if (a.type == ActionType::FindColor) {
+        if (a.findImageFollowUp > 2) a.findImageFollowUp = 2;
+    } else if (a.type == ActionType::MultiMatch) {
+        if (a.findImageFollowUp > 2) a.findImageFollowUp = 2;
+    } else if (a.findImageFollowUp > 3) {
+        a.findImageFollowUp = 3;
+    }
     if (!coordsNormalized) {
         a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
         a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
@@ -225,7 +387,12 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
     a.findTimeExpr = ExtractString(block, L"findTimeExpr");
     if (a.findTimeExpr.empty()) a.findTimeExpr = L"0";
-    if (a.findImageFollowUp == 2 || a.findImageFollowUp == 3) a.findTimeExpr = L"0";
+    // 保存图片无模板是纯截屏，不需要等图；保存匹配度/有模板的保存图片与点击/移动一样走 findTimeExpr。
+    if (a.type == ActionType::FindImage
+        && a.findImageFollowUp == 3
+        && a.imagePath.empty()) {
+        a.findTimeExpr = L"0";
+    }
     a.matchVarName = ExtractString(block, L"matchVarName");
     if (a.matchVarName.empty()) {
         if (a.type == ActionType::TextRecognition) a.matchVarName = L"a";
@@ -247,6 +414,20 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.ocrFollowUp = static_cast<int>(ExtractNumber(block, L"ocrFollowUp", 0));
     a.conditionExpr = ExtractString(block, L"conditionExpr");
     a.gotoStepExpr = ExtractString(block, L"gotoStepExpr");
+    a.resumeAfterWatch = ExtractNumber(block, L"resumeAfterWatch", 1) != 0;
+    a.watchMode = ParseWatchModeField(block);
+    {
+        // 缺 watchPollSeconds 时 ExtractNumber 默认 1 会挡住 watchPollInterval 别名
+        double poll = ExtractNumber(block, L"watchPollSeconds", 0.0);
+        if (!(poll > 0.0)) poll = ExtractNumber(block, L"watchPollInterval", 0.0);
+        if (!(poll > 0.0)) poll = 1.0;
+        if (poll < 0.05) poll = 0.05;
+        if (poll > 3600.0) poll = 3600.0;
+        a.watchPollSeconds = poll;
+    }
+    a.computeCode = ExtractString(block, L"computeCode");
+    if (a.type == ActionType::VarCompute && a.computeCode.empty())
+        a.computeCode = a.inputText;
     a.matchFileNameOnly = ExtractNumber(block, L"matchFileNameOnly", 0) != 0;
     // imageRegion*：模板内相对偏移。旧 OCR 锚点脚本把相对值写在 search* 上，需迁移。
     const bool hasImageRegionKey = block.find(L"\"imageRegionX1\"") != std::wstring::npos;
@@ -314,6 +495,7 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     }
     a.captureOffsetX = static_cast<int>(ExtractNumber(block, L"captureOffsetX", 0));
     a.captureOffsetY = static_cast<int>(ExtractNumber(block, L"captureOffsetY", 0));
+    NormalizeMultiMatchFields(a);
     return a;
 }
 
@@ -334,14 +516,23 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
         file << L"      \"y\": " << a.y << L",\n";
         file << L"      \"randomX\": " << a.randomX << L",\n";
         file << L"      \"randomY\": " << a.randomY << L",\n";
+        file << L"      \"endX\": " << a.endX << L",\n";
+        file << L"      \"endY\": " << a.endY << L",\n";
+        file << L"      \"randomEndX\": " << a.randomEndX << L",\n";
+        file << L"      \"randomEndY\": " << a.randomEndY << L",\n";
     } else {
         // 写入归一化坐标（0.0–1.0 浮点数）
         file << L"      \"x\": " << a.nx << L",\n";
         file << L"      \"y\": " << a.ny << L",\n";
         file << L"      \"randomX\": " << a.nRandomX << L",\n";
         file << L"      \"randomY\": " << a.nRandomY << L",\n";
+        file << L"      \"endX\": " << a.nEndX << L",\n";
+        file << L"      \"endY\": " << a.nEndY << L",\n";
+        file << L"      \"randomEndX\": " << a.nRandomEndX << L",\n";
+        file << L"      \"randomEndY\": " << a.nRandomEndY << L",\n";
     }
     file << L"      \"moveFromVar\": " << (a.moveFromVar ? 1 : 0) << L",\n";
+    file << L"      \"imageLocate\": " << (a.imageLocate ? 1 : 0) << L",\n";
     file << L"      \"moveVarExprX\": \"" << EscapeJson(a.moveVarExprX) << L"\",\n";
     file << L"      \"moveVarExprY\": \"" << EscapeJson(a.moveVarExprY) << L"\",\n";
     file << L"      \"button\": \"" << JsonButton(a.button) << L"\",\n";
@@ -370,6 +561,24 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     if (a.type == ActionType::MousePlayback) {
         file << L"      \"playbackSpeed\": " << a.playbackSpeed << L",\n";
     }
+    if (a.type == ActionType::RunMacro || a.type == ActionType::MousePlayback) {
+        file << L"      \"useMode\": " << NormalizeNestedUseMode(a.useMode) << L",\n";
+        file << L"      \"breakoutTimeSeconds\": " << a.breakoutTimeSeconds << L",\n";
+        windowmode::WindowModeScriptConfig nestedWm = a.nestedWindowMode;
+        if (a.useMode == kNestedUseModeWindow || a.useMode == kNestedUseModeBackground) {
+            nestedWm.enabled = true;
+            nestedWm.executionKind = (a.useMode == kNestedUseModeBackground)
+                ? windowmode::WindowModeExecutionKind::BackgroundWindow
+                : windowmode::WindowModeExecutionKind::HiddenDesktop;
+        } else if (NestedWindowModeHasIdentity(nestedWm) || nestedWm.windowRelativeCoordinates) {
+            nestedWm.enabled = true;
+        } else {
+            nestedWm.enabled = false;
+        }
+        std::wstring nestedWmJson;
+        windowmode::WriteNestedWindowModeJson(nestedWmJson, nestedWm, true);
+        file << nestedWmJson;
+    }
     file << L"      \"shortcutPreset\": " << a.shortcutPreset << L",\n";
     file << L"      \"inputText\": \"" << EscapeJson(a.inputText) << L"\",\n";
     file << L"      \"charInterval\": " << a.charInterval << L",\n";
@@ -396,12 +605,45 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
         if (a.type == ActionType::FindImage && !a.imagePath.empty()) {
             return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
         }
+        if (a.type == ActionType::MultiMatch && !a.imagePath.empty() && !a.imageUseVar) {
+            return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
+        }
+        if (a.type == ActionType::WatchImage && !a.imagePath.empty()) {
+            return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
+        }
+        if (a.imageLocate && !a.imagePath.empty()
+            && (a.type == ActionType::MouseDrag
+                || a.type == ActionType::GetColor
+                || a.type == ActionType::ColorMatch
+                || a.type == ActionType::FindColor)) {
+            return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
+        }
         if (a.type == ActionType::TextRecognition && a.ocrRegionByImage && !a.imagePath.empty()) {
             return ImagePathForJson(EnsureImageInLibrary(a.imagePath));
         }
         return a.imagePath;
     }();
     file << L"      \"imagePath\": \"" << EscapeJson(savedImagePath) << L"\",\n";
+    if (a.type == ActionType::MultiMatch) {
+        file << L"      \"imagePaths\": [";
+        for (size_t i = 0; i < a.imagePaths.size(); ++i) {
+            if (i) file << L", ";
+            std::wstring p = a.imagePaths[i];
+            const bool useVar = MultiMatchSlotUseVar(a, static_cast<int>(i));
+            if (!useVar && !p.empty()) p = ImagePathForJson(EnsureImageInLibrary(p));
+            file << L"\"" << EscapeJson(p) << L"\"";
+        }
+        file << L"],\n";
+        file << L"      \"imageUseVars\": [";
+        for (size_t i = 0; i < a.imagePaths.size(); ++i) {
+            if (i) file << L", ";
+            file << (MultiMatchSlotUseVar(a, static_cast<int>(i)) ? 1 : 0);
+        }
+        file << L"],\n";
+        file << L"      \"multiMatchMode\": " << a.multiMatchMode << L",\n";
+        file << L"      \"multiMatchMax\": " << a.multiMatchMax << L",\n";
+        file << L"      \"multiMatchSort\": " << a.multiMatchSort << L",\n";
+    }
     file << L"      \"matchThreshold\": " << a.matchThreshold << L",\n";
     file << L"      \"perfectMatch\": " << (a.perfectMatch ? 1 : 0) << L",\n";
     file << L"      \"imageScale\": " << a.imageScale << L",\n";
@@ -440,6 +682,10 @@ void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last)
     }
     file << L"      \"conditionExpr\": \"" << EscapeJson(a.conditionExpr) << L"\",\n";
     file << L"      \"gotoStepExpr\": \"" << EscapeJson(a.gotoStepExpr) << L"\",\n";
+    file << L"      \"resumeAfterWatch\": " << (a.resumeAfterWatch ? 1 : 0) << L",\n";
+    file << L"      \"watchMode\": " << a.watchMode << L",\n";
+    file << L"      \"watchPollSeconds\": " << a.watchPollSeconds << L",\n";
+    file << L"      \"computeCode\": \"" << EscapeJson(a.computeCode) << L"\",\n";
     file << L"      \"matchFileNameOnly\": " << (a.matchFileNameOnly ? 1 : 0) << L",\n";
     // ── AI 动作字段 ──
     file << L"      \"aiPrompt\": \"" << EscapeJson(a.aiPrompt) << L"\",\n";
@@ -513,7 +759,13 @@ void ApplyWindowRelativePlaybackConfig(ScriptFileData& data, const std::wstring&
 bool ScriptNormValuesLookLikePixels(const std::vector<ScriptAction>& actions) {
     for (const auto& a : actions) {
         if (!a.coordsAreNormalized) continue;
-        if (a.nx > 1.5 || a.ny > 1.5 || a.nSearchX2 > 1.5 || a.nSearchY2 > 1.5
+        // 找图定位的 x/y 相对模板，偏移可超出图外（nx>1.5 仍合法）
+        const bool templateRelXy = a.imageLocate
+            && (a.type == ActionType::MouseDrag
+                || a.type == ActionType::GetColor
+                || a.type == ActionType::ColorMatch);
+        if (!templateRelXy && (a.nx > 1.5 || a.ny > 1.5)) return true;
+        if (a.nSearchX2 > 1.5 || a.nSearchY2 > 1.5
             || a.nAiSearchX2 > 1.5 || a.nAiSearchY2 > 1.5) {
             return true;
         }
@@ -553,6 +805,8 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
         ExtractNumber(content, L"breakoutTimeSeconds", 0));
     data.windowMode = windowmode::ParseWindowModeJson(content);
+    data.visualLayoutJson = ExtractNamedJsonObject(content, L"visualLayout");
+    if (!VisualLayoutLooksValid(data.visualLayoutJson)) data.visualLayoutJson.clear();
 
     // 解析 coordMeta
     if (HasCoordMetaJson(content)) {
@@ -626,6 +880,8 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
         ExtractNumber(content, L"breakoutTimeSeconds", 0));
     data.windowMode = windowmode::ParseWindowModeJson(content);
+    data.visualLayoutJson = ExtractNamedJsonObject(content, L"visualLayout");
+    if (!VisualLayoutLooksValid(data.visualLayoutJson)) data.visualLayoutJson.clear();
 
     if (HasCoordMetaJson(content)) {
         data.coordMeta = ParseCoordMetaJson(content);
@@ -782,4 +1038,122 @@ bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data) {
         }
     }
     return true;
+}
+
+namespace {
+
+int RetargetNestedLibraryRefs(bool prefix, const std::wstring& oldRef, const std::wstring& newRef) {
+    if (oldRef.empty() || newRef.empty() || LibraryPathsEqual(oldRef, newRef)) return 0;
+    int filesChanged = 0;
+    auto visitRoot = [&](const std::wstring& root) {
+        std::vector<ScriptFileEntry> files;
+        EnumerateScriptJsonFiles(root, files);
+        for (const auto& fe : files) {
+            if (LibraryPathsEqual(fe.path, newRef)) continue;
+            ScriptFileData data = LoadScriptFileData(fe.path, false);
+            bool changed = false;
+            for (auto& a : data.actions) {
+                if (a.type != ActionType::RunMacro && a.type != ActionType::MousePlayback)
+                    continue;
+                if (a.targetPath.empty()) continue;
+                if (prefix) {
+                    if (RelocatePathUnderDir(a.targetPath, oldRef, newRef)) changed = true;
+                } else if (LibraryPathsEqual(a.targetPath, oldRef)) {
+                    a.targetPath = newRef;
+                    changed = true;
+                }
+            }
+            if (changed && SaveScriptFileData(fe.path, data)) ++filesChanged;
+        }
+    };
+    visitRoot(ScriptsDir());
+    visitRoot(RecordingsDir());
+    return filesChanged;
+}
+
+}  // namespace
+
+int RetargetNestedLibraryScriptPaths(const std::wstring& oldPath, const std::wstring& newPath) {
+    return RetargetNestedLibraryRefs(false, oldPath, newPath);
+}
+
+int RetargetNestedLibraryScriptPathPrefix(const std::wstring& oldDir, const std::wstring& newDir) {
+    return RetargetNestedLibraryRefs(true, oldDir, newDir);
+}
+
+namespace {
+
+std::wstring NormalizeScriptPathKey(const std::wstring& scriptPath) {
+    wchar_t full[MAX_PATH]{};
+    const DWORD n = GetFullPathNameW(scriptPath.c_str(), MAX_PATH, full, nullptr);
+    std::wstring key = (n > 0 && n < MAX_PATH) ? full : scriptPath;
+    for (wchar_t& ch : key) {
+        if (ch == L'/') ch = L'\\';
+        ch = static_cast<wchar_t>(towlower(ch));
+    }
+    return key;
+}
+
+uint64_t Fnv1a64W(const std::wstring& s) {
+    uint64_t h = 14695981039346656037ull;
+    for (wchar_t c : s) {
+        h ^= static_cast<uint64_t>(c);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::wstring HexU64(uint64_t v) {
+    wchar_t buf[17];
+    swprintf_s(buf, L"%016llX", static_cast<unsigned long long>(v));
+    return buf;
+}
+
+}  // namespace
+
+std::wstring VisualLayoutCachePathForScript(const std::wstring& scriptPath) {
+    const std::wstring dir = AppDir() + L"\\cache\\visual";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir + L"\\" + HexU64(Fnv1a64W(NormalizeScriptPathKey(scriptPath))) + L".json";
+}
+
+bool SaveVisualLayoutCache(const std::wstring& scriptPath, const std::wstring& json) {
+    if (scriptPath.empty() || json.size() < 2 || json.front() != L'{') return false;
+    const std::wstring path = VisualLayoutCachePathForScript(scriptPath);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    const auto bytes = ToUtf8(json);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return out.good();
+}
+
+bool LoadVisualLayoutCache(const std::wstring& scriptPath, std::wstring& jsonOut) {
+    jsonOut.clear();
+    if (scriptPath.empty()) return false;
+    const std::wstring path = VisualLayoutCachePathForScript(scriptPath);
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    jsonOut = ReadAll(path);
+    while (!jsonOut.empty() && (jsonOut.front() == 0xFEFF || jsonOut.front() == L' ' || jsonOut.front() == L'\n')) {
+        jsonOut.erase(jsonOut.begin());
+    }
+    return jsonOut.size() >= 2 && jsonOut.front() == L'{';
+}
+
+void DeleteVisualLayoutCache(const std::wstring& scriptPath) {
+    if (scriptPath.empty()) return;
+    const std::wstring path = VisualLayoutCachePathForScript(scriptPath);
+    DeleteFileW(path.c_str());
+}
+
+void MoveVisualLayoutCache(const std::wstring& oldScriptPath, const std::wstring& newScriptPath) {
+    if (oldScriptPath.empty() || newScriptPath.empty()) return;
+    if (_wcsicmp(oldScriptPath.c_str(), newScriptPath.c_str()) == 0) return;
+    std::wstring json;
+    if (!LoadVisualLayoutCache(oldScriptPath, json)) {
+        DeleteVisualLayoutCache(newScriptPath);
+        return;
+    }
+    SaveVisualLayoutCache(newScriptPath, json);
+    DeleteVisualLayoutCache(oldScriptPath);
 }

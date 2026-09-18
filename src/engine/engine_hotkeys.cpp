@@ -333,6 +333,8 @@ void EngineHost::UninstallGlobalHotkeyHooks() {
         ghHotkeyEnabled = false;
         KillTimer(hwnd_, kHotkeyLatchSyncTimerId);
         KillTimer(hwnd_, kHotkeyHookWatchdogTimerId);
+        KillTimer(hwnd_, kImeHotkeyPassTimerId);
+        ghImeHotkeyPassCache.store(false, std::memory_order_relaxed);
         ClearRegFailIds();
         if (ghHotkeyKbHook)     { UnhookWindowsHookEx(ghHotkeyKbHook);     ghHotkeyKbHook     = nullptr; }
         if (ghHotkeyMouseHook)  { UnhookWindowsHookEx(ghHotkeyMouseHook);  ghHotkeyMouseHook  = nullptr; }
@@ -523,7 +525,7 @@ void EngineHost::OnHotkey(int id, int holdCmd) {
             if (clicking_) { StopClicking(); return; }
             if (recording_) { StopRecording(); return; }
             if (running_) { StopRun(); return; }
-            // 「中文输入法不触发热键」：组字时不启动连点/宏/录制（停止不受影响）
+            // 「中文输入法不触发热键」：中文模式不启动连点/宏/录制（停止不受影响）
             if (ShouldSuppressHotkeyWhileTyping()) return;
             if (activeHomeTab_ == quickscript::MainTab::Clicker) {
                 ToggleClicker();
@@ -680,7 +682,7 @@ void EngineHost::OnHotkey(int id, int holdCmd) {
             // 长按热键不走 RegisterHotKey 单击通道；若仍收到 holdCmd==0 则忽略
             if (holdKey) return;
 
-            // 「中文输入法不触发热键」：组字时不启动宏（运行中仍可停）
+            // 「中文输入法不触发热键」：中文模式不启动宏（运行中仍可停）
             if (!running_ && ShouldSuppressHotkeyWhileTyping()) return;
             const DWORD now = GetTickCount();
             const bool busy = running_ || ghHotkeySessionBusy.load(std::memory_order_relaxed);

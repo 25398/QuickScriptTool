@@ -3,10 +3,13 @@
 #include "action_utils.h"
 #include "background_uia_input.h"
 #include "background_input_target.h"
+#include "cdp/cdp_input.h"
+#include "utils.h"
 #include "window_coords.h"
 #include "window_mode_log.h"
 #include "window_mode_types.h"
 #include "window_target.h"
+#include "fake_focus/fake_focus_soft_input_host.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +19,49 @@
 #include <thread>
 
 namespace windowmode {
+
+LPARAM BuildWindowKeyLParam(UINT vk, bool down) {
+    UINT scan = 0;
+    switch (vk) {
+    case VK_UP: scan = 0x48; break;
+    case VK_LEFT: scan = 0x4B; break;
+    case VK_RIGHT: scan = 0x4D; break;
+    case VK_DOWN: scan = 0x50; break;
+    case VK_INSERT: scan = 0x52; break;
+    case VK_DELETE: scan = 0x53; break;
+    case VK_HOME: scan = 0x47; break;
+    case VK_END: scan = 0x4F; break;
+    case VK_PRIOR: scan = 0x49; break;
+    case VK_NEXT: scan = 0x51; break;
+    default: {
+        UINT scanEx = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+        if (!scanEx) scanEx = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        scan = scanEx & 0xFFu;
+        // DirectInput 风格 0xCB 不能塞进 WM 的 8 位扫描码字段。
+        if (scan >= 0x80) scan &= 0x7Fu;
+        break;
+    }
+    }
+    LPARAM lParam = 1;
+    if (scan) lParam |= static_cast<LPARAM>(scan) << 16;
+    // 方向/编辑键必须带 KF_EXTENDED：否则 VK_LEFT 会被当成小键盘 4。
+    switch (vk) {
+    case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT:
+    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+    case VK_INSERT: case VK_DELETE:
+    case VK_DIVIDE: case VK_NUMLOCK:
+    case VK_RCONTROL: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN: case VK_APPS:
+    case VK_SNAPSHOT:
+        lParam |= (1 << 24); // KF_EXTENDED
+        break;
+    default:
+        break;
+    }
+    if (down) return lParam;
+    lParam |= (1 << 30) | (static_cast<LPARAM>(1) << 31);
+    return lParam;
+}
 
 namespace {
 
@@ -34,6 +80,78 @@ bool g_softVkDown[256] = {};
 
 bool SoftIsVkDown(UINT vk) {
     return vk < 256 && g_softVkDown[vk];
+}
+
+bool g_lcaQueuedKeys = false;
+
+bool LooksLikeMapleStoryHwnd(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    HWND top = TopLevelTargetWindow(hwnd);
+    if (!top) top = hwnd;
+    wchar_t cls[256]{};
+    GetClassNameW(top, cls, 256);
+    if (LooksLikeMapleStoryWindowClass(cls)) return true;
+    GetClassNameW(hwnd, cls, 256);
+    if (LooksLikeMapleStoryWindowClass(cls)) return true;
+    wchar_t title[512]{};
+    GetWindowTextW(top, title, 512);
+    if (LooksLikeMapleStoryTitle(title)) return true;
+    return LooksLikeMapleStoryExecutable(QueryHwndProcessImagePath(top));
+}
+
+bool ShouldPostLcaQueuedKeys(HWND hwnd) {
+    if (g_lcaQueuedKeys) return true;
+    return LooksLikeMapleStoryHwnd(hwnd);
+}
+
+bool LooksLikeWeixinSoftHwnd(HWND hwnd) {
+    return LooksLikeWeixinTarget(WindowModeScriptConfig{}, hwnd);
+}
+
+bool LooksLikeQtSoftHwnd(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    if (LooksLikeQtRenderWindowClass(cls)) return true;
+    HWND top = TopLevelTargetWindow(hwnd);
+    if (top && top != hwnd) {
+        GetClassNameW(top, cls, 256);
+        if (LooksLikeQtRenderWindowClass(cls)) return true;
+    }
+    return false;
+}
+
+bool ClassPrefersPostedQuickKeys(const wchar_t* cls) {
+    if (!cls || !cls[0]) return false;
+    if (LooksLikeQtRenderWindowClass(cls)) return true;
+    if (LooksLikeAdobeAirWindowClass(cls)) return true;
+    if (LooksLikeGameWindowClass(cls)) return true;
+    if (LooksLikeChromiumBrowserClass(cls)) return true;
+    if (LooksLikeEmulatorWindowClass(cls)) return true;
+    if (LooksLikeMapleStoryWindowClass(cls)) return true;
+    if (LooksLikeGlfwOrSdlWindowClass(cls)) return true;
+    return false;
+}
+
+bool WindowPrefersPostedQuickKeys(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    HWND top = TopLevelTargetWindow(hwnd);
+    if (!top) top = hwnd;
+    if (LooksLikeWeixinSoftHwnd(hwnd) || LooksLikeWeixinSoftHwnd(top)) return true;
+    if (ShouldPostLcaQueuedKeys(hwnd) || ShouldPostLcaQueuedKeys(top)) return true;
+    if (IsAndroidEmulatorTarget(top, nullptr) || IsAndroidEmulatorTarget(hwnd, nullptr)) {
+        return true;
+    }
+    if (HwndLooksLikeChromiumShell(hwnd) || HwndLooksLikeChromiumShell(top)) return true;
+    if (IsDesktopEmulatorTarget(top, nullptr)) return true;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    if (ClassPrefersPostedQuickKeys(cls)) return true;
+    if (top != hwnd) {
+        GetClassNameW(top, cls, 256);
+        if (ClassPrefersPostedQuickKeys(cls)) return true;
+    }
+    return false;
 }
 
 void SoftSetVkDown(UINT vk, bool down) {
@@ -72,6 +190,13 @@ bool IsTextInputClass(const wchar_t* cls) {
         if (_wcsicmp(cls, name) == 0) return true;
     }
     return false;
+}
+
+bool WindowAcceptsWmPaste(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    return IsTextInputClass(cls);
 }
 
 BOOL CALLBACK FindTextInputProc(HWND hwnd, LPARAM lp) {
@@ -162,6 +287,12 @@ bool IsMouseWindowMessage(UINT msg) {
 bool DeliverWindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!hwnd || !IsWindow(hwnd)) return false;
     HWND top = TopLevelTargetWindow(hwnd);
+    if (LooksLikeWeixinSoftHwnd(hwnd) || LooksLikeWeixinSoftHwnd(top)) {
+        const BOOL ok = PostMessageW(hwnd, msg, wp, lp);
+        if (top && IsWindow(top)) PostMessageW(top, WM_NULL, 0, 0);
+        else PostMessageW(hwnd, WM_NULL, 0, 0);
+        return ok != FALSE;
+    }
     if (IsAndroidEmulatorTarget(top ? top : hwnd, nullptr)) {
         if (IsMouseWindowMessage(msg)) {
             return NotifyWindowMessage(hwnd, msg, wp, lp);
@@ -314,6 +445,9 @@ private:
 
 bool SendQuickInputViaClipboard(HWND input, const std::wstring& text, bool /*usePostMessage*/) {
     if (!input || !IsWindow(input) || text.empty()) return false;
+    // QWindow / AIR / 游戏 / Chromium 控件都会“成功”吃掉 WM_PASTE 但输入框不动。
+    // 只对真正的 Edit/RichEdit 等声称粘贴成功，其余走 KEY* 或 WM_CHAR。
+    if (!WindowAcceptsWmPaste(input)) return false;
 
     ScopedClipboardUnicodeText clip(text);
     if (!clip.Ok()) return false;
@@ -325,26 +459,7 @@ bool SendQuickInputViaClipboard(HWND input, const std::wstring& text, bool /*use
 }
 
 LPARAM BuildKeyLParam(UINT vk, bool down) {
-    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-    LPARAM lParam = 1;
-    if (scan) lParam |= static_cast<LPARAM>(scan) << 16;
-    // 与 SendKeyboardKey 一致：方向/编辑键标扩展位，避免被当成小键盘
-    switch (vk) {
-    case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT:
-    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
-    case VK_INSERT: case VK_DELETE:
-    case VK_DIVIDE: case VK_NUMLOCK:
-    case VK_RCONTROL: case VK_RMENU:
-    case VK_LWIN: case VK_RWIN: case VK_APPS:
-    case VK_SNAPSHOT:
-        lParam |= (1 << 24); // KF_EXTENDED
-        break;
-    default:
-        break;
-    }
-    if (down) return lParam;
-    lParam |= (1 << 30) | (static_cast<LPARAM>(1) << 31);
-    return lParam;
+    return BuildWindowKeyLParam(vk, down);
 }
 
 /// 用软修饰键态把 VK 译成字符（后台路径看不到物理 GetKeyState 的脚本 Shift）。
@@ -405,12 +520,23 @@ void PrimeWindowSoftFocus(HWND hwnd) {
     if (!top) top = hwnd;
     // DeSmuME：不要发 WM_SETFOCUS/ACTIVATE（wx 消息泵敏感，易偶发崩）。
     if (IsDesktopEmulatorTarget(top, nullptr)) return;
+    if (ShouldPostLcaQueuedKeys(hwnd) || ShouldPostLcaQueuedKeys(top)) {
+        // LCA 后台一：按键前不发 WM_ACTIVATE/SETFOCUS（冒险岛发激活会冻客户端）。
+        return;
+    }
+    // 微信 4.x Qt：WM_ACTIVATE 会让客户端 SetForegroundWindow，把微信切到前台。
+    if (LooksLikeWeixinSoftHwnd(hwnd) || LooksLikeWeixinSoftHwnd(top)) {
+        return;
+    }
     wchar_t title[512]{};
     wchar_t cls[256]{};
-    GetWindowTextW(top, title, 512);
     GetClassNameW(hwnd, cls, 256);
-    if (LooksLikeAndroidEmulatorWindowTitle(title)
-        || LooksLikeQtRenderWindowClass(cls)) {
+    GetWindowTextW(top, title, 512);
+    // 只给安卓模拟器发 WM_ACTIVATE。勿把所有 Qt*QWindowIcon（含其它 Qt 桌面程序）都激活，
+    // 否则会像微信一样抢前台。
+    if (IsAndroidEmulatorTarget(top, nullptr)
+        || LooksLikeAndroidEmulatorWindowTitle(title)
+        || LooksLikeAndroidEmulatorWindowClass(cls)) {
         PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
         if (g_haveLastClientPos && g_lastClientHwnd == hwnd) {
             const WPARAM moveFlags = ModifierKeyFlags() | g_softMouseFlags;
@@ -510,7 +636,8 @@ HWND ResolveBackgroundPostTarget(HWND hwnd, int& cx, int& cy) {
     if (!root) root = hwnd;
 
     // DeSmuME：触摸只吃顶层 WM_LBUTTON*，勿重定向到子窗。
-    if (IsDesktopEmulatorTarget(root, nullptr)) {
+    // 冒险岛：LCA 后台一键鼠都打到绑定的顶层 MapleStory 窗，不要落到最大子表面。
+    if (IsDesktopEmulatorTarget(root, nullptr) || ShouldPostLcaQueuedKeys(root)) {
         if (root != hwnd) {
             MapClientPointBetweenHwnds(hwnd, root, cx, cy);
         }
@@ -540,8 +667,40 @@ HWND ResolveBackgroundPostTarget(HWND hwnd, int& cx, int& cy) {
     return hwnd;
 }
 
+/// 后台逐字投递的最小时序（毫秒）。
+/// 真实键盘不会在同一瞬间完成 DOWN→UP：多数目标按帧取键，且只在「该键仍按下」时
+/// 才接受由自己的 TranslateMessage 合成的 WM_CHAR。零间隔连发会把整串按键挤进同一帧、
+/// 并把所有 WM_CHAR 排到所有 KEYUP 之后，表现为吞字
+/// （实测：后台窗口快捷输入 "11" 只进一个 1；前台走 SendInput 正常）。
+/// 现场试值：环境变量 QST_LCA_KEY_MS=<0~500> 同时覆盖按住与间隔（0=关闭，回到旧的立刻 DOWN/UP）。
+int PostedKeyStepMs() {
+    static const int value = [] {
+        wchar_t buf[16]{};
+        const DWORD n = GetEnvironmentVariableW(L"QST_LCA_KEY_MS", buf, 16);
+        if (n > 0 && n < 16) {
+            const int parsed = _wtoi(buf);
+            if (parsed >= 0 && parsed <= 500) return parsed;
+        }
+        return 24;  // ≥1 帧（60fps≈17ms / 30fps≈33ms 取中）
+    }();
+    return value;
+}
+
+/// 队列屏障开关（默认开）。关掉即回到「纯固定按住时序」，只用于现场 A/B 对照：
+/// 环境变量 QST_LCA_NO_BARRIER=1。
+bool PostedKeyBarrierEnabled() {
+    static const bool value = [] {
+        wchar_t buf[8]{};
+        return GetEnvironmentVariableW(L"QST_LCA_NO_BARRIER", buf, 8) == 0;
+    }();
+    return value;
+}
+
 HWND ResolveSoftInputHwnd(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return nullptr;
+    HWND root = TopLevelTargetWindow(hwnd);
+    if (!root) root = hwnd;
+    if (ShouldPostLcaQueuedKeys(root) || ShouldPostLcaQueuedKeys(hwnd)) return root;
     int lastX = 0;
     int lastY = 0;
     if (GetLastSoftMouseClientPos(hwnd, lastX, lastY)) {
@@ -549,8 +708,6 @@ HWND ResolveSoftInputHwnd(HWND hwnd) {
         int hitY = lastY;
         if (HWND hit = ResolveBackgroundPostTarget(hwnd, hitX, hitY)) return hit;
     }
-    HWND root = TopLevelTargetWindow(hwnd);
-    if (!root) root = hwnd;
     if (HWND surface = FindBackgroundInputChild(root, nullptr)) {
         if (surface != root) return surface;
     }
@@ -581,6 +738,37 @@ bool SendQuickInputViaSoftChars(HWND input, const std::wstring& text, double cha
 }
 
 }  // namespace
+
+void SetLcaBackgroundMessageMode(bool enabled) {
+    g_lcaQueuedKeys = enabled;
+}
+
+bool WaitSoftKeyPostTurn(HWND target, int timeoutMs) {
+    if (!target || !IsWindow(target)) return false;
+    if (!FakeFocusSoftInput_IsAttached() || !FakeFocusSoftInput_PostKeyEventsEnabled()) return false;
+    // 现场 A/B：QST_NO_SOFT_KEY_BARRIER=1 关掉软键屏障（回到「宿主一次写完所有键态」的旧行为）。
+    {
+        static const bool disabled = [] {
+            wchar_t buf[8]{};
+            return GetEnvironmentVariableW(L"QST_NO_SOFT_KEY_BARRIER", buf, 8) != 0;
+        }();
+        if (disabled) return false;
+    }
+    // 交叉点：DLL 灌键线程 1ms 轮询后才把事件 PostMessage 给目标，而状态（down[]）由宿主**立刻**写好。
+    // 因此这里先用一次跨线程同步消息做「队列屏障」：屏障消息排在已投递的键消息之后被目标处理，
+    // 它返回时目标已经跑完这批键的 WndProc（Chromium 正是在那里 GetKeyState 判 Ctrl+V 组合键）。
+    // 两趟：第一趟可能早于灌键线程的 PostMessage，第二趟兜住那一笔。
+    bool ok = false;
+    for (int pass = 0; pass < 2; ++pass) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(pass == 0 ? 2 : 1));
+        DWORD_PTR res = 0;
+        ok = SendMessageTimeoutW(target, WM_NULL, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_NORMAL,
+            static_cast<UINT>(timeoutMs > 0 ? timeoutMs : 80), &res) != 0;
+        if (!ok) return false;
+    }
+    return true;
+}
 
 bool GetLastSoftMouseClientPos(HWND hwnd, int& cx, int& cy) {
     if (!g_haveLastClientPos) return false;
@@ -624,6 +812,158 @@ HWND FindTextInputTarget(HWND root) {
     FindTextInputContext ctx{};
     EnumChildWindows(root, FindTextInputProc, reinterpret_cast<LPARAM>(&ctx));
     return ctx.found;
+}
+
+bool SendQuickInputViaPostedKeys(HWND hwnd, const std::wstring& text, double charInterval,
+    const std::atomic_bool* cancelFlag) {
+    if (!hwnd || !IsWindow(hwnd) || text.empty()) return false;
+    HWND top = TopLevelTargetWindow(hwnd);
+    if (!top || !IsWindow(top)) top = hwnd;
+
+    const bool drainKeys = FakeFocusSoftInput_IsAttached()
+        && FakeFocusSoftInput_PostKeyEventsEnabled();
+    const bool weixin = LooksLikeWeixinSoftHwnd(hwnd) || LooksLikeWeixinSoftHwnd(top);
+    WindowModeLog(weixin
+        ? L"[窗口模式] 微信 Qt 快捷输入走 KEY*/Ctrl+V，不向 QWindow 发 WM_PASTE"
+        : L"[窗口模式] 快捷输入：非 Edit 走 KEY*/Ctrl+V（不发 WM_PASTE）");
+
+    // 按住/间隔：见 PostedKeyStepMs 注释。用户给了字间隔就取较大者，绝不低于最小时序。
+    const int stepMs = PostedKeyStepMs();
+    int gapMs = stepMs;
+    if (charInterval > 0) {
+        gapMs = std::max(gapMs, static_cast<int>(charInterval * 1000.0 + 0.5));
+    }
+    auto waitMs = [&](int ms) {
+        if (ms > 0) WindowModeSleepInterruptible(cancelFlag, std::chrono::milliseconds(ms));
+    };
+
+    auto postVk = [&](UINT vk, bool down) {
+        if (drainKeys) {
+            SoftSetVkDown(vk, down);
+            FakeFocusSoftInput_SetKey(vk, down);
+            return;
+        }
+        PostKeyToWindow(top, vk, down);
+    };
+
+    bool allHaveVk = true;
+    for (wchar_t ch : text) {
+        if (ch == L'\r' || ch == L'\n') continue;
+        if (VkKeyScanW(ch) == -1) {
+            allHaveVk = false;
+            break;
+        }
+    }
+
+    if (!allHaveVk) {
+        // 非 Edit 不吃 WM_PASTE；Ctrl+V 须在剪贴板还原之前处理完。
+        ScopedClipboardUnicodeText clip(text);
+        if (!clip.Ok()) return false;
+        if (drainKeys) {
+            // 软键态与事件是两条路：每笔之后必须等目标处理完再写下一步键态，
+            // 否则目标处理 WM_KEYDOWN(V) 时读到的 Ctrl 已经是抬起（只出 v 不粘贴）。
+            SoftSetVkDown(VK_LCONTROL, true);
+            SoftSetVkDown(VK_CONTROL, true);
+            FakeFocusSoftInput_SetKey(VK_LCONTROL, true);
+            FakeFocusSoftInput_SetKey(VK_CONTROL, true);
+            WaitSoftKeyPostTurn(top);
+            FakeFocusSoftInput_SetKey('V', true);
+            WaitSoftKeyPostTurn(top);
+            FakeFocusSoftInput_SetKey('V', false);
+            WaitSoftKeyPostTurn(top);
+            FakeFocusSoftInput_SetKey(VK_LCONTROL, false);
+            FakeFocusSoftInput_SetKey(VK_CONTROL, false);
+            WaitSoftKeyPostTurn(top);
+            SoftSetVkDown('V', false);
+            SoftSetVkDown(VK_LCONTROL, false);
+            SoftSetVkDown(VK_CONTROL, false);
+        } else {
+            if (FakeFocusSoftInput_IsAttached()) {
+                FakeFocusSoftInput_SetKey(VK_LCONTROL, true);
+                FakeFocusSoftInput_SetKey(VK_CONTROL, true);
+            }
+            DWORD_PTR res = 0;
+            auto send = [&](UINT msg, UINT vk, bool down) {
+                SendMessageTimeoutW(top, msg, vk, BuildWindowKeyLParam(vk, down),
+                    SMTO_ABORTIFHUNG | SMTO_NORMAL, 500, &res);
+            };
+            send(WM_KEYDOWN, VK_CONTROL, true);
+            waitMs(stepMs);
+            if (FakeFocusSoftInput_IsAttached()) FakeFocusSoftInput_SetKey('V', true);
+            send(WM_KEYDOWN, 'V', true);
+            waitMs(stepMs);
+            send(WM_KEYUP, 'V', false);
+            send(WM_KEYUP, VK_CONTROL, false);
+            if (FakeFocusSoftInput_IsAttached()) {
+                FakeFocusSoftInput_SetKey('V', false);
+                FakeFocusSoftInput_SetKey(VK_LCONTROL, false);
+                FakeFocusSoftInput_SetKey(VK_CONTROL, false);
+            }
+        }
+        WindowModeSleepInterruptible(cancelFlag, std::chrono::milliseconds(80));
+        return true;
+    }
+
+    // 目标线程队列屏障（决定性时序，与目标帧率无关）：
+    // 跨线程同步 SendMessage 会被目标线程当作**队列里的消息**处理 —— 它排在「我们已 PostMessage
+    // 投递的消息之后、目标自己 TranslateMessage 补发的 WM_CHAR 之前」。等它返回即证明：本键已
+    // 被目标处理（键处于按下态），且它的 WM_CHAR 已经排在接下来要处理的队列里，先于我们随后发的 UP。
+    // 这样就不会出现「DOWN/UP 挤进同一帧、WM_CHAR 被排到 KEYUP 之后 → 目标按『键仍按下』判定时整串被吞」。
+    // 失败（UIPI 拒发 / 目标不应答 / 进程内灌键队列另有时序）→ 回落固定按住/间隔兜底。
+    auto queueBarrier = [&]() -> bool {
+        if (drainKeys || !PostedKeyBarrierEnabled()) return false;
+        DWORD_PTR res = 0;
+        return SendMessageTimeoutW(top, WM_NULL, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_NORMAL, 120, &res) != 0;
+    };
+    // 探测一次：顺带把队列里已有的点击/按键冲干净（替代固定的前导等待）。
+    const bool useBarrier = queueBarrier();
+
+    // 诊断：把真正发出的文本与时序写进日志（现场排「吞字」时先看这一行）。
+    {
+        std::wstring preview;
+        const size_t limit = 48;
+        for (size_t i = 0; i < text.size() && i < limit; ++i) {
+            const wchar_t ch = text[i];
+            if (ch == L'\r') preview += L"\\r";
+            else if (ch == L'\n') preview += L"\\n";
+            else if (ch == L'\t') preview += L"\\t";
+            else preview.push_back(ch);
+        }
+        if (text.size() > limit) preview += L"…";
+        wchar_t pacing[32]{};
+        if (useBarrier) swprintf_s(pacing, L"队列屏障");
+        else swprintf_s(pacing, L"%dms", stepMs);
+        WindowModeLogf(
+            L"[窗口模式] 快捷输入逐字投递 %zu 字 按住=%s 间隔=%dms 文本=\"%s\"",
+            text.size(), pacing, gapMs, preview.c_str());
+    }
+
+    // 先让目标把队列里已有的消息（上一条点击/按键）处理完，避免首字被并进同一帧。
+    if (!useBarrier) waitMs(stepMs);
+
+    for (wchar_t ch : text) {
+        if (WindowModeCancelled(cancelFlag)) return true;
+        if (ch == L'\r' || ch == L'\n') {
+            postVk(VK_RETURN, true);
+            if (!(useBarrier && queueBarrier())) waitMs(stepMs);
+            postVk(VK_RETURN, false);
+        } else {
+            const SHORT scanned = VkKeyScanW(ch);
+            const UINT vk = static_cast<UINT>(LOBYTE(scanned));
+            const bool shift = (HIBYTE(scanned) & 1) != 0;
+            if (shift) postVk(VK_LSHIFT, true);
+            postVk(vk, true);
+            // 必须以真实键盘的 DOWN→（目标自己 TranslateMessage 出 WM_CHAR）→UP 顺序落地：
+            // 立刻发 UP 会让 WM_CHAR 排在 KEYUP 之后，目标按「键仍按下」判定时整串被吞。
+            if (!(useBarrier && queueBarrier())) waitMs(stepMs);
+            postVk(vk, false);
+            if (shift) postVk(VK_LSHIFT, false);
+        }
+        // 本字的 UP 先落地，下一字不会与本字并进同一帧（无屏障时才退化成固定间隔）。
+        if (!(useBarrier && queueBarrier())) waitMs(gapMs);
+    }
+    return true;
 }
 
 void SendQuickInputViaForeground(HWND hwnd, const std::wstring& text, double charInterval,
@@ -698,21 +1038,43 @@ void PostQuickInputToWindow(HWND hwnd, const std::wstring& text, double charInte
 
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root) root = hwnd;
-    // 优先最近点击子控件，再 Edit 扫描，避免多输入框贴错位置。
-    HWND input = ResolveSoftInputHwnd(hwnd);
-    if (!input) input = FindTextInputTarget(root);
+    // 调用方已是 Edit/RichEdit 时不要被「上次点击点」拐到别的表面。
+    HWND input = hwnd;
+    wchar_t inputCls[256]{};
+    if (!GetClassNameW(hwnd, inputCls, 256) || !IsTextInputClass(inputCls)) {
+        input = ResolveSoftInputHwnd(hwnd);
+        if (!input) input = FindTextInputTarget(root);
+    }
 
     if (input) {
+        const bool posted = WindowPrefersPostedQuickKeys(input)
+            || WindowPrefersPostedQuickKeys(root);
+        if (posted) {
+            // 若点到的是真 Edit（即便顶层是 Qt/游戏），仍走 EM_REPLACESEL / WM_PASTE。
+            if (SendQuickInputViaEditMessages(input, text, charInterval, cancelFlag)) return;
+            if (WindowModeCancelled(cancelFlag)) return;
+            if (WindowAcceptsWmPaste(input)
+                && SendQuickInputViaClipboard(input, text, true)) {
+                return;
+            }
+            if (WindowModeCancelled(cancelFlag)) return;
+            SendQuickInputViaPostedKeys(input, text, charInterval, cancelFlag);
+            return;
+        }
         PrimeWindowSoftFocus(input);
         if (SendQuickInputViaEditMessages(input, text, charInterval, cancelFlag)) return;
         if (WindowModeCancelled(cancelFlag)) return;
         if (SendQuickInputViaClipboard(input, text, true)) return;
         if (WindowModeCancelled(cancelFlag)) return;
-        // 非 Edit / 剪贴板失败：逐字 WM_CHAR（中文、自定义控件）
+        // 非 Edit / 剪贴板失败：逐字 WM_CHAR（中文、自定义 Win32 控件）
         if (SendQuickInputViaSoftChars(input, text, charInterval, cancelFlag)) return;
     }
 
     if (WindowModeCancelled(cancelFlag)) return;
+    if (WindowPrefersPostedQuickKeys(root)) {
+        SendQuickInputViaPostedKeys(root, text, charInterval, cancelFlag);
+        return;
+    }
     if (SendQuickInputViaClipboard(root, text, true)) return;
     if (WindowModeCancelled(cancelFlag)) return;
     if (SendQuickInputViaSoftChars(root, text, charInterval, cancelFlag)) return;
@@ -768,7 +1130,21 @@ void PostScrollWheelToWindow(HWND hwnd, int cx, int cy, int steps, bool vertical
     }
 }
 
+bool IsArrowVirtualKey(UINT vk) {
+    return vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN;
+}
+
+bool ShouldMirrorLcaNavKeyState(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (LooksLikeMapleStoryHwnd(hwnd)) return true;
+    // 未登记 LCA 游戏：前台时同样靠本机键态走路。自检探针是 TOOLWINDOW，勿 SendInput。
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    return (ex & WS_EX_TOOLWINDOW) == 0;
+}
+
 void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
+    vk = NormalizeScriptKeyVk(vk, L"");
+    if (vk > 255) vk = 0;
     if (!hwnd || !IsWindow(hwnd) || vk == 0) return;
 
     HWND target = ResolveSoftInputHwnd(hwnd);
@@ -782,24 +1158,92 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
         || SoftIsVkDown(VK_RMENU);
     const bool useSys = down ? altDown : altWasDown;
 
-    PrimeWindowSoftFocus(target);
+    if (FakeFocusSoftInput_IsAttached()) {
+        FakeFocusSoftInput_SetKey(vk, down);
+    }
+
     HWND top = TopLevelTargetWindow(target);
-    // MuMu 等安卓壳：KEYDOWN 与 WM_CHAR 都会进 Android 文本层，双发会变成 11223344。
+    const bool weixinQt = LooksLikeWeixinSoftHwnd(hwnd) || LooksLikeWeixinSoftHwnd(target)
+        || LooksLikeWeixinSoftHwnd(top);
+    const bool qtWindow = weixinQt || LooksLikeQtSoftHwnd(hwnd) || LooksLikeQtSoftHwnd(target)
+        || LooksLikeQtSoftHwnd(top);
+    if (!weixinQt) {
+        PrimeWindowSoftFocus(target);
+        top = TopLevelTargetWindow(target);
+    }
+    const bool lcaKeys = ShouldPostLcaQueuedKeys(hwnd) || ShouldPostLcaQueuedKeys(target)
+        || ShouldPostLcaQueuedKeys(top);
+    if (lcaKeys) {
+        // LCA 后台一：PostMessage 只发 KEYDOWN/KEYUP，不附带 WM_CHAR；WM_NULL 催队列。
+        HWND send = top && IsWindow(top) ? top : target;
+        const LPARAM lp = BuildWindowKeyLParam(vk, down);
+        // 走路不走 WndProc：冒险岛 / 未登记 LCA 方向键兼写本机键态。
+        // DirectInput 键盘钩已在轮询（lastCb=256）后不再 SendInput，以免方向键打进当前前台窗。
+        if (IsArrowVirtualKey(vk) && ShouldMirrorLcaNavKeyState(send)) {
+            bool mapleDiLive = false;
+            DWORD gaks = 0, diState = 0, diData = 0, lastCb = 0;
+            DWORD hitReady = 0, gfw = 0, focus = 0;
+            if (LooksLikeMapleStoryHwnd(send) && FakeFocusSoftInput_IsAttached()
+                && FakeFocusSoftInput_ReadMapleHits(
+                    gaks, diState, diData, lastCb, hitReady, gfw, focus)) {
+                mapleDiLive = diState > 0 && lastCb == 256;
+            }
+            static bool loggedArrowKeyState = false;
+            if (!loggedArrowKeyState) {
+                loggedArrowKeyState = true;
+                WindowModeLogf(
+                    L"[窗口模式] 方向键%s本机键态 vk=0x%02X lParam=0x%08X"
+                    L"（DI lastCb=%lu diState=%lu；钩未挂上时仍打本机键，遮挡窗会收到方向键）",
+                    mapleDiLive ? L"改走 DirectInput 软键、不再写" : L"兼写",
+                    vk, static_cast<unsigned>(lp),
+                    static_cast<unsigned long>(lastCb),
+                    static_cast<unsigned long>(diState));
+                DWORD diag = 0, iatPoll = 0, diVt = 0;
+                if (LooksLikeMapleStoryHwnd(send) && FakeFocusSoftInput_IsAttached()
+                    && FakeFocusSoftInput_ReadMapleInstall(diag, iatPoll, diVt)) {
+                    WindowModeLogf(
+                        L"[窗口模式] 冒险岛首方向键后 hitReady=%lu gfw=%lu gaks=%lu diState=%lu "
+                        L"lastCb=%lu iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu",
+                        static_cast<unsigned long>(hitReady),
+                        static_cast<unsigned long>(gfw),
+                        static_cast<unsigned long>(gaks),
+                        static_cast<unsigned long>(diState),
+                        static_cast<unsigned long>(lastCb),
+                        static_cast<unsigned long>(iatPoll),
+                        static_cast<unsigned>(diag),
+                        static_cast<unsigned long>(diVt & 0xFFu),
+                        static_cast<unsigned long>((diVt >> 8) & 0xFFu));
+                }
+            }
+            if (!mapleDiLive) SendKeyboardKey(vk, down);
+        }
+        PostMessageW(send, down ? WM_KEYDOWN : WM_KEYUP, vk, lp);
+        PostMessageW(send, WM_NULL, 0, 0);
+        return;
+    }
+    // MuMu：KEYDOWN 与 WM_CHAR 都会进 Android 文本层，双发变成 11223344。
+    // 微信 4.x Qt：自己把 KEYDOWN 转成字，再吃宿主 WM_CHAR 就会一次变两次。
     const bool androidEmu = IsAndroidEmulatorTarget(top ? top : target, nullptr);
+    HWND send = (weixinQt && top && IsWindow(top)) ? top : target;
     if (down) {
         const UINT keyMsg = useSys ? WM_SYSKEYDOWN : WM_KEYDOWN;
-        DeliverWindowMessage(target, keyMsg, vk, BuildKeyLParam(vk, true));
-
-        if (!androidEmu) {
+        DeliverWindowMessage(send, keyMsg, vk, BuildKeyLParam(vk, true));
+        if (!androidEmu && !qtWindow) {
             if (wchar_t ch = SoftVkToChar(vk)) {
                 const UINT charMsg = useSys ? WM_SYSCHAR : WM_CHAR;
-                DeliverWindowMessage(target, charMsg, static_cast<WPARAM>(ch),
+                DeliverWindowMessage(send, charMsg, static_cast<WPARAM>(ch),
                     BuildKeyLParam(vk, true));
             }
         }
+        if (weixinQt) {
+            PostMessageW(send, WM_NULL, 0, 0);
+        }
     } else {
         const UINT keyMsg = useSys ? WM_SYSKEYUP : WM_KEYUP;
-        DeliverWindowMessage(target, keyMsg, vk, BuildKeyLParam(vk, false));
+        DeliverWindowMessage(send, keyMsg, vk, BuildKeyLParam(vk, false));
+        if (weixinQt) {
+            PostMessageW(send, WM_NULL, 0, 0);
+        }
     }
 }
 

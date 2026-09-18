@@ -26,6 +26,18 @@ int ColorChannelDistance(int r1, int g1, int b1, int r2, int g2, int b2);
 
 bool ColorsMatch(int r1, int g1, int b1, int r2, int g2, int b2, int tolerance);
 
+/// 点击效果取样：5×5、步长 8px（约 ±16px 邻域），避免只打在数字/透明像素上漏检。
+constexpr int kClickColorGridN = 25;
+
+bool SampleClickColorGrid(int cx, int cy, int* outR, int* outG, int* outB,
+    HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0);
+
+/// 邻域内至少 minChanged 个点超出容差则视为外观已变。
+bool ClickColorGridChanged(
+    const int* beforeR, const int* beforeG, const int* beforeB,
+    const int* afterR, const int* afterG, const int* afterB,
+    int tolerance, int minChanged = 2);
+
 /// 屏幕坐标取色（可选锁屏位图）
 bool GetScreenPixelRgb(int x, int y, int& outR, int& outG, int& outB,
     HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0);

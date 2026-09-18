@@ -1,6 +1,6 @@
 # WebView2 壳 + C++ 引擎 — Bridge API
 
-> 产品主入口：`QstWebViewShell.exe`（发版时复制为 `QuickScriptTool.exe`）= Web UI + Engine（`src/engine/qst_engine.h`）+ DesktopTools  
+> 产品主入口：`QuickScriptTool.exe`（CMake 目标 `QstWebViewShell`）= Web UI + Engine（`src/engine/qst_engine.h`）+ DesktopTools  
 > **禁止** Electron；**禁止** WebView 内 `SendInput`；不破坏 Fixed `WebView2Fixed` 便携。
 > 旧 GDI 产品 exe / `archive/gdi_legacy` **已移除**；`forceNative:1` 一律 `legacy_unavailable`。
 
@@ -34,7 +34,7 @@
 | `readImageDataUrl` | 读文件 → data URL | 找图预览 `<img>`，避免 `file://` 拦截 |
 | `resolveImagePath` | `ResolveImagePath` | 相对→ScriptsDir/FindImagesDir |
 | `crosshairPick` | `CrosshairDragController` | `ScopedHideShell`；`coordinates` \| `programPath` \| `windowTarget` |
-| `installDriver` | `ShellExecute` 提权 | `GetExitCodeProcess`；成功/失败/取消 |
+| `installDriver` | `ShellExecute` 提权 | 缺 `.sys` 时先下载 HidDriver zip；`GetExitCodeProcess`；成功/失败/取消 |
 | `queryVhidStatus` | 只读探测（无 UAC） | HVCI / 待重启续装 / 设备可用 / 上次退出码 |
 
 Web 侧按钮只发消息、填回表单；**禁止**用浏览器 Pointer Lock / 全屏 div 冒充桌面选区或准星。
@@ -58,7 +58,7 @@ Web 侧按钮只发消息、填回表单；**禁止**用浏览器 Pointer Lock /
 | 圆角 | **≈14px** | CSS `.app { border-radius:14px }` + Win11 `DWMWCP_ROUND` / 否则 `SetWindowRgn` |
 | 断言 | `window.clientSize` | setMode/启动后 `GetClientRect` 与 expectW/H；不匹配再强制一次 |
 
-产品 `ui/index.html` 的 `.app` **禁止** mockup 的 `min(…vw)` 缩小；须 `width/height:100%` 填满客户区。发版/本地请跑 `build\Release\QstWebViewShell.exe`（旁路 `ui/` 由 MSBuild 复制），勿用陈旧 `dist`。
+产品 `ui/index.html` 的 `.app` **禁止** mockup 的 `min(…vw)` 缩小；须 `width/height:100%` 填满客户区。发版/本地请跑 `build\Release\QuickScriptTool.exe`（旁路 `ui/` 由 MSBuild 复制），勿用陈旧 `dist`。
 
 **headless 引擎窗**：凡 `RestoreMainWindowAfterRun` / `RestoreBreakout*` / `ForceEndBreakoutUiState` / 录制·连点恢复 / 对引擎 `hwnd_` 的 `SW_SHOW*|SW_RESTORE`，在 `headlessUi_` 下一律 `SW_HIDE`。用户可见窗只用 `webViewHostHwnd_`（`RestoreMainWindowForUser`）。
 
@@ -270,7 +270,9 @@ F8 / CTA 目标 = 引擎当前 `selectedScript_` / `selectedRecording_` + `activ
 
 ```json
 { "type":"openSettingsData" }
-→ { "ok":true, "settings":{ /* click/playback/other/ai/home */ } }
+→ { "ok":true, "settings":{ /* click/playback/other/ai/home, findImageEngine */ } }
+
+`findImageEngine` 只读：OpenCV 可用为 true。为 false 时 UI 隐藏找图/看图/多点匹配动作，连点与脚本编辑仍可用。
 
 { "type":"saveSettings", "settings":{ "closeToTray":true, "autoHideMainWindow":true, … } }
 → { "ok":true }
@@ -303,7 +305,8 @@ F8 / CTA 目标 = 引擎当前 `selectedScript_` / `selectedRecording_` + `activ
   "selected":[…], "waitCalculation":"sum|average|first|last|fixed",
   "mergeWaitValue":0.1 }
 { "type":"applyOptimizeRecording", "path":"…", "scheme":3,
-  "selected":[…], "distanceThreshold":3, "compressWait":0.05 }
+  "selected":[…], "distanceThreshold":3,
+  "waitCalculation":"sum|average|first|last|fixed", "mergeWaitValue":0.1 }
 { "type":"applyOptimizeRecording", "path":"…", "scheme":4,
   "selected":[…], "findTimeExpr":"0|-1|3" }
 { "type":"applyOptimizeRecording", "path":"…", "scheme":-1, "saveAsNew":1 }
@@ -316,7 +319,7 @@ scheme：0 批量删除 / 1 等待调整 / 2 移动合并 / 3 移动压缩 / 4 �
 
 - **scheme0**：`protectKeyOps:1` 时保护「关键操作」（对齐原生 `IsKeyOperation`：除绝对/相对移动与等待外均保留）；未选中任何项返回错误。
 - **scheme1**：仅改 `selected` 中的 Wait；`waitFilter` 0=全部 / 1&lt; / 2≤ / 3&gt; / 4≥ / 5= / 6≠（亦可传中文标签）；非「全部」时用 `compareValue`（秒）过滤，对齐原生 `ApplyWaitAdjust` + `WaitMatchesFilter`。
-- **scheme2/3**：`selected` **未含关键操作**时，仍须一整段连续的 move/wait（原 `SelectionIsContiguousMoveWait`）。**含关键操作**时以已选关键动作为分割点，对每段已选的 move/wait 分别合并/压缩（等待时间按段计算）；未勾选的空洞也分段；含相对位移的段跳过、其它段照常。算法在 C++ `recopt`（对话框 `ApplyOptimizeAndSave` 与助手 `optimizeRecording` / `optimizeScript` 共用 `MergeAllKeySplit`），禁止 JS 重写变换。
+- **scheme2/3**：`selected` **未含关键操作**时，仍须一整段连续的 move/wait（原 `SelectionIsContiguousMoveWait`）。**含关键操作**时以已选关键动作为分割点，对每段已选的 move/wait 分别合并/压缩。scheme2 每段合并为 1 个等待+终点；scheme3 抽稀后留下的移动点之间用同一套 `waitCalculation`。未勾选的空洞也分段；含相对位移的段跳过、其它段照常。算法在 C++ `recopt`（对话框 `ApplyOptimizeAndSave` 与助手 `optimizeRecording` / `optimizeScript` 共用），禁止 JS 重写变换。
 - **scheme4**：result 含 `converted` / `skipped` / `detail`，UI `#optFindResult` 写转换统计。
 
 `waitCalculation` 禁止后端 hardcode 为 sum。点「开始合并」等只改对话框工作副本，**不写原录制**；`saveAsNew:1` 才写入 `recordings/` 新文件。转找图后裁切/测试再调 `findImageCrop` / `findImageMatch`。
@@ -425,9 +428,9 @@ Native → Web 推送；`ui/app.js` 调现有 `toast()`。无 Web 桥时回落 `
 
 `applyOptimizeRecording` 成功后引擎 `ReloadScriptsAndHotkeys`（对齐原生 `LoadRecordings`）。
 
-设置 `openSettingsData` / `saveSettings` 的 `playback` 含：`enablePlaybackCount`、`playbackCount`、`enablePlaybackInterval`、间隔秒、`enablePlaybackSpeed`、`playbackSpeed`(0.25~4)。**全局倍速只作用于录制页直接播放**：极简模式无视勾选（视为已启用），专业模式看勾选；与极简录制工具栏共用 `playbackSpeed`，专业录制页不再另放滑条。鼠标宏顶层不缩放。嵌套「运行录制回放」(`mousePlayback`) 只用动作自身 `playbackSpeed`（缺省 1），不叠加全局。`enableDebugOutputWindow`、`autoOutputKeyFunctionDebug`、`recordingClickCaptureEnabled`、`recordingClickCaptureHalfSize`、`foregroundInputBackend`(0/1/2)、`scheduledTaskConflictPolicy`(0=执行脚本优先/跳过 1=定时脚本优先/打断)、`scheduledTaskAutoResume`（false=上述跳过/打断不恢复；true 时 0=结束后再跑、1=插入后从原步骤继续）。`other` 另含 `closeToTray`、`playSoundOnStart`、`hideBottomRightTip`、`resolveImeConflict` 等（**`preferDirect2D` 在 Web 壳设置页隐藏**，磁盘值保留）。`home` 含 `activeTab`、`uiMode`(`simple`/`pro`)、可选 `selectedScriptPath` / `selectedRecordingPath`。
+设置 `openSettingsData` / `saveSettings` 的 `playback` 含：`enablePlaybackCount`、`playbackCount`、`enablePlaybackInterval`、间隔秒、`enablePlaybackSpeed`、`playbackSpeed`(0.25~4)。**全局倍速只作用于录制页直接播放**：极简模式无视勾选（视为已启用），专业模式看勾选；与极简录制工具栏共用 `playbackSpeed`，专业录制页不再另放滑条。鼠标宏顶层不缩放。嵌套「运行录制回放」(`mousePlayback`) 只用动作自身 `playbackSpeed`（缺省 1），不叠加全局。`enableDebugOutputWindow`、`autoOutputKeyFunctionDebug`、`recordingClickCaptureEnabled`、`recordingClickCaptureHalfSize`、`foregroundInputBackend`(0/1/2)、`scheduledTaskConflictPolicy`(0=执行脚本优先/跳过 1=定时脚本优先/打断)、`scheduledTaskAutoResume`（false=上述跳过/打断不恢复；true 时 0=结束后再跑、1=插入后从原步骤继续）。`other` 另含 `closeToTray`、`playSoundOnStart`、`playSoundOnEnd`、`hideBottomRightTip`、`resolveImeConflict`、`showFloatBall`（默认 true，桌面悬浮球显隐；可贴边半露或拖到工作区中间自由悬浮）等（**`preferDirect2D` 在 Web 壳设置页隐藏**，磁盘值保留）。`home` 含 `activeTab`、`uiMode`(`simple`/`pro`)、可选 `selectedScriptPath` / `selectedRecordingPath`。
 
-headless 下原生右下角 tip **禁用**（仅用 Web `#statusPill`，由 `hideBottomRightTip` 控制），避免双显。
+headless 下原生右下角 tip **禁用**（仅用 Web `#statusPill`，由 `hideBottomRightTip` 控制），避免双显。桌面悬浮球是独立 DesktopTools HWND，与 tip 无关。
 
 ### 仍强制原生的窗口
 
@@ -438,8 +441,9 @@ headless 下原生右下角 tip **禁用**（仅用 Web `#statusPill`，由 `hid
 | 准星 | CrosshairDragController |
 | OCR 安装进度 | Web `#ov-ocr`（壳内 `RunOcrInstall`；非 OcrInstallDialog） |
 | 全局/脚本热键捕获 | HotkeyCapture |
+| 桌面悬浮球 | FloatBall（`QstDesktopFloatBall`） |
 | 宏调试输出（enableDebugOutputWindow） | **独立 WebView 顶层窗**（产品）；Gdi 逃生舱仍 MacroDebugWindow |
-| 驱动安装 | ShellExecute 提权 installer |
+| 驱动安装 | ShellExecute 提权 installer（主程序 asInvoker，仅此处 UAC） |
 
 ### 桌面工具 result
 
@@ -462,7 +466,8 @@ headless 下原生右下角 tip **禁用**（仅用 Web `#statusPill`，由 `hid
   "uninstalled":true|false, "detail":"…", "probed":true|false, "suggestedBackend":0|1|2 }
 { "type":"queryVhidStatus.result", "ok":true, "hvciEnabled":true|false,
   "rebootPending":true|false, "driverReady":true|false,
-  "installScriptPresent":true|false, "lastExitCode":-1|0|2|10|99 }
+  "installScriptPresent":true|false, "packagePresent":true|false,
+  "hidDllPresent":true|false, "lastExitCode":-1|0|2|10|99 }
 ```
 
 ---

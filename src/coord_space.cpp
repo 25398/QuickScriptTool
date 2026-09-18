@@ -1,18 +1,41 @@
 #include "coord_space.h"
 
 #include "image_match.h"
+#include "opencv_runtime.h"
 #include "utils.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace {
 
+cv::Mat NormalizeDecodedImage(cv::Mat img) {
+    if (img.empty()) return {};
+    if (img.channels() == 1) {
+        cv::Mat bgr;
+        cv::cvtColor(img, bgr, cv::COLOR_GRAY2BGR);
+        return bgr;
+    }
+    if (img.channels() == 2) {
+        std::vector<cv::Mat> ch;
+        cv::split(img, ch);
+        cv::Mat bgra;
+        cv::cvtColor(ch[0], bgra, cv::COLOR_GRAY2BGRA);
+        std::vector<cv::Mat> bgraCh;
+        cv::split(bgra, bgraCh);
+        bgraCh[3] = ch[1];
+        cv::merge(bgraCh, bgra);
+        return bgra;
+    }
+    return img;
+}
+
 cv::Mat ImReadW(const std::wstring& path) {
-    if (path.empty()) return {};
+    if (path.empty() || !OpenCvAvailable()) return {};
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return {};
     std::vector<uint8_t> buf;
@@ -23,13 +46,22 @@ cv::Mat ImReadW(const std::wstring& path) {
     buf.resize(static_cast<size_t>(sz));
     fread(buf.data(), 1, buf.size(), fp);
     fclose(fp);
-    return cv::imdecode(buf, cv::IMREAD_COLOR);
+    return NormalizeDecodedImage(cv::imdecode(buf, cv::IMREAD_UNCHANGED));
 }
 
 HBITMAP BgrMatToHBitmap(const cv::Mat& img) {
     if (img.empty()) return nullptr;
     cv::Mat bgra;
-    cv::cvtColor(img, bgra, cv::COLOR_BGR2BGRA);
+    if (img.channels() == 4) {
+        if (img.type() != CV_8UC4) return nullptr;
+        bgra = img;
+    } else if (img.channels() == 1) {
+        cv::cvtColor(img, bgra, cv::COLOR_GRAY2BGRA);
+    } else if (img.channels() == 3) {
+        cv::cvtColor(img, bgra, cv::COLOR_BGR2BGRA);
+    } else {
+        return nullptr;
+    }
     const int w = bgra.cols;
     const int h = bgra.rows;
     BITMAPINFO bi{};
@@ -42,14 +74,22 @@ HBITMAP BgrMatToHBitmap(const cv::Mat& img) {
     void* bits = nullptr;
     HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!bmp || !bits) return bmp;
-    const size_t bytes = static_cast<size_t>(w) * h * 4;
-    memcpy(bits, bgra.data, bytes);
+    auto* dst = static_cast<uint8_t*>(bits);
+    if (bgra.isContinuous() && static_cast<int>(bgra.step) == w * 4) {
+        memcpy(dst, bgra.data, static_cast<size_t>(w) * h * 4);
+    } else {
+        for (int y = 0; y < h; ++y) {
+            memcpy(dst + static_cast<size_t>(y) * w * 4, bgra.ptr(y), static_cast<size_t>(w) * 4);
+        }
+    }
     return bmp;
 }
 
-bool GetTemplateBitmapSize(const std::wstring& path, int& outW, int& outH) {
+bool TryTemplateBitmapSize(const std::wstring& path, int& outW, int& outH) {
     outW = outH = 0;
     if (path.empty()) return false;
+    // 已解码过的模板直接拿缓存宽高：不必再造一个 HBITMAP（编辑期这里调得非常频繁）
+    if (TryGetCachedTemplateImageSize(path, outW, outH)) return true;
     HBITMAP bmp = LoadBitmapFromFile(path);
     if (!bmp) return false;
     BITMAP bm{};
@@ -61,6 +101,87 @@ bool GetTemplateBitmapSize(const std::wstring& path, int& outW, int& outH) {
     return true;
 }
 
+bool GetTemplateBitmapSize(const std::wstring& path, int& outW, int& outH) {
+    if (TryTemplateBitmapSize(path, outW, outH)) return true;
+    const std::wstring resolved = ResolveImagePath(path);
+    if (resolved.empty() || resolved == path) return false;
+    return TryTemplateBitmapSize(resolved, outW, outH);
+}
+
+bool LooksLikeImageFilePath(const std::wstring& p) {
+    if (p.empty()) return false;
+    if (p.find(L'\\') != std::wstring::npos || p.find(L'/') != std::wstring::npos) return true;
+    if (p.size() >= 2 && p[1] == L':') {
+        const wchar_t c = p[0];
+        return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+    }
+    return false;
+}
+
+std::wstring OffsetTemplateToken(const ScriptAction& a) {
+    if (a.type == ActionType::MultiMatch && !a.imagePaths.empty() && !a.imagePaths[0].empty()) {
+        return a.imagePaths[0];
+    }
+    return a.imagePath;
+}
+
+bool OffsetTemplateUseVar(const ScriptAction& a) {
+    if (a.type == ActionType::MultiMatch) return MultiMatchSlotUseVar(a, 0);
+    return a.imageUseVar;
+}
+
+bool ProducerSearchRectSize(const ScriptAction& p, int& w, int& h) {
+    if (p.searchFullScreen || p.searchX2 <= p.searchX1 || p.searchY2 <= p.searchY1) {
+        int x = 0, y = 0;
+        GetVirtualScreenBounds(x, y, w, h);
+        return w >= 8 && h >= 8;
+    }
+    w = p.searchX2 - p.searchX1;
+    h = p.searchY2 - p.searchY1;
+    if (w < 0) w = -w;
+    if (h < 0) h = -h;
+    return w >= 8 && h >= 8;
+}
+
+/// 找图偏移 / 找图定位的模板像素尺寸：文件模板读位图；变量图用前序「保存图片」的搜索区或相对区。
+bool ResolveFindImageOffsetTemplateSize(
+    const std::vector<ScriptAction>& actions, size_t index, int& w, int& h) {
+    w = 0;
+    h = 0;
+    if (index >= actions.size()) return false;
+    const ScriptAction& a = actions[index];
+    const std::wstring token = Trim(OffsetTemplateToken(a));
+    const bool useVar = OffsetTemplateUseVar(a);
+    if (!useVar) {
+        return GetTemplateBitmapSize(a.imagePath, w, h) && w > 0 && h > 0;
+    }
+    if (LooksLikeImageFilePath(token)) {
+        return GetTemplateBitmapSize(token, w, h) && w > 0 && h > 0;
+    }
+    const std::wstring name = token.empty() ? L"image" : token;
+    for (size_t i = index; i > 0;) {
+        --i;
+        const ScriptAction& p = actions[i];
+        if (p.type != ActionType::FindImage || p.findImageFollowUp != 3) continue;
+        std::wstring vn = Trim(p.matchVarName);
+        if (vn.empty()) vn = L"image";
+        if (vn != name) continue;
+        if (p.imagePath.empty()) {
+            if (ProducerSearchRectSize(p, w, h)) return true;
+            continue;
+        }
+        if (p.imageRegionX2 > p.imageRegionX1 && p.imageRegionY2 > p.imageRegionY1) {
+            w = p.imageRegionX2 - p.imageRegionX1;
+            h = p.imageRegionY2 - p.imageRegionY1;
+            if (w >= 1 && h >= 1) return true;
+        }
+        if (!p.imageUseVar && GetTemplateBitmapSize(p.imagePath, w, h) && w > 0 && h > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 void SyncFindImageOffsetNorm(ScriptAction& a) {
@@ -70,6 +191,25 @@ void SyncFindImageOffsetNorm(ScriptAction& a) {
     a.nOffsetY = a.offsetY / static_cast<double>(tplH);
 }
 
+void SyncMouseDragNorm(ScriptAction& a) {
+    if (!a.imageLocate) return;
+    if (a.type != ActionType::MouseDrag
+        && a.type != ActionType::GetColor
+        && a.type != ActionType::ColorMatch) return;
+    int tplW = 0, tplH = 0;
+    if (!GetTemplateBitmapSize(a.imagePath, tplW, tplH) || tplW <= 0 || tplH <= 0) return;
+    a.nx = a.x / static_cast<double>(tplW);
+    a.ny = a.y / static_cast<double>(tplH);
+    a.nRandomX = a.randomX / static_cast<double>(tplW);
+    a.nRandomY = a.randomY / static_cast<double>(tplH);
+    if (a.type == ActionType::MouseDrag) {
+        a.nEndX = a.endX / static_cast<double>(tplW);
+        a.nEndY = a.endY / static_cast<double>(tplH);
+        a.nRandomEndX = a.randomEndX / static_cast<double>(tplW);
+        a.nRandomEndY = a.randomEndY / static_cast<double>(tplH);
+    }
+}
+
 namespace {
 
 void DenormFindImageOffsetPixels(ScriptAction& a) {
@@ -77,6 +217,95 @@ void DenormFindImageOffsetPixels(ScriptAction& a) {
     if (!GetTemplateBitmapSize(a.imagePath, tplW, tplH)) return;
     a.offsetX = static_cast<int>(std::round(a.nOffsetX * tplW));
     a.offsetY = static_cast<int>(std::round(a.nOffsetY * tplH));
+}
+
+void DenormMouseDragPixels(ScriptAction& a) {
+    if (!a.imageLocate) return;
+    if (a.type != ActionType::MouseDrag
+        && a.type != ActionType::GetColor
+        && a.type != ActionType::ColorMatch) return;
+    int tplW = 0, tplH = 0;
+    if (!GetTemplateBitmapSize(a.imagePath, tplW, tplH) || tplW <= 0 || tplH <= 0) return;
+    a.x = static_cast<int>(std::round(a.nx * tplW));
+    a.y = static_cast<int>(std::round(a.ny * tplH));
+    a.randomX = static_cast<int>(std::round(a.nRandomX * tplW));
+    a.randomY = static_cast<int>(std::round(a.nRandomY * tplH));
+    if (a.type == ActionType::MouseDrag) {
+        a.endX = static_cast<int>(std::round(a.nEndX * tplW));
+        a.endY = static_cast<int>(std::round(a.nEndY * tplH));
+        a.randomEndX = static_cast<int>(std::round(a.nRandomEndX * tplW));
+        a.randomEndY = static_cast<int>(std::round(a.nRandomEndY * tplH));
+    }
+}
+
+void ApplyFindImageOffsetNormFromScript(std::vector<ScriptAction>& actions, size_t index) {
+    if (index >= actions.size()) return;
+    ScriptAction& a = actions[index];
+    if (a.type != ActionType::FindImage && a.type != ActionType::MultiMatch) return;
+    int tplW = 0, tplH = 0;
+    if (!ResolveFindImageOffsetTemplateSize(actions, index, tplW, tplH) || tplW <= 0 || tplH <= 0) {
+        return;
+    }
+    a.nOffsetX = a.offsetX / static_cast<double>(tplW);
+    a.nOffsetY = a.offsetY / static_cast<double>(tplH);
+}
+
+void ApplyFindImageOffsetDenormFromScript(std::vector<ScriptAction>& actions, size_t index) {
+    if (index >= actions.size()) return;
+    ScriptAction& a = actions[index];
+    if (a.type != ActionType::FindImage && a.type != ActionType::MultiMatch) return;
+    int tplW = 0, tplH = 0;
+    if (!ResolveFindImageOffsetTemplateSize(actions, index, tplW, tplH) || tplW <= 0 || tplH <= 0) {
+        return;
+    }
+    a.offsetX = static_cast<int>(std::round(a.nOffsetX * tplW));
+    a.offsetY = static_cast<int>(std::round(a.nOffsetY * tplH));
+}
+
+void ApplyMouseDragNormFromScript(std::vector<ScriptAction>& actions, size_t index) {
+    if (index >= actions.size()) return;
+    ScriptAction& a = actions[index];
+    if (!a.imageLocate) return;
+    if (a.type != ActionType::MouseDrag
+        && a.type != ActionType::GetColor
+        && a.type != ActionType::ColorMatch) return;
+    int tplW = 0, tplH = 0;
+    if (!ResolveFindImageOffsetTemplateSize(actions, index, tplW, tplH) || tplW <= 0 || tplH <= 0) {
+        return;
+    }
+    a.nx = a.x / static_cast<double>(tplW);
+    a.ny = a.y / static_cast<double>(tplH);
+    a.nRandomX = a.randomX / static_cast<double>(tplW);
+    a.nRandomY = a.randomY / static_cast<double>(tplH);
+    if (a.type == ActionType::MouseDrag) {
+        a.nEndX = a.endX / static_cast<double>(tplW);
+        a.nEndY = a.endY / static_cast<double>(tplH);
+        a.nRandomEndX = a.randomEndX / static_cast<double>(tplW);
+        a.nRandomEndY = a.randomEndY / static_cast<double>(tplH);
+    }
+}
+
+void ApplyMouseDragDenormFromScript(std::vector<ScriptAction>& actions, size_t index) {
+    if (index >= actions.size()) return;
+    ScriptAction& a = actions[index];
+    if (!a.imageLocate) return;
+    if (a.type != ActionType::MouseDrag
+        && a.type != ActionType::GetColor
+        && a.type != ActionType::ColorMatch) return;
+    int tplW = 0, tplH = 0;
+    if (!ResolveFindImageOffsetTemplateSize(actions, index, tplW, tplH) || tplW <= 0 || tplH <= 0) {
+        return;
+    }
+    a.x = static_cast<int>(std::round(a.nx * tplW));
+    a.y = static_cast<int>(std::round(a.ny * tplH));
+    a.randomX = static_cast<int>(std::round(a.nRandomX * tplW));
+    a.randomY = static_cast<int>(std::round(a.nRandomY * tplH));
+    if (a.type == ActionType::MouseDrag) {
+        a.endX = static_cast<int>(std::round(a.nEndX * tplW));
+        a.endY = static_cast<int>(std::round(a.nEndY * tplH));
+        a.randomEndX = static_cast<int>(std::round(a.nRandomEndX * tplW));
+        a.randomEndY = static_cast<int>(std::round(a.nRandomEndY * tplH));
+    }
 }
 
 void SyncNormFieldsFromPixelsAction(ScriptAction& a, const CoordMeta& meta) {
@@ -99,6 +328,10 @@ void SyncNormFieldsFromPixelsAction(ScriptAction& a, const CoordMeta& meta) {
     a.ny = (a.y - meta.refOriginY) / rh;
     a.nRandomX = a.randomX / rw;
     a.nRandomY = a.randomY / rh;
+    a.nEndX = (a.endX - meta.refOriginX) / rw;
+    a.nEndY = (a.endY - meta.refOriginY) / rh;
+    a.nRandomEndX = a.randomEndX / rw;
+    a.nRandomEndY = a.randomEndY / rh;
 
     if (!a.searchFullScreen) {
         // search 区域始终为屏幕绝对坐标（OCR「根据图片」的相对偏移在 imageRegion*）
@@ -115,8 +348,13 @@ void SyncNormFieldsFromPixelsAction(ScriptAction& a, const CoordMeta& meta) {
 
     a.nOffsetX = a.offsetX / rw;
     a.nOffsetY = a.offsetY / rh;
-    if (a.type == ActionType::FindImage) {
+    if (a.type == ActionType::FindImage || a.type == ActionType::MultiMatch) {
         SyncFindImageOffsetNorm(a);
+    }
+    if (a.type == ActionType::MouseDrag
+        || a.type == ActionType::GetColor
+        || a.type == ActionType::ColorMatch) {
+        SyncMouseDragNorm(a);
     }
 
     // 模板内相对偏移：按参考分辨率归一化（与历史 OCR 锚点行为一致）
@@ -258,8 +496,10 @@ void NormalizeActionCoords(ScriptAction& a, const CoordMeta& meta) {
 }
 
 void NormalizeScriptCoords(std::vector<ScriptAction>& actions, const CoordMeta& meta) {
-    for (auto& a : actions) {
-        NormalizeActionCoords(a, meta);
+    for (size_t i = 0; i < actions.size(); ++i) {
+        NormalizeActionCoords(actions[i], meta);
+        ApplyFindImageOffsetNormFromScript(actions, i);
+        ApplyMouseDragNormFromScript(actions, i);
     }
 }
 
@@ -278,6 +518,10 @@ void DenormalizeActionCoords(ScriptAction& a, const CoordMeta& meta, int targetW
     a.y = vsY + static_cast<int>(std::round(a.ny * th));
     a.randomX = static_cast<int>(std::round(a.nRandomX * tw));
     a.randomY = static_cast<int>(std::round(a.nRandomY * th));
+    a.endX = vsX + static_cast<int>(std::round(a.nEndX * tw));
+    a.endY = vsY + static_cast<int>(std::round(a.nEndY * th));
+    a.randomEndX = static_cast<int>(std::round(a.nRandomEndX * tw));
+    a.randomEndY = static_cast<int>(std::round(a.nRandomEndY * th));
 
     const bool hasSearch = (a.nSearchX2 > a.nSearchX1 || a.nSearchY2 > a.nSearchY1);
     if (hasSearch) {
@@ -289,8 +533,13 @@ void DenormalizeActionCoords(ScriptAction& a, const CoordMeta& meta, int targetW
 
     a.offsetX = static_cast<int>(std::round(a.nOffsetX * tw));
     a.offsetY = static_cast<int>(std::round(a.nOffsetY * th));
-    if (a.type == ActionType::FindImage) {
+    if (a.type == ActionType::FindImage || a.type == ActionType::MultiMatch) {
         DenormFindImageOffsetPixels(a);
+    }
+    if (a.type == ActionType::MouseDrag
+        || a.type == ActionType::GetColor
+        || a.type == ActionType::ColorMatch) {
+        DenormMouseDragPixels(a);
     }
 
     a.imageRegionX1 = static_cast<int>(std::round(a.nImageRegionX1 * tw));
@@ -309,10 +558,11 @@ void DenormalizeActionCoords(ScriptAction& a, const CoordMeta& meta, int targetW
 
 void DenormalizeScriptCoords(std::vector<ScriptAction>& actions, const CoordMeta& meta,
     int targetW, int targetH) {
-    for (auto& a : actions) {
-        if (a.coordsAreNormalized) {
-            DenormalizeActionCoords(a, meta, targetW, targetH);
-        }
+    for (size_t i = 0; i < actions.size(); ++i) {
+        if (!actions[i].coordsAreNormalized) continue;
+        DenormalizeActionCoords(actions[i], meta, targetW, targetH);
+        ApplyFindImageOffsetDenormFromScript(actions, i);
+        ApplyMouseDragDenormFromScript(actions, i);
     }
 }
 
@@ -322,7 +572,8 @@ void MigrateLegacyScriptToNormalized(std::vector<ScriptAction>& actions,
     const double rh = static_cast<double>(assumedRef.refHeight);
     if (rw <= 0 || rh <= 0) return;
 
-    for (auto& a : actions) {
+    for (size_t i = 0; i < actions.size(); ++i) {
+        ScriptAction& a = actions[i];
         if (a.type == ActionType::MoveMouseRelative) {
             a.coordsAreNormalized = false;
             continue;
@@ -331,6 +582,10 @@ void MigrateLegacyScriptToNormalized(std::vector<ScriptAction>& actions,
         a.ny = (a.y - assumedRef.refOriginY) / rh;
         a.nRandomX = a.randomX / rw;
         a.nRandomY = a.randomY / rh;
+        a.nEndX = (a.endX - assumedRef.refOriginX) / rw;
+        a.nEndY = (a.endY - assumedRef.refOriginY) / rh;
+        a.nRandomEndX = a.randomEndX / rw;
+        a.nRandomEndY = a.randomEndY / rh;
 
         if (!a.searchFullScreen) {
             a.nSearchX1 = (a.searchX1 - assumedRef.refOriginX) / rw;
@@ -341,9 +596,16 @@ void MigrateLegacyScriptToNormalized(std::vector<ScriptAction>& actions,
 
         a.nOffsetX = a.offsetX / rw;
         a.nOffsetY = a.offsetY / rh;
-        if (a.type == ActionType::FindImage) {
+        if (a.type == ActionType::FindImage || a.type == ActionType::MultiMatch) {
             SyncFindImageOffsetNorm(a);
         }
+        if (a.type == ActionType::MouseDrag
+            || a.type == ActionType::GetColor
+            || a.type == ActionType::ColorMatch) {
+            SyncMouseDragNorm(a);
+        }
+        ApplyFindImageOffsetNormFromScript(actions, i);
+        ApplyMouseDragNormFromScript(actions, i);
 
         a.nImageRegionX1 = a.imageRegionX1 / rw;
         a.nImageRegionY1 = a.imageRegionY1 / rh;
@@ -368,8 +630,10 @@ void SyncNormFieldsFromPixels(std::vector<ScriptAction>& actions, const CoordMet
     if (captureMeta.refWidth <= 0 || captureMeta.refHeight <= 0) {
         captureMeta = CaptureCurrentCoordMeta(nullptr);
     }
-    for (auto& a : actions) {
-        SyncNormFieldsFromPixelsAction(a, captureMeta);
+    for (size_t i = 0; i < actions.size(); ++i) {
+        SyncNormFieldsFromPixelsAction(actions[i], captureMeta);
+        ApplyFindImageOffsetNormFromScript(actions, i);
+        ApplyMouseDragNormFromScript(actions, i);
     }
 }
 
@@ -447,7 +711,7 @@ ImageMatchOptions BuildExecutionFindImageOptions(const ScriptAction& action,
         opt.scaleStep = 1.0;
         opt.disablePyramid = true;
         opt.crossResolutionMatch = false;
-        opt.maxMatches = 20;
+        RestrictFindImageToSingleAnchor(opt);
         opt.maxOverlap = 0.5;
         return opt;
     }
@@ -503,7 +767,7 @@ ImageMatchOptions BuildExecutionFindImageOptions(const ScriptAction& action,
         opt.scaleStep = span > kMaxSamples * 0.05 ? span / kMaxSamples : 0.05;
     }
 
-    opt.maxMatches = 20;
+    RestrictFindImageToSingleAnchor(opt);
     opt.maxOverlap = 0.5;
     return opt;
 }
@@ -555,7 +819,22 @@ HBITMAP LoadScaledTemplateBitmap(const std::wstring& path, double sx, double sy)
     const int newH = std::max(1, static_cast<int>(std::round(src.rows * sy)));
 
     cv::Mat dst;
-    cv::resize(src, dst, cv::Size(newW, newH), 0, 0, cv::INTER_LINEAR);
+    if (src.channels() == 4) {
+        std::vector<cv::Mat> ch;
+        cv::split(src, ch);
+        cv::Mat bgr;
+        cv::merge(std::vector<cv::Mat>{ch[0], ch[1], ch[2]}, bgr);
+        cv::Mat bgrR;
+        cv::Mat aR;
+        cv::resize(bgr, bgrR, cv::Size(newW, newH), 0, 0, cv::INTER_AREA);
+        cv::resize(ch[3], aR, cv::Size(newW, newH), 0, 0, cv::INTER_NEAREST);
+        std::vector<cv::Mat> outCh;
+        cv::split(bgrR, outCh);
+        outCh.push_back(aR);
+        cv::merge(outCh, dst);
+    } else {
+        cv::resize(src, dst, cv::Size(newW, newH), 0, 0, cv::INTER_LINEAR);
+    }
     return BgrMatToHBitmap(dst);
 }
 
@@ -567,7 +846,12 @@ PreparedFindImageMatch PrepareFindImageMatch(const ScriptAction& action, const T
     prep.effScaleY = sy;
     // 始终加载原图像素；缩放交给 matchTemplate 的单一/粗细尺度，
     // 避免 HBITMAP 预缩放 + 二次 scale 搜索导致位置偏移。
-    prep.bitmap = LoadBitmapFromFile(action.imagePath);
+    std::wstring path = action.imagePath;
+    if (!path.empty() && !action.imageUseVar) {
+        const std::wstring resolved = ResolveImagePath(path);
+        if (!resolved.empty()) path = resolved;
+    }
+    prep.bitmap = LoadBitmapFromFile(path);
     prep.templatePreScaled = false;
     prep.options = BuildExecutionFindImageOptions(action, ts);
 
@@ -583,16 +867,20 @@ PreparedFindImageMatch PrepareFindImageMatch(const ScriptAction& action, const T
 void ResolveFindImageClickPoint(const ImageMatchResult& match,
     int origTplW, int origTplH, double nOffsetX, double nOffsetY,
     const TemplateScale& tmplScale, bool templatePreScaled, int& tx, int& ty) {
-    if (!match.found) {
-        tx = ty = 0;
-        return;
-    }
     int cx = 0;
     int cy = 0;
     FindImageMatchCenter(match, cx, cy);
 
-    // 落点中心已是屏幕坐标；偏移按「原图尺寸 × 实际匹配尺度」
-    // 若模板曾非等比预缩放，则分轴用分辨率比例，再乘 match.scale
+    // nOffset 相对模板宽高。命中框可能已被窗口模式从截图像素映射到客户区，
+    // 必须跟框同一坐标系加偏移，不能再用 origTpl×match.scale（仍是模板/截图空间）。
+    const int boxW = match.bottomRightX - match.topLeftX;
+    const int boxH = match.bottomRightY - match.topLeftY;
+    if (boxW > 0 && boxH > 0) {
+        tx = cx + static_cast<int>(std::round(nOffsetX * boxW));
+        ty = cy + static_cast<int>(std::round(nOffsetY * boxH));
+        return;
+    }
+
     const double matchScale = match.scale > 0.0 ? match.scale : 1.0;
     const double offSx = templatePreScaled
         ? (tmplScale.sx > 0.0 ? tmplScale.sx : 1.0) * matchScale
@@ -600,11 +888,8 @@ void ResolveFindImageClickPoint(const ImageMatchResult& match,
     const double offSy = templatePreScaled
         ? (tmplScale.sy > 0.0 ? tmplScale.sy : 1.0) * matchScale
         : matchScale;
-
-    const int offX = static_cast<int>(std::round(nOffsetX * origTplW * offSx));
-    const int offY = static_cast<int>(std::round(nOffsetY * origTplH * offSy));
-    tx = cx + offX;
-    ty = cy + offY;
+    tx = cx + static_cast<int>(std::round(nOffsetX * origTplW * offSx));
+    ty = cy + static_cast<int>(std::round(nOffsetY * origTplH * offSy));
 }
 
 void WriteCoordMetaJson(std::wstring& out, const CoordMeta& meta, bool trailingComma) {
@@ -627,17 +912,33 @@ CoordMeta ParseCoordMetaJson(const std::wstring& content) {
     CoordMeta meta;
     if (content.empty()) return meta;
 
-    meta.version = static_cast<int>(ExtractNumber(content, L"version", 1));
-    const auto space = ExtractString(content, L"space");
+    // ExtractString/Number 只认当前对象顶层键；脚本里这些字段在 coordMeta 内。
+    const std::wstring* src = &content;
+    std::wstring nested;
+    const std::wstring kCoordMetaKey = L"\"coordMeta\"";
+    const auto keyPos = content.find(kCoordMetaKey);
+    if (keyPos != std::wstring::npos) {
+        const auto brace = content.find(L'{', keyPos + kCoordMetaKey.size());
+        if (brace != std::wstring::npos) {
+            const auto end = FindMatchingJsonBrace(content, brace);
+            if (end != std::wstring::npos) {
+                nested = content.substr(brace, end - brace + 1);
+                src = &nested;
+            }
+        }
+    }
+
+    meta.version = static_cast<int>(ExtractNumber(*src, L"version", 1));
+    const auto space = ExtractString(*src, L"space");
     meta.space = (space == L"windowClient")
         ? CoordMeta::Space::WindowClient : CoordMeta::Space::ScreenVirtual;
-    meta.refOriginX = static_cast<int>(ExtractNumber(content, L"refOriginX", 0));
-    meta.refOriginY = static_cast<int>(ExtractNumber(content, L"refOriginY", 0));
-    meta.refWidth = static_cast<int>(ExtractNumber(content, L"refWidth", 0));
-    meta.refHeight = static_cast<int>(ExtractNumber(content, L"refHeight", 0));
-    meta.refDpi = static_cast<int>(ExtractNumber(content, L"refDpi", 96));
-    meta.captureWidth = static_cast<int>(ExtractNumber(content, L"captureWidth", 0));
-    meta.captureHeight = static_cast<int>(ExtractNumber(content, L"captureHeight", 0));
+    meta.refOriginX = static_cast<int>(ExtractNumber(*src, L"refOriginX", 0));
+    meta.refOriginY = static_cast<int>(ExtractNumber(*src, L"refOriginY", 0));
+    meta.refWidth = static_cast<int>(ExtractNumber(*src, L"refWidth", 0));
+    meta.refHeight = static_cast<int>(ExtractNumber(*src, L"refHeight", 0));
+    meta.refDpi = static_cast<int>(ExtractNumber(*src, L"refDpi", 96));
+    meta.captureWidth = static_cast<int>(ExtractNumber(*src, L"captureWidth", 0));
+    meta.captureHeight = static_cast<int>(ExtractNumber(*src, L"captureHeight", 0));
     return meta;
 }
 

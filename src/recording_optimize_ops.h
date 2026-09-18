@@ -36,13 +36,14 @@ OptimizeApplyResult MergeSelected(std::vector<ScriptAction>& actions,
     const std::vector<char>& selected, const std::string& waitCalc, double fixedWait);
 
 OptimizeApplyResult CompressSelected(std::vector<ScriptAction>& actions,
-    const std::vector<char>& selected, double distanceThreshold, double compressWait);
+    const std::vector<char>& selected, double distanceThreshold,
+    const std::string& waitCalc, double fixedWait);
 
 /// 整文件：相当于全选（含关键动作），与产品「跨关键动作合并/压缩」一致。
 OptimizeApplyResult MergeAllKeySplit(std::vector<ScriptAction>& actions,
     const std::string& waitCalc, double fixedWait);
 
 OptimizeApplyResult CompressAllKeySplit(std::vector<ScriptAction>& actions,
-    double distanceThreshold, double compressWait);
+    double distanceThreshold, const std::string& waitCalc, double fixedWait);
 
 }  // namespace recopt

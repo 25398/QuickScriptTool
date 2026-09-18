@@ -20,7 +20,7 @@ struct ScriptActionBuildResult {
 ScriptActionBuildResult BuildScriptActionFromJson(const nlohmann::json& params);
 
 /// 把嵌套 children 展开为扁平列表并写入 indent（子动作 indent=父级+1，忽略子项自带 indent）。
-/// 仅 loop/if/else/defineBlock 允许 children。失败时 flat 被清空。
+/// 仅 loop/if/else/defineBlock/watchImage 允许 children。失败时 flat 被清空。
 bool FlattenNestedActionParamList(const std::vector<nlohmann::json>& nested,
     std::vector<nlohmann::json>& flat, std::wstring& error);
 

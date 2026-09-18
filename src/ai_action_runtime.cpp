@@ -1,4 +1,4 @@
-﻿#include "ai_action_runtime.h"
+#include "ai_action_runtime.h"
 
 #include "agent_ai_actions.h"
 #include "ai_action_service.h"
@@ -51,7 +51,8 @@ AgentCore* EnsureSlotCore(
     cfg.model = profile.modelName;
     cfg.temperature = profile.temperature;
     if (withTools)
-        cfg.maxTokens = profile.maxTokens > 0 ? std::min(profile.maxTokens, 2048) : 2048;
+        // 与 CreateAiActionExecuteCore 同一口径：思考也吃 max_tokens，2048 会中途截断
+        cfg.maxTokens = (std::max)(profile.maxTokens > 0 ? profile.maxTokens : 8192, 8192);
     else
         cfg.maxTokens = maxTokens > 0 ? maxTokens : profile.maxTokens;
     cfg.recvTimeoutMs = std::max(5000, recvTimeoutMs);

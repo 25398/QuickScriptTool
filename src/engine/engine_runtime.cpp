@@ -144,10 +144,6 @@ bool RunScriptPath(const std::wstring& path, std::string& err) {
         err = "busy";
         return false;
     }
-    if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        err = "script not found";
-        return false;
-    }
     // WebView 桥在 UI 线程：同步启动，便于回传「无动作 / 窗口模式取消」等错误
     std::wstring werr;
     if (!g_engine->EngineRunFromPath(path, werr)) {
@@ -202,6 +198,15 @@ bool DebugStepMode() {
 
 int ExecutedSteps() {
     return g_engine ? g_engine->EngineExecutedSteps() : 0;
+}
+
+void PlaybackProgress(int& current, int& total) {
+    if (!g_engine) {
+        current = 0;
+        total = 0;
+        return;
+    }
+    g_engine->EnginePlaybackProgress(current, total);
 }
 
 std::string RunningScriptNameUtf8() {
@@ -376,6 +381,11 @@ void ReloadScheduledTasks() {
 void TouchScheduledIntervalClock(const std::wstring& id) {
     if (!g_engine || id.empty()) return;
     g_engine->EngineTouchScheduledIntervalClock(id);
+}
+
+void TickScheduledTasks() {
+    if (!g_engine) return;
+    g_engine->EngineTickScheduledTasks();
 }
 
 void SetUiHost(HWND hwnd) {

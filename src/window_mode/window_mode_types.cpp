@@ -16,6 +16,12 @@ std::wstring ToLowerCopy(std::wstring value) {
     return value;
 }
 
+std::wstring ExeFileNameLower(const std::wstring& exePath) {
+    const std::wstring lower = ToLowerCopy(exePath);
+    const auto slash = lower.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? lower : lower.substr(slash + 1);
+}
+
 }  // namespace
 
 bool LooksLikeChromiumBrowserClass(const std::wstring& className) {
@@ -33,11 +39,9 @@ bool LooksLikeChromiumBrowserClass(const std::wstring& className) {
 
 bool LooksLikeChromiumBrowserExecutable(const std::wstring& exePath) {
     if (exePath.empty()) return false;
-    const std::wstring lower = ToLowerCopy(exePath);
-    const auto slash = lower.find_last_of(L"\\/");
-    const std::wstring name = slash == std::wstring::npos
-        ? lower : lower.substr(slash + 1);
-    // 仅真浏览器；QQ/微信/Discord/VS Code/Spotify 等 Electron·CEF 勿误判。
+    const std::wstring name = ExeFileNameLower(exePath);
+    // 仅真浏览器；QQ/Discord/VS Code/Spotify 等 Electron·CEF 勿误判。
+    // 微信 4.x 是 Weixin.exe（Qt），也不是浏览器。
     return name == L"msedge.exe"
         || name == L"msedge_proxy.exe"
         || name == L"chrome.exe"
@@ -114,7 +118,9 @@ bool LooksLikeUnrealEngineWindowClass(const std::wstring& className) {
     const std::wstring lower = ToLowerCopy(className);
     if (lower == L"unrealwindow" || lower == L"unrealwindowwin") return true;
     // 常见变体：UnrealWindow / UnrealWindowWin / …UnrealWindow…
-    return lower.find(L"unrealwindow") != std::wstring::npos;
+    if (lower.find(L"unrealwindow") != std::wstring::npos) return true;
+    // UE3 / 枪神纪等：LaunchUnrealUWindowsClient（不含 UnrealWindow 子串）。
+    return lower.find(L"launchunreal") != std::wstring::npos;
 }
 
 bool LooksLikeRemoteDesktopWindowClass(const std::wstring& className) {
@@ -214,11 +220,217 @@ bool LooksLikeMapleStoryTitle(const std::wstring& title) {
     return title.find(L"冒险岛") != std::wstring::npos;
 }
 
+bool LooksLikeMapleStoryTarget(const WindowModeScriptConfig& config, HWND hwnd) {
+    if (LooksLikeMapleStoryWindowClass(config.windowClassName)
+        || LooksLikeMapleStoryWindowClass(config.childWindowClassName)
+        || LooksLikeMapleStoryExecutable(config.targetExePath)
+        || LooksLikeMapleStoryTitle(config.windowName)
+        || LooksLikeMapleStoryTitle(config.targetWindowTitle)) {
+        return true;
+    }
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    if (LooksLikeMapleStoryWindowClass(cls)) return true;
+    wchar_t title[512]{};
+    GetWindowTextW(hwnd, title, 512);
+    if (LooksLikeMapleStoryTitle(title)) return true;
+    return LooksLikeMapleStoryExecutable(QueryHwndProcessImagePath(hwnd));
+}
+
+bool MapleNeedsSafeFakeFocusLite(const WindowModeScriptConfig& config, HWND hwnd) {
+    return LooksLikeMapleStoryTarget(config, hwnd);
+}
+
+bool LooksLikeStandardDesktopAppClass(const std::wstring& className) {
+    if (className.empty()) return false;
+    const std::wstring lower = ToLowerCopy(className);
+    if (lower == L"notepad" || lower == L"wordpadclass") return true;
+    if (lower == L"cabinetwclass" || lower == L"explorewclass") return true;
+    if (lower == L"#32770" || lower == L"consolewindowclass") return true;
+    if (lower == L"applicationframewindow") return true;
+    if (lower == L"edit" || lower == L"button" || lower == L"static") return true;
+    if (lower == L"listbox" || lower == L"combobox" || lower == L"scrollbar") return true;
+    return false;
+}
+
+bool LooksLikeInjectRequiredGameClass(const std::wstring& className) {
+    if (className.empty()) return false;
+    if (LooksLikeMapleStoryWindowClass(className)) return false;
+    return LooksLikeGameWindowClass(className);
+}
+
+bool ClassLooksLikeLcaUnknownGame(const std::wstring& className) {
+    if (className.empty()) return false;
+    if (LooksLikeStandardDesktopAppClass(className)) return false;
+    if (LooksLikeInjectRequiredGameClass(className)) return false;
+    if (LooksLikeMapleStoryWindowClass(className)) return false;
+    if (LooksLikeEmulatorWindowClass(className)) return false;
+    if (LooksLikeAndroidEmulatorWindowClass(className)) return false;
+    if (LooksLikeChromiumBrowserClass(className)) return false;
+    if (LooksLikeQtRenderWindowClass(className)) return false;
+    if (LooksLikeRemoteDesktopWindowClass(className)) return false;
+    if (LooksLikeKernelAntiCheatToken(className)) return false;
+    return true;
+}
+
+bool LooksLikeWeixinExecutable(const std::wstring& exePath) {
+    if (exePath.empty()) return false;
+    const std::wstring name = ExeFileNameLower(exePath);
+    return name == L"weixin.exe" || name == L"wechat.exe";
+}
+
+bool LooksLikeWeixinTitle(const std::wstring& title) {
+    if (title.empty()) return false;
+    if (title.find(L"开发者工具") != std::wstring::npos) return false;
+    const std::wstring lower = ToLowerCopy(title);
+    if (lower.find(L"devtools") != std::wstring::npos) return false;
+    if (title == L"微信") return true;
+    if (title.size() >= 2 && title.compare(0, 2, L"微信") == 0) return true;
+    return lower == L"wechat" || lower == L"weixin";
+}
+
+bool LooksLikeWeixinTarget(const WindowModeScriptConfig& config, HWND hwnd) {
+    if (LooksLikeWeixinExecutable(config.targetExePath)) return true;
+    if (LooksLikeWeixinTitle(config.windowName)
+        || LooksLikeWeixinTitle(config.targetWindowTitle)) {
+        return true;
+    }
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    HWND top = GetAncestor(hwnd, GA_ROOT);
+    if (!top) top = hwnd;
+    wchar_t title[512]{};
+    GetWindowTextW(top, title, 512);
+    if (LooksLikeWeixinTitle(title)) return true;
+    return LooksLikeWeixinExecutable(QueryHwndProcessImagePath(top));
+}
+
+bool NeedsFakeFocusInjection(const WindowModeScriptConfig& config, HWND hwnd) {
+    if (LooksLikeMapleStoryTarget(config, hwnd)) return false;
+    if (LooksLikeTianLongBaBuTarget(config, hwnd)) return true;
+    if (config.enabled && UsesCdpInput(config)) return false;
+    if (LooksLikeRemoteDesktopWindowClass(config.windowClassName)
+        || LooksLikeRemoteDesktopWindowClass(config.childWindowClassName)
+        || LooksLikeRemoteDesktopExePath(config.targetExePath)) {
+        return false;
+    }
+    if (ConfigLooksLikeElectronShell(config) || HwndLooksLikeChromiumShell(hwnd)) return true;
+    if (LooksLikeWeixinTarget(config, hwnd)) return true;
+    if (LooksLikeInjectRequiredGameClass(config.windowClassName)
+        || LooksLikeInjectRequiredGameClass(config.childWindowClassName)) {
+        return true;
+    }
+    if (LooksLikeEmulatorWindowClass(config.windowClassName)
+        || LooksLikeEmulatorWindowClass(config.childWindowClassName)
+        || LooksLikeEmulatorExecutable(config.targetExePath)
+        || LooksLikeEmulatorTarget(config, hwnd)) {
+        return true;
+    }
+    if (HwndLooksLikeDelphiVclGame(hwnd)) return true;
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    if (LooksLikeInjectRequiredGameClass(cls) || LooksLikeEmulatorWindowClass(cls)) return true;
+    if (LooksLikeRemoteDesktopWindowClass(cls)) return false;
+    HWND top = GetAncestor(hwnd, GA_ROOT);
+    if (top && top != hwnd) {
+        GetClassNameW(top, cls, 256);
+        if (LooksLikeInjectRequiredGameClass(cls) || LooksLikeEmulatorWindowClass(cls)) return true;
+    }
+    return false;
+}
+
+bool HwndPrefersLcaBackgroundMessages(HWND hwnd) {
+    // 直播 HWND 只认冒险岛。未登记游戏必须靠脚本类名，避免把记事本自检壳当成游戏。
+    return LooksLikeMapleStoryTarget(WindowModeScriptConfig{}, hwnd);
+}
+
+bool PrefersLcaBackgroundMessages(const WindowModeScriptConfig& config, HWND hwnd) {
+    if (LooksLikeMapleStoryTarget(config, hwnd)) return true;
+    if (config.enabled && UsesCdpInput(config)) return false;
+    if (NeedsFakeFocusInjection(config, hwnd)) return false;
+    if (LooksLikeKernelAntiCheatProtectedTarget(config, hwnd)) return false;
+    if (LooksLikeAndroidEmulatorWindowClass(config.windowClassName)
+        || LooksLikeAndroidEmulatorWindowClass(config.childWindowClassName)
+        || LooksLikeAndroidEmulatorExecutable(config.targetExePath)
+        || LooksLikeAndroidEmulatorWindowTitle(config.windowName)
+        || LooksLikeAndroidEmulatorWindowTitle(config.targetWindowTitle)) {
+        return false;
+    }
+    if (LooksLikeStandardDesktopAppClass(config.windowClassName)
+        || LooksLikeStandardDesktopAppClass(config.childWindowClassName)) {
+        return false;
+    }
+    if (config.enabled
+        && (config.executionKind == WindowModeExecutionKind::BackgroundWindow
+            || config.executionKind == WindowModeExecutionKind::HiddenDesktop)) {
+        if (ClassLooksLikeLcaUnknownGame(config.windowClassName)
+            || ClassLooksLikeLcaUnknownGame(config.childWindowClassName)) {
+            return true;
+        }
+        if (hwnd && IsWindow(hwnd)) {
+            HWND top = GetAncestor(hwnd, GA_ROOT);
+            if (!top) top = hwnd;
+            wchar_t cls[256]{};
+            GetClassNameW(top, cls, 256);
+            if (ClassLooksLikeLcaUnknownGame(cls)) return true;
+        }
+    }
+    return hwnd && HwndPrefersLcaBackgroundMessages(hwnd);
+}
+
+bool LooksLikeTianLongBaBuWindowClass(const std::wstring& className) {
+    if (className.empty()) return false;
+    const std::wstring lower = ToLowerCopy(className);
+    // 官方客户端：`TianLongBaBuHJ WndClass`（类名里有空格）。
+    if (lower.find(L"tianlong") != std::wstring::npos) return true;
+    if (lower.find(L"babuhj") != std::wstring::npos) return true;
+    return false;
+}
+
+bool LooksLikeTianLongBaBuExecutable(const std::wstring& exePath) {
+    if (exePath.empty()) return false;
+    const std::wstring lower = ToLowerCopy(exePath);
+    if (lower.find(L"tianlongbabu") != std::wstring::npos) return true;
+    if (lower.find(L"tianlong") != std::wstring::npos) return true;
+    if (exePath.find(L"天龙八部") != std::wstring::npos) return true;
+    if (exePath.find(L"开心天龙") != std::wstring::npos) return true;
+    return false;
+}
+
+bool LooksLikeTianLongBaBuTitle(const std::wstring& title) {
+    if (title.empty()) return false;
+    if (title.find(L"天龙八部") != std::wstring::npos) return true;
+    const std::wstring lower = ToLowerCopy(title);
+    return lower.find(L"tianlong") != std::wstring::npos;
+}
+
+bool LooksLikeTianLongBaBuTarget(const WindowModeScriptConfig& config, HWND hwnd) {
+    if (LooksLikeTianLongBaBuWindowClass(config.windowClassName)
+        || LooksLikeTianLongBaBuWindowClass(config.childWindowClassName)
+        || LooksLikeTianLongBaBuExecutable(config.targetExePath)
+        || LooksLikeTianLongBaBuTitle(config.windowName)
+        || LooksLikeTianLongBaBuTitle(config.targetWindowTitle)) {
+        return true;
+    }
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    HWND top = GetAncestor(hwnd, GA_ROOT);
+    if (!top) top = hwnd;
+    wchar_t cls[256]{};
+    GetClassNameW(top, cls, 256);
+    if (LooksLikeTianLongBaBuWindowClass(cls)) return true;
+    wchar_t title[512]{};
+    GetWindowTextW(top, title, 512);
+    if (LooksLikeTianLongBaBuTitle(title)) return true;
+    return LooksLikeTianLongBaBuExecutable(QueryHwndProcessImagePath(top));
+}
+
 bool LooksLikeGameWindowClass(const std::wstring& className) {
     if (className.empty()) return false;
     if (LooksLikeAdobeAirWindowClass(className)) return true;
     if (LooksLikeUnrealEngineWindowClass(className)) return true;
     if (LooksLikeDelphiVclGameWindowClass(className)) return true;
+    if (LooksLikeTianLongBaBuWindowClass(className)) return true;
     if (LooksLikeMapleStoryWindowClass(className)) return true;
     const std::wstring lower = ToLowerCopy(className);
     if (lower == L"unitywndclass" || lower == L"unitywndclasshidden") return true;
@@ -460,6 +672,8 @@ bool ConfigLooksLikeEmulatorTarget(const WindowModeScriptConfig& config) {
         || LooksLikeEmulatorExecutable(config.targetExePath)) {
         return true;
     }
+    // 微信 4.x 与 MuMu 同为 Qt*QWindowIcon，不能单凭类名当模拟器。
+    if (LooksLikeWeixinTarget(config, nullptr)) return false;
     if (LooksLikeAndroidEmulatorWindowClass(config.windowClassName)
         || LooksLikeAndroidEmulatorWindowClass(config.childWindowClassName)
         || LooksLikeAndroidEmulatorExecutable(config.targetExePath)
@@ -473,24 +687,15 @@ bool ConfigLooksLikeEmulatorTarget(const WindowModeScriptConfig& config) {
 }
 
 bool UsesFakeFocusForTarget(const WindowModeScriptConfig& config, HWND hwnd) {
+    // 冒险岛 / 未登记游戏：窗口消息即可。冒险岛走路的 mapleSafe 注入由 TryInstallFakeFocus 单独放行。
+    if (PrefersLcaBackgroundMessages(config, hwnd)) return false;
     // 仅真铺满独占禁止注入；窗口化 UE5 走精简假焦点（不钩 PeekMessage）。
     // 传奇 Delphi 即使铺满也要钩 GetCursorPos：后台模式不会改走 SendInput。
     if (LooksLikeMonitorCoveringFullscreen(hwnd)) {
         bool allowCovering = HwndLooksLikeDelphiVclGame(hwnd)
             || LooksLikeDelphiVclGameWindowClass(config.windowClassName)
             || LooksLikeDelphiVclGameWindowClass(config.childWindowClassName)
-            || LooksLikeMapleStoryWindowClass(config.windowClassName)
-            || LooksLikeMapleStoryWindowClass(config.childWindowClassName)
-            || LooksLikeMapleStoryExecutable(config.targetExePath);
-        if (!allowCovering && hwnd && IsWindow(hwnd)) {
-            wchar_t liveCls[256]{};
-            GetClassNameW(hwnd, liveCls, 256);
-            wchar_t liveTitle[512]{};
-            GetWindowTextW(hwnd, liveTitle, 512);
-            allowCovering = LooksLikeMapleStoryWindowClass(liveCls)
-                || LooksLikeMapleStoryTitle(liveTitle)
-                || LooksLikeMapleStoryExecutable(QueryHwndProcessImagePath(hwnd));
-        }
+            || LooksLikeTianLongBaBuTarget(config, hwnd);
         if (!allowCovering) return false;
     }
     if (LooksLikeRemoteDesktopWindowClass(config.windowClassName)
@@ -505,8 +710,9 @@ bool UsesFakeFocusForTarget(const WindowModeScriptConfig& config, HWND hwnd) {
     }
     if (UsesFakeFocus(config)) return true;
     if (AndroidEmulatorPrefersFakeFocus(hwnd, &config)) return true;
-    // 绑定时 config.exe 可能为空：按直播 HWND 识别 QQ/微信/Discord 等 Chromium 壳。
+    // 绑定时 config.exe 可能为空：按直播 HWND 识别 QQ/Discord 等 Chromium 壳，或微信 4.x。
     if (HwndLooksLikeChromiumShell(hwnd)) return true;
+    if (LooksLikeWeixinTarget(config, hwnd)) return true;
     if (!config.enabled || UsesCdpInput(config)) return false;
     if (config.executionKind != WindowModeExecutionKind::HiddenDesktop
         && config.executionKind != WindowModeExecutionKind::BackgroundWindow) {
@@ -517,18 +723,18 @@ bool UsesFakeFocusForTarget(const WindowModeScriptConfig& config, HWND hwnd) {
     GetClassNameW(hwnd, cls, 256);
     if (LooksLikeGameWindowClass(cls) || LooksLikeEmulatorWindowClass(cls)) return true;
     if (HwndLooksLikeDelphiVclGame(hwnd)) return true;
-    wchar_t title[512]{};
-    GetWindowTextW(hwnd, title, 512);
-    if (LooksLikeMapleStoryTitle(title)) return true;
     const std::wstring path = QueryHwndProcessImagePath(hwnd);
-    if (LooksLikeMapleStoryExecutable(path)) return true;
     return LooksLikeEmulatorExecutable(path);
 }
 
 bool GameTargetNeedsHardwareWithoutFakeFocus(const WindowModeScriptConfig& config, HWND hwnd) {
     if (!config.enabled || UsesCdpInput(config)) return false;
-    if (config.executionKind != WindowModeExecutionKind::HiddenDesktop) return false;
+    if (config.executionKind != WindowModeExecutionKind::HiddenDesktop
+        && config.executionKind != WindowModeExecutionKind::BackgroundWindow) {
+        return false;
+    }
     if (LooksLikeChromiumShellTarget(config, hwnd)) return false;
+    if (LooksLikeWeixinTarget(config, hwnd)) return false;
     if (AndroidEmulatorPrefersFakeFocus(hwnd, &config)
         || AndroidEmulatorPrefersFakeFocusFromConfig(config)) {
         return false;
@@ -603,7 +809,8 @@ const wchar_t* HealthToUserHint(WindowModeHealth health) {
     case WindowModeHealth::TargetMinimized: return L"目标窗口已最小化，已尝试后台还原但仍失败，请手动还原";
     case WindowModeHealth::TargetNoRender: return L"该程序可能不支持后台截图（游戏/GPU 界面）";
     case WindowModeHealth::CaptureFailed: return L"截图失败，请稍后重试";
-    case WindowModeHealth::PermissionMismatch: return L"请以相同权限运行本工具与目标程序";
+    case WindowModeHealth::PermissionMismatch:
+        return L"目标程序权限更高。请右键本工具选择「以管理员身份运行」后再试，不要重复打开游戏客户端";
     default: return L"";
     }
 }

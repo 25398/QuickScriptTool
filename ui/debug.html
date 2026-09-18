@@ -17,6 +17,7 @@ html,body{
   height:100%;overflow:hidden;background:var(--sky-100);font-family:var(--font);color:var(--text);
   -webkit-user-select:none;user-select:none;
 }
+html{zoom:var(--qst-ui-scale,1)}
 body{display:flex;flex-direction:column;background:var(--frost)}
 .title{
   height:40px;flex-shrink:0;display:flex;align-items:center;gap:8px;
@@ -152,6 +153,12 @@ body.minimized{height:auto}
       return;
     }
     if (msg.type === "debugWindow.show") {
+      return;
+    }
+    if (msg.type === "uiScale.apply") {
+      const s = Number(msg.scale);
+      if (Number.isFinite(s) && s > 0)
+        document.documentElement.style.setProperty("--qst-ui-scale", String(s));
       return;
     }
     if (msg.type === "debugWindowSetTopmost.result") {

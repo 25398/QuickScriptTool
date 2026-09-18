@@ -3,6 +3,7 @@
 #include "action_tree.h"
 #include "action_utils.h"
 #include "image_match.h"
+#include "opencv_runtime.h"
 #include "image_var_util.h"
 #include "recording_to_findimage.h"
 #include "script_io.h"
@@ -46,7 +47,7 @@ bool LooksLikeListOcrText(const std::wstring& text) {
 }
 
 double EstimateFindImageTemplateFeatureScore(const std::wstring& imagePath) {
-    if (imagePath.empty()) return -1.0;
+    if (imagePath.empty() || !OpenCvAvailable()) return -1.0;
     try {
         const cv::Mat img = cv::imread(ToUtf8(imagePath), cv::IMREAD_GRAYSCALE);
         if (img.empty() || img.cols < 4 || img.rows < 4) return -1.0;
@@ -775,6 +776,26 @@ void AiLogicConvertNoteWindowActivate(const std::wstring& matchQuery) {
     e.activateMatch = match;
     e.action = MakeActivateSettle(match, 0);
     Sess().transcript.push_back(std::move(e));
+}
+
+void AiLogicConvertNoteOpenWebpage(const std::wstring& url) {
+    if (!Sess().active) return;
+    const std::wstring u = Trim(url);
+    if (u.empty()) return;
+    if (static_cast<int>(Sess().transcript.size()) >= 80) return;
+    if (!Sess().transcript.empty()) {
+        const auto& last = Sess().transcript.back();
+        if (!last.fromLocate && !last.fromActivate
+            && last.action.type == ActionType::OpenWebpage
+            && last.action.targetPath == u) {
+            return;
+        }
+    }
+    ScriptAction a;
+    a.type = ActionType::OpenWebpage;
+    a.targetPath = u;
+    a.remark = L"扩展导航";
+    AiLogicConvertNoteAction(a);
 }
 
 const std::vector<AiLogicTranscriptEntry>& AiLogicConvertTranscript() {

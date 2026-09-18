@@ -43,6 +43,9 @@ int ClientArea(HWND hwnd) {
 }
 
 bool IsAndroidEmulatorTop(HWND top, const WindowModeScriptConfig* config) {
+    if (LooksLikeWeixinTarget(config ? *config : WindowModeScriptConfig{}, top)) {
+        return false;
+    }
     if (config && LooksLikeAndroidEmulatorExecutable(config->targetExePath)) return true;
     if (config && LooksLikeAndroidEmulatorWindowTitle(config->windowName)) return true;
     top = TopLevelTargetWindow(top);
@@ -340,6 +343,12 @@ HWND FindBackgroundInputChild(HWND top, const WindowModeScriptConfig* config,
 
     if (HWND emu = FindAndroidEmulatorRenderChild(top, config)) {
         return finish(emu, BackgroundInputTargetKind::AndroidEmulatorRender);
+    }
+
+    // 微信 4.x：键鼠打到顶层 QWindow，不要落到最大子表面（与 AIR/冒险岛相同）。
+    if (LooksLikeWeixinTarget(config ? *config : WindowModeScriptConfig{}, top)
+        && !LooksLikeChromiumShellTarget(config ? *config : WindowModeScriptConfig{}, top)) {
+        return finish(top, BackgroundInputTargetKind::TopLevel);
     }
 
     // DeSmuME/Dolphin 等：WM_LBUTTON / 假焦点绑顶层；勿误投到工具栏或最大子窗。

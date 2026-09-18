@@ -160,6 +160,21 @@ body::after {
   flex-direction: column;
   overflow: hidden;
 }
+.app.editor-mode .left-col.is-visual .action-table,
+.app.editor-mode .left-col.is-visual .add-bar,
+.app.editor-mode .editor-chrome.is-visual .action-table,
+.app.editor-mode .editor-chrome.is-visual .add-bar,
+.app.visual-editor .action-table,
+.app.visual-editor .add-bar {
+  display: none !important;
+}
+.app.editor-mode .left-col.is-visual #visualCanvasHost,
+.app.editor-mode .editor-chrome.is-visual #visualCanvasHost,
+.app.visual-editor #visualCanvasHost {
+  display: block !important;
+  flex: 1 1 auto;
+  min-height: 0;
+}
 .app .editor-chrome .col-headers {
   overflow-y: auto;
   scrollbar-gutter: stable;
@@ -388,4 +403,31 @@ body::after {
   width: 100%;
   max-width: 100%;
   min-width: 0;
+}
+.param-block .fline.nwm-btns {
+  width: 100%;
+  gap: calc(6px * var(--qst-u, 1.5));
+  align-items: center;
+}
+.param-block .fline.nwm-btns > button.btn {
+  width: auto;
+  max-width: none;
+  flex: 0 0 auto;
+  min-width: calc(72px * var(--qst-u, 1.5));
+  margin: 0;
+  white-space: nowrap;
+}
+.param-block .fline-stack.nwm-full .stack-ctrl > .inp {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 100%;
+}
+.param-block .fline-stack.nwm-full .stack-lab.nwm-lab {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--qst-u, 1.5));
+}
+.param-block .fline-stack.nwm-full .stack-lab.nwm-lab > .chk {
+  flex: 0 0 auto;
+  font-weight: 500;
 }

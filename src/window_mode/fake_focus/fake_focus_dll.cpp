@@ -24,6 +24,8 @@ std::atomic_bool g_installed{false};
 bool g_liteMode = false;
 bool g_electronSafe = false;
 bool g_airSafe = false;
+bool g_weixinSafe = false;
+bool g_tianlongSafe = false;
 bool g_mapleSafe = false;
 bool g_desktopEmuSafe = false;  // DeSmuME/Dolphin：极简假焦点，禁 RawInput/WM_INPUT
 volatile LONG g_mapleHitGaks = 0;
@@ -34,6 +36,11 @@ volatile LONG g_mapleHitGfw = 0;
 volatile LONG g_mapleHitFocus = 0;
 fakefocus::SoftInputState* g_softView = nullptr;
 bool g_softWritable = false;
+int g_mapleInputHookCount = 0;
+DWORD g_mapleDiag = 0;
+int g_diVtPatchN = 0;
+int g_mapleFoundVt = 0;
+int g_mapleHeapVt = 0;
 void MaplePublishHits() {
     if (!g_softWritable || !g_softView) return;
     if (!fakefocus::SoftInputStateLooksValid(g_softView)) return;
@@ -44,6 +51,16 @@ void MaplePublishHits() {
     g_softView->hitGfw = static_cast<uint32_t>(g_mapleHitGfw);
     g_softView->hitFocus = static_cast<uint32_t>(g_mapleHitFocus);
     g_softView->hitReady = 1;
+    g_softView->mapleDiag = g_mapleDiag;
+    g_softView->mapleIatPoll = static_cast<uint32_t>(g_mapleInputHookCount);
+    const uint32_t foundVt = static_cast<uint32_t>(g_mapleFoundVt) & 0xFFu;
+    const uint32_t patched = static_cast<uint32_t>(g_diVtPatchN) & 0xFFu;
+    const uint32_t heapVt = static_cast<uint32_t>(g_mapleHeapVt) & 0xFFu;
+    g_softView->mapleDiVt = foundVt | (patched << 8) | (heapVt << 16);
+}
+void MapleNoteDiStateCb(DWORD cb) {
+    const LONG store = cb > 0x7FFFFFFFu ? 0x7FFFFFFF : static_cast<LONG>(cb);
+    InterlockedExchange(&g_mapleLastDiStateCb, store);
 }
 void MapleBumpHit(volatile LONG* c) {
     if (!c) return;
@@ -74,6 +91,14 @@ BOOL (WINAPI* g_mapleRealFlashWindowEx)(PFLASHWINFO) = nullptr;
 void (WINAPI* g_mapleRealSwitchToThisWindow)(HWND, BOOL) = nullptr;
 HWND (WINAPI* g_mapleRealGetActiveWindow)() = nullptr;
 HWND (WINAPI* g_mapleRealGetFocus)() = nullptr;
+BOOL (WINAPI* g_mapleRealIsIconic)(HWND) = nullptr;
+BOOL (WINAPI* g_mapleRealIsWindowVisible)(HWND) = nullptr;
+void* g_mapleNtUserGfw = nullptr;
+void* g_mapleNtUserGaks = nullptr;
+void* g_mapleNtUserKeyState = nullptr;
+void* g_mapleNtUserKbState = nullptr;
+void* g_mapleNtUserCursor = nullptr;
+void* g_mapleNtUserSetCursor = nullptr;
 HANDLE g_drainThread = nullptr;
 std::atomic_bool g_drainStop{false};
 
@@ -81,6 +106,9 @@ void DrainSoftKeyEventsPost();
 void MaybePostFakeWmInput();
 void StopSoftKeyDrainThread();
 bool ProcessImageLooksLikeDesktopEmu(HWND top);
+bool ProcessImageLooksLikeWeixin(HWND top);
+bool HwndLooksLikeWeixinClient(HWND top);
+bool ClassLooksLikeTianLongBaBu(const wchar_t* cls);
 bool LooksLikeDesktopEmuClassName(const wchar_t* cls);
 
 WNDPROC g_oldWndProc = nullptr;
@@ -100,16 +128,20 @@ fakefocus::InlineHook g_hookKeyState{};
 fakefocus::InlineHook g_hookKeyboardState{};
 fakefocus::InlineHook g_hookIsVisible{};
 fakefocus::InlineHook g_hookDwmAttr{};
-fakefocus::InlineHook g_hookDiLiveAcquire[4]{};
-fakefocus::InlineHook g_hookDiLiveState[4]{};
-constexpr int kMapleLiveDiN = 4;
+fakefocus::InlineHook g_hookDiLiveAcquire[8]{};
+fakefocus::InlineHook g_hookDiLiveState[8]{};
+constexpr int kMapleLiveDiN = 8;
 
 HANDLE g_softMapping = nullptr;
 DWORD g_softPid = 0;
 HHOOK g_focusGuardHook = nullptr;
+void CloseSoftInputView();
 
 bool OpenSoftInputView(DWORD softPid) {
-    if (g_softView) return true;
+    if (g_softView) {
+        if (fakefocus::SoftInputStateLooksValid(g_softView)) return true;
+        CloseSoftInputView();
+    }
     if (softPid == 0) softPid = GetCurrentProcessId();
     g_softPid = softPid;
     wchar_t name[128]{};
@@ -130,7 +162,10 @@ bool OpenSoftInputView(DWORD softPid) {
         return false;
     }
     g_softWritable = (access & FILE_MAP_WRITE) != 0;
-    if (!fakefocus::SoftInputStateLooksValid(g_softView)) return false;
+    if (!fakefocus::SoftInputStateLooksValid(g_softView)) {
+        CloseSoftInputView();
+        return false;
+    }
     if (g_softWritable) g_softView->hitReady = 1;
     return true;
 }
@@ -389,7 +424,7 @@ HWND CallMapleOrInlineForeground() {
 HWND WINAPI Hook_GetForegroundWindow() {
     if (g_mapleSafe) MapleBumpHit(&g_mapleHitGfw);
     // AIR/冒险岛只骗前景查询：不要在游戏线程顺带灌键/WM_ACTIVATE。
-    if (!g_airSafe && !g_mapleSafe) DrainSoftKeyEventsPost();
+    if (!g_airSafe && !g_weixinSafe && !g_tianlongSafe && !g_mapleSafe) DrainSoftKeyEventsPost();
     HWND fake = g_targetTop.load(std::memory_order_relaxed);
     if (fake && IsWindow(fake)) return fake;
     // 方法体 JMP 后不能再进 user32/win32u 原函数（会递归）。
@@ -452,6 +487,7 @@ void WINAPI Hook_SwitchToThisWindow(HWND hwnd, BOOL fAltTab) {
 }
 
 HWND WINAPI Hook_GetActiveWindow() {
+    if (g_mapleSafe) MapleBumpHit(&g_mapleHitGfw);
     HWND fake = g_targetTop.load(std::memory_order_relaxed);
     if (fake && IsWindow(fake)) return fake;
     if (g_mapleSafe) return fake;
@@ -468,6 +504,16 @@ HWND WINAPI Hook_GetFocus() {
     if (g_mapleSafe) return focus ? focus : fake;
     if (g_mapleRealGetFocus) return g_mapleRealGetFocus();
     return CallOriginalFocus();
+}
+
+BOOL WINAPI Hook_IsIconic(HWND hwnd) {
+    HWND fake = g_targetTop.load(std::memory_order_relaxed);
+    if (g_mapleSafe && fake && IsWindow(fake)
+        && (hwnd == fake || (hwnd && IsChild(fake, hwnd)))) {
+        return FALSE;
+    }
+    if (g_mapleRealIsIconic) return g_mapleRealIsIconic(hwnd);
+    return FALSE;
 }
 
 HWND FindChromeRenderWidget(HWND top) {
@@ -541,7 +587,7 @@ HWND FindQtAndroidRenderChild(HWND top) {
 
 HWND ResolveSoftInputPostHwnd(HWND top) {
     if (!top || !IsWindow(top)) return nullptr;
-    if (g_mapleSafe || g_airSafe) return top;
+    if (g_mapleSafe || g_airSafe || g_weixinSafe || g_tianlongSafe) return top;
     if (HWND render = FindChromeRenderWidget(top)) return render;
     if (HWND qt = FindQtAndroidRenderChild(top)) return qt;
     return top;
@@ -627,6 +673,10 @@ void DrainSoftKeyEventsPost() {
     }
 
     while (g_keyEventRead < write) {
+        // 卸载时立刻收手：本函数由灌键线程调用，FreeLibrary 在另一个线程上等它退出。
+        // 忙等里不看停止位会让 StopSoftKeyDrainThread 超时放行 → DLL 代码被解除映射后
+        // 线程继续跑（表现为后续 LoadLibrary/FreeLibrary 卡死或崩溃）。
+        if (g_drainStop.load(std::memory_order_acquire)) return;
         const fakefocus::SoftKeyEvent e =
             st->keyEvents[g_keyEventRead % fakefocus::kSoftKeyEventCap];
         ++g_keyEventRead;
@@ -676,7 +726,8 @@ void DrainSoftKeyEventsPost() {
 void StopSoftKeyDrainThread() {
     g_drainStop.store(true, std::memory_order_release);
     if (g_drainThread) {
-        WaitForSingleObject(g_drainThread, 3000);
+        // DrainSoftKeyEventsPost 每轮都查停止位，正常 1~2ms 退出；1s 已足够宽容。
+        WaitForSingleObject(g_drainThread, 1000);
         CloseHandle(g_drainThread);
         g_drainThread = nullptr;
     }
@@ -694,15 +745,20 @@ void StartSoftKeyDrainThread() {
     StopSoftKeyDrainThread();
     g_drainStop.store(false, std::memory_order_release);
     g_drainThread = CreateThread(nullptr, 0, SoftKeyDrainThreadProc, nullptr, 0, nullptr);
+    if (g_drainThread) SetThreadPriority(g_drainThread, THREAD_PRIORITY_BELOW_NORMAL);
 }
 
 BOOL WINAPI Hook_GetCursorPos(LPPOINT pt) {
     // 冒险岛走 IAT，禁止在游戏线程灌 WM_INPUT / WM_ACTIVATE（会卡死）。
     // DeSmuME：同样禁止假 WM_INPUT（InputTimer 高频 GetAsyncKeyState 会洪泛崩进程）。
-    if (!g_mapleSafe && !g_desktopEmuSafe) {
-        if (!g_electronSafe) MaybePostFakeWmInput();
-        DrainSoftKeyEventsPost();
+    // 微信/AIR/Electron：禁止假 WM_INPUT 与 SoftRefreshFocusMessages（会 Post WM_ACTIVATE 抢前台）。
+    if (!g_mapleSafe && !g_desktopEmuSafe && !g_weixinSafe && !g_tianlongSafe && !g_airSafe) {
+        // Electron（Chromium 壳）：静默钩——只回报软光标。
+        // 灌 WM_INPUT 会被 Chromium 当伪造输入丢弃甚至洪泛消息队列；
+        // 焦点消息与灌键已由 SoftKeyDrainThread 按 200ms/1ms 节拍负责，此处勿重复。
         if (!g_electronSafe) {
+            MaybePostFakeWmInput();
+            DrainSoftKeyEventsPost();
             const DWORD now = GetTickCount();
             if (now - g_lastFocusRefreshMs >= 200) {
                 g_lastFocusRefreshMs = now;
@@ -766,7 +822,7 @@ SHORT SoftKeyDownShort(int vKey, bool asyncStyle) {
 
 SHORT WINAPI Hook_GetAsyncKeyState(int vKey) {
     if (g_mapleSafe) MapleBumpHit(&g_mapleHitGaks);
-    if (!g_mapleSafe && !g_desktopEmuSafe) {
+    if (!g_mapleSafe && !g_desktopEmuSafe && !g_weixinSafe && !g_tianlongSafe && !g_airSafe) {
         if (!g_electronSafe) MaybePostFakeWmInput();
         DrainSoftKeyEventsPost();
     }
@@ -824,7 +880,14 @@ BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
 
 BOOL WINAPI Hook_IsWindowVisible(HWND hwnd) {
     // 宏桌面 / Pin+Cloak 时系统常报不可见；Chromium 据此丢弃输入。
+    // 冒险岛 visible=0 时客户端会停轮询，IAT 必须回报可见。
+    if (g_mapleSafe && IsOurHwnd(hwnd)) {
+        MapleBumpHit(&g_mapleHitGfw);
+        return TRUE;
+    }
     if (IsOurHwnd(hwnd)) return TRUE;
+    if (g_mapleSafe && g_mapleRealIsWindowVisible) return g_mapleRealIsWindowVisible(hwnd);
+    if (g_mapleSafe) return TRUE;
     return CallOriginalIsWindowVisible(hwnd);
 }
 
@@ -853,6 +916,129 @@ bool IsDeactivate(WPARAM wp, UINT msg) {
         return true;
     }
     return false;
+}
+
+// 星辰目录里是 2009 官方 dinput8：失焦后靠 WM_ACTIVATE 停轮询，不是每帧 GetForegroundWindow。
+// 164352 / FakeFocus32.raw.dll：Peek 灌假 WM_INPUT、钩 GetRawInput*、改 dinput8 可写节、
+// 注入线程 RegisterRawInputDevices(INPUTSINK) / SetCooperativeLevel = 立刻闪退。
+// 只改 IAT 吞失活 + 27–32 方法虚表；禁止假 WM_INPUT、禁止代理 DLL、禁止 user32 方法体 JMP。
+BOOL (WINAPI* g_mapleRealPeekMessageW)(LPMSG, HWND, UINT, UINT, UINT) = nullptr;
+BOOL (WINAPI* g_mapleRealPeekMessageA)(LPMSG, HWND, UINT, UINT, UINT) = nullptr;
+BOOL (WINAPI* g_mapleRealGetMessageW)(LPMSG, HWND, UINT, UINT) = nullptr;
+BOOL (WINAPI* g_mapleRealGetMessageA)(LPMSG, HWND, UINT, UINT) = nullptr;
+LRESULT (WINAPI* g_mapleRealDispatchMessageW)(const MSG*) = nullptr;
+LRESULT (WINAPI* g_mapleRealDispatchMessageA)(const MSG*) = nullptr;
+BOOL (WINAPI* g_mapleRealTranslateMessage)(const MSG*) = nullptr;
+LRESULT (WINAPI* g_mapleRealCallWindowProcW)(WNDPROC, HWND, UINT, WPARAM, LPARAM) = nullptr;
+LRESULT (WINAPI* g_mapleRealCallWindowProcA)(WNDPROC, HWND, UINT, WPARAM, LPARAM) = nullptr;
+
+void MapleNeutralizeDeactivateMsg(MSG* msg) {
+    if (!msg) return;
+    HWND top = g_targetTop.load(std::memory_order_relaxed);
+    const bool ours = IsOurHwnd(msg->hwnd)
+        || (msg->hwnd && top && IsWindow(top) && IsChild(top, msg->hwnd));
+    if (msg->message == WM_ACTIVATEAPP) {
+        if (msg->wParam == FALSE) {
+            msg->wParam = TRUE;
+            MapleBumpHit(&g_mapleHitFocus);
+        }
+        return;
+    }
+    if (!ours) return;
+    if (!IsDeactivate(msg->wParam, msg->message)) return;
+    if (msg->message == WM_KILLFOCUS) {
+        msg->message = WM_NULL;
+        MapleBumpHit(&g_mapleHitFocus);
+        return;
+    }
+    if (msg->message == WM_NCACTIVATE) {
+        msg->wParam = TRUE;
+        MapleBumpHit(&g_mapleHitFocus);
+        return;
+    }
+    if (msg->message == WM_ACTIVATE) {
+        msg->wParam = MAKEWPARAM(WA_ACTIVE, HIWORD(msg->wParam));
+        MapleBumpHit(&g_mapleHitFocus);
+    }
+}
+
+WPARAM MapleNeutralizeDeactivateParams(HWND hwnd, UINT msg, WPARAM wp) {
+    HWND top = g_targetTop.load(std::memory_order_relaxed);
+    const bool ours = IsOurHwnd(hwnd)
+        || (hwnd && top && IsWindow(top) && IsChild(top, hwnd));
+    if (msg == WM_ACTIVATEAPP && wp == FALSE) return TRUE;
+    if (!ours || !IsDeactivate(wp, msg)) return wp;
+    if (msg == WM_NCACTIVATE) return TRUE;
+    if (msg == WM_ACTIVATE) return MAKEWPARAM(WA_ACTIVE, HIWORD(wp));
+    if (msg == WM_ACTIVATEAPP) return TRUE;
+    return wp;
+}
+
+BOOL WINAPI Hook_MaplePeekMessageW(LPMSG lpMsg, HWND hWnd, UINT min, UINT max, UINT remove) {
+    auto orig = g_mapleRealPeekMessageW ? g_mapleRealPeekMessageW : PeekMessageW;
+    const BOOL got = orig(lpMsg, hWnd, min, max, remove);
+    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    return got;
+}
+BOOL WINAPI Hook_MaplePeekMessageA(LPMSG lpMsg, HWND hWnd, UINT min, UINT max, UINT remove) {
+    auto orig = g_mapleRealPeekMessageA ? g_mapleRealPeekMessageA : PeekMessageA;
+    const BOOL got = orig(lpMsg, hWnd, min, max, remove);
+    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    return got;
+}
+BOOL WINAPI Hook_MapleGetMessageW(LPMSG lpMsg, HWND hWnd, UINT min, UINT max) {
+    auto orig = g_mapleRealGetMessageW ? g_mapleRealGetMessageW : GetMessageW;
+    const BOOL got = orig(lpMsg, hWnd, min, max);
+    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    return got;
+}
+BOOL WINAPI Hook_MapleGetMessageA(LPMSG lpMsg, HWND hWnd, UINT min, UINT max) {
+    auto orig = g_mapleRealGetMessageA ? g_mapleRealGetMessageA : GetMessageA;
+    const BOOL got = orig(lpMsg, hWnd, min, max);
+    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    return got;
+}
+LRESULT WINAPI Hook_MapleDispatchMessageW(const MSG* lpMsg) {
+    auto orig = g_mapleRealDispatchMessageW ? g_mapleRealDispatchMessageW : DispatchMessageW;
+    MSG copy{};
+    if (lpMsg) {
+        copy = *lpMsg;
+        MapleNeutralizeDeactivateMsg(&copy);
+        return orig(&copy);
+    }
+    return orig(lpMsg);
+}
+LRESULT WINAPI Hook_MapleDispatchMessageA(const MSG* lpMsg) {
+    auto orig = g_mapleRealDispatchMessageA ? g_mapleRealDispatchMessageA : DispatchMessageA;
+    MSG copy{};
+    if (lpMsg) {
+        copy = *lpMsg;
+        MapleNeutralizeDeactivateMsg(&copy);
+        return orig(&copy);
+    }
+    return orig(lpMsg);
+}
+BOOL WINAPI Hook_MapleTranslateMessage(const MSG* lpMsg) {
+    auto orig = g_mapleRealTranslateMessage ? g_mapleRealTranslateMessage : TranslateMessage;
+    return orig(lpMsg);
+}
+LRESULT WINAPI Hook_MapleCallWindowProcW(WNDPROC prev, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto orig = g_mapleRealCallWindowProcW ? g_mapleRealCallWindowProcW : CallWindowProcW;
+    if (msg == WM_KILLFOCUS && (IsOurHwnd(hwnd)
+        || (hwnd && IsOurHwnd(GetAncestor(hwnd, GA_ROOT))))) {
+        return 0;
+    }
+    wp = MapleNeutralizeDeactivateParams(hwnd, msg, wp);
+    return orig(prev, hwnd, msg, wp, lp);
+}
+LRESULT WINAPI Hook_MapleCallWindowProcA(WNDPROC prev, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto orig = g_mapleRealCallWindowProcA ? g_mapleRealCallWindowProcA : CallWindowProcA;
+    if (msg == WM_KILLFOCUS && (IsOurHwnd(hwnd)
+        || (hwnd && IsOurHwnd(GetAncestor(hwnd, GA_ROOT))))) {
+        return 0;
+    }
+    wp = MapleNeutralizeDeactivateParams(hwnd, msg, wp);
+    return orig(prev, hwnd, msg, wp, lp);
 }
 
 #include "fake_focus_raw_input.inl"
@@ -939,6 +1125,8 @@ void ResetFocusModeFlags() {
     g_liteMode = false;
     g_electronSafe = false;
     g_airSafe = false;
+    g_weixinSafe = false;
+    g_tianlongSafe = false;
     g_mapleSafe = false;
     g_desktopEmuSafe = false;
 }
@@ -966,6 +1154,8 @@ bool ShouldAttachFakeFocusSubclass(HWND top) {
     if (_wcsicmp(cls, L"SDL_APP") == 0) return false;
     // Adobe AIR（造梦 ApolloRuntime）：子类化会卡死播放器随后退出。
     if (LooksLikeAdobeAirClassName(cls)) return false;
+    if (HwndLooksLikeWeixinClient(top)) return false;
+    if (ClassLooksLikeTianLongBaBu(cls)) return false;
     // 冒险岛 DirectX：子类化 / 光标钩会让客户端无响应，只能任务管理器杀。
     if (LooksLikeMapleStoryTarget(top)) return false;
     return true;
@@ -1002,6 +1192,72 @@ bool ProcessImageLooksLikeDesktopEmu(HWND top) {
     return false;
 }
 
+bool ClassLooksLikeQtQWindowIcon(const wchar_t* cls) {
+    if (!cls || !cls[0]) return false;
+    wchar_t lower[256]{};
+    size_t n = 0;
+    for (; cls[n] && n < 255; ++n) {
+        lower[n] = static_cast<wchar_t>(towlower(cls[n]));
+    }
+    return wcsstr(lower, L"qt") != nullptr && wcsstr(lower, L"qwindowicon") != nullptr;
+}
+
+bool ClassLooksLikeTianLongBaBu(const wchar_t* cls) {
+    if (!cls || !cls[0]) return false;
+    wchar_t lower[256]{};
+    size_t n = 0;
+    for (; cls[n] && n < 255; ++n) {
+        lower[n] = static_cast<wchar_t>(towlower(cls[n]));
+    }
+    return wcsstr(lower, L"tianlong") != nullptr || wcsstr(lower, L"babuhj") != nullptr;
+}
+
+bool TitleLooksLikeWeixinClient(const wchar_t* title) {
+    if (!title || !title[0]) return false;
+    if (wcsstr(title, L"开发者工具") != nullptr) return false;
+    wchar_t lower[512]{};
+    size_t n = 0;
+    for (; title[n] && n < 511; ++n) {
+        lower[n] = static_cast<wchar_t>(towlower(title[n]));
+    }
+    if (wcsstr(lower, L"devtools") != nullptr) return false;
+    if (wcscmp(title, L"微信") == 0) return true;
+    if (title[0] == L'微' && title[1] == L'信') return true;
+    return wcscmp(lower, L"wechat") == 0 || wcscmp(lower, L"weixin") == 0;
+}
+
+bool ProcessImageLooksLikeWeixin(HWND top) {
+    if (!top || !IsWindow(top)) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(top, &pid);
+    if (pid == 0) return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return false;
+    wchar_t path[MAX_PATH]{};
+    DWORD n = MAX_PATH;
+    const BOOL ok = QueryFullProcessImageNameW(proc, 0, path, &n);
+    CloseHandle(proc);
+    if (!ok || n == 0) return false;
+    for (DWORD i = 0; i < n; ++i) {
+        path[i] = static_cast<wchar_t>(towlower(path[i]));
+    }
+    const wchar_t* leaf = path;
+    for (DWORD i = 0; i < n; ++i) {
+        if (path[i] == L'\\' || path[i] == L'/') leaf = path + i + 1;
+    }
+    return wcscmp(leaf, L"weixin.exe") == 0 || wcscmp(leaf, L"wechat.exe") == 0;
+}
+
+bool HwndLooksLikeWeixinClient(HWND top) {
+    if (ProcessImageLooksLikeWeixin(top)) return true;
+    if (!top || !IsWindow(top)) return false;
+    wchar_t cls[256]{};
+    wchar_t title[512]{};
+    GetClassNameW(top, cls, 256);
+    GetWindowTextW(top, title, 512);
+    return ClassLooksLikeQtQWindowIcon(cls) && TitleLooksLikeWeixinClient(title);
+}
+
 bool LooksLikeDesktopEmuClassName(const wchar_t* cls) {
     if (!cls || !cls[0]) return false;
     if (_wcsicmp(cls, L"DeSmuME") == 0) return true;
@@ -1022,6 +1278,8 @@ bool ShouldSkipGetCursorPosHook(HWND top) {
     if (ProcessImageLooksLikeDesktopEmu(top)) return true;
     // AIR 2D 吃 WM_MOUSE*；钩 GetCursorPos/SetCursorPos 会让真光标原地抽，并狂投 WM_INPUT。
     if (LooksLikeAdobeAirClassName(cls)) return true;
+    // Phase2 全套会带 RawInput；微信光标钩走 InstallWeixinMouseStateHooks。
+    if (HwndLooksLikeWeixinClient(top)) return true;
     if (LooksLikeMapleStoryTarget(top)) return true;
     return false;
 }
@@ -1066,9 +1324,7 @@ struct MapleIatPatch {
 };
 MapleIatPatch g_mapleIat[kMapleIatCap]{};
 int g_mapleIatCount = 0;
-int g_mapleInputHookCount = 0;
-DWORD g_mapleDiag = 0;
-HMODULE g_mapleExtraMods[32]{};
+HMODULE g_mapleExtraMods[48]{};
 int g_mapleExtraModN = 0;
 FARPROC (WINAPI* g_mapleRealGetProcAddress)(HMODULE, LPCSTR) = nullptr;
 void MapleMarkIatDetour(void* detour);
@@ -1095,14 +1351,13 @@ struct MapleDiKindEnt {
     int kind = 0;
 };
 MapleDiKindEnt g_mapleDiKind[8]{};
-constexpr int kMapleDiVtCap = 20;
+constexpr int kMapleDiVtCap = 40;
 struct MapleDiVtPatch {
     void** slot = nullptr;
     void* orig = nullptr;
     int index = 0;
 };
 MapleDiVtPatch g_diVtPatch[kMapleDiVtCap]{};
-int g_diVtPatchN = 0;
 
 bool MapleIatPatchSlot(void** slot, void* detour, bool countPoll) {
     if (!slot || !detour || g_mapleIatCount >= kMapleIatCap) return false;
@@ -1119,19 +1374,29 @@ bool MapleIatPatchSlot(void** slot, void* detour, bool countPoll) {
     return true;
 }
 
-bool MapleImportDllWanted(const char* dll) {
+enum class MapleIatWalkKind {
+    All,
+    // 游戏目录 dinput8/dinput：只补 user32 前景/轮询 IAT。
+    // 禁止 GetProcAddress / DirectInputCreate* / 可写节（155648 立刻闪退）。
+    DinputUser32Only,
+};
+
+bool MapleImportDllWanted(const char* dll, MapleIatWalkKind kind) {
     if (!dll || !*dll) return false;
     char lower[64]{};
     lstrcpynA(lower, dll, 64);
     CharLowerA(lower);
-    if (lstrcmpA(lower, "user32.dll") == 0 || lstrcmpA(lower, "user32") == 0) return true;
+    const bool user32 = lstrcmpA(lower, "user32.dll") == 0 || lstrcmpA(lower, "user32") == 0
+        || lstrcmpA(lower, "win32u.dll") == 0 || lstrcmpA(lower, "win32u") == 0
+        || strncmp(lower, "api-ms-win-ntuser-", 18) == 0
+        || strncmp(lower, "ext-ms-win-ntuser-", 18) == 0;
+    if (kind == MapleIatWalkKind::DinputUser32Only) return user32;
+    if (user32) return true;
     if (lstrcmpA(lower, "dinput8.dll") == 0 || lstrcmpA(lower, "dinput8") == 0) return true;
     if (lstrcmpA(lower, "dinput.dll") == 0 || lstrcmpA(lower, "dinput") == 0) return true;
     if (lstrcmpA(lower, "kernel32.dll") == 0 || lstrcmpA(lower, "kernel32") == 0) return true;
     if (lstrcmpA(lower, "kernelbase.dll") == 0 || lstrcmpA(lower, "kernelbase") == 0) return true;
-    return strncmp(lower, "api-ms-win-ntuser-", 18) == 0
-        || strncmp(lower, "ext-ms-win-ntuser-", 18) == 0
-        || strncmp(lower, "api-ms-win-core-libraryloader-", 30) == 0;
+    return strncmp(lower, "api-ms-win-core-libraryloader-", 30) == 0;
 }
 
 void MapleCopyImportBaseName(const char* name, char* out, int outLen) {
@@ -1184,7 +1449,7 @@ BYTE* MapleImagePtr(BYTE* base, size_t imageSize, DWORD value, bool rva) {
     return p;
 }
 
-void* MapleDetourForImportName(const char* name);
+void* MapleDetourForImportName(const char* name, MapleIatWalkKind kind);
 HRESULT WINAPI Hook_DirectInput8Create(HINSTANCE hinst, DWORD version,
     const GUID* iid, void** out, void* unk);
 HRESULT WINAPI Hook_DirectInputCreateA(HINSTANCE hinst, DWORD version, void** out, void* unk);
@@ -1237,6 +1502,32 @@ int MapleIatFillPairs(MapleIatPair* out, int cap) {
         reinterpret_cast<void*>(&Hook_GetActiveWindow), false);
     add(reinterpret_cast<void*>(g_mapleRealGetFocus),
         reinterpret_cast<void*>(&Hook_GetFocus), false);
+    add(reinterpret_cast<void*>(g_mapleRealIsWindowVisible),
+        reinterpret_cast<void*>(&Hook_IsWindowVisible), false);
+    add(reinterpret_cast<void*>(g_mapleRealIsIconic),
+        reinterpret_cast<void*>(&Hook_IsIconic), false);
+    add(g_mapleNtUserCursor, reinterpret_cast<void*>(&Hook_GetCursorPos), true);
+    add(g_mapleNtUserSetCursor, reinterpret_cast<void*>(&Hook_SetCursorPos), false);
+    add(g_mapleNtUserGaks, reinterpret_cast<void*>(&Hook_GetAsyncKeyState), true);
+    add(g_mapleNtUserKeyState, reinterpret_cast<void*>(&Hook_GetKeyState), true);
+    add(g_mapleNtUserKbState, reinterpret_cast<void*>(&Hook_GetKeyboardState), true);
+    add(g_mapleNtUserGfw, reinterpret_cast<void*>(&Hook_GetForegroundWindow), false);
+    add(reinterpret_cast<void*>(g_mapleRealPeekMessageW),
+        reinterpret_cast<void*>(&Hook_MaplePeekMessageW), false);
+    add(reinterpret_cast<void*>(g_mapleRealPeekMessageA),
+        reinterpret_cast<void*>(&Hook_MaplePeekMessageA), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetMessageW),
+        reinterpret_cast<void*>(&Hook_MapleGetMessageW), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetMessageA),
+        reinterpret_cast<void*>(&Hook_MapleGetMessageA), false);
+    add(reinterpret_cast<void*>(g_mapleRealDispatchMessageW),
+        reinterpret_cast<void*>(&Hook_MapleDispatchMessageW), false);
+    add(reinterpret_cast<void*>(g_mapleRealDispatchMessageA),
+        reinterpret_cast<void*>(&Hook_MapleDispatchMessageA), false);
+    add(reinterpret_cast<void*>(g_mapleRealCallWindowProcW),
+        reinterpret_cast<void*>(&Hook_MapleCallWindowProcW), false);
+    add(reinterpret_cast<void*>(g_mapleRealCallWindowProcA),
+        reinterpret_cast<void*>(&Hook_MapleCallWindowProcA), false);
     add(reinterpret_cast<void*>(g_realDiCreate),
         reinterpret_cast<void*>(&Hook_DirectInput8Create), true);
     add(reinterpret_cast<void*>(g_realDiCreateA),
@@ -1274,12 +1565,74 @@ int MapleIatFillFocusPairs(MapleIatPair* out, int cap) {
         reinterpret_cast<void*>(&Hook_GetActiveWindow));
     add(reinterpret_cast<void*>(g_mapleRealGetFocus),
         reinterpret_cast<void*>(&Hook_GetFocus));
+    add(reinterpret_cast<void*>(g_mapleRealIsWindowVisible),
+        reinterpret_cast<void*>(&Hook_IsWindowVisible));
+    add(reinterpret_cast<void*>(g_mapleRealIsIconic),
+        reinterpret_cast<void*>(&Hook_IsIconic));
+    add(g_mapleNtUserGfw, reinterpret_cast<void*>(&Hook_GetForegroundWindow));
     return n;
 }
 
-void MapleIatWalkBoundThunks(IMAGE_THUNK_DATA* iat) {
-    MapleIatPair pairs[24]{};
-    const int nPairs = MapleIatFillPairs(pairs, 24);
+int MapleIatFillDinputUser32Pairs(MapleIatPair* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    int n = 0;
+    auto add = [&](void* original, void* detour, bool poll) {
+        if (!original || !detour || n >= cap) return;
+        out[n].original = original;
+        out[n].detour = detour;
+        out[n].poll = poll;
+        ++n;
+    };
+    add(reinterpret_cast<void*>(g_mapleRealGetCursorPos),
+        reinterpret_cast<void*>(&Hook_GetCursorPos), true);
+    add(reinterpret_cast<void*>(g_mapleRealSetCursorPos),
+        reinterpret_cast<void*>(&Hook_SetCursorPos), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetAsyncKeyState),
+        reinterpret_cast<void*>(&Hook_GetAsyncKeyState), true);
+    add(reinterpret_cast<void*>(g_mapleRealGetKeyState),
+        reinterpret_cast<void*>(&Hook_GetKeyState), true);
+    add(reinterpret_cast<void*>(g_mapleRealGetKeyboardState),
+        reinterpret_cast<void*>(&Hook_GetKeyboardState), true);
+    add(reinterpret_cast<void*>(g_mapleRealGetForegroundWindow),
+        reinterpret_cast<void*>(&Hook_GetForegroundWindow), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetActiveWindow),
+        reinterpret_cast<void*>(&Hook_GetActiveWindow), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetFocus),
+        reinterpret_cast<void*>(&Hook_GetFocus), false);
+    add(reinterpret_cast<void*>(g_mapleRealIsIconic),
+        reinterpret_cast<void*>(&Hook_IsIconic), false);
+    add(reinterpret_cast<void*>(g_mapleRealIsWindowVisible),
+        reinterpret_cast<void*>(&Hook_IsWindowVisible), false);
+    add(g_mapleNtUserCursor, reinterpret_cast<void*>(&Hook_GetCursorPos), true);
+    add(g_mapleNtUserSetCursor, reinterpret_cast<void*>(&Hook_SetCursorPos), false);
+    add(g_mapleNtUserGaks, reinterpret_cast<void*>(&Hook_GetAsyncKeyState), true);
+    add(g_mapleNtUserKeyState, reinterpret_cast<void*>(&Hook_GetKeyState), true);
+    add(g_mapleNtUserKbState, reinterpret_cast<void*>(&Hook_GetKeyboardState), true);
+    add(g_mapleNtUserGfw, reinterpret_cast<void*>(&Hook_GetForegroundWindow), false);
+    add(reinterpret_cast<void*>(g_mapleRealPeekMessageW),
+        reinterpret_cast<void*>(&Hook_MaplePeekMessageW), false);
+    add(reinterpret_cast<void*>(g_mapleRealPeekMessageA),
+        reinterpret_cast<void*>(&Hook_MaplePeekMessageA), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetMessageW),
+        reinterpret_cast<void*>(&Hook_MapleGetMessageW), false);
+    add(reinterpret_cast<void*>(g_mapleRealGetMessageA),
+        reinterpret_cast<void*>(&Hook_MapleGetMessageA), false);
+    add(reinterpret_cast<void*>(g_mapleRealDispatchMessageW),
+        reinterpret_cast<void*>(&Hook_MapleDispatchMessageW), false);
+    add(reinterpret_cast<void*>(g_mapleRealDispatchMessageA),
+        reinterpret_cast<void*>(&Hook_MapleDispatchMessageA), false);
+    add(reinterpret_cast<void*>(g_mapleRealCallWindowProcW),
+        reinterpret_cast<void*>(&Hook_MapleCallWindowProcW), false);
+    add(reinterpret_cast<void*>(g_mapleRealCallWindowProcA),
+        reinterpret_cast<void*>(&Hook_MapleCallWindowProcA), false);
+    return n;
+}
+
+void MapleIatWalkBoundThunks(IMAGE_THUNK_DATA* iat, MapleIatWalkKind kind) {
+    MapleIatPair pairs[64]{};
+    const int nPairs = kind == MapleIatWalkKind::DinputUser32Only
+        ? MapleIatFillDinputUser32Pairs(pairs, 64)
+        : MapleIatFillPairs(pairs, 64);
     int n = 0;
     for (; iat && MapleMemCommittedReadable(iat, sizeof(*iat)) && iat->u1.Function && n < 512;
         ++iat, ++n) {
@@ -1305,7 +1658,7 @@ bool MapleCStringInImage(const char* s, size_t remain, size_t cap) {
 }
 
 void MapleIatWalkNamedThunks(BYTE* base, size_t imageSize,
-    IMAGE_THUNK_DATA* names, IMAGE_THUNK_DATA* iat) {
+    IMAGE_THUNK_DATA* names, IMAGE_THUNK_DATA* iat, MapleIatWalkKind kind) {
     if (!base || !names || !iat) return;
     int walked = 0;
     for (; MapleMemCommittedReadable(names, sizeof(*names))
@@ -1327,22 +1680,21 @@ void MapleIatWalkNamedThunks(BYTE* base, size_t imageSize,
         if (nameOff >= imageSize) continue;
         const char* iname = reinterpret_cast<const char*>(base + nameOff);
         if (!MapleCStringInImage(iname, imageSize - nameOff, 96)) continue;
-        void* detour = MapleDetourForImportName(iname);
-        if (detour) {
-            const bool poll = detour == reinterpret_cast<void*>(&Hook_GetCursorPos)
-                || detour == reinterpret_cast<void*>(&Hook_GetAsyncKeyState)
-                || detour == reinterpret_cast<void*>(&Hook_GetKeyState)
-                || detour == reinterpret_cast<void*>(&Hook_GetKeyboardState)
-                || detour == reinterpret_cast<void*>(&Hook_DirectInput8Create)
-                || detour == reinterpret_cast<void*>(&Hook_DirectInputCreateA)
-                || detour == reinterpret_cast<void*>(&Hook_DirectInputCreateW)
-                || detour == reinterpret_cast<void*>(&Hook_DirectInputCreateEx);
-            MapleIatPatchSlot(reinterpret_cast<void**>(&iat->u1.Function), detour, poll);
-        }
+        void* detour = MapleDetourForImportName(iname, kind);
+        if (!detour) continue;
+        const bool poll = detour == reinterpret_cast<void*>(&Hook_GetCursorPos)
+            || detour == reinterpret_cast<void*>(&Hook_GetAsyncKeyState)
+            || detour == reinterpret_cast<void*>(&Hook_GetKeyState)
+            || detour == reinterpret_cast<void*>(&Hook_GetKeyboardState)
+            || detour == reinterpret_cast<void*>(&Hook_DirectInput8Create)
+            || detour == reinterpret_cast<void*>(&Hook_DirectInputCreateA)
+            || detour == reinterpret_cast<void*>(&Hook_DirectInputCreateW)
+            || detour == reinterpret_cast<void*>(&Hook_DirectInputCreateEx);
+        MapleIatPatchSlot(reinterpret_cast<void**>(&iat->u1.Function), detour, poll);
     }
 }
 
-void MapleIatWalkModuleByName(HMODULE mod) {
+void MapleIatWalkModuleByName(HMODULE mod, MapleIatWalkKind kind) {
     if (!mod) return;
     if (!MapleMemCommittedReadable(mod, sizeof(IMAGE_DOS_HEADER))) return;
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
@@ -1366,7 +1718,7 @@ void MapleIatWalkModuleByName(HMODULE mod) {
         auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + impDir.VirtualAddress);
         const BYTE* impEnd = base + impDir.VirtualAddress + impDir.Size;
         int nDesc = 0;
-        for (; MapleMemCommittedReadable(desc, sizeof(*desc)) && desc->Name && nDesc < 64
+        for (; MapleMemCommittedReadable(desc, sizeof(*desc)) && desc->Name && nDesc < 256
                 && reinterpret_cast<BYTE*>(desc) + sizeof(*desc) <= impEnd;
             ++desc, ++nDesc) {
             if (desc->Name >= imageSize || !desc->FirstThunk || desc->FirstThunk >= imageSize) {
@@ -1374,15 +1726,15 @@ void MapleIatWalkModuleByName(HMODULE mod) {
             }
             const char* dll = reinterpret_cast<const char*>(base + desc->Name);
             if (!MapleCStringInImage(dll, imageSize - desc->Name, 64)) continue;
-            if (!MapleImportDllWanted(dll)) continue;
+            if (!MapleImportDllWanted(dll, kind)) continue;
             IMAGE_THUNK_DATA* iat =
                 reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
             if (desc->OriginalFirstThunk && desc->OriginalFirstThunk < imageSize) {
                 IMAGE_THUNK_DATA* names =
                     reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
-                MapleIatWalkNamedThunks(base, imageSize, names, iat);
+                MapleIatWalkNamedThunks(base, imageSize, names, iat, kind);
             } else {
-                MapleIatWalkBoundThunks(iat);
+                MapleIatWalkBoundThunks(iat, kind);
             }
         }
     }
@@ -1393,7 +1745,7 @@ void MapleIatWalkModuleByName(HMODULE mod) {
         auto* delay = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(base + delayDir.VirtualAddress);
         const BYTE* delayEnd = base + delayDir.VirtualAddress + delayDir.Size;
         int nDelay = 0;
-        for (; MapleMemCommittedReadable(delay, sizeof(*delay)) && delay->DllNameRVA && nDelay < 32
+        for (; MapleMemCommittedReadable(delay, sizeof(*delay)) && delay->DllNameRVA && nDelay < 64
                 && reinterpret_cast<BYTE*>(delay) + sizeof(*delay) <= delayEnd;
             ++delay, ++nDelay) {
             const bool rvaBased = (delay->Attributes.AllAttributes & 1) != 0;
@@ -1402,16 +1754,16 @@ void MapleIatWalkModuleByName(HMODULE mod) {
             const char* dll = reinterpret_cast<const char*>(dllPtr);
             const size_t dllRemain = static_cast<size_t>((base + imageSize) - dllPtr);
             if (!MapleCStringInImage(dll, dllRemain, 64)) continue;
-            if (!MapleImportDllWanted(dll)) continue;
+            if (!MapleImportDllWanted(dll, kind)) continue;
             BYTE* iatPtr = MapleImagePtr(base, imageSize, delay->ImportAddressTableRVA, rvaBased);
             if (!iatPtr) continue;
             auto* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(iatPtr);
             BYTE* namePtr = MapleImagePtr(base, imageSize, delay->ImportNameTableRVA, rvaBased);
             if (namePtr) {
                 MapleIatWalkNamedThunks(base, imageSize,
-                    reinterpret_cast<IMAGE_THUNK_DATA*>(namePtr), iat);
+                    reinterpret_cast<IMAGE_THUNK_DATA*>(namePtr), iat, kind);
             } else {
-                MapleIatWalkBoundThunks(iat);
+                MapleIatWalkBoundThunks(iat, kind);
             }
         }
     }
@@ -1501,8 +1853,8 @@ void MaplePatchWritablePointerList(HMODULE mod, const MapleIatPair* pairs, int n
 }
 
 void MaplePatchWritablePointers(HMODULE mod, size_t maxImageSize) {
-    MapleIatPair pairs[24]{};
-    const int nPairs = MapleIatFillPairs(pairs, 24);
+    MapleIatPair pairs[48]{};
+    const int nPairs = MapleIatFillPairs(pairs, 48);
     MaplePatchWritablePointerList(mod, pairs, nPairs, maxImageSize, 48);
 }
 
@@ -1559,6 +1911,11 @@ bool MapleSkipSensitiveGameModule(const wchar_t* lowerPath) {
     return false;
 }
 
+bool MapleIsDinputModule(HMODULE mod);
+
+void MapleIatWalkGameDirDinputUser32();
+void MaplePatchFocusPointersProcessWide();
+
 bool MapleModuleInGameDir(HMODULE mod, const wchar_t* exeDirLower) {
     if (!mod || !exeDirLower || !*exeDirLower) return false;
     wchar_t path[MAX_PATH]{};
@@ -1612,11 +1969,11 @@ void MapleIatWalkGameDirModules(HMODULE mainMod) {
 #endif
     if (!MapleMemCommittedReadable(head, sizeof(LIST_ENTRY))) return;
 
-    HMODULE extrasMod[32]{};
+    HMODULE extrasMod[48]{};
     int extraN = 0;
     int walked = 0;
     for (LIST_ENTRY* cur = head->Flink;
-        cur && cur != head && walked < 96 && extraN < 32;
+        cur && cur != head && walked < 128 && extraN < 48;
         cur = cur->Flink, ++walked) {
         if (!MapleMemCommittedReadable(cur, sizeof(LIST_ENTRY))) break;
         auto* entry = CONTAINING_RECORD(cur, MapleLdrEntry, InLoadOrderLinks);
@@ -1636,23 +1993,33 @@ void MapleIatWalkGameDirModules(HMODULE mainMod) {
         g_mapleExtraMods[i] = extrasMod[i];
     }
     for (int i = 0; i < extraN; ++i) {
-        MapleIatWalkModuleByName(extrasMod[i]);
+        const MapleIatWalkKind kind = MapleIsDinputModule(extrasMod[i])
+            ? MapleIatWalkKind::DinputUser32Only
+            : MapleIatWalkKind::All;
+        MapleIatWalkModuleByName(extrasMod[i], kind);
     }
     // 辅助 DLL 可写节只补前景/闪框（禁止 GetAsyncKeyState 等 poll 指针）。
     // 不按 SizeOfImage 跳过：检查 GetForegroundWindow 的缓存常在 >4MB 的游戏 DLL 里。
-    // slots 仍应约 2；若涨到 ≥10 说明又扫了 poll 指针。
+    // 主程序 poll 约 2；本地 dinput8 user32 再加 GAKS/光标后常 ≥4。
+    // 若涨到 ≥10 说明又扫了辅助 DLL 的 poll 指针。
+    // 禁止改 dinput8/dinput 可写节（155648 立刻闪退）。
     for (int i = 0; i < extraN; ++i) {
+        if (MapleIsDinputModule(extrasMod[i])) continue;
         MaplePatchWritableFocusPointers(extrasMod[i], 0);
     }
 }
 
 void MapleIatInstallFromPeb() {
     HMODULE mainMod = GetModuleHandleW(nullptr);
-    MapleIatWalkModuleByName(mainMod);
+    MapleIatWalkModuleByName(mainMod, MapleIatWalkKind::All);
     MaplePatchWritablePointers(mainMod, 0);
     // 主程序 poll API 已补上时仍要扫游戏目录：SetForegroundWindow/FlashWindow
     // 常在辅助 DLL 的 IAT 里。禁止 Toolhelp 全模块。
     MapleIatWalkGameDirModules(mainMod);
+    // 已加载 dinput8/dinput（含系统目录）只补 user32 IAT，禁止 GPA/可写节。
+    MapleIatWalkGameDirDinputUser32();
+    // 打包器常把 GFW/IsWindowVisible 缓存在堆上，PE 节扫描看不到。
+    MaplePatchFocusPointersProcessWide();
 }
 
 UINT MapleVkToDik(UINT vk) {
@@ -1924,13 +2291,13 @@ HRESULT __fastcall Hook_DiAcquire(void* self) {
 
 HRESULT __fastcall Hook_DiKbGetDeviceState(void* self, void* /*edx*/, DWORD cb, void* data) {
     MapleBumpHit(&g_mapleHitDiState);
-    InterlockedExchange(&g_mapleLastDiStateCb, cb > 255u ? 255 : static_cast<LONG>(cb));
+    MapleNoteDiStateCb(cb);
     MaplePublishHits();
     MapleNoteDiDeviceKind(self, cb);
     if (MapleFillDiKeyboard(cb, data)) return 0;
     if (MapleFillDiMouse(cb, data)) return 0;
-    if (data && cb > 0 && cb <= 256) std::memset(data, 0, cb);
-    return 0;
+    // 不是键盘/鼠标状态块：不要 memset 0（误钩其它设备时会把摇杆等读空）。
+    return static_cast<HRESULT>(0x80070057L);
 }
 
 HRESULT __fastcall Hook_DiGetDeviceData(void* self, void* /*edx*/, DWORD cb, void* data, DWORD* n, DWORD flags) {
@@ -1953,13 +2320,12 @@ HRESULT WINAPI Hook_DiAcquire(void* self) {
 
 HRESULT WINAPI Hook_DiKbGetDeviceState(void* self, DWORD cb, void* data) {
     MapleBumpHit(&g_mapleHitDiState);
-    InterlockedExchange(&g_mapleLastDiStateCb, cb > 255u ? 255 : static_cast<LONG>(cb));
+    MapleNoteDiStateCb(cb);
     MaplePublishHits();
     MapleNoteDiDeviceKind(self, cb);
     if (MapleFillDiKeyboard(cb, data)) return 0;
     if (MapleFillDiMouse(cb, data)) return 0;
-    if (data && cb > 0 && cb <= 256) std::memset(data, 0, cb);
-    return 0;
+    return static_cast<HRESULT>(0x80070057L);
 }
 
 HRESULT WINAPI Hook_DiGetDeviceData(void* self, DWORD cb, void* data, DWORD* n, DWORD flags) {
@@ -1985,6 +2351,25 @@ HRESULT WINAPI Hook_DiMouseGetDeviceState(void* self, DWORD cb, void* data) {
     return Hook_DiKbGetDeviceState(self, cb, data);
 }
 #endif
+
+#if defined(_M_IX86)
+HRESULT __fastcall Hook_DiSetCooperativeLevel(void* self, void* /*edx*/, HWND hwnd, DWORD flags) {
+#else
+HRESULT WINAPI Hook_DiSetCooperativeLevel(void* self, HWND hwnd, DWORD flags) {
+#endif
+    // DISCL_BACKGROUND|NONEXCLUSIVE，去掉 FOREGROUND|EXCLUSIVE（dinput8hook / Reloaded DInputPleaseCooperate）
+    flags = (flags | 0x08u | 0x02u) & ~(0x04u | 0x01u);
+    for (int i = 0; i < g_diVtPatchN; ++i) {
+        if (g_diVtPatch[i].index != 13 || !g_diVtPatch[i].orig) continue;
+#if defined(_M_IX86)
+        auto orig = reinterpret_cast<HRESULT (__thiscall*)(void*, HWND, DWORD)>(g_diVtPatch[i].orig);
+#else
+        auto orig = reinterpret_cast<HRESULT (WINAPI*)(void*, HWND, DWORD)>(g_diVtPatch[i].orig);
+#endif
+        return orig(self, hwnd, flags);
+    }
+    return 0;
+}
 
 bool MaplePatchVtableSlot(void* object, int index, void* detour, void** savedOrig, void*** savedSlot) {
     if (!object || !detour || !savedOrig || !savedSlot) return false;
@@ -2016,11 +2401,10 @@ HRESULT WINAPI Hook_DiCreateDevice(void* self, const GUID* guid, void** out, voi
     if (!MapleMemCommittedReadable(*out, sizeof(void*))) return hr;
     void** vt = *reinterpret_cast<void***>(*out);
     if (!vt) return hr;
-    if (!MapleMemCommittedReadable(vt, sizeof(void*) * 11)) return hr;
+    if (!MapleMemCommittedReadable(vt, sizeof(void*) * 14)) return hr;
     void* acquireFn = vt[7];
     void* stateFn = vt[9];
     MaplePatchVtPtr(&vt[7], reinterpret_cast<void*>(&Hook_DiAcquire), 7);
-    MaplePatchVtPtr(&vt[8], reinterpret_cast<void*>(&Hook_DiAcquire), 8);
     if (InlineIsEqualGUID(*guid, kMapleSysKeyboard) && !g_diKbStateSlot) {
         MaplePatchVtableSlot(*out, 9, reinterpret_cast<void*>(&Hook_DiKbGetDeviceState),
             &g_diKbStateOrig, &g_diKbStateSlot);
@@ -2031,6 +2415,7 @@ HRESULT WINAPI Hook_DiCreateDevice(void* self, const GUID* guid, void** out, voi
         MaplePatchVtPtr(&vt[9], reinterpret_cast<void*>(&Hook_DiKbGetDeviceState), 9);
     }
     MaplePatchVtPtr(&vt[10], reinterpret_cast<void*>(&Hook_DiGetDeviceData), 10);
+    MaplePatchVtPtr(&vt[13], reinterpret_cast<void*>(&Hook_DiSetCooperativeLevel), 13);
     if (InlineIsEqualGUID(*guid, kMapleSysKeyboard)) MapleNoteDiDeviceKind(*out, 256);
     else if (InlineIsEqualGUID(*guid, kMapleSysMouse)) MapleNoteDiDeviceKind(*out, 16);
     MapleInstallLiveDiFn(acquireFn, reinterpret_cast<void*>(&Hook_DiAcquire), g_hookDiLiveAcquire, kMapleLiveDiN,
@@ -2103,17 +2488,86 @@ HRESULT WINAPI Hook_DirectInputCreateEx(HINSTANCE hinst, DWORD version,
     return hr;
 }
 
+void MapleIatWalkGameDirDinputUser32() {
+    // 星辰可能加载 SysWOW64\dinput8，游戏目录那份反而不在 PEB 游戏目录列表。
+    // 只补 user32 IAT，仍禁止 GPA / DirectInputCreate* / 可写节。
+    HMODULE mods[2] = {
+        GetModuleHandleW(L"dinput8.dll"),
+        GetModuleHandleW(L"dinput.dll"),
+    };
+    for (int i = 0; i < 2; ++i) {
+        HMODULE mod = mods[i];
+        if (!mod) continue;
+        wchar_t path[MAX_PATH]{};
+        if (GetModuleFileNameW(mod, path, MAX_PATH) && path[0]) {
+            CharLowerW(path);
+            if (MapleIsFakeFocusModulePath(path)) continue;
+        }
+        MapleIatWalkModuleByName(mod, MapleIatWalkKind::DinputUser32Only);
+    }
+}
+
+void MaplePatchFocusPointersProcessWide() {
+    MapleIatPair pairs[12]{};
+    const int nPairs = MapleIatFillFocusPairs(pairs, 12);
+    if (nPairs <= 0) return;
+    int patched = 0;
+    BYTE* addr = nullptr;
+    for (int regions = 0; regions < 4096 && patched < 48; ++regions) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        BYTE* regionEnd = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= addr) break;
+        const DWORD page = mbi.Protect & 0xFF;
+        const bool writable = mbi.State == MEM_COMMIT
+            && (mbi.Protect & PAGE_GUARD) == 0
+            && (page == PAGE_READWRITE || page == PAGE_WRITECOPY);
+        if (writable) {
+            HMODULE owner = static_cast<HMODULE>(mbi.AllocationBase);
+            bool skip = MapleIsDinputModule(owner);
+            if (!skip && owner) {
+                wchar_t path[MAX_PATH]{};
+                if (GetModuleFileNameW(owner, path, MAX_PATH) && path[0]) {
+                    CharLowerW(path);
+                    skip = MapleIsFakeFocusModulePath(path);
+                }
+            }
+            if (!skip) {
+                BYTE* aligned = reinterpret_cast<BYTE*>(
+                    (reinterpret_cast<ULONG_PTR>(addr) + sizeof(void*) - 1)
+                    & ~(sizeof(void*) - 1));
+                BYTE* scanEnd = regionEnd;
+                for (; aligned + sizeof(void*) <= scanEnd && patched < 48;
+                    aligned += sizeof(void*)) {
+                    void* cur = *reinterpret_cast<void**>(aligned);
+                    if (!cur) continue;
+                    for (int k = 0; k < nPairs; ++k) {
+                        if (pairs[k].original && cur == pairs[k].original) {
+                            if (MapleIatPatchSlot(reinterpret_cast<void**>(aligned),
+                                    pairs[k].detour, false)) {
+                                ++patched;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        addr = regionEnd;
+    }
+}
+
 FARPROC WINAPI Hook_GetProcAddress(HMODULE module, LPCSTR name) {
     auto orig = g_mapleRealGetProcAddress;
     FARPROC real = orig ? orig(module, name) : nullptr;
     if (!module || !name) return real;
     if (HIWORD(reinterpret_cast<ULONG_PTR>(name)) == 0) return real;
-    void* detour = MapleDetourForImportName(name);
+    void* detour = MapleDetourForImportName(name, MapleIatWalkKind::All);
     if (!detour || detour == reinterpret_cast<void*>(&Hook_GetProcAddress)) return real;
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(module, path, MAX_PATH) || !path[0]) return real;
     CharLowerW(path);
-    if (wcsstr(path, L"user32") || wcsstr(path, L"ntuser")
+    if (wcsstr(path, L"user32") || wcsstr(path, L"ntuser") || wcsstr(path, L"win32u")
         || wcsstr(path, L"dinput8")
         || wcsstr(path, L"\\dinput.dll") || wcsstr(path, L"/dinput.dll")) {
         return reinterpret_cast<FARPROC>(detour);
@@ -2121,7 +2575,7 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE module, LPCSTR name) {
     return real;
 }
 
-void* MapleDetourForImportName(const char* name) {
+void* MapleDetourForImportName(const char* name, MapleIatWalkKind kind) {
     if (!name || !*name) return nullptr;
     char base[96]{};
     MapleCopyImportBaseName(name, base, 96);
@@ -2148,6 +2602,38 @@ void* MapleDetourForImportName(const char* name) {
     if (lstrcmpA(n, "GetActiveWindow") == 0)
         return reinterpret_cast<void*>(&Hook_GetActiveWindow);
     if (lstrcmpA(n, "GetFocus") == 0) return reinterpret_cast<void*>(&Hook_GetFocus);
+    if (lstrcmpA(n, "IsIconic") == 0) return reinterpret_cast<void*>(&Hook_IsIconic);
+    if (lstrcmpA(n, "IsWindowVisible") == 0)
+        return reinterpret_cast<void*>(&Hook_IsWindowVisible);
+    if (lstrcmpA(n, "PeekMessageW") == 0)
+        return reinterpret_cast<void*>(&Hook_MaplePeekMessageW);
+    if (lstrcmpA(n, "PeekMessageA") == 0)
+        return reinterpret_cast<void*>(&Hook_MaplePeekMessageA);
+    if (lstrcmpA(n, "GetMessageW") == 0)
+        return reinterpret_cast<void*>(&Hook_MapleGetMessageW);
+    if (lstrcmpA(n, "GetMessageA") == 0)
+        return reinterpret_cast<void*>(&Hook_MapleGetMessageA);
+    if (lstrcmpA(n, "DispatchMessageW") == 0)
+        return reinterpret_cast<void*>(&Hook_MapleDispatchMessageW);
+    if (lstrcmpA(n, "DispatchMessageA") == 0)
+        return reinterpret_cast<void*>(&Hook_MapleDispatchMessageA);
+    if (lstrcmpA(n, "CallWindowProcW") == 0)
+        return reinterpret_cast<void*>(&Hook_MapleCallWindowProcW);
+    if (lstrcmpA(n, "CallWindowProcA") == 0)
+        return reinterpret_cast<void*>(&Hook_MapleCallWindowProcA);
+    if (lstrcmpA(n, "NtUserGetForegroundWindow") == 0)
+        return reinterpret_cast<void*>(&Hook_GetForegroundWindow);
+    if (lstrcmpA(n, "NtUserGetAsyncKeyState") == 0)
+        return reinterpret_cast<void*>(&Hook_GetAsyncKeyState);
+    if (lstrcmpA(n, "NtUserGetKeyState") == 0)
+        return reinterpret_cast<void*>(&Hook_GetKeyState);
+    if (lstrcmpA(n, "NtUserGetKeyboardState") == 0)
+        return reinterpret_cast<void*>(&Hook_GetKeyboardState);
+    if (lstrcmpA(n, "NtUserGetCursorPos") == 0)
+        return reinterpret_cast<void*>(&Hook_GetCursorPos);
+    if (lstrcmpA(n, "NtUserSetCursorPos") == 0)
+        return reinterpret_cast<void*>(&Hook_SetCursorPos);
+    if (kind == MapleIatWalkKind::DinputUser32Only) return nullptr;
     if (lstrcmpA(n, "DirectInput8Create") == 0)
         return reinterpret_cast<void*>(&Hook_DirectInput8Create);
     if (lstrcmpA(n, "DirectInputCreateA") == 0)
@@ -2182,6 +2668,17 @@ void MapleMarkIatDetour(void* detour) {
         || detour == reinterpret_cast<void*>(&Hook_FlashWindowEx)) {
         g_mapleDiag |= 0x0040;
     }
+    if (detour == reinterpret_cast<void*>(&Hook_MaplePeekMessageW)
+        || detour == reinterpret_cast<void*>(&Hook_MaplePeekMessageA)
+        || detour == reinterpret_cast<void*>(&Hook_MapleGetMessageW)
+        || detour == reinterpret_cast<void*>(&Hook_MapleGetMessageA)
+        || detour == reinterpret_cast<void*>(&Hook_MapleDispatchMessageW)
+        || detour == reinterpret_cast<void*>(&Hook_MapleDispatchMessageA)
+        || detour == reinterpret_cast<void*>(&Hook_MapleCallWindowProcW)
+        || detour == reinterpret_cast<void*>(&Hook_MapleCallWindowProcA)
+        || detour == reinterpret_cast<void*>(&Hook_MapleTranslateMessage)) {
+        g_mapleDiag |= 0x10000;
+    }
 }
 
 bool MaplePtrInModuleExec(const void* p, BYTE* base, size_t imageSize) {
@@ -2214,39 +2711,17 @@ int MapleCountDiVtableMethods(void** vt, BYTE* base, size_t imageSize, int maxN)
     return n;
 }
 
-bool MapleImageHasPointerTo(BYTE* base, size_t imageSize, const void* needle,
-    const BYTE* skipBegin, const BYTE* skipEnd) {
-    if (!base || !needle || imageSize < sizeof(void*)) return false;
-    const ULONG_PTR want = reinterpret_cast<ULONG_PTR>(needle);
-    BYTE* cur = base;
-    BYTE* end = base + imageSize;
-    int hits = 0;
-    while (cur + sizeof(void*) <= end && hits < 2) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(cur, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
-        BYTE* regionEnd = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd <= cur) break;
-        BYTE* scanEnd = regionEnd < end ? regionEnd : end;
-        const DWORD prot = mbi.Protect;
-        const DWORD page = prot & 0xFF;
-        const bool readable = mbi.State == MEM_COMMIT && (prot & PAGE_GUARD) == 0
-            && (page == PAGE_READONLY || page == PAGE_READWRITE || page == PAGE_WRITECOPY
-                || page == PAGE_EXECUTE_READ || page == PAGE_EXECUTE_READWRITE
-                || page == PAGE_EXECUTE_WRITECOPY);
-        if (readable) {
-            BYTE* aligned = reinterpret_cast<BYTE*>(
-                (reinterpret_cast<ULONG_PTR>(cur) + sizeof(void*) - 1) & ~(sizeof(void*) - 1));
-            for (; aligned + sizeof(void*) <= scanEnd; aligned += sizeof(void*)) {
-                if (skipBegin && aligned >= skipBegin && aligned < skipEnd) continue;
-                if (*reinterpret_cast<ULONG_PTR*>(aligned) == want) {
-                    ++hits;
-                    if (hits >= 1) return true;
-                }
-            }
-        }
-        cur = scanEnd;
-    }
-    return false;
+bool MapleVtableInModuleData(void** vt, BYTE* base, size_t imageSize) {
+    if (!vt || !base || imageSize < sizeof(void*) * 27) return false;
+    const BYTE* p = reinterpret_cast<const BYTE*>(vt);
+    if (p < base || p + sizeof(void*) * 27 > base + imageSize) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(vt, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+    const DWORD page = mbi.Protect & 0xFF;
+    return page == PAGE_READONLY || page == PAGE_READWRITE || page == PAGE_WRITECOPY
+        || page == PAGE_EXECUTE_READ || page == PAGE_EXECUTE_READWRITE
+        || page == PAGE_EXECUTE_WRITECOPY;
 }
 
 bool MapleDiSlotsLookDistinct(void** vt) {
@@ -2265,23 +2740,23 @@ bool MapleDiSlotsLookDistinct(void** vt) {
 bool MapleLooksLikeDeviceVtable(void** vt, BYTE* base, size_t imageSize) {
     if (!vt) return false;
     const int n = MapleCountDiVtableMethods(vt, base, imageSize, 40);
-    // IDirectInputDevice2=27 / Device7=29 / Device8=32。更长的是跳转表，不能 JMP。
-    if (n < 27 || n > 32) return false;
+    // IDirectInputDevice2=27 / Device7=29 / Device8=32。18 方法跳转表会闪退，仍拒绝。
+    // 相邻两张 Device8 表会把计数顶到 40，不能再因 n>32/36 丢掉真表。
+    if (n < 27) return false;
     if (!MapleDiSlotsLookDistinct(vt)) return false;
-    const BYTE* skipB = reinterpret_cast<BYTE*>(vt);
-    const BYTE* skipE = skipB + sizeof(void*) * n;
-    return MapleImageHasPointerTo(base, imageSize, vt, skipB, skipE);
+    // 设备对象只在堆上持有虚表指针时，模块内没有第二份引用——不能再要求 ImageHasPointerTo。
+    return MapleVtableInModuleData(vt, base, imageSize);
 }
 
 bool MapleHookDeviceVtableSlots(void** vt) {
     if (!vt) return false;
-    if (!MapleMemCommittedReadable(vt, sizeof(void*) * 11)) return false;
+    if (!MapleMemCommittedReadable(vt, sizeof(void*) * 14)) return false;
     void* acquireFn = vt[7];
     void* stateFn = vt[9];
     const bool acquireOk = MaplePatchVtPtr(&vt[7], reinterpret_cast<void*>(&Hook_DiAcquire), 7);
-    MaplePatchVtPtr(&vt[8], reinterpret_cast<void*>(&Hook_DiAcquire), 8);
     const bool stateOk = MaplePatchVtPtr(&vt[9], reinterpret_cast<void*>(&Hook_DiKbGetDeviceState), 9);
     MaplePatchVtPtr(&vt[10], reinterpret_cast<void*>(&Hook_DiGetDeviceData), 10);
+    MaplePatchVtPtr(&vt[13], reinterpret_cast<void*>(&Hook_DiSetCooperativeLevel), 13);
     MapleInstallLiveDiFn(acquireFn, reinterpret_cast<void*>(&Hook_DiAcquire), g_hookDiLiveAcquire, kMapleLiveDiN,
         0);
     MapleInstallLiveDiFn(stateFn, reinterpret_cast<void*>(&Hook_DiKbGetDeviceState), g_hookDiLiveState, kMapleLiveDiN,
@@ -2307,10 +2782,11 @@ void MapleScanDiImageVtables(HMODULE mod) {
     if (nsec > 96) nsec = 96;
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     if (!MapleMemCommittedReadable(sec, sizeof(IMAGE_SECTION_HEADER) * nsec)) return;
+    constexpr int kMapleDiVtFindCap = 10;
     constexpr size_t kMaxSectionScan = 2 * 1024 * 1024;
-    void** found[6]{};
+    void** found[kMapleDiVtFindCap]{};
     int foundN = 0;
-    for (WORD i = 0; i < nsec && foundN < 6; ++i) {
+    for (WORD i = 0; i < nsec && foundN < kMapleDiVtFindCap; ++i) {
         const DWORD ch = sec[i].Characteristics;
         if (ch & IMAGE_SCN_MEM_EXECUTE) continue;
         if (MapleSectionSkipByName(sec[i])) continue;
@@ -2326,7 +2802,7 @@ void MapleScanDiImageVtables(HMODULE mod) {
         if (bytes > kMaxSectionScan) bytes = kMaxSectionScan;
         BYTE* end = start + bytes;
         MEMORY_BASIC_INFORMATION mbi{};
-        for (BYTE* p = start; p + sizeof(void*) * 27 <= end && foundN < 6; ) {
+        for (BYTE* p = start; p + sizeof(void*) * 27 <= end && foundN < kMapleDiVtFindCap; ) {
             if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
             BYTE* regionEnd = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
             if (regionEnd <= p) break;
@@ -2344,7 +2820,8 @@ void MapleScanDiImageVtables(HMODULE mod) {
             }
             BYTE* aligned = reinterpret_cast<BYTE*>(
                 (reinterpret_cast<ULONG_PTR>(p) + sizeof(void*) - 1) & ~(sizeof(void*) - 1));
-            for (; aligned + sizeof(void*) * 27 <= scanEnd && foundN < 6; aligned += sizeof(void*)) {
+            for (; aligned + sizeof(void*) * 27 <= scanEnd && foundN < kMapleDiVtFindCap;
+                 aligned += sizeof(void*)) {
                 void** vt = reinterpret_cast<void**>(aligned);
                 if (!MapleLooksLikeDeviceVtable(vt, base, imageSize)) continue;
                 if (aligned >= start + sizeof(void*)) {
@@ -2364,17 +2841,18 @@ void MapleScanDiImageVtables(HMODULE mod) {
             p = scanEnd;
         }
     }
-    // 找到太多更像误伤跳转表：全部不改，避免再把游戏打崩。
-    if (foundN <= 0 || foundN > 4) return;
+    g_mapleFoundVt += foundN;
+    if (foundN <= 0) return;
     for (int i = 0; i < foundN; ++i) {
         MapleHookDeviceVtableSlots(found[i]);
     }
 }
 
 void* MapleDiDetourForIndex(int index) {
-    if (index == 7 || index == 8) return reinterpret_cast<void*>(&Hook_DiAcquire);
+    if (index == 7) return reinterpret_cast<void*>(&Hook_DiAcquire);
     if (index == 9) return reinterpret_cast<void*>(&Hook_DiKbGetDeviceState);
     if (index == 10) return reinterpret_cast<void*>(&Hook_DiGetDeviceData);
+    if (index == 13) return reinterpret_cast<void*>(&Hook_DiSetCooperativeLevel);
     return nullptr;
 }
 
@@ -2425,21 +2903,95 @@ void MaplePatchDiCachedAll() {
     }
 }
 
+bool MapleDiHasStateHook() {
+    for (int i = 0; i < g_diVtPatchN; ++i) {
+        if (g_diVtPatch[i].index == 9) return true;
+    }
+    return g_diKbStateSlot != nullptr || g_diMouseStateSlot != nullptr;
+}
+
+bool MapleModuleBounds(HMODULE mod, BYTE** baseOut, size_t* sizeOut) {
+    if (!mod || !baseOut || !sizeOut) return false;
+    if (!MapleMemCommittedReadable(mod, sizeof(IMAGE_DOS_HEADER))) return false;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))
+        || static_cast<size_t>(dos->e_lfanew) > 0x100000) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+        reinterpret_cast<BYTE*>(mod) + dos->e_lfanew);
+    if (!MapleMemCommittedReadable(nt, sizeof(IMAGE_NT_HEADERS))) return false;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+    if (imageSize < sizeof(IMAGE_NT_HEADERS)) return false;
+    *baseOut = reinterpret_cast<BYTE*>(mod);
+    *sizeOut = imageSize;
+    return true;
+}
+
+#if defined(_M_IX86)
+void MapleHookHeapDiDeviceVtables(HMODULE diMod) {
+    BYTE* base = nullptr;
+    size_t imageSize = 0;
+    if (!MapleModuleBounds(diMod, &base, &imageSize)) return;
+    BYTE* addr = nullptr;
+    SIZE_T scanned = 0;
+    constexpr SIZE_T kMaxScan = 48u * 1024u * 1024u;
+    for (int regions = 0; regions < 8192 && g_diVtPatchN < kMapleDiVtCap; ++regions) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        BYTE* regionEnd = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= addr) break;
+        const DWORD page = mbi.Protect & 0xFF;
+        const bool heapish = mbi.State == MEM_COMMIT
+            && (mbi.Protect & PAGE_GUARD) == 0
+            && mbi.Type == MEM_PRIVATE
+            && (page == PAGE_READWRITE || page == PAGE_WRITECOPY)
+            && mbi.RegionSize >= sizeof(void*) * 2
+            && mbi.RegionSize <= 8u * 1024u * 1024u;
+        if (heapish && scanned < kMaxScan) {
+            SIZE_T nbytes = mbi.RegionSize;
+            if (scanned + nbytes > kMaxScan) nbytes = kMaxScan - scanned;
+            BYTE* p = reinterpret_cast<BYTE*>(
+                (reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + sizeof(void*) - 1)
+                & ~(sizeof(void*) - 1));
+            BYTE* end = static_cast<BYTE*>(mbi.BaseAddress) + nbytes;
+            for (; p + sizeof(void*) <= end && g_diVtPatchN < kMapleDiVtCap; p += sizeof(void*)) {
+                void* maybeVt = *reinterpret_cast<void**>(p);
+                if (!maybeVt) continue;
+                BYTE* vp = static_cast<BYTE*>(maybeVt);
+                if (vp < base || vp + sizeof(void*) * 27 > base + imageSize) continue;
+                void** vt = reinterpret_cast<void**>(maybeVt);
+                if (!MapleLooksLikeDeviceVtable(vt, base, imageSize)) continue;
+                const int before = g_diVtPatchN;
+                MapleHookDeviceVtableSlots(vt);
+                if (g_diVtPatchN > before) ++g_mapleHeapVt;
+            }
+            scanned += nbytes;
+        }
+        addr = regionEnd;
+    }
+}
+#endif
+
 void MapleHookDinputVtables() {
     HMODULE di8 = GetModuleHandleW(L"dinput8.dll");
     HMODULE di = GetModuleHandleW(L"dinput.dll");
     if (di8 || di) g_mapleDiag |= 0x0080;
     if (di8) MapleScanDiImageVtables(di8);
     if (di) MapleScanDiImageVtables(di);
-    bool state = false;
+    if (!MapleDiHasStateHook()) {
+#if defined(_M_IX86)
+        if (di8) MapleHookHeapDiDeviceVtables(di8);
+        if (di) MapleHookHeapDiDeviceVtables(di);
+#endif
+    }
+    bool state = MapleDiHasStateHook();
     bool acquire = false;
     bool data = false;
     for (int i = 0; i < g_diVtPatchN; ++i) {
-        if (g_diVtPatch[i].index == 9) state = true;
         if (g_diVtPatch[i].index == 7) acquire = true;
         if (g_diVtPatch[i].index == 10) data = true;
     }
-    if (g_diKbStateSlot || g_diMouseStateSlot) state = true;
     if (state) g_mapleDiag |= 0x0020;
     if (acquire) g_mapleDiag |= 0x0100;
     if (data) g_mapleDiag |= 0x4000;
@@ -2459,6 +3011,8 @@ void MapleRestoreDiVtables() {
         g_diVtPatch[i] = {};
     }
     g_diVtPatchN = 0;
+    g_mapleFoundVt = 0;
+    g_mapleHeapVt = 0;
     restore(g_diKbStateSlot, g_diKbStateOrig);
     restore(g_diMouseStateSlot, g_diMouseStateOrig);
     restore(g_diCreateDeviceSlot, g_diCreateDeviceOrig);
@@ -2508,6 +3062,23 @@ void RemoveMapleIatHooks() {
     g_mapleRealSwitchToThisWindow = nullptr;
     g_mapleRealGetActiveWindow = nullptr;
     g_mapleRealGetFocus = nullptr;
+    g_mapleRealIsIconic = nullptr;
+    g_mapleRealIsWindowVisible = nullptr;
+    g_mapleRealPeekMessageW = nullptr;
+    g_mapleRealPeekMessageA = nullptr;
+    g_mapleRealGetMessageW = nullptr;
+    g_mapleRealGetMessageA = nullptr;
+    g_mapleRealDispatchMessageW = nullptr;
+    g_mapleRealDispatchMessageA = nullptr;
+    g_mapleRealTranslateMessage = nullptr;
+    g_mapleRealCallWindowProcW = nullptr;
+    g_mapleRealCallWindowProcA = nullptr;
+    g_mapleNtUserGfw = nullptr;
+    g_mapleNtUserGaks = nullptr;
+    g_mapleNtUserKeyState = nullptr;
+    g_mapleNtUserKbState = nullptr;
+    g_mapleNtUserCursor = nullptr;
+    g_mapleNtUserSetCursor = nullptr;
 }
 
 void InstallMapleIatHooks() {
@@ -2542,6 +3113,43 @@ void InstallMapleIatHooks() {
         GetProcAddress(user32, "GetActiveWindow"));
     g_mapleRealGetFocus = reinterpret_cast<HWND(WINAPI*)()>(
         GetProcAddress(user32, "GetFocus"));
+    g_mapleRealIsIconic = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
+        GetProcAddress(user32, "IsIconic"));
+    g_mapleRealIsWindowVisible = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
+        GetProcAddress(user32, "IsWindowVisible"));
+    g_mapleRealPeekMessageW = reinterpret_cast<BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT)>(
+        GetProcAddress(user32, "PeekMessageW"));
+    g_mapleRealPeekMessageA = reinterpret_cast<BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT)>(
+        GetProcAddress(user32, "PeekMessageA"));
+    g_mapleRealGetMessageW = reinterpret_cast<BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT)>(
+        GetProcAddress(user32, "GetMessageW"));
+    g_mapleRealGetMessageA = reinterpret_cast<BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT)>(
+        GetProcAddress(user32, "GetMessageA"));
+    g_mapleRealDispatchMessageW = reinterpret_cast<LRESULT(WINAPI*)(const MSG*)>(
+        GetProcAddress(user32, "DispatchMessageW"));
+    g_mapleRealDispatchMessageA = reinterpret_cast<LRESULT(WINAPI*)(const MSG*)>(
+        GetProcAddress(user32, "DispatchMessageA"));
+    g_mapleRealTranslateMessage = reinterpret_cast<BOOL(WINAPI*)(const MSG*)>(
+        GetProcAddress(user32, "TranslateMessage"));
+    g_mapleRealCallWindowProcW = reinterpret_cast<LRESULT(WINAPI*)(WNDPROC, HWND, UINT, WPARAM, LPARAM)>(
+        GetProcAddress(user32, "CallWindowProcW"));
+    g_mapleRealCallWindowProcA = reinterpret_cast<LRESULT(WINAPI*)(WNDPROC, HWND, UINT, WPARAM, LPARAM)>(
+        GetProcAddress(user32, "CallWindowProcA"));
+    HMODULE win32u = GetModuleHandleW(L"win32u.dll");
+    if (win32u) {
+        g_mapleNtUserGfw = reinterpret_cast<void*>(
+            GetProcAddress(win32u, "NtUserGetForegroundWindow"));
+        g_mapleNtUserGaks = reinterpret_cast<void*>(
+            GetProcAddress(win32u, "NtUserGetAsyncKeyState"));
+        g_mapleNtUserKeyState = reinterpret_cast<void*>(
+            GetProcAddress(win32u, "NtUserGetKeyState"));
+        g_mapleNtUserKbState = reinterpret_cast<void*>(
+            GetProcAddress(win32u, "NtUserGetKeyboardState"));
+        g_mapleNtUserCursor = reinterpret_cast<void*>(
+            GetProcAddress(win32u, "NtUserGetCursorPos"));
+        g_mapleNtUserSetCursor = reinterpret_cast<void*>(
+            GetProcAddress(win32u, "NtUserSetCursorPos"));
+    }
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     if (k32) {
         g_mapleRealGetProcAddress = reinterpret_cast<FARPROC(WINAPI*)(HMODULE, LPCSTR)>(
@@ -2569,6 +3177,9 @@ void InstallMapleIatHooks() {
     // 禁止 Poll、禁止注入线程 CreateDevice。
     MapleHookDinputVtables();
     MaplePatchDiCachedAll();
+    MaplePublishHits();
+    // 164352 闪退：禁止假 WM_INPUT、禁止改 dinput8 可写节、禁止注入线程
+    // RegisterRawInputDevices / SetCooperativeLevel / Prime SendMessage。
 }
 
 void RemoveAllHooks() {
@@ -2592,6 +3203,47 @@ void RemoveAllHooks() {
         UnhookWindowsHookEx(g_focusGuardHook);
         g_focusGuardHook = nullptr;
     }
+}
+
+/// 软光标 + 软键态钩子（微信 Qt 与 Electron/CEF 共用）：
+/// 让 QCursor::pos / GetAsyncKeyState(LBUTTON) / GetKeyboardState(修饰键) 对上脚本软输入。
+/// 不装 RawInput / ClipCursor / 子类化；灌键线程由调用方决定（微信不装，Electron 装）。
+bool InstallWeixinMouseStateHooks() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return false;
+    void* pCursor = reinterpret_cast<void*>(GetProcAddress(user32, "GetCursorPos"));
+    void* pAsync = reinterpret_cast<void*>(GetProcAddress(user32, "GetAsyncKeyState"));
+    void* pKeyState = reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyState"));
+    void* pKeys = reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyboardState"));
+    if (!pCursor || !pAsync || !pKeyState || !pKeys) return false;
+    if (!fakefocus::InstallInlineHook(g_hookCursor, pCursor, reinterpret_cast<void*>(&Hook_GetCursorPos))) {
+        return false;
+    }
+    void* pSetCursor = reinterpret_cast<void*>(GetProcAddress(user32, "SetCursorPos"));
+    if (pSetCursor) {
+        fakefocus::InstallInlineHook(g_hookSetCursor, pSetCursor,
+            reinterpret_cast<void*>(&Hook_SetCursorPos));
+    }
+    auto undoCursor = [&]() {
+        fakefocus::RemoveInlineHook(g_hookSetCursor);
+        fakefocus::RemoveInlineHook(g_hookCursor);
+    };
+    if (!fakefocus::InstallInlineHook(g_hookAsyncKey, pAsync, reinterpret_cast<void*>(&Hook_GetAsyncKeyState))) {
+        undoCursor();
+        return false;
+    }
+    if (!fakefocus::InstallInlineHook(g_hookKeyState, pKeyState, reinterpret_cast<void*>(&Hook_GetKeyState))) {
+        fakefocus::RemoveInlineHook(g_hookAsyncKey);
+        undoCursor();
+        return false;
+    }
+    if (!fakefocus::InstallInlineHook(g_hookKeyboardState, pKeys, reinterpret_cast<void*>(&Hook_GetKeyboardState))) {
+        fakefocus::RemoveInlineHook(g_hookKeyState);
+        fakefocus::RemoveInlineHook(g_hookAsyncKey);
+        undoCursor();
+        return false;
+    }
+    return true;
 }
 
 bool InstallPhase2Hooks() {
@@ -2671,7 +3323,8 @@ bool InstallPhase2Hooks() {
 
     // lite 仍钩 GetRawInputData（不钩 PeekMessage）：GLFW 靠 WM_INPUT + GetRawInputData 读相对鼠标。
     // DeSmuME 等桌面模拟器禁用：InputTimer 高频轮询 + 假 WM_INPUT 会启动崩/长挂崩。
-    if (!g_desktopEmuSafe) {
+    // 天龙八部：找图点击靠 GetCursorPos/GetAsyncKeyState；假 WM_INPUT 易抢前台，不装 RawInput。
+    if (!g_desktopEmuSafe && !g_tianlongSafe) {
         InstallRawInputHooks(user32, g_liteMode);
     }
 
@@ -2708,15 +3361,22 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
         || (_wcsicmp(cls, L"CefClientWindow") == 0)
         || (FindChromeRenderWidget(top) != nullptr));
     const bool airSafe = !mapleSafe && LooksLikeAdobeAirClassName(cls);
+    const bool weixinSafe = !mapleSafe && !electronSafe && HwndLooksLikeWeixinClient(top);
+    const bool tianlongSafe = !mapleSafe && !electronSafe && !weixinSafe
+        && ClassLooksLikeTianLongBaBu(cls);
     // melonDS 顶层常为 Qt*QWindowIcon：必须靠进程名识别，不能只认类名。
     const bool desktopEmuSafe =
         (LooksLikeDesktopEmuClassName(cls) || ProcessImageLooksLikeDesktopEmu(top))
-        && !airSafe && !mapleSafe;
-    g_electronSafe = electronSafe && !airSafe && !mapleSafe && !desktopEmuSafe;
+        && !airSafe && !mapleSafe && !weixinSafe && !tianlongSafe;
+    g_electronSafe = electronSafe && !airSafe && !mapleSafe && !desktopEmuSafe && !weixinSafe
+        && !tianlongSafe;
     g_airSafe = airSafe;
+    g_weixinSafe = weixinSafe;
+    g_tianlongSafe = tianlongSafe;
     g_mapleSafe = mapleSafe;
     g_desktopEmuSafe = desktopEmuSafe;
-    g_liteMode = lite || electronSafe || airSafe || mapleSafe || desktopEmuSafe;
+    g_liteMode = lite || electronSafe || airSafe || weixinSafe || mapleSafe
+        || desktopEmuSafe || tianlongSafe;
 
     DWORD softPid = 0;
     GetWindowThreadProcessId(top, &softPid);
@@ -2726,8 +3386,8 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
     HWND render = ResolveSoftInputPostHwnd(top);
     g_focusHwnd.store((render && IsWindow(render)) ? render : top, std::memory_order_relaxed);
 
-    // 冒险岛：IAT + 确认设备 Acquire/GetDeviceState 方法 JMP。禁止 user32/win32u 方法体 JMP。
-    // 禁止 CallThroughOriginal、子类化、RawInput、注入线程里 CreateDevice。
+    // 冒险岛：IAT + 吞失活消息 + DirectInput 后台协作。禁止 user32/win32u 方法体 JMP。
+    // 禁止 CallThroughOriginal、子类化 WndProc、假 WM_INPUT、注入线程里 CreateDevice。
     if (mapleSafe) {
         InstallMapleIatHooks();
         g_installed.store(true, std::memory_order_release);
@@ -2783,6 +3443,13 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
         g_installed.store(true, std::memory_order_release);
         return TRUE;
     }
+    // 微信 4.x Qt：前景查询 + 软光标/键态。键鼠仍由宿主 PostMessage；
+    // 禁止 Chromium 灌键线程、子类化、假 WM_INPUT、ClipCursor。
+    if (weixinSafe) {
+        (void)InstallWeixinMouseStateHooks();
+        g_installed.store(true, std::memory_order_release);
+        return TRUE;
+    }
     // DeSmuME/Dolphin：前景查询 + 键态钩即可；禁止 RawInput/子类化/ClipCursor 清理。
     if (desktopEmuSafe) {
         if (!InstallPhase2Hooks()) {
@@ -2794,8 +3461,23 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
         g_installed.store(true, std::memory_order_release);
         return TRUE;
     }
-    // Electron：焦点欺骗 + 灌键线程；Prime 只用 PostMessage（禁 SendMessageTimeout）。
+    // Electron/CEF：焦点欺骗 + 灌键线程；Prime 只用 PostMessage（禁 SendMessageTimeout）。
+    // ★必须同时钩软光标/键态（钩的是本进程 user32，因此 GetKeyboardState 只影响
+    // 目标进程自己）：
+    // ① Chromium 的按键预检 `IsKeyDown(GetKeyboardState(), modifiers)` 决定 Ctrl+V
+    //    这类组合键算不算快捷键——不钩时它读到系统键态（本机 Ctrl 全抬起）→
+    //    Ctrl 被丢掉，WM_KEYDOWN(V) 退化成普通字符输入，表现就是**只出 V 不粘贴**；
+    // ② 点击命中判定要 GetCursorPos——不钩时目标读到本机真实光标（可能在别的窗上）
+    //    → 悬停/焦点判断错位，表现就是**鼠标移到某处不动、点了没反应**。
+    // 这两组钩子只读软状态、不写系统键态，也不会给 Chromium 灌假 WM_INPUT
+    // （Hook_GetCursorPos 在 electronSafe 下是静默钩）。
     if (electronSafe) {
+        if (!InstallWeixinMouseStateHooks()) {
+            RemoveAllHooks();
+            CloseSoftInputView();
+            ResetFocusModeFlags();
+            return FALSE;
+        }
         SoftRefreshFocusMessages();
         StartSoftKeyDrainThread();
         g_installed.store(true, std::memory_order_release);
@@ -2865,7 +3547,8 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_UpdateTarget(HWND targetTop) {
     g_targetTop.store(top, std::memory_order_relaxed);
     HWND render = ResolveSoftInputPostHwnd(top);
     g_focusHwnd.store((render && IsWindow(render)) ? render : top, std::memory_order_relaxed);
-    if (!g_electronSafe && !g_airSafe && !g_mapleSafe && !g_desktopEmuSafe) {
+    if (!g_electronSafe && !g_airSafe && !g_weixinSafe && !g_tianlongSafe && !g_mapleSafe
+        && !g_desktopEmuSafe) {
         AttachSubclass(top);
     }
     if (!g_softView) {
@@ -2919,8 +3602,9 @@ FAKEFOCUS_API DWORD WINAPI FakeFocus_MapleHookHits(HWND) {
     const DWORD gaks = static_cast<DWORD>(g_mapleHitGaks) & 0xFFu;
     const DWORD diState = static_cast<DWORD>(g_mapleHitDiState) & 0xFFu;
     const DWORD diData = static_cast<DWORD>(g_mapleHitDiData) & 0xFFu;
-    const DWORD lastCb = static_cast<DWORD>(g_mapleLastDiStateCb) & 0xFFu;
-    return gaks | (diState << 8) | (diData << 16) | (lastCb << 24);
+    const DWORD lastCb = static_cast<DWORD>(g_mapleLastDiStateCb);
+    const DWORD lastCbPacked = lastCb > 255u ? 255u : lastCb;
+    return gaks | (diState << 8) | (diData << 16) | (lastCbPacked << 24);
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {

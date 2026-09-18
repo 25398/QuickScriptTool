@@ -2,24 +2,242 @@
 #include "engine/engine_host_window.h"
 #include "action_utils.h"
 #include "agent_ui_notify.h"
+#include "ai_action_service.h"
+#include "ai_locate_cache.h"
+#include "ai_fast_paths.h"
+#include "ai_ui_layout.h"
+#include "ai_locate_verify.h"
 #include "ai_logic_convert.h"
 #include "color_match.h"
 #include "desktop_tools/desktop_tools.h"
 #include "image_var_util.h"
+#include "low_power_mode.h"
 #include "macro_execute_tools.h"
+#include "ocr_engine.h"
 #include "script_io.h"
+#include "var_compute.h"
 #include "window_mode/ui_element_probe.h"
 #include "window_mode/window_list.h"
 #include "window_mode/window_capture.h"
 #include "window_mode/window_capture_wgc.h"
+#include "page_snapshot.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <mutex>
+#include <string>
+#include <unordered_map>
+
+/// 日志用短截断（本 TU 内自用；只影响调试输出）
+static std::wstring TruncLog(const std::wstring& s, size_t n) {
+    return s.size() <= n ? s : (s.substr(0, n) + L"…");
+}
+
+static std::wstring ResolveNestedLibraryTarget(const std::wstring& targetPath,
+    const std::wstring& blockName) {    std::wstring resolved;
+    if (!targetPath.empty() && ResolveLibraryScriptPath(targetPath, resolved))
+        return resolved;
+    if (!blockName.empty() && ResolveLibraryScriptPath(blockName, resolved))
+        return resolved;
+    return {};
+}
+
+// ── 找图「上一帧命中」本地复核：跨动作存活的极小状态表 ──────────────────
+// 判据（纯函数）在 image_match.h 的 PlanFindImageFastPath / AcceptFindImageFastPathHit，
+// 这里只负责「按请求指纹存/取上一次全屏命中的结果」。
+// 指纹包含模板路径、搜索区、阈值/尺度、模板尺寸、目标分辨率 —— 任一变化即视为新请求。
+// **每次开始跑脚本都清空**：绝不让上一次运行的命中影响到这一次。
+namespace {
+
+struct FindImageFastPathEntry {
+    int prevTLX = 0;
+    int prevTLY = 0;
+    int tplW = 0;
+    int tplH = 0;
+    double lastFullSearchMs = 0.0;
+    std::chrono::steady_clock::time_point at{};
+};
+
+std::unordered_map<std::wstring, FindImageFastPathEntry> g_findImageFastPath;
+constexpr size_t kFindImageFastPathMaxEntries = 8;
+
+void ResetFindImageFastPath() {
+    g_findImageFastPath.clear();
+}
+
+std::wstring FindImageFastPathKey(const std::wstring& tplPath, const ImageMatchOptions& opt,
+    int x1, int y1, int x2, int y2, int tplW, int tplH, int targetW, int targetH) {
+    wchar_t buf[256]{};
+    swprintf_s(buf, L"|%d,%d,%d,%d|%d,%d|%.1f|%.4f,%.4f,%.4f|%d,%d|%d,%d",
+        x1, y1, x2, y2, tplW, tplH, opt.thresholdPercent,
+        opt.scaleMin, opt.scaleMax, opt.scaleStep, targetW, targetH,
+        opt.perfectMatch ? 1 : 0, opt.crossResolutionMatch ? 1 : 0);
+    return tplPath + buf;
+}
+
+}  // namespace
+
+// ── 「文字直点」用的本地 OCR 屏幕文字索引 ────────────────────────────────
+// 与观察帧同源：观察时本来就要跑一次本地 OCR（给模型看「屏幕上哪段文字在哪」），
+// 这里**留一份带坐标的原始行表**，让 locateAndClick 能对「纯短文本」目标直接落点。
+// 实测一次「点个按钮」= 整屏识图 + Zoom 精炼两轮 VLM ≈ 20s，而这张表早就有坐标了。
+// 有效期很短（画面一变坐标就废）：过期即回落识图，绝不拿旧坐标硬点。
+namespace {
+
+constexpr long long kOcrScreenIndexFreshMs = 90000;
+
+struct OcrScreenIndexState {
+    std::vector<OcrTextLine> lines;
+    long long stampMs = 0;
+    int capX1 = 0, capY1 = 0, capX2 = 0, capY2 = 0;
+    /// 索引对应的前台窗口：窗口换了，这些字坐标立刻作废（哪怕还在 6s 内）
+    HWND hwnd = nullptr;
+};
+
+OcrScreenIndexState& OcrScreenIndex() {
+    static OcrScreenIndexState s;
+    return s;
+}
+
+void StoreOcrScreenIndex(const OcrEngineOutput& ocr, int cx1, int cy1, int cx2, int cy2) {
+    auto& s = OcrScreenIndex();
+    if (!ocr.success || ocr.lines.empty()) {
+        // 这次没识别出东西 → 旧表立刻作废（宁可回落识图，也不用过期坐标）
+        s.lines.clear();
+        s.stampMs = 0;
+        return;
+    }
+    s.lines = ocr.lines;
+    s.stampMs = static_cast<long long>(GetTickCount64());
+    s.capX1 = cx1;
+    s.capY1 = cy1;
+    s.capX2 = cx2;
+    s.capY2 = cy2;
+    s.hwnd = GetForegroundWindow();
+}
+
+void ResetOcrScreenIndex() {
+    auto& s = OcrScreenIndex();
+    s.lines.clear();
+    s.stampMs = 0;
+}
+
+/// 画面与「OCR 索引那一帧」基本一致 → 索引里的字坐标依然成立，给它续期。
+/// 否则静态菜单上连续点几个文字按钮时，6s 一过就又掉回「识图那套」。
+void TouchOcrScreenIndex() {
+    auto& s = OcrScreenIndex();
+    if (!s.lines.empty()) s.stampMs = static_cast<long long>(GetTickCount64());
+}
+
+// ── 「一次性目标」判定：本次运行里这个目标被定位过几次 ───────────────────
+// 用户实测反馈：**不是每个按钮都值得抽象出可复用定位** —— 很多按钮只点一次。
+// 复用缓存（定位模板 + 布局记忆）只对「反复点的位置」有意义：
+//  · 给一次性按钮存缓存没有收益（下次根本不再点它）；
+//  · 却要付出真金白银（布局记忆要整屏转灰度、算 8×8 外观签名）；
+//  · 而且会把**一次性的**坐标固化成「下次直接用」——实测「一键全选」那次就是这么点错的
+//    （面板已关，记忆命中把点击打到了别的地方）。
+// 所以改成：同一目标**第二次**被定位成功后才写缓存/记忆（第一次只定位，不记）。
+namespace {
+
+std::unordered_map<std::wstring, int> g_locateTargetSeen;
+
+int NoteLocateTargetSeen(const std::wstring& targetDesc) {
+    const std::wstring key = Trim(targetDesc);
+    if (key.empty()) return 0;
+    int& n = g_locateTargetSeen[key];
+    if (n < 1000000) ++n;
+    return n;
+}
+
+void ResetLocateTargetSeen() {
+    g_locateTargetSeen.clear();
+}
+
+/// 错点自纠开关（备用项）：默认开；`QST_NO_MISS_SELFCORRECT=1` 关掉。
+bool AiMissSelfCorrectEnabled() {
+    static const bool enabled = []() {
+        wchar_t buf[8]{};
+        return GetEnvironmentVariableW(L"QST_NO_MISS_SELFCORRECT", buf, 8) == 0;
+    }();
+    return enabled;
+}
+
+/// 「屏幕像素(x,y)＝归一化(nx,ny)」：模型自己的坐标系是 0~1000（computer/mouseClick 都是），
+/// 只告诉它屏幕像素时它会反复自问「这是屏幕还是图上的坐标」白烧轮次（实测第十二份日志）。
+std::wstring DescribeClickPointForModel(int x, int y) {
+    const int sw = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
+    const int sh = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
+    return L"屏幕像素(" + std::to_wstring(x) + L"," + std::to_wstring(y) + L")＝归一化("
+        + std::to_wstring(x * 1000 / sw) + L"," + std::to_wstring(y * 1000 / sh)
+        + L")（0~1000，与 computer/mouseClick 同一套）";
+}
+
+/// 明确告诉宿主「这个目标会被反复点」（网格锚点）：允许它写复用缓存。
+/// 网格锚点每次 grid 调用都要用，属于典型的可复用目标；只靠「第二次才存」
+/// 会让第 2 次 grid 调用又走一遍识图并**再点一次锚点格**（那是一次多余点击）。
+void MarkLocateTargetReusable(const std::wstring& targetDesc) {
+    const std::wstring key = Trim(targetDesc);
+    if (key.empty()) return;
+    int& n = g_locateTargetSeen[key];
+    if (n < 1) n = 1;   // 紧接着的这次定位自增后即为 2 → 可复用
+}
+
+}  // namespace
+
+}  // namespace
+
+struct NestedModeFrame {
+    windowmode::WindowModeScriptConfig cfg;
+    bool wasActive = false;
+    double breakoutTime = 0;
+    std::wstring launchPath;
+};
+
+static void MergeNestedWindowRelative(windowmode::WindowModeScriptConfig& cfg,
+    const ScriptFileData& nested) {
+    bool anyRel = cfg.windowRelativeCoordinates || nested.windowMode.windowRelativeCoordinates;
+    for (const auto& act : nested.actions) {
+        if (act.windowRelative) { anyRel = true; break; }
+    }
+    if (!anyRel) return;
+    windowmode::FinalizeWindowModeForPlayback(cfg, true, false);
+    if (cfg.recordClientWidth <= 0 && nested.windowMode.recordClientWidth > 0) {
+        cfg.recordClientWidth = nested.windowMode.recordClientWidth;
+        cfg.recordClientHeight = nested.windowMode.recordClientHeight;
+    }
+}
 
 // 合成桌面区域采集（微信截图同原理）：
 // GDI BitBlt+CAPTUREBLT 拍不到 DirectComposition 表面（TSF 输入法候选框/组字框
 // 是独立合成层），WGC 整屏采集的是 DWM 合成后的完整桌面，能拍到输入法状态。
 // 优先 WGC 整屏后裁剪到目标区域；WGC 不可用/失败时回退 GDI BitBlt。
 // cx1..cy2 为屏幕坐标区域。
+static std::string JsonEscapeUtf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    return out;
+}
+
 static HBITMAP CaptureAiRegionComposed(int cx1, int cy1, int cx2, int cy2) {
     HBITMAP bmp = nullptr;
     bool usedWgc = false;
@@ -192,10 +410,10 @@ bool EngineHost::EngineDebugRunActions(const std::vector<ScriptAction>& actions,
                 return false;
             }
         }
-        // 起点位于容器体内时（defineBlock/Loop/If/Else），直接从中部执行会丢失容器
+        // 起点位于容器体内时（defineBlock/watchImage/Loop/If/Else），直接从中部执行会丢失容器
         // 上下文（块体被主流程跳过、循环变量/条件未建立、EndLoop/Goto 可能逃逸）。
-        // 统一追溯到最外层祖先容器并从其绝对序号开始；defineBlock 祖先链在调试中
-        // 按流程执行一次（嵌套块继续向上追溯）。Else 的容器归属其所属 If。
+        // 统一追溯到最外层祖先容器并从其绝对序号开始；主流程跳过的顶层容器（定义块/找图监视）
+        // 在调试中按流程执行一次（嵌套块继续向上追溯）。Else 的容器归属其所属 If。
         debugBlockEntrySet_.clear();
         if (actions[static_cast<size_t>(startIndex)].type == ActionType::Else) {
             // 起点本身是 Else（结构性动作）：归属到所属 If 开始，让分支按条件执行
@@ -212,7 +430,7 @@ bool EngineHost::EngineDebugRunActions(const std::vector<ScriptAction>& actions,
         int outer = -1;
         int outerIndent = INT_MAX;
         for (;;) {
-            if (actions[static_cast<size_t>(ancestorCursor)].type == ActionType::DefineBlock) {
+            if (SkipsInMainFlow(actions[static_cast<size_t>(ancestorCursor)].type)) {
                 debugBlockEntrySet_.insert(ancestorCursor);
             }
             const auto& acur = actions[static_cast<size_t>(ancestorCursor)];
@@ -231,7 +449,7 @@ bool EngineHost::EngineDebugRunActions(const std::vector<ScriptAction>& actions,
                     }
                 }
             }
-            if (actions[static_cast<size_t>(effParent)].type == ActionType::DefineBlock) {
+            if (SkipsInMainFlow(actions[static_cast<size_t>(effParent)].type)) {
                 debugBlockEntrySet_.insert(effParent);
             }
             if (actions[static_cast<size_t>(effParent)].indent < outerIndent) {
@@ -365,6 +583,7 @@ void EngineHost::OnScheduledTaskFire(const std::wstring& path) {
         const bool autoResume = appSettings_.playback.scheduledTaskAutoResume;
         const auto action = DecideScheduledTaskFire(policy, busy, runningIsScheduled, autoResume);
         auto dbg = [&](const std::wstring& msg) {
+            windowmode::WindowModeLog(msg);
             if (qst::desktop_tools::MacroDebug().IsCreated()) {
                 qst::desktop_tools::MacroDebug().AppendLog(msg);
             }
@@ -378,6 +597,7 @@ void EngineHost::OnScheduledTaskFire(const std::wstring& path) {
             dbg(L"定时任务跳过（当前脚本未结束）：" + name);
             return;
         case ScheduledTaskFireAction::RunNow:
+            dbg(L"定时任务触发：" + name + L" → " + path);
             if (!pendingScheduledPaths_.empty()) {
                 EnqueueScheduledPath(path);
                 TryStartPendingScheduled();
@@ -467,6 +687,8 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
         ghEmergencyStop.store(false, std::memory_order_release);
         ghWorkerCancelFlag = &stopFlag_;
         executedSteps_.store(0, std::memory_order_relaxed);
+        playbackActionIndex_.store(0, std::memory_order_relaxed);
+        playbackActionTotal_.store(static_cast<int>(actions.size()), std::memory_order_relaxed);
         SuspendHotkeysForPlayback();
         if (debugMode) {
             // 编辑器打开时 EngineSetUiMode(1) 会置「界面热键静音」并放行 LL 钩子，
@@ -520,7 +742,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
         runSavedExStyle_ = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
         SetWindowCloaked(hwnd_, false);
         CloseEditorPopup(); CancelQuickInputTip();
-        if (appSettings_.other.playSoundOnStart) MessageBeep(MB_OK);
+        if (appSettings_.other.playSoundOnStart) PlayAppStartupSound();
         EnsureTrayIcon();
         if (debugMode) {
             // 调试期间主界面/编辑界面一律隐藏（不受「自动隐藏」设置影响）
@@ -559,20 +781,19 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
         breakoutHookState_.running = &running_;
         breakoutHookState_.simulatingDepth = &simulatingInputDepth_;
         breakoutHookState_.userInput = &breakoutUserInput_;
-        if (workerBreakoutTime_ > 0) {
-            if (globalHotkey_.enabled && globalHotkey_.vk) {
-                breakoutHookState_.ignoreHotkeys.push_back(globalHotkey_);
-            }
-            for (const auto& script : scripts_) {
-                if (script.hotkey.enabled && script.hotkey.vk) {
-                    breakoutHookState_.ignoreHotkeys.push_back(script.hotkey);
-                }
-            }
-            if (scriptHotkey.enabled && scriptHotkey.vk) {
-                breakoutHookState_.ignoreHotkeys.push_back(scriptHotkey);
-            }
-            breakout_input::InstallBreakoutHooks(breakoutHookState_);
+        if (globalHotkey_.enabled && globalHotkey_.vk) {
+            breakoutHookState_.ignoreHotkeys.push_back(globalHotkey_);
         }
+        for (const auto& script : scripts_) {
+            if (script.hotkey.enabled && script.hotkey.vk) {
+                breakoutHookState_.ignoreHotkeys.push_back(script.hotkey);
+            }
+        }
+        if (scriptHotkey.enabled && scriptHotkey.vk) {
+            breakoutHookState_.ignoreHotkeys.push_back(scriptHotkey);
+        }
+        // 始终装脱离钩：嵌套 runMacro/mousePlayback 切到默认模式时可中途打开脱离
+        breakout_input::InstallBreakoutHooks(breakoutHookState_);
         worker_ = std::thread([this, actions, selfPath, wmCfg, execCoordMeta]() {
             if (debugMode_.load(std::memory_order_relaxed)) {
                 // 只对调试脚本的主序列启用闸门/断点（嵌套宏/指令块指向其它 actions 副本）
@@ -587,14 +808,22 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
             bool usesOcr = ScriptUsesTextRecognition(actions);
             workerUsesOcrVars_ = usesOcr;
             matchVars_.clear();
+            matchListVars_.clear();
             if (usesOcr) ocrVars_.clear();
             loopVars_.clear();
             timerStarts_.clear();
             aiVars_.clear();
+            userVars_.clear();
             ClearImageVars(imageVars_);
             curLoops_ = 0;
             const unsigned long long imageVarRunId = GetTickCount64();
             bool ocrSessionHeld = false;
+            // OCR 文本核对预算：只给「不确定」的定位做核对，且一次运行最多这么多次
+            //（OCR 是可选能力，装了引擎才走；没装时这一段完全静默跳过）
+            int ocrVerifyBudget = 8;
+            // 错点自纠预算（每次运行几次）：点下去没反应时，用「刚点的错点」当红叉锚点补一次点。
+            // 备用项，不是主链路；用完就老实回主模型。
+            int missSelfCorrectBudget = 3;
             auto holdOcrSession = [&ocrSessionHeld]() {
                 if (ocrSessionHeld) return;
                 EnsureOcrSession();
@@ -607,14 +836,23 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
             int lockedVirtY_ = 0;
 
             windowmode::WindowModeExecutor wmExec;
-            windowmode::WindowModeExecutor* wmExecPtr = nullptr;
+            windowmode::WindowModeExecutor* wmExecPtr = &wmExec;
+            windowmode::WindowModeScriptConfig activeWmCfg = wmCfg;
+            std::vector<NestedModeFrame> nestedModeStack;
+            wmExec.SetEnableFakeFocusInjection(
+                appSettings_.windowMode.enableFakeFocusInjection);
+            wmExec.SetInjectionTechnique(
+                windowmode::inject::TechniqueFromInt(
+                    appSettings_.windowMode.injectionTechnique));
+            wmExec.SetHideInjectedModule(
+                appSettings_.windowMode.hideInjectedModule);
 
             // 计算模板缩放比例（用于找图跨分辨率适配，嵌套宏可切换 activeCoordMeta）
             int execTargetW = 0, execTargetH = 0, execVirtX = 0, execVirtY = 0;
             GetVirtualScreenBounds(execVirtX, execVirtY, execTargetW, execTargetH);
             CoordMeta activeCoordMeta = execCoordMeta;
             auto currentTmplScale = [&]() -> TemplateScale {
-                if (wmExecPtr && wmExecPtr->IsActive() && wmCfg.windowRelativeCoordinates) {
+                if (wmExecPtr && wmExecPtr->IsActive() && activeWmCfg.windowRelativeCoordinates) {
                     const TemplateScale wmTs = wmExecPtr->FindImageTemplateScale();
                     if (wmTs.sx > 0.0 && wmTs.sy > 0.0) return wmTs;
                 }
@@ -629,14 +867,6 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 windowmode::BeginRunOptions wmBeginOpts;
                 wmBeginOpts.launchTarget = true;
                 wmBeginOpts.cancelFlag = &stopFlag_;
-                // 对抗性测试：假焦点注入开关/技术/模块隐藏来自全局设置（默认经典远线程）
-                wmExec.SetEnableFakeFocusInjection(
-                    appSettings_.windowMode.enableFakeFocusInjection);
-                wmExec.SetInjectionTechnique(
-                    windowmode::inject::TechniqueFromInt(
-                        appSettings_.windowMode.injectionTechnique));
-                wmExec.SetHideInjectedModule(
-                    appSettings_.windowMode.hideInjectedModule);
                 {
                     const auto slash = selfPath.find_last_of(L"\\/");
                     wmBeginOpts.launchSearchDir = slash == std::wstring::npos ? L"" : selfPath.substr(0, slash);
@@ -657,7 +887,6 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     }
                     return;
                 }
-                wmExecPtr = &wmExec;
                 wmExec.SetCoordMeta(activeCoordMeta);
                 windowmode::WindowModeLog(L"[窗口模式] 已绑定目标，开始运行");
                 windowmode::WindowModeLogDesktopSnap(L"绑定后", wmExec.TargetHwnd());
@@ -764,6 +993,25 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 if (act.holdLeftShift) wmSendKey(VK_LSHIFT, down);
                 if (act.holdRightShift) wmSendKey(VK_RSHIFT, down);
             };
+            auto activateDesktopAt = [this](int x, int y) {
+                POINT pt{x, y};
+                HWND hit = WindowFromPoint(pt);
+                if (!hit) return;
+                HWND root = GetAncestor(hit, GA_ROOT);
+                if (!root) root = hit;
+                DWORD pid = 0;
+                GetWindowThreadProcessId(root, &pid);
+                if (pid == GetCurrentProcessId()) return;
+                if (GetForegroundWindow() == root) return;
+                std::wstring err;
+                if (!windowmode::ActivateWindow(root, err)
+                    && appSettings_.playback.autoOutputKeyFunctionDebug) {
+                    wchar_t cls[160]{};
+                    GetClassNameW(root, cls, 160);
+                    AppendDebugLog(std::wstring(L"默认模式点击未能激活窗口 class=") + cls
+                        + L"：" + err);
+                }
+            };
             auto wmMouseButton = [this, wmExecPtr, wmUsesTarget](int cx, int cy, MouseButtonType btn, bool down) {
                 if (wmUsesTarget()) {
                     const bool hw = wmExecPtr->PreferHardwareInput();
@@ -774,12 +1022,15 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     MouseButtonEvent(btn, down);
                 }
             };
-            auto wmMouseClick = [this, wmExecPtr, wmUsesTarget](int cx, int cy, MouseButtonType btn) {
+            auto wmMouseClick = [this, wmExecPtr, wmUsesTarget, &activateDesktopAt](int cx, int cy, MouseButtonType btn) {
                 if (wmUsesTarget()) {
                     const bool hw = wmExecPtr->PreferHardwareInput();
                     if (hw) MarkSimulatedInput();
                     wmExecPtr->PostMouseClickAtClient(cx, cy, btn);
                     if (hw) UnmarkSimulatedInput();
+                } else if (cx != 0 || cy != 0) {
+                    activateDesktopAt(cx, cy);
+                    SendMouseClickAtScreen(cx, cy, btn);
                 } else {
                     MouseClick(btn);
                 }
@@ -787,12 +1038,13 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
             auto wmSendShortcut = [wmSendKey](const ScriptAction& action) {
                 ScriptAction tmp = action;
                 ApplyShortcutPreset(tmp, action.shortcutPreset);
+                const UINT playVk = NormalizeScriptKeyVk(tmp.keyVk, tmp.keyText);
                 if (tmp.holdLeftWin) wmSendKey(VK_LWIN, true);
                 if (tmp.holdLeftCtrl) wmSendKey(VK_LCONTROL, true);
                 if (tmp.holdLeftAlt) wmSendKey(VK_LMENU, true);
                 if (tmp.holdLeftShift) wmSendKey(VK_LSHIFT, true);
-                wmSendKey(tmp.keyVk, true);
-                wmSendKey(tmp.keyVk, false);
+                wmSendKey(playVk, true);
+                wmSendKey(playVk, false);
                 if (tmp.holdLeftShift) wmSendKey(VK_LSHIFT, false);
                 if (tmp.holdLeftAlt) wmSendKey(VK_LMENU, false);
                 if (tmp.holdLeftCtrl) wmSendKey(VK_LCONTROL, false);
@@ -870,8 +1122,10 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
             auto makeVarCtx = [&]() {
                 MacroVariableContext ctx;
                 ctx.matchVars = &matchVars_;
+                ctx.matchListVars = &matchListVars_;
                 ctx.ocrVars = usesOcr ? &ocrVars_ : nullptr;
                 ctx.aiVars = &aiVars_;
+                ctx.userVars = &userVars_;
                 ctx.imageVars = &imageVars_;
                 ctx.loopVars = &loopVars_;
                 ctx.timerStarts = &timerStarts_;
@@ -881,7 +1135,8 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
 
             auto resolveTemplatePath = [&](bool useVar, const std::wstring& stored) -> std::wstring {
                 if (useVar) return ResolveRuntimeImagePath(stored, &imageVars_);
-                return stored;
+                const std::wstring resolved = ResolveImagePath(stored);
+                return resolved.empty() ? stored : resolved;
             };
 
             AiSessionStore aiSessions;
@@ -893,11 +1148,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
             std::function<void(const ScriptAction&, const ScriptAction*)> runAiActionExecute;
             auto executeOne = std::function<void(const ScriptAction&)>();
 
-            runAiActionExecute = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &runRange, &runningScriptPath,
+            runAiActionExecute = [this, &usesOcr, &holdOcrSession, &ocrVerifyBudget, &missSelfCorrectBudget, &heldKeyVk, &runRange, &runningScriptPath,
                 &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx,
                 &resolveTemplatePath,
                 &executeOne, &runAiActionExecute, &aiSessions, &aiLoopDepth, &aiRootBudget, &aiCurFrame, &aiInheritParent,
-                &pendingBreakLoop, wmExecPtr, &wmUsesTarget, &currentTmplScale, imageVarRunId](
+                &pendingBreakLoop, wmExecPtr, &wmUsesTarget, &activeWmCfg, &currentTmplScale, imageVarRunId](
                 const ScriptAction& action,                 const ScriptAction* inheritFrom) {
                 if (StopRequested()) return;
                 AiActionExecuteNestGuard nestGuard;
@@ -1003,7 +1258,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         HBITMAP tmpl = LoadBitmapFromFile(tmplPath);
                         if (!tmpl) return false;
                         ImageMatchOptions opt = BuildExecutionFindImageOptions(eff, tmplScale);
-                        opt.maxMatches = 20;
+                        RestrictFindImageToSingleAnchor(opt);
                         opt.maxOverlap = 0.5;
                         ImageMatchOutput output;
                         if (lockedScreen_) {
@@ -1056,6 +1311,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 bool lastUiSettleReacted = false;
                 bool lastUiSettleSettled = false;
                 std::wstring lastUiChangeRoisText;
+                std::vector<ScreenChangeRoi> lastUiChangeRois;
                 /// settle 刚写入 aiObs 后，下一轮观察必须上传，避免被「未变」短路
                 bool forceNextObserveUpload = false;
                 /// 最近一次定位/点击的屏幕坐标（动作局部验收，抑制视频区抢注意力）
@@ -1075,8 +1331,23 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     altTabHoldRounds = 0;
                 };
 
+                std::wstring lastPointerClickFgTitle;
+                auto foregroundTitle = []() -> std::wstring {
+                    HWND fg = GetForegroundWindow();
+                    if (!fg) return {};
+                    wchar_t buf[512]{};
+                    GetWindowTextW(fg, buf, 512);
+                    return buf;
+                };
                 auto notePointerClick = [&](int sx, int sy, bool isPrimaryLeft) -> std::wstring {
                     if (sx < 0 || sy < 0) return {};
+                    const std::wstring fgTitle = foregroundTitle();
+                    if (!lastPointerClickFgTitle.empty() && fgTitle != lastPointerClickFgTitle) {
+                        nearDupClickCount = 0;
+                        lastActionScreenX = -1;
+                        lastActionScreenY = -1;
+                    }
+                    lastPointerClickFgTitle = fgTitle;
                     // 右键菜单常需同点再试/点菜单项，勿用近点拒绝误伤
                     if (!isPrimaryLeft) {
                         lastActionScreenX = sx;
@@ -1090,8 +1361,10 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         if (dx * dx + dy * dy <= 56LL * 56LL) {
                             ++nearDupClickCount;
                             if (nearDupClickCount >= 2) {
-                                return L"[错误] 已连续在相近位置左键点击。请根据界面判断是否已成功"
-                                    L"（如点赞高亮），达成则 completeTask，勿重复点击。"
+                                return L"[错误] 已连续在相近位置左键点击（同一屏重复点）。"
+                                    L"若刚跳转了页面，请对「新页面」上的目标重新定位。"
+                                    L"若目标态已达成（选中/点赞/按下）请 completeTask；"
+                                    L"未变则 observePage 看 checked/pressed，勿对同一坐标连点。"
                                     L"切窗用 activateWindow；打开桌面图标请 doubleClick=true。";
                             }
                         } else {
@@ -1130,14 +1403,24 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     // 点击/键鼠前藏壳与调试窗，避免挡桌面目标或进截屏
                     qst::desktop_tools::ScopedHideOwnUiForCapture hideOwn(UserFacingMainHwnd());
                     std::wstring jsonStr = Trim(rawJson);
-                    const size_t bracketStart = jsonStr.find(L'[');
-                    const size_t bracketEnd = jsonStr.rfind(L']');
-                    if (bracketStart != std::wstring::npos && bracketEnd != std::wstring::npos
-                        && bracketEnd > bracketStart) {
-                        jsonStr = jsonStr.substr(bracketStart, bracketEnd - bracketStart + 1);
+                    // ★必须用「括号配对 + 跳过字符串」的取法：构建器会在数组后追加
+                    // 「[提示] 已自动…stopMacro…」，提示自带 [ ]，裸 rfind(']') 会把提示里的
+                    // ] 当数组结尾 → 整段非法 JSON →「JSON 解析失败」（runCommand 实测踩到）。
+                    if (const std::wstring arr = ExtractActionJsonArrayText(jsonStr); !arr.empty()) {
+                        jsonStr = arr;
+                    }
+                    nlohmann::json steps;
+                    try {
+                        steps = nlohmann::json::parse(ToUtf8(jsonStr));
+                    } catch (const std::exception& e) {
+                        // 只有这里才是真的「JSON 不合法」——报错必须带上原因，
+                        // 否则模型只会看到「JSON 解析失败」而不知道错在哪（实测白烧两轮）。
+                        AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：动作 JSON 解析失败："
+                            + FromUtf8(std::string(e.what())));
+                        return L"[错误] 动作 JSON 解析失败：" + FromUtf8(std::string(e.what()))
+                            + L"。请重新生成动作 JSON（勿手写残缺字段）。";
                     }
                     try {
-                        nlohmann::json steps = nlohmann::json::parse(ToUtf8(jsonStr));
                         if (!steps.is_array())
                             return L"[错误] 返回内容不是 JSON 数组";
                         AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：即时执行本批 "
@@ -1212,6 +1495,14 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         std::wstring firstInvalidError;
                         // 近点重复点击被拒 ≠ 坐标越界，回给模型的理由必须分开
                         std::wstring skippedDupNote;
+                        // ★逐步生效校验（通用）：盲批量里「先选中/切换 → 再作用」这类依赖链，
+                        //   第一步没生效后面全是空转；而动态画面上的整批 settle 只会说「仍在变化」，
+                        //   看不出第一步其实没点上。这里记下**第一次点击的落点**（点完光标就在那儿）
+                        //   与点击步数，稍后用 settle 的变化区判断它到底有没有引起局部变化。
+                        int firstClickScreenX = -1;
+                        int firstClickScreenY = -1;
+                        int clickedSteps = 0;
+                        std::wstring stepEffectFact;
                         // 批量配方里每行都有 Enter：只在「本批最后一个会触发界面变化的步骤」上 settle，
                         // 中间行狂等会把 10 行填表拖成十几秒空转
                         auto stepWantsInteractionSettle = [](const nlohmann::json& raw) -> bool {
@@ -1412,6 +1703,17 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 && !LastLaunchProgramError().empty()) {
                                 return L"[错误] " + LastLaunchProgramError();
                             }
+                            // 记「第一次点击的落点」：点完光标就在那儿，不需要坐标换算
+                            if (stepAction.type == ActionType::MouseClick) {
+                                ++clickedSteps;
+                                if (firstClickScreenX < 0) {
+                                    POINT cp{};
+                                    if (GetCursorPos(&cp)) {
+                                        firstClickScreenX = cp.x;
+                                        firstClickScreenY = cp.y;
+                                    }
+                                }
+                            }
                             // 逻辑转化：仅在真正执行成功后记轨迹（避免幽灵步骤）
                             if (AiLogicConvertSessionActive()
                                 && stepAction.type != ActionType::AiActionExecute) {
@@ -1422,7 +1724,17 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 int cx1 = 0, cy1 = 0, cx2 = 0, cy2 = 0;
                                 resolveAiRegion(cx1, cy1, cx2, cy2);
                                 UiVisualSettleOptions sopt;
-                                if (wantsLaunchSettle) {
+                                // ★游戏/自绘前台：画面每帧都在变，等「反应→稳定」既等不到也没意义，
+                                // 用户实测每个动作白等 1.5~2.6s（拿卡→放卡中间隔好几秒）。
+                                // 只留一个很短的节拍让游戏把这一帧画完。
+                                const bool gameForeground = AiActionGameForegroundLikely();
+                                if (gameForeground) {
+                                    sopt.pollIntervalMs = 80;
+                                    sopt.reactDeadlineMs = 350;
+                                    sopt.stableHoldMs = 150;
+                                    sopt.maxTotalMs = 900;
+                                    sopt.refreshSuggestMs = 100000;  // 游戏里别提「建议刷新/重开」
+                                } else if (wantsLaunchSettle) {
                                     sopt.pollIntervalMs = 150;
                                     sopt.reactDeadlineMs = 2200;
                                     sopt.stableHoldMs = 400;
@@ -1456,8 +1768,54 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 lastUiSettleElapsedMs = settled.elapsedMs;
                                 lastUiSettleReacted = settled.reacted;
                                 lastUiSettleSettled = settled.settled;
+                                // 权威的「点完到底有没有反应」：给「错点自纠」这类补点逻辑看
+                                NoteAiUiSettleReacted(settled.reacted);
                                 if (!settled.reacted)
                                     settleNoReactionThisBatch = true;
+                                // 播放器大面积在动不算翻页：勿清近点计数，否则会再点一次把开关取消。
+                                lastUiChangeRois = settled.lastChangeRois;
+                                // ★逐步生效判定：本批是「多点」时，第一次点击有没有在它附近
+                                //   引起**小范围结构变化**（大面积动态区不算，那是播放器/游戏背景）。
+                                //   没有 → 明说「第一步很可能没生效」，并提醒后续步骤在空转。
+                                //   这条对任何界面都成立：先选中/先切换没成功，后面点什么都是白点。
+                                if (clickedSteps >= 2 && firstClickScreenX >= 0) {
+                                    const int lx = firstClickScreenX - cx1;
+                                    const int ly = firstClickScreenY - cy1;
+                                    // 变量名勿用 near/far/small（Windows 旧头历史宏：#define small char）
+                                    bool nearHit = false;
+                                    bool sawSmallRoi = false;
+                                    for (const auto& rr : settled.lastChangeRois) {
+                                        const int rw = rr.x2 - rr.x1;
+                                        const int rh = rr.y2 - rr.y1;
+                                        const bool roiSmall = rw > 0 && rh > 0 && rw <= 220 && rh <= 180
+                                            && rw * rh <= 48000;
+                                        if (!roiSmall) continue;
+                                        sawSmallRoi = true;
+                                        if (lx >= rr.x1 - 40 && lx <= rr.x2 + 40
+                                            && ly >= rr.y1 - 40 && ly <= rr.y2 + 40) {
+                                            nearHit = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!nearHit && sawSmallRoi) {
+                                        stepEffectFact = L"\n[事实] 本批**第一次点击**" 
+                                            + DescribeClickPointForModel(firstClickScreenX, firstClickScreenY)
+                                            + L"附近没有任何结构变化（变化都发生在别处）：该步很可能没生效"
+                                              L"（点错了/没选中/不可点）。★后面的步骤依赖它，可能全在空转 —— "
+                                              L"先单独确认这一步的状态（看截图、或再点一次这一步），再继续后续。"
+                                              L"批量做「先选中/先切换 → 再作用于目标」这类链条时应改用 "
+                                              L"locateAndClick(targets=[…])（逐步校验、失败即停）。";
+                                    } else if (!nearHit && !sawSmallRoi && !settled.reacted) {
+                                        stepEffectFact = L"\n[事实] 本批点了 " 
+                                            + std::to_wstring(clickedSteps)
+                                            + L" 次但整屏没有可归因的变化：很可能一步都没生效。"
+                                              L"先确认第一步（选中/切换）的状态，别继续往下堆动作。";
+                                    }
+                                    AppendAiDebugLog(L"  [诊断] 批量逐步校验：点击 "
+                                        + std::to_wstring(clickedSteps) + L" 次，首次点击"
+                                        + (nearHit ? L"附近已变" : L"附近无变化")
+                                        + (sawSmallRoi ? L"" : L"（整屏无小范围变化）"));
+                                }
                                 lastUiChangeRoisText.clear();
                                 for (size_t i = 0; i < settled.lastChangeRois.size() && i < 4; ++i) {
                                     const auto& r = settled.lastChangeRois[i];
@@ -1477,6 +1835,36 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 }
                             } else if (settleBaseline) {
                                 DeleteBitmapHandle(settleBaseline);
+                            }
+                            if ((stepAction.type == ActionType::OpenWebpage
+                                    || stepAction.type == ActionType::RunProgram)
+                                && !windowmode::ExtBridgeServer::Instance().IsExtensionConnected()) {
+                                std::wstring hay = stepAction.targetPath + L" " + stepAction.inputText;
+                                for (auto& c : hay) {
+                                    if (c >= L'A' && c <= L'Z')
+                                        c = static_cast<wchar_t>(c - L'A' + L'a');
+                                }
+                                const bool browserish = stepAction.type == ActionType::OpenWebpage
+                                    || hay.find(L"msedge") != std::wstring::npos
+                                    || hay.find(L"chrome") != std::wstring::npos
+                                    || hay.find(L"firefox") != std::wstring::npos
+                                    || hay.find(L"brave") != std::wstring::npos
+                                    || hay.find(L"iexplore") != std::wstring::npos
+                                    || (hay.find(L"edge") != std::wstring::npos
+                                        && hay.find(L"edgedriver") == std::wstring::npos);
+                                if (browserish) {
+                                    auto& launchBridge = windowmode::ExtBridgeServer::Instance();
+                                    launchBridge.RefreshDiscovery();
+                                    AppendAiDebugLog(L"  [诊断] 打开浏览器/网页后等待配套扩展 port="
+                                        + std::to_wstring(launchBridge.Port()) + L"…");
+                                    std::wstring waitErr;
+                                    if (launchBridge.WaitForExtension(10000, waitErr)) {
+                                        AppendAiDebugLog(L"  [诊断] 扩展已连接本机桥");
+                                    } else {
+                                        AppendAiDebugLog(L"  [诊断] 扩展 10s 未握手（页导航应唤醒 SW；"
+                                            L"未装扩展则后续 observePage 会走识图）");
+                                    }
+                                }
                             }
                             if (pendingBreakLoop) break;
                             ++stepCount;
@@ -1528,6 +1916,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         if (settleNoReactionThisBatch) {
                             settleFact = L"\n[事实] settle无反应：界面相对操作前几乎无变化。";
                         }
+                        settleFact += stepEffectFact;
                         if (!skippedDupNote.empty()) {
                             return L"已执行 " + std::to_wstring(stepCount)
                                 + L" 步；另跳过重复近点点击 1 步" + altNote + settleFact;
@@ -1545,9 +1934,18 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         }
                         return L"已执行 " + std::to_wstring(stepCount) + L" 步" + altNote
                             + settleFact;
+                    } catch (const std::exception& e) {
+                        // 走到这里说明 JSON 是好的，是**执行**环节抛了异常。
+                        // 旧代码一律回「JSON 解析失败」，把模型和排查都带进沟里
+                        //（实测 runCommand 的失败就是这么被误报的）。
+                        const std::wstring what = FromUtf8(std::string(e.what()));
+                        AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：执行动作时异常：" + what);
+                        return L"[错误] 执行动作时异常：" + what
+                            + L"。已执行过的步骤不会回滚；请改参数重试，或换路线"
+                              L"（runCommand / clickRef / invokeUiControl）。";
                     } catch (...) {
-                        AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：JSON 解析失败");
-                        return L"[错误] JSON 解析失败";
+                        AppendAiDebugLog(L"AI动作执行 [" + effModel + L"]：执行动作时未知异常");
+                        return L"[错误] 执行动作时未知异常。请换路线或用 observePage 看当前状态。";
                     }
                 };
 
@@ -1640,6 +2038,49 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         parkCursorAwayFromUi();
                     }
                     AiObserveCaptureResult r;
+                    // ★前台是模态对话框（另存为/打开/确认）时，直接把「这是什么、该怎么收尾」
+                    // 写进本轮指令。模型看不到窗口类，只能靠这条：实测另存为框弹出来后，
+                    // 模型不知道那是保存框，去 locateAndClick「更多选项」、又反复 activateWindow
+                    // 切窗（模态框会挡住 SetForegroundWindow，必然失败），整轮卡死。
+                    {
+                        const std::wstring probe = windowmode::FormatForegroundDialogProbe();
+                        auto field = [&probe](const wchar_t* key) -> std::wstring {
+                            const std::wstring needle = std::wstring(key) + L"=";
+                            const size_t p = probe.find(needle);
+                            if (p == std::wstring::npos) return {};
+                            const size_t from = p + needle.size();
+                            const size_t end = probe.find(L';', from);
+                            return probe.substr(from,
+                                end == std::wstring::npos ? std::wstring::npos : end - from);
+                        };
+                        const std::wstring kind = field(L"kind");
+                        const std::wstring dlgTitle = field(L"title");
+                        if (!kind.empty() && kind != L"none") {
+                            const bool saveLike = kind == L"saveAs" || kind == L"saveAsMini";
+                            const bool openLike = kind == L"openFile";
+                            std::wstring f = L"★前台是一个**模态对话框**";
+                            if (!dlgTitle.empty()) f += L"「" + dlgTitle + L"」";
+                            f += L"（宿主探测 kind=" + kind + L"）：";
+                            if (saveLike) {
+                                f += L"这是保存/另存为框。收尾办法："
+                                     L"① 用 quickInput 把**文件名**（或完整路径）打进文件名框 → "
+                                     L"② keyClick(Enter) 或 locateAndClick(保存) 提交；"
+                                     L"想放弃才 Escape。可以点左侧「桌面」再输入纯文件名。"
+                                     L"★不要 locateAndClick「更多选项」等菜单、不要 activateWindow 切窗"
+                                     L"（模态框挡着一定切不动）、不要 F12/切任务栏。";
+                            } else if (openLike) {
+                                f += L"这是打开框：quickInput 文件名 → Enter；或 Escape 取消后改用 openFile(路径)。"
+                                     L"不要切窗/点更多选项。";
+                            } else {
+                                f += L"先看图处理它（确定/关闭/取消），再继续任务；"
+                                     L"不要 Escape 关掉未完成的对话框，也不要反复切窗。";
+                            }
+                            r.foregroundFact = f;
+                            AppendAiDebugLog(L"  [诊断] ★前台模态对话框 kind=" + kind
+                                + (dlgTitle.empty() ? L"" : (L" title=" + dlgTitle))
+                                + L" → 本轮注入处理指引");
+                        }
+                    }
                     if (!lastUiSettleHint.empty()) {
                         r.settleChecked = true;
                         r.uiReacted = lastUiSettleReacted;
@@ -1680,7 +2121,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         f0 = nullptr;
                     }
 
-                    const bool skipUnchangedCheck = forceRefresh || forceNextObserveUpload;
+                    // ★模型明确要过截图（computer(action=screenshot)）→ 必须回传这一帧：
+                    //   历史里的旧图已被剥成「(历史截图已省略)」，用「界面未变」省掉这帧
+                    //   等于把模型变成瞎子（实测它反复自问「我看不到图」并空转好几轮）。
+                    const bool skipUnchangedCheck = forceRefresh || forceNextObserveUpload
+                        || AiTakeExplicitScreenshotRequest();
                     forceNextObserveUpload = false;
 
                     if (!skipUnchangedCheck) {
@@ -1756,6 +2201,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                     const bool structurallyQuiet = diff.sameSize
                                         && (diff.nearlyIdentical || diff.changedRatio < 0.003
                                             || diff.onlyDynamicChanged);
+                                    // 与「OCR 索引那一帧」结构一致（只忽略动态区）→ 字坐标仍成立，续期
+                                    if (diff.sameSize
+                                        && (diff.nearlyIdentical || diff.changedRatio < 0.003)) {
+                                        TouchOcrScreenIndex();
+                                    }
                                     if (structurallyQuiet && !actionLocalStructural) {
                                         ++consecutiveDynamicOnlyObserves;
                                         DeleteBitmapHandle(baseline);
@@ -1786,6 +2236,48 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
 
                     consecutiveDynamicOnlyObserves = 0;
                     CommitSavedImage(bmp, kAiObsImageVarName, imageVarRunId, imageVars_);
+                    // ★屏幕文字坐标索引（通用）：本地 OCR 出「哪些文字在哪」，
+                    // 让模型不靠看图也能准确点。OCR 未安装则整段静默跳过。
+                    // 这是「AI 看不懂界面/靠猜坐标」的正解，也与文档 §21 的 PP-OCR 评估对应。
+                    if (AiFastPathsEnabled() && CheckOcrEnvironment(false).state == OcrEnvState::Ready) {
+                        const OcrEngineOutput ocr = RunOcrOnBitmap(bmp, cx1, cy1, false);
+                        // 原始行表留一份给「文字直点」（textIndex 只是给模型看的裁剪版）
+                        StoreOcrScreenIndex(ocr, cx1, cy1, cx2, cy2);
+                        if (ocr.success && !ocr.lines.empty()) {
+                            std::wstring idx;
+                            int kept = 0;
+                            int numericKept = 0;
+                            for (const auto& ln : ocr.lines) {
+                                const std::wstring t = Trim(ln.text);
+                                if (t.size() < 2 || t.size() > 24) continue;
+                                if (ln.confidence < 0.55) continue;
+                                // ★纯数字（价格/血量/分数）不是可点按钮，排在后面且限量：
+                                // 实测满屏价格把索引塞满（33 条全是 100/75/6666…），
+                                // 模型反而找不到「一键全选/上一页/确认」这类**文字按钮**。
+                                bool hasLetter = false;
+                                for (const wchar_t c : t) {
+                                    if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')
+                                        || c >= 0x4E00) { hasLetter = true; break; }
+                                }
+                                if (!hasLetter) {
+                                    if (numericKept >= 6) continue;
+                                    ++numericKept;
+                                }
+                                if (kept >= 24) break;
+                                if (!idx.empty()) idx += L"；";
+                                idx += t + L"("
+                                    + std::to_wstring((ln.x1 + ln.x2) / 2) + L","
+                                    + std::to_wstring((ln.y1 + ln.y2) / 2) + L")";
+                                ++kept;
+                            }
+                            if (kept > 0) {
+                                r.textIndex = L"屏幕文字索引（本地 OCR，坐标为**屏幕绝对像素**；"
+                                    L"带文字的才是按钮/标签，纯数字是价格数值不用点；"
+                                    L"可直接 locateAndClick(target=其中任一文字) 或按坐标点）：" + idx;
+                                r.textIndexCount = kept;
+                            }
+                        }
+                    }
                     const double scale = std::clamp(
                         eff.aiImageScale > 0.0 ? eff.aiImageScale : 0.5, 0.1, 1.0);
                     std::wstring imeStatus;
@@ -1794,8 +2286,13 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         if (imeStatus.find(L"[输入法] 英文") != std::wstring::npos)
                             imeStatus.clear();
                     }
+                    // 观察帧长边上限：默认 768（省 token）。
+                    // ★前台不是浏览器窗口（游戏/自绘应用）时抬到 1024：这类画面没有控件树，
+                    //   模型只能靠这一张图认格子/单位，768×432 上小目标（植物/僵尸/道具）
+                    //   只剩十几个像素，识图基本靠猜。像素 ×1.78，只在非浏览器前台付出。
+                    const int observeLongEdge = ForegroundWindowIsBrowserClass() ? 768 : 1024;
                     const AiImageEncodeResult enc = EncodeBitmapForAiAnalysis(
-                        bmp, scale, 768, imeStatus.empty() ? nullptr : &imeStatus);
+                        bmp, scale, observeLongEdge, imeStatus.empty() ? nullptr : &imeStatus);
                     DeleteBitmapHandle(bmp);
                     if (enc.base64.empty()) return r;
                     r.ok = true;
@@ -1833,6 +2330,16 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 };
                 agentHooks.onQueryImeStatus = []() {
                     return QueryForegroundImeStatusText();
+                };
+                agentHooks.onConfirmWebLaunch = [this](const std::wstring& detail) -> bool {
+                    std::wstring msg = L"智能体刚抓取了网页，现在要启动程序。\n\n";
+                    if (detail.size() > 400) msg += detail.substr(0, 400) + L"…";
+                    else msg += detail;
+                    msg += L"\n\n这可能来自网页内容，请确认是否允许。\n"
+                        L"（脚本里直接「启动程序」不受影响，只有先抓网页再启动才会问。）";
+                    const int r = MessageBoxW(UserFacingMainHwnd(), msg.c_str(),
+                        L"键鼠工坊", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+                    return r == IDYES;
                 };
                 agentHooks.onListWindows = [&]() -> std::wstring {
                     // 台账要排除本软件自身窗口；枚举期间也顺手藏壳，避免壳窗抢 Z 序
@@ -1897,23 +2404,1009 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     if (!hit.processName.empty()) out += L" [" + hit.processName + L"]";
                     return out;
                 };
-                agentHooks.onLocateAndClick = [&](const std::wstring& targetDesc,
-                    int refineLevels, const std::wstring& button,
-                    int clickCount) -> std::wstring {
+                auto ensureExtensionConnected = [&](const wchar_t* what) -> std::wstring {
+                    auto& bridge = windowmode::ExtBridgeServer::Instance();
+                    if (bridge.IsExtensionConnected()) return {};
+                    bridge.RefreshDiscovery();
+                    std::wstring waitErr;
+                    AppendAiDebugLog(L"  [诊断] 扩展未连接，等待本机桥 port="
+                        + std::to_wstring(bridge.Port()) + L"…");
+                    if (!bridge.WaitForExtension(12000, waitErr)) {
+                        return std::wstring(L"[错误] 未连接配套扩展，无法 ")
+                            + what
+                            + L"。本机桥已监听 port=" + std::to_wstring(bridge.Port())
+                            + L"（HTTP探测=" + std::to_wstring(bridge.HttpProbeCount())
+                            + L" WS握手失败=" + std::to_wstring(bridge.WsHandshakeFailCount())
+                            + L"）。请点工具栏「键鼠工坊」看弹窗状态并点重连；"
+                              L"仍失败再用 locateAndClick。";
+                    }
+                    AppendAiDebugLog(L"  [诊断] 扩展已连接");
+                    return {};
+                };
+                agentHooks.onObservePage = [&](bool force, const std::wstring& titleHintIn,
+                    const std::wstring& query) -> std::wstring {
+                    if (const std::wstring wait = ensureExtensionConnected(L"observePage");
+                        !wait.empty())
+                        return wait;
+                    auto& bridge = windowmode::ExtBridgeServer::Instance();
+                    std::wstring hint = titleHintIn;
+                    if (hint.empty()) {
+                        HWND fg = GetForegroundWindow();
+                        if (fg) {
+                            wchar_t buf[512]{};
+                            GetWindowTextW(fg, buf, 512);
+                            hint = buf;
+                        }
+                    }
+                    // 扩展按「标签页标题」匹配：窗口标题里的「和另外 N 个页面 - 个人 - Microsoft Edge」
+                    // 必须剥掉，否则一直挂在旧标签上（实测前台已是设置页、树却还是游戏页）。
+                    //
+                    // ★注意顺序：剥完装饰后**不能再**用 LooksLikeBrowserWindowTitle 判断，
+                    // 否则「历史记录」这种纯标签标题会被判定成「不是浏览器」而被清空 ——
+                    // 那样 titleHint 根本没传给扩展，跟随标签失效，宿主侧「树与前台不一致」的
+                    // 可信度校验也因为 hint 为空而永远判「可信」，截图被剥掉、模型彻底看不到界面。
+                    // （这正是「卡在历史记录界面反复打开」的直接原因。）
+                    const bool hintWasBrowserTitle = LooksLikeBrowserWindowTitle(hint);
+                    if (hintWasBrowserTitle) {
+                        const std::wstring stripped = StripBrowserWindowTitleDecorations(hint);
+                        if (!stripped.empty() && stripped != hint) {
+                            AppendAiDebugLog(L"  [诊断] 观察 hint 去掉窗口装饰：「" + hint
+                                + L"」→「" + stripped + L"」（仅作标签标题提示）");
+                            hint = stripped;
+                        }
+                    } else {
+                        // 不是浏览器窗口标题：窗口模式配置/游戏绑窗名兜底，否则不给 hint
+                        if (LooksLikeBrowserWindowTitle(activeWmCfg.windowName))
+                            hint = activeWmCfg.windowName;
+                        else
+                            hint.clear();
+                    }
+                    std::string extra = std::string("\"force\":") + (force ? "true" : "false");
+                    if (AiPageKindIsCanvas() && !force)
+                        extra += ",\"light\":true";
+                    if (!hint.empty())
+                        extra += ",\"titleHint\":\"" + JsonEscapeUtf8(ToUtf8(hint)) + "\"";
+                    const std::wstring urlHint = AiLastOpenWebpageUrl();
+                    if (!urlHint.empty())
+                        extra += ",\"urlHint\":\"" + JsonEscapeUtf8(ToUtf8(urlHint)) + "\"";
+                    else if (!AiLastPageUrl().empty())
+                        extra += ",\"urlHint\":\"" + JsonEscapeUtf8(ToUtf8(AiLastPageUrl())) + "\"";
+                    if (!query.empty())
+                        extra += ",\"query\":\"" + JsonEscapeUtf8(ToUtf8(query)) + "\"";
+                    std::string result;
+                    std::wstring err;
+                    if (!bridge.Request("observePage", extra, result, err, 15000)) {
+                        return L"[错误] observePage 失败：" + err;
+                    }
+                    const PageSnapshot snap = ParsePageSnapshotJson(result);
+                    if (!snap.error.empty() && snap.kind == PageKind::Unknown)
+                        return L"[错误] " + snap.error;
+                    AiNotePageSnapshot(snap);
+                    // ★树可信度：titleHint 是「当前前台标签标题」（已剥窗口装饰），
+                    // 若树上标题与它明显不符，说明扩展还挂在旧标签上。此时必须保留截图走
+                    // 视觉兜底，否则模型会拿着旧页面树 + 无图地决策（实测连续 10 轮
+                    // 都意识不到前台已经换成历史记录页）。
+                    {
+                        bool trusted = true;
+                        std::wstring why;
+                        const std::wstring treeTitle = Trim(snap.title);
+                        const std::wstring wantTitle = Trim(hint);
+                        auto normTitle = [](const std::wstring& in) {
+                            std::wstring o;
+                            for (wchar_t c : in) {
+                                if (c == L' ' || c == L'\t') continue;
+                                if (c >= L'A' && c <= L'Z')
+                                    c = static_cast<wchar_t>(c - L'A' + L'a');
+                                o.push_back(c);
+                            }
+                            return o;
+                        };
+                        if (!wantTitle.empty() && !treeTitle.empty()) {
+                            const std::wstring a = normTitle(treeTitle);
+                            const std::wstring b = normTitle(wantTitle);
+                            if (a.find(b) == std::wstring::npos && b.find(a) == std::wstring::npos) {
+                                trusted = false;
+                                why = L"树「" + treeTitle + L"」≠ 前台「" + wantTitle + L"」";
+                            }
+                        }
+                        // ★前台根本不是浏览器窗口（模态对话框/桌面软件）→ 树不可能是当前画面。
+                        // 实测：另存为对话框（#32770）标题是空的，旧逻辑「标题读不出来就跳过比对」
+                        // 于是判「可信」→ 截图被剥掉 → 模型看不到保存框，卡在保存界面乱切窗。
+                        if (trusted && !AiForegroundIsBrowserWindow()) {
+                            trusted = false;
+                            wchar_t fgCls[64]{};
+                            if (HWND fgWnd = GetForegroundWindow())
+                                GetClassNameW(fgWnd, fgCls, 64);
+                            why = L"前台不是浏览器窗口（"
+                                + std::wstring(fgCls[0] ? fgCls : L"未知类") + L"），控件树已过期";
+                        }
+                        if (trusted && wantTitle.empty()) {
+                            trusted = false;
+                            why = L"前台标题读不出来，无法确认控件树是当前页";
+                        }
+                        // ★树「有标题但没用」的两种情形也必须保留截图：
+                        //  · 0 个可交互节点 → 页面多半是 canvas / 内置页 / 侧边栏，DOM 看不到内容；
+                        //  · 带 query 却 queryHits=0 → 树上没有模型要找的东西。
+                        // 不判这两条时，模型会「拿着空树 + 没有截图」盲决策：
+                        // 实测就是反复 Ctrl+H / 菜单 / 换措辞 locate 同一个目标，烧掉十几轮。
+                        if (trusted && snap.nodes.empty() && snap.kind != PageKind::Unknown) {
+                            trusted = false;
+                            why = L"控件树 0 个可交互节点（canvas/内置页/侧边栏，DOM 看不到）";
+                        }
+                        if (trusted && snap.queryHits == 0 && !snap.query.empty()) {
+                            trusted = false;
+                            why = L"树上没有「" + snap.query + L"」";
+                        }
+                        AiNotePageTreeTrusted(trusted, why);
+                        if (!trusted) {
+                            AppendAiDebugLog(L"  [诊断] ★控件树与前台标签不一致（" + why
+                                + L"）→ 保留截图走视觉兜底，勿依赖旧树");
+                        }
+                    }
+                    AppendAiDebugLog(L"  [诊断] 扩展 observePage pageKind="
+                        + std::wstring(PageKindName(snap.kind))
+                        + L" nodes=" + std::to_wstring(snap.nodes.size())
+                        + (snap.url.empty() ? L"" : (L" url=" + snap.url.substr(0,
+                            snap.url.size() > 60 ? 60 : snap.url.size()))));
+                    std::wstring body = FormatPageSnapshotForAgent(snap);
+                    // ★内置页导航核对（一次性）：上一轮 openWebpage(edge://…) 是「地址栏
+                    // Ctrl+L→输入→Enter」合成的，焦点/IME 一旦不对就会静默失败；实测模型会
+                    // 在「以为已经打开历史记录」的前提下继续决策，反复 Ctrl+H / 点菜单。
+                    // 这里直接核对树上的 URL：没到就明说，并给出可靠的替代动作。
+                    if (const std::wstring pending = AiConsumeInternalPagePendingVerify();
+                        !pending.empty()) {
+                        std::wstring treeLower = snap.url;
+                        for (auto& c : treeLower)
+                            if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+                        std::wstring wantLower = pending;
+                        for (auto& c : wantLower)
+                            if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+                        if (treeLower.rfind(wantLower, 0) != 0) {
+                            AiNotePageTreeTrusted(false,
+                                L"地址栏导航 " + pending + L" 未生效（树仍在 " + snap.url + L"）");
+                            AppendAiDebugLog(L"  [诊断] ★内置页导航未生效：期望 " + pending
+                                + L"，树仍在 " + snap.url + L" → 保留截图 + 给替代路线");
+                            body += L"\n[事实] ★openWebpage(" + pending
+                                + L") 没生效：控件树还停在 " + (snap.url.empty() ? L"(空)" : snap.url)
+                                + L"（若 URL/标题变成「… - 搜索」，说明这个 URL 被打进搜索栏了）。"
+                                  L"不要再用 Ctrl+H / Ctrl+L 重试。可靠替代："
+                                  L"runProgram(targetPath=\"edge\", inputText=\""
+                                + pending + L"\"，让浏览器自己打开)；"
+                                  L"若你要的是浏览器侧边栏/面板（DOM 看不到），"
+                                  L"用 listUiControls → invokeUiControl 或对截图 locateAndClick。";
+                        }
+                    }
+                    return body;
+                };
+                auto formatRefAction = [&](const std::string& result, const std::wstring& actionLine)
+                    -> std::wstring {
+                    const PageSnapshot snap = ParsePageSnapshotJson(result);
+                    if (!snap.error.empty() && snap.kind == PageKind::Unknown)
+                        return L"[错误] " + snap.error;
+                    const std::wstring prevUrl = AiLastPageUrl();
+                    AiNotePageSnapshot(snap);
+                    AppendAiDebugLog(L"  [诊断] 扩展 " + actionLine
+                        + L" pageKind=" + std::wstring(PageKindName(snap.kind))
+                        + L" nodes=" + std::to_wstring(snap.nodes.size()));
+                    std::wstring body = FormatPageSnapshotForAgent(snap);
+                    if (!prevUrl.empty() && !snap.url.empty()
+                        && (prevUrl == snap.url || PageUrlsSameDocument(prevUrl, snap.url))) {
+                        if (actionLine.find(L"typeRef") != std::wstring::npos) {
+                            body += L"\n[事实] 提交后地址未变。搜人/搜词请 searchOnPage(query)，勿再 keyClick(Enter)。";
+                        } else if (actionLine.find(L"clickRef") != std::wstring::npos) {
+                            body += L"\n[事实] 页面未跳转。点筛选项无效。"
+                                L"请点 href 含 space.bilibili.com 或 /video/ 的卡片（会直接打开）。";
+                        }
+                    }
+                    if (actionLine.empty()) return body;
+                    return actionLine + L"\n" + body;
+                };
+                agentHooks.onClickRef = [&](const std::wstring& ref, bool doubleClick) -> std::wstring {
+                    if (const std::wstring wait = ensureExtensionConnected(L"clickRef");
+                        !wait.empty())
+                        return wait;
+                    int sx = 0, sy = 0;
+                    std::wstring clickName;
+                    const bool havePt = AiLastSnapshotClickPoint(ref, sx, sy, clickName);
+                    std::wstring tmpl;
+                    if (AiLogicConvertSessionActive() && havePt) {
+                        qst::desktop_tools::ScopedHideOwnUiForCapture hideForLogicTmpl(
+                            UserFacingMainHwnd());
+                        tmpl = CaptureAiLogicConvertTemplateAt(sx, sy);
+                    }
+                    auto& bridge = windowmode::ExtBridgeServer::Instance();
+                    std::string extra = std::string("\"ref\":\"") + JsonEscapeUtf8(ToUtf8(ref))
+                        + "\",\"doubleClick\":" + (doubleClick ? "true" : "false");
+                    std::string result;
+                    std::wstring err;
+                    if (!bridge.Request("clickRef", extra, result, err, 15000)) {
+                        if (err.find(L"STALE") != std::wstring::npos)
+                            return L"[错误] ref 已过期，请先 observePage 再 clickRef。";
+                        return L"[错误] clickRef 失败：" + err;
+                    }
+                    if (AiLogicConvertSessionActive()) {
+                        const PageSnapshot after = ParsePageSnapshotJson(result);
+                        if (LooksLikeUserSpaceSiteUrl(after.url)
+                            && !LooksLikeWatchVideoSiteUrl(after.url)
+                            && !after.url.empty()) {
+                            AiLogicConvertNoteOpenWebpage(after.url);
+                        } else if (!tmpl.empty()) {
+                            AiLogicConvertNoteLocate(clickName.empty() ? ref : clickName,
+                                sx, sy, L"left", doubleClick ? 2 : 1, tmpl);
+                        } else if (!after.url.empty() && !LooksLikeWatchVideoSiteUrl(after.url)) {
+                            AiLogicConvertNoteOpenWebpage(after.url);
+                        }
+                    }
+                    return formatRefAction(result, L"已 clickRef(" + ref + L")，新树如下（旧 ref 作废）");
+                };
+                agentHooks.onTypeRef = [&](const std::wstring& ref, const std::wstring& text,
+                    bool clearFirst, bool submit) -> std::wstring {
+                    if (const std::wstring wait = ensureExtensionConnected(L"typeRef");
+                        !wait.empty())
+                        return wait;
+                    auto& bridge = windowmode::ExtBridgeServer::Instance();
+                    std::string extra = std::string("\"ref\":\"") + JsonEscapeUtf8(ToUtf8(ref))
+                        + "\",\"text\":\"" + JsonEscapeUtf8(ToUtf8(text))
+                        + "\",\"clearFirst\":" + (clearFirst ? "true" : "false")
+                        + ",\"submit\":" + (submit ? "true" : "false");
+                    std::string result;
+                    std::wstring err;
+                    if (!bridge.Request("typeRef", extra, result, err, 15000)) {
+                        if (err.find(L"STALE") != std::wstring::npos)
+                            return L"[错误] ref 已过期，请先 observePage 再 typeRef。";
+                        return L"[错误] typeRef 失败：" + err;
+                    }
+                    return formatRefAction(result, L"已 typeRef(" + ref + L")，新树如下（旧 ref 作废）");
+                };
+                agentHooks.onNavigatePage = [&](const std::wstring& url, const std::wstring& query)
+                    -> std::wstring {
+                    if (const std::wstring wait = ensureExtensionConnected(L"searchOnPage");
+                        !wait.empty())
+                        return wait;
+                    auto& bridge = windowmode::ExtBridgeServer::Instance();
+                    std::string extra = std::string("\"url\":\"") + JsonEscapeUtf8(ToUtf8(url))
+                        + "\"";
+                    if (!query.empty())
+                        extra += ",\"query\":\"" + JsonEscapeUtf8(ToUtf8(query)) + "\"";
+                    const std::wstring urlHint = AiLastOpenWebpageUrl();
+                    if (!urlHint.empty())
+                        extra += ",\"urlHint\":\"" + JsonEscapeUtf8(ToUtf8(urlHint)) + "\"";
+                    else if (!AiLastPageUrl().empty())
+                        extra += ",\"urlHint\":\"" + JsonEscapeUtf8(ToUtf8(AiLastPageUrl())) + "\"";
+                    std::string result;
+                    std::wstring err;
+                    if (!bridge.Request("navigatePage", extra, result, err, 20000)) {
+                        return L"[错误] searchOnPage 失败：" + err;
+                    }
+                    const PageSnapshot snap = ParsePageSnapshotJson(result);
+                    if (!snap.error.empty() && snap.kind == PageKind::Unknown)
+                        return L"[错误] " + snap.error;
+                    AiNotePageSnapshot(snap);
+                    // 导航是宿主显式发起并已切到目标标签，树必然对应前台 → 重置可信度
+                    AiNotePageTreeTrusted(true);
+                    if (snap.url.empty())
+                        AiNotePageUrl(url);
+                    AppendAiDebugLog(L"  [诊断] 扩展 navigatePage pageKind="
+                        + std::wstring(PageKindName(snap.kind))
+                        + L" nodes=" + std::to_wstring(snap.nodes.size())
+                        + (snap.url.empty() ? L"" : (L" url=" + snap.url.substr(0,
+                            snap.url.size() > 60 ? 60 : snap.url.size()))));
+                    return FormatPageSnapshotForAgent(snap);
+                };
+                // ── 浏览器 DOM 优先点击（配套扩展针对性优化）───────────────────
+                // 「点击 X」类目标在网页上先按控件名问扩展要树：名字命中就直接 clickRef
+                // 精确点击——不截屏、不上传识图（省 1~2 轮 VLM），也不会点到相邻像素。
+                // 仅当「扩展已连接 + 前台确像浏览器 + 非 canvas 页」才尝试；任何一步不满足
+                // 都立刻回落到下面的识图管线，行为与改动前一致。对齐 Midscene「DOM 优先、
+                // 视觉兜底」与 Stagehand 单次 act(prompt) 的原语设计。
+                auto tryDomClickViaExtension = [&](const std::wstring& targetDesc,
+                    bool doubleClick, bool rightButton, std::wstring& outWhy) -> std::wstring {
+                    outWhy.clear();
+                    std::wstring fgTitle;
+                    if (HWND fg = GetForegroundWindow()) {
+                        wchar_t buf[512]{};
+                        GetWindowTextW(fg, buf, 512);
+                        fgTitle = buf;
+                    }
+                    // 门禁集中判定（可自检）：判错会点到别的窗口，是准确度关键路径
+                    DomFirstActionGateInput gate;
+                    gate.extensionConnected =
+                        windowmode::ExtBridgeServer::Instance().IsExtensionConnected();
+                    gate.hasDomHooks = agentHooks.onObservePage && agentHooks.onClickRef;
+                    gate.pageIsCanvas = AiPageKindIsCanvas();
+                    gate.foregroundLooksBrowser = LooksLikeBrowserWindowTitle(fgTitle)
+                        || AiForegroundIsBrowserWindow();
+                    // 标题读不出来（模态对话框标题常为空）时不能放行 —— 看窗口类
+                    gate.foregroundBrowserClass = ForegroundWindowIsBrowserClass();
+                    gate.webSessionActive = AiWebBrowseSessionActive();
+                    gate.foregroundTitleReadable = !fgTitle.empty();
+                    gate.rightButton = rightButton;
+                    if (!ShouldUseDomFirstAction(gate, &outWhy)) return {};
+                    const std::wstring keyword = PageSnapshotTargetKeyword(targetDesc);
+                    const std::wstring tree = agentHooks.onObservePage(false, fgTitle, keyword);
+                    if (tree.rfind(L"[错误]", 0) == 0) {
+                        outWhy = L"observePage 失败";
+                        return {};
+                    }
+                    const PageSnapshot snap = AiLastPageSnapshot();
+                    const PageSnapshotPick pick = PickPageSnapshotRefForText(snap, targetDesc);
+                    if (pick.ref.empty()) {
+                        outWhy = L"树上名字无可信命中";
+                        return {};
+                    }
+                    if (pick.ambiguous) {
+                        outWhy = L"树上命中歧义(候选 "
+                            + std::to_wstring(pick.candidates) + L" 项)";
+                        return {};
+                    }
+                    AppendAiDebugLog(L"  [诊断] DOM 优先：树上命中「" + pick.name + L"」["
+                        + pick.role + L" " + pick.ref + L"] score="
+                        + std::to_wstring(pick.score)
+                        + L"（同名前 " + std::to_wstring(pick.sameNameCount)
+                        + L" 项）→ clickRef，省整屏截图+识图");
+                    const std::wstring clicked = agentHooks.onClickRef(pick.ref, doubleClick);
+                    if (clicked.rfind(L"[错误]", 0) == 0) {
+                        outWhy = L"clickRef 失败";
+                        return {};
+                    }
+                    const PageSnapshot after = AiLastPageSnapshot();
+                    std::wstring brief;
+                    int shown = 0;
+                    for (const auto& n : after.nodes) {
+                        if (n.ref.empty() || Trim(n.name).empty()) continue;
+                        if (!brief.empty()) brief += L"; ";
+                        brief += n.role.empty() ? L"generic" : n.role;
+                        brief += L" \"" + Trim(n.name) + L"\" [" + n.ref + L"]";
+                        if (++shown >= 6) break;
+                    }
+                    std::wstring head = L"locateAndClick 已按控件树点击「" + Trim(pick.name)
+                        + L"」(" + pick.ref + L"，DOM 精确点击，未截屏/未识图)";
+                    if (!after.url.empty() || !after.title.empty()) {
+                        head += L"\n新页面：" + (after.title.empty() ? L"(无标题)" : after.title);
+                        if (!after.url.empty()) head += L" | " + after.url;
+                    }
+                    if (!brief.empty()) head += L"\n树上前几项：" + brief;
+                    return head;
+                };
+                // ── 桌面 UIA 优先点击（第三基底；不烧 vision token）─────────────
+                // 对齐微软 UFO：枚举前台窗口的可交互控件 → 按名字选中 → 校验后
+                // InvokePattern 触发（不可 Invoke 时才点矩形中心）。命中即省掉整屏截图
+                // + 1~2 轮 VLM。仅左键单击、非窗口模式、前台不是浏览器/自己时尝试；
+                // 任何一步不满足都回落识图，行为与改动前一致。
+                auto tryUiaClickFirst = [&](const std::wstring& targetDesc,
+                    std::wstring& outWhy) -> std::wstring {
+                    outWhy.clear();
+                    HWND fg = GetForegroundWindow();
+                    if (!fg || !IsWindow(fg)) {
+                        outWhy = L"无前台窗口";
+                        return {};
+                    }
+                    const HWND fgRoot = GetAncestor(fg, GA_ROOT);
+                    const HWND own = UserFacingMainHwnd();
+                    if (own && fgRoot && fgRoot == GetAncestor(own, GA_ROOT)) {
+                        outWhy = L"前台是本软件窗口";
+                        return {};
+                    }
+                    wchar_t titleBuf[512]{};
+                    GetWindowTextW(fg, titleBuf, 512);
+                    // 注意：**不要**因为「前台是浏览器」就跳过 UIA。浏览器的扩展可访问性树
+                    // 只覆盖网页内容，覆盖不到浏览器外壳（地址栏、标签、「…」菜单、菜单项）；
+                    // 而这些恰恰在 UIA 里有准确名字。DOM 路径已经先试过并失败了，这里必须继续试。
+                    const auto items = windowmode::ListInteractiveUiControls(fg, 60);
+                    if (items.empty()) {
+                        outWhy = L"UIA 未枚举到可交互控件";
+                        return {};
+                    }
+                    bool ambiguous = false;
+                    const int pickIdx = windowmode::PickUiControlByName(items, targetDesc, &ambiguous);
+                    if (pickIdx < 0) {
+                        outWhy = L"UIA 控件名无可信命中";
+                        return {};
+                    }
+                    if (ambiguous) {
+                        outWhy = L"UIA 命中歧义（近似竞争项）";
+                        return {};
+                    }
+                    const windowmode::UiControlInfo& hit =
+                        items[static_cast<size_t>(pickIdx)];
+                    if (!hit.enabled) {
+                        // 原来要先识图定位、再 UIA 探测才发现是灰控件；现在提前一轮拦掉
+                        if (const std::wstring memo = hit.name; !memo.empty())
+                            AppendAiTaskMemoLine(L"blocked: disabled " + memo);
+                        return L"[错误] 目标「" + targetDesc + L"」当前是灰色不可用状态"
+                            L"（UIA 控件名：「" + hit.name + L"」），点击已被拦截。"
+                            L"灰掉=前置条件没满足，不是位置点错：先修正输入/必填项再提交。";
+                    }
+                    std::wstring actualName;
+                    std::wstring warn;
+                    int actualId = 0;
+                    RECT rc{};
+                    bool invoked = false;
+                    if (!windowmode::InvokeUiControlByName(hit.name, hit.id, actualName,
+                            actualId, rc, invoked, warn)) {
+                        outWhy = L"UIA 元素已失效（界面可能刚变）";
+                        return {};
+                    }
+                    const int cx = (rc.left + rc.right) / 2;
+                    const int cy = (rc.top + rc.bottom) / 2;
+                    AppendAiDebugLog(L"  [诊断] UIA 优先：命中「" + actualName + L"」["
+                        + hit.controlType + L" id=" + std::to_wstring(actualId) + L"]"
+                        + (invoked ? L" → InvokePattern" : L" → 点矩形中心")
+                        + L"（未整屏截图/未识图）"
+                        + (warn.empty() ? L"" : (L"；" + warn)));
+                    if (!invoked) {
+                        // 无 InvokePattern 的控件（列表项/树项）：仍是点中心，但按 UIA
+                        // 矩形而不是像素猜测；同屏重复点击守卫照旧生效
+                        if (const std::wstring dup = notePointerClick(cx, cy, true);
+                            !dup.empty()) {
+                            return dup;
+                        }
+                        parkCursorAwayFromUi();
+                        const std::wstring clickJson =
+                            BuildScreenClickActionsJson(cx, cy, false, L"left", 1);
+                        (void)executeActionsJsonNow(clickJson);
+                    }
+                    std::wstring out = L"locateAndClick 已按 UIA 控件「" + actualName + L"」"
+                        + (invoked ? L"触发（InvokePattern，未打像素）" : L"点击控件中心")
+                        + L" 屏幕(" + std::to_wstring(cx) + L"," + std::to_wstring(cy) + L")"
+                        + L"（UIA 精确命中，未截屏/未识图）";
+                    if (!warn.empty()) out += L"\n[警告] " + warn;
+                    return out;
+                };
+                agentHooks.onListUiControls = [&](int maxCount) -> std::wstring {
+                    HWND fg = GetForegroundWindow();
+                    if (!fg || !IsWindow(fg)) return L"[错误] 没有前台窗口。";
+                    wchar_t titleBuf[512]{};
+                    GetWindowTextW(fg, titleBuf, 512);
+                    const auto items = windowmode::ListInteractiveUiControls(fg, maxCount);
+                    if (items.empty()) {
+                        return L"[错误] 前台窗口「" + std::wstring(titleBuf)
+                            + L"」UIA 枚举不到可交互控件（自绘界面/游戏/未实现 UIA）。"
+                              L"网页内容请用 observePage/clickRef；"
+                              L"自绘界面请改用 locateAndClick 识图点击。";
+                    }
+                    AppendAiDebugLog(L"  [诊断] listUiControls: 前台「"
+                        + std::wstring(titleBuf) + L"」枚举到 "
+                        + std::to_wstring(items.size()) + L" 个可交互控件（未截屏）");
+                    std::wstring out = L"前台窗口：" + std::wstring(titleBuf) + L"\n";
+                    out += windowmode::FormatUiControlListForAgent(items, 2000);
+                    if (LooksLikeBrowserWindowTitle(titleBuf)) {
+                        out += L"（浏览器：这里只有外壳控件——地址栏/标签/菜单；"
+                               L"网页里的按钮请用 observePage/clickRef）\n";
+                    }
+                    out += L"用法：invokeUiControl(id=编号, name=\"名字\")；编号可能因界面变化"
+                           L"错位，name 必须以这里列出的为准。";
+                    return out;
+                };
+                agentHooks.onInvokeUiControl = [&](int id, const std::wstring& name,
+                    bool observeAfter) -> std::wstring {
+                    std::wstring actualName;
+                    std::wstring warn;
+                    int actualId = 0;
+                    RECT rc{};
+                    bool invoked = false;
+                    if (!windowmode::InvokeUiControlByName(name, id, actualName, actualId, rc,
+                            invoked, warn)) {
+                        // 别只回「找不到」——那会逼模型再花一轮 listUiControls。
+                        // 直接把最接近的候选名字带回去（模型常从对话框探测文本里抄名字，
+                        // 例如把 Win32 按钮文本「保存(&S)」当成 UIA 名）。
+                        const auto items = windowmode::ListInteractiveUiControls(
+                            GetForegroundWindow(), 60);
+                        std::wstring cands;
+                        int shown = 0;
+                        const wchar_t first = name.empty() ? 0 : name[0];
+                        for (const auto& it : items) {
+                            if (shown >= 6) break;
+                            if (it.name.empty()) continue;
+                            const bool sameStart = first && it.name[0] == first;
+                            const bool contains = name.size() >= 2
+                                && it.name.find(name.substr(0, 2)) != std::wstring::npos;
+                            if (!sameStart && !contains) continue;
+                            if (!cands.empty()) cands += L" / ";
+                            cands += L"「" + it.name + L"」";
+                            ++shown;
+                        }
+                        std::wstring out = L"[错误] 前台窗口里找不到名字像「" + name
+                            + L"」的可交互控件（界面可能已变）。";
+                        if (!cands.empty()) out += L"\n最接近的候选：" + cands + L"（按台账原样传名）";
+                        else out += L"\n台账里没有相近名字：请 listUiControls 看准确名字。";
+                        out += L"\n若你要的是输入框/标签文字（如「文件名:」）：台账只列按钮/菜单/输入类控件，"
+                               L"填内容请直接在焦点框 quickInput，别用本工具。";
+                        return out;
+                    }
+                    const int cx = (rc.left + rc.right) / 2;
+                    const int cy = (rc.top + rc.bottom) / 2;
+                    std::wstring how;
+                    if (invoked) {
+                        how = L"InvokePattern 触发（未打像素）";
+                    } else {
+                        if (const std::wstring dup = notePointerClick(cx, cy, true);
+                            !dup.empty()) {
+                            return dup;
+                        }
+                        parkCursorAwayFromUi();
+                        const std::wstring clickJson =
+                            BuildScreenClickActionsJson(cx, cy, false, L"left", 1);
+                        const std::wstring execMsg = executeActionsJsonNow(clickJson);
+                        how = L"点击控件中心";
+                        if (execMsg.rfind(L"[错误]", 0) == 0) return execMsg;
+                    }
+                    AppendAiDebugLog(L"  [诊断] invokeUiControl:「" + actualName + L"」id="
+                        + std::to_wstring(actualId) + L" → " + how
+                        + (warn.empty() ? L"" : (L"（" + warn + L"）")));
+                    (void)observeAfter;  // 标记由工具层按调用参数补（宿主只回纯文本）
+                    std::wstring out = L"invokeUiControl 已触发「"
+                        + actualName + L"」(id=" + std::to_wstring(actualId) + L"，" + how
+                        + L") 屏幕(" + std::to_wstring(cx) + L"," + std::to_wstring(cy) + L")";
+                    if (!warn.empty()) out += L"\n[警告] " + warn;
+                    return out;
+                };
+                std::function<std::wstring(const std::wstring&, int, const std::wstring&, int)>
+                    locateAndClickFn = nullptr;
+                // 布局记忆用：最近一次真识图定位到的屏幕框（网格推断的锚点）
+                AiUiLayoutRect lastLocateScreenRect{};
+                auto MakeAiUiLayoutKey = [](const std::wstring& targetDesc) -> AiUiLayoutKey {
+                    AiUiLayoutKey k;
+                    // ★键必须保真：不做「去掉按钮后缀/折叠」这类模糊归一 ——
+                    // 实测「一键全选」命中了「自选僵尸卡牌」的坐标（把选卡面板点关了）。
+                    // 措辞不同就当作新目标（miss 只是多识图一次，安全；错命中会点错东西）。
+                    std::wstring t = Trim(targetDesc);
+                    for (auto& c : t) {
+                        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+                    }
+                    if (t.empty()) return k;
+                    HWND fg = GetForegroundWindow();
+                    if (!fg) return k;
+                    k.target = t;
+                    k.windowIdentity = AiUiWindowIdentityForLayout(fg);
+                    int sx = 0, sy = 0, sw = 0, sh = 0;
+                    GetVirtualScreenRect(sx, sy, sw, sh);
+                    k.screenW = sw;
+                    k.screenH = sh;
+                    return k;
+                };
+                locateAndClickFn =
+                    [&](const std::wstring& targetDesc, int refineLevels,
+                        const std::wstring& button, int clickCount) -> std::wstring {
                     LocateAndClickNestGuard locateGuard;
                     if (!locateGuard.entered()) {
                         return L"[错误] locateAndClick 不可嵌套（防无限外包定位）。";
                     }
-                    // 整段定位+点击期间藏壳/调试窗（含 Zoom 二次截屏）
+                    // 这个目标本次运行被点过几次（1 = 一次性目标：不做复用缓存/记忆）
+                    const int targetSeenCount = NoteLocateTargetSeen(targetDesc);
+                    const bool reusableTarget = targetSeenCount >= 2;
+                    // ★布局记忆：这个界面上「这个目标」之前定位成功过 → 直接用旧坐标，
+                    // 0 次识图（Midscene caching / UiPath Object Repository 的同类做法）。
+                    // 键含窗口身份+屏幕尺寸：换窗/挪窗/改分辨率自动作废。
+                    const AiUiLayoutKey layoutKey = MakeAiUiLayoutKey(targetDesc);
+                    if (AiFastPathsEnabled() && !layoutKey.empty() && clickCount == 1) {
+                        AiUiLayoutRect mem{};
+                        if (AiUiLayoutRecall(layoutKey, mem)) {
+                            // ★命中前硬校验（「点错按钮」的闸）：用当前画面重算外观签名，
+                            // 对不上说明界面已经变了（面板关了/换页/换内容）→ 回退真识图，绝不盲点。
+                            bool sigOk = true;
+                            {
+                                int rx1 = 0, ry1 = 0, rx2 = 0, ry2 = 0;
+                                if (resolveAiRegion(rx1, ry1, rx2, ry2)) {
+                                    HBITMAP vf = captureAiRegionBmp(rx1, ry1, rx2, ry2);
+                                    std::vector<uint8_t> gb;
+                                    int gw = 0, gh = 0, gs = 0;
+                                    if (vf && AiUiBitmapToGrayBytes(vf, gb, gw, gh, gs)) {
+                                        uint8_t sig[kAiUiSigN * kAiUiSigN]{};
+                                        const AiUiLayoutRect boxInFrame{ mem.x1 - rx1, mem.y1 - ry1,
+                                            mem.x2 - rx1, mem.y2 - ry1 };
+                                        if (AiUiLayoutSignature(gb.data(), gw, gh, gs, boxInFrame, sig))
+                                            sigOk = AiUiLayoutSignatureMatches(layoutKey, sig);
+                                    }
+                                    if (vf) DeleteBitmapHandle(vf);
+                                }
+                            }
+                            if (!sigOk) {
+                                AppendAiDebugLog(L"  [诊断] 布局记忆命中但外观校验不通过（界面变了）"
+                                    L"→ 回退真识图");
+                                AiUiLayoutNoteClickNoEffect(layoutKey);
+                            } else {
+                            const std::wstring clickJson = BuildScreenClickActionsJson(
+                                mem.cx(), mem.cy(), false, button, clickCount);
+                            const std::wstring execMsg = executeActionsJsonNow(clickJson);
+                            AppendAiDebugLog(L"  [诊断] 布局记忆命中：「"
+                                + TruncLog(targetDesc, 16) + L"」→ 屏幕("
+                                + std::to_wstring(mem.cx()) + L"," + std::to_wstring(mem.cy())
+                                + L")，省一次识图");
+                            lastLocateScreenRect = mem;
+                            std::wstring out = L"locateAndClick 已点击"
+                                + DescribeClickPointForModel(mem.cx(), mem.cy())
+                                + L"（布局记忆命中：这个界面上该目标位置没变，未重新识图）";
+                            if (!execMsg.empty()) out += L"；" + execMsg;
+                            return out;
+                            }
+                        }
+                    }
+                    // 网页左键：先试 DOM（右键门禁在 ShouldUseDomFirstAction 里挡住）
+                    if (button != L"right") {
+                        std::wstring why;
+                        const std::wstring domMsg = tryDomClickViaExtension(
+                            targetDesc, clickCount >= 2, false, why);
+                        if (!domMsg.empty()) return domMsg;
+                        AppendAiDebugLog(L"  [诊断] DOM 优先未命中（" + why + L"），试 UIA");
+                        // 桌面：DOM 不适用，再试 UIA（同样不烧 vision token）
+                        if (clickCount <= 1 && !wmUsesTarget()) {
+                            std::wstring uiaWhy;
+                            const std::wstring uiaMsg = tryUiaClickFirst(targetDesc, uiaWhy);
+                            if (!uiaMsg.empty()) return uiaMsg;
+                            AppendAiDebugLog(L"  [诊断] UIA 优先未命中（" + uiaWhy
+                                + L"），回落识图定位");
+                        }
+                    }
+                    // 整段定位+点击期间藏壳/调试窗（含 Zoom 二次截屏、缓存模板裁剪）
                     qst::desktop_tools::ScopedHideOwnUiForCapture hideOwn(UserFacingMainHwnd());
+                    // ── 定位缓存（第三档加速）：同一目标在循环里反复点时，
+                    // 屏幕没动就不该再烧一次 VLM。命中条件很严（窗口键一致 + 模板高分 +
+                    // 唯一命中 + 距缓存点不远），且点击后画面没变就立刻作废这条缓存。
+                    AiLocateCacheKey cacheKey;
+                    cacheKey.target = AiLocateNormalizeTarget(targetDesc);
+                    cacheKey.captureW = liveMap.capX2 - liveMap.capX1;
+                    cacheKey.captureH = liveMap.capY2 - liveMap.capY1;
+                    {
+                        HWND fgWnd = GetForegroundWindow();
+                        if (fgWnd) {
+                            wchar_t tbuf[512]{};
+                            GetWindowTextW(fgWnd, tbuf, 512);
+                            cacheKey.windowTitle = tbuf;
+                            wchar_t cbuf[128]{};
+                            GetClassNameW(fgWnd, cbuf, 128);
+                            cacheKey.windowClass = cbuf;
+                        }
+                    }
+                    bool usedLocateCache = false;
+                    int cachedX = 0;
+                    int cachedY = 0;
+                    AiLocateCacheEntry cacheEntry;
+                    if (clickCount <= 1 && !wmUsesTarget()
+                        && AiLocateCacheLookup(cacheKey, &cacheEntry)) {
+                        // ★窗口位移重锚：窗口被拖动/移动（窗口化游戏、用户拖窗）后，
+                        // 模板仍在窗口内同一相对位置；按窗口矩形差把期望点挪过去，
+                        // 否则「距缓存点太远」会把完全可用的缓存判掉、白回一次识图。
+                        RECT fgRectNow{};
+                        bool haveFgRectNow = false;
+                        if (HWND fgNow = GetForegroundWindow()) {
+                            if (GetWindowRect(fgNow, &fgRectNow)) haveFgRectNow = true;
+                        }
+                        int expectX = cacheEntry.screenX;
+                        int expectY = cacheEntry.screenY;
+                        if (cacheEntry.hasWindowRect && haveFgRectNow) {
+                            const int moved = std::abs(fgRectNow.left - cacheEntry.windowRect.left)
+                                + std::abs(fgRectNow.top - cacheEntry.windowRect.top);
+                            if (moved > 0) {
+                                AiLocateCacheReanchor(cacheEntry.screenX, cacheEntry.screenY,
+                                    cacheEntry.windowRect, fgRectNow, &expectX, &expectY);
+                                AppendAiDebugLog(L"  [诊断] 定位缓存按窗口位移重锚：("
+                                    + std::to_wstring(cacheEntry.screenX) + L","
+                                    + std::to_wstring(cacheEntry.screenY) + L") → ("
+                                    + std::to_wstring(expectX) + L"," + std::to_wstring(expectY)
+                                    + L") 位移 " + std::to_wstring(moved) + L"px");
+                            }
+                        }
+                        // 只在期望点周围一小片搜（模板匹配够用且不会被同屏相似控件带偏）
+                        const int half = 200;
+                        const int sx1 = (std::max)(liveMap.capX1, expectX - half);
+                        const int sy1 = (std::max)(liveMap.capY1, expectY - half);
+                        const int sx2 = (std::min)(liveMap.capX2, expectX + half);
+                        const int sy2 = (std::min)(liveMap.capY2, expectY + half);
+                        if (sx2 - sx1 >= 16 && sy2 - sy1 >= 16) {
+                            ImageMatchOptions mopt;
+                            mopt.thresholdPercent = 90.0;
+                            mopt.scaleMin = 0.97;
+                            mopt.scaleMax = 1.03;
+                            mopt.scaleStep = 0.03;
+                            mopt.disablePyramid = true;
+                            mopt.maxMatches = 6;
+                            // 单帧采样：返回最佳分/次佳分/与期望点的距离
+                            auto sampleCache = [&](AiLocateCacheAcceptInput* outAcc,
+                                                   int* outX, int* outY) {
+                                const ImageMatchOutput mo = FindTemplateOnScreenMulti(
+                                    sx1, sy1, sx2, sy2, cacheEntry.tmpl, mopt);
+                                AiLocateCacheAcceptInput acc;
+                                acc.bestScore = -1.0;
+                                int bx = 0, by = 0;
+                                for (const auto& m : mo.matches) {
+                                    if (!m.found) continue;
+                                    int mx = 0, my = 0;
+                                    FindImageMatchCenter(m, mx, my);
+                                    const int dx = mx - expectX;
+                                    const int dy = my - expectY;
+                                    const int dist = static_cast<int>(
+                                        std::sqrt(static_cast<double>(dx) * dx
+                                            + static_cast<double>(dy) * dy) + 0.5);
+                                    if (m.score > acc.bestScore) {
+                                        acc.secondScore = acc.bestScore;
+                                        acc.secondDistToCached = acc.bestDistToCached;
+                                        acc.bestScore = m.score;
+                                        acc.bestDistToCached = dist;
+                                        bx = mx;
+                                        by = my;
+                                    } else if (m.score > acc.secondScore) {
+                                        acc.secondScore = m.score;
+                                        acc.secondDistToCached = dist;
+                                    }
+                                }
+                                if (outAcc) *outAcc = acc;
+                                if (outX) *outX = bx;
+                                if (outY) *outY = by;
+                            };
+                            // ★N-of-M 迟滞：实测单帧检测在 60~70% 摆动（最低 40%），
+                            // 「保留多数帧都出现的目标」后稳定率 80~100%。画面在动
+                            // （游戏/视频/滚动）时单帧就点极易点在残影上，多花两次
+                            // 毫秒级小区域匹配非常划算。
+                            constexpr int kCacheSamples = 3;
+                            constexpr int kCacheNeedPass = 2;
+                            int passCount = 0;
+                            AiLocateCacheAcceptInput accept;
+                            accept.bestScore = -1.0;
+                            int lastGoodX = 0, lastGoodY = 0;
+                            double bestPassScore = -1.0;
+                            for (int s = 0; s < kCacheSamples; ++s) {
+                                if (s > 0) Sleep(45);
+                                AiLocateCacheAcceptInput acc;
+                                int bx = 0, by = 0;
+                                sampleCache(&acc, &bx, &by);
+                                if (acc.bestScore >= 0 && ShouldAcceptAiLocateCacheHit(acc)) {
+                                    ++passCount;
+                                    cachedX = bx;
+                                    cachedY = by;
+                                    if (acc.bestScore > bestPassScore) {
+                                        bestPassScore = acc.bestScore;
+                                        accept = acc;
+                                    }
+                                } else if (acc.bestScore >= 0) {
+                                    // 留一份「没通过门槛」的样本用于日志
+                                    if (accept.bestScore < 0) accept = acc;
+                                }
+                            }
+                            // 后续日志/判定统一用「通过次数」口径
+                            if (passCount > 0) {
+                                accept.bestScore = bestPassScore;
+                                cachedX = lastGoodX;
+                                cachedY = lastGoodY;
+                            }
+                            if (ShouldAcceptAiLocateCacheHitHysteresis(passCount, kCacheSamples,
+                                    kCacheNeedPass, kCacheSamples)) {
+                                usedLocateCache = true;
+                                AiLocateCacheNoteHit(cacheKey);
+                                AppendAiDebugLog(L"  [诊断] 定位缓存命中：屏幕("
+                                    + std::to_wstring(cachedX) + L","
+                                    + std::to_wstring(cachedY) + L") 匹配 "
+                                    + std::to_wstring(static_cast<int>(accept.bestScore + 0.5))
+                                    + L"% 偏差 " + std::to_wstring(accept.bestDistToCached)
+                                    + L"px；迟滞 " + std::to_wstring(passCount) + L"/"
+                                    + std::to_wstring(kCacheSamples) + L" 帧一致（省一次识图）");
+                            } else if (passCount > 0) {
+                                AppendAiDebugLog(L"  [诊断] 定位缓存抖动："
+                                    + std::to_wstring(passCount) + L"/"
+                                    + std::to_wstring(kCacheSamples)
+                                    + L" 帧才命中（画面在动）→ 不打缓存点，回识图");
+                                AiLocateCacheInvalidate(cacheKey);
+                            } else if (accept.bestScore >= 0) {
+                                AppendAiDebugLog(L"  [诊断] 定位缓存未通过门槛（最佳 "
+                                    + std::to_wstring(static_cast<int>(accept.bestScore + 0.5))
+                                    + L"% / 次佳 "
+                                    + std::to_wstring(static_cast<int>(accept.secondScore + 0.5))
+                                    + L"%），回落识图");
+                            } else {
+                                AppendAiDebugLog(L"  [诊断] 定位缓存未命中模板，回落识图");
+                            }
+                        }
+                    }
+                    // ── 错点自纠（备用项，用户提出）────────────────────────────────
+                    // 场景：点下去**没有任何变化证据** → 那一点就是**已知的错点**。
+                    // 这正是 PrecisionCUA 红叉闭环需要的锚点，而且不必动真光标：把红叉画在
+                    // **放大图**上（本机 GDI，<1ms），让识图子模型对着红叉重新给出目标的绝对坐标，
+                    // 然后补点一次。比让主模型重看整屏便宜（省一整轮 10~40s），也躲开
+                    // 「反复给出同一个错坐标」（Attentional Fixation, MEGA-GUI 记录的失败模式）。
+                    // 与「真光标伺服」的差别：不动用户桌面、不触发 hover、不要求 32px 光标
+                    // 在 960 宽的下采样图里还被认出来（那个方案唯一开源实现实测退步 15pp）。
+                    auto tryMissSelfCorrect = [&](const std::wstring& target, int failedX,
+                                                  int failedY, std::wstring* outWhy) -> std::wstring {
+                        if (outWhy) outWhy->clear();
+                        auto bail = [&](const wchar_t* why) -> std::wstring {
+                            if (outWhy) *outWhy = why;
+                            return {};
+                        };
+                        const std::wstring visionModel = ResolveVisionSubtaskModelName(
+                            appSettings_.ai, effModel);
+                        const std::wstring model = visionModel.empty() ? effModel : visionModel;
+                        if (!ModelSupportsVision(model)) return bail(L"无多模态模型可用");
+                        // 裁「错点附近」的放大图（±260px，含容错），画上红叉
+                        const int half = 260;
+                        const int rx1 = failedX - half;
+                        const int ry1 = failedY - half;
+                        const int rx2 = failedX + half;
+                        const int ry2 = failedY + half;
+                        HBITMAP shot = CaptureScreenRegion(rx1, ry1, rx2, ry2);
+                        if (!shot) return bail(L"局部截图失败");
+                        DrawPredictionCrossOnBitmap(shot, failedX - rx1, failedY - ry1, 22, 4);
+                        const AiImageEncodeResult enc = EncodeBitmapForAiZoomUpload(shot, 768);
+                        DeleteBitmapHandle(shot);
+                        if (enc.base64.empty()) return bail(L"局部编码失败");
+                        auto coreOk = ModelSupportsVision(model);
+                        if (!coreOk) return bail(L"无多模态模型可用");
+                        const std::wstring prompt = BuildMissSelfCorrectPrompt(
+                            target, enc.outWidth, enc.outHeight, failedX, failedY);
+                        const AiActionResult vr = RunAiOneShotVisionQuery(model,
+                            appSettings_.ai.savedModels, appSettings_.ai.apiUrl,
+                            appSettings_.ai.apiKey,
+                            BuildAiActionVisionQuerySystemPrompt(enc.outWidth, enc.outHeight),
+                            prompt, enc.base64,
+                            ResolveAiLocateVisionTimeoutSec(eff.aiTimeoutSec) * 1000,
+                            stopFlag_, &aiHttpAbort_);
+                        if (!vr.ok) return bail(L"自纠识图失败");
+                        if (IsVisionLocateNotFound(vr.textResult)) {
+                            return bail(L"自纠识图也判定目标不在画面内");
+                        }
+                        int ax = 0, ay = 0;
+                        if (!TryParseCoordinatePair(vr.textResult, ax, ay)) {
+                            return bail(L"自纠识图未给出坐标");
+                        }
+                        // 归一化 → 屏幕（本图就是裁切区，一一对应）
+                        const int sw = (std::max)(1, rx2 - rx1);
+                        const int sh = (std::max)(1, ry2 - ry1);
+                        const int nx = rx1 + std::clamp(ax, 0, 1000) * sw / 1000;
+                        const int ny = ry1 + std::clamp(ay, 0, 1000) * sh / 1000;
+                        const int dx = nx - failedX;
+                        const int dy = ny - failedY;
+                        // 与错点几乎重合 → 没有新信息，别白点第二下
+                        if (std::abs(dx) < 24 && std::abs(dy) < 24) {
+                            return bail(L"自纠点与原错点几乎重合（无新信息）");
+                        }
+                        // 遮挡/前台/重复点守卫，与主链路同一套
+                        if (!wmUsesTarget()
+                            && !windowmode::IsScreenPointOnForegroundWindow(nx, ny)) {
+                            return bail(L"自纠点不在前台窗口上");
+                        }
+                        if (!notePointerClick(nx, ny, true).empty()) {
+                            return bail(L"自纠点命中重复点击守卫");
+                        }
+                        parkCursorAwayFromUi();
+                        const std::wstring fixMsg = executeActionsJsonNow(
+                            BuildScreenClickActionsJson(nx, ny, false, L"left", 1));
+                        AppendAiDebugLog(L"  [诊断] 错点自纠：红叉="
+                            + std::to_wstring(failedX) + L"," + std::to_wstring(failedY)
+                            + L" → 识图给出 " + std::to_wstring(nx) + L"," + std::to_wstring(ny)
+                            + L"（差 " + std::to_wstring(dx) + L"," + std::to_wstring(dy)
+                            + L"px），已补点一次");
+                        return L"；★第一次点" + DescribeClickPointForModel(failedX, failedY)
+                            + L"没有任何反应；宿主已把该点当红叉让识图子模型重新定位，"
+                              L"并补点在" + DescribeClickPointForModel(nx, ny) + L"（差 "
+                            + std::to_wstring(dx) + L"," + std::to_wstring(dy)
+                            + L"px）。请用本轮截图核对结果；仍不对就换更具体的短标签，"
+                              L"**不要**再重复这两个坐标";
+                    };
+
+                    // 视觉兜底：缓存命中时整段跳过（不截屏、不建识图客户端、不调 API）
+                    AiLocateVerdict locateVerdict = AiLocateVerdict::Suspect;
+                    std::wstring locateVerdictWhy;
+                    // ── 「文字定位」共用探针：在 (px,py) 附近裁一小块**现场重新识别** ──
+                    // 返回 true 时把目标文字的真实框中心写进 (outX,outY)。
+                    // 两个用途：① 文字直点的候选点复核（索引可能已过期）；② 识图之后的坐标覆盖
+                    // （本地 OCR 读的是文字像素，比 VLM 的粗框准 —— 实测粗框低了 63px 直接射失）。
+                    auto ocrProbeText = [&](const std::wstring& wantText, int px, int py,
+                                            int halfW, int halfH,
+                                            int* outX, int* outY, std::wstring* outNote) -> bool {
+                        if (outX) *outX = px;
+                        if (outY) *outY = py;
+                        if (CheckOcrEnvironment(false).state != OcrEnvState::Ready) {
+                            if (outNote) *outNote = L"未安装文字识别引擎";
+                            return false;
+                        }
+                        const int pad = 10;
+                        const int rx1 = px - halfW - pad;
+                        const int ry1 = py - halfH - pad;
+                        const int rx2 = px + halfW + pad;
+                        const int ry2 = py + halfH + pad;
+                        HBITMAP region = CaptureScreenRegion(rx1, ry1, rx2, ry2);
+                        if (!region) {
+                            if (outNote) *outNote = L"局部截图失败";
+                            return false;
+                        }
+                        holdOcrSession();
+                        const OcrEngineOutput probe = RunOcrOnBitmap(region, rx1, ry1, false);
+                        DeleteBitmapHandle(region);
+                        if (!probe.success || probe.lines.empty()) {
+                            if (outNote) *outNote = L"局部没认到任何文字";
+                            return false;
+                        }
+                        // 最近的同名文字（探针框很小，等价于「就是它」）；不做模糊匹配
+                        AiOcrDirectHit ph;
+                        const int w = rx2 - rx1, h = ry2 - ry1;
+                        if (!AiOcrPickNearestText(probe.lines, wantText, px, py,
+                                (std::max)(w, h), w, h, &ph)) {
+                            if (outNote) *outNote = ph.why.empty()
+                                ? (L"局部没读到「" + wantText + L"」") : ph.why;
+                            return false;
+                        }
+                        if (outX) *outX = ph.screenX;
+                        if (outY) *outY = ph.screenY;
+                        if (outNote) {
+                            *outNote = L"局部复核确认「" + ph.hitText + L"」("
+                                + std::to_wstring(ph.screenX) + L","
+                                + std::to_wstring(ph.screenY) + L")";
+                        }
+                        return true;
+                    };
+                    // ★文字直点：这次要点的目标**就是屏幕上一段短文字**（按钮/菜单项/标签），
+                    //   而观察帧的本地 OCR 已经给出它在哪 → 直接点，不截屏、不建识图客户端、不调 API。
+                    //   带文字的按钮多是「点一次就完」的一次性操作，走 DOM→UIA→两轮 VLM
+                    //   这条复用阶梯是纯浪费（实测一次 ≈ 20s，模型还得再花一轮确认）。
+                    //   ★索引有效期放宽到 90s 但**用之前必须就地复核**：模型「看一眼 → 想 8~40s
+                    //   → 才动手」是常态（实测日志 `OCR 索引已过期(7969ms) → 回落识图`），
+                    //   6s 的 TTL 几乎永远命中不了；而时间长短本身说明不了画面有没有变，
+                    //   裁一小块重新识别一次（几十毫秒）才是可靠的验证。
+                    bool ocrDirectHit = false;
+                    int ocrDirectX = 0, ocrDirectY = 0;
+                    if (!usedLocateCache && AiFastPathsEnabled()
+                        && button == L"left" && clickCount == 1) {
+                        const auto& ocrIdx = OcrScreenIndex();
+                        if (!ocrIdx.lines.empty()) {
+                            const long long age = static_cast<long long>(GetTickCount64())
+                                - ocrIdx.stampMs;
+                            std::wstring wantText;
+                            if (age > kOcrScreenIndexFreshMs) {
+                                AppendAiDebugLog(L"  [诊断] 文字直点：OCR 索引已过期("
+                                    + std::to_wstring(age) + L"ms) → 回落识图");
+                            } else if (ocrIdx.hwnd != GetForegroundWindow()) {
+                                // 前台窗口换了：索引里的字坐标是别的窗口的 → 一律作废
+                                AppendAiDebugLog(L"  [诊断] 文字直点：前台窗口已切换，"
+                                    L"OCR 索引作废 → 回落识图");
+                            } else if (!AiLocateExtractOcrTarget(targetDesc, &wantText)) {
+                                // 图标/方位/序号/格子类目标：OCR 对不上号，正常走识图
+                            } else {
+                                AiOcrDirectHit hit;
+                                const bool picked = AiOcrPickDirectClickTarget(ocrIdx.lines,
+                                    wantText, ocrIdx.capX2 - ocrIdx.capX1,
+                                    ocrIdx.capY2 - ocrIdx.capY1, &hit);
+                                if (picked && hit.screenX >= ocrIdx.capX1
+                                    && hit.screenX < ocrIdx.capX2
+                                    && hit.screenY >= ocrIdx.capY1 && hit.screenY < ocrIdx.capY2) {
+                                    int vx = hit.screenX, vy = hit.screenY;
+                                    std::wstring vnote;
+                                    // 复核窗口按命中框尺寸给（框大时裁小了会把文字切一半）
+                                    const int phw = (std::max)(60, hit.boxW / 2 + 12);
+                                    const int phh = (std::max)(28, hit.boxH / 2 + 10);
+                                    const bool verified = ocrProbeText(wantText,
+                                        hit.screenX, hit.screenY, phw, phh, &vx, &vy, &vnote);
+                                    if (verified) {
+                                        ocrDirectHit = true;
+                                        ocrDirectX = vx;
+                                        ocrDirectY = vy;
+                                        AppendAiDebugLog(L"  [诊断] 文字直点：本地 OCR 索引命中「"
+                                            + hit.hitText + L"」(" + hit.matchKind + L") → 屏幕("
+                                            + std::to_wstring(ocrDirectX) + L","
+                                            + std::to_wstring(ocrDirectY)
+                                            + L")，" + vnote + L"，未截屏未识图（省 1~2 轮 API）");
+                                    } else {
+                                        AppendAiDebugLog(L"  [诊断] 文字直点：候选「" + hit.hitText
+                                            + L"」就地复核未通过（" + vnote + L"）→ 回落识图");
+                                    }
+                                } else if (!hit.why.empty()) {
+                                    AppendAiDebugLog(L"  [诊断] 文字直点不可用：" + hit.why
+                                        + L" → 回落识图");
+                                }
+                            }
+                        }
+                    }
+                    auto runVisionLocate = [&]() -> ZoomRefineLocateResult {
+                    ZoomRefineLocateResult zr;
                     std::string b64;
                     int aw = 0, ah = 0;
                     // 定位长边 960 + 满分辨率（不被 aiImageScale=0.5 再压一半）：
                     // 小控件/输入框在整屏缩略后仍可辨，识图请求体也保持可控
-                    if (!captureObservationNow(b64, aw, ah, 960, 1.0) || b64.empty())
-                        return L"[错误] locateAndClick 截屏失败";
+                    if (!captureObservationNow(b64, aw, ah, 960, 1.0) || b64.empty()) {
+                        zr.errorMessage = L"locateAndClick 截屏失败";
+                        return zr;
+                    }
                     if (!liveMapValid) {
-                        return L"[错误] locateAndClick 无有效截图映射";
+                        zr.errorMessage = L"locateAndClick 无有效截图映射";
+                        return zr;
                     }
                     AppendAiDebugLog(L"  [诊断] locateAndClick freshCore targetLen="
                         + std::to_wstring(targetDesc.size()));
@@ -1929,14 +3422,18 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         AppendAiDebugLog(L"  [诊断] 主模型「" + effModel
                             + L"」非多模态，识图定位改用「" + visionModel + L"」");
                     } else if (visionModel.empty() && !ModelSupportsVision(effModel)) {
-                        return L"[错误] " + MissingVisionModelError(effModel);
+                        zr.errorMessage = MissingVisionModelError(effModel);
+                        return zr;
                     }
                     auto visionCore = CreateAiActionCore(
                         locateModel, appSettings_.ai.savedModels,
                         appSettings_.ai.apiUrl, appSettings_.ai.apiKey,
                         BuildAiActionVisionQuerySystemPrompt(aw, ah),
                         timeoutMs);
-                    if (!visionCore) return L"[错误] 无法创建识图客户端";
+                    if (!visionCore) {
+                        zr.errorMessage = L"无法创建识图客户端";
+                        return zr;
+                    }
                     ZoomRefineLocateOptions zopts;
                     zopts.maxLevels = std::clamp(refineLevels > 0 ? refineLevels : 1, 1, 2);
                     zopts.adaptiveRefineDepth = true;
@@ -1945,19 +3442,177 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             + std::to_wstring(zopts.maxLevels)
                             + L"（自适应：紧凑粗框可跳过二级）");
                     }
-                    const ZoomRefineLocateResult zr = ExecuteZoomRefineLocate(
+                    // UIA+视觉融合的锚点：窗口模式前台往往不是目标窗口，故只在非窗口模式取
+                    std::vector<AiUiAnchor> uiAnchors;
+                    if (!wmUsesTarget()) {
+                        for (const auto& ctl : windowmode::ListInteractiveUiControls(
+                                 GetForegroundWindow(), 60)) {
+                            uiAnchors.push_back(AiUiAnchor{ ctl.rect.left, ctl.rect.top,
+                                ctl.rect.right, ctl.rect.bottom, ctl.name });
+                        }
+                        if (!uiAnchors.empty())
+                            AppendAiDebugLog(L"  [诊断] 融合锚点：UIA 控件 "
+                                + std::to_wstring(uiAnchors.size()) + L" 个（候选重合则用精确框）");
+                    }
+                    return ExecuteZoomRefineLocate(
                         visionCore.get(), targetDesc, b64, aw, ah, liveMap,
                         stopFlag_,
                         [this](const std::wstring& line) { AppendAiDebugLog(line); },
-                        &aiHttpAbort_, zopts);
-                    if (!zr.ok) {
-                        const std::wstring detail = zr.errorMessage.empty()
-                            ? L"定位失败" : zr.errorMessage;
-                        return L"[错误] " + detail
-                            + L"。换短标签再 locate 最多1次，或看图换策略 / completeTask。";
+                        &aiHttpAbort_, zopts, uiAnchors.empty() ? nullptr : &uiAnchors,
+                        &locateVerdict, &locateVerdictWhy);
+                    };
+                    ZoomRefineLocateResult zr;
+                    if (usedLocateCache) {
+                        zr.ok = true;
+                        zr.screenX = cachedX;
+                        zr.screenY = cachedY;
+                        zr.levelsUsed = 0;
+                        zr.skippedRefine = true;  // 未走 Zoom 精炼，日志沿用「跳过二级」
+                    } else if (ocrDirectHit) {
+                        zr.ok = true;
+                        zr.screenX = ocrDirectX;
+                        zr.screenY = ocrDirectY;
+                        zr.levelsUsed = 0;
+                        zr.skippedRefine = true;
+                        // OCR 是真读到这段文字才点的 → 直接记「可用」，别让模型看到
+                        // 「可疑」又回头确认一轮（这正是用户抱怨的「总要反复确认」）。
+                        zr.verdict = AiLocateVerdict::Accept;
+                        locateVerdict = AiLocateVerdict::Accept;
+                        locateVerdictWhy = L"本地 OCR 索引命中文字标签";
+                    } else {
+                        zr = runVisionLocate();
+                        if (!zr.ok) {
+                            const std::wstring detail = zr.errorMessage.empty()
+                                ? L"定位失败" : zr.errorMessage;
+                            return L"[错误] " + detail
+                                + L"。换短标签再 locate 最多1次，或看图换策略 / completeTask。";
+                        }
+                        if (zr.skippedRefine) {
+                            AppendAiDebugLog(L"  [诊断] locateAndClick 自适应跳过二级 refine");
+                        }
+                        // ── OCR 文本核对（可选，最后一层独立证据）──────────────
+                        // 只在「定位校验不是可用」且目标是纯短文本时才做：在定位点附近裁一块
+                        // 交给文字识别，读到目标文字 → 升级为可用（省掉模型再确认一轮）；
+                        // 读到别的文字 → 提示疑似未命中。用户没装识别引擎时整段静默跳过。
+                        // ── 文字坐标覆盖（可选，装了识别引擎才走）──────────────────
+                        // 目标是纯短文本时，**本地 OCR 读到的文字像素比 VLM 的粗框准**：
+                        // 实测「自选僵尸卡牌」VLM 粗框中心 (226,169)，OCR 文字框中心 (245,106)
+                        // —— 低了 63px，而那一轮因为「紧凑框」跳过了二级精炼，直接射失。
+                        // 所以识图之后一律用 OCR 覆核一遍（不再只在「不是可用」时才做）：
+                        //   ① 索引里离识图点最近的同名文字（≤300px）→ 就地复核；
+                        //   ② 索引没有/太远 → 直接在识图点周边 ±120px 重新识别一次；
+                        // 拿到文字框中心就改用它的坐标（差 >6px 才动），并记「可用」。
+                        if (zr.ok && ocrVerifyBudget > 0) {
+                            std::wstring wantText;
+                            if (AiLocateExtractOcrTarget(targetDesc, &wantText)) {
+                                int probeX = zr.screenX, probeY = zr.screenY;
+                                int probeHalfW = 120, probeHalfH = 90;
+                                std::wstring srcNote;
+                                const auto& ocrIdx = OcrScreenIndex();
+                                if (!ocrIdx.lines.empty()
+                                    && ocrIdx.hwnd == GetForegroundWindow()
+                                    && static_cast<long long>(GetTickCount64()) - ocrIdx.stampMs
+                                        <= kOcrScreenIndexFreshMs) {
+                                    AiOcrDirectHit nearHit;
+                                    if (AiOcrPickNearestText(ocrIdx.lines, wantText,
+                                            zr.screenX, zr.screenY, 300,
+                                            ocrIdx.capX2 - ocrIdx.capX1,
+                                            ocrIdx.capY2 - ocrIdx.capY1, &nearHit)) {
+                                        probeX = nearHit.screenX;
+                                        probeY = nearHit.screenY;
+                                        probeHalfW = (std::max)(60, nearHit.boxW / 2 + 12);
+                                        probeHalfH = (std::max)(28, nearHit.boxH / 2 + 10);
+                                        srcNote = L"索引最近命中";
+                                    }
+                                }
+                                int vx = probeX, vy = probeY;
+                                std::wstring vnote;
+                                if (ocrProbeText(wantText, probeX, probeY,
+                                        probeHalfW, probeHalfH, &vx, &vy, &vnote)) {
+                                    --ocrVerifyBudget;
+                                    const int dx = vx - zr.screenX;
+                                    const int dy = vy - zr.screenY;
+                                    if (std::abs(dx) > 6 || std::abs(dy) > 6) {
+                                        AppendAiDebugLog(L"  [诊断] 文字坐标覆盖识图点「"
+                                            + wantText + L"」：" + srcNote + L"，识图("
+                                            + std::to_wstring(zr.screenX) + L","
+                                            + std::to_wstring(zr.screenY) + L") → OCR("
+                                            + std::to_wstring(vx) + L"," + std::to_wstring(vy)
+                                            + L")（差 " + std::to_wstring(dx) + L","
+                                            + std::to_wstring(dy) + L"px）");
+                                        zr.screenX = vx;
+                                        zr.screenY = vy;
+                                    } else {
+                                        AppendAiDebugLog(L"  [诊断] 文字核对「" + wantText
+                                            + L"」位置一致（" + vnote + L"）");
+                                    }
+                                    zr.verdict = AiLocateVerdict::Accept;
+                                    locateVerdict = AiLocateVerdict::Accept;
+                                    locateVerdictWhy = vnote;
+                                } else if (zr.verdict != AiLocateVerdict::Accept) {
+                                    // 原本就不可用 + OCR 也没读到 → 明说疑似未命中（不改坐标）
+                                    locateVerdict = AiLocateVerdict::Refine;
+                                    locateVerdictWhy = L"OCR 未在该点附近读到「" + wantText
+                                        + L"」（" + vnote + L"），疑似未命中";
+                                    AppendAiDebugLog(L"  [诊断] OCR 文本核对「" + wantText
+                                        + L"」: " + vnote);
+                                }
+                            }
+                        }
+                        // 识图成功 → 存模板，供循环里下一次直接复用
+                        // （模板取固定 80×80 邻域：命中判定还有窗口键 + 高分 + 唯一性三重门闩）
+                        // ★只在「这个目标本次运行已经点过至少一次」时才存：一次性按钮
+                        //   不进复用缓存（存了也没人再查，还会把一次性坐标固化成「下次直接用」）。
+                        if (!reusableTarget && clickCount <= 1 && !wmUsesTarget()) {
+                            AppendAiDebugLog(L"  [诊断] 一次性目标「" + targetDesc
+                                + L"」首次定位：不写定位模板缓存（再点它才存）");
+                        }
+                        if (reusableTarget && clickCount <= 1 && !wmUsesTarget()) {
+                            const int half = 40;
+                            int tx1 = zr.screenX - half;
+                            int ty1 = zr.screenY - half;
+                            int tx2 = zr.screenX + half;
+                            int ty2 = zr.screenY + half;
+                            if (tx2 - tx1 >= 20 && ty2 - ty1 >= 20) {
+                                HBITMAP tmpl = CaptureScreenRegion(tx1, ty1, tx2, ty2);
+                                // 低特征模板不入缓存：纯色/空白区存下来下次会匹配到别处
+                                if (tmpl && BitmapRegionLooksLowFeature(tmpl, nullptr)) {
+                                    DeleteBitmapHandle(tmpl);
+                                    tmpl = nullptr;
+                                    AppendAiDebugLog(L"  [诊断] 定位框内特征过低，跳过缓存模板");
+                                }
+                                if (tmpl) {
+                                    // 连窗口矩形一起存：窗口被拖动后靠它重锚缓存点
+                                    RECT storeRect{};
+                                    const bool haveStoreRect = GetForegroundWindow()
+                                        && GetWindowRect(GetForegroundWindow(), &storeRect);
+                                    AiLocateCacheStore(cacheKey, tmpl, zr.screenX, zr.screenY,
+                                        tx2 - tx1, ty2 - ty1,
+                                        haveStoreRect ? &storeRect : nullptr);
+                                    AppendAiDebugLog(L"  [诊断] 已存定位模板 "
+                                        + std::to_wstring(tx2 - tx1) + L"×"
+                                        + std::to_wstring(ty2 - ty1)
+                                        + L"（循环复用时省识图）");
+                                }
+                            }
+                        }
                     }
-                    if (zr.skippedRefine) {
-                        AppendAiDebugLog(L"  [诊断] locateAndClick 自适应跳过二级 refine");
+                    {
+                        std::wstring t = targetDesc;
+                        const bool ordinalFirst = t.find(L"第一个") != std::wstring::npos
+                            || t.find(L"第1个") != std::wstring::npos
+                            || t.find(L"第一张") != std::wstring::npos
+                            || t.find(L"最上") != std::wstring::npos;
+                        HWND fg = GetForegroundWindow();
+                        RECT wr{};
+                        if (ordinalFirst && fg && GetWindowRect(fg, &wr)) {
+                            const int wh = wr.bottom - wr.top;
+                            if (wh > 200 && zr.screenY > wr.top + wh * 85 / 100) {
+                                return L"[错误] 「第1个」点在了窗口底部（那是推荐/页脚，不是列表开头）。"
+                                    L"请 observePage 后 clickRef 列表第1项，或 locateAndClick "
+                                    L"内容区重复卡片网格里最上最左的那张。";
+                            }
+                        }
                     }
                     // 点击前查 UIA：控件灰掉说明前置条件没满足，点它只会白烧轮次
                     const windowmode::UiElementState uiState =
@@ -1976,6 +3631,23 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             AppendAiTaskMemoLine(L"blocked: disabled " + memo);
                         return why;
                     }
+                    // 点击前遮挡校验：定位点必须真的落在前台窗口（或其弹窗）上。
+                    // 没有这道闸时，只要窗口中途被别的东西盖住/抢了前台，就会照着旧
+                    // 截图把点击打到别的程序上——这是最典型的「点了但没反应/点错东西」来源。
+                    // 窗口模式下目标窗口不一定是前台，故只在非窗口模式启用。
+                    if (!wmUsesTarget()
+                        && !windowmode::IsScreenPointOnForegroundWindow(zr.screenX, zr.screenY)) {
+                        HWND fgNow = GetForegroundWindow();
+                        wchar_t nowTitle[256]{};
+                        if (fgNow) GetWindowTextW(fgNow, nowTitle, 256);
+                        AppendAiDebugLog(L"  [诊断] 遮挡校验失败：定位点不属于前台窗口，已拦截点击");
+                        return L"[错误] 定位到了 ("
+                            + std::to_wstring(zr.screenX) + L"," + std::to_wstring(zr.screenY)
+                            + L")，但该点当前不属于前台窗口（当前前台：「" + nowTitle
+                            + L"」）——窗口可能被覆盖或已切换，点击会打错目标，已拦截。"
+                              L"请 listWindows + activateWindow 确认目标窗口在前台后再操作；"
+                              L"网页请 observePage 后 clickRef。";
+                    }
                     const bool isDouble = clickCount >= 2;
                     const bool isLeftSingle = (button != L"right") && !isDouble;
                     // 双击/右键是「换手法再试」，不算重复盲点
@@ -1984,14 +3656,74 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         !dup.empty()) {
                         return dup;
                     }
-                    int br = 0, bg = 0, bb = 0;
-                    const bool hadBefore = GetScreenPixelRgb(zr.screenX, zr.screenY, br, bg, bb);
+                    // ★只记「可信」的定位：校验=可疑时（可能没点中/点错）绝不写进布局记忆，
+                    // 否则会把错坐标固化成「下次直接用」的记忆。实测：一键全选那次
+                    // 定位校验=可疑 + settle 无反应，仍被记住 → 后续直接点错位置。
+                    // ★复用缓存（布局记忆 + 网格推断）只对「会被反复点的位置」有价值：
+                    //   用户实测反馈——不是每个按钮都值得抽象出可复用定位，很多按钮只点一次。
+                    //   一次性按钮既不值得存（下次不再点它），也不该把**一次性的**坐标固化成
+                    //   「下次直接用」（实测「一键全选」就是这样点错的）。
+                    //   两块都要「整区截屏 + 转灰度」，所以只截一次、两处共用（省一次全窗转换）。
+                    if (AiFastPathsEnabled() && reusableTarget && !layoutKey.empty()
+                        && isLeftSingle && zr.verdict == AiLocateVerdict::Accept) {
+                        int rx1 = 0, ry1 = 0, rx2 = 0, ry2 = 0;
+                        HBITMAP frame = resolveAiRegion(rx1, ry1, rx2, ry2)
+                            ? captureAiRegionBmp(rx1, ry1, rx2, ry2) : nullptr;
+                        std::vector<uint8_t> gb;
+                        int gw = 0, gh = 0, gs = 0;
+                        if (frame && AiUiBitmapToGrayBytes(frame, gb, gw, gh, gs)) {
+                            const AiUiLayoutRect boxInFrame{ lastLocateScreenRect.x1 - rx1,
+                                lastLocateScreenRect.y1 - ry1,
+                                lastLocateScreenRect.x2 - rx1, lastLocateScreenRect.y2 - ry1 };
+                            // ① 布局记忆 + 外观签名（命中前硬校验用）
+                            AiUiLayoutRemember(layoutKey, lastLocateScreenRect);
+                            {
+                                uint8_t sig[kAiUiSigN * kAiUiSigN]{};
+                                if (AiUiLayoutSignature(gb.data(), gw, gh, gs, boxInFrame, sig))
+                                    AiUiLayoutRememberSignature(layoutKey, sig);
+                            }
+                            // ② 顺手推断网格：锚点带内周期 → 整片格子坐标（草坪/卡槽/图标阵列）
+                            AiUiGridSpec grid{};
+                            if (!AiUiLayoutRecallGrid(layoutKey, grid)) {
+                                int px = 0, py = 0;
+                                if (AiUiDetectGridPeriod(gb.data(), gw, gh, gs, boxInFrame,
+                                        16, 420, px, py)) {
+                                    AiUiGridSpec g;
+                                    g.originX = zr.screenX;
+                                    g.originY = zr.screenY;
+                                    g.stepX = px;
+                                    g.stepY = py;
+                                    g.cols = px > 0 ? (std::max)(1, (rx2 - zr.screenX) / px) : 0;
+                                    g.rows = py > 0 ? (std::max)(1, (ry2 - zr.screenY) / py) : 0;
+                                    if (g.valid()) {
+                                        AiUiLayoutRememberGrid(layoutKey, g);
+                                        AppendAiDebugLog(L"  [诊断] 网格推断："
+                                            + TruncLog(targetDesc, 20) + L" 周期 "
+                                            + std::to_wstring(px) + L"×" + std::to_wstring(py)
+                                            + L"px（右侧 " + std::to_wstring(g.cols)
+                                            + L" 列 / 下方 " + std::to_wstring(g.rows)
+                                            + L" 行）→ 之后按 (行,列) 直接点，无需识图");
+                                    }
+                                }
+                            }
+                        }
+                        if (frame) DeleteBitmapHandle(frame);
+                    } else if (!reusableTarget && isLeftSingle
+                        && zr.verdict == AiLocateVerdict::Accept && !layoutKey.empty()) {
+                        AppendAiDebugLog(L"  [诊断] 一次性目标（本次运行首次定位）：不写布局记忆/"
+                            L"网格缓存（同一个目标再点一次才存）");
+                    }
+                    int br[kClickColorGridN]{}, bg[kClickColorGridN]{}, bb[kClickColorGridN]{};
+                    parkCursorAwayFromUi();
+                    const bool hadBefore = SampleClickColorGrid(
+                        zr.screenX, zr.screenY, br, bg, bb);
                     const std::wstring clickJson = BuildScreenClickActionsJson(
                         zr.screenX, zr.screenY, false, button, clickCount);
+                    lastLocateScreenRect = AiUiLayoutRect{
+                        zr.screenX - 24, zr.screenY - 24, zr.screenX + 24, zr.screenY + 24 };
                     // 逻辑转化模板必须在点击前截取：点击会把按钮/菜单/页面切换到新状态，
                     // 点击后截到的模板是「后置状态」，下次运行时门闩 findImage 会找不到它，
                     // 快路径永远失效、每轮都烧 AI。先移开指针再截，模板=点击前界面=门闩要找的状态。
-                    parkCursorAwayFromUi();
                     if (AiLogicConvertSessionActive()) {
                         // 藏起壳/宏调试窗再裁模板，避免裁进调试信息窗口
                         qst::desktop_tools::ScopedHideOwnUiForCapture hideForLogicTmpl(
@@ -2004,24 +3736,270 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         }
                     }
                     const std::wstring execMsg = executeActionsJsonNow(clickJson);
+                    // 坐标单位写清楚（见 DescribeClickPointForModel 的注释）
                     std::wstring out = L"locateAndClick 已"
                         + std::wstring(isDouble ? L"双击" : (button == L"right" ? L"右键点击" : L"点击"))
-                        + L"屏幕("
-                        + std::to_wstring(zr.screenX) + L"," + std::to_wstring(zr.screenY)
-                        + L") 识图轮次=" + std::to_wstring(zr.levelsUsed);
+                        + DescribeClickPointForModel(zr.screenX, zr.screenY)
+                        + L" 识图轮次=" + std::to_wstring(zr.levelsUsed);
                     if (zr.usedFindImageSnap) {
                         out += L"；找图精修"
                             + std::to_wstring(static_cast<int>(zr.findImageScore + 0.5)) + L"%";
                     }
+                    // 本地校验定级：可疑时明确提示模型别盲信这一个点（不阻断点击，只提示）
+                    if (!usedLocateCache && zr.verdict != AiLocateVerdict::Accept) {
+                        out += L"；定位校验=" + std::wstring(AiLocateVerdictName(zr.verdict));
+                        if (!locateVerdictWhy.empty())
+                            out += L"（" + locateVerdictWhy + L"）";
+                        if (zr.verdict == AiLocateVerdict::Refine) {
+                            out += L"。★该点可疑：先看截图确认再继续；"
+                                   L"若没点中，换更具体的短标签或加 refineLevels=2，勿连点同坐标";
+                        }
+                    }
                     if (hadBefore) {
-                        if (VerifyClickEffectByColorSample(zr.screenX, zr.screenY, br, bg, bb, 12))
-                            out += L"；采样色已变";
-                        else
-                            out += L"；采样色接近";
+                        int ar[kClickColorGridN]{}, ag[kClickColorGridN]{}, ab[kClickColorGridN]{};
+                        const bool hadAfter = SampleClickColorGrid(
+                            zr.screenX, zr.screenY, ar, ag, ab);
+                        bool compactRoiNear = false;
+                        bool largeMotion = false;
+                        for (const auto& r : lastUiChangeRois) {
+                            const int rw = r.x2 - r.x1;
+                            const int rh = r.y2 - r.y1;
+                            const int area = rw * rh;
+                            const bool hits = zr.screenX >= r.x1 - 24 && zr.screenX <= r.x2 + 40
+                                && zr.screenY >= r.y1 - 24 && zr.screenY <= r.y2 + 24;
+                            if (rw > 220 || rh > 180 || area > 48000) {
+                                largeMotion = true;
+                                continue;
+                            }
+                            if (hits) compactRoiNear = true;
+                        }
+                        const bool colorChanged = hadAfter
+                            && ClickColorGridChanged(br, bg, bb, ar, ag, ab, 12, 2);
+                        // ★有「点下去确实变了」的证据时，把前面那句「该点可疑」收回去 ——
+                        // 否则模型会照它去再截一次图确认（实测白烧 1~2 轮）。
+                        if (colorChanged || compactRoiNear) {
+                            const size_t pos = out.find(L"。★该点可疑");
+                            if (pos != std::wstring::npos) out.resize(pos);
+                        }
+                        const bool mixedPage = AiLastPageKind() == L"mixed";
+                        if (compactRoiNear) {
+                            out += L"；点击处小范围已变（开关可能已切换）。"
+                                L"禁止再点同一位置（会取消）。请 observePage 看 pressed/checked；"
+                                L"已是目标态则 completeTask";
+                        } else if (colorChanged && !mixedPage && !largeMotion) {
+                            out += L"；点击附近颜色已变。勿再点同一位置；"
+                                L"请 observePage 看 pressed/checked 后 completeTask";
+                        } else if (largeMotion) {
+                            out += L"；大范围画面在动（播放器），不能当成开关已切换。"
+                                L"请 observePage 看 pressed/checked，勿连点同一坐标";
+                        } else {
+                            // ★无任何变化证据 → 用「刚点的这个错点」当锚点自纠一次（备用项）。
+                            // ★★先问 settle 的权威判定：**只要界面有反应就绝不补点**。
+                            //   实测只看局部颜色+变化区就补点，会在开关类按钮上打第二下
+                            //   （「自选僵尸卡牌」开面板→我补的一下又关回去），界面进了不一致
+                            //   状态后点什么都没反应（用户报障「拿下来一张卡就点不动了」）。
+                            std::wstring fixWhy;
+                            std::wstring fix;
+                            if (isLeftSingle && !usedLocateCache && !AiLastUiSettleReacted()
+                                && missSelfCorrectBudget > 0 && AiMissSelfCorrectEnabled()) {
+                                --missSelfCorrectBudget;
+                                fix = tryMissSelfCorrect(targetDesc, zr.screenX, zr.screenY,
+                                    &fixWhy);
+                            }
+                            if (!fix.empty()) {
+                                out += fix;
+                            } else {
+                                out += L"；点击附近外观接近（若开关仍是旧态则未完成；"
+                                       L"勿对同一坐标连点）";
+                                if (!fixWhy.empty()) out += L"（已试自纠：" + fixWhy + L"）";
+                            }
+                        }
+                        // 定位缓存闭环：这次是「照缓存点的」，而点下去画面没变、
+                        // 也没有小范围变化 → 这条缓存多半是错点，立刻作废（下次老实识图）。
+                        // 宁可丢掉优化，也不能把错点固化下来。
+                        if (usedLocateCache && !colorChanged && !compactRoiNear) {
+                            AiLocateCacheInvalidate(cacheKey);
+                            out += L"；定位缓存已作废（点击无变化，下次改用识图）";
+                            AppendAiDebugLog(L"  [诊断] 定位缓存作废：点击后画面无变化");
+                        }
+                        // ★同一条规矩适用于布局记忆：照记忆坐标点下去没变化 → 记一笔。
+                        // **不删条目**（用户实测：小范围颜色采样会误报，工具本身耗时几秒后
+                        // 画面早变了）；连续两次才让 Recall 回退真识图并刷新坐标。
+                        if (!colorChanged && !compactRoiNear
+                            && !layoutKey.empty() && isLeftSingle) {
+                            AiUiLayoutNoteClickNoEffect(layoutKey);
+                            AppendAiDebugLog(L"  [诊断] 布局记忆记一笔未生效（连续 2 次才回退识图，"
+                                L"当前过期条目 " + std::to_wstring(AiUiLayoutStaleCount()) + L"）");
+                        }
                     }
                     out += L"；已移开指针防 hover";
                     AppendAiTaskMemoLine(L"done: locateAndClick");
                     if (!execMsg.empty()) out += L"；" + execMsg;
+                    return out;
+                };
+                agentHooks.onLocateAndClick = locateAndClickFn;
+                // ★★网格定位：锚点只识图一次，整片坐标由画面周期推断；
+                // 之后每次 grid(anchor, cells) 都是纯坐标计算（0 次识图）——
+                // 「两次找图覆盖放置僵尸」就靠这个：① 定位卡槽 ② 定位草坪锚点+推断网格，
+                // 后面每次放僵尸只是 grid(anchor="草坪", cells=[[r,c],…])。
+                agentHooks.onLocateGrid = [&, locateAndClickFn](
+                    const std::wstring& anchor,
+                    const std::vector<std::pair<int, int>>& cells,
+                    const std::wstring& button, int clickCount) -> std::wstring {
+                    if (!locateAndClickFn) return L"[错误] 网格定位未初始化。";
+                    const AiUiLayoutKey key = MakeAiUiLayoutKey(anchor);
+                    if (key.empty()) {
+                        return L"[错误] 网格定位拿不到前台窗口身份：先 listWindows + activateWindow "
+                               L"把目标窗口切到前台。";
+                    }
+                    int gx1 = 0, gy1 = 0, gx2 = 0, gy2 = 0;
+                    if (!resolveAiRegion(gx1, gy1, gx2, gy2))
+                        return L"[错误] 网格定位无法确定截图区域。";
+
+                    AiUiLayoutRect anchorRect{};
+                    bool firstLocate = false;
+                    if (!AiUiLayoutRecall(key, anchorRect)) {
+                        // 第一次：真识图一次（顺带把锚点格点了 —— 与 cells 里的 (0,0) 语义一致）
+                        // 锚点注定要反复用 → 先标成可复用目标，别让「一次性目标不写缓存」
+                        // 的规矩把第 2 次 grid 调用又逼回识图（还会多点在锚点格一下）。
+                        MarkLocateTargetReusable(anchor);
+                        const std::wstring r = locateAndClickFn(anchor, 1, button, clickCount);
+                        if (r.rfind(L"[错误]", 0) == 0) return r;
+                        if (!lastLocateScreenRect.valid())
+                            return L"[错误] 网格锚点定位成功但拿不到坐标（内部状态异常）。";
+                        anchorRect = lastLocateScreenRect;
+                        firstLocate = true;
+                    }
+
+                    AiUiGridSpec grid{};
+                    if (!AiUiLayoutRecallGrid(key, grid)) {
+                        HBITMAP frame = captureAiRegionBmp(gx1, gy1, gx2, gy2);
+                        std::vector<uint8_t> grayBytes;
+                        int gw = 0, gh = 0, gstride = 0;
+                        const bool gotGray = frame
+                            && AiUiBitmapToGrayBytes(frame, grayBytes, gw, gh, gstride);
+                        if (frame) DeleteBitmapHandle(frame);
+                        if (!gotGray) {
+                            return L"[错误] 网格定位截图失败。";
+                        }
+                        AiUiLayoutRect boxInFrame{ anchorRect.x1 - gx1, anchorRect.y1 - gy1,
+                            anchorRect.x2 - gx1, anchorRect.y2 - gy1 };
+                        int px = 0, py = 0;
+                        if (!AiUiDetectGridPeriod(grayBytes.data(), gw, gh, gstride,
+                                boxInFrame, 16, 420, px, py)) {
+                            return L"[错误] 这个界面看不出规则网格（周期检测不显著）。"
+                                   L"改用 locateAndClick(targets=[…]) 逐个目标描述，或直接给屏幕目标。";
+                        }
+                        grid.originX = anchorRect.cx();
+                        grid.originY = anchorRect.cy();
+                        grid.stepX = px;
+                        grid.stepY = py;
+                        grid.cols = px > 0 ? (std::max)(1, (gx2 - grid.originX) / px) : 0;
+                        grid.rows = py > 0 ? (std::max)(1, (gy2 - grid.originY) / py) : 0;
+                        // ★合理性闸：任何真实界面都不会有几十列格子。实测在暂停菜单的
+                        // 石纹背景上误报「周期 16×16px → 79 列 / 19 行」，照它点就是乱点。
+                        if (grid.cols > 24 || grid.rows > 12) {
+                            AppendAiDebugLog(L"  [诊断] 网格推断被拒：周期 "
+                                + std::to_wstring(px) + L"×" + std::to_wstring(py)
+                                + L"px 推出 " + std::to_wstring(grid.cols) + L" 列 / "
+                                + std::to_wstring(grid.rows) + L" 行，明显是纹理不是网格");
+                            grid = AiUiGridSpec{};
+                        }
+                        if (!grid.valid())
+                            return L"[错误] 网格周期无效（stepX/stepY 都为 0）。";
+                        AiUiLayoutRememberGrid(key, grid);
+                        AppendAiDebugLog(L"  [诊断] 网格已建立：锚点("
+                            + std::to_wstring(grid.originX) + L"," + std::to_wstring(grid.originY)
+                            + L") 周期 " + std::to_wstring(px) + L"×" + std::to_wstring(py)
+                            + L"px 右侧 " + std::to_wstring(grid.cols) + L" 列 / 下方 "
+                            + std::to_wstring(grid.rows) + L" 行");
+                    }
+
+                    std::vector<std::pair<int, int>> pts;
+                    std::wstring skipped;
+                    for (const auto& rc : cells) {
+                        if (grid.stepX == 0 && rc.second != 0) {
+                            skipped += L"(列周期未知 r" + std::to_wstring(rc.first) + L"c"
+                                + std::to_wstring(rc.second) + L")";
+                            continue;
+                        }
+                        if (grid.stepY == 0 && rc.first != 0) {
+                            skipped += L"(行周期未知 r" + std::to_wstring(rc.first) + L"c"
+                                + std::to_wstring(rc.second) + L")";
+                            continue;
+                        }
+                        int x = 0, y = 0;
+                        if (!AiUiGridCellCenter(grid, rc.first, rc.second, x, y)) continue;
+                        if (x < gx1 + 2 || x >= gx2 - 2 || y < gy1 + 2 || y >= gy2 - 2) {
+                            skipped += L"(越界 r" + std::to_wstring(rc.first) + L"c"
+                                + std::to_wstring(rc.second) + L")";
+                            continue;
+                        }
+                        pts.emplace_back(x, y);
+                    }
+                    if (pts.empty()) {
+                        return L"[错误] 没有可点的格子。" + skipped
+                            + L" 网格：周期 " + std::to_wstring(grid.stepX) + L"×"
+                            + std::to_wstring(grid.stepY) + L"px，右侧 "
+                            + std::to_wstring(grid.cols) + L" 列 / 下方 "
+                            + std::to_wstring(grid.rows) + L" 行。"
+                              L"请把 (行,列) 收在有效范围内（可为负=锚点左上方向）。";
+                    }
+                    // 一次批量执行：moveMouse+mouseClick 交替，中间不插观察/验收
+                    std::wstring json = L"[";
+                    for (size_t i = 0; i < pts.size(); ++i) {
+                        const std::wstring one = BuildScreenClickActionsJson(
+                            pts[i].first, pts[i].second, false, button, clickCount);
+                        // 去掉两端的 [ ] 拼成一个批次
+                        std::wstring body = one;
+                        if (!body.empty() && body.front() == L'[') body.erase(body.begin());
+                        if (!body.empty() && body.back() == L']') body.pop_back();
+                        if (i) json += L",";
+                        json += body;
+                    }
+                    json += L"]";
+                    const std::wstring execMsg = executeActionsJsonNow(json);
+                    AppendAiTaskMemoLine(L"done: 网格点击 ×" + std::to_wstring(pts.size()));
+                    std::wstring out = L"locateAndClick(grid) 已按网格连点 "
+                        + std::to_wstring(pts.size()) + L" 格（锚点「"
+                        + TruncLog(anchor, 20) + L"」周期 "
+                        + std::to_wstring(grid.stepX) + L"×" + std::to_wstring(grid.stepY)
+                        + L"px）";
+                    if (firstLocate) out += L"；锚点是本次新定位的，之后同一界面直接用记忆坐标";
+                    else out += L"；锚点走布局记忆（未重新识图）";
+                    if (!skipped.empty()) out += L"；跳过：" + skipped;
+                    if (!execMsg.empty()) out += L"；" + execMsg;
+                    return out;
+                };
+                // ★多目标：逐个定位并**立即点击**，中间不插观察/验收 ——
+                // 「拿僵尸卡 → 放到草坪」这类两步操作以前要两轮主模型 + 两次 settle
+                //（实测每步 1.5~2.6s），现在一次工具调用做完，失败即停。
+                agentHooks.onLocateMulti = [locateAndClickFn](
+                    const std::vector<std::wstring>& targets,
+                    const std::wstring& button, int clickCount) -> std::wstring {
+                    if (!locateAndClickFn) return L"[错误] 多目标定位未初始化。";
+                    std::wstring out;
+                    int okCount = 0;
+                    for (size_t i = 0; i < targets.size(); ++i) {
+                        const std::wstring r = locateAndClickFn(targets[i], 1, button, clickCount);
+                        if (!out.empty()) out += L"\n";
+                        out += L"[" + std::to_wstring(i + 1) + L"/"
+                            + std::to_wstring(targets.size()) + L"] " + r;
+                        if (r.rfind(L"[错误]", 0) == 0) {
+                            out += L"\n★第 " + std::to_wstring(i + 1)
+                                + L" 个目标没定位到，后面的目标**没有点**（不做猜着点）。"
+                                  L"换更短/更显眼的目标描述重试整批，或先 screenshot 看清再决定。";
+                            break;
+                        }
+                        ++okCount;
+                    }
+                    if (okCount == static_cast<int>(targets.size())) {
+                        out += L"\n★已连续完成 " + std::to_wstring(okCount)
+                            + L" 个目标（一张截图内依次定位，未逐步验收）。"
+                              L"下一步要么继续同一手法批量推进，要么 completeTask。";
+                        AppendAiTaskMemoLine(L"done: locateAndClick 多目标 ×"
+                            + std::to_wstring(okCount));
+                    }
                     return out;
                 };
 
@@ -2173,6 +4151,14 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         : 10);
 
                 auto handleAiActionApiResult = [&](const AiActionResult& ar) {
+                    if (!wmUsesTarget()) {
+                        auto& b = windowmode::ExtBridgeServer::Instance();
+                        if (b.IsExtensionConnected() && !b.IsAborted()) {
+                            std::string ign;
+                            std::wstring e;
+                            b.Request("detach", "", ign, e, 800);
+                        }
+                    }
                     // 用户热键终止：若 AI 已成功且有可固化轨迹，仍尝试写回再退出
                     if (StopRequested()) {
                         releaseAltTabIfHeld();
@@ -2236,7 +4222,21 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 // 首轮截图策略：勾选「带截图」→ 必截；未勾选则仅当 prompt 明显要看屏（点击/定位）才按需截。
                 // 纯变量分析+按键等不截；运行中 locateAndClick / observe 仍可按需截屏。勿嵌套 aiActionExecute。
                 auto runWithOptionalAutoCapture = [&](bool preferCapture) {
-                    const bool wantCapture = preferCapture || eff.aiWithImage;
+                    // 「点击 X」类目标由宿主 onLocateAndClick 自己截屏（960 长边）；
+                    // 这里再截一张 1280 长边整屏 + JPEG 编码纯属白烧（约 0.2–0.4s/次）。
+                    // 路由分类依赖 withImage，故必须显式覆盖路由，保证仍走 CompositeClick
+                    // 快路径（本地定位点击，不经规划轮）。
+                    const AiActionRouteKind preRoute =
+                        ClassifyAiActionRoute(resolvedPrompt, true);
+                    const bool localLocateNoCapture = preferCapture && !eff.aiWithImage
+                        && agentHooks.onLocateAndClick != nullptr
+                        && preRoute == AiActionRouteKind::CompositeClick;
+                    if (localLocateNoCapture) {
+                        AppendAiDebugLog(L"AI动作执行 [" + effModel
+                            + L"]：本地定位点击自带截屏 → 跳过首帧整屏截图（省一次截图+JPEG 编码）");
+                    }
+                    const bool wantCapture =
+                        !localLocateNoCapture && (preferCapture || eff.aiWithImage);
                     int capX1 = 0, capY1 = 0, capX2 = 0, capY2 = 0;
                     std::string screenshotB64;
                     int apiW = 0, apiH = 0;
@@ -2345,7 +4345,8 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 core, resolvedPrompt, "", 0, 0, eff.aiContextMode,
                                 stopFlag_, eff.aiTimeoutSec, logFn, &aiHttpAbort_, nullptr,
                                 &agentHooks, agentRounds,
-                                clipExtraJpeg.empty() ? nullptr : &clipExtraJpeg);
+                                clipExtraJpeg.empty() ? nullptr : &clipExtraJpeg,
+                                localLocateNoCapture ? &preRoute : nullptr);
                             if (ar.ok) {
                                 propagateAiHistory(core, prepAction, histBefore,
                                     BuildAiActionExecuteTextSystemPrompt(),
@@ -2519,15 +4520,19 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     MouseInputRouter::Instance().SetCatchUpGapUs(0);
                 }
             } catchUpGapResetGuard;
+            // ── 低性能模式（设置 → 宏回放设置）：只保留必要的时间轴，
+            //    不做提优先级/绑核/抬全局定时器分辨率 —— 这三样都会让整机更热
+            //    （抬定时器分辨率会让全系统无法进深度 C-state，长时间挂机尤其明显）。
+            const bool lowPerf = LowPerformanceMode();
             MouseBallisticsGuard ballisticsGuard(inputTimeline.enabled
                 || (wmExecPtr && wmExecPtr->PreferHardwareInput()));
             // 加速已关：保持 Raw 原包大小；未关才拆包防加倍（拆包会改变报告次数）。
             const bool splitLargeMoves =
                 inputTimeline.enabled && !ballisticsGuard.FlatVerified();
             MouseInputRouter::Instance().SetSplitLargeMoves(splitLargeMoves);
-            PlaybackProcessPriorityGuard processPriGuard(inputTimeline.enabled);
-            PlaybackThreadAffinityGuard affinityGuard(inputTimeline.enabled);
-            MultimediaTimerGuard timerPeriodGuard(inputTimeline.enabled);
+            PlaybackProcessPriorityGuard processPriGuard(inputTimeline.enabled && !lowPerf);
+            PlaybackThreadAffinityGuard affinityGuard(inputTimeline.enabled && !lowPerf);
+            MultimediaTimerGuard timerPeriodGuard(inputTimeline.enabled, !lowPerf);
             struct ThreadPriorityGuard {
                 HANDLE thread = nullptr;
                 int prev = THREAD_PRIORITY_NORMAL;
@@ -2543,7 +4548,16 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 ~ThreadPriorityGuard() {
                     if (active) SetThreadPriority(thread, prev);
                 }
-            } threadPriGuard(inputTimeline.enabled);
+            } threadPriGuard(inputTimeline.enabled && !lowPerf);
+
+            // 每次开始跑脚本都清掉「上一帧命中」：绝不让上一次运行的命中影响这一次
+            ResetFindImageFastPath();
+            // 布局记忆同理：上一次运行的坐标/网格一律作废（窗口换了、分辨率换了都会错）
+            AiUiLayoutClear();
+            // 文字直点用的 OCR 行表同理：上一轮的字坐标一律作废
+            ResetOcrScreenIndex();
+            // 「一次性目标」计数同理：上次运行点过什么与这一次无关
+            ResetLocateTargetSeen();
 
             bool timelineInterrupted = false;
             bool wmTargetLostLogged = false;
@@ -2553,7 +4567,8 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 if (!wmTargetLostLogged) {
                     wmTargetLostLogged = true;
                     windowmode::WindowModeLog(
-                        L"[窗口模式] 目标窗口已消失（进程退出/闪退），停止脚本");
+                        std::wstring(L"[窗口模式] 目标窗口已消失（进程退出/闪退），停止脚本 ")
+                        + wmExecPtr->TargetAliveDebug());
                     AppendDebugLog(L"窗口模式：目标已闪退或关闭，已停止（不会对失效窗口继续记步）");
                 }
                 stopFlag_.store(true, std::memory_order_relaxed);
@@ -2582,13 +4597,510 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
 
             int scheduledYieldDepth = 0;
             bool scheduledYieldLocalStop = false;
-            executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &heldKeys, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx, &resolveTemplatePath, &executeOne, &runAiActionExecute, &aiSessions, &aiLoopDepth, &pendingBreakLoop, wmExecPtr, &wmSetPos, &wmSetLivePos, &wmSendKey, &wmSendHeldModifiers, &wmMouseButton, &wmMouseClick, &wmSendShortcut, &isImeToggleShortcut, &wmUsesTarget, &wmUsesBackground, &activeCoordMeta, &currentTmplScale, execTargetW, execTargetH, &inputTimeline, &waitAbsoluteTimeline, &wmAbortIfTargetLost, &playbackTimeScale, imageVarRunId, &scheduledYieldDepth, &scheduledYieldLocalStop](const ScriptAction& a) {
+            int imageWatchDepth = 0;
+            std::vector<std::chrono::steady_clock::time_point> watchPollAt;
+            const std::vector<ScriptAction>* watchPollBound = nullptr;
+            auto matchScriptImageOnce = [&](const ScriptAction& src) -> ImageMatchResult {
+                ScriptAction findAct = src;
+                findAct.imagePath = resolveTemplatePath(src.imageUseVar, src.imagePath);
+                if (findAct.imagePath.empty()) return {};
+                const TemplateScale findTmplScale = currentTmplScale();
+                if (wmUsesTarget()) {
+                    ImageMatchOutput output = wmExecPtr->FindImageClient(
+                        findAct, lockedScreen_, lockedVirtX_, lockedVirtY_);
+                    if (output.matches.empty()) return {};
+                    return output.matches.front();
+                }
+                if (src.windowRelative) return {};
+                int x1 = src.searchX1, y1 = src.searchY1, x2 = src.searchX2, y2 = src.searchY2;
+                if (src.searchFullScreen) {
+                    int sx = 0, sy = 0, sw = 0, sh = 0;
+                    GetVirtualScreenRect(sx, sy, sw, sh);
+                    x1 = sx; y1 = sy; x2 = sx + sw; y2 = sy + sh;
+                } else {
+                    int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+                    GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+                    if ((x2 <= x1 || y2 <= y1)
+                        || (x1 <= vsX + 2 && y1 <= vsY + 2
+                            && x2 >= vsX + vsW - 2 && y2 >= vsY + vsH - 2)) {
+                        x1 = vsX; y1 = vsY; x2 = vsX + vsW; y2 = vsY + vsH;
+                    }
+                }
+                const PreparedFindImageMatch prep = PrepareFindImageMatch(findAct, findTmplScale);
+                if (!prep.bitmap) return {};
+                ImageMatchOptions opt = prep.options;
+                RestrictFindImageToSingleAnchor(opt);
+                opt.maxOverlap = 0.5;
+                ImageMatchOutput output;
+                if (lockedScreen_) {
+                    output = FindTemplateInFrozenScreenMulti(
+                        lockedScreen_, lockedVirtX_, lockedVirtY_, x1, y1, x2, y2, prep.bitmap, opt);
+                } else {
+                    output = FindTemplateOnScreenMulti(x1, y1, x2, y2, prep.bitmap, opt);
+                }
+                if (prep.bitmap) DeleteBitmapHandle(prep.bitmap);
+                if (output.matches.empty()) return {};
+                return output.matches.front();
+            };
+            auto matchScriptImageAll = [&](const ScriptAction& src, int maxMatches) -> ImageMatchOutput {
+                ScriptAction findAct = src;
+                findAct.imagePath = resolveTemplatePath(src.imageUseVar, src.imagePath);
+                ImageMatchOutput empty{};
+                if (findAct.imagePath.empty()) return empty;
+                const TemplateScale findTmplScale = currentTmplScale();
+                const int keep = std::clamp(maxMatches, 1, kMultiMatchMaxHits);
+                if (wmUsesTarget()) {
+                    ImageMatchOutput output = wmExecPtr->FindImageClient(
+                        findAct, lockedScreen_, lockedVirtX_, lockedVirtY_);
+                    if (static_cast<int>(output.matches.size()) > keep) {
+                        output.matches.resize(static_cast<size_t>(keep));
+                    }
+                    return output;
+                }
+                if (src.windowRelative) return empty;
+                int x1 = src.searchX1, y1 = src.searchY1, x2 = src.searchX2, y2 = src.searchY2;
+                if (src.searchFullScreen) {
+                    int sx = 0, sy = 0, sw = 0, sh = 0;
+                    GetVirtualScreenRect(sx, sy, sw, sh);
+                    x1 = sx; y1 = sy; x2 = sx + sw; y2 = sy + sh;
+                } else {
+                    int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
+                    GetVirtualScreenRect(vsX, vsY, vsW, vsH);
+                    if ((x2 <= x1 || y2 <= y1)
+                        || (x1 <= vsX + 2 && y1 <= vsY + 2
+                            && x2 >= vsX + vsW - 2 && y2 >= vsY + vsH - 2)) {
+                        x1 = vsX; y1 = vsY; x2 = vsX + vsW; y2 = vsY + vsH;
+                    }
+                }
+                const PreparedFindImageMatch prep = PrepareFindImageMatch(findAct, findTmplScale);
+                if (!prep.bitmap) return empty;
+                ImageMatchOptions opt = prep.options;
+                opt.maxMatches = keep;
+                opt.maxOverlap = 0.5;
+                ImageMatchOutput output;
+                if (lockedScreen_) {
+                    output = FindTemplateInFrozenScreenMulti(
+                        lockedScreen_, lockedVirtX_, lockedVirtY_, x1, y1, x2, y2, prep.bitmap, opt);
+                } else {
+                    output = FindTemplateOnScreenMulti(x1, y1, x2, y2, prep.bitmap, opt);
+                }
+                if (prep.bitmap) DeleteBitmapHandle(prep.bitmap);
+                if (static_cast<int>(output.matches.size()) > keep) {
+                    output.matches.resize(static_cast<size_t>(keep));
+                }
+                return output;
+            };
+            auto ensureWatchPollClock = [&]() {
+                if (watchPollBound != activeActions) {
+                    watchPollBound = activeActions;
+                    const size_t n = activeActions ? activeActions->size() : 0;
+                    // 时间监视第一次立即搜一次，之后按间隔轮询
+                    const auto dueNow = std::chrono::steady_clock::now() - std::chrono::hours(24);
+                    watchPollAt.assign(n, dueNow);
+                }
+            };
+            auto watchPollIntervalSec = [](const ScriptAction& w) -> double {
+                double s = w.watchPollSeconds;
+                if (!(s > 0.0)) s = 1.0;
+                // 低性能模式：轮询下限 50ms → 200ms（占用与轮询频率成正比；
+                // 监视是内部轮询，不像 loop 的 duration 属于用户语义，抬高更安全）
+                const double floorSec = LowPerformanceMode() ? 0.2 : 0.05;
+                if (s < floorSec) s = floorSec;
+                if (s > 3600.0) s = 3600.0;
+                return s;
+            };
+            auto fireImageWatches = [&](bool timedOnly) -> bool {
+                if (imageWatchDepth > 0 || !activeActions) return false;
+                ensureWatchPollClock();
+                const auto now = std::chrono::steady_clock::now();
+                int fired = -1;
+                size_t seen = 0;
+                for (size_t i = 0; i < activeActions->size(); ++i) {
+                    const auto& w = (*activeActions)[i];
+                    if (w.type != ActionType::WatchImage || w.indent != 0) continue;
+                    if (++seen > 8) break;
+                    const bool timeMode = w.watchMode != 0;
+                    if (timedOnly != timeMode) continue;
+                    if (timeMode) {
+                        if (i >= watchPollAt.size()) continue;
+                        const double interval = watchPollIntervalSec(w);
+                        const double elapsed = std::chrono::duration<double>(now - watchPollAt[i]).count();
+                        if (elapsed < interval) continue;
+                        watchPollAt[i] = now;
+                    }
+                    const ImageMatchResult raw = matchScriptImageOnce(w);
+                    const ImageMatchResult match = NormalizeMatchVarResult(
+                        raw, w.matchThreshold, w.perfectMatch);
+                    if (match.found) {
+                        fired = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (fired < 0) return false;
+                ++imageWatchDepth;
+                const size_t bodyEnd = containerBodyEnd(static_cast<size_t>(fired));
+                if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                    AppendDebugLog(L"找图监视命中：第 "
+                        + std::to_wstring((*activeActions)[static_cast<size_t>(fired)].originalNo > 0
+                            ? (*activeActions)[static_cast<size_t>(fired)].originalNo
+                            : fired + 1)
+                        + L" 步");
+                }
+                const RunRangeResult r = runRange(static_cast<size_t>(fired) + 1, bodyEnd);
+                --imageWatchDepth;
+                if (r == RunRangeResult::BreakLoop) pendingBreakLoop = true;
+                if (pendingGoto || pendingBreakLoop) return true;
+                if ((*activeActions)[static_cast<size_t>(fired)].resumeAfterWatch) return true;
+                pendingGoto = bodyEnd;
+                return true;
+            };
+            auto sleepWithTimeWatches = [&](double seconds) {
+                if (seconds <= 0.0 || StopRequested()) return;
+                using clock = std::chrono::steady_clock;
+                auto end = clock::now() + std::chrono::duration_cast<clock::duration>(
+                    std::chrono::duration<double>(seconds));
+                while (!StopRequested() && !BreakoutTriggered()) {
+                    if (fireImageWatches(true)) {
+                        if (pendingGoto || pendingBreakLoop || StopRequested()) return;
+                    }
+                    const auto now = clock::now();
+                    if (now >= end) break;
+                    const double rem = std::chrono::duration<double>(end - now).count();
+                    double slice = rem;
+                    ensureWatchPollClock();
+                    if (activeActions) {
+                        bool anyTime = false;
+                        double soon = rem;
+                        size_t seen = 0;
+                        const auto tnow = clock::now();
+                        for (size_t i = 0; i < activeActions->size(); ++i) {
+                            const auto& w = (*activeActions)[i];
+                            if (w.type != ActionType::WatchImage || w.indent != 0) continue;
+                            if (++seen > 8) break;
+                            if (w.watchMode == 0) continue;
+                            anyTime = true;
+                            if (i >= watchPollAt.size()) continue;
+                            const double interval = watchPollIntervalSec(w);
+                            const double elapsed = std::chrono::duration<double>(tnow - watchPollAt[i]).count();
+                            const double due = (std::max)(0.0, interval - elapsed);
+                            if (due < soon) soon = due;
+                        }
+                        if (anyTime) slice = (std::min)(rem, (std::max)(0.02, soon));
+                    }
+                    SleepInterruptible(slice);
+                }
+            };
+            auto sleepRepeatInterval = [&](const ScriptAction& act, int repeatIndex) -> bool {
+                if (!ShouldWaitAfterRepeat(act, repeatIndex)
+                    || StopRequested() || scheduledYieldLocalStop) {
+                    return pendingGoto || pendingBreakLoop;
+                }
+                sleepWithTimeWatches(quickscript::ScalePlaybackTimeSeconds(
+                    act.duration + RandomDelay(act.randomDuration), playbackTimeScale));
+                return pendingGoto || pendingBreakLoop || StopRequested();
+            };
+            std::function<bool(const ScriptAction&, ImageMatchResult&, int&, int&)> findLocateAnchor;
+            findLocateAnchor = [this, &executeOne, &resolveTemplatePath, &makeVarCtx,
+                &pendingGoto, &pendingBreakLoop](
+                const ScriptAction& src, ImageMatchResult& matchOut, int& tplW, int& tplH) -> bool {
+                matchVars_.erase(L"_qstLocateAnchor");
+                ScriptAction findAct = src;
+                findAct.type = ActionType::FindImage;
+                findAct.findImageFollowUp = 2;
+                findAct.matchVarName = L"_qstLocateAnchor";
+                findAct.offsetX = 0;
+                findAct.offsetY = 0;
+                findAct.nOffsetX = 0;
+                findAct.nOffsetY = 0;
+                findAct.duration = 0;
+                findAct.randomDuration = 0;
+                findAct.timingUs = 0;
+                findAct.clickCount = 1;
+                findAct.imageLocate = false;
+                const std::wstring tplPath = ResolveImagePath(
+                    resolveTemplatePath(src.imageUseVar, src.imagePath));
+                tplW = 0;
+                tplH = 0;
+                HBITMAP tplBmp = LoadBitmapFromFile(tplPath);
+                if (tplBmp) {
+                    BITMAP bm{};
+                    GetObjectW(tplBmp, sizeof(bm), &bm);
+                    tplW = bm.bmWidth;
+                    tplH = bm.bmHeight;
+                    DeleteBitmapHandle(tplBmp);
+                }
+                findAct.imagePath = tplPath.empty() ? src.imagePath : tplPath;
+                findAct.findTimeExpr = L"0";
+                const double findTimeSec = ResolveFindImageTimeSec(src.findTimeExpr, makeVarCtx());
+                const bool loopUntilFound = findTimeSec < 0.0;
+                const auto findStart = std::chrono::steady_clock::now();
+                for (;;) {
+                    if (StopRequested() || pendingGoto || pendingBreakLoop) return false;
+                    executeOne(findAct);
+                    if (StopRequested() || pendingGoto || pendingBreakLoop) return false;
+                    auto it = matchVars_.find(L"_qstLocateAnchor");
+                    if (it != matchVars_.end() && it->second.found) {
+                        matchOut = it->second;
+                        if (tplW <= 0)
+                            tplW = (std::max)(1, matchOut.bottomRightX - matchOut.topLeftX);
+                        if (tplH <= 0)
+                            tplH = (std::max)(1, matchOut.bottomRightY - matchOut.topLeftY);
+                        return true;
+                    }
+                    if (!loopUntilFound) {
+                        if (findTimeSec <= 0.0) return false;
+                        const double elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - findStart).count();
+                        if (elapsed >= findTimeSec) return false;
+                    }
+                    SleepInterruptible(0.05);
+                }
+            };
+
+            auto applyWorkerBreakout = [this](double seconds, bool wmActive) {
+                const double t = (!wmActive && seconds > 0.0) ? seconds : 0.0;
+                workerBreakoutTime_ = t;
+                if (ForegroundInputRouter::Instance().IsHidActive()) {
+                    synthetic_input::SetBreakoutTracking(t > 0.0);
+                }
+            };
+            auto publishRunningWm = [this](const windowmode::WindowModeScriptConfig& cfg) {
+                std::lock_guard<std::mutex> lock(extScriptStateMu_);
+                runningWindowMode_ = cfg;
+            };
+            auto beginWmCfg = [this, &wmExec](
+                const windowmode::WindowModeScriptConfig& cfg,
+                const std::wstring& nestedPath, std::wstring& err) -> bool {
+                windowmode::BeginRunOptions opts;
+                opts.launchTarget = true;
+                opts.cancelFlag = &stopFlag_;
+                const auto slash = nestedPath.find_last_of(L"\\/");
+                opts.launchSearchDir = slash == std::wstring::npos ? L"" : nestedPath.substr(0, slash);
+                return wmExec.BeginRun(cfg, err, opts);
+            };
+            auto captureFgIntoCfg = [this](windowmode::WindowModeScriptConfig& cfg) -> bool {
+                HWND fg = GetForegroundWindow();
+                DWORD pid = 0;
+                if (fg) GetWindowThreadProcessId(fg, &pid);
+                if (!fg || !IsWindow(fg) || pid == 0 || pid == GetCurrentProcessId()) return false;
+                RECT rc{};
+                if (!GetWindowRect(fg, &rc)) return false;
+                const auto info = GetWindowInfoFromPoint(
+                    (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+                if (info.windowClassName.empty() && info.windowTitle.empty()
+                    && info.processPath.empty()) {
+                    return false;
+                }
+                ApplyWindowInfoToConfig(cfg, info);
+                return true;
+            };
+            auto restoreModeFrame = [&](const NestedModeFrame& frame) {
+                if (wmExec.IsActive()) wmExec.EndRun();
+                activeWmCfg = frame.cfg;
+                if (frame.wasActive && frame.cfg.enabled) {
+                    std::wstring err;
+                    const std::wstring restorePath =
+                        frame.launchPath.empty() ? selfPath : frame.launchPath;
+                    if (!beginWmCfg(frame.cfg, restorePath, err)) {
+                        AppendDebugLog(L"嵌套运行结束：恢复主宏窗口模式失败：" + err);
+                        activeWmCfg = windowmode::DefaultWindowModeConfig();
+                        applyWorkerBreakout(frame.breakoutTime, false);
+                        publishRunningWm(activeWmCfg);
+                        wmExec.SetCoordMeta(activeCoordMeta);
+                        return;
+                    }
+                    wmExec.SetCoordMeta(activeCoordMeta);
+                }
+                applyWorkerBreakout(frame.breakoutTime, wmExec.IsActive());
+                publishRunningWm(activeWmCfg);
+            };
+            auto pushNestedUseMode = [&](const ScriptAction& a, const ScriptFileData& nestedData,
+                const std::wstring& nestedPath) -> bool {
+                const int mode = NormalizeNestedUseMode(a.useMode);
+                if (mode == kNestedUseModeInherit) return true;
+                NestedModeFrame frame{
+                    activeWmCfg, wmExec.IsActive(), workerBreakoutTime_, runningScriptPath};
+                if (mode == kNestedUseModeDefault) {
+                    if (wmExec.IsActive()) wmExec.EndRun();
+                    activeWmCfg = windowmode::DefaultWindowModeConfig();
+                    applyWorkerBreakout(a.breakoutTimeSeconds, false);
+                    publishRunningWm(activeWmCfg);
+                    nestedModeStack.push_back(frame);
+                    return true;
+                }
+
+                windowmode::WindowModeScriptConfig cfg = a.nestedWindowMode;
+                cfg.enabled = true;
+                cfg.executionKind = (mode == kNestedUseModeBackground)
+                    ? windowmode::WindowModeExecutionKind::BackgroundWindow
+                    : windowmode::WindowModeExecutionKind::HiddenDesktop;
+                MergeNestedWindowRelative(cfg, nestedData);
+                cfg.selectMethod = windowmode::NormalizeSelectMethod(cfg.selectMethod);
+                using SM = windowmode::WindowSelectMethod;
+                if (cfg.selectMethod == SM::SelectOnStartup) {
+                    if (!captureFgIntoCfg(cfg)) {
+                        AppendDebugLog(L"嵌套运行失败：启动时使用当前所在窗口，但未能获取前台窗口");
+                        return false;
+                    }
+                    cfg.autoLaunchTarget = false;
+                } else {
+                    cfg.autoLaunchTarget = windowmode::ShouldAutoLaunchTarget(cfg);
+                    if (cfg.selectMethod == SM::UseEditorWindowClass
+                        && !NestedWindowModeHasIdentity(cfg)) {
+                        AppendDebugLog(L"嵌套运行失败：请先配置目标窗口类或改用其他选择窗口方式");
+                        return false;
+                    }
+                    if (cfg.selectMethod == SM::NoSelect && cfg.targetExePath.empty()) {
+                        AppendDebugLog(L"嵌套运行失败：不选择窗口时需要目标程序路径");
+                        return false;
+                    }
+                }
+                if (wmExec.IsActive()) wmExec.EndRun();
+                std::wstring wmErr;
+                if (!beginWmCfg(cfg, nestedPath, wmErr)) {
+                    AppendDebugLog(L"嵌套运行失败：窗口模式启动失败 " + wmErr);
+                    restoreModeFrame(frame);
+                    return false;
+                }
+                activeWmCfg = cfg;
+                wmExec.SetCoordMeta(activeCoordMeta);
+                applyWorkerBreakout(0, true);
+                publishRunningWm(activeWmCfg);
+                nestedModeStack.push_back(frame);
+                return true;
+            };
+            auto popNestedUseMode = [&]() {
+                if (nestedModeStack.empty()) return;
+                NestedModeFrame frame = nestedModeStack.back();
+                nestedModeStack.pop_back();
+                restoreModeFrame(frame);
+            };
+            auto runNestedLibrary = [&](const ScriptAction& a, bool isPlayback) {
+                const int useMode = NormalizeNestedUseMode(a.useMode);
+                bool switched = false;
+                for (int i = 0; i < a.clickCount && !StopRequested() && !scheduledYieldLocalStop; ++i) {
+                    std::wstring path = ResolveNestedLibraryTarget(a.targetPath, a.blockName);
+                    if (path.empty() || (!isPlayback && _wcsicmp(path.c_str(), runningScriptPath.c_str()) == 0)) {
+                        if (path.empty()) {
+                            AppendDebugLog(isPlayback
+                                ? L"运行录制回放失败：找不到目标录制（可能已拖入专业模式文件夹）"
+                                : L"运行宏失败：找不到目标脚本（可能已拖入专业模式文件夹）");
+                        }
+                        break;
+                    }
+                    const ScriptFileData nestedData = LoadScriptFileData(path, false);
+                    if (nestedData.actions.empty()) break;
+                    if (i == 0 && useMode != kNestedUseModeInherit) {
+                        if (!pushNestedUseMode(a, nestedData, path)) break;
+                        switched = true;
+                    } else if (switched && useMode != kNestedUseModeDefault) {
+                        MergeNestedWindowRelative(activeWmCfg, nestedData);
+                    }
+                    CoordMeta nestedMeta = ScriptCoordMetaForExecution(nestedData.coordMeta);
+                    std::vector<ScriptAction> nested =
+                        PrepareScriptActionsForExecution(nestedData.actions, nestedMeta);
+                    if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(nested)
+                        || nestedData.inputTimingVersion > 0) {
+                        RepairCompressedRelativeGaps(nested);
+                    }
+                    if (!usesOcr && ScriptUsesTextRecognition(nested)) {
+                        usesOcr = true;
+                        workerUsesOcrVars_ = true;
+                    }
+                    if (usesOcr) holdOcrSession();
+                    const std::vector<ScriptAction>* prevActions = activeActions;
+                    const std::wstring prevPath = runningScriptPath;
+                    const CoordMeta prevCoordMeta = activeCoordMeta;
+                    activeCoordMeta = nestedMeta;
+                    if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
+                    activeActions = &nested;
+                    runningScriptPath = path;
+                    if (inputTimeline.enabled
+                        && (IsRecordingScriptPath(path)
+                            || ScriptIsTimedInputSequence(nested)
+                            || nestedData.inputTimingVersion > 0)) {
+                        inputTimeline.Reset();
+                    }
+                    const double prevScale = playbackTimeScale;
+                    if (isPlayback) {
+                        playbackTimeScale = quickscript::PlaybackTimeScaleAlways(a.playbackSpeed);
+                    }
+                    runRange(0, nested.size());
+                    if (isPlayback) playbackTimeScale = prevScale;
+                    activeActions = prevActions;
+                    runningScriptPath = prevPath;
+                    activeCoordMeta = prevCoordMeta;
+                    if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
+                    if (sleepRepeatInterval(a, i)) {
+                        if (switched) popNestedUseMode();
+                        return;
+                    }
+                }
+                if (switched) popNestedUseMode();
+            };
+
+            // 找图/OCR「移动/点击」成功后，后续鼠标点击应落在该点。
+            // 编辑器「鼠标点击」不展示坐标，改动作类型时却常带上旧 x/y，会从找图落点飞走。
+            // 远程桌面/真人鼠标会在等待间隙把系统光标拖走，必须记住落点并在每次点击前重新落到该点，
+            // 不能只点 GetCursorPos「当前位置」。
+            bool keepCursorAtFind = false;
+            int lastFindX = 0;
+            int lastFindY = 0;
+            bool loggedRdpFindPin_ = false;
+            auto applyFindCursor = [&](int tx, int ty, bool click, MouseButtonType btn,
+                const ScriptAction& act) -> bool {
+                keepCursorAtFind = true;
+                lastFindX = tx;
+                lastFindY = ty;
+                if (!click) {
+                    wmSetLivePos(tx, ty, 0, 0);
+                    return false;
+                }
+                if (!wmUsesTarget()) activateDesktopAt(tx, ty);
+                const int n = std::max(1, act.clickCount);
+                for (int i = 0; i < n && !StopRequested(); ++i) {
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
+                    if (wmUsesTarget()) {
+                        wmSetLivePos(tx, ty, 0, 0);
+                        wmExecPtr->PostMouseClickAtClient(tx, ty, btn, false);
+                    } else {
+                        SendMouseClickAtScreen(tx, ty, btn);
+                    }
+                    if (markSim) UnmarkSimulatedInput();
+                    if (i == 0 && appSettings_.playback.autoOutputKeyFunctionDebug && !wmUsesTarget()) {
+                        POINT cur{};
+                        GetCursorPos(&cur);
+                        HWND hit = WindowFromPoint(POINT{tx, ty});
+                        HWND root = hit ? GetAncestor(hit, GA_ROOT) : nullptr;
+                        wchar_t cls[160]{};
+                        if (root) GetClassNameW(root, cls, 160);
+                        wchar_t buf[384]{};
+                        swprintf_s(buf,
+                            L"找图点击 目标=(%d,%d) 光标=(%d,%d) 窗口=%s",
+                            tx, ty, cur.x, cur.y, cls[0] ? cls : L"(无)");
+                        AppendDebugLog(buf);
+                        if (cur.x != tx || cur.y != ty) {
+                            AppendDebugLog(
+                                L"光标未能落到找图点（游戏锁定/裁剪光标，或远程桌面把鼠标拖走了）");
+                        }
+                    }
+                    if (sleepRepeatInterval(act, i)) return true;
+                }
+                return false;
+            };
+
+            executeOne = [this, &usesOcr, &holdOcrSession, &heldKeyVk, &heldKeys, &runRange, &runningScriptPath, &activeActions, &lockedScreen_, &lockedVirtX_, &lockedVirtY_, &clearLockedScreen, &makeVarCtx, &resolveTemplatePath, &executeOne, &runAiActionExecute, &aiSessions, &aiLoopDepth, &pendingBreakLoop, wmExecPtr, &wmSetPos, &wmSetLivePos, &wmSendKey, &wmSendHeldModifiers, &wmMouseButton, &wmMouseClick, &activateDesktopAt, &wmSendShortcut, &isImeToggleShortcut, &wmUsesTarget, &wmUsesBackground, &activeCoordMeta, &currentTmplScale, execTargetW, execTargetH, &inputTimeline, &waitAbsoluteTimeline, &wmAbortIfTargetLost, &playbackTimeScale, imageVarRunId, &scheduledYieldDepth, &scheduledYieldLocalStop, &fireImageWatches, &sleepWithTimeWatches, &sleepRepeatInterval, &pendingGoto, &findLocateAnchor, &matchScriptImageAll, &runNestedLibrary, &keepCursorAtFind, &lastFindX, &lastFindY, &loggedRdpFindPin_, &applyFindCursor](const ScriptAction& a) {
                 if (StopRequested() || scheduledYieldLocalStop || wmAbortIfTargetLost()) return;
+                if (fireImageWatches(true)) {
+                    if (pendingGoto || pendingBreakLoop) return;
+                }
                 executedSteps_.fetch_add(1, std::memory_order_relaxed);
                 // 兼容未 Normalize 的旧内存对象：瞬时类仍可能带前延迟
                 if (inputTimeline.enabled && a.randomDuration <= 1e-12) {
                     const bool durationIsInterval =
                         a.type == ActionType::Wait
+                        || a.type == ActionType::MouseDrag
                         || ActionUsesInterRepeatInterval(a.type);
                     if (!durationIsInterval && (a.timingUs > 0 || a.duration > 1e-9)) {
                         waitAbsoluteTimeline(a.duration, a.timingUs);
@@ -2604,9 +5116,41 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     && a.type != ActionType::KeyUp
                     && a.type != ActionType::FindImage
                     && a.type != ActionType::TextRecognition) {
-                    AppendDebugLog(FormatGenericActionDebug(a));
+                    if (keepCursorAtFind && !a.moveFromVar
+                        && (a.type == ActionType::MouseClick
+                            || a.type == ActionType::MouseDown
+                            || a.type == ActionType::MouseUp)) {
+                        wchar_t pinBuf[256]{};
+                        if (wmUsesTarget()) {
+                            int ccx = 0, ccy = 0;
+                            if (wmExecPtr && wmExecPtr->GetCursorClientPos(ccx, ccy)) {
+                                swprintf_s(pinBuf,
+                                    L"（沿用找图/OCR落点，软光标=(%d,%d)，重新落到(%d,%d)）",
+                                    ccx, ccy, lastFindX, lastFindY);
+                            } else {
+                                swprintf_s(pinBuf, L"（沿用找图/OCR落点，重新落到(%d,%d)）",
+                                    lastFindX, lastFindY);
+                            }
+                        } else {
+                            POINT cur{};
+                            GetCursorPos(&cur);
+                            swprintf_s(pinBuf,
+                                L"（沿用找图/OCR落点，当前光标=(%d,%d)，重新落到(%d,%d)）",
+                                cur.x, cur.y, lastFindX, lastFindY);
+                        }
+                        AppendDebugLog(FormatGenericActionDebug(a) + pinBuf);
+                        if (!loggedRdpFindPin_ && GetSystemMetrics(SM_REMOTESESSION)) {
+                            loggedRdpFindPin_ = true;
+                            AppendDebugLog(
+                                L"当前是远程桌面会话：找图后的点击会重新落到找图点；"
+                                L"遥控时请勿在对端画面上移动/点击鼠标（会把系统光标拖走）");
+                        }
+                    } else {
+                        AppendDebugLog(FormatGenericActionDebug(a));
+                    }
                 }
                 if (a.type == ActionType::MoveMouse) {
+                    keepCursorAtFind = false;
                     int x = a.x;
                     int y = a.y;
                     if (a.moveFromVar) {
@@ -2626,6 +5170,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     wmSetPos(x, y, rx, ry);
                 }
                 else if (a.type == ActionType::MoveMouseRelative) {
+                    keepCursorAtFind = false;
                     const bool recordingReplay = IsRecordingScriptPath(runningScriptPath);
                     const int dx = a.x + (recordingReplay ? 0 : RandomInt(a.randomX));
                     const int dy = a.y + (recordingReplay ? 0 : RandomInt(a.randomY));
@@ -2648,7 +5193,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         const double waitSec = quickscript::ScalePlaybackTimeSeconds(
                             a.duration + RandomDelay(a.randomDuration), playbackTimeScale);
                         if (waitSec > 0.0) {
-                            SleepInterruptible(waitSec);
+                            sleepWithTimeWatches(waitSec);
                             if (inputTimeline.enabled) inputTimeline.Reset();
                         }
                     } else if (a.timingUs > 0) {
@@ -2656,6 +5201,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     } else if (a.duration > 0.0) {
                         waitAbsoluteTimeline(a.duration, 0);
                     }
+                    if (pendingGoto || pendingBreakLoop) return;
                     if (KeyFunctionDebugActive()) {
                         AppendDeferredWaitDebug(a,
                             inputTimeline.enabled
@@ -2664,21 +5210,59 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     }
                 }
                 else if (a.type == ActionType::MouseDown) {
-                    MarkSimulatedInput();
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
                     wmSendHeldModifiers(a, true);
-                    wmMouseButton(a.x, a.y, a.button, true);
-                    UnmarkSimulatedInput();
+                    if (keepCursorAtFind && !a.moveFromVar) {
+                        if (wmUsesTarget()) {
+                            wmSetLivePos(lastFindX, lastFindY, 0, 0);
+                            wmExecPtr->PostMouseButtonAtClient(lastFindX, lastFindY, a.button, true, false);
+                        } else {
+                            activateDesktopAt(lastFindX, lastFindY);
+                            SendMouseMoveAbsoluteScreen(lastFindX, lastFindY);
+                            wmMouseButton(lastFindX, lastFindY, a.button, true);
+                        }
+                    } else {
+                        wmMouseButton(a.x, a.y, a.button, true);
+                    }
+                    if (markSim) UnmarkSimulatedInput();
                 }
                 else if (a.type == ActionType::MouseUp) {
-                    MarkSimulatedInput();
-                    wmMouseButton(a.x, a.y, a.button, false);
+                    const bool markSim = !wmUsesTarget();
+                    if (markSim) MarkSimulatedInput();
+                    if (keepCursorAtFind && !a.moveFromVar) {
+                        if (wmUsesTarget()) {
+                            wmSetLivePos(lastFindX, lastFindY, 0, 0);
+                            wmExecPtr->PostMouseButtonAtClient(lastFindX, lastFindY, a.button, false, false);
+                        } else {
+                            activateDesktopAt(lastFindX, lastFindY);
+                            SendMouseMoveAbsoluteScreen(lastFindX, lastFindY);
+                            wmMouseButton(lastFindX, lastFindY, a.button, false);
+                        }
+                    } else {
+                        wmMouseButton(a.x, a.y, a.button, false);
+                    }
                     wmSendHeldModifiers(a, false);
-                    UnmarkSimulatedInput();
+                    if (markSim) UnmarkSimulatedInput();
                 }
                 else if (a.type == ActionType::MouseClick) for (int i = 0; i < a.clickCount && !StopRequested(); ++i) {
                     int cx = a.x;
                     int cy = a.y;
-                    if (a.x != 0 || a.y != 0) {
+                    bool clickAtFind = false;
+                    if (a.moveFromVar) {
+                        keepCursorAtFind = false;
+                        MacroVariableContext ctx = makeVarCtx();
+                        if (!TryResolveIntOperand(a.moveVarExprX, ctx, cx)) cx = 0;
+                        if (!TryResolveIntOperand(a.moveVarExprY, ctx, cy)) cy = 0;
+                        wmSetPos(cx, cy, a.randomX, a.randomY);
+                        cx = cx + RandomInt(a.randomX);
+                        cy = cy + RandomInt(a.randomY);
+                    } else if (keepCursorAtFind) {
+                        // 找图/OCR 落点；每次点击前重钉，避免远程桌面/真人鼠标把光标拖走。
+                        cx = lastFindX;
+                        cy = lastFindY;
+                        clickAtFind = true;
+                    } else if (a.x != 0 || a.y != 0) {
                         wmSetPos(a.x, a.y, a.randomX, a.randomY);
                         cx = a.x + RandomInt(a.randomX);
                         cy = a.y + RandomInt(a.randomY);
@@ -2687,18 +5271,102 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     const bool markSim = !wmUsesTarget();
                     if (markSim) MarkSimulatedInput();
                     wmSendHeldModifiers(a, true);
-                    wmMouseClick(cx, cy, a.button);
+                    if (clickAtFind && wmUsesTarget())
+                        wmExecPtr->PostMouseClickAtClient(cx, cy, a.button, false);
+                    else
+                        wmMouseClick(cx, cy, a.button);
                     wmSendHeldModifiers(a, false);
                     if (markSim) UnmarkSimulatedInput();
                     // duration=两次重复之间的间隔；执行 1 次时不等待，首前/末后也不插等待
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested()) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
+                    if (sleepRepeatInterval(a, i)) return;
+                }
+                else if (a.type == ActionType::MouseDrag) {
+                    keepCursorAtFind = false;
+                    int sx = a.x + RandomInt(a.randomX);
+                    int sy = a.y + RandomInt(a.randomY);
+                    int ex = a.endX + RandomInt(a.randomEndX);
+                    int ey = a.endY + RandomInt(a.randomEndY);
+                    bool skipDrag = false;
+                    if (a.imageLocate) {
+                        ImageMatchResult loc{};
+                        int tplW = 0, tplH = 0;
+                        if (!findLocateAnchor(a, loc, tplW, tplH)) {
+                            skipDrag = true;
+                        } else {
+                            const double nsx = a.x / static_cast<double>(tplW);
+                            const double nsy = a.y / static_cast<double>(tplH);
+                            const double nex = a.endX / static_cast<double>(tplW);
+                            const double ney = a.endY / static_cast<double>(tplH);
+                            const TemplateScale dragScale = currentTmplScale();
+                            ResolveFindImageClickPoint(loc, tplW, tplH, nsx, nsy,
+                                dragScale, false, sx, sy);
+                            ResolveFindImageClickPoint(loc, tplW, tplH, nex, ney,
+                                dragScale, false, ex, ey);
+                            sx += RandomInt(a.randomX);
+                            sy += RandomInt(a.randomY);
+                            ex += RandomInt(a.randomEndX);
+                            ey += RandomInt(a.randomEndY);
+                        }
+                    }
+                    if (!skipDrag) {
+                        const bool markSim = !wmUsesTarget();
+                        auto lift = [&]() {
+                            if (markSim) MarkSimulatedInput();
+                            wmMouseButton(ex, ey, a.button, false);
+                            wmSendHeldModifiers(a, false);
+                            if (markSim) UnmarkSimulatedInput();
+                        };
+                        if (markSim) MarkSimulatedInput();
+                        wmSendHeldModifiers(a, true);
+                        wmSetLivePos(sx, sy, 0, 0);
+                        wmMouseButton(sx, sy, a.button, true);
+                        if (markSim) UnmarkSimulatedInput();
+                        const double dragSec = std::max(0.0, quickscript::ScalePlaybackTimeSeconds(
                             a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
+                        if (dragSec > 1e-4) {
+                            // 按「按下→松开」墙钟插值。旧实现每步 Sleep(时长/步数)，
+                            // SendInput/投递耗时叠在间隔外，实际总比设定慢一截。
+                            using clock = std::chrono::steady_clock;
+                            const auto t0 = clock::now();
+                            const auto tEnd = t0 + std::chrono::duration_cast<clock::duration>(
+                                std::chrono::duration<double>(dragSec));
+                            int lastPx = sx;
+                            int lastPy = sy;
+                            while (!StopRequested() && !wmAbortIfTargetLost()) {
+                                const auto now = clock::now();
+                                double u = 1.0;
+                                if (now < tEnd && dragSec > 1e-12) {
+                                    u = std::chrono::duration<double>(now - t0).count() / dragSec;
+                                    if (u < 0.0) u = 0.0;
+                                    if (u > 1.0) u = 1.0;
+                                }
+                                const int px = sx + static_cast<int>(std::lround((ex - sx) * u));
+                                const int py = sy + static_cast<int>(std::lround((ey - sy) * u));
+                                if (px != lastPx || py != lastPy) {
+                                    wmSetLivePos(px, py, 0, 0);
+                                    lastPx = px;
+                                    lastPy = py;
+                                }
+                                if (u >= 1.0 || now >= tEnd) break;
+                                const double remSec = std::chrono::duration<double>(
+                                    tEnd - clock::now()).count();
+                                if (remSec <= 0.0) break;
+                                SleepInterruptible((std::min)(remSec, 1.0 / 120.0));
+                            }
+                            if ((lastPx != ex || lastPy != ey)
+                                && !StopRequested() && !wmAbortIfTargetLost()) {
+                                wmSetLivePos(ex, ey, 0, 0);
+                            }
+                        } else {
+                            wmSetLivePos(ex, ey, 0, 0);
+                        }
+                        lift();
                     }
                 }
                 else if (a.type == ActionType::KeyDown) {
+                    const UINT playVk = NormalizeScriptKeyVk(a.keyVk, a.keyText);
                     // 已按住再 KeyDown = 录制自动重复；精密回放跳过注入，避免向游戏灌重复 KEYDOWN
-                    if (inputTimeline.enabled && heldKeys.count(a.keyVk)) {
+                    if (inputTimeline.enabled && heldKeys.count(playVk)) {
                         if (KeyFunctionDebugActive() && !DeferredDetailDebugDropped()) {
                             AppendDebugLog(FormatGenericActionDebug(a) + L" (已按住，跳过)");
                         }
@@ -2709,25 +5377,27 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         const bool markSim = !wmUsesTarget();
                         if (markSim) MarkSimulatedInput();
                         wmSendHeldModifiers(a, true);
-                        wmSendKey(a.keyVk, true);
-                        heldKeyVk = a.keyVk;
-                        heldKeys.insert(a.keyVk);
+                        wmSendKey(playVk, true);
+                        heldKeyVk = playVk;
+                        heldKeys.insert(playVk);
                         if (markSim) UnmarkSimulatedInput();
                     }
                 }
                 else if (a.type == ActionType::KeyUp) {
+                    const UINT playVk = NormalizeScriptKeyVk(a.keyVk, a.keyText);
                     if (KeyFunctionDebugActive() && !DeferredDetailDebugDropped()) {
                         AppendDebugLog(FormatGenericActionDebug(a));
                     }
                     const bool markSim = !wmUsesTarget();
                     if (markSim) MarkSimulatedInput();
-                    wmSendKey(a.keyVk, false);
-                    if (heldKeyVk == a.keyVk) heldKeyVk = 0;
-                    heldKeys.erase(a.keyVk);
+                    wmSendKey(playVk, false);
+                    if (heldKeyVk == playVk) heldKeyVk = 0;
+                    heldKeys.erase(playVk);
                     wmSendHeldModifiers(a, false);
                     if (markSim) UnmarkSimulatedInput();
                 }
                 else if (a.type == ActionType::KeyClick) for (int i = 0; i < a.clickCount && !StopRequested(); ++i) {
+                    const UINT playVk = NormalizeScriptKeyVk(a.keyVk, a.keyText);
                     const bool markSim = !wmUsesTarget();
                     if (markSim) MarkSimulatedInput();
                     // 表格导航键/ASCII 键前先切英文 IME：中文组合窗会把 Enter/Tab/Home 吃掉
@@ -2740,14 +5410,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     // 收不到 Unicode 事件，导致「按键点击失效」（鼠标正常、按键无反应）。
                     // 文字输入请用 quickInput（走 Unicode，天然绕开中文 IME）。
                     wmSendHeldModifiers(a, true);
-                    wmSendKey(a.keyVk, true);
-                    wmSendKey(a.keyVk, false);
+                    wmSendKey(playVk, true);
+                    wmSendKey(playVk, false);
                     wmSendHeldModifiers(a, false);
                     if (markSim) UnmarkSimulatedInput();
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested()) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                            a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
-                    }
+                    if (sleepRepeatInterval(a, i)) return;
                 }
                 else if (a.type == ActionType::HotkeyShortcut) for (int i = 0; i < a.clickCount && !StopRequested(); ++i) {
                     const bool markSim = !wmUsesTarget();
@@ -2757,14 +5424,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     }
                     wmSendShortcut(a);
                     if (markSim) UnmarkSimulatedInput();
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested()) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                            a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
-                    }
+                    if (sleepRepeatInterval(a, i)) return;
                 }
                 else if (a.type == ActionType::QuickInput) for (int i = 0; i < a.clickCount && !StopRequested(); ++i) {
                     // 不在整段输入期间持有 MarkSimulatedInput：否则热键停止会被 ShouldIgnoreHotkeyStop 挡住。
-                    // 注入键由 LL 钩子过滤 LLKHF_INJECTED；字间轮询 stopFlag_
+                    // 注入键由 LL 钩子按 ExtraInfo 标签过滤（远控 INJECTED 仍可停）；字间轮询 stopFlag_
                     // （紧急停会经 ghWorkerCancelFlag 一并置位）以便立即终止。
                     const std::wstring text = ResolveQuickInputText(a.inputText, a.parseEscapes);
                     if (text.empty() && !Trim(a.inputText).empty()) {
@@ -2791,10 +5455,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             quickscript::ScalePlaybackTimeSeconds(a.charInterval, playbackTimeScale),
                             &stopFlag_);
                     }
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested()) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                            a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
-                    }
+                    if (sleepRepeatInterval(a, i)) return;
                 }
                 else if (a.type == ActionType::ScrollWheel) for (int i = 0; i < a.clickCount && !StopRequested(); ++i) {
                     MarkSimulatedInput();
@@ -2816,10 +5477,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         }
                     }
                     UnmarkSimulatedInput();
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested()) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                            a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
-                    }
+                    if (sleepRepeatInterval(a, i)) return;
                 }
                 else if (a.type == ActionType::FindImage) {
                     // 找图/保存图片时隐藏本软件窗口（主界面+调试输出窗）：
@@ -2835,16 +5493,31 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
 
                     // ── 后续操作：保存图片 ──
                     if (a.findImageFollowUp == 3) {
+                      const double saveImgFindTimeSec = hasTemplate
+                          ? ResolveFindImageTimeSec(a.findTimeExpr, makeVarCtx())
+                          : 0.0;
+                      const bool saveImgLoopUntilFound = hasTemplate && saveImgFindTimeSec < 0.0;
+                      auto saveImgFindStart = std::chrono::steady_clock::now();
+                      for (;;) {
                         const std::wstring saveTarget = a.matchVarName.empty() ? L"image" : a.matchVarName;
                         int capX1 = 0, capY1 = 0, capX2 = 0, capY2 = 0;
                         bool regionOk = false;
                         ImageMatchResult lastRawMatch{};
 
                         if (!hasTemplate) {
-                            if (a.searchFullScreen) {
+                            if (wmUsesTarget()) {
+                                int cx1 = 0, cy1 = 0, cx2 = 0, cy2 = 0;
+                                ScriptAction probe = a;
+                                if (wmExecPtr->ResolveClientSearchRect(probe, cx1, cy1, cx2, cy2)
+                                    && wmExecPtr->MapClientRect(cx1, cy1, cx2, cy2,
+                                        capX1, capY1, capX2, capY2)) {
+                                    regionOk = true;
+                                }
+                            } else if (a.searchFullScreen) {
                                 int sx = 0, sy = 0, sw = 0, sh = 0;
                                 GetVirtualScreenRect(sx, sy, sw, sh);
                                 capX1 = sx; capY1 = sy; capX2 = sx + sw; capY2 = sy + sh;
+                                regionOk = (capX2 > capX1 && capY2 > capY1);
                             } else {
                                 capX1 = a.searchX1; capY1 = a.searchY1;
                                 capX2 = a.searchX2; capY2 = a.searchY2;
@@ -2854,15 +5527,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                     GetVirtualScreenRect(sx, sy, sw, sh);
                                     capX1 = sx; capY1 = sy; capX2 = sx + sw; capY2 = sy + sh;
                                 }
-                            }
-                            regionOk = (capX2 > capX1 && capY2 > capY1);
-                            if (wmUsesTarget() && regionOk) {
-                                int cx1 = 0, cy1 = 0, cx2 = 0, cy2 = 0;
-                                ScriptAction probe = a;
-                                if (wmExecPtr->ResolveClientSearchRect(probe, cx1, cy1, cx2, cy2)
-                                    && wmExecPtr->MapClientRect(cx1, cy1, cx2, cy2, capX1, capY1, capX2, capY2)) {
-                                    regionOk = true;
-                                }
+                                regionOk = (capX2 > capX1 && capY2 > capY1);
                             }
                         } else {
                             // 有模板：找锚图 → ApplyImageRegion → 截图区
@@ -2894,7 +5559,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 HBITMAP tmpl = LoadBitmapFromFile(findAct.imagePath);
                                 if (tmpl) {
                                     ImageMatchOptions opt = BuildExecutionFindImageOptions(findAct, findTmplScale);
-                                    opt.maxMatches = 20;
+                                    RestrictFindImageToSingleAnchor(opt);
                                     opt.maxOverlap = 0.5;
                                     ImageMatchOutput output;
                                     if (lockedScreen_) {
@@ -2937,9 +5602,31 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 DeleteBitmapHandle(bmp);
                             }
                         }
-                        if (appSettings_.playback.autoOutputKeyFunctionDebug) {
-                            AppendDebugLog(FormatFindImageDebug(a, lastRawMatch, regionOk, 0, 0));
+                        if (fireImageWatches(false) || fireImageWatches(true)) {
+                            if (pendingGoto || pendingBreakLoop) break;
+                            if (hasTemplate) {
+                                saveImgFindStart = std::chrono::steady_clock::now();
+                            }
+                            continue;
                         }
+                        bool saveImgDone = regionOk || !hasTemplate;
+                        if (!saveImgDone && !saveImgLoopUntilFound) {
+                            if (saveImgFindTimeSec <= 0.0) {
+                                saveImgDone = true;
+                            } else {
+                                const double elapsed = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - saveImgFindStart).count();
+                                if (elapsed >= saveImgFindTimeSec) saveImgDone = true;
+                            }
+                        }
+                        if (saveImgDone || StopRequested() || BreakoutTriggered()) {
+                            if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                                AppendDebugLog(FormatFindImageDebug(a, lastRawMatch, regionOk, 0, 0));
+                            }
+                            break;
+                        }
+                        SleepInterruptible(0.05);
+                      }
                     } else {
                     // 窗口/后台模式也必须 Prepare：偏移 nOffset 依赖 templateW/H。
                     // 若这里留空，ResolveFindImageClickPoint 会把偏移算成 0（落在中心）。
@@ -2956,9 +5643,10 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 && output.matches.empty()) {
                                 wchar_t buf[320]{};
                                 swprintf_s(buf,
-                                    L"找图诊断(窗口模式) 无匹配 %dms bestNcc=%.1f%% "
+                                    L"找图诊断(窗口模式) 无匹配 %dms bestNcc=%.1f%% pixelAgree=%.1f%% "
                                     L"（应走扩展/客户区；若见全屏找图调试则窗口模式未激活）",
-                                    output.elapsedMs, output.debugBestNccPercent);
+                                    output.elapsedMs, output.debugBestNccPercent,
+                                    output.debugBestPixelAgreePercent);
                                 AppendDebugLog(buf);
                             }
                             if (output.matches.empty()) return {};
@@ -2980,9 +5668,9 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         } else {
                             int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
                             GetVirtualScreenRect(vsX, vsY, vsW, vsH);
-                            // 搜索区域为空/倒置（含全 0 的未配置状态）时回退整屏：
-                            // 与 Web 编辑器「测试」和窗口模式 ResolveClientSearchRect 语义一致，
+                            // 默认模式：搜索区域为空/倒置（含全 0）时回退整屏，
                             // 否则运行期会在 0 面积区域上找图，rawCandidates=0 永远匹配不到。
+                            // 窗口模式不走这里，由 FindImageClient / ResolveClientSearchRect 用全客户区。
                             if ((x2 <= x1 || y2 <= y1)
                                 || (x1 <= vsX + 2 && y1 <= vsY + 2
                                     && x2 >= vsX + vsW - 2 && y2 >= vsY + vsH - 2)) {
@@ -3015,7 +5703,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 lockedScreen_ ? 1 : 0);
                             AppendDebugLog(buf);
                         }
-                        opt.maxMatches = 20;
+                        RestrictFindImageToSingleAnchor(opt);
                         opt.maxOverlap = 0.5;
                         auto doMatch = [&](HBITMAP bmp, const ImageMatchOptions& matchOpt) -> ImageMatchOutput {
                             if (lockedScreen_) {
@@ -3024,9 +5712,66 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             }
                             return FindTemplateOnScreenMulti(x1, y1, x2, y2, bmp, matchOpt);
                         };
-                        ImageMatchOutput output = doMatch(tmpl, opt);
-                        lastFindMs = output.elapsedMs;
-
+                        // ── 快速路径：上一帧命中点周围的小窗口本地复核 ──
+                        // 只在「同一请求 + 上一帧搜索很慢（区域找图不值得）+ 命中新鲜」时尝试；
+                        // 过了就直接用，没过**当场回退全屏搜索**（所以精度上限不变，
+                        // 最坏只是多花一次小窗口的时间）。窗口内找不到/分数余量不足都会回退。
+                        const FindImageFastPathParams fastParams{};
+                        const std::wstring fastKey = (!wmUsesTarget() && !a.windowRelative)
+                            ? FindImageFastPathKey(findAct.imagePath, opt, x1, y1, x2, y2,
+                                  findPrep.templateW, findPrep.templateH, execTargetW, execTargetH)
+                            : std::wstring();
+                        ImageMatchOutput output;
+                        bool fastAccepted = false;
+                        if (!fastKey.empty()) {
+                            const auto it = g_findImageFastPath.find(fastKey);
+                            if (it != g_findImageFastPath.end()) {
+                                const long long ageMs = std::chrono::duration_cast<
+                                    std::chrono::milliseconds>(std::chrono::steady_clock::now()
+                                        - it->second.at).count();
+                                int wx1 = 0, wy1 = 0, wx2 = 0, wy2 = 0;
+                                if (PlanFindImageFastPath(fastParams, x1, y1, x2, y2,
+                                        it->second.prevTLX, it->second.prevTLY,
+                                        it->second.tplW, it->second.tplH,
+                                        it->second.lastFullSearchMs, ageMs, wx1, wy1, wx2, wy2)) {
+                                    ImageMatchOutput fastOut;
+                                    if (lockedScreen_) {
+                                        fastOut = FindTemplateInFrozenScreenMulti(
+                                            lockedScreen_, lockedVirtX_, lockedVirtY_,
+                                            wx1, wy1, wx2, wy2, tmpl, opt);
+                                    } else {
+                                        fastOut = FindTemplateOnScreenMulti(wx1, wy1, wx2, wy2, tmpl, opt);
+                                    }
+                                    if (!fastOut.matches.empty()) {
+                                        const ImageMatchResult& fm = fastOut.matches.front();
+                                        if (AcceptFindImageFastPathHit(fastParams,
+                                                it->second.prevTLX, it->second.prevTLY,
+                                                fm.topLeftX, fm.topLeftY,
+                                                opt.thresholdPercent, fm.score)) {
+                                            output = fastOut;
+                                            fastAccepted = true;
+                                            lastFindMs = fastOut.elapsedMs;
+                                            if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                                                wchar_t buf[256]{};
+                                                swprintf_s(buf,
+                                                    L"找图快速路径 命中 %dms（上次全屏 %dms）tl=(%d,%d) "
+                                                    L"score=%.1f 漂移=(%d,%d)",
+                                                    fastOut.elapsedMs,
+                                                    static_cast<int>(it->second.lastFullSearchMs),
+                                                    fm.topLeftX, fm.topLeftY, fm.score,
+                                                    fm.topLeftX - it->second.prevTLX,
+                                                    fm.topLeftY - it->second.prevTLY);
+                                                AppendDebugLog(buf);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (!fastAccepted) {
+                            output = doMatch(tmpl, opt);
+                            lastFindMs = output.elapsedMs;
+                        }
                         // 宽高比变化时：仅当 NCC 还有希望时再试非等比拉伸
                         const bool aspectChanged =
                             std::abs(findTmplScale.sx - findTmplScale.sy) > 0.02;
@@ -3061,9 +5806,10 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
 
                         if (appSettings_.playback.autoOutputKeyFunctionDebug && output.matches.empty()) {
                             wchar_t buf[320]{};
-                            swprintf_s(buf,
-                                L"找图诊断 无共识匹配 %dms rawCandidates=%d bestNcc=%.1f%%",
-                                output.elapsedMs, output.debugRawCandidates, output.debugBestNccPercent);
+                                swprintf_s(buf,
+                                    L"找图诊断 无共识匹配 %dms rawCandidates=%d bestNcc=%.1f%% pixelAgree=%.1f%%",
+                                    output.elapsedMs, output.debugRawCandidates, output.debugBestNccPercent,
+                                    output.debugBestPixelAgreePercent);
                             AppendDebugLog(buf);
                             // 模板过大提示：整屏/大区域模板对光标、时钟、消息等任何微小变化都敏感，
                             // 阈值越高越容易「无共识」→ 循环里反复触发后续动作烧 API。
@@ -3082,7 +5828,27 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 AppendDebugLog(warn);
                             }
                         }
-                        if (output.matches.empty()) return {};
+                        if (output.matches.empty()) {
+                            // 全屏也没找到 → 旧命中已失效，别让下一步再白试小窗口
+                            if (!fastKey.empty()) g_findImageFastPath.erase(fastKey);
+                            return {};
+                        }
+                        // 记下这一帧的命中，供下次同请求做本地复核。
+                        // 快速路径命中时保留上次的全屏耗时（它代表「这个请求本来就慢」），
+                        // 全屏命中时刷新为本次耗时。
+                        if (!fastKey.empty()) {
+                            FindImageFastPathEntry& entry = g_findImageFastPath[fastKey];
+                            entry.prevTLX = output.matches.front().topLeftX;
+                            entry.prevTLY = output.matches.front().topLeftY;
+                            entry.tplW = findPrep.templateW;
+                            entry.tplH = findPrep.templateH;
+                            entry.at = std::chrono::steady_clock::now();
+                            if (!fastAccepted) entry.lastFullSearchMs = output.elapsedMs;
+                            if (g_findImageFastPath.size() > kFindImageFastPathMaxEntries) {
+                                g_findImageFastPath.clear();
+                                g_findImageFastPath[fastKey] = entry;
+                            }
+                        }
                         return output.matches.front();
                     };
                     ImageMatchResult lastRawMatch{};
@@ -3091,16 +5857,27 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     // 找图时限按脚本原值（含正数），不随回放倍速缩放
                     const double findTimeSec = ResolveFindImageTimeSec(a.findTimeExpr, makeVarCtx());
                     const bool loopUntilFound = findTimeSec < 0.0;
-                    const auto findStart = std::chrono::steady_clock::now();
+                    auto findStart = std::chrono::steady_clock::now();
                     do {
                         const ImageMatchResult rawMatch = runFind();
                         lastRawMatch = rawMatch;
+                        if (fireImageWatches(false) || fireImageWatches(true)) {
+                            if (pendingGoto || pendingBreakLoop) break;
+                            findStart = std::chrono::steady_clock::now();
+                            continue;
+                        }
                         const ImageMatchResult match = NormalizeMatchVarResult(
                             rawMatch, a.matchThreshold, a.perfectMatch);
                         if (a.findImageFollowUp == 2) {
                             const std::wstring varName = a.matchVarName.empty() ? L"matchRet" : a.matchVarName;
                             matchVars_[varName] = match;
-                            break;
+                            if (match.found) break;
+                            else if (!loopUntilFound) {
+                                if (findTimeSec <= 0.0) break;
+                                const double elapsed = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - findStart).count();
+                                if (elapsed >= findTimeSec) break;
+                            }
                         } else if (match.found) {
                             int tx = 0, ty = 0;
                             ResolveFindImageClickPoint(match, findPrep.templateW, findPrep.templateH,
@@ -3112,13 +5889,6 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             if (appSettings_.playback.autoOutputKeyFunctionDebug) {
                                 int cx = 0, cy = 0;
                                 FindImageMatchCenter(match, cx, cy);
-                                const bool scaledTpl = findPrep.templatePreScaled || findUsedAnamorphic;
-                                const int scaledOffX = static_cast<int>(std::round(
-                                    a.nOffsetX * findPrep.templateW
-                                    * (scaledTpl ? findTmplScale.sx : match.scale)));
-                                const int scaledOffY = static_cast<int>(std::round(
-                                    a.nOffsetY * findPrep.templateH
-                                    * (scaledTpl ? findTmplScale.sy : match.scale)));
                                 int vsX = 0, vsY = 0, vsW = 0, vsH = 0;
                                 GetVirtualScreenBounds(vsX, vsY, vsW, vsH);
                                 wchar_t buf[640]{};
@@ -3134,19 +5904,15 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                     cx, cy,
                                     vsW > 0 ? (cx - vsX) / static_cast<double>(vsW) : 0.0,
                                     vsH > 0 ? (cy - vsY) / static_cast<double>(vsH) : 0.0,
-                                    a.nOffsetX, a.nOffsetY, scaledOffX, scaledOffY, tx, ty);
+                                    a.nOffsetX, a.nOffsetY, tx - cx, ty - cy, tx, ty);
                                 AppendDebugLog(buf);
                             }
                             const std::wstring varName = a.matchVarName.empty() ? L"matchRet" : a.matchVarName;
                             matchVars_[varName] = match;
                             if (a.findImageFollowUp == 0) {
-                                wmSetLivePos(tx, ty, 0, 0);
-                                MarkSimulatedInput();
-                                if (wmUsesTarget()) wmExecPtr->PostMouseClickAtClient(tx, ty, a.button, false);
-                                else wmMouseClick(tx, ty, a.button);
-                                UnmarkSimulatedInput();
+                                applyFindCursor(tx, ty, true, a.button, a);
                             } else if (a.findImageFollowUp == 1) {
-                                wmSetLivePos(tx, ty, 0, 0);
+                                applyFindCursor(tx, ty, false, a.button, a);
                                 if (appSettings_.playback.autoOutputKeyFunctionDebug) {
                                     wchar_t buf[160]{};
                                     if (wmUsesTarget()) {
@@ -3175,6 +5941,10 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         // 可中断等待；窗口模式单次找图常 1~2s，重试间隔宜短以便热键立刻停
                         SleepInterruptible(0.05);
                     } while (!StopRequested() && !BreakoutTriggered());
+                    if ((a.findImageFollowUp == 0 || a.findImageFollowUp == 1) && !lastHadTarget
+                        && appSettings_.playback.autoOutputKeyFunctionDebug) {
+                        AppendDebugLog(L"找图未匹配，跳过点击/移动");
+                    }
                     if (appSettings_.playback.autoOutputKeyFunctionDebug) {
                         AppendDebugLog(FormatFindImageDebug(a, lastRawMatch, lastHadTarget, lastTargetX, lastTargetY));
                     }
@@ -3182,6 +5952,178 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         DeleteBitmapHandle(findPrep.bitmap);
                     }
                     } // end else (non-saveImage followUp)
+                }
+                else if (a.type == ActionType::MultiMatch) {
+                    qst::desktop_tools::ScopedHideOwnUiForCapture hideOwnMm(
+                        UserFacingMainHwnd());
+                    ScriptAction mmAct = a;
+                    NormalizeMultiMatchFields(mmAct);
+                    if (mmAct.imagePaths.empty()) {
+                        if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                            AppendDebugLog(L"多图匹配跳过: 没有模板图");
+                        }
+                    } else {
+                    const TemplateScale mmTmplScale = currentTmplScale();
+                    struct MultiHit {
+                        ImageMatchResult match;
+                        int templateIndex = 0;
+                        std::wstring templatePath;
+                        int templateW = 0;
+                        int templateH = 0;
+                        bool templatePreScaled = false;
+                    };
+                    auto fileNameOf = [](const std::wstring& path) -> std::wstring {
+                        const auto slash = path.find_last_of(L"\\/");
+                        return slash == std::wstring::npos ? path : path.substr(slash + 1);
+                    };
+                    auto sortHits = [&](std::vector<ImageMatchResult>& matches) {
+                        if (mmAct.multiMatchSort == 1) {
+                            std::sort(matches.begin(), matches.end(),
+                                [](const ImageMatchResult& l, const ImageMatchResult& r) {
+                                    return l.score > r.score;
+                                });
+                        } else {
+                            std::sort(matches.begin(), matches.end(),
+                                [](const ImageMatchResult& l, const ImageMatchResult& r) {
+                                    if (l.topLeftX != r.topLeftX) return l.topLeftX < r.topLeftX;
+                                    return l.topLeftY < r.topLeftY;
+                                });
+                        }
+                    };
+                    auto prepTemplateSize = [&](const std::wstring& path, bool useVar, int& w, int& h, bool& preScaled) {
+                        ScriptAction probe = mmAct;
+                        probe.imagePath = useVar ? path : resolveTemplatePath(false, path);
+                        probe.imageUseVar = useVar;
+                        if (useVar) probe.imagePath = resolveTemplatePath(true, path);
+                        const PreparedFindImageMatch prep = PrepareFindImageMatch(probe, mmTmplScale);
+                        w = prep.templateW;
+                        h = prep.templateH;
+                        preScaled = prep.templatePreScaled;
+                        if (prep.bitmap) DeleteBitmapHandle(prep.bitmap);
+                    };
+                    auto collectHits = [&]() -> std::vector<MultiHit> {
+                        std::vector<MultiHit> hits;
+                        if (mmAct.multiMatchMode == 1) {
+                            ScriptAction probe = mmAct;
+                            probe.imagePath = mmAct.imagePaths.front();
+                            probe.imageUseVar = MultiMatchSlotUseVar(mmAct, 0);
+                            ImageMatchOutput output = matchScriptImageAll(probe, mmAct.multiMatchMax);
+                            sortHits(output.matches);
+                            int tw = 0, th = 0;
+                            bool pre = false;
+                            prepTemplateSize(probe.imagePath, probe.imageUseVar, tw, th, pre);
+                            for (const auto& raw : output.matches) {
+                                const ImageMatchResult match = NormalizeMatchVarResult(
+                                    raw, mmAct.matchThreshold, mmAct.perfectMatch);
+                                if (!match.found) continue;
+                                MultiHit hit;
+                                hit.match = match;
+                                hit.templateIndex = 0;
+                                hit.templatePath = probe.imagePath;
+                                hit.templateW = tw;
+                                hit.templateH = th;
+                                hit.templatePreScaled = pre;
+                                hits.push_back(std::move(hit));
+                                if (static_cast<int>(hits.size()) >= mmAct.multiMatchMax) break;
+                            }
+                            return hits;
+                        }
+                        for (int i = 0; i < static_cast<int>(mmAct.imagePaths.size()); ++i) {
+                            ScriptAction probe = mmAct;
+                            probe.imagePath = mmAct.imagePaths[static_cast<size_t>(i)];
+                            probe.imageUseVar = MultiMatchSlotUseVar(mmAct, i);
+                            ImageMatchOutput output = matchScriptImageAll(probe, 1);
+                            if (output.matches.empty()) continue;
+                            const ImageMatchResult match = NormalizeMatchVarResult(
+                                output.matches.front(), mmAct.matchThreshold, mmAct.perfectMatch);
+                            if (!match.found) continue;
+                            MultiHit hit;
+                            hit.match = match;
+                            hit.templateIndex = i;
+                            hit.templatePath = probe.imagePath;
+                            prepTemplateSize(probe.imagePath, probe.imageUseVar, hit.templateW, hit.templateH,
+                                hit.templatePreScaled);
+                            hits.push_back(std::move(hit));
+                            break;
+                        }
+                        return hits;
+                    };
+                    std::vector<MultiHit> lastHits;
+                    const double findTimeSec = ResolveFindImageTimeSec(mmAct.findTimeExpr, makeVarCtx());
+                    const bool loopUntilFound = findTimeSec < 0.0;
+                    auto findStart = std::chrono::steady_clock::now();
+                    do {
+                        lastHits = collectHits();
+                        if (fireImageWatches(false) || fireImageWatches(true)) {
+                            if (pendingGoto || pendingBreakLoop) break;
+                            findStart = std::chrono::steady_clock::now();
+                            continue;
+                        }
+                        if (!lastHits.empty()) break;
+                        if (!loopUntilFound) {
+                            if (findTimeSec <= 0.0) break;
+                            const double elapsed = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - findStart).count();
+                            if (elapsed >= findTimeSec) break;
+                        }
+                        SleepInterruptible(0.05);
+                    } while (!StopRequested() && !BreakoutTriggered());
+
+                    const std::wstring varName =
+                        mmAct.matchVarName.empty() ? L"matchRet" : mmAct.matchVarName;
+                    ImageMatchListVar list;
+                    list.hits.reserve(lastHits.size());
+                    for (const auto& hit : lastHits) {
+                        ImageMatchListHit stored;
+                        stored.match = hit.match;
+                        stored.templateIndex = hit.templateIndex;
+                        stored.templateName = fileNameOf(hit.templatePath);
+                        list.hits.push_back(std::move(stored));
+                    }
+                    matchListVars_[varName] = std::move(list);
+                    if (lastHits.empty()) {
+                        ImageMatchResult miss{};
+                        matchVars_[varName] = miss;
+                    } else {
+                        matchVars_[varName] = lastHits.front().match;
+                    }
+
+                    const int follow = mmAct.findImageFollowUp;
+                    if (lastHits.empty() && (follow == 0 || follow == 1)
+                        && appSettings_.playback.autoOutputKeyFunctionDebug) {
+                        AppendDebugLog(L"多图匹配未命中，跳过点击/移动");
+                    }
+                    if (!lastHits.empty() && follow != 2) {
+                        auto clickOrMove = [&](const MultiHit& hit) -> bool {
+                            int tx = 0, ty = 0;
+                            ResolveFindImageClickPoint(hit.match, hit.templateW, hit.templateH,
+                                mmAct.nOffsetX, mmAct.nOffsetY, mmTmplScale,
+                                hit.templatePreScaled, tx, ty);
+                            return applyFindCursor(tx, ty, follow == 0, mmAct.button, mmAct);
+                        };
+                        if (follow == 1 || mmAct.multiMatchMode != 1) {
+                            if (clickOrMove(lastHits.front())) return;
+                        } else {
+                            for (size_t i = 0; i < lastHits.size(); ++i) {
+                                if (StopRequested() || BreakoutTriggered()) break;
+                                if (clickOrMove(lastHits[i])) return;
+                                if (i + 1 < lastHits.size()
+                                    && (mmAct.duration > 0.0 || mmAct.randomDuration > 0.0)
+                                    && mmAct.clickCount <= 1) {
+                                    SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
+                                        mmAct.duration + RandomDelay(mmAct.randomDuration),
+                                        playbackTimeScale));
+                                }
+                            }
+                        }
+                    }
+                    if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                        AppendDebugLog(L"多图匹配 "
+                            + std::wstring(mmAct.multiMatchMode == 1 ? L"一图多处" : L"多图择一")
+                            + L" 命中=" + std::to_wstring(static_cast<int>(lastHits.size()))
+                            + L" 变量=" + varName);
+                    }
+                    }
                 }
                 else if (a.type == ActionType::TextRecognition) {
                     // OCR 按图定位/识别同样隐藏本软件窗口，避免日志窗进入识别区域
@@ -3228,7 +6170,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             HBITMAP tmpl = LoadBitmapFromFile(tmplPath);
                             if (!tmpl) return false;
                             ImageMatchOptions opt = BuildExecutionFindImageOptions(a, tmplScale);
-                            opt.maxMatches = 20;
+                            RestrictFindImageToSingleAnchor(opt);
                             opt.maxOverlap = 0.5;
                             ImageMatchOutput output;
                             if (lockedScreen_) {
@@ -3297,16 +6239,9 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 wmExecPtr->TargetHwnd(), tx, ty, tx, ty);
                         }
                         if (a.ocrFollowUp == 0) {
-                            wmSetLivePos(tx, ty, 0, 0);
-                            MarkSimulatedInput();
-                            if (wmUsesTarget()) {
-                                wmExecPtr->PostMouseClickAtClient(tx, ty, MouseButtonType::Left, false);
-                            } else {
-                                wmMouseClick(tx, ty, MouseButtonType::Left);
-                            }
-                            UnmarkSimulatedInput();
+                            applyFindCursor(tx, ty, true, MouseButtonType::Left, a);
                         } else if (a.ocrFollowUp == 1) {
-                            wmSetLivePos(tx, ty, 0, 0);
+                            applyFindCursor(tx, ty, false, MouseButtonType::Left, a);
                         }
                     };
                     auto emitOcrDebug = [&](const std::wstring& textContent, bool searchFound) {
@@ -3333,15 +6268,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         ocrVars_[varName] = MakeOcrTextVarResult(text);
                         emitOcrDebug(text, false);
                         if (output.success && !output.lines.empty()) {
-                            int minX = output.lines.front().x1, minY = output.lines.front().y1;
-                            int maxX = output.lines.front().x2, maxY = output.lines.front().y2;
+                            const OcrTextLine* best = &output.lines.front();
                             for (const auto& line : output.lines) {
-                                minX = std::min(minX, line.x1);
-                                minY = std::min(minY, line.y1);
-                                maxX = std::max(maxX, line.x2);
-                                maxY = std::max(maxY, line.y2);
+                                if (line.confidence > best->confidence) best = &line;
                             }
-                            applyFollowUpAt((minX + maxX) / 2, (minY + maxY) / 2);
+                            applyFollowUpAt((best->x1 + best->x2) / 2, (best->y1 + best->y2) / 2);
                         }
                     } else if (a.ocrResultMode == 0) {
                         OcrVarResult result = runOcrAction();
@@ -3389,66 +6320,8 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         emitOcrDebug(lastResult.text, lastResult.found != 0);
                     }
                 }
-                else if (a.type == ActionType::RunMacro) for (int i = 0; i < a.clickCount && !StopRequested() && !scheduledYieldLocalStop; ++i) {
-                    std::wstring path = a.targetPath;
-                    if (path.empty() || path == runningScriptPath) break;
-                    // 嵌套宏只允许脚本/录制目录，防任意路径加载后链式 runProgram
-                    {
-                        wchar_t fullPath[MAX_PATH]{};
-                        wchar_t scriptsDir[MAX_PATH]{};
-                        wchar_t recDir[MAX_PATH]{};
-                        if (GetFullPathNameW(path.c_str(), MAX_PATH, fullPath, nullptr) == 0) break;
-                        GetFullPathNameW(ScriptsDir().c_str(), MAX_PATH, scriptsDir, nullptr);
-                        GetFullPathNameW(RecordingsDir().c_str(), MAX_PATH, recDir, nullptr);
-                        const size_t sl = wcslen(scriptsDir);
-                        const size_t rl = wcslen(recDir);
-                        const bool inScripts = sl > 0 && _wcsnicmp(fullPath, scriptsDir, sl) == 0
-                            && (fullPath[sl] == L'\\' || fullPath[sl] == L'\0');
-                        const bool inRec = rl > 0 && _wcsnicmp(fullPath, recDir, rl) == 0
-                            && (fullPath[rl] == L'\\' || fullPath[rl] == L'\0');
-                        if (!inScripts && !inRec) {
-                            AppendDebugLog(L"运行宏失败：路径不在脚本/录制目录内");
-                            break;
-                        }
-                        path = fullPath;
-                    }
-                    const ScriptFileData nestedData = LoadScriptFileData(path, false);
-                    if (nestedData.actions.empty()) break;
-                    CoordMeta nestedMeta = ScriptCoordMetaForExecution(nestedData.coordMeta);
-                    std::vector<ScriptAction> nested =
-                        PrepareScriptActionsForExecution(nestedData.actions, nestedMeta);
-                    if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(nested)
-                        || nestedData.inputTimingVersion > 0) {
-                        RepairCompressedRelativeGaps(nested);
-                    }
-                    if (!usesOcr && ScriptUsesTextRecognition(nested)) {
-                        usesOcr = true;
-                        workerUsesOcrVars_ = true;
-                    }
-                    if (usesOcr) holdOcrSession();
-                    const std::vector<ScriptAction>* prevActions = activeActions;
-                    const std::wstring prevPath = runningScriptPath;
-                    const CoordMeta prevCoordMeta = activeCoordMeta;
-                    activeCoordMeta = nestedMeta;
-                    if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
-                    activeActions = &nested;
-                    runningScriptPath = path;
-                    // 嵌套录制/精密轨迹：对齐时间轴原点，避免沿用外层已漂移的 elapsed
-                    if (inputTimeline.enabled
-                        && (IsRecordingScriptPath(path)
-                            || ScriptIsTimedInputSequence(nested)
-                            || nestedData.inputTimingVersion > 0)) {
-                        inputTimeline.Reset();
-                    }
-                    runRange(0, nested.size());
-                    activeActions = prevActions;
-                    runningScriptPath = prevPath;
-                    activeCoordMeta = prevCoordMeta;
-                    if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested() && !scheduledYieldLocalStop) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                            a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
-                    }
+                else if (a.type == ActionType::RunMacro) {
+                    runNestedLibrary(a, false);
                 }
                 else if (a.type == ActionType::LockScreenshot) {
                     clearLockedScreen();
@@ -3550,62 +6423,8 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         timerStarts_[a.loopVarName] = std::chrono::steady_clock::now();
                     }
                 }
-                else if (a.type == ActionType::MousePlayback) for (int i = 0; i < a.clickCount && !StopRequested() && !scheduledYieldLocalStop; ++i) {
-                    std::wstring path = a.targetPath;
-                    if (path.empty()) break;
-                    {
-                        wchar_t fullPath[MAX_PATH]{};
-                        wchar_t scriptsDir[MAX_PATH]{};
-                        wchar_t recDir[MAX_PATH]{};
-                        if (GetFullPathNameW(path.c_str(), MAX_PATH, fullPath, nullptr) == 0) break;
-                        GetFullPathNameW(ScriptsDir().c_str(), MAX_PATH, scriptsDir, nullptr);
-                        GetFullPathNameW(RecordingsDir().c_str(), MAX_PATH, recDir, nullptr);
-                        const size_t sl = wcslen(scriptsDir);
-                        const size_t rl = wcslen(recDir);
-                        const bool inScripts = sl > 0 && _wcsnicmp(fullPath, scriptsDir, sl) == 0
-                            && (fullPath[sl] == L'\\' || fullPath[sl] == L'\0');
-                        const bool inRec = rl > 0 && _wcsnicmp(fullPath, recDir, rl) == 0
-                            && (fullPath[rl] == L'\\' || fullPath[rl] == L'\0');
-                        if (!inScripts && !inRec) {
-                            AppendDebugLog(L"运行录制回放失败：路径不在脚本/录制目录内");
-                            break;
-                        }
-                        path = fullPath;
-                    }
-                    const ScriptFileData nestedData = LoadScriptFileData(path, false);
-                    if (nestedData.actions.empty()) break;
-                    CoordMeta nestedMeta = ScriptCoordMetaForExecution(nestedData.coordMeta);
-                    std::vector<ScriptAction> nested =
-                        PrepareScriptActionsForExecution(nestedData.actions, nestedMeta);
-                    if (IsRecordingScriptPath(path) || ScriptIsTimedInputSequence(nested)
-                        || nestedData.inputTimingVersion > 0) {
-                        RepairCompressedRelativeGaps(nested);
-                    }
-                    const std::vector<ScriptAction>* prevActions = activeActions;
-                    const std::wstring prevPath = runningScriptPath;
-                    const CoordMeta prevCoordMeta = activeCoordMeta;
-                    activeCoordMeta = nestedMeta;
-                    if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
-                    activeActions = &nested;
-                    runningScriptPath = path;
-                    if (inputTimeline.enabled
-                        && (IsRecordingScriptPath(path)
-                            || ScriptIsTimedInputSequence(nested)
-                            || nestedData.inputTimingVersion > 0)) {
-                        inputTimeline.Reset();
-                    }
-                    const double prevScale = playbackTimeScale;
-                    playbackTimeScale = quickscript::PlaybackTimeScaleAlways(a.playbackSpeed);
-                    runRange(0, nested.size());
-                    playbackTimeScale = prevScale;
-                    activeActions = prevActions;
-                    runningScriptPath = prevPath;
-                    activeCoordMeta = prevCoordMeta;
-                    if (wmExecPtr) wmExecPtr->SetCoordMeta(activeCoordMeta);
-                    if (ShouldWaitAfterRepeat(a, i) && !StopRequested() && !scheduledYieldLocalStop) {
-                        SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                            a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
-                    }
+                else if (a.type == ActionType::MousePlayback) {
+                    runNestedLibrary(a, true);
                 }
                 else if (a.type == ActionType::GetCursorPos) {
                     int cx = 0, cy = 0;
@@ -3636,10 +6455,42 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         }
                     }
                 }
+                else if (a.type == ActionType::VarCompute) {
+                    MacroVariableContext ctx = makeVarCtx();
+                    const VarComputeResult vr = RunVarCompute(a.computeCode, ctx, &stopFlag_);
+                    if (!vr.ok) {
+                        AppendDebugLog(L"变量运算失败：" + vr.error);
+                    } else {
+                        for (const auto& kv : vr.exported) {
+                            userVars_[kv.first] = kv.second;
+                        }
+                        if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                            std::wstring line = L"变量运算导出 ";
+                            if (vr.exported.empty()) line += L"（无 return）";
+                            else {
+                                bool first = true;
+                                for (const auto& kv : vr.exported) {
+                                    if (!first) line += L", ";
+                                    first = false;
+                                    line += kv.first + L"=" + kv.second;
+                                }
+                            }
+                            AppendDebugLog(line);
+                        }
+                    }
+                }
                 else if (a.type == ActionType::GetColor) {
                     MacroVariableContext ctx = makeVarCtx();
                     int px = a.x, py = a.y;
-                    if (a.moveFromVar) {
+                    if (a.imageLocate) {
+                        ImageMatchResult loc{};
+                        int tplW = 0, tplH = 0;
+                        if (!findLocateAnchor(a, loc, tplW, tplH)) return;
+                        const double nsx = tplW > 0 ? a.x / static_cast<double>(tplW) : 0.0;
+                        const double nsy = tplH > 0 ? a.y / static_cast<double>(tplH) : 0.0;
+                        ResolveFindImageClickPoint(loc, tplW, tplH, nsx, nsy,
+                            currentTmplScale(), false, px, py);
+                    } else if (a.moveFromVar) {
                         TryResolveIntOperand(a.moveVarExprX, ctx, px);
                         TryResolveIntOperand(a.moveVarExprY, ctx, py);
                     }
@@ -3668,14 +6519,64 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 }
                 else if (a.type == ActionType::FindColor) {
                     int x1 = a.searchX1, y1 = a.searchY1, x2 = a.searchX2, y2 = a.searchY2;
-                    if (a.searchFullScreen) {
+                    HBITMAP colorBmp = lockedScreen_;
+                    int colorVx = lockedVirtX_, colorVy = lockedVirtY_;
+                    HBITMAP colorTmp = nullptr;
+                    if (a.imageLocate) {
+                        ImageMatchResult loc{};
+                        int tplW = 0, tplH = 0;
+                        if (!findLocateAnchor(a, loc, tplW, tplH)) {
+                            const std::wstring varName = a.matchVarName.empty() ? L"colorRet" : a.matchVarName;
+                            matchVars_[varName] = {};
+                            if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                                AppendDebugLog(L"找色未命中（未找到定位图） "
+                                    + FormatColorHex(a.colorR, a.colorG, a.colorB));
+                            }
+                            return;
+                        }
+                        if (!ApplyImageRegionToMatch(a,
+                                loc.topLeftX, loc.topLeftY, loc.bottomRightX, loc.bottomRightY,
+                                x1, y1, x2, y2)) {
+                            x1 = loc.topLeftX;
+                            y1 = loc.topLeftY;
+                            x2 = loc.bottomRightX;
+                            y2 = loc.bottomRightY;
+                        }
+                        if (x2 <= x1) x2 = x1 + 1;
+                        if (y2 <= y1) y2 = y1 + 1;
+                    } else if (wmUsesTarget()) {
+                        if (!wmExecPtr->ResolveClientSearchRect(a, x1, y1, x2, y2)) {
+                            const std::wstring varName = a.matchVarName.empty() ? L"colorRet" : a.matchVarName;
+                            matchVars_[varName] = {};
+                            if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                                AppendDebugLog(L"找色未命中（无法解析目标窗口客户区）");
+                            }
+                            return;
+                        }
+                    } else if (a.searchFullScreen) {
                         int vx = 0, vy = 0, vw = 0, vh = 0;
                         GetVirtualScreenRect(vx, vy, vw, vh);
                         x1 = vx; y1 = vy; x2 = vx + vw; y2 = vy + vh;
                     }
+                    if (wmUsesTarget() && !colorBmp) {
+                        int ox = 0, oy = 0;
+                        if (wmExecPtr->LockWindowCapture(colorTmp, ox, oy)) {
+                            colorBmp = colorTmp;
+                            colorVx = 0;
+                            colorVy = 0;
+                        } else {
+                            const std::wstring varName = a.matchVarName.empty() ? L"colorRet" : a.matchVarName;
+                            matchVars_[varName] = {};
+                            if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                                AppendDebugLog(L"找色未命中（无法截取目标窗口）");
+                            }
+                            return;
+                        }
+                    }
                     const ColorMatchHit hit = FindColorInScreenRegion(
                         x1, y1, x2, y2, a.colorR, a.colorG, a.colorB, a.colorTolerance,
-                        lockedScreen_, lockedVirtX_, lockedVirtY_, 2, &stopFlag_);
+                        colorBmp, colorVx, colorVy, 2, &stopFlag_);
+                    if (colorTmp) DeleteBitmapHandle(colorTmp);
                     if (StopRequested()) return;
                     const std::wstring varName = a.matchVarName.empty() ? L"colorRet" : a.matchVarName;
                     ImageMatchResult match{};
@@ -3692,17 +6593,9 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         const int tx = hit.x + a.offsetX;
                         const int ty = hit.y + a.offsetY;
                         if (a.findImageFollowUp == 0) {
-                            ScriptAction click = a;
-                            click.type = ActionType::MouseClick;
-                            click.x = tx; click.y = ty;
-                            click.moveFromVar = false;
-                            executeOne(click);
+                            applyFindCursor(tx, ty, true, a.button, a);
                         } else if (a.findImageFollowUp == 1) {
-                            ScriptAction mv = a;
-                            mv.type = ActionType::MoveMouse;
-                            mv.x = tx; mv.y = ty;
-                            mv.moveFromVar = false;
-                            executeOne(mv);
+                            applyFindCursor(tx, ty, false, a.button, a);
                         }
                     }
                     matchVars_[varName] = match;
@@ -3716,7 +6609,24 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                 else if (a.type == ActionType::ColorMatch) {
                     MacroVariableContext ctx = makeVarCtx();
                     int px = a.x, py = a.y;
-                    if (a.moveFromVar) {
+                    if (a.imageLocate) {
+                        ImageMatchResult loc{};
+                        int tplW = 0, tplH = 0;
+                        if (!findLocateAnchor(a, loc, tplW, tplH)) {
+                            const std::wstring varName = a.matchVarName.empty() ? L"colorRet" : a.matchVarName;
+                            ImageMatchResult miss{};
+                            miss.found = false;
+                            matchVars_[varName] = miss;
+                            if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+                                AppendDebugLog(L"颜色匹配失败（未找到定位图）");
+                            }
+                            return;
+                        }
+                        const double nsx = tplW > 0 ? a.x / static_cast<double>(tplW) : 0.0;
+                        const double nsy = tplH > 0 ? a.y / static_cast<double>(tplH) : 0.0;
+                        ResolveFindImageClickPoint(loc, tplW, tplH, nsx, nsy,
+                            currentTmplScale(), false, px, py);
+                    } else if (a.moveFromVar) {
                         TryResolveIntOperand(a.moveVarExprX, ctx, px);
                         TryResolveIntOperand(a.moveVarExprY, ctx, py);
                     }
@@ -3820,7 +6730,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                             HBITMAP tmpl = LoadBitmapFromFile(aiProbe.aiTargetImagePath);
                             if (!tmpl) return false;
                             ImageMatchOptions opt = BuildExecutionFindImageOptions(a, tmplScale);
-                            opt.maxMatches = 20;
+                            RestrictFindImageToSingleAnchor(opt);
                             opt.maxOverlap = 0.5;
                             ImageMatchOutput output;
                             if (lockedScreen_) {
@@ -4017,6 +6927,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     return RunRangeResult::Normal;
                 };
                 for (size_t i = start; i < end && !StopRequested() && !scheduledYieldLocalStop; ) {
+                    if (activeActions == &actions) {
+                        playbackActionIndex_.store(static_cast<int>(i) + 1, std::memory_order_relaxed);
+                        playbackActionTotal_.store(static_cast<int>(actions.size()),
+                            std::memory_order_relaxed);
+                    }
                     if (drainScheduledYield) drainScheduledYield();
                     if (StopRequested() || scheduledYieldLocalStop) break;
                     if (pendingGoto) {
@@ -4030,7 +6945,7 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         && debugBlockEntrySet_.count(static_cast<int>(i));
                     if (SkipsInMainFlow(a.type)) {
                         if (debugEntryBlock) {
-                            // 调试入口所在的 defineBlock：块体按流程执行一次（单步可进入块内）
+                            // 调试入口所在的顶层跳过容器（定义块/找图监视）：块体按流程执行一次
                             debugGate(i);
                             if (StopRequested() || scheduledYieldLocalStop) {
                                 return RunRangeResult::Normal;
@@ -4156,9 +7071,12 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                                 runBlockGotoContinue = true;
                                 break;
                             }
-                            if (ShouldWaitAfterRepeat(a, r) && !StopRequested() && !scheduledYieldLocalStop) {
-                                SleepInterruptible(quickscript::ScalePlaybackTimeSeconds(
-                                    a.duration + RandomDelay(a.randomDuration), playbackTimeScale));
+                            if (sleepRepeatInterval(a, r)) {
+                                if (pendingBreakLoop) return RunRangeResult::BreakLoop;
+                                const RunRangeResult gotoResult = consumePendingGoto(start, end, i);
+                                if (gotoResult == RunRangeResult::GotoPending) return RunRangeResult::GotoPending;
+                                runBlockGotoContinue = true;
+                                break;
                             }
                         }
                         if (runBlockGotoContinue) continue;
@@ -4189,6 +7107,11 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                         if (pendingBreakLoop) {
                             pendingBreakLoop = false;
                             return RunRangeResult::BreakLoop;
+                        }
+                        if (pendingGoto) {
+                            const RunRangeResult gotoResult = consumePendingGoto(start, end, i);
+                            if (gotoResult == RunRangeResult::GotoPending) return RunRangeResult::GotoPending;
+                            continue;
                         }
                         debugAfterAction(i);
                         ++i;
@@ -4325,10 +7248,12 @@ void EngineHost::StartActionsWorker(const std::vector<ScriptAction>& actions, co
                     }
                 }
                 matchVars_.clear();
+                matchListVars_.clear();
                 if (usesOcr) ocrVars_.clear();
                 loopVars_.clear();
                 timerStarts_.clear();
                 aiVars_.clear();
+                userVars_.clear();
                 ClearImageVars(imageVars_);
                 pendingGoto.reset();
                 loopEntryGotoTarget.reset();
@@ -4475,7 +7400,10 @@ void EngineHost::RestoreMainWindowAfterRun() {
 
 // was engine_host_window.h:14302-14342
 void EngineHost::OnRunDone() {
+        // 热键看门狗与 WM_RUN_DONE 可能各走一遍；只在仍标记运行时收尾，避免结束音连响两次。
+        if (!running_) return;
         running_ = false;
+        if (appSettings_.other.playSoundOnEnd) PlayAppFinishSound();
         runningFromScheduled_ = false;
         nextRunFromScheduled_ = false;
         scheduledInterruptStop_ = false;
@@ -4523,6 +7451,8 @@ void EngineHost::OnRunDone() {
         }
         windowmode::SetWindowModeLogSink(nullptr);
         executedSteps_.store(0, std::memory_order_relaxed);
+        playbackActionIndex_.store(0, std::memory_order_relaxed);
+        playbackActionTotal_.store(0, std::memory_order_relaxed);
         ghHotkeySessionBusy.store(recording_ || clicking_, std::memory_order_relaxed);
         EnsureHotkeyAuxTimers();
         ClearToggleHotkeyLatches();

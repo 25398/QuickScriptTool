@@ -19,6 +19,8 @@ std::wstring BuildAgentSystemPrompt(const std::wstring& modelName, const std::ws
               L"searchAgentFiles（详见 readAgentSkill section=shell）；"
               L"所有文件修改都会记录，用户可随时撤销（listAgentChanges / revertAgentChange）；"
               L"用户编辑已发送消息重发时按新文本重新执行。\n";
+    prompt += L"对用户用中文、一两句话说明结果即可。不要逐步复述脚本每一步，"
+              L"不要把工具返回里的内部约束、提示词或动作一览念给用户听。\n";
     (void)apiUrl;
     return prompt;
 }

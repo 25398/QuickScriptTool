@@ -37,6 +37,44 @@ WindowModeExecutor::~WindowModeExecutor() {
 namespace {
 
 int g_mapleSoftKeyLogs = 0;
+int g_mapleSoftClickLogs = 0;
+/// 软键屏障无应答（目标不应答/权限）后，本次运行不再逐键等待。
+bool g_softKeyPacingOff = false;
+
+void LogMapleHookHits(const wchar_t* when) {
+    DWORD gaks = 0;
+    DWORD diState = 0;
+    DWORD diData = 0;
+    DWORD lastCb = 0;
+    DWORD hitReady = 0;
+    DWORD gfw = 0;
+    DWORD focus = 0;
+    if (FakeFocusSoftInput_ReadMapleHits(gaks, diState, diData, lastCb, hitReady, gfw, focus)) {
+        WindowModeLogEventf(
+            L"[窗口模式] 冒险岛钩命中 %s hitReady=%lu gfw=%lu focus=%lu "
+            L"gaks=%lu diState=%lu diData=%lu lastCb=%lu",
+            when ? when : L"",
+            static_cast<unsigned long>(hitReady),
+            static_cast<unsigned long>(gfw),
+            static_cast<unsigned long>(focus),
+            static_cast<unsigned long>(gaks),
+            static_cast<unsigned long>(diState),
+            static_cast<unsigned long>(diData),
+            static_cast<unsigned long>(lastCb));
+    }
+    DWORD diag = 0;
+    DWORD iatPoll = 0;
+    DWORD diVt = 0;
+    if (!FakeFocusSoftInput_ReadMapleInstall(diag, iatPoll, diVt)) return;
+    WindowModeLogEventf(
+        L"[窗口模式] 冒险岛钩安装 %s iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu heapVt=%lu",
+        when ? when : L"",
+        static_cast<unsigned long>(iatPoll),
+        static_cast<unsigned>(diag),
+        static_cast<unsigned long>(diVt & 0xFFu),
+        static_cast<unsigned long>((diVt >> 8) & 0xFFu),
+        static_cast<unsigned long>((diVt >> 16) & 0xFFu));
+}
 
 void DebugLog(const wchar_t* msg) {
     WindowModeLog(msg);
@@ -181,7 +219,17 @@ bool WindowModeExecutor::CheckRunHealth(const WindowModeScriptConfig& config, st
         probe.autoLaunchTarget = false;
         WindowModeSession session;
         if (!session.Start(probe, err)) return false;
-        if (session.State().targetHwnd) return true;
+        // Start() 对「指定窗口类」会跳过绑窗；这里必须实探一次，否则高完整性游戏
+        // 会被当成「路径有效」放行，随后 BeginRun 再误当成未找到去自动打开。
+        std::wstring bindErr;
+        const bool bound = session.RefreshTarget(bindErr);
+        if (ShouldAbortAutoLaunchOnBindFailure(session.State().health)) {
+            err = bindErr.empty()
+                ? HealthToUserHint(session.State().health)
+                : bindErr;
+            return false;
+        }
+        if (bound && session.State().targetHwnd) return true;
         if (!config.targetExePath.empty()) return session.ValidateTargetExe(err);
         err = L"未找到目标窗口，请确认窗口已打开且类名/标题匹配";
         return false;
@@ -377,20 +425,12 @@ bool WindowModeExecutor::ResolveAiScreenRect(const ScriptAction& a,
     if (a.aiRegionByImage && !a.aiTargetImagePath.empty()) {
         ScriptAction probe = a;
         if (probe.imagePath.empty()) probe.imagePath = probe.aiTargetImagePath;
-        // aiSearch* 为绝对（客户区）搜索范围；在该范围内找图，用匹配框作为最终截屏区
-        if (a.aiSearchX2 > a.aiSearchX1 && a.aiSearchY2 > a.aiSearchY1) {
-            probe.searchFullScreen = false;
-            probe.searchX1 = a.aiSearchX1;
-            probe.searchY1 = a.aiSearchY1;
-            probe.searchX2 = a.aiSearchX2;
-            probe.searchY2 = a.aiSearchY2;
-        } else {
-            probe.searchFullScreen = true;
-            probe.searchX1 = 0;
-            probe.searchY1 = 0;
-            probe.searchX2 = 0;
-            probe.searchY2 = 0;
-        }
+        // 窗口模式先在整个目标窗口内找图，再用 imageRegion 二次筛选。
+        probe.searchFullScreen = true;
+        probe.searchX1 = 0;
+        probe.searchY1 = 0;
+        probe.searchX2 = 0;
+        probe.searchY2 = 0;
         ImageMatchOutput output = FindImageClient(probe, lockedBmp, lockX, lockY);
         if (output.matches.empty()) return false;
         const ImageMatchResult& match = output.matches.front();
@@ -403,23 +443,9 @@ bool WindowModeExecutor::ResolveAiScreenRect(const ScriptAction& a,
         return MapClientRect(cx1, cy1, cx2, cy2, sx1, sy1, sx2, sy2);
     }
 
-    if (a.aiSearchX2 > a.aiSearchX1 && a.aiSearchY2 > a.aiSearchY1) {
-        int x1 = a.aiSearchX1, y1 = a.aiSearchY1, x2 = a.aiSearchX2, y2 = a.aiSearchY2;
-        if (session_.Config().windowRelativeCoordinates) {
-            int recW = 0, recH = 0, liveW = 0, liveH = 0;
-            if (RecordedClientSize(recW, recH) && LiveClientSize(liveW, liveH)) {
-                ScaleWindowClientRect(recW, recH, liveW, liveH, x1, y1, x2, y2);
-            }
-        }
-        return MapClientRect(x1, y1, x2, y2, sx1, sy1, sx2, sy2);
-    }
-
-    const auto& st = session_.State();
-    sx1 = st.clientRectScreen.left;
-    sy1 = st.clientRectScreen.top;
-    sx2 = st.clientRectScreen.right;
-    sy2 = st.clientRectScreen.bottom;
-    return sx2 > sx1 && sy2 > sy1;
+    int cx1 = 0, cy1 = 0, cx2 = 0, cy2 = 0;
+    if (!ResolveClientSearchRect(a, cx1, cy1, cx2, cy2)) return false;
+    return MapClientRect(cx1, cy1, cx2, cy2, sx1, sy1, sx2, sy2);
 }
 
 bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wstring& err,
@@ -473,10 +499,25 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
     const bool background = runConfig.executionKind == WindowModeExecutionKind::BackgroundWindow;
     const bool shouldAutoLaunch = ShouldAutoLaunchTarget(runConfig);
 
+    auto abortIfBindFatal = [&]() -> bool {
+        const WindowModeHealth health = session_.State().health;
+        if (!ShouldAbortAutoLaunchOnBindFailure(health)) return false;
+        if (err.empty()) {
+            err = session_.State().lastError.empty()
+                ? HealthToUserHint(health)
+                : session_.State().lastError;
+        }
+        WindowModeLogf(L"[窗口模式] 已找到目标但无法绑定（%s），禁止自动打开以免重复启动搞挂游戏",
+            err.c_str());
+        EndRun();
+        return true;
+    };
+
     if (shouldAutoLaunch) {
         if (options.launchTarget) {
             // 「指定窗口类」绑定后须再校验标题/文档身份：勿把同程序其它窗当成已找到而跳过打开。
             bool bound = session_.RefreshTarget(err);
+            if (abortIfBindFatal()) return false;
             if (bound && session_.State().targetHwnd
                 && runConfig.selectMethod == WindowSelectMethod::UseEditorWindowClass) {
                 HWND top = session_.State().targetHwnd;
@@ -518,6 +559,7 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
                 }
             }
         } else if (!session_.RefreshTarget(err)) {
+            if (abortIfBindFatal()) return false;
             if (!session_.ValidateTargetExe(err)) {
                 EndRun();
                 return false;
@@ -527,6 +569,7 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
             return true;
         }
     } else if (!session_.RefreshTarget(err)) {
+        if (abortIfBindFatal()) return false;
         if (background) {
             if (runConfig.windowClassName.empty() && runConfig.windowName.empty()) {
                 err = L"后台窗口模式请先指定目标窗口";
@@ -571,6 +614,8 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
     }
 
     hardwareFallback_ = false;
+    g_softKeyPacingOff = false;  // 每次运行重新尝试「软键屏障」等待
+    SetLcaBackgroundMessageMode(false);
     active_ = true;
     {
         const auto strategy = ResolveInputStrategy(runConfig);
@@ -608,19 +653,23 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
         }
     } else if (LooksLikeChromiumShellTarget(runConfig, session_.State().targetHwnd)) {
         WindowModeLog(L"[窗口模式] Chromium 壳（Electron/CEF）：将优先假焦点 DLL 真后台（注入失败才假前台）");
+    } else if (LooksLikeWeixinTarget(runConfig, session_.State().targetHwnd)) {
+        WindowModeLog(
+            L"[窗口模式] 微信 Qt：将注入精简假焦点（只骗前景查询；键鼠仍 PostMessage，不走 Chromium 灌键）");
     } else if (LooksLikeEmulatorTarget(runConfig, session_.State().targetHwnd)) {
         WindowModeLogEvent(
             L"[窗口模式] 桌面模拟器：将注入精简假焦点（仅前景+键态；禁 RawInput/WM_INPUT）");
     } else {
         HWND topHint = TopLevelTargetWindow(session_.State().targetHwnd);
-        const bool androidEmu =
+        const bool weixinQt = LooksLikeWeixinTarget(runConfig, topHint);
+        const bool androidEmu = !weixinQt && (
             LooksLikeAndroidEmulatorExecutable(runConfig.targetExePath)
             || LooksLikeAndroidEmulatorWindowClass(runConfig.windowClassName)
             || LooksLikeAndroidEmulatorWindowClass(runConfig.childWindowClassName)
             || LooksLikeAndroidEmulatorWindowTitle(runConfig.windowName)
             || LooksLikeQtRenderWindowClass(runConfig.windowClassName)
             || (topHint && IsWindow(topHint)
-                && LooksLikeAndroidEmulatorExecutable(QueryHwndProcessImagePath(topHint)));
+                && LooksLikeAndroidEmulatorExecutable(QueryHwndProcessImagePath(topHint))));
         if (androidEmu) {
             const bool qtMumu = AndroidEmulatorPrefersFakeFocusFromConfig(runConfig)
                 || (topHint && AndroidEmulatorPrefersFakeFocus(topHint, &runConfig));
@@ -648,12 +697,16 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
                 || LooksLikeMapleStoryTitle(runConfig.targetWindowTitle)
                 || LooksLikeMapleStoryExecutable(runConfig.targetExePath)
                 || LooksLikeMapleStoryExecutable(QueryHwndProcessImagePath(topHint));
+            const bool lcaHint = mapleHint
+                || PrefersLcaBackgroundMessages(runConfig, topHint);
             WindowModeLog(adobeAirHint
                 ? L"[窗口模式] Adobe AIR：将注入假焦点（只骗前景查询；键鼠 PostMessage）"
                 : mapleHint
-                ? L"[窗口模式] 冒险岛：将注入假焦点（IAT 软光标/按键；禁止 Phase2 CallThroughOriginal/子类化/RawInput）"
+                ? L"[窗口模式] 冒险岛：技能键走窗口消息；将注入精简假焦点（吞失活+DirectInput）以便后台走路"
+                : lcaHint
+                ? L"[窗口模式] 未登记游戏：不注入假焦点，键鼠走 LCA 后台窗口消息（PostMessage KEY*）"
                 : game3d
-                ? L"[窗口模式] 3D/游戏窗口：将注入假焦点（钩光标/RawInput/焦点查询）；失败才 PostMessage"
+                ? L"[窗口模式] 3D/游戏窗口：将注入假焦点（钩光标/RawInput/焦点查询）；失败才回退窗口消息"
                 : L"[窗口模式] 使用 PostMessage/软消息（非 CDP）");
         }
     }
@@ -701,7 +754,8 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
             WindowModeLog(
                 L"[窗口模式] 假焦点未注入，回退假前台 SendInput（绝对坐标；会占键鼠）");
         }
-        if (top && IsWindow(top) && !covering) {
+        const bool backgroundHw = UsesBackgroundWindow();
+        if (!backgroundHw && top && IsWindow(top) && !covering) {
             auto& vda = VirtualDesktopAccessor::Instance();
             std::wstring vdaErr;
             if (vda.EnsureLoaded(vdaErr)) {
@@ -721,7 +775,7 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
         hwParkedHwnd_ = nullptr;
         hwSavedTopmost_ = false;
         hwSavedWp_ = {};
-        if (top && IsWindow(top) && !covering && !electronShell
+        if (!backgroundHw && top && IsWindow(top) && !covering && !electronShell
             && ParkHardwareInputTargetOffscreen(top, &hwSavedWp_, &hwSavedTopmost_)) {
             hwOffscreenParked_ = true;
             hwParkedHwnd_ = top;
@@ -729,7 +783,11 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
                 L"[窗口模式] 本机输入：已屏外+顶置（仍保持前台焦点；"
                 L"不能同时操作其它窗口，结束脚本会还原位置）");
         }
-        if (!EnsureHardwareInputFocus()) {
+        if (backgroundHw) {
+            WindowModeLog(
+                L"[窗口模式] 后台窗口：找图保持后台；键鼠在投递前再假前台 SendInput"
+                L"（避免切走游戏后相对鼠标打到其它窗）");
+        } else if (!EnsureHardwareInputFocus()) {
             WindowModeLog(L"[窗口模式] 未能切到前台，SendInput 可能打到其它窗");
         } else {
             WindowModeLog(L"[窗口模式] 假前台本机输入已激活");
@@ -770,8 +828,20 @@ void WindowModeExecutor::TryInstallFakeFocus() {
             L"[窗口模式] 独占全屏/远程桌面：跳过假焦点注入，键鼠走本机输入");
         return;
     }
-    // 铺满/远程跳过与 UsesFakeFocusForTarget 同一套例外（传奇 Delphi、冒险岛标题/exe/类名）。
-    if (!UsesFakeFocusForTarget(session_.Config(), top)) {
+    const bool mapleStory = LooksLikeMapleStoryTarget(session_.Config(), top);
+    if (PrefersLcaBackgroundMessages(session_.Config(), top)) {
+        SetLcaBackgroundMessageMode(true);
+        if (!mapleStory) {
+            WindowModeLog(
+                L"[窗口模式] 未登记游戏：跳过假焦点注入，键鼠走 LCA 窗口消息（PostMessage KEY*，方向键 KF_EXTENDED）");
+            return;
+        }
+        WindowModeLog(
+            L"[窗口模式] 冒险岛：技能键走 PostMessage；注入精简假焦点吞失活/DirectInput 后台走路");
+    }
+    // 铺满/远程跳过与 UsesFakeFocusForTarget 同一套例外（传奇 Delphi）。
+    // 冒险岛 UsesFakeFocusForTarget=false（保持 PostMessage），但仍须 mapleSafe 精简注入。
+    if (!UsesFakeFocusForTarget(session_.Config(), top) && !mapleStory) {
         if (top && IsWindow(top) && LooksLikeMonitorCoveringFullscreen(top) && !delphiVcl) {
             WindowModeLogEvent(
                 L"[窗口模式] 独占全屏/远程桌面：跳过假焦点注入，键鼠走本机输入");
@@ -785,18 +855,30 @@ void WindowModeExecutor::TryInstallFakeFocus() {
             L"[窗口模式] 假焦点跳过：内核反作弊目标禁止注入（会被拒绝访问，且有封号风险）");
         return;
     }
+    DWORD pid = session_.State().targetPid;
+    if (pid == 0 && top) GetWindowThreadProcessId(top, &pid);
+    const bool chromiumShell = LooksLikeChromiumShellTarget(cfg, top);
+    const bool weixinQt = !chromiumShell && LooksLikeWeixinTarget(cfg, top);
     if (!enableFakeFocusInjection_) {
-        if (!UsesBackgroundWindow()
+        // 微信 4.x Qt 查真 GetForegroundWindow；不注入就会丢键，并在 WM_ACTIVATE 后抢前台。
+        if (weixinQt) {
+            WindowModeLog(
+                L"[窗口模式] 微信 Qt 后台必须注入精简假焦点，已忽略「关闭假焦点注入」设置");
+        } else if (mapleStory) {
+            WindowModeLog(
+                L"[窗口模式] 冒险岛后台走路必须注入精简假焦点，已忽略「关闭假焦点注入」设置");
+        } else if (!UsesBackgroundWindow()
             && GameTargetNeedsHardwareWithoutFakeFocus(session_.Config(), top)) {
             hardwareFallback_ = true;
             WindowModeLog(
                 L"[窗口模式] 设置未启用假焦点注入：不注入 DLL，"
                 L"游戏/3D 目标改走假前台 SendInput（PostMessage 无法驱动 Raw Input）");
+            return;
         } else {
             WindowModeLog(
                 L"[窗口模式] 设置未启用假焦点注入：不注入 DLL，改走软消息/必要时假前台");
+            return;
         }
-        return;
     }
     if (top && IsFakeFocusInjectionUnsupported(top)) {
         WindowModeLog(IsRemoteDesktopWindow(top)
@@ -804,9 +886,6 @@ void WindowModeExecutor::TryInstallFakeFocus() {
             : L"[窗口模式] 假焦点跳过：真浏览器请用网页兼容（Electron 壳应已放行）");
         return;
     }
-    DWORD pid = session_.State().targetPid;
-    if (pid == 0 && top) GetWindowThreadProcessId(top, &pid);
-    const bool chromiumShell = LooksLikeChromiumShellTarget(cfg, top);
     const bool androidQt = AndroidEmulatorPrefersFakeFocus(top, &cfg);
     const bool glfwSdl = LooksLikeGlfwOrSdlWindowClass(cls)
         || LooksLikeGlfwOrSdlWindowClass(cfg.windowClassName)
@@ -818,35 +897,32 @@ void WindowModeExecutor::TryInstallFakeFocus() {
         && !IsAndroidEmulatorTarget(top, &cfg);
     // SetWindowsHook 在目标 UI 线程 LoadLibrary。GLFW/Java《我的世界》这一下就会崩。
     // DeSmuME：同样禁止在消息线程装 DLL（启动高概率崩）。
-    if ((chromiumShell || androidQt || native3d || desktopEmu)
+    if ((chromiumShell || weixinQt || androidQt || native3d || desktopEmu)
         && fakeFocus_.injection_technique() == inject::Technique::SetWindowsHook) {
         WindowModeLogf(
             L"[窗口模式] %s：注入技术 setwindowshook 改为 classic（避免在游戏线程装 DLL 崩溃）",
             desktopEmu ? L"桌面模拟器"
                 : (glfwSdl ? L"GLFW/SDL" : (androidQt ? L"Qt 安卓壳"
-                : (chromiumShell ? L"Chromium 壳" : L"3D/游戏窗"))));
+                : (weixinQt ? L"微信 Qt"
+                : (chromiumShell ? L"Chromium 壳" : L"3D/游戏窗")))));
         fakeFocus_.SetInjectionTechnique(inject::Technique::ClassicRemoteThread);
     }
     const bool adobeAir = LooksLikeAdobeAirWindowClass(cls)
         || LooksLikeAdobeAirWindowClass(cfg.windowClassName)
         || LooksLikeAdobeAirWindowClass(cfg.childWindowClassName);
-    wchar_t mapleTitle[512]{};
-    if (top) GetWindowTextW(top, mapleTitle, 512);
-    const bool mapleStory = LooksLikeMapleStoryWindowClass(cls)
-        || LooksLikeMapleStoryWindowClass(cfg.windowClassName)
-        || LooksLikeMapleStoryWindowClass(cfg.childWindowClassName)
-        || LooksLikeMapleStoryExecutable(cfg.targetExePath)
-        || LooksLikeMapleStoryExecutable(QueryHwndProcessImagePath(top))
-        || LooksLikeMapleStoryTitle(mapleTitle)
-        || LooksLikeMapleStoryTitle(cfg.windowName)
-        || LooksLikeMapleStoryTitle(cfg.targetWindowTitle);
+    const bool tianlongDx = LooksLikeTianLongBaBuTarget(cfg, top)
+        || LooksLikeTianLongBaBuWindowClass(cls)
+        || LooksLikeTianLongBaBuWindowClass(cfg.windowClassName)
+        || LooksLikeTianLongBaBuWindowClass(cfg.childWindowClassName);
     const bool lite = chromiumShell
+        || weixinQt
         || androidQt
         || desktopEmu
         || delphiVcl
         || glfwSdl
         || adobeAir
         || mapleStory
+        || tianlongDx
         || LooksLikeUnrealEngineWindowClass(cls)
         || LooksLikeUnrealEngineWindowClass(cfg.windowClassName)
         || LooksLikeUnrealEngineWindowClass(cfg.childWindowClassName);
@@ -855,7 +931,7 @@ void WindowModeExecutor::TryInstallFakeFocus() {
     // Chromium 壳 / 原生 3D（GLFW/Unity/SDL）：只注入窗口 PID。
     // Minecraft javaw 的 helper 子进程没有消息泵，先注入它们会把主进程误记成「跳过」。
     if (!fakeFocus_.InjectAndInstall(pid, top, ffErr, lite,
-            chromiumShell || native3d || desktopEmu || mapleStory /*windowPidOnly*/)) {
+            chromiumShell || weixinQt || native3d || desktopEmu || mapleStory /*windowPidOnly*/)) {
         WindowModeLogf(L"[窗口模式] 假焦点注入失败%s: %s",
             lite ? L"（精简/Chromium壳/Qt安卓）" : L"", ffErr.c_str());
         if (androidQt) {
@@ -868,9 +944,10 @@ void WindowModeExecutor::TryInstallFakeFocus() {
                 L"若安全中心拦截了 FakeFocus64.dll，请到「保护历史记录」允许后"
                 L"完全退出游戏再试；并确认 exe 旁有该 DLL（静态 CRT）");
         } else if (native3d && !delphiVcl && !lite) {
+            hardwareFallback_ = true;
             WindowModeLog(
-                L"[窗口模式] 3D 假焦点失败：后台只剩 PostMessage，暂停菜单/视角会跟用户真光标走。"
-                L"请确认目录含 FakeFocus64.dll");
+                L"[窗口模式] 3D 假焦点失败：PostMessage 无法驱动 Raw Input，"
+                L"键鼠改走假前台 SendInput。请确认目录含 FakeFocus64.dll");
         } else if (delphiVcl) {
             WindowModeLog(
                 L"[窗口模式] 传奇/Delphi 假焦点注入失败：后台仍仅 PostMessage（鼠标会原地点击）。"
@@ -879,9 +956,14 @@ void WindowModeExecutor::TryInstallFakeFocus() {
             WindowModeLog(
                 L"[窗口模式] Adobe AIR 假焦点失败：后台只剩 PostMessage（造梦等要点不到）。"
                 L"请确认目录含 FakeFocus32.dll / FakeFocus64.dll");
+        } else if (weixinQt) {
+            WindowModeLog(
+                L"[窗口模式] 微信 Qt 假焦点失败：后台只剩 PostMessage KEY*（不发 WM_CHAR/激活，"
+                L"无焦点欺骗时 Qt 可能丢键）。请确认目录含 FakeFocus64.dll / FakeFocus32.dll，"
+                L"并允许安全中心放行");
         } else if (mapleStory) {
             WindowModeLog(
-                L"[窗口模式] 冒险岛假焦点注入失败：后台 PostMessage 游戏不读。"
+                L"[窗口模式] 冒险岛假焦点注入失败：技能键仍 PostMessage；走路可能仅前台有效。"
                 L"请确认目录含 FakeFocus32.dll（32 位客户端）或 FakeFocus64.dll，并允许安全中心放行");
         } else if ((lite && !chromiumShell) || emulator) {
             if (!(UsesBackgroundWindow() && emulator)) {
@@ -893,13 +975,35 @@ void WindowModeExecutor::TryInstallFakeFocus() {
                     : L"[窗口模式] 模拟器假焦点失败，回退假前台 SendInput（后台模式亦会占焦点）")
                 : L"[窗口模式] UE5 假焦点失败，回退假前台 SendInput");
         }
+        // hardwareFallback：走假前台 SendInput，不要再标 LCA 纯 PostMessage。
+        if (!chromiumShell && !weixinQt && !hardwareFallback_) {
+            SetLcaBackgroundMessageMode(true);
+            WindowModeLog(
+                L"[窗口模式] 假焦点失败：回退 LCA 窗口消息（PostMessage KEY*，不发 WM_CHAR/激活）");
+        }
         return;
     }
     if (chromiumShell) {
         FakeFocusSoftInput_SetPostKeyEvents(true);
         WindowModeLog(
             L"[窗口模式] Chromium 壳假焦点：仅窗口进程、焦点欺骗+灌键鼠线程"
-            L"（适用 QQ/微信/Discord/VS Code/CEF 等；tech= 见上）");
+            L"（适用 QQ/Discord/VS Code/CEF 等；tech= 见上）");
+    } else if (weixinQt) {
+        HWND seedHwnd = top && IsWindow(top) ? top : TargetHwnd();
+        POINT seed{};
+        if (seedHwnd && IsWindow(seedHwnd)) {
+            RECT rc{};
+            GetClientRect(seedHwnd, &rc);
+            seed.x = (std::max)(0, static_cast<int>(rc.right - rc.left)) / 2;
+            seed.y = (std::max)(0, static_cast<int>(rc.bottom - rc.top)) / 2;
+            ClientToScreen(seedHwnd, &seed);
+            FakeFocusSoftInput_SetCursorScreen(seed.x, seed.y);
+        } else if (GetCursorPos(&seed)) {
+            FakeFocusSoftInput_SetCursorScreen(seed.x, seed.y);
+        }
+        WindowModeLog(
+            L"[窗口模式] 微信 Qt 假焦点已注入（前景查询+软光标/键态；键鼠仍 PostMessage，"
+            L"不走 Chromium 灌键/不发 WM_CHAR/激活）");
     } else if (androidQt) {
         FakeFocusSoftInput_SetPostKeyEvents(true);
         WindowModeLog(
@@ -910,6 +1014,22 @@ void WindowModeExecutor::TryInstallFakeFocus() {
     } else if (lite && delphiVcl) {
         WindowModeLog(
             L"[窗口模式] 传奇/Delphi 精简假焦点已注入（钩 GetCursorPos；后台不占前台）");
+    } else if (lite && tianlongDx) {
+        HWND seedHwnd = top && IsWindow(top) ? top : TargetHwnd();
+        POINT seed{};
+        if (seedHwnd && IsWindow(seedHwnd)) {
+            RECT rc{};
+            GetClientRect(seedHwnd, &rc);
+            seed.x = (std::max)(0, static_cast<int>(rc.right - rc.left)) / 2;
+            seed.y = (std::max)(0, static_cast<int>(rc.bottom - rc.top)) / 2;
+            ClientToScreen(seedHwnd, &seed);
+            FakeFocusSoftInput_SetCursorScreen(seed.x, seed.y);
+        } else if (GetCursorPos(&seed)) {
+            FakeFocusSoftInput_SetCursorScreen(seed.x, seed.y);
+        }
+        WindowModeLog(
+            L"[窗口模式] 天龙八部假焦点已注入（前景查询+软光标/键态；找图点击走 PostMessage，"
+            L"不抢前台、不走 LCA 纯消息）");
     } else if (lite && glfwSdl) {
         POINT seed{};
         if (GetCursorPos(&seed)) {
@@ -935,55 +1055,11 @@ void WindowModeExecutor::TryInstallFakeFocus() {
             FakeFocusSoftInput_SetCursorScreen(seed.x, seed.y);
         }
         WindowModeLog(
-            L"[窗口模式] 冒险岛假焦点已注入（IAT+DirectInput 设备虚表软光标按键；"
-            L"不改 user32/win32u 指令、不改 WndProc、不 RawInput；宿主不 PostMessage）");
+            L"[窗口模式] 冒险岛假焦点已注入（仅 IAT 前景/键态 + DI 虚表；"
+            L"禁止假 WM_INPUT / dinput8 可写节 / 注入线程协作级别 / 运行中远程线程计数）");
         g_mapleSoftKeyLogs = 0;
-        DWORD packed = 0;
-        std::wstring iatErr;
-        if (fakeFocus_.QueryMapleIatCount(packed, iatErr)) {
-            const DWORD iatSlots = packed & 0xFFFFu;
-            const DWORD diag = packed >> 16;
-            WindowModeLogf(
-                L"[窗口模式] 冒险岛 IAT 已补 slots=%lu diag=0x%04X "
-                L"(cursor=%d asyncKey=%d keyState=%d kbState=%d diCreate=%d diState=%d flash=%d "
-                L"diAcquire=%d dinput=%d fg=%d setFg=%d liveJmp=%d u32jmp=%d diData=%d "
-                L"dataSlot=%d softOk=%d)",
-                static_cast<unsigned long>(iatSlots),
-                static_cast<unsigned>(diag),
-                (diag & 0x0001) ? 1 : 0,
-                (diag & 0x0002) ? 1 : 0,
-                (diag & 0x0004) ? 1 : 0,
-                (diag & 0x0008) ? 1 : 0,
-                (diag & 0x0010) ? 1 : 0,
-                (diag & 0x0020) ? 1 : 0,
-                (diag & 0x0040) ? 1 : 0,
-                (diag & 0x0100) ? 1 : 0,
-                (diag & 0x0080) ? 1 : 0,
-                (diag & 0x0200) ? 1 : 0,
-                (diag & 0x0400) ? 1 : 0,
-                (diag & 0x0800) ? 1 : 0,
-                (diag & 0x1000) ? 1 : 0,
-                (diag & 0x2000) ? 1 : 0,
-                (diag & 0x4000) ? 1 : 0,
-                (diag & 0x8000) ? 1 : 0);
-            DWORD gaks = 0, diState = 0, diData = 0, lastCb = 0, hitReady = 0, gfw = 0, focus = 0;
-            if (FakeFocusSoftInput_ReadMapleHits(gaks, diState, diData, lastCb, hitReady, gfw, focus)) {
-                WindowModeLogf(
-                    L"[窗口模式] 冒险岛钩映射 hitReady=%lu gfw=%lu focus=%lu gaks=%lu diState=%lu",
-                    static_cast<unsigned long>(hitReady),
-                    static_cast<unsigned long>(gfw),
-                    static_cast<unsigned long>(focus),
-                    static_cast<unsigned long>(gaks),
-                    static_cast<unsigned long>(diState));
-            }
-            if (diag & 0x3000u) {
-                WindowModeLog(
-                    L"[窗口模式] 冒险岛：当前 FakeFocus32.dll 仍是会闪退的旧版（u32jmp/diData=1）。"
-                    L"请结束 MapleStoryt.exe 和本软件，再覆盖安装目录的 FakeFocus32.dll 与 QuickScriptTool.exe");
-            }
-        } else if (!iatErr.empty()) {
-            WindowModeLogf(L"[窗口模式] 冒险岛 IAT 计数读取失败: %s", iatErr.c_str());
-        }
+        g_mapleSoftClickLogs = 0;
+        LogMapleHookHits(L"注入后");
     } else if (lite) {
         WindowModeLog(
             L"[窗口模式] UE5 精简假焦点已注入（不钩 PeekMessage；不占用户前台）");
@@ -1003,23 +1079,8 @@ bool WindowModeExecutor::UsesChromiumShellInProcInput() const {
 }
 
 bool WindowModeExecutor::UsesMapleStoryFakeFocusInput() const {
-    if (!fakeFocus_.IsInjected() || !FakeFocusSoftInput_IsAttached()) return false;
-    HWND top = TopLevelTargetWindow(TargetHwnd());
-    wchar_t cls[256]{};
-    wchar_t title[512]{};
-    if (top) {
-        GetClassNameW(top, cls, 256);
-        GetWindowTextW(top, title, 512);
-    }
-    const auto& cfg = session_.Config();
-    return LooksLikeMapleStoryWindowClass(cls)
-        || LooksLikeMapleStoryWindowClass(cfg.windowClassName)
-        || LooksLikeMapleStoryWindowClass(cfg.childWindowClassName)
-        || LooksLikeMapleStoryTitle(title)
-        || LooksLikeMapleStoryTitle(cfg.windowName)
-        || LooksLikeMapleStoryTitle(cfg.targetWindowTitle)
-        || LooksLikeMapleStoryExecutable(cfg.targetExePath)
-        || LooksLikeMapleStoryExecutable(QueryHwndProcessImagePath(top));
+    // 技能键必须 PostMessage。旧 true 会跳过 PostMessage，字母/Ctrl 也不动。
+    return false;
 }
 
 bool WindowModeExecutor::UsesInProcFakeFocusSoftInput() const {
@@ -1033,9 +1094,18 @@ bool WindowModeExecutor::PreferHardwareInput() const {
     if (LooksLikeChromiumShellTarget(cfg, TargetHwnd())) {
         return !fakeFocus_.IsInjected();
     }
+    HWND top = TopLevelTargetWindow(TargetHwnd());
     if (UsesBackgroundWindow()) {
-        // 后台窗口模式禁止假前台 SendInput（MuMu 等走假焦点+PostMessage）。
+        if (fakeFocus_.IsInjected()) return false;
+        // MuMu 等仍走假焦点+PostMessage；仅注入失败的模拟器才假前台。
         if (hardwareFallback_ && LooksLikeEmulatorTarget(cfg, TargetHwnd())) return true;
+        // Unreal/Unity：注入被拒后 PostMessage 进不了 Raw Input。
+        // 嵌套录制若再拆会话，相对鼠标会打到用户刚切过去的前台窗。
+        if (GameTargetNeedsHardwareWithoutFakeFocus(cfg, top)) return true;
+        if (top && IsWindow(top) && LooksLikeMonitorCoveringFullscreen(top)
+            && !PrefersLcaBackgroundMessages(cfg, top)) {
+            return true;
+        }
         return false;
     }
     if (hardwareFallback_) return true;
@@ -1044,9 +1114,11 @@ bool WindowModeExecutor::PreferHardwareInput() const {
         || LooksLikeRemoteDesktopExePath(cfg.targetExePath)) {
         return true;
     }
-    HWND top = TopLevelTargetWindow(TargetHwnd());
     if (top && IsRemoteDesktopWindow(top)) return true;
-    if (top && IsWindow(top) && LooksLikeMonitorCoveringFullscreen(top)) return true;
+    if (top && IsWindow(top) && LooksLikeMonitorCoveringFullscreen(top)
+        && !PrefersLcaBackgroundMessages(cfg, top)) {
+        return true;
+    }
     // 窗口化 UE5/Unity：未注入时 PostMessage 无效；勿等铺满才改走 SendInput。
     if (!fakeFocus_.IsInjected()
         && GameTargetNeedsHardwareWithoutFakeFocus(cfg, top)) {
@@ -1194,11 +1266,9 @@ void WindowModeExecutor::MoveMouseRelativeClient(int dx, int dy) {
         int cx = 0, cy = 0;
         if (GetLastSoftMouseClientPos(TargetHwnd(), cx, cy)) {
             RememberSoftMouseClientPos(TargetHwnd(), cx + dx, cy + dy);
-            if (!UsesRelativeHardwareCursor()) {
-                SendHardwareCursorToClient(cx + dx, cy + dy);
-                return;
-            }
         }
+        // 相对移动必须保持相对 SendInput：窗口化 FPS（枪神纪/UE）读 Raw Input，
+        // 改成绝对 SetCursorPos 镜头不会转。
         SendMouseMoveRelative(dx, dy);
         return;
     }
@@ -1245,6 +1315,7 @@ void WindowModeExecutor::NotifyCancel() {
 void WindowModeExecutor::EndRun() {
     RestoreHardwareOffscreenPark();
     hardwareFallback_ = false;
+    SetLcaBackgroundMessageMode(false);
     HWND top = TopLevelTargetWindow(session_.State().targetHwnd);
     const bool fsGame = top && IsWindow(top) && LooksLikeFullscreenGameTarget(top);
     const bool rdp = IsRemoteDesktopPlaybackTarget();
@@ -1260,6 +1331,9 @@ void WindowModeExecutor::EndRun() {
     }
     wasMinimizedAtBeginRun_ = false;
     loggedClientScale_ = false;
+    if (fakeFocus_.IsInjected() && LooksLikeMapleStoryTarget(session_.Config(), top)) {
+        LogMapleHookHits(L"结束前");
+    }
     fakeFocus_.Unload();
     StopCdpMacroDesktopWatchPump();
     top = TopLevelTargetWindow(session_.State().targetHwnd);
@@ -1395,11 +1469,6 @@ void WindowModeExecutor::MaybeRefreshExtLayout() {
             ix, iy, iw, ih, pw, ph, ext_.SurfaceW(), ext_.SurfaceH());
         return;
     }
-    if (!ext_.SupportsStableBridgeApi()) {
-        extLayoutFresh_ = true;
-        WindowModeLog(L"[窗口模式] 扩展 <1.1.12：跳过 layout 刷新（旧版会断桥）。请重载到 v1.1.12+");
-        return;
-    }
 
     std::wstring err;
     if (ext_.RefreshLayout(err)) {
@@ -1418,20 +1487,48 @@ bool WindowModeExecutor::TargetStillAlive() const {
     if (!active_) return false;
     HWND hwnd = TargetHwnd();
     if (!hwnd || !IsWindow(hwnd)) return false;
-    const DWORD expectPid = session_.State().targetPid;
-    DWORD livePid = 0;
-    GetWindowThreadProcessId(hwnd, &livePid);
-    if (expectPid != 0 && livePid != 0 && livePid != expectPid) return false;
-    if (expectPid == 0) return true;
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, expectPid);
+    const DWORD storedTopPid = session_.State().targetPid;
+    const DWORD storedBindPid = session_.State().bindPid;
+    DWORD liveBindPid = 0;
+    GetWindowThreadProcessId(hwnd, &liveBindPid);
+    HWND top = TopLevelTargetWindow(hwnd);
+    DWORD liveTopPid = 0;
+    if (top && IsWindow(top)) {
+        GetWindowThreadProcessId(top, &liveTopPid);
+    }
+    if (!TargetBindPidStillMatches(storedBindPid, liveBindPid, storedTopPid, liveTopPid)) {
+        return false;
+    }
+    const DWORD checkPid = storedBindPid != 0 ? storedBindPid : storedTopPid;
+    if (checkPid == 0) return true;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, checkPid);
     if (!process) {
         // 窗口还在但打不开进程：多半权限问题，不按闪退处理。
-        return livePid == expectPid || livePid == 0;
+        return true;
     }
     DWORD exitCode = STILL_ACTIVE;
     const BOOL ok = GetExitCodeProcess(process, &exitCode);
     CloseHandle(process);
     return ok && exitCode == STILL_ACTIVE;
+}
+
+std::wstring WindowModeExecutor::TargetAliveDebug() const {
+    HWND hwnd = TargetHwnd();
+    DWORD liveBindPid = 0;
+    if (hwnd) GetWindowThreadProcessId(hwnd, &liveBindPid);
+    HWND top = TopLevelTargetWindow(hwnd);
+    DWORD liveTopPid = 0;
+    if (top) GetWindowThreadProcessId(top, &liveTopPid);
+    wchar_t buf[320]{};
+    swprintf_s(buf,
+        L"hwnd=0x%p isWindow=%d liveBindPid=%lu storedBindPid=%lu top=0x%p liveTopPid=%lu storedTopPid=%lu",
+        hwnd, (hwnd && IsWindow(hwnd)) ? 1 : 0,
+        static_cast<unsigned long>(liveBindPid),
+        static_cast<unsigned long>(session_.State().bindPid),
+        top,
+        static_cast<unsigned long>(liveTopPid),
+        static_cast<unsigned long>(session_.State().targetPid));
+    return buf;
 }
 
 WindowModeHealth WindowModeExecutor::Health() const {
@@ -1646,7 +1743,7 @@ bool WindowModeExecutor::EnsurePlaybackGeometry(std::wstring& err) {
 
     // Chromium/Electron/CEF：最小化或隐藏后 GPU 合成停摆。
     // Win32 安静 ShowWindow/置底还原只会唤出空白壳（bestNcc≈0，已证伪），禁止再走。
-    // 真浏览器走扩展截图；QQ/微信等壳须保持「已还原且可被遮挡」，勿最小化。
+    // 真浏览器走扩展截图；QQ 等 Chromium 壳须保持「已还原且可被遮挡」，勿最小化。
     if (UsesChromiumShellInProcInput()
         || LooksLikeChromiumShellTarget(session_.Config(), root)) {
         if (TargetNeedsQuietPlaybackRestore(root)
@@ -2028,6 +2125,9 @@ void WindowModeExecutor::PostMouseClickAtClient(int cx, int cy, MouseButtonType 
         WindowModeLogEventf(L"[窗口模式] 假焦点软点击 客户区(%d,%d) (%s)",
             cx, cy,
             UsesMapleStoryFakeFocusInput() ? L"共享内存/DirectInput" : L"DLL/PostMessage 队列");
+        if (UsesMapleStoryFakeFocusInput() && ++g_mapleSoftClickLogs == 1) {
+            LogMapleHookHits(L"首击后");
+        }
     }
 
 }
@@ -2060,41 +2160,30 @@ void WindowModeExecutor::PostKeyToTarget(UINT vk, bool down) {
             chromiumShell ? L" (Chromium壳 假前台回退)" : L"");
         return;
     }
-    // Chromium 壳：进程内 PostMessage；冒险岛：只写共享内存，由 DLL 填 DirectInput/GetAsyncKeyState。
+    // Chromium 壳：进程内 PostMessage。冒险岛不走这条（UsesMapleStoryFakeFocusInput 恒 false）。
     if (UsesInProcFakeFocusSoftInput()) {
         FakeFocusSoftInput_SetKey(vk, down);
         WindowModeLogEventf(L"[窗口模式] 假焦点软按键 vk=0x%02X %s (%s)",
             vk, down ? L"down" : L"up",
             UsesMapleStoryFakeFocusInput() ? L"共享内存/DirectInput" : L"DLL/PostMessage 队列");
-        if (UsesMapleStoryFakeFocusInput()) {
-            if (++g_mapleSoftKeyLogs == 8) {
-                DWORD gaks = 0;
-                DWORD diState = 0;
-                DWORD diData = 0;
-                DWORD lastCb = 0;
-                DWORD hitReady = 0;
-                DWORD gfw = 0;
-                DWORD focus = 0;
-                if (FakeFocusSoftInput_ReadMapleHits(gaks, diState, diData, lastCb, hitReady, gfw, focus)) {
-                    WindowModeLogf(
-                        L"[窗口模式] 冒险岛钩命中 hitReady=%lu gfw=%lu focus=%lu "
-                        L"gaks=%lu diState=%lu diData=%lu lastCb=%lu",
-                        static_cast<unsigned long>(hitReady),
-                        static_cast<unsigned long>(gfw),
-                        static_cast<unsigned long>(focus),
-                        static_cast<unsigned long>(gaks),
-                        static_cast<unsigned long>(diState),
-                        static_cast<unsigned long>(diData),
-                        static_cast<unsigned long>(lastCb));
-                }
+        if (UsesMapleStoryFakeFocusInput() && ++g_mapleSoftKeyLogs == 1) {
+            LogMapleHookHits(L"首键后");
+        }
+        // 软键态是「当前值」、事件走灌键线程：不等目标处理完就写下一步，
+        // 组合键（Ctrl+V/Ctrl+C…）会被目标读成「Ctrl 已抬起」→ 只出 v 不粘贴。
+        // 冒险岛走 DirectInput 共享内存（等消息队列无意义），其余（Chromium 壳/Qt/微信）都等。
+        if (!UsesMapleStoryFakeFocusInput()) {
+            if (!g_softKeyPacingOff && !WaitSoftKeyPostTurn(TargetHwnd())) {
+                g_softKeyPacingOff = true;  // 目标不应答（超时/权限）：本次运行不再逐键等，免得卡住回放
+                WindowModeLog(L"[窗口模式] 软键屏障无应答：本会话改为不等待（组合键可能退化成普通字符）");
             }
         }
         return;
     }
+    HWND top = TopLevelTargetWindow(TargetHwnd());
     if (FakeFocusSoftInput_IsAttached()) {
         FakeFocusSoftInput_SetKey(vk, down);
     }
-    HWND top = TopLevelTargetWindow(TargetHwnd());
     // DeSmuME 只吃 GetAsyncKeyState 轮询，外层 WM_KEY* 无效且可能干扰。
     if (!IsDesktopEmulatorTarget(top, &session_.Config())) {
         PostKeyToWindow(TargetHwnd(), vk, down);
@@ -2208,122 +2297,29 @@ bool WindowModeExecutor::ResolveClientSearchRect(const ScriptAction& a,
         return false;
     }
 
-    int searchX1 = a.searchX1;
-    int searchY1 = a.searchY1;
-    int searchX2 = a.searchX2;
-    int searchY2 = a.searchY2;
-    if (session_.Config().windowRelativeCoordinates) {
-        int recW = 0, recH = 0, liveW2 = 0, liveH2 = 0;
-        if (RecordedClientSize(recW, recH) && LiveClientSize(liveW2, liveH2)) {
-            ScaleWindowClientRect(recW, recH, liveW2, liveH2, searchX1, searchY1, searchX2, searchY2);
-        }
+    // 窗口/后台窗口模式：绝对「选取区域」不生效，默认整个客户区。
+    // 「根据图片选取区域」在 FindImage 命中后再用 imageRegion 二次筛选。
+    if (!a.searchFullScreen && a.searchX2 > a.searchX1 && a.searchY2 > a.searchY1) {
+        WindowModeLogf(
+            L"[窗口模式] ResolveClientSearchRect: 忽略绝对选取区域 (%d,%d)-(%d,%d)，改用全客户区 %dx%d",
+            a.searchX1, a.searchY1, a.searchX2, a.searchY2, clientW, clientH);
     }
-
-    if (a.searchFullScreen || (searchX1 == 0 && searchY1 == 0 && searchX2 == 0 && searchY2 == 0)) {
-        x1 = 0;
-        y1 = 0;
-        x2 = clientW;
-        y2 = clientH;
-        return true;
+    if (!EffectiveWindowModeClientSearchRect(clientW, clientH, x1, y1, x2, y2)) {
+        WindowModeLogf(L"[窗口模式] ResolveClientSearchRect: 全客户区无效 %dx%d", clientW, clientH);
+        return false;
     }
-
-    // 找图配置为整屏(如 0,0,2560,1440) 时，窗口模式下等价于全客户区。
-    if (UsesClientCoords() && searchX2 > searchX1 && searchY2 > searchY1
-        && searchX1 <= 0 && searchY1 <= 0
-        && searchX2 >= clientW && searchY2 >= clientH) {
-        x1 = 0;
-        y1 = 0;
-        x2 = clientW;
-        y2 = clientH;
-        WindowModeLog(L"[窗口模式] ResolveClientSearchRect: 整屏搜索映射为全客户区");
-        return true;
-    }
-
-    if (UsesClientCoords()) {
-        auto applyClientRect = [&](int cx1, int cy1, int cx2, int cy2) -> bool {
-            const int L = std::min(cx1, cx2);
-            const int T = std::min(cy1, cy2);
-            const int R = std::max(cx1, cx2);
-            const int B = std::max(cy1, cy2);
-            x1 = std::clamp(L, 0, clientW);
-            y1 = std::clamp(T, 0, clientH);
-            x2 = std::clamp(R, 0, clientW);
-            y2 = std::clamp(B, 0, clientH);
-            return x2 > x1 && y2 > y1;
-        };
-
-        if (session_.Config().windowRelativeCoordinates) {
-            if (applyClientRect(searchX1, searchY1, searchX2, searchY2)) {
-                return true;
-            }
-            x1 = 0;
-            y1 = 0;
-            x2 = clientW;
-            y2 = clientH;
-            return true;
-        }
-
-        HWND root = TopLevelTargetWindow(CaptureTargetHwnd());
-        const bool iconic = root && IsIconic(root);
-
-        if (!iconic && hwnd) {
-            int cx1 = 0, cy1 = 0, cx2 = 0, cy2 = 0;
-            if (ScreenSearchRectToClientRect(hwnd, searchX1, searchY1, searchX2, searchY2,
-                    cx1, cy1, cx2, cy2)
-                && applyClientRect(cx1, cy1, cx2, cy2)) {
-                return true;
-            }
-        }
-
-        const RECT& bound = st.clientRectScreen;
-        if (bound.right > bound.left && bound.bottom > bound.top) {
-            const int cx1 = searchX1 - bound.left;
-            const int cy1 = searchY1 - bound.top;
-            const int cx2 = searchX2 - bound.left;
-            const int cy2 = searchY2 - bound.top;
-            if (applyClientRect(cx1, cy1, cx2, cy2)) {
-                WindowModeLogf(L"[窗口模式] ResolveClientSearchRect: 绑定原点映射 screen(%d,%d,%d,%d) bound(%d,%d,%d,%d)",
-                    searchX1, searchY1, searchX2, searchY2,
-                    bound.left, bound.top, bound.right, bound.bottom);
-                return true;
-            }
-        }
-
-        if (searchX2 > searchX1 && searchY2 > searchY1
-            && searchX1 >= 0 && searchY1 >= 0
-            && searchX2 <= clientW && searchY2 <= clientH
-            && applyClientRect(searchX1, searchY1, searchX2, searchY2)) {
-            WindowModeLog(L"[窗口模式] ResolveClientSearchRect: 按客户区坐标解析");
-            return true;
-        }
-
-        WindowModeLogf(L"[窗口模式] ResolveClientSearchRect: 搜索区无效 iconic=%d screen(%d,%d,%d,%d) 回退全客户区 %dx%d",
-            iconic ? 1 : 0, searchX1, searchY1, searchX2, searchY2, clientW, clientH);
-        x1 = 0;
-        y1 = 0;
-        x2 = clientW;
-        y2 = clientH;
-        return true;
-    }
-
-    x1 = searchX1;
-    y1 = searchY1;
-    x2 = searchX2;
-    y2 = searchY2;
-    return x2 > x1 && y2 > y1;
+    return true;
 }
 
 bool WindowModeExecutor::MapClientRect(int cx1, int cy1, int cx2, int cy2,
     int& sx1, int& sy1, int& sx2, int& sy2) const {
     if (!active_) return false;
-    if (!UsesClientCoords()) {
-        sx1 = cx1;
-        sy1 = cy1;
-        sx2 = cx2;
-        sy2 = cy2;
-        return cx2 > cx1 && cy2 > cy1;
-    }
-    return MapClientRectToScreen(VisionCaptureHwnd(), cx1, cy1, cx2, cy2, sx1, sy1, sx2, sy2);
+    // 入参始终是目标客户区（ResolveClientSearchRect / FindImageClient 命中框）。
+    // 不能看 coordSpace：默认 screenAbsolute，原样拷贝会把 (0,0,w,h) 当成屏幕坐标，
+    // OCR/AI/保存图片就会截到虚拟屏左上角而不是目标窗口。
+    HWND hwnd = VisionCaptureHwnd();
+    if (!hwnd || !IsWindow(hwnd)) hwnd = TargetHwnd();
+    return MapClientRectToScreen(hwnd, cx1, cy1, cx2, cy2, sx1, sy1, sx2, sy2);
 }
 
 ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
@@ -2380,7 +2376,15 @@ ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
         WindowModeLog(L"[窗口模式] FindImageClient: 模板图加载失败");
         return output;
     }
-    opt.maxMatches = 20;
+    int keepMatches = 1;
+    if (a.type == ActionType::MultiMatch) {
+        keepMatches = (a.multiMatchMode == 1)
+            ? std::clamp(a.multiMatchMax, 1, kMultiMatchMaxHits)
+            : 1;
+    }
+    opt.maxMatches = keepMatches;
+    if (keepMatches <= 1)
+        opt.disablePyramid = true;
     opt.maxOverlap = 0.5;
 
     auto applyWindowRelativeSurface = [&](int surfaceW, int surfaceH,
@@ -2391,7 +2395,9 @@ ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
             if (surfTs.sx > 0.0 && surfTs.sy > 0.0) {
                 ts = surfTs;
                 io = BuildExecutionFindImageOptions(probe, ts);
-                io.maxMatches = 20;
+                io.maxMatches = keepMatches;
+                if (keepMatches <= 1)
+                    io.disablePyramid = true;
                 io.maxOverlap = 0.5;
                 // 窗口拉伸可大于 1.0；全局 anamorphic 选项曾把 scaleMax 封在 1.05。
                 const double lo = std::min(surfTs.sx, surfTs.sy);
@@ -2443,19 +2449,13 @@ ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
 
     // 窗口模式 CDP：找图必须走扩展 HTTP 截图（PrintWindow/Cloak 必切屏，已证伪）。
     // 后台 CDP：可扩展优先，失败再同桌面 Win32。
+    // 注意：以前这里按扩展版本号（≥1.1.15 / ≥1.0.21）判断能力，但扩展版本号已重置为
+    // 1.0.0 起重新计数，版本比较不再有意义，反而会把可用路径判成不可用（截图链路整体
+    // 关闭）。现在只以「扩展是否已连接」为准；能力不足时由截图命令自身的错误路径兜底。
     const bool windowModeCdp = !UsesBackgroundWindow() && UsesCdpInput(session_.Config());
     const bool cdpExt = UsesCdpInput(session_.Config());
-    if (windowModeCdp && ext_.IsConnected() && !ext_.SupportsStableBridgeApi()) {
-        WindowModeLog(L"[窗口模式] ★请重载扩展到 v1.1.43+★（HTTP 截图；轻量保活防卡帧）");
-    }
-    const bool cdpExtVision = UsesCdpInput(session_.Config())
-        && ext_.IsConnected()
-        && ext_.SupportsExtVision()
-        && ext_.SupportsStableBridgeApi();
-    const bool preferExtShot = UsesCdpInput(session_.Config())
-        && ext_.IsConnected()
-        && (ext_.SupportsExtVision() || ext_.SupportsSafeExtScreenshot())
-        && ext_.SupportsStableBridgeApi();
+    const bool cdpExtVision = UsesCdpInput(session_.Config()) && ext_.IsConnected();
+    const bool preferExtShot = UsesCdpInput(session_.Config()) && ext_.IsConnected();
     if (preferExtShot) {
         if (UserOnMacroDesktopNow() && prepRoot && IsWindow(prepRoot)) {
             const DWORD settle0 = GetTickCount();
@@ -2527,11 +2527,12 @@ ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
             const DWORD matchMs = GetTickCount() - tMatch0;
             DeleteObject(shot);
             WindowModeLogf(
-                L"[窗口模式] 匹配(扩展截图%s): 命中=%zu best=%.1f%% peakNcc=%.1f%% shot=%ums match=%ums",
+                L"[窗口模式] 匹配(扩展截图%s): 命中=%zu best=%.1f%% peakNcc=%.1f%% pixelAgree=%.1f%% shot=%ums match=%ums",
                 canvasSpace ? L"/canvas" : L"/client",
                 matched.matches.size(),
                 matched.matches.empty() ? 0.0 : matched.matches.front().score,
                 matched.debugBestNccPercent,
+                matched.debugBestPixelAgreePercent,
                 shotMs, matchMs);
             DeleteBitmapHandle(tmpl);
             WindowModeLogDesktopSnap(L"找图后", prepRoot);
@@ -2551,10 +2552,10 @@ ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
             WindowModeLogDesktopSnap(L"找图后", prepRoot);
             return output;
         }
-    } else if (UsesCdpInput(session_.Config()) && ext_.IsConnected()
-        && !ext_.SupportsStableBridgeApi()) {
+    } else if (UsesCdpInput(session_.Config()) && !ext_.IsConnected()) {
+        // 扩展未连接：窗口模式 CDP 没有截图来源，直接返回空匹配（禁止 PrintWindow 回退）
         MaybeRefreshExtLayout();
-        WindowModeLog(L"[窗口模式] 扩展 <1.1.15：无 HTTP 截图能力");
+        WindowModeLog(L"[窗口模式] 扩展未连接：无 HTTP 截图能力");
         if (windowModeCdp) {
             DeleteBitmapHandle(tmpl);
             return output;
@@ -2594,17 +2595,6 @@ ImageMatchOutput WindowModeExecutor::FindImageClient(const ScriptAction& a,
         L"[窗口模式] FindImageClient: 模板 %dx%d scale=%.3fx%.3f matchScale=%.3f~%.3f thr=%.0f search=(%d,%d)-(%d,%d)",
         findMatch.templateW, findMatch.templateH, ts.sx, ts.sy,
         opt.scaleMin, opt.scaleMax, opt.thresholdPercent, cx1, cy1, cx2, cy2);
-
-    int sx1 = 0, sy1 = 0, sx2 = 0, sy2 = 0;
-    if (!MapClientRect(cx1, cy1, cx2, cy2, sx1, sy1, sx2, sy2)) {
-        WindowModeLog(L"[窗口模式] FindImageClient: MapClientRect 失败");
-        DeleteBitmapHandle(tmpl);
-        return output;
-    }
-    (void)sx1;
-    (void)sy1;
-    (void)sx2;
-    (void)sy2;
 
     const HWND captureHwnd = VisionCaptureHwnd();
     const HWND inputHwnd = TargetHwnd();

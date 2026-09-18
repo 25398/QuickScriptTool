@@ -117,6 +117,12 @@ QstVhidEvtDeviceAdd(
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     WdfDeviceInitSetExclusive(DeviceInit, FALSE);
 
+    status = WdfDeviceInitAssignSDDLString(DeviceInit,
+        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
     WDF_FILEOBJECT_CONFIG_INIT(&fileConfig,
         QstVhidEvtDeviceFileCreate,
         WDF_NO_EVENT_CALLBACK,

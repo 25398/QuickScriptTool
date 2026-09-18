@@ -9,6 +9,37 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
+
+#include "window_mode/window_mode_types.h"
+
+/// runMacro / mousePlayback「使用模式」：0默认 1窗口 2后台窗口 3继承（缺省，兼容旧脚本）
+inline constexpr int kNestedUseModeDefault = 0;
+inline constexpr int kNestedUseModeWindow = 1;
+inline constexpr int kNestedUseModeBackground = 2;
+inline constexpr int kNestedUseModeInherit = 3;
+
+inline int NormalizeNestedUseMode(int mode) {
+    if (mode < 0 || mode > 3) return kNestedUseModeInherit;
+    return mode;
+}
+
+inline int NestedUseModeFromText(std::wstring text) {
+    for (wchar_t& ch : text) {
+        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+    }
+    if (text == L"default" || text == L"0") return kNestedUseModeDefault;
+    if (text == L"window" || text == L"1") return kNestedUseModeWindow;
+    if (text == L"backgroundwindow" || text == L"background" || text == L"2")
+        return kNestedUseModeBackground;
+    if (text == L"inherit" || text == L"3") return kNestedUseModeInherit;
+    return kNestedUseModeInherit;
+}
+
+inline bool NestedWindowModeHasIdentity(const windowmode::WindowModeScriptConfig& cfg) {
+    return !cfg.targetExePath.empty() || !cfg.windowClassName.empty()
+        || !cfg.windowName.empty() || !cfg.targetWindowTitle.empty();
+}
 
 // ── 脚本动作类型枚举 ──────────────────────────────────────────────
 // 共 28 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
@@ -19,6 +50,7 @@ enum class ActionType {
     MouseDown,
     MouseUp,
     MouseClick,
+    MouseDrag,          // 鼠标拖拽（按下→插值移动→松开）
     KeyDown,
     KeyUp,
     KeyClick,
@@ -52,8 +84,14 @@ enum class ActionType {
     CustomText,
     AiTextAnalysis,    // AI文字分析
     AiImageAnalysis,   // AI图片分析
-    AiActionExecute    // AI动作执行
+    AiActionExecute,   // AI动作执行
+    WatchImage,        // 找图监视（顶层声明，主流程跳过）
+    VarCompute,        // 变量运算（类 C 脚本）
+    MultiMatch         // 多图匹配（多模板择一 / 单模板多处）
 };
+
+inline constexpr int kMultiMatchMaxTemplates = 8;
+inline constexpr int kMultiMatchMaxHits = 20;
 
 enum class MouseButtonType { Left, Right, Middle, X1, X2 };
 
@@ -69,6 +107,11 @@ struct ScriptAction {
     int y = 0;                                // 目标 Y 坐标；或相对 dy (MoveMouseRelative)
     int randomX = 0;                          // X 坐标随机偏移范围
     int randomY = 0;                          // Y 坐标随机偏移范围
+    int endX = 0;                             // 拖拽终点 X（绝对坐标；找图定位时为相对图中心偏移）
+    int endY = 0;                             // 拖拽终点 Y
+    int randomEndX = 0;                       // 终点 X 随机
+    int randomEndY = 0;                       // 终点 Y 随机
+    bool imageLocate = false;                 // 找图定位：相对找到的图中心偏移（拖拽/取色/颜色匹配）；找色则先找图再在命中框内搜色
     bool moveFromVar = false;                  // 是否从变量表达式解析移动坐标
     std::wstring moveVarExprX;                 // X 坐标变量表达式
     std::wstring moveVarExprY;                 // Y 坐标变量表达式
@@ -87,9 +130,11 @@ struct ScriptAction {
     bool holdRightShift = false;
     // Wait: 等待秒数。mouseClick/keyClick/hotkeyShortcut/quickInput/scrollWheel/
     //   mousePlayback/runMacro/runBlock: 相邻两次重复之间的间隔（clickCount=1 时不生效；首前/末后不等待）
+    // MouseDrag: 拖拽时长（按下到松开的插值时间），不是重复间隔。
+    // MultiMatch: 一图多处依次点击的间隔（默认 0.05；择一/移动/保存不用）。
     // 默认 0：瞬时类（Move*/Down/Up/KeyDown/Up/FindImage）必须为 0；Wait/重复间隔类构建时显式设默认。
     double duration = 0.0;
-    // Wait: 随机附加等待。上列重复类动作: 重复间隔上的随机附加秒数
+    // Wait: 随机附加等待。上列重复类动作: 重复间隔上的随机附加秒数；MouseDrag: 拖拽时长上的随机附加
     double randomDuration = 0.0;
     // Wait（及迁移期残留）：微秒步长，优先于 duration 浮点；version≥2 瞬时类应为 0
     uint64_t timingUs = 0;
@@ -101,22 +146,33 @@ struct ScriptAction {
     std::wstring targetPath;                   // 目标脚本路径 (RunMacro/MousePlayback)
     /// mousePlayback：嵌套录制回放倍速（0.25~4，缺省 1）。只用本字段，不叠加设置全局倍速
     double playbackSpeed = 1.0;
+    /// runMacro/mousePlayback：使用模式（缺省继承，兼容旧脚本）
+    int useMode = kNestedUseModeInherit;
+    /// runMacro/mousePlayback：默认模式下的脱离时间（秒）；窗口类模式忽略
+    double breakoutTimeSeconds = 0;
+    /// runMacro/mousePlayback：窗口/后台窗口模式的绑窗配置（useMode 才是是否启用的来源）
+    windowmode::WindowModeScriptConfig nestedWindowMode;
     int shortcutPreset = 0;                   // 快捷按键预设索引
     std::wstring inputText;                    // 快捷输入文本内容
     double charInterval = 0.01;              // 字符输入间隔 (秒)
-    bool parseEscapes = false;              // 快捷输入：1=解析 \n \r \t \\；缺省 0=按字面输出
+    bool parseEscapes = false;              // 快捷输入：1=解析文本和变量中的 \n \r \t \\；缺省 0=按字面（变量内换行/Tab 丢掉）
     bool scrollVertical = true;               // 垂直滚动
     bool scrollHorizontal = false;            // 水平滚动
     int scrollSteps = 1;                     // 滚动步数
     int scrollDirection = 0;                  // 0=向上/左, 1=向下/右
     // ── 找图相关 ──
-    int searchX1 = 0;                        // 搜索区域左上 X
+    int searchX1 = 0;                        // 搜索区域左上 X（默认模式；窗口模式忽略，改搜整个目标窗口）
     int searchY1 = 0;                        // 搜索区域左上 Y
     int searchX2 = 0;                        // 搜索区域右下 X
     int searchY2 = 0;                        // 搜索区域右下 Y
-    bool searchFullScreen = true;             // 是否搜索整个屏幕
+    bool searchFullScreen = true;             // 默认模式：是否搜索整个屏幕；窗口模式视为整个目标窗口
     std::wstring imagePath;                   // 图片路径；imageUseVar 时为变量名或路径字符串
-    bool imageUseVar = false;                 // 找图/OCR：「要查找的图」使用变量/路径输入
+    std::vector<std::wstring> imagePaths;     // 多图匹配：模板列表（顺序=择一优先级）；imagePath 镜像首张
+    std::vector<char> imageUseVars;           // 多图匹配：每张是否变量图（与 imagePaths 对齐；0/1）
+    int multiMatchMode = 0;                   // 0=多图择一 1=一图多处
+    int multiMatchMax = kMultiMatchMaxHits;   // 一图多处最多保留处数
+    int multiMatchSort = 0;                   // 0=从左到右再从上到下 1=匹配度高到低
+    bool imageUseVar = false;                 // 找图/OCR：「要查找的图」使用变量/路径输入；多图匹配镜像 imageUseVars[0]
     double matchThreshold = 65.0;            // 匹配阈值 (百分比)
     bool perfectMatch = false;               // 完美匹配：像素级终审（忽略 matchThreshold）
     double imageScale = 1.0;                // 缩放比例
@@ -135,12 +191,16 @@ struct ScriptAction {
     int colorTolerance = 16;                 // 单通道最大差 0~255
     // ── 文字识别相关 ──
     bool ocrRegionByImage = false;           // 根据找图锚点 + imageRegion 相对偏移确定 OCR 区域
-    bool ocrDigitsOnly = false;              // 纯数字识别（PaddleOCR 数字模式，失败时回退通用识别）
+    bool ocrDigitsOnly = false;              // 纯数字：小框整行识别；全图/大区域先定位再留数字
     int ocrResultMode = 0;                   // 0=获取文字, 1=文字查找
     std::wstring ocrSearchText;              // 文字查找目标（可含变量）
     int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到, 2=保存到变量
     std::wstring conditionExpr;               // 条件表达式 (If 动作)
     std::wstring gotoStepExpr;                // 跳转目标序号（支持变量表达式）
+    bool resumeAfterWatch = true;            // 找图监视：中断后从原处继续（无跳转时）
+    int watchMode = 0;                       // 0=动作监视（找图等待顺带搜）；1=时间监视（按间隔轮询）
+    double watchPollSeconds = 1.0;           // 时间监视：轮询间隔（秒）
+    std::wstring computeCode;                // 变量运算：类 C 源码
     bool matchFileNameOnly = false;           // 关闭程序时仅匹配文件名
     // ── 根据图片选取区域：匹配框内相对偏移（OCR / AI 共用；与 search/aiSearch 绝对识别区分离）──
     int imageRegionX1 = 0;
@@ -179,6 +239,8 @@ struct ScriptAction {
     bool windowRelative = false;
     double nx = 0.0, ny = 0.0;
     double nRandomX = 0.0, nRandomY = 0.0;
+    double nEndX = 0.0, nEndY = 0.0;
+    double nRandomEndX = 0.0, nRandomEndY = 0.0;
     double nSearchX1 = 0.0, nSearchY1 = 0.0, nSearchX2 = 0.0, nSearchY2 = 0.0;
     double nOffsetX = 0.0, nOffsetY = 0.0;
     double nAiSearchX1 = 0.0, nAiSearchY1 = 0.0, nAiSearchX2 = 0.0, nAiSearchY2 = 0.0;
@@ -211,16 +273,59 @@ inline bool ApplyImageRegionToMatch(const ScriptAction& a,
 // 判断动作类型是否包含子动作 (可展开/折叠)
 inline bool IsExpandableContainer(ActionType type) {
     return type == ActionType::Loop || type == ActionType::DefineBlock
-        || type == ActionType::If || type == ActionType::Else;
+        || type == ActionType::If || type == ActionType::Else
+        || type == ActionType::WatchImage;
 }
 
 // 判断是否作为子树容器 (用于拖拽嵌套逻辑)
 inline bool IsSubtreeContainer(ActionType type) {
     return type == ActionType::Loop || type == ActionType::DefineBlock
-        || type == ActionType::If || type == ActionType::Else;
+        || type == ActionType::If || type == ActionType::Else
+        || type == ActionType::WatchImage;
 }
 
-// 判断动作是否在执行主流程中跳过 (定义块不在主流程中执行)
+// 判断动作是否在执行主流程中跳过 (定义块 / 找图监视不在主流程中执行)
 inline bool SkipsInMainFlow(ActionType type) {
-    return type == ActionType::DefineBlock;
+    return type == ActionType::DefineBlock || type == ActionType::WatchImage;
+}
+
+inline void NormalizeMultiMatchFields(ScriptAction& a) {
+    if (a.type != ActionType::MultiMatch) return;
+    if (a.multiMatchMode < 0) a.multiMatchMode = 0;
+    if (a.multiMatchMode > 1) a.multiMatchMode = 1;
+    if (a.multiMatchSort < 0) a.multiMatchSort = 0;
+    if (a.multiMatchSort > 1) a.multiMatchSort = 1;
+    if (a.multiMatchMax < 1) a.multiMatchMax = kMultiMatchMaxHits;
+    if (a.multiMatchMax > kMultiMatchMaxHits) a.multiMatchMax = kMultiMatchMaxHits;
+    if (a.findImageFollowUp < 0) a.findImageFollowUp = 0;
+    if (a.findImageFollowUp > 2) a.findImageFollowUp = 2;
+    std::vector<std::wstring> srcPaths;
+    if (!a.imagePaths.empty()) srcPaths = a.imagePaths;
+    else if (!a.imagePath.empty()) srcPaths.push_back(a.imagePath);
+    std::vector<std::wstring> paths;
+    std::vector<char> useVars;
+    paths.reserve(static_cast<size_t>(kMultiMatchMaxTemplates));
+    useVars.reserve(static_cast<size_t>(kMultiMatchMaxTemplates));
+    for (size_t i = 0; i < srcPaths.size(); ++i) {
+        std::wstring p = srcPaths[i];
+        while (!p.empty() && (p.front() == L' ' || p.front() == L'\t')) p.erase(p.begin());
+        while (!p.empty() && (p.back() == L' ' || p.back() == L'\t')) p.pop_back();
+        if (p.empty()) continue;
+        if (static_cast<int>(paths.size()) >= kMultiMatchMaxTemplates) break;
+        bool useVar = false;
+        if (i < a.imageUseVars.size()) useVar = a.imageUseVars[i] != 0;
+        else if (i == 0) useVar = a.imageUseVar;
+        paths.push_back(std::move(p));
+        useVars.push_back(useVar ? 1 : 0);
+    }
+    a.imagePaths = std::move(paths);
+    a.imageUseVars = std::move(useVars);
+    a.imagePath = a.imagePaths.empty() ? std::wstring() : a.imagePaths.front();
+    a.imageUseVar = !a.imageUseVars.empty() && a.imageUseVars.front() != 0;
+}
+
+inline bool MultiMatchSlotUseVar(const ScriptAction& a, int i) {
+    if (i < 0) return false;
+    if (i < static_cast<int>(a.imageUseVars.size())) return a.imageUseVars[static_cast<size_t>(i)] != 0;
+    return i == 0 && a.imageUseVar;
 }

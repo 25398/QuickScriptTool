@@ -55,6 +55,11 @@ struct ScreenRegionResult : OpError {
     int x1 = 0, y1 = 0, x2 = 0, y2 = 0; // 屏幕坐标
 };
 
+struct DragPickResult : OpError {
+    int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    double durationSec = 0.0;
+};
+
 struct TemplateCaptureResult : OpError {
     std::wstring imagePath;     // 相对/存储路径（ImagePathForJson）
     std::wstring resolvedPath;  // 绝对路径
@@ -62,15 +67,21 @@ struct TemplateCaptureResult : OpError {
 
 struct FindImageMatchParams {
     std::wstring imagePath; // 已 Resolve 的绝对路径，或待 Resolve 的存储路径
-    std::string modeUtf8;   // test | offset | region | regionBySize
+    std::string modeUtf8;   // test | offset | region | regionBySize | offsetBySize
     int searchX1 = 0, searchY1 = 0, searchX2 = 0, searchY2 = 0;
     int searchFullScreen = 0;
     double matchThreshold = 65.0; // 1–100（≤1 时按比例×100）
     int perfectMatch = 0;
     double imageScaleMin = 1.0;
     double imageScaleMax = 1.0;
-    int syntheticW = 0; // regionBySize：合成锚框宽
-    int syntheticH = 0; // regionBySize：合成锚框高
+    int syntheticW = 0; // regionBySize / offsetBySize：合成锚框宽
+    int syntheticH = 0; // regionBySize / offsetBySize：合成锚框高
+    int syntheticUseScreen = 0; // 1=用虚拟屏尺寸当锚框（保存图片全图）
+    int maxMatches = 20; // 测试叠层最多画几处（一图多处用）；offset/region 叠层会强制 1
+    int constrainToWindow = 0; // 1=窗口/后台窗口模式：在目标窗口客户区内搜，忽略绝对选取区
+    std::wstring windowClassName;
+    std::wstring windowTitle;
+    std::wstring targetExePath;
 };
 
 struct FindImageMatchResult : OpError {
@@ -137,6 +148,10 @@ struct TestOcrParams {
     int ocrResultMode = 0;
     int searchX1 = 0, searchY1 = 0, searchX2 = 0, searchY2 = 0;
     int imageRegionX1 = 0, imageRegionY1 = 0, imageRegionX2 = 0, imageRegionY2 = 0;
+    int constrainToWindow = 0;
+    std::wstring windowClassName;
+    std::wstring windowTitle;
+    std::wstring targetExePath;
     double matchThreshold = 65.0;
     int perfectMatch = 0;
     double imageScaleMin = 1.0;
@@ -169,6 +184,9 @@ struct VhidInstallStatus {
     bool pendingSb = false;             // 已预约续装且等待用户在 BIOS 关闭 Secure Boot
     bool driverReady = false;           // 设备接口可探测（服务 + 设备就绪）
     bool installScriptPresent = false;  // 发版包内含安装脚本
+    bool packagePresent = false;         // package\*.sys 已在本地（可直接装；否则点安装会先下载）
+    bool hidDllPresent = false;          // interception.dll 在 exe 旁或 LocalAppData
+    bool driverNeedsUpdate = false;     // 已装但 INF/ACL 版本过旧，需重新安装
     int lastExitCode = -1;              // install_log.txt 最近 EXIT_CODE；-1 = 无记录
 };
 
@@ -179,6 +197,8 @@ struct BrowsePathResult : OpError {
 // ── API（唯一入口）──────────────────────────────────────────────
 
 ScreenRegionResult PickScreenRegion(HWND owner, const wchar_t* title = L"选取区域");
+DragPickResult PickScreenDrag(HWND owner);
+DragPickResult PickTemplateDrag(HWND owner, const std::wstring& imagePath);
 TemplateCaptureResult CaptureTemplateScreenshot(HWND owner, const wchar_t* title = L"屏幕截图");
 FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& params);
 /// Web 选区裁切：图像像素矩形 (x,y,w,h)。产品路径必须带 rect。

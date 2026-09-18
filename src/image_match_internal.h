@@ -36,14 +36,18 @@ inline void BuildPyramid(const cv::Mat& src, std::vector<cv::Mat>& out, int leve
     cv::buildPyramid(src, out, levels);
 }
 
-inline void SuppressPeak(cv::Mat& result, cv::Point pt, int tplW, int tplH, double maxOverlap) {
+inline void SuppressPeak(cv::Mat& result, cv::Point pt, int tplW, int tplH,
+                          double maxOverlap, bool lowerIsBetter) {
     const int padX = std::max(1, static_cast<int>(tplW * (1.0 - maxOverlap)));
     const int padY = std::max(1, static_cast<int>(tplH * (1.0 - maxOverlap)));
     const int x1 = std::max(0, pt.x - padX);
     const int y1 = std::max(0, pt.y - padY);
     const int x2 = std::min(result.cols - 1, pt.x + padX);
     const int y2 = std::min(result.rows - 1, pt.y + padY);
-    cv::rectangle(result, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(-1.0), cv::FILLED);
+    // CCOEFF 越大越好，填 -1 可去掉峰。SQDIFF 越小越好，填 -1 会变成更强的假峰，
+    // 后续 FindPeaks 全吸在第一处周围，多处匹配只剩 1 个。
+    const double fill = lowerIsBetter ? 1.0e6 : -1.0;
+    cv::rectangle(result, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(fill), cv::FILLED);
 }
 
 inline std::vector<std::pair<cv::Point, double>> FindPeaks(
@@ -57,18 +61,19 @@ inline std::vector<std::pair<cv::Point, double>> FindPeaks(
         cv::Point extremeLoc;
         if (lowerIsBetter) {
             cv::minMaxLoc(work, &extreme, nullptr, &extremeLoc, nullptr);
-            if (extreme > threshold) break;
+            if (!std::isfinite(extreme) || extreme < 0.0 || extreme > threshold) break;
         } else {
             cv::minMaxLoc(work, nullptr, &extreme, nullptr, &extremeLoc);
-            if (extreme < threshold) break;
+            if (!std::isfinite(extreme) || extreme < threshold) break;
         }
         peaks.emplace_back(extremeLoc, extreme);
-        SuppressPeak(work, extremeLoc, tplW, tplH, maxOverlap);
+        SuppressPeak(work, extremeLoc, tplW, tplH, maxOverlap, lowerIsBetter);
     }
     return peaks;
 }
 
 inline double RawScoreToSimilarity(double rawScore, cv::TemplateMatchModes mode) {
+    if (!std::isfinite(rawScore)) return 0.0;
     switch (mode) {
     case cv::TM_SQDIFF:
     case cv::TM_SQDIFF_NORMED:
@@ -188,6 +193,12 @@ inline double CandidateThresholdPercent(double thresholdPercent, bool crossResol
     return std::max(30.0, thresholdPercent * 0.55);
 }
 
+/// 可选 GPU（OpenCL）跑一次 matchTemplate。返回 false = 未启用/不可用/面积太小 →
+/// 调用方照旧走 CPU。**结果图始终回到 CPU**（FindPeaks/多峰/阈值筛选都要整图），
+/// 实测门槛见 image_match.cpp 的 `FindImageGpuMinAreaPx()`。
+bool TryMatchTemplateOnGpu(const cv::Mat& src, const cv::Mat& tpl,
+    int method, cv::Mat& outResult);
+
 /// 单尺度 NCC 峰值（不过滤阈值，供粗搜/诊断）
 inline double PeakNccPercentAtScale(const cv::Mat& srcGray, const cv::Mat& tplGray, double scale) {
     if (srcGray.empty() || tplGray.empty()) return 0.0;
@@ -236,7 +247,10 @@ inline std::vector<ImageMatchResult> MatchSingleScale(
     const int levels = opt.disablePyramid ? 0 : CalcPyramidLevels(tplW, tplH);
     if (levels <= 0) {
         cv::Mat result;
-        cv::matchTemplate(srcGray, scaledTpl, result, mode);
+        // 大区域可走 GPU（上传+GPU+回传，实测 ~2.9x）；小区域自动回落 CPU
+        if (!TryMatchTemplateOnGpu(srcGray, scaledTpl, static_cast<int>(mode), result)) {
+            cv::matchTemplate(srcGray, scaledTpl, result, mode);
+        }
         double extreme = 0.0;
         if (lowerIsBetter) {
             cv::minMaxLoc(result, &extreme, nullptr, nullptr, nullptr);

@@ -22,9 +22,9 @@ description: >-
 ## 模式（与产品「录制优化」对话框相同）
 
 - **merge（默认，用户说「优化」时必须用）**：与产品「鼠标移动合并」相同。按关键动作分段，每段移动+等待合并为一次等待 + 一次移动；等待时间按**该段**计算（默认 `sum` 累加）。含相对位移的段跳过。密集轨迹通常能从几百步收到十几步。
-- **compressPath（不要默认用）**：与产品「鼠标移动压缩」相同，只去掉过密的绝对移动点，动作数只会略减。仅当用户明确说「压缩路径 / 去掉过密移动点」时才用。
+- **compressPath（不要默认用）**：与产品「鼠标移动压缩」相同，只去掉过密的绝对移动点，动作数只会略减。仅当用户明确说「压缩路径 / 去掉过密移动点」时才用。等待时间与 merge 同一套 `waitCalculation`，按留下的移动点间隔计算。
 
-`waitCalculation`：`sum` / `average` / `first` / `last` / `fixed`（`fixed` 时传 `mergeWaitValue` 秒）。
+`waitCalculation`（merge 与 compressPath）：`sum` / `average` / `first` / `last` / `fixed`（`fixed` 时传 `mergeWaitValue` 秒）。
 
 ## 另存
 
