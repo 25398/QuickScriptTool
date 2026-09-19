@@ -250,6 +250,141 @@ AGENTS.md 已把「含中文的 `.ps1` 必须存成 UTF-8 带 BOM」列为硬规
 
 ---
 
+## 九、第 3 轮验收后的清账 + D 段 D1（2026-09-19）
+
+> 依据：`docs/refactor-acceptance-round3.md`（F1–F4）+ 用户指定的顺序
+> 「清账 → 分批提交 → 盯首次 CI → D 段」。
+
+### F3 版本号单源化（已修）
+
+报告列了 4 处硬编码；实际修了 **5 处**——报告漏了最严重的一处：
+
+| 位置 | 处理 |
+|------|------|
+| `installer/QuickScriptTool.iss:4` 自指检查行「当前 1.3.3」 | 去掉具体版本号 |
+| `tools/package_with_version.ps1` 的 `.EXAMPLE` | 改 `<x.y.z>` |
+| `website/downloads/README.md` / `website/README.md` | 文件名改 `<版本>` 占位 |
+| **`resources/QuickScriptTool.rc`（报告未记录）** | `FILEVERSION` / `PRODUCTVERSION` / `FileVersion` / `ProductVersion` **四处**硬编码，发版脚本原本**不写它** → 下次发版 exe 属性里的版本会是旧的。已纳入写入清单 |
+
+顺带修掉一个我引入前就存在的隐患：`Set-VersionInFile` 每次调用都覆盖备份，
+同一个文件被多条规则依次写（.rc 有 4 条）时，回滚会退到「第一次写之后」的中间态。
+改成只记第一次读到的内容。
+
+**过程中抓到自己写错的一版正则**（值得记）：`(\.\d+){0,3}` 是重复捕获组，只保留
+最后一次匹配（`.3.3.0` 只留 `.0`），替换串漏掉收尾引号 → 生成 `"9.9.9.0.0`（丢引号）。
+而「包含新版本号」的弱校验**拦不住**它。已改成 `\d[\d.]*` 一次吃掉整个版本号，
+并把收尾引号放进校验串（变异测试确认：弱校验 True、强校验 False）。
+
+**编码核实（不是缺陷，记录以免后人误改）**：`.iss` 无 BOM 也能被 ISCC 正确按 UTF-8
+读取——已发布安装包里「键鼠工坊」是 UTF-16LE，实测正确。
+
+### F4 `-DryRun` 校验版本号正则（已修）
+
+DryRun 现在对全部 7 条写入规则做「文件存在 + 正则可匹配」校验，把「文件结构变了」
+提前到 DryRun 暴露，而不是等正式跑（已写进 `product_version.txt` 之后）靠回滚兜底。
+同时把 DryRun 与实际执行收敛到**同一份 `$VersionWrites` 清单**，两处不再各写一套。
+
+### F2 窗口模式自检抖动（已修命名用例，并发现报告漏了第二条）
+
+**修的是 `background_minimized_quiet_restore`**（报告 F2 指定的那条）：
+
+- 把三处固定 sleep（80/50/50ms）+ 读一次，改成 `ForegroundWatch` 持续采样 +
+  轮询等待 + 沉降窗口。
+- 判定拆成两条语义明确的断言：`stolen`（**目标窗**成为前台 = 产品缺陷，硬失败）、
+  `settled`（期望窗在前台且结束时仍是）。瞬时 NULL / 第三方窗不计失败——
+  第一版「持续采样 + 一有偏差就失败」实测失败率反而升到 **70%**，就是因为把
+  窗口切换中的瞬时值当成了抢前台。
+- 加前置条件：`decoy` 必须稳定成为前台，否则**跳过**而不是判失败。
+- 结果：**15 次全跑 14 次全绿，该用例 0 失败**（原基线 40% 失败）。
+
+**报告漏了第二条**：`background_click_keeps_foreground` 是同一根因（50/80ms 定值
+sleep + 读一次）。我尝试同样改造，但**改完变成 0/12**——我加的额外等待改变了与
+执行器的交互时序，`stayedMin`（重新最小化是否保持）恒为 false。已**完整还原**该用例，
+不留半成品。
+
+**诚实说明**：这台机器的前台状态会被会话自身的窗口干扰，**无法可靠 A/B 前台类抖动**
+（同一份原始代码在不同时间分别测出 12/12 通过与 5/12 失败）。所以：
+`-Tier full` 仍**不建议**接进 CI；前台观察这一族用例需要一个专门的、隔离的桌面会话
+才能稳定测量。
+
+### 分批提交（已完成）
+
+按主题分 5 个提交并推送（`a44c267..16619fa`）：
+
+| # | 提交 | 内容 |
+|---|------|------|
+| 1 | `52a97c7` | 仓库卫生（取消 49 文件追踪）+ 补齐 6 份重构文档 |
+| 2 | `87c37df` | 重构主体：去重 + 构建去重 + A/B/C 段 + 3 个新 suite + CI |
+| 3 | `89053c7` | 发版入口 `release.cmd` + 版本号单源化 + 驱动脚本补 BOM |
+| 4 | `6306214` | **修复 nlohmann 从未入库（CI 阻塞）** |
+| 5 | `16619fa` | D 段 D1：往返基线 + `ScriptSerializationSelfTest` |
+
+### 首次 CI（已跑，并抓到 1 项 P1 仓库缺陷）
+
+CI run #1（head=`89053c7`）**失败**，但两个长期未知项都得到了答案：
+
+| 步骤 | 结果 |
+|------|------|
+| Cache / Setup OpenCV | ✅ **success**（约 250MB 下载首次在真实 runner 上跑通） |
+| Configure CMake | ✅ success |
+| **Build product shell** | ❌ **failure** |
+
+失败根因（从 job log 取到）：
+
+```
+src\agent_core.h(16,10): error C1083: Cannot open include file:
+  'nlohmann/json.hpp': No such file or directory
+```
+
+**`src/third_party/nlohmann/json.hpp`（920 KB 单头依赖）从未被 git 跟踪**：
+`.gitignore` 第 32 行的 `third_party/`（本意忽略根目录的 OpenCV 安装目录）不带
+前导斜杠，按 gitignore 规则匹配任意层级同名目录，把 `src/third_party/` 连带忽略了。
+**后果：从干净克隆构建不出产品**——本机之所以能编，只是因为磁盘上有这份文件。
+这是 P1 级仓库缺陷，CI 之前从未跑过所以一直没暴露。
+
+已修（`6306214`）：`.gitignore` 加 `!src/third_party/` + `!src/third_party/**` 并入库，
+`git check-ignore -v` 双向确认（该头文件不再被忽略、根 `third_party/opencv` 仍被忽略）。
+
+### D 段 D1：往返基线（已完成）
+
+新增 `tools/script_serialization_selftest.cpp`：
+
+- 默认（CI 安全）**7 条**合成用例，覆盖历史上出过问题的形状：wait 基础、归一化坐标
+  n*（曾被像素冲掉）、multiMatch 的 `template_` 路径（`\t` 曾被吃成制表符）、
+  watchImage 的三个字段、中文与转义、varCompute 多行代码、**保存确定性**
+  （同一份数据连存两次逐字节一致）。
+- `--corpus <dir>`：递归扫描真实脚本库做 读→写→再读，逐动作比对
+  `ScriptActionToJsonString` + 关键顶层字段。
+
+**基线结果（本机 `build\Release\scripts`，14 个真实脚本：夸父上悬崖 72KB、
+龙女下风口 26KB、鼠标宏 21KB 等）**：
+
+```
+脚本 14 个，零差异 14
+其中 14 个 captureSize 被盖上本机屏幕（设计如此，不计差异）
+```
+
+即**动作列表与顶层字段全部逐字往返一致，未发现数据丢失**。
+
+唯一系统性差异 `coordMeta.captureWidth/Height`：`script_io.cpp:946` 用
+`CaptureCurrentCoordMeta()` 把它盖成**保存时所在机器的屏幕尺寸**（找图模板缩放的
+基准），源码注释即写明「像素→n* 用当前屏幕；JSON coordMeta 固定为标准 2560×1440」。
+实测 `2560x1440 -> 1707x960`（本机屏幕）。属**设计如此**，故不参与严格比对，
+但单独计数上报——它是「脚本跨分辨率不字节稳定」的唯一来源，D2/D3 动序列化必须知道。
+
+### 下一步（D 段 D2–D4）
+
+| 步 | 动作 | 验收口径 |
+|----|------|----------|
+| D2 | 以 nlohmann 为唯一实现，三处入口（`script_io.cpp` / `script_action_builder.cpp` / `webview_bridge_backend.cpp`）转发 | `ScriptIoSelfTest` 58 条不退；D1 基线零差异 |
+| D3 | 加 `"v"` 字段 + `MigrateAction(json, fromVer)` | 旧脚本（无 `v`）按 v1 迁移，往返仍零差异 |
+| D4 | 扩充 `ScriptSerializationSelfTest` 含事故形状回归 | **变异测试**：把某字段映射改错 → 必须变红 |
+
+注意 D1 已暴露一条约束：`captureSize` 是机器相关的，**D3 加版本字段时不要把它纳入
+「内容哈希/等价判定」**，否则同一脚本在不同机器上会被判为不同版本。
+
+---
+
 ## 九、第 3 轮记录（发版工具链 + FakeFocus32 + A4/A5 收尾）
 
 > 验收全文：[`docs/refactor-acceptance-round3.md`](refactor-acceptance-round3.md)
