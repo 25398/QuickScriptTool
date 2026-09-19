@@ -252,8 +252,15 @@
 ### `maplestory_bg_fake_focus`
 
 - **测什么**：`MapleStoryClass` / `MapleStory.exe` / 标题含冒险岛 识别为游戏；后台 **不** `UsesFakeFocus`、绑后不最小化；`MapleNeedsSafeFakeFocusLite` 为 true。  
-- **用户症状**：游戏必须前台才会走，切走后原地 A。技能键走 WndProc/PostMessage；走路走 DirectInput，失焦后停轮询。  
-- **代码**：`UsesFakeFocus` / `UsesFakeFocusForTarget` 仍 false（保持 PostMessage）；`TryInstallFakeFocus` 对冒险岛注入 mapleSafe `InstallLite`（吞失活 + DI 填键）。`UsesMapleStoryFakeFocusInput` 恒 false。方向键**始终** `SendKeyboardKey`（防 DI 虚表未挂上时前台也不走）+ 已注入时写 SoftInput。`fake_focus_maplestory_focus_only` 约束 DLL：禁止假 WM_INPUT / 18 方法表 / user32 JMP。  
+- **用户症状**：游戏必须前台才会走，切走后原地 A；或**在桌面/浏览器前台时点运行**，全程原地 A（切走只会 A 不会走）。技能键走 WndProc/PostMessage；走路走 DirectInput，失焦后停轮询。  
+- **「点运行时游戏已不在前台」根因**：2009 dinput8 靠 WM_ACTIVATE 停轮询（不逐帧查前台），客户端早在注入前就停了 → DI 虚表钩子/软键态全不被读。IAT 吞失活只能拦「以后」的失活。修法：`WakeMapleStoryInputPolling()`（注入后真激活一次、等 `diState>0`、还前台）；**禁止**假 WM_ACTIVATE（会冻客户端）。同时方向键兜底 SendInput 只在目标为前台时补，否则会打进用户正在看的浏览器（B 站视频跳进度/调音量）。  
+- **「游戏已在前台、诊断却全零」根因（第二轮，仍未收敛）**：日志里 `gaks=0 gfw=0 diState=0 lastCb=0` 且 `diag=0x00014FE3`（钩子装好了）——说明**客户端根本不调这些 API**，而不是没装上。此时不要盲目继续补钩子，先看 `pollHit=`（见下）。可能的真实入口：打包器手搓 PE 导出解析（绕过 `GetProcAddress`，只能方法体 JMP，而冒险岛**明令禁止** user32 方法体 JMP）；或客户端是纯消息驱动、走路靠别的键态源。  
+- **诊断契约（本轮新增，务必先读再动手）**：`mapleDiag` 高位是运行期命中位，宿主在 `冒险岛钩安装` 行尾解成 `pollHit=` + `gpaIat=` + `dinputIat=`：
+  - `0x20000` GetKeyState 被调用过 / `0x40000` GetKeyboardState / `0x80000` GetCursorPos / `0x100000` GetProcAddress / `0x200000` GetProcAddress 的 IAT 槽已补 / `0x400000` dinput user32 IAT 补到过槽。
+  - 判读：`pollHit=无` + `gaks=0 diState=0` ⇒ 客户端不走任何被拦 API（**不是**钩子没装上）；`pollHit=GetCursorPos` 但无键态项 ⇒ 客户端确实在轮询 Win32，键态走了别的入口。
+  - **`iatPoll=2` 是异常值**：本地 dinput8 存在时应 ≥4。成因是 dinput8/dinput **懒加载**，PEB 那轮还没进进程；`InstallMapleIatHooks` 末尾已在 DI 虚表阶段之后补走一次 `MapleIatWalkGameDirDinputUser32()`。
+- **构建前提（踩过，别再踩）**：`src/window_mode/fake_focus/build_fakefocus32.cmd` 里 **禁止**写 `if defined ProgramFiles(x86)` —— 括号会打断 `if` 解析，BuildTools 装在「Program Files (x86)」时永远走到 `vcvarsall.bat not found - skip 32-bit DLL`，**32 位 DLL 被静默跳过**（症状：`FakeFocus32.dll` 时间戳远旧于 `FakeFocus64.dll`，任何 DLL 侧修复都没生效）。已改成先 `set "PF86=%ProgramFiles(x86)%"` 再判断，并加 vswhere 全路径兜底。验证：`cmake --build build --config Release --target FakeFocus32` 必须打印 `[FakeFocus32] OK:`。
+- **代码**：`UsesFakeFocus` / `UsesFakeFocusForTarget` 仍 false（保持 PostMessage）；`TryInstallFakeFocus` 对冒险岛注入 mapleSafe `InstallLite`（吞失活 + DI 填键）。`UsesMapleStoryFakeFocusInput` 恒 false。方向键：已注入时写 SoftInput + PostMessage，`SendKeyboardKey` **只在目标为前台窗时**才补（`TargetOwnsForegroundWindow`）。`WakeMapleStoryInputPolling()`（`window_mode_executor.cpp`，后台窗口模式 BeginRun 内）负责把「注入前已失焦」的客户端叫醒。`fake_focus_maplestory_focus_only` 约束 DLL：禁止假 WM_INPUT / 18 方法表 / user32 JMP。`MaplePollHitSummary()`（`window_mode_executor.cpp`）负责把诊断位解成人话。  
 
 ### `lca_arrow_key_lparam`
 

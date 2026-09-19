@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
   Recovery for machines that can still reach Windows / Safe Mode / WinRE

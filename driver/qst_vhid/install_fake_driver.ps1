@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
   LAB ONLY — do not run from the product settings UI.
   This script is a signing-bypass experiment. The product installer

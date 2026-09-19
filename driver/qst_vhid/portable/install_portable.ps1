@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
   LAB ONLY — portable QstVHid installer for security testing. Do not ship or run from product UI.

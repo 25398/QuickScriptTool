@@ -1,7 +1,9 @@
 ; QuickScriptTool 安装包脚本（Inno Setup 6）
 ;
 ; 发版流程：
-;   1. 确认 tools\product_version.txt 与下方 MyAppVersion 一致（当前 1.3.3）
+;   1. 确认 tools\product_version.txt 与下方 MyAppVersion 一致
+;      （tools\package_with_version.ps1 会同时写这两处 + app_branding.cpp + QuickScriptTool.rc，
+;        所以正常发版不要手工改单边；这里刻意不写具体版本号，避免每次发版后这句话就过期）
 ;   2. powershell -ExecutionPolicy Bypass -File tools\package_release.ps1
 ;      （会把 MSVC CRT / WebView2Fixed / ui / extension / 驱动安装脚本等打进 dist\QuickScriptTool；内核 .sys 不随默认包）
 ;   3. 编译本脚本（需 Inno Setup 6；简体中文语言文件在本目录 ChineseSimplified.isl）：
