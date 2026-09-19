@@ -385,6 +385,83 @@ src\agent_core.h(16,10): error C1083: Cannot open include file:
 
 ---
 
+## 十、D 段 D2 / D3 / D4（2026-09-19）
+
+### D2 字段提取统一到 nlohmann（已完成）
+
+`script_io.cpp` 有 1,159 行却 **0 处 nlohmann** —— 整个脚本格式解析都是手写的。
+真正的收敛点不是三个文件各写一套，而是 `utils.cpp` 里的三个手写扫描器
+`ExtractString` / `ExtractNumber` / `ExtractBool`，调用分布：
+
+| 文件 | 调用数 | 数据源 |
+|------|--------|--------|
+| `script_io.cpp` → `ParseScriptActionBlock` | 179 | `block` |
+| `script_io.cpp` → `LoadScriptFileData` | 10 | `content` |
+| `script_io.cpp` → `ParseScriptContent` | 10 | `content` |
+
+（`script_action_builder.cpp` 本来就是 nlohmann，0 处调用。）
+
+做法：`json_util.h` 新增 `WideObjectView`（**解析一次、多次取值**），语义与旧 `Extract*`
+逐条对齐（`GetBool` 保留「数字非 0 视为 true」，否则 `"enabled":1` 的老脚本会静默失效）。
+199 处调用全部改走它；`ExtractNamedJsonObject` 的手写括号扫描改走 `GetSubObjectText`。
+
+性能：旧实现每次取值都要 `FindTopLevelJsonKeyColon` 扫整个块，一个动作 ~50 次，
+1.5 万步录制即 75 万次全块扫描；现在整块只解析一次。
+
+**过程中发现并处理的两个真问题：**
+
+1. **非法转义会让动作被静默丢弃（数据丢失）**：`"images\a.png"` 里 `\a` 是非法 JSON
+   转义 → 严格解析整块失败 → `ParseScriptContent` 的 `if (!type.empty())` 守卫把该动作
+   **静默跳过**（AgentAssistantSelfTest 实测 3 个动作掉 1 个）。旧词法扫描容忍这种输入，
+   所以这是 D2 引入的行为回退，而且是最坏的失败方式。已给 `WideObjectView` 加**唯一一条**
+   兜底：把「反斜杠 + 非合法转义字符」补成 `\\` 后重试。刻意不做更宽的容错。
+   实测 14 个真实脚本**全部是合法 JSON**，这条只覆盖手改/旧版本写出的文件。
+2. **文档级严格度提高（行为变更）**：`ParseScriptContent` / `LoadScriptFileData` 现在要求
+   整份 content 合法 JSON，非法输入**响亮失败**（错误信息区分「不是合法 JSON」与
+   「缺少 scriptName」）。已核实真实数据不受影响。
+
+### D4 变异测试暴露的根本盲点（已完成）
+
+按验收报告要求做变异测试，结果发现**往返测试抓不到稳定的字段映射错误**：
+A=parse(content) 与 B=parse(save(A)) 都经过同一个被变异的解析器，错得一模一样，
+往返是「零差异」。实测：把 mouseClick 的 x 读成 y → `ScriptIoSelfTest` 变红 1 条，
+而往返套件 **0 条变红**。
+
+补 `field_mapping_anchors`：给定输入 → 断言字段落到正确成员。用**老脚本**（无 coordMeta），
+解析路径是 像素→n\*（按标准 2560×1440）→ 反归一化到当前虚拟屏，所以像素期望值可精确算出
+（`GetVirtualScreenBounds` 是公开的）。**实测有效**：把通用分支的 x 映射改成读 y → 立刻变红，
+诊断打出「`[0].x（x/y 读错？）, [3].x（x/y 读错？） | 实际 click=(148,148) 期望=(74,148)`」。
+
+**覆盖缺口（必须记住）**：第一次变异打在 `MoveMouseRelative` 分支上，套件**没变红** ——
+因为锚定用例里没有这个动作类型。**锚定断言的覆盖面 = 它列举的动作类型**；新加动作类型时
+要同步补一条，否则那类映射错误只有真实脚本语料（`--corpus`）才可能碰到。
+
+### D3 schema 版本 + 迁移锚点（已完成）
+
+- `ScriptFileData.schemaVersion`（缺省 1 = 历史文件无 `"v"`）；保存时顶层写 `"v": 2`
+- 新增 `MigrateScriptFileData(data, fromVer)`：逐版本迁移链，v1→v2 是**空迁移**
+  （格式未变，v2 只是开始显式记版本、给下次变更留锚点）。函数里写清了下一版该照抄的模板，
+  并明确「不要在这里做顺手修正」（那是 `NormalizeInputTiming` 的职责）
+- 迁移**已解析的模型**而非原始 JSON（解析已统一到 nlohmann，原始 JSON 到这一步已被消费成
+  `ScriptAction`/`ScriptFileData`）；验收报告写的 `MigrateAction(json, fromVer)` 落到了模型层
+
+### 验证
+
+| 项 | 结果 |
+|----|------|
+| 逻辑层 | **19 suite / 676 用例 / 0 失败** |
+| `ScriptSerializationSelfTest` 内置 | 11 条全绿 |
+| `--corpus`（14 个真实脚本） | 12 条全绿，仍零差异 |
+| 变异测试 1（非法转义兜底） | 去掉兜底 → `roundtrip_invalid_escape_path` 立刻变红 |
+| 变异测试 2（x/y 映射） | 改错 → `field_mapping_anchors` 立刻变红，诊断精确 |
+| 构建 | 零 error、零 warning（顺手清了 AiActionRouterSelfTest 的 C4100） |
+
+### 提交
+
+`00ae566` D2 · `1819c05` D3+D4
+
+---
+
 ## 九、第 3 轮记录（发版工具链 + FakeFocus32 + A4/A5 收尾）
 
 > 验收全文：[`docs/refactor-acceptance-round3.md`](refactor-acceptance-round3.md)
