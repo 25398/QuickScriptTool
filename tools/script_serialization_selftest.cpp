@@ -27,6 +27,7 @@
 // =============================================================================
 #include "selftest_harness.h"
 
+#include "coord_space.h"
 #include "json_util.h"
 #include "script_io.h"
 #include "script_types.h"
@@ -58,6 +59,12 @@ const selftest::CaseInfo kCases[] = {
         L"路径含单个反斜杠（JSON 非法转义）时动作不得被静默丢弃"},
     {L"save_is_deterministic", L"default",
         L"同一份数据连续保存两次，产物逐字节一致（无隐藏时间戳/顺序抖动）"},
+    {L"field_mapping_anchors", L"default",
+        L"给定输入解析出的字段必须等于期望值（往返测试抓不到稳定映射错误）"},
+    {L"schema_version_chain", L"default",
+        L"老文件无 v → 视为 v1 → 迁移到当前版本 → 保存写出 v → 读回一致（D3）"},
+    {L"legacy_roundtrip_clean", L"default",
+        L"无 v 的老脚本整条往返仍零差异（D3 迁移不得改动内容）"},
     {L"corpus_roundtrip_clean", L"corpus",
         L"真实脚本库递归往返：零差异（--corpus <dir>）"},
 };
@@ -113,6 +120,7 @@ void NoteDiff(RoundTripResult& r, const std::string& text) {
 
 /// 关键顶层字段比对（动作以外的部分）
 void CompareTopLevel(const ScriptFileData& a, const ScriptFileData& b, RoundTripResult& r) {
+    if (a.schemaVersion != b.schemaVersion) NoteDiff(r, "schemaVersion");
     if (a.scriptName != b.scriptName) NoteDiff(r, "scriptName");
     if (a.durationSeconds != b.durationSeconds) NoteDiff(r, "durationSeconds");
     if (a.breakoutTimeSeconds != b.breakoutTimeSeconds) NoteDiff(r, "breakoutTimeSeconds");
@@ -354,6 +362,131 @@ void CaseInvalidEscapePath() {
     Emit(L"roundtrip_invalid_escape_path", ok, detail.c_str());
 }
 
+// ── D3：schema 版本 ───────────────────────────────────────────────
+// 老文件（无 "v"）→ 视为 v1 → 迁移到当前版本 → 保存时写出 "v" → 再读回仍是当前版本。
+// 这条链一旦断了，未来改格式就没有迁移锚点，老脚本会静默读错。
+void CaseSchemaVersionChain() {
+    const std::wstring legacy =
+        LR"({"scriptName":"selftest_legacy","actions":[{"type":"wait","duration":0.1}]})";
+    const std::wstring path = TempPathFor(L"schema");
+
+    ScriptFileData d = ParseScriptContent(legacy);
+    const bool migrated = d.schemaVersion == kScriptSchemaVersion;
+
+    const bool saved = SaveScriptFileData(path, d);
+    std::string raw;
+    const bool readOk = ReadFileUtf8(path, &raw);
+    const std::wstring w = FromUtf8(raw);
+    const std::wstring needle = L"\"v\": " + std::to_wstring(kScriptSchemaVersion);
+    const bool wroteV = w.find(needle) != std::wstring::npos;
+
+    ScriptFileData back = LoadScriptFileData(path, false);
+    const bool readBack = back.schemaVersion == kScriptSchemaVersion;
+
+    // 老文件（显式 "v":1）也要能迁移
+    const std::wstring v1 = LR"({"v":1,"scriptName":"x","actions":[{"type":"wait","duration":0.1}]})";
+    const bool v1Migrated = ParseScriptContent(v1).schemaVersion == kScriptSchemaVersion;
+
+    const bool ok = migrated && saved && readOk && wroteV && readBack && v1Migrated;
+    std::wstring detail = L"迁移=" + std::to_wstring(d.schemaVersion)
+        + L" 写出" + needle + L"=" + (wroteV ? L"1" : L"0")
+        + L" 读回=" + std::to_wstring(back.schemaVersion)
+        + L" v1迁移=" + (v1Migrated ? L"1" : L"0");
+    Emit(L"schema_version_chain", ok, detail.c_str());
+}
+
+// 老文件（无 v）在整条往返里仍须零差异
+void CaseLegacyRoundTripClean() {
+    const std::wstring legacy =
+        LR"({"scriptName":"selftest_legacy2","recordTime":"2026-01-01 00:00:00",)"
+        R"("actions":[{"type":"wait","duration":0.25},)"
+        R"({"type":"mouseClick","x":10,"y":20,"clickCount":2}]})";
+    const RoundTripResult r = RoundTripContent(legacy, TempPathFor(L"legacy"));
+    const bool ok = r.loaded && r.saved && r.reloaded && r.diffs.empty()
+        && r.actionsA == r.actionsB && r.unparsableBlocks == 0;
+    std::wstring detail = L"actions=" + std::to_wstring(r.actionsA) + L"/块="
+        + std::to_wstring(r.lexicalActions);
+    if (!ok) {
+        for (const auto& d : r.diffs) detail += L" | " + std::wstring(d.begin(), d.end());
+    }
+    Emit(L"legacy_roundtrip_clean", ok, detail.c_str());
+}
+
+// ── 字段锚定（D4 变异测试暴露的必需补充）────────────────────────────
+// 为什么不能只做往返：往返比对的是 A=parse(content) 与 B=parse(save(A))。
+// 若解析器把某个字段**稳定地**读错（例如 mouseClick 的 x 读成 y），A 与 B 都错得
+// 一模一样，往返是「零差异」—— 实测：注入这个变异后 ScriptIoSelfTest 变红 1 条，
+// 而往返套件 0 条变红。
+// 所以必须有「给定输入 → 解析出的字段必须等于期望值」的锚定断言。
+void CaseFieldMappingAnchors() {
+    // 关键：用**老脚本**（无 coordMeta）。解析路径是
+    //   像素 → n*（按标准 2560×1440）→ 反归一化到当前虚拟屏
+    // 所以像素期望值可以**精确算出**：
+    //   x_out = x_in / 2560 * vsW ,  y_out = y_in / 1440 * vsH
+    // 这正是能抓到「x 读成 y」的地方 —— 只断言 n* 抓不到（n* 有独立的映射），
+    // 只断言往返也抓不到（A/B 都错得一样）。
+    const std::wstring content =
+        LR"({"scriptName":"anchor","actions":[)"
+        LR"({"type":"mouseClick","x":111,"y":222,"clickCount":3},)"
+        LR"({"type":"wait","duration":1.75},)"
+        LR"({"type":"findImage","imagePath":"images\a.png","matchVarName":"hit"},)"
+        LR"({"type":"moveMouse","x":333,"y":444},)"
+        LR"({"type":"varCompute","computeCode":"a = 7;\nreturn a;"})"
+        R"(]})";
+    const ScriptFileData d = ParseScriptContent(content);
+    int vx = 0, vy = 0, vsW = 0, vsH = 0;
+    GetVirtualScreenBounds(vx, vy, vsW, vsH);
+
+    std::wstring bad;
+    auto fail = [&bad](const wchar_t* what) {
+        if (!bad.empty()) bad += L", ";
+        bad += what;
+    };
+
+    if (d.actions.size() != 5) {
+        fail(L"动作数");
+    } else {
+        const ScriptAction& click = d.actions[0];
+        if (click.type != ActionType::MouseClick) fail(L"[0].type");
+        if (std::fabs(click.x - 111.0 / 2560.0 * vsW) > 1.0) fail(L"[0].x（x/y 读错？）");
+        if (std::fabs(click.y - 222.0 / 1440.0 * vsH) > 1.0) fail(L"[0].y（x/y 读错？）");
+        if (click.clickCount != 3) fail(L"[0].clickCount");
+
+        const ScriptAction& wait = d.actions[1];
+        if (wait.type != ActionType::Wait) fail(L"[1].type");
+        if (std::fabs(wait.duration - 1.75) > 1e-6) fail(L"[1].duration");
+
+        const ScriptAction& find = d.actions[2];
+        if (find.type != ActionType::FindImage) fail(L"[2].type");
+        if (find.imagePath.find(L"images") == std::wstring::npos
+            || find.imagePath.find(L"a.png") == std::wstring::npos) {
+            fail(L"[2].imagePath（路径未落到该字段？）");
+        }
+        if (find.matchVarName != L"hit") fail(L"[2].matchVarName");
+
+        const ScriptAction& move = d.actions[3];
+        if (move.type != ActionType::MoveMouse) fail(L"[3].type");
+        if (std::fabs(move.x - 333.0 / 2560.0 * vsW) > 1.0) fail(L"[3].x（x/y 读错？）");
+        if (std::fabs(move.y - 444.0 / 1440.0 * vsH) > 1.0) fail(L"[3].y（x/y 读错？）");
+
+        const ScriptAction& vc = d.actions[4];
+        if (vc.type != ActionType::VarCompute) fail(L"[4].type");
+        if (vc.computeCode.find(L"a = 7;") == std::wstring::npos) fail(L"[4].computeCode");
+    }
+
+    const bool ok = bad.empty();
+    std::wstring detail = ok ? std::wstring(L"5 个动作的字段全部落到正确成员（像素值按 2560x1440 参考精确核对）")
+                             : (L"字段映射错: " + bad);
+    if (!ok && d.actions.size() >= 4) {
+        detail += L" | 实际 click=(" + std::to_wstring(d.actions[0].x) + L","
+            + std::to_wstring(d.actions[0].y) + L") 期望=("
+            + std::to_wstring(static_cast<int>(111.0 / 2560.0 * vsW)) + L","
+            + std::to_wstring(static_cast<int>(222.0 / 1440.0 * vsH)) + L") vs="
+            + std::to_wstring(vsW) + L"x" + std::to_wstring(vsH);
+    }
+    Emit(L"field_mapping_anchors", ok, detail.c_str());
+}
+
 // ── 语料往返（D1 基线）────────────────────────────────────────────
 int g_corpusTotal = 0;
 int g_corpusClean = 0;
@@ -473,6 +606,9 @@ int wmain(int argc, wchar_t** argv) {
     CaseUnicodeAndEscapes();
     CaseVarComputeCode();
     CaseInvalidEscapePath();
+    CaseFieldMappingAnchors();
+    CaseSchemaVersionChain();
+    CaseLegacyRoundTripClean();
     CaseSaveDeterministic();
     if (!corpusDir.empty()) CaseCorpus(corpusDir);
 

@@ -4947,7 +4947,7 @@ void CaseRecipeReuseGuards() {
     SetAiActionPlanGateEnabled(false);
     int executed = 0;
     AiActionHostHooks hooks;
-    hooks.onExecuteActions = [&executed](const std::wstring& json) {
+    hooks.onExecuteActions = [&executed](const std::wstring& /*json*/) {
         ++executed;
         return std::wstring(L"已执行");
     };

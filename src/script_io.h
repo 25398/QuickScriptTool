@@ -15,6 +15,12 @@
 bool IsRecordingScriptPath(const std::wstring& path);
 
 struct ScriptFileData {
+    /// 脚本文件格式版本（JSON 顶层 "v"）。
+    /// 1 = 历史文件（无 "v" 字段）；2 = 显式记录版本的当前格式。
+    /// **改字段语义/名字时必须**：① 把 kScriptSchemaVersion +1；
+    /// ② 在 MigrateScriptFileData 里加一条 fromVer→fromVer+1 的分支；
+    /// ③ 在 ScriptSerializationSelfTest 里补一条「老版本文件仍能正确迁移」的用例。
+    int schemaVersion = 1;
     std::wstring scriptName;
     std::wstring recordTime;
     double durationSeconds = 0;
@@ -40,6 +46,18 @@ void MoveVisualLayoutCache(const std::wstring& oldScriptPath, const std::wstring
 
 /// 提取 JSON 对象字段（key 后的 {...}），找不到返回空
 std::wstring ExtractNamedJsonObject(const std::wstring& content, const wchar_t* key);
+
+/// 当前脚本文件格式版本。保存时写入 JSON 顶层 "v"；读取时缺省视为 1。
+inline constexpr int kScriptSchemaVersion = 2;
+
+/// 把 fromVer 版本的已解析脚本迁移到当前版本（就地改 data）。
+/// 只在 fromVer < kScriptSchemaVersion 时由 Load/Parse 调用。
+///
+/// 为什么迁移**已解析的模型**而不是原始 JSON：
+/// 解析已统一到 nlohmann（json_util::WideObjectView），原始 JSON 到这一步已被消费成
+/// ScriptAction / ScriptFileData；对模型做迁移比再改一遍 JSON 更简单、也更不容易漏字段。
+/// 逐动作的迁移逻辑写在本函数里（遍历 data.actions）。
+void MigrateScriptFileData(ScriptFileData& data, int fromVer);
 
 /// 若 version<2：安全 Expand 前延迟为 Wait，合并相邻 Wait，升为 version=2。
 void NormalizeInputTiming(ScriptFileData& data, const std::wstring& path,

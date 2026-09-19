@@ -760,6 +760,28 @@ bool ScriptNormValuesLookLikePixels(const std::vector<ScriptAction>& actions) {
 
 }  // namespace
 
+void MigrateScriptFileData(ScriptFileData& data, int fromVer) {
+    // ── 逐版本迁移链 ────────────────────────────────────────────────
+    // 每条分支只负责「把 fromVer 升到 fromVer+1」，逐级推进，不要跳级判断。
+    // v1 → v2：**格式未变**。v1 是「没有 v 字段」的历史文件，v2 只是开始显式记录
+    // 版本号，为后续格式变更留锚点。所以这条是空迁移 —— 它的存在本身是给下一次
+    // 改字段时照抄的模板：
+    //
+    //   if (fromVer < 3) {
+    //       for (auto& a : data.actions) {
+    //           if (a.type == ActionType::Xxx) { /* 把旧字段搬到新字段 */ }
+    //       }
+    //   }
+    //
+    // 注意：**不要**在这里做「顺手修正」类的事情（那是 NormalizeInputTiming 的职责），
+    // 迁移只负责版本间的字段语义变化，否则两种逻辑会互相纠缠。
+    (void)data;
+    (void)fromVer;
+    if (fromVer < 2) {
+        // v1 → v2：无字段变化
+    }
+}
+
 void NormalizeInputTiming(ScriptFileData& data, const std::wstring& path,
     bool forceRecordingExpand) {
     if (data.inputTimingVersion >= kInputTimingVersionExplicitWaits) return;
@@ -776,6 +798,9 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
     if (path.empty()) return data;
     const auto content = ReadAll(path);
     const qst::jsonutil::WideObjectView JC(content);
+    // 格式版本：缺省（老文件）视为 1；低于当前版本则跑迁移链。
+    data.schemaVersion = static_cast<int>(JC.GetNumber(L"v", 1));
+    if (data.schemaVersion < 1) data.schemaVersion = 1;
     data.scriptName = JC.GetString(L"scriptName");
     data.recordTime = JC.GetString(L"recordTime");
     data.durationSeconds = JC.GetNumber(L"durationSeconds", 0);
@@ -843,6 +868,11 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
         DenormalizeScriptToCurrentScreen(data.actions);
     }
 
+    if (data.schemaVersion < kScriptSchemaVersion) {
+        MigrateScriptFileData(data, data.schemaVersion);
+        data.schemaVersion = kScriptSchemaVersion;
+    }
+
     NormalizeInputTiming(data, path);
     ApplyWindowRelativePlaybackConfig(data, path);
     return data;
@@ -852,6 +882,9 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
     ScriptFileData data{};
     const qst::jsonutil::WideObjectView JC(content);
     if (content.empty()) return data;
+    // 格式版本：缺省（老文件）视为 1；低于当前版本则跑迁移链。
+    data.schemaVersion = static_cast<int>(JC.GetNumber(L"v", 1));
+    if (data.schemaVersion < 1) data.schemaVersion = 1;
     data.scriptName = JC.GetString(L"scriptName");
     data.recordTime = JC.GetString(L"recordTime");
     data.durationSeconds = JC.GetNumber(L"durationSeconds", 0);
@@ -897,6 +930,11 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
 
     if (data.coordsNormalized && !data.actions.empty()) {
         DenormalizeScriptToCurrentScreen(data.actions);
+    }
+
+    if (data.schemaVersion < kScriptSchemaVersion) {
+        MigrateScriptFileData(data, data.schemaVersion);
+        data.schemaVersion = kScriptSchemaVersion;
     }
 
     // 无路径：仅 version==1 视为录制时间线；scripts 默认 0.1 不展开。
@@ -968,6 +1006,8 @@ bool SaveScriptFileData(const std::wstring& path, const ScriptFileData& data) {
     if (!out) return false;
     out.write("\xEF\xBB\xBF", 3);
     file << L"{\n";
+    // 格式版本写在最前，便于人眼/脚本一眼看出文件格式（见 kScriptSchemaVersion）
+    file << L"  \"v\": " << kScriptSchemaVersion << L",\n";
     file << L"  \"scriptName\": \"" << EscapeJson(data.scriptName) << L"\",\n";
     file << L"  \"recordTime\": \"" << EscapeJson(data.recordTime) << L"\",\n";
     if (data.durationSeconds > 0) {
