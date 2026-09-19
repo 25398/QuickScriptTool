@@ -1,4 +1,4 @@
-# package_webview_portable.ps1 — 便携 zip：解压即用，无需安装 WebView2 Runtime
+﻿# package_webview_portable.ps1 — 便携 zip：解压即用，无需安装 WebView2 Runtime
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File tools\package_webview_portable.ps1 [-SkipBuild] [-SkipFetch]
 
@@ -141,3 +141,11 @@ Write-Host "  zip:   $ZipPath"
 Write-Host ("  zip bytes: {0:N0} (~{1:N1} MB)" -f $zipSize, ($zipSize / 1MB))
 Write-Host ("  WebView2Fixed bytes: {0:N0} (~{1:N1} MB)" -f $fixedSize, ($fixedSize / 1MB))
 Write-Host "  runtime version: $verLine"
+
+# ── dist 保留策略（架构评估 #15）──────────────────────────────────
+$pruneScript = Join-Path $PSScriptRoot "prune_dist.ps1"
+if (Test-Path -LiteralPath $pruneScript) {
+    Write-Host ""
+    Write-Host "Pruning dist (keep last 5 versions per artifact series)..."
+    & $pruneScript -DistRoot $DistRoot
+}

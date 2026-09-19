@@ -41,6 +41,31 @@ int g_mapleSoftClickLogs = 0;
 /// 软键屏障无应答（目标不应答/权限）后，本次运行不再逐键等待。
 bool g_softKeyPacingOff = false;
 
+/// 把 mapleDiag 里的运行期「命中」高位解成人话，附在安装日志后面。
+/// 这些高位全 0 而 gaks/diState 也全 0 ⇒ 客户端根本不走这些 API（不是钩子没装上）。
+/// 背景：星辰冒险岛后台只原地平A 的日志里 gfw/gaks/diState/lastCb 全 0，光看计数器
+/// 分不清「没装上」和「没调用」，这一行就是用来区分的。
+std::wstring MaplePollHitSummary(DWORD diag) {
+    struct Ent {
+        DWORD bit;
+        const wchar_t* name;
+    };
+    static const Ent kEnts[] = {
+        {0x0020000u, L"GetKeyState"},
+        {0x0040000u, L"GetKeyboardState"},
+        {0x0080000u, L"GetCursorPos"},
+        {0x0100000u, L"GetProcAddress"},
+    };
+    std::wstring out;
+    for (const Ent& e : kEnts) {
+        if ((diag & e.bit) == 0) continue;
+        if (!out.empty()) out += L"+";
+        out += e.name;
+    }
+    if (out.empty()) out = L"无";
+    return out;
+}
+
 void LogMapleHookHits(const wchar_t* when) {
     DWORD gaks = 0;
     DWORD diState = 0;
@@ -66,18 +91,84 @@ void LogMapleHookHits(const wchar_t* when) {
     DWORD iatPoll = 0;
     DWORD diVt = 0;
     if (!FakeFocusSoftInput_ReadMapleInstall(diag, iatPoll, diVt)) return;
+    const std::wstring pollHit = MaplePollHitSummary(diag);
     WindowModeLogEventf(
-        L"[窗口模式] 冒险岛钩安装 %s iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu heapVt=%lu",
+        L"[窗口模式] 冒险岛钩安装 %s iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu heapVt=%lu "
+        L"| pollHit=%s gpaIat=%d dinputIat=%d",
         when ? when : L"",
         static_cast<unsigned long>(iatPoll),
         static_cast<unsigned>(diag),
         static_cast<unsigned long>(diVt & 0xFFu),
         static_cast<unsigned long>((diVt >> 8) & 0xFFu),
-        static_cast<unsigned long>((diVt >> 16) & 0xFFu));
+        static_cast<unsigned long>((diVt >> 16) & 0xFFu),
+        pollHit.c_str(),
+        (diag & 0x0200000u) ? 1 : 0,
+        (diag & 0x0400000u) ? 1 : 0);
 }
 
 void DebugLog(const wchar_t* msg) {
     WindowModeLog(msg);
+}
+
+/// 冒险岛后台走路：客户端「失焦即停输入轮询」（2009 dinput8 靠 WM_ACTIVATE 停，不逐帧查前台）。
+/// FakeFocus32/64.dll 的 IAT 钩子只能吞掉**注入之后**到来的失活；如果脚本是在游戏
+/// 已经不在前台时点运行的，客户端早在注入前就停了轮询 —— 此时 DI 虚表钩子/软键态
+/// 全都不会被读取（诊断就是 diState=0 lastCb=0），后台只剩原地平A。
+/// 这里在注入后补一次**真激活**（不用假 WM_ACTIVATE：给冒险岛灌假激活会冻客户端），
+/// 让客户端自己把轮询重新打开，随后把前台还给用户窗口；之后它收到的失活由 IAT 吞掉，
+/// 轮询就一直是开的，用户切去浏览器看视频也不再影响走路。
+/// 只在「还没在轮询」时动手；已经在轮询（前台启动过）就完全不碰前台。
+void WakeMapleStoryInputPolling(HWND targetHwnd, const std::atomic_bool* cancelFlag) {
+    HWND top = TopLevelTargetWindow(targetHwnd);
+    if (!top || !IsWindow(top)) return;
+    if (!FakeFocusSoftInput_IsAttached()) return;
+
+    DWORD gaks = 0, diState = 0, diData = 0, lastCb = 0;
+    DWORD hitReady = 0, gfw = 0, focus = 0;
+    if (FakeFocusSoftInput_ReadMapleHits(gaks, diState, diData, lastCb, hitReady, gfw, focus)
+        && diState > 0) {
+        return;  // 客户端本来就在轮询：不动前台
+    }
+
+    const HWND prevFg = GetForegroundWindow();
+    if (prevFg == top || (prevFg && IsChild(top, prevFg))) return;
+
+    std::wstring err;
+    if (!ActivateWindow(top, err)) {
+        WindowModeLogf(
+            L"[窗口模式] 冒险岛后台走路：唤醒输入轮询失败（切不到前台）: %s", err.c_str());
+        return;
+    }
+    WindowModeLog(
+        L"[窗口模式] 冒险岛后台走路：客户端在注入前已失焦停轮询，已临时激活以恢复（马上还前台）");
+    for (int i = 0; i < 30; ++i) {
+        WindowModeSleepInterruptible(cancelFlag, std::chrono::milliseconds(20));
+        if (WindowModeCancelled(cancelFlag)) break;
+        DWORD a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
+        if (FakeFocusSoftInput_ReadMapleHits(a, b, c, d, e, f, g) && b > 0) break;
+    }
+    DWORD a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
+    const bool woke =
+        FakeFocusSoftInput_ReadMapleHits(a, b, c, d, e, f, g) && b > 0;
+
+    if (prevFg && IsWindow(prevFg) && prevFg != top) {
+        std::wstring backErr;
+        if (ActivateWindow(prevFg, backErr)) {
+            WindowModeLog(L"[窗口模式] 冒险岛后台走路：已把前台还给用户窗口");
+        } else {
+            WindowModeLogf(L"[窗口模式] 冒险岛后台走路：还原前台失败（可手动点回）: %s",
+                backErr.c_str());
+        }
+    }
+    if (woke) {
+        WindowModeLog(
+            L"[窗口模式] 冒险岛后台走路：客户端输入轮询已恢复（之后的失活由 IAT 吞掉，"
+            L"切走也会继续走）");
+    } else {
+        WindowModeLog(
+            L"[窗口模式] 冒险岛后台走路：仍未见 DirectInput 轮询（diState=0）——"
+            L"请先把游戏切到前台再点运行，或在游戏里按一下方向键再运行");
+    }
 }
 
 void ClientMatchResultsToScreen(HWND hwnd, ImageMatchOutput& output) {
@@ -805,6 +896,10 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
         FakeFocusSoftInput_SetPostKeyEvents(true);
         WindowModeLog(
             L"[窗口模式] Chromium 壳真后台就绪（焦点欺骗 + 进程内 PostMessage 队列）");
+    } else if (UsesBackgroundWindow() && fakeFocus_.IsInjected()
+        && LooksLikeMapleStoryTarget(runConfig, TargetHwnd())) {
+        // 后台窗口模式 + 冒险岛：注入前客户端若已失焦停轮询，后台只会原地平A。
+        WakeMapleStoryInputPolling(TargetHwnd(), cancelFlag_);
     }
     DebugLog(L"[WindowMode] Executor::BeginRun OK");
     return true;

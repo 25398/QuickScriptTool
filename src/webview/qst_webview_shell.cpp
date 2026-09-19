@@ -1,4 +1,4 @@
-// ──────────────────────────────────────────────────────────────────
+﻿// ──────────────────────────────────────────────────────────────────
 // qst_webview_shell.cpp — WebView2 UI shell (Fixed Runtime portable)
 // Icons/tray reuse taskbar_window.h + product resources; engine via bridge.
 // ──────────────────────────────────────────────────────────────────
@@ -9,9 +9,12 @@
 #include <wrl.h>
 
 #include "agent_ui_notify.h"
+#include "base64.h"
 #include "config.h"
 #include "desktop_tools/desktop_tools.h"
 #include "desktop_tools/float_ball.h"
+#include "engine/engine_ui_hooks.h"
+#include "json_util.h"
 #include "mcp_server.h"
 #include "ocr_engine.h"
 #include "process_utils.h"
@@ -20,6 +23,7 @@
 #include "ui_scale.h"
 #include "utils.h"
 #include "engine/qst_engine.h"
+#include "webview/bridge_commands.h"
 #include "webview/webview_bridge_backend.h"
 #include "window_mode/ext_bridge/ext_bridge_server.h"
 #include "window_mode/window_mode_json.h"
@@ -87,7 +91,11 @@ using Microsoft::WRL::Make;
 #define DWMWA_TRANSITIONS_FORCEDISABLED 3
 #endif
 
-HINSTANCE g_instance = nullptr;
+// g_instance 的定义已移到 src/app_instance.cpp（编进 qst_utils）。
+// 原先是定义在这里 —— 但 taskbar_window.h 的 inline 函数、engine_gdi_editor.cpp、
+// engine_host_window.h 都引用它，于是 qst_engine / qst_desktop_tools 隐含依赖壳符号，
+// 自检无法只链库（架构评估 B1）。壳仍在 wWinMain 里赋值。
+extern HINSTANCE g_instance;
 
 namespace {
 
@@ -3147,11 +3155,16 @@ void HandleBridgeMessage(const std::string& json) {
         return;
     }
     if (type == "saveSettings") {
-        std::string payload = json;
-        const auto pos = json.find("\"settings\"");
-        if (pos != std::string::npos) {
-            const auto brace = json.find('{', pos);
-            if (brace != std::string::npos) payload = json.substr(brace);
+        // 取 settings 子对象必须走严格解析（json_util.h::GetSubObjectText）：
+        // 早期用 substr(首个 '{') 截到末尾会多带外层 '}'，payload 非法 →
+        // 严格解析下所有键取不到 → 各字段保持旧值再写回盘 → 仍报「保存成功」。
+        // 见 docs/refactor-acceptance.md §3。
+        std::string payload;
+        if (!qst::jsonutil::GetSubObjectText(json, "settings", payload, "saveSettings.payload")) {
+            // 键缺失 / 不是对象：保留旧的「整条消息」回落行为，但**必须留痕**——
+            // 否则又是一次「提示成功但什么都没改」的静默失败。
+            BootLogLine("BRIDGE: saveSettings 缺少 settings 子对象，回落整条消息（本次保存很可能不生效）");
+            payload = json;
         }
         std::string err;
         if (!qst::webview::ApplySaveSettingsJson(payload, err)) {
@@ -4038,20 +4051,9 @@ void HandleBridgeMessage(const std::string& json) {
             return;
         }
         bytes.resize(read);
-        static const char* kB64 =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::string b64;
-        b64.reserve(((bytes.size() + 2) / 3) * 4);
-        for (size_t i = 0; i < bytes.size(); i += 3) {
-            const unsigned a = static_cast<unsigned char>(bytes[i]);
-            const unsigned b = (i + 1 < bytes.size()) ? static_cast<unsigned char>(bytes[i + 1]) : 0;
-            const unsigned c = (i + 2 < bytes.size()) ? static_cast<unsigned char>(bytes[i + 2]) : 0;
-            const unsigned n = (a << 16) | (b << 8) | c;
-            b64.push_back(kB64[(n >> 18) & 63]);
-            b64.push_back(kB64[(n >> 12) & 63]);
-            b64.push_back((i + 1 < bytes.size()) ? kB64[(n >> 6) & 63] : '=');
-            b64.push_back((i + 2 < bytes.size()) ? kB64[n & 63] : '=');
-        }
+        // Base64 唯一实现见 src/base64.h（原内联编码循环已收敛；语义完全一致）
+        const std::string b64 = qst::base64::Encode(
+            reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
         std::string mime = "image/bmp";
         const auto dot = resolved.find_last_of(L'.');
         if (dot != std::wstring::npos) {
@@ -4380,6 +4382,17 @@ void HandleBridgeMessage(const std::string& json) {
         return;
     }
 
+    // 走到这里 = 没有分支认领。回一条 error 让 JS 弹提示（app.js:14403），
+    // 同时**落一条日志**：桥接层不允许「无痕失败」——2026-09-18 的 saveSettings
+    // P0 之所以难查，就是因为外部完全看不出发生了什么。
+    // 用命令表区分两种成因（见 src/webview/bridge_commands.h）：
+    if (qst::webview::IsDeclaredBridgeCommand(type.c_str())) {
+        BootLogLine("BRIDGE: 已登记命令却无分支 type=" + type
+            + "（bridge_commands.h 与分派漂移，BridgeContractSelfTest 应能拦住）");
+    } else {
+        BootLogLine("BRIDGE: 未登记的命令 type=" + type
+            + "（JS 发了但 C++ 无分支；请同步 ui/ 与 src/webview/bridge_commands.h）");
+    }
     PostToJs(std::string("{\"type\":\"error\",\"detail\":\"unknown method:") + type + "\"}");
 }
 
@@ -5017,14 +5030,47 @@ bool RegisterWndClass(HINSTANCE inst) {
 // delayimp 需要全局可见的 hook 符号（不可放进匿名命名空间）
 extern "C" const PfnDliHook __pfnDliFailureHook2 = QstDelayLoadFailureHook;
 
-namespace qst::webview {
-void HotkeyLogLine(const std::string& line) {
+// 注：qst::webview::HotkeyLogLine / PostToWebUi / NotifyWebDebugWindowSetting /
+// SyncHomeSelectionCache 的定义已移到引擎侧（src/engine/engine_ui_hooks.cpp），
+// 壳只在 InstallShellUiHooks() 里注入真实现。见 src/engine/engine_ui_hooks.h。
+
+namespace {
+// 壳侧热键日志（引擎通过 qst::webview::HotkeyLogLine 转发到这里）。
+void ShellHotkeyLogLine(const std::string& line) {
     BootLogLine("HOTKEY: " + line);
 }
-}  // namespace qst::webview
+
+// 解析失败诊断落盘（架构评估验收 A2）。json_util 检测到非法 JSON 时回调本函数，
+// 把「键取不到」与「JSON 非法」区分开——这是 2026-09-18 那次 saveSettings 静默
+// 失效最难发现的原因（外部看到的现象与「键缺失」完全一样）。
+void JsonParseFailureToBootLog(const char* where, const std::string& text, size_t offset) {
+    std::string line = "JSON: 解析失败 where=";
+    line += (where && *where) ? where : "?";
+    if (offset != static_cast<size_t>(-1)) {
+        line += " offset=" + std::to_string(offset);
+    }
+    line += " text=";
+    line += text;
+    BootLogLine(line);
+}
+
+// 依赖倒置（架构评估 B1）：把壳侧 UI 能力装进引擎钩子。
+// 必须在任何引擎代码调用 qst::webview::PostToWebUi / NotifyWebDebugWindowSetting /
+// SyncHomeSelectionCache / HotkeyLogLine 之前调用。
+// 分两处注册（bridge backend 的三个 + 本处的热键日志），SetUiBridgeHooks 只覆盖
+// 非空成员，所以互不覆盖。
+void InstallShellUiHooks() {
+    qst::engine::UiBridgeHooks hooks;
+    hooks.hotkeyLogLine = &ShellHotkeyLogLine;
+    qst::engine::SetUiBridgeHooks(std::move(hooks));
+    qst::webview::InstallBridgeUiHooks();
+}
+}  // namespace
 
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     g_instance = inst;
+    qst::jsonutil::SetParseFailureSink(&JsonParseFailureToBootLog);
+    InstallShellUiHooks();
     // ★--mcp：把产品当 MCP server 跑（stdio，一行一个 JSON-RPC）。
     // 必须在任何 UI/单实例/WebView2 初始化之前分流：MCP 客户端会以管道方式反复拉起它，
     // 不能弹窗、不能抢单实例锁、不能初始化 WebView2。

@@ -1,0 +1,95 @@
+name: build-and-selftest
+
+# 架构评估 P1-7：项目已有 21 个 SelfTest 与统一 harness，却没有任何自动回归
+# （投入已花、收益未取）。本 workflow 把「构建 + 跑自检」变成每次 push/PR 的
+# 硬门槛：任一套件 exit != 0 即红。
+#
+# 判定口径完全复用 tools/run_all_selftests.ps1 —— 与本地开发同一条命令，
+# 避免 CI 与本地两套标准。
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: '自检档位（full 需要桌面会话与已装驱动的 self-hosted runner）'
+        required: false
+        default: logic
+        type: choice
+        options: [logic, full]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    # windows-2022 预装 VS2022 + C++ 工作负载（含 x86 工具链，FakeFocus32 需要）。
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── OpenCV（第三方预编译包，约 250MB；命中缓存可省数分钟）────────
+      - name: Cache OpenCV
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: third_party/opencv
+          key: opencv-4.10.0-windows-x64
+
+      - name: Setup OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./scripts/setup_opencv.ps1
+
+      - name: Configure CMake
+        shell: pwsh
+        # QST_WEBVIEW_BUNDLE_FIXED=OFF：CI 不打包 WebView2 Fixed 运行时（约 150MB，
+        # 与自检无关；发版脚本自己会拉）。
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DOpenCV_DIR="${{ github.workspace }}/third_party/opencv/build"
+          -DQST_WEBVIEW_BUNDLE_FIXED=OFF
+
+      # ── 构建：产品壳 + 全部自检目标 ────────────────────────────────
+      # 分开列 target（PowerShell 不要用 /t:A;B 拼多个 target，分号会拆命令）。
+      - name: Build product shell
+        shell: pwsh
+        run: cmake --build build --config Release --target QstWebViewShell
+
+      # 说明：这里也编 WindowModeSelfTest / VirtualHidSelfTest / InjectionSelfTest，
+      # 虽然 -Tier logic 不跑它们——**保留编译覆盖**（它们能编过本身就是一道门禁：
+      # 这三个目标各自包含引擎/注入/驱动侧代码）。要在 CI 里真跑，需 self-hosted
+      # runner（桌面会话 + 已装驱动），用 workflow_dispatch 的 tier=full。
+      - name: Build selftest targets
+        shell: pwsh
+        run: >
+          cmake --build build --config Release
+          --target ScriptActionBuilderSelfTest --target ScriptIoSelfTest --target CoordSpaceSelfTest
+          --target MacroVariablesSelfTest --target ImageMatchSelfTest --target OcrSelfTest
+          --target AiActionRouterSelfTest --target AgentAssistantSelfTest --target AppSettingsStoreSelfTest
+          --target ThemeUiSelfTest --target BreakoutCooldownSelfTest --target HotkeyStopSelfTest
+          --target ClickerTimingSelfTest --target ScheduledTaskSelfTest --target RecorderSelfTest
+          --target BridgeJsonSelfTest --target ScriptRunnerSelfTest --target BridgeContractSelfTest
+          --target WindowModeSelfTest --target VirtualHidSelfTest --target InjectionSelfTest
+
+      # ── 跑自检（--json，按 exit code 判定）─────────────────────────
+      - name: Run self-tests
+        shell: pwsh
+        run: >
+          ./tools/run_all_selftests.ps1
+          -SkipBuild
+          -Tier "${{ github.event.inputs.tier || 'logic' }}"
+          -LogPath build/selftest.log
+
+      - name: Upload self-test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-log
+          path: build/selftest.log
+          if-no-files-found: warn

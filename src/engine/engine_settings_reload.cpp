@@ -1,6 +1,7 @@
 // engine_settings_reload.cpp — F2 slice extracted from engine_host_window.h
 #include "engine/engine_host_window.h"
-#include "webview/webview_bridge_backend.h"
+// 引擎→壳的唯一出口（依赖倒置，架构评估 B1）。勿改回 webview_bridge_backend.h。
+#include "engine/engine_ui_hooks.h"
 
 // was engine_host_window.h:7495-7522
 void EngineHost::LoadScripts() {

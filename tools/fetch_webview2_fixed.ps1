@@ -1,4 +1,4 @@
-# fetch_webview2_fixed.ps1 — download + expand WebView2 Fixed Version Runtime (not committed to git)
+﻿# fetch_webview2_fixed.ps1 — download + expand WebView2 Fixed Version Runtime (not committed to git)
 # Usage:
 #   powershell -File tools\fetch_webview2_fixed.ps1 [-OutDir path] [-Force]
 # Default OutDir: <repo>\third_party\webview2_fixed\<version>\WebView2Fixed

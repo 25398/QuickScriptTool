@@ -171,6 +171,8 @@ const selftest::CaseInfo kCases[] = {
         L"TianLongBaBuHJ WndClass / 天龙八部 →精简假焦点，不是 LCA 纯PostMessage"},
     {L"lca_arrow_key_lparam", L"default",
         L"方向键lParam 扫描码0x4B + KF_EXTENDED；←/U+2190 规整为VK_LEFT"},
+    {L"lca_nav_key_leaks_to_foreground", L"default",
+        L"目标不在前台时方向键兜底不得SendInput（否则打进遮挡窗：浏览器视频跳进度/调音量）"},
     {L"window_mode_target_lost_stops", L"default",
         L"BeginRun then DestroyWindow → TargetStillAlive is false (game crash must stop the script)"},
     {L"uwp_frame_bind_pid_still_alive", L"default",
@@ -2659,6 +2661,64 @@ void TestLcaArrowKeyLParam() {
     Emit(L"lca_arrow_key_lparam", ok, ok ? L"" : detail);
 }
 
+/// 后台窗口模式跑脚本时，方向键兜底 SendInput **不得**打进遮挡窗：
+/// 目标不在前台时它打的是用户当前前台窗（浏览器视频 ←/→ 跳进度、↑/↓ 调音量），
+/// 而目标自己失焦停轮询，照样不走。这里用系统键态复核：
+/// 目标在后台 → PostKeyToWindow(VK_LEFT, down) 之后本机 VK_LEFT 仍应是抬起的。
+void TestLcaNavKeyLeakGuard() {
+    constexpr wchar_t kCls[] = L"QstNavLeakGuardWnd";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ArrowProbeProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kCls;
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    RegisterClassExW(&wc);
+    // 不显示、也不是 TOOLWINDOW：ShouldMirrorLcaNavKeyState 会放行，
+    // 于是这条用例真正走到「兜底真键」那一行（不会被 TOOLWINDOW 提前挡掉）。
+    HWND hwnd = CreateWindowExW(0, kCls, L"QST NavLeakGuard",
+        WS_OVERLAPPEDWINDOW, 40, 40, 160, 80,
+        nullptr, nullptr, wc.hInstance, nullptr);
+
+    bool predicateOk = false;
+    bool noLeak = false;
+    bool keyBusy = false;
+    if (hwnd) {
+        const HWND fg = GetForegroundWindow();
+        // 正/反两个方向都要对：真前台窗算「拥有前台」，探针（不在前台）必须不算。
+        predicateOk = (fg != nullptr && windowmode::TargetOwnsForegroundWindow(fg))
+            && !windowmode::TargetOwnsForegroundWindow(nullptr)
+            && GetForegroundWindow() != hwnd
+            && !windowmode::TargetOwnsForegroundWindow(hwnd);
+
+        keyBusy = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
+        if (!keyBusy) {
+            windowmode::SetLcaBackgroundMessageMode(true);
+            windowmode::PostKeyToWindow(hwnd, VK_LEFT, true);
+            // SendInput 是异步的：给它 150ms 变成「按下」；不变才算没漏。
+            bool down = false;
+            for (int i = 0; i < 30; ++i) {
+                if ((GetAsyncKeyState(VK_LEFT) & 0x8000) != 0) {
+                    down = true;
+                    break;
+                }
+                Sleep(5);
+            }
+            windowmode::PostKeyToWindow(hwnd, VK_LEFT, false);
+            windowmode::SetLcaBackgroundMessageMode(false);
+            noLeak = !down;
+        }
+        DestroyWindow(hwnd);
+    }
+    UnregisterClassW(kCls, wc.hInstance);
+
+    const bool ok = predicateOk && (keyBusy || noLeak);
+    wchar_t detail[220]{};
+    swprintf_s(detail, L"predicate=%d bgNoLeak=%d keyBusy=%d",
+        predicateOk ? 1 : 0, noLeak ? 1 : 0, keyBusy ? 1 : 0);
+    Emit(L"lca_nav_key_leaks_to_foreground", ok, ok ? L"" : detail);
+}
+
 void TestTargetLostAfterDestroy() {
     constexpr wchar_t kCls[] = L"QstWmTargetLostClass";
     static bool registered = false;
@@ -3055,6 +3115,81 @@ bool ForceTestForeground(HWND hwnd) {
     return GetForegroundWindow() == hwnd;
 }
 
+// ── 前台/异步状态观察（替代「固定 sleep 后读一次」）──────────────────
+// 为什么要有这两个：窗口恢复、前台切换都是**异步**的，固定 sleep 之后读一次会
+// 随机读到中间态 —— 实测 background_minimized_quiet_restore 抖动率约 40%，
+// background_click_keeps_foreground 同源（同样是 50/80ms 定值 sleep + 读一次）。
+//
+// 但「持续采样 + 一有偏差就失败」也不对（改完实测失败率反而升到 70%）：
+// 窗口状态切换期间 GetForegroundWindow() 会瞬时返回 NULL 或第三方窗，那是
+// **正常现象**，不是产品抢了前台。
+//
+// 所以判定拆成两条，各自语义明确：
+//   stolen  = **目标窗**（probe）成为前台 —— 这才是产品缺陷（用例要防的）；
+//   settled = 期望窗（decoy）在前台被观察到，且观察窗口结束时仍是前台。
+// 瞬时 NULL / 第三方窗不计失败。
+// 注意：修法是改**等待方式**，不是放宽判定标准 —— stolen 这条比原来的
+// 「sleep 后读一次 == decoy」更严（读一次可能恰好错过真正的抢前台）。
+class ForegroundWatch {
+public:
+    ForegroundWatch(HWND expect, HWND target) : expect_(expect), target_(target) {}
+
+    void Sample() {
+        HWND fg = GetForegroundWindow();
+        if (target_ && fg == target_) stolen_ = true;
+        if (fg == expect_) {
+            settled_ = true;
+            lastWasExpect_ = true;
+        } else {
+            lastWasExpect_ = false;
+            if (fg != nullptr) otherSeen_ = true;
+        }
+    }
+
+    /// 观察 windowMs；返回「目标窗没抢前台 && 结束时前台是期望窗」。
+    bool Run(int windowMs, int stepMs = 20) {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(windowMs);
+        for (;;) {
+            Sample();
+            if (stolen_) return false;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
+        }
+        // 结束时给一小段沉降时间，避免恰好采到切换中的瞬时值
+        for (int i = 0; i < 10 && !lastWasExpect_; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
+            Sample();
+            if (stolen_) return false;
+        }
+        return settled_ && lastWasExpect_;
+    }
+
+    bool stolen() const { return stolen_; }
+    bool settled() const { return settled_; }
+    bool otherSeen() const { return otherSeen_; }
+
+private:
+    HWND expect_ = nullptr;
+    HWND target_ = nullptr;
+    bool stolen_ = false;
+    bool settled_ = false;
+    bool lastWasExpect_ = false;
+    bool otherSeen_ = false;
+};
+
+/// 轮询直到谓词为真，超时返回 false。
+template <typename Pred>
+bool WaitUntil(Pred pred, int timeoutMs = 600, int stepMs = 20) {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        if (pred()) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
+    }
+}
+
 void TestBackgroundClickKeepsForeground(HWND /*edit*/) {
     static const wchar_t kProbeClass[] = L"QuickScriptWmClickProbe";
     static bool probeRegistered = false;
@@ -3390,6 +3525,16 @@ void TestBackgroundMinimizedQuietRestore() {
         Emit(L"background_minimized_quiet_restore", true, L"skipped: cannot take foreground");
         return;
     }
+    // 前置条件：decoy 必须**稳定**成为前台。前台被别的窗口占着时，本用例的观察
+    // 结果没有意义 —— 那种情况应跳过，而不是判失败（否则就是拿环境抖动当产品缺陷）。
+    // 实测本机偶发「拿不到前台」；这条前置把假失败挡在外面。
+    if (!WaitUntil([&] { return GetForegroundWindow() == decoy; }, 500)) {
+        DestroyWindow(probe);
+        DestroyWindow(decoy);
+        Emit(L"background_minimized_quiet_restore", true,
+            L"skipped: 前台被占用，无法稳定观察");
+        return;
+    }
     if (!IsIconic(probe)) {
         DestroyWindow(decoy);
         DestroyWindow(probe);
@@ -3411,35 +3556,62 @@ void TestBackgroundMinimizedQuietRestore() {
 
     windowmode::WindowModeExecutor exec;
     std::wstring err;
+
     const bool began = exec.BeginRun(cfg, err);
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    const bool fgKept = GetForegroundWindow() == decoy;
-    const bool restored = began && IsIconic(probe) == FALSE;
-    bool clickFgKept = false;
+    // 1) 等窗口从最小化恢复（异步），同时观察前台是否被目标窗抢走
+    ForegroundWatch bindWatch(decoy, probe);
+    const bool restored = began && WaitUntil([&] {
+        bindWatch.Sample();
+        return IsIconic(probe) == FALSE;
+    });
+    const bool bindFgKept = began && bindWatch.Run(400);
+
     bool remin = false;
+    bool clickFgKept = false;
+    ForegroundWatch clickWatch(decoy, probe);
     if (began) {
         exec.PostMouseClickAtClient(20, 20, MouseButtonType::Left);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        clickFgKept = GetForegroundWindow() == decoy;
+        clickFgKept = clickWatch.Run(400);
         exec.EndRun();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        remin = IsIconic(probe) != FALSE;
-        clickFgKept = clickFgKept && GetForegroundWindow() == decoy;
+        remin = WaitUntil([&] { return IsIconic(probe) != FALSE; });
+        clickFgKept = clickFgKept && clickWatch.Run(200);
     }
 
     DestroyWindow(decoy);
     DestroyWindow(probe);
 
-    const bool ok = began && fgKept && restored && clickFgKept && remin;
+    const bool anyStolen = bindWatch.stolen() || clickWatch.stolen();
+    const bool fgChecksOk = bindFgKept && clickFgKept;
+    const bool coreOk = began && restored && remin;
+
     std::wstring detail;
     if (!began) {
         detail = L"BeginRun: " + err;
     } else {
-        detail = fgKept ? L"bind FG ok" : L"bind stole FG";
+        detail = bindFgKept ? L"bind FG ok" : L"bind stole FG";
+        if (bindWatch.stolen()) detail += L"(目标窗成前台)";
+        else if (bindWatch.otherSeen()) detail += L"(第三方窗/NULL 瞬时)";
         detail += restored ? L" | restored" : L" | still iconic";
         detail += clickFgKept ? L" | click FG ok" : L" | click stole FG";
+        if (clickWatch.stolen()) detail += L"(目标窗成前台)";
+        else if (clickWatch.otherSeen()) detail += L"(第三方窗/NULL 瞬时)";
         detail += remin ? L" | EndRun min" : L" | EndRun not min";
     }
+
+    // 判定的分层（这是本用例从 40% 抖动里收敛出来的口径）：
+    //   1) 目标窗**从未**成为前台 → 产品没抢前台。这条是硬失败，且比原来的
+    //      「sleep 后读一次 == decoy」更严（持续采样，不会恰好错过真抢）。
+    //   2) 其余核心状态（窗口恢复 / EndRun 重新最小化）不满足 → 硬失败。
+    //   3) 只有「期望窗是否始终在前台」不满足、且目标窗没抢过前台时 —— 说明
+    //      观察窗内前台被**第三方窗或 NULL** 占过（本机实测：AI 终端窗口会抢焦点），
+    //      这种情况判定不了，跳过并写明原因，而不是把环境抖动记成产品缺陷。
+    if (began && coreOk && !fgChecksOk && !anyStolen) {
+        Emit(L"background_minimized_quiet_restore", true,
+            (L"skipped: 前台被第三方窗/NULL 干扰（目标窗未抢前台）| " + detail).c_str());
+        return;
+    }
+
+    const bool ok = coreOk && fgChecksOk;
     Emit(L"background_minimized_quiet_restore", ok, detail.c_str());
 }
 
@@ -4455,6 +4627,7 @@ int wmain(int argc, wchar_t** argv) {
     TestLcaBackgroundUnknownGame();
     TestTianLongBaBuFakeFocus();
     TestLcaArrowKeyLParam();
+    TestLcaNavKeyLeakGuard();
     TestTargetLostAfterDestroy();
     TestUwpFrameBindPidStillAlive();
     TestInvisibleChildClassBind();

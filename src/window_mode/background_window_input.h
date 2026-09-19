@@ -14,6 +14,11 @@ void PostQuickInputToWindow(HWND hwnd, const std::wstring& text, double charInte
 void SendQuickInputViaForeground(HWND hwnd, const std::wstring& text, double charInterval,
     const std::atomic_bool* cancelFlag = nullptr);
 void PostKeyToWindow(HWND hwnd, UINT vk, bool down);
+/// 目标窗口（或其顶层）此刻是否就是前台窗。
+/// 方向键的本机键态兜底（SendInput）只在目标就是前台时才有意义：目标在后台时
+/// SendInput 打的是当前前台窗（用户正在看的浏览器/视频会收到 ←/→/↑/↓），
+/// 而目标自己失焦停轮询，照样不走 —— 所以后台一律不补真键。
+bool TargetOwnsForegroundWindow(HWND hwnd);
 /// WM_KEYDOWN/UP 的 lParam（方向键扫描码 0x4B 等 + KF_EXTENDED）。
 LPARAM BuildWindowKeyLParam(UINT vk, bool down);
 /// BeginRun/EndRun：本会话走 LCA 后台窗口消息（假焦点失败回退或未登记游戏）。

@@ -88,7 +88,10 @@
 #include "window_mode/window_pick_result.h"
 #include "window_mode/window_mode_json.h"
 #if defined(QST_WEBVIEW_WITH_ENGINE) && QST_WEBVIEW_WITH_ENGINE
-#include "webview/webview_bridge_backend.h"
+// 引擎→壳的唯一出口（依赖倒置）。**不要**改回
+// #include "webview/webview_bridge_backend.h" —— 那是壳的头文件，
+// 引它会让 qst_engine 依赖壳符号、自检无法只链库（架构评估 B1）。
+#include "engine/engine_ui_hooks.h"
 #endif
 
 /// 热键诊断日志：WebView 构建写入 exe 目录 webview_boot.log（HOTKEY: 前缀），

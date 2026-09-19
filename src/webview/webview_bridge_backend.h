@@ -27,17 +27,21 @@ BridgeContext& Ctx();
 
 /// Thread-safe post to WebView (shell installs poster via WM_BRIDGE_POST_JS).
 void SetJsPoster(std::function<void(std::string)> poster);
-void PostToWebUi(std::string jsonUtf8);
-/// 引擎热键诊断日志 → exe 目录 webview_boot.log（HOTKEY: 前缀）。
-void HotkeyLogLine(const std::string& line);
+
+/// 把壳侧的 UI 能力注入引擎钩子（依赖倒置，架构评估 B1）。
+/// 壳必须在任何引擎代码调用 qst::webview::PostToWebUi /
+/// NotifyWebDebugWindowSetting / SyncHomeSelectionCache **之前**调用一次
+/// （wWinMain 顶部即可）。
+///
+/// 注意：PostToWebUi / HotkeyLogLine / NotifyWebDebugWindowSetting /
+/// SyncHomeSelectionCache 这 4 个函数现在**定义在引擎侧**
+/// （src/engine/engine_ui_hooks.cpp，默认 no-op 转发），声明见
+/// src/engine/engine_ui_hooks.h。壳不再定义它们 —— 否则 qst_engine
+/// 链接时会依赖壳符号，自检无法只链库。
+void InstallBridgeUiHooks();
 
 /// 强制从磁盘刷新 g_ctx.settings（openSettings / 外部写盘后调用）。
 void ReloadSettingsFromDisk();
-/// 引擎 SaveHomeState 后同步选中缓存，避免后续 quietSaveSettings 用旧 path 覆盖磁盘。
-void SyncHomeSelectionCache(const std::wstring& selectedScriptPath,
-    const std::wstring& selectedRecordingPath, int activeTab);
-/// 宏调试窗被用户关闭后：同步 bridge 缓存并推送 settings.changed。
-void NotifyWebDebugWindowSetting(bool enabled);
 /// 悬浮球拖拽后只写位置，不碰其它设置。
 void PersistFloatBallPlacement(bool docked, int edge, double xRatio, double yRatio,
     const std::wstring& monitorId);

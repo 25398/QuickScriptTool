@@ -42,7 +42,14 @@ inline bool NestedWindowModeHasIdentity(const windowmode::WindowModeScriptConfig
 }
 
 // ── 脚本动作类型枚举 ──────────────────────────────────────────────
-// 共 28 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别等
+// 共 44 种动作类型，涵盖鼠标/键盘操作、流程控制、图像识别、颜色/OCR、AI、变量运算等。
+//
+// ⚠ 本注释曾写「共 28 种」，与枚举实际成员数漂移（架构评估 #16）。
+// 新增动作类型时必须同步这四处（目前靠人工保持一致，无编译期校验）：
+//   1. src/script_action_builder.cpp  构建（BuildScriptActionFromJson / 类型名映射）
+//   2. src/script_io.cpp              序列化（WriteActionJson / ParseScriptActionBlock）
+//   3. ui/                             编辑器动作目录
+//   4. src/engine/engine_script_run.cpp 执行分发（StartActionsWorker 的 if-else 链）
 enum class ActionType {
     MoveMouse,
     MoveMouseRelative,  // 相对位移 dx/dy（FPS 视角等；非屏幕绝对坐标）
@@ -96,7 +103,12 @@ inline constexpr int kMultiMatchMaxHits = 20;
 enum class MouseButtonType { Left, Right, Middle, X1, X2 };
 
 // ── 脚本动作数据结构 ──────────────────────────────────────────────
-// 每个字段对应某种动作类型的参数，未使用的字段保持默认值
+// 每个字段对应某种动作类型的参数，未使用的字段保持默认值。
+//
+// ⚠ 现状：**126 个字段**的扁平 struct，覆盖全部 44 种 ActionType。
+// 副作用：新增动作 = 往这里加字段；序列化必须逐个处理；编译器无法发现
+// 「用了不属于该类型的字段」。结构化方案（按类型分组的参数子结构）见
+// docs/refactor-progress.md 的 #5。
 struct ScriptAction {
     ActionType type = ActionType::MoveMouse;  // 动作类型
     std::wstring remark;                       // 用户备注文本

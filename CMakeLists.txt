@@ -26,7 +26,6 @@ endif()
 find_package(OpenCV REQUIRED)
 
 set(WINDOW_MODE_CORE_SOURCES
-    src/window_mode/window_mode_types.cpp
     src/window_mode/window_mode_log.cpp
     src/window_mode/hidden_desktop.cpp
     src/window_mode/macro_virtual_desktop.cpp
@@ -61,6 +60,30 @@ set(WINDOW_MODE_CORE_SOURCES
     src/window_mode/injection/inject_hook.cpp
 )
 
+# ── window_mode 数据层（构建去重 A5）─────────────────────────────
+# window_mode_types.cpp（818 行）与 window_mode_json.cpp（214 行）是**纯函数**
+# （只有匿名 namespace，无全局可变状态、无静态注册），却分别被 2 / 3 个 target
+# 各编一份：types → window_mode_core + script_action_builder_core；
+# json → qst_engine + script_action_builder_core + WindowModeSelfTest。
+# 合计约 1,246 行重复编译。这里编一次进 STATIC 库。
+# 与 qst_utils 同理：**必须 STATIC 而不是 OBJECT** —— OBJECT 库的 .obj 不跨
+# 中间 OBJECT 库传递；STATIC 库的 PUBLIC 链接依赖可正常传递。
+add_library(window_mode_common STATIC
+    src/window_mode/window_mode_types.cpp
+    src/window_mode/window_mode_json.cpp
+)
+target_compile_definitions(window_mode_common PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(window_mode_common PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(window_mode_common PUBLIC
+    user32 gdi32 shell32 shlwapi ole32
+)
+if(MSVC)
+    target_compile_options(window_mode_common PRIVATE /W4 /permissive- /utf-8)
+endif()
+
 add_library(window_mode_core OBJECT ${WINDOW_MODE_CORE_SOURCES})
 target_compile_definitions(window_mode_core PUBLIC UNICODE _UNICODE NOMINMAX)
 target_include_directories(window_mode_core PUBLIC
@@ -68,6 +91,7 @@ target_include_directories(window_mode_core PUBLIC
     ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(window_mode_core PUBLIC
+    window_mode_common
     ${OpenCV_LIBS}
     user32
     gdi32
@@ -143,6 +167,23 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_dependencies(FakeFocus32 FakeFocus)
 endif()
 
+# ── 共享工具库（构建去重 #9）─────────────────────────────────────
+# utils.cpp（1,814 行）原本被 4 个 target 各编一份：script_core_common /
+# scheduled_task_core / app_settings_store_core / RecorderSelfTest。
+# 这里编一次进 STATIC 库。
+# 为什么必须 STATIC 而不是 OBJECT：OBJECT 库的 .obj 不会经由中间 OBJECT 库
+# 传递给消费者（实测：只链 qst_engine 会缺 qst_desktop_tools 的符号，
+# 所以 QstWebViewShell 才要逐个列出）。STATIC 库可正常传递。
+# utils.cpp 无全局注册对象（纯函数），不担心静态库裁剪掉初始化。
+# app_instance.cpp：g_instance 的定义（原在壳里 → 引擎/桌面工具链接不到）。
+add_library(qst_utils STATIC src/utils.cpp src/app_instance.cpp)
+target_compile_definitions(qst_utils PUBLIC UNICODE _UNICODE NOMINMAX)
+target_include_directories(qst_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(qst_utils PUBLIC user32 shell32 shlwapi winmm advapi32 crypt32 gdi32)
+if(MSVC)
+    target_compile_options(qst_utils PRIVATE /W4 /permissive- /utf-8)
+endif()
+
 set(SCRIPT_CORE_COMMON_SOURCES
     src/action_utils.cpp
     src/ai_ui_layout.cpp
@@ -161,7 +202,6 @@ set(SCRIPT_CORE_COMMON_SOURCES
     src/color_match.cpp
     src/ocr_engine.cpp
     src/opencv_runtime.cpp
-    src/utils.cpp
 )
 
 add_library(script_core_common OBJECT ${SCRIPT_CORE_COMMON_SOURCES})
@@ -171,7 +211,7 @@ target_include_directories(script_core_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/qst_vhid
     ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS} setupapi)
+target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS} setupapi qst_utils)
 if(MSVC)
     target_compile_options(script_core_common PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -231,13 +271,12 @@ add_library(scheduled_task_core OBJECT
     src/scheduled_task_types.cpp
     src/scheduled_task_store.cpp
     src/scheduled_task_scheduler.cpp
-    src/utils.cpp
 )
 target_compile_definitions(scheduled_task_core PUBLIC UNICODE _UNICODE NOMINMAX)
 target_include_directories(scheduled_task_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(scheduled_task_core PUBLIC user32 shell32 shlwapi)
+target_link_libraries(scheduled_task_core PUBLIC user32 shell32 shlwapi qst_utils)
 if(MSVC)
     target_compile_options(scheduled_task_core PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -264,8 +303,6 @@ add_library(script_action_builder_core OBJECT
     src/app_theme.cpp
     src/script_io.cpp
     src/recorder_timeline.cpp
-    src/window_mode/window_mode_json.cpp
-    src/window_mode/window_mode_types.cpp
 )
 target_compile_definitions(script_action_builder_core PUBLIC UNICODE _UNICODE NOMINMAX)
 target_include_directories(script_action_builder_core PUBLIC
@@ -275,6 +312,7 @@ target_include_directories(script_action_builder_core PUBLIC
 )
 target_link_libraries(script_action_builder_core PUBLIC
     script_core_common
+    window_mode_common
     ${OpenCV_LIBS}
     user32 shell32 shlwapi
 )
@@ -284,7 +322,6 @@ endif()
 
 qst_add_selftest(WindowModeSelfTest
     tools/window_mode_selftest.cpp
-    src/window_mode/window_mode_json.cpp
     LIBS
         window_mode_core
         script_core_common
@@ -319,7 +356,6 @@ qst_add_selftest(ScriptActionBuilderSelfTest
 
 add_library(app_settings_store_core OBJECT
     src/app_settings_store.cpp
-    src/utils.cpp
 )
 target_compile_definitions(app_settings_store_core PUBLIC
     UNICODE _UNICODE NOMINMAX
@@ -328,7 +364,7 @@ target_compile_definitions(app_settings_store_core PUBLIC
 target_include_directories(app_settings_store_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(app_settings_store_core PUBLIC user32 shell32 shlwapi winmm advapi32 crypt32)
+target_link_libraries(app_settings_store_core PUBLIC user32 shell32 shlwapi winmm advapi32 crypt32 qst_utils)
 if(MSVC)
     target_compile_options(app_settings_store_core PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -367,59 +403,41 @@ qst_add_selftest(OcrSelfTest
         user32 gdi32 shell32 shlwapi urlmon
 )
 
+# 构建去重（架构评估 #9）：原先这里重编 9 个被测源（约 11,791 行，含
+# macro_execute_tools.cpp 6,646 行），它们都已在 qst_engine 内编过一次。
+# 改链 qst_engine 后：
+#   - tools/fetch_webpage_link_stub.cpp 不再需要（agent_web.cpp 的真身已在 qst_engine）；
+#   - tools/window_mode_link_stubs.cpp 也不再需要（符号由 window_mode_core 提供）；
+#   - tools/engine_link_stubs.cpp 已删除（引擎→壳依赖已倒置，见 engine_ui_hooks.*）。
 qst_add_selftest(AiActionRouterSelfTest
     tools/ai_action_router_selftest.cpp
-    tools/window_mode_link_stubs.cpp
-    tools/fetch_webpage_link_stub.cpp
-    src/macro_execute_tools.cpp
-    src/page_snapshot.cpp
-    src/ai_locate_cache.cpp
-    src/ai_locate_verify.cpp
-    src/office_doc.cpp
-    src/process_utils.cpp
-    src/ai_action_lookahead.cpp
-    src/ai_logic_convert.cpp
-    src/recording_to_findimage.cpp
     LIBS
-        script_action_builder_core
-        script_core_common
-        ${OpenCV_LIBS}
-        user32 gdi32 shell32 shlwapi advapi32 ole32 imm32
+        qst_engine
+        qst_desktop_tools
+        qst_engine_ui_stubs
+        Qst::WebView2
+        ${QST_COMMON_LINK_LIBS}
 )
 
+# 构建去重（架构评估 #9）：原先这里直接列出 24 个被测 .cpp（22,595 行）逐个重编，
+# 而这些源已经在 qst_engine 里编过一次。改为直接链 qst_engine：
+#   - 少编 22,595 行（含 macro_execute_tools.cpp 6,646 行、agent_tools.cpp 2,087 行）；
+#   - 不再需要 window_mode_link_stubs.cpp —— 那些符号由 window_mode_core 真身提供，
+#     同时链 stub 会符号重复。
+# 注意：OBJECT 库的 .obj 不会经由中间 OBJECT 库传递，必须像 QstWebViewShell 那样
+# 把 qst_engine / qst_desktop_tools / qst_engine_ui_stubs 逐个列出，否则会缺
+# RenderBatchScope / UiEditorWidth / ResolveProgramLaunchPath 等符号。
+# 链 qst_engine 后**不要**再链 script_action_builder_core（其源已在 qst_engine 内）。
+# 也不再需要 tools/engine_link_stubs.cpp —— 引擎对壳的 5 个符号依赖已倒置成
+# 回调注入（src/engine/engine_ui_hooks.*），引擎可独立链接。
 qst_add_selftest(AgentAssistantSelfTest
     tools/agent_assistant_selftest.cpp
-    tools/window_mode_link_stubs.cpp
-    src/agent_attachment.cpp
-    src/agent_conversation_store.cpp
-    src/agent_script_ops.cpp
-    src/recording_optimize_ops.cpp
-    src/agent_shell.cpp
-    src/agent_web.cpp
-    src/agent_webview.cpp
-    src/agent_undo.cpp
-    src/agent_ui_notify.cpp
-    src/agent_reference.cpp
-    src/agent_core.cpp
-    src/agent_tools.cpp
-    src/macro_execute_tools.cpp
-    src/page_snapshot.cpp
-    src/ai_locate_cache.cpp
-    src/ai_locate_verify.cpp
-    src/office_doc.cpp
-    src/process_utils.cpp
-    src/ai_action_lookahead.cpp
-    src/ai_logic_convert.cpp
-    src/recording_to_findimage.cpp
-    src/scheduled_task_store.cpp
-    src/scheduled_task_types.cpp
-    src/ui_scale.cpp
     LIBS
-        script_action_builder_core
-        script_core_common
+        qst_engine
+        qst_desktop_tools
+        qst_engine_ui_stubs
         Qst::WebView2
-        ${OpenCV_LIBS}
-        user32 gdi32 shell32 shlwapi advapi32 ole32 oleaut32 imm32 winhttp crypt32
+        ${QST_COMMON_LINK_LIBS}
 )
 
 add_custom_command(TARGET AgentAssistantSelfTest POST_BUILD
@@ -474,6 +492,34 @@ qst_add_selftest(BreakoutCooldownSelfTest
     tools/breakout_cooldown_selftest.cpp
 )
 
+# 桥接 JSON 边界契约（架构评估验收 A1）：锁住 saveSettings「提示成功但全部回滚」
+# 那次 P0。被测逻辑已上收到 src/json_util.h（纯 header），所以只链 qst_utils，
+# 不依赖引擎能独立链接——这样 B 段删掉 engine_link_stubs.cpp 后本 suite 仍成立。
+qst_add_selftest(BridgeJsonSelfTest
+    tools/bridge_json_selftest.cpp
+    LIBS qst_utils
+)
+
+# 桥接命令契约（架构评估 #10 / 验收报告 §7.2 C）：双向校验
+# src/webview/bridge_commands.h ↔ C++ 入站分派 ↔ ui/*.js 发送侧。
+# 纯源码分析（读文件 + 正则），不链任何库。
+qst_add_selftest(BridgeContractSelfTest
+    tools/bridge_contract_selftest.cpp
+)
+
+# 引擎执行侧（架构评估验收 B3）：UI 钩子契约（默认跑）+ headless 跑
+# Wait/Loop/VarCompute（--engine 显式打开）。
+# 需要 B 段的依赖倒置已完成（引擎可脱离壳链接），否则这里会缺壳符号。
+qst_add_selftest(ScriptRunnerSelfTest
+    tools/script_runner_selftest.cpp
+    LIBS
+        qst_engine
+        qst_desktop_tools
+        qst_engine_ui_stubs
+        Qst::WebView2
+        ${QST_COMMON_LINK_LIBS}
+)
+
 qst_add_selftest(HotkeyStopSelfTest
     tools/hotkey_stop_selftest.cpp
 )
@@ -489,9 +535,8 @@ qst_add_selftest(RecorderSelfTest
     src/recorder_timeline.cpp
     src/recording_to_findimage.cpp
     src/input_timeline_scheduler.cpp
-    src/utils.cpp
     resources/selftest_version.rc
-    LIBS user32 shell32 shlwapi winmm gdi32
+    LIBS user32 shell32 shlwapi winmm gdi32 qst_utils
 )
 # 输出名避开 Recorder*+SendInput 启发式指纹；CMake/技能里仍用目标名 RecorderSelfTest
 set_target_properties(RecorderSelfTest PROPERTIES OUTPUT_NAME QstRecorderLogicTest)

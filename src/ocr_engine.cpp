@@ -1,5 +1,6 @@
 #include "ocr_engine.h"
 
+#include "base64.h"
 #include "image_match.h"
 #include "opencv_runtime.h"
 #include "utils.h"
@@ -479,43 +480,11 @@ bool EncodeHbitmapPng(HBITMAP bitmap, std::vector<uchar>& pngOut) {
     return cv::imencode(".png", bgr, pngOut);
 }
 
-std::string Base64Encode(const unsigned char* data, size_t len) {
-    static const char kTbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    size_t i = 0;
-    while (i + 2 < len) {
-        const unsigned n = (static_cast<unsigned>(data[i]) << 16)
-            | (static_cast<unsigned>(data[i + 1]) << 8)
-            | static_cast<unsigned>(data[i + 2]);
-        out.push_back(kTbl[(n >> 18) & 63]);
-        out.push_back(kTbl[(n >> 12) & 63]);
-        out.push_back(kTbl[(n >> 6) & 63]);
-        out.push_back(kTbl[n & 63]);
-        i += 3;
-    }
-    if (i < len) {
-        unsigned n = static_cast<unsigned>(data[i]) << 16;
-        if (i + 1 < len) n |= static_cast<unsigned>(data[i + 1]) << 8;
-        out.push_back(kTbl[(n >> 18) & 63]);
-        out.push_back(kTbl[(n >> 12) & 63]);
-        if (i + 1 < len) {
-            out.push_back(kTbl[(n >> 6) & 63]);
-            out.push_back('=');
-        } else {
-            out.push_back('=');
-            out.push_back('=');
-        }
-    }
-    return out;
-}
-
 bool EncodeHbitmapPngBase64(HBITMAP bitmap, std::string& b64Out) {
     b64Out.clear();
     std::vector<uchar> png;
     if (!EncodeHbitmapPng(bitmap, png) || png.empty()) return false;
-    b64Out = Base64Encode(png.data(), png.size());
+    b64Out = qst::base64::Encode(png.data(), png.size());
     return !b64Out.empty();
 }
 

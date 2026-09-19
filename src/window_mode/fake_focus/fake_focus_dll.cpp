@@ -68,6 +68,26 @@ void MapleBumpHit(volatile LONG* c) {
     if (v > 255) InterlockedExchange(c, 255);
     MaplePublishHits();
 }
+
+// mapleDiag 高位 = 运行期「这个钩子至少被调用过一次」标记。
+// 低位（0x0001..0x10000）是**安装**位，高位是**命中**位，别混用。
+// 宿主日志会把这些位解成人话，用来判断客户端到底走哪条输入路径：
+//   IAT 直呼 / GetProcAddress 动态解析 / 全都不走（那就说明它是消息驱动 + 别的键态源）。
+// 背景：星辰冒险岛后台只原地平A、不走路的日志里，gfw/gaks/diState/lastCb 全是 0，
+// 光看计数器无法区分「钩子没装上」和「客户端根本不调这些 API」。
+constexpr DWORD kMapleCalledKeyState = 0x0020000u;   // Hook_GetKeyState
+constexpr DWORD kMapleCalledKbState = 0x0040000u;    // Hook_GetKeyboardState
+constexpr DWORD kMapleCalledCursor = 0x0080000u;     // Hook_GetCursorPos
+constexpr DWORD kMapleCalledGpa = 0x0100000u;        // Hook_GetProcAddress
+constexpr DWORD kMapleIatGpaPatched = 0x0200000u;    // GetProcAddress 的 IAT 槽补到过
+constexpr DWORD kMapleIatDinputWalked = 0x0400000u;  // dinput8/dinput 的 user32 IAT 补到过槽
+
+void MapleMarkCalled(DWORD bit) {
+    if ((g_mapleDiag & bit) != 0) return;
+    g_mapleDiag |= bit;
+    MaplePublishHits();
+}
+
 void MapleResetHookHits() {
     InterlockedExchange(&g_mapleHitGaks, 0);
     InterlockedExchange(&g_mapleHitDiState, 0);
@@ -749,6 +769,7 @@ void StartSoftKeyDrainThread() {
 }
 
 BOOL WINAPI Hook_GetCursorPos(LPPOINT pt) {
+    if (g_mapleSafe) MapleMarkCalled(kMapleCalledCursor);
     // 冒险岛走 IAT，禁止在游戏线程灌 WM_INPUT / WM_ACTIVATE（会卡死）。
     // DeSmuME：同样禁止假 WM_INPUT（InputTimer 高频 GetAsyncKeyState 会洪泛崩进程）。
     // 微信/AIR/Electron：禁止假 WM_INPUT 与 SoftRefreshFocusMessages（会 Post WM_ACTIVATE 抢前台）。
@@ -837,6 +858,7 @@ SHORT WINAPI Hook_GetAsyncKeyState(int vKey) {
 }
 
 SHORT WINAPI Hook_GetKeyState(int nVirtKey) {
+    if (g_mapleSafe) MapleMarkCalled(kMapleCalledKeyState);
     const fakefocus::SoftInputState* st = SoftState();
     if (st && (st->flags & fakefocus::kSoftFlagKeysValid)) {
         if (SHORT soft = SoftKeyDownShort(nVirtKey, false)) return soft;
@@ -848,6 +870,7 @@ SHORT WINAPI Hook_GetKeyState(int nVirtKey) {
 }
 
 BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
+    if (g_mapleSafe) MapleMarkCalled(kMapleCalledKbState);
     if (!lpKeyState) return FALSE;
     if (g_mapleSafe) {
         std::memset(lpKeyState, 0, 256);
@@ -2503,7 +2526,11 @@ void MapleIatWalkGameDirDinputUser32() {
             CharLowerW(path);
             if (MapleIsFakeFocusModulePath(path)) continue;
         }
+        const int before = g_mapleInputHookCount;
         MapleIatWalkModuleByName(mod, MapleIatWalkKind::DinputUser32Only);
+        // dinput8/dinput 是**懒加载**的：注入那一轮 PEB 扫描时它们往往还没进进程，
+        // 这里补到槽就记一位，方便日志区分「本地 dinput8 没被补」和「根本没加载」。
+        if (g_mapleInputHookCount > before) g_mapleDiag |= kMapleIatDinputWalked;
     }
 }
 
@@ -2558,6 +2585,7 @@ void MaplePatchFocusPointersProcessWide() {
 }
 
 FARPROC WINAPI Hook_GetProcAddress(HMODULE module, LPCSTR name) {
+    if (g_mapleSafe) MapleMarkCalled(kMapleCalledGpa);
     auto orig = g_mapleRealGetProcAddress;
     FARPROC real = orig ? orig(module, name) : nullptr;
     if (!module || !name) return real;
@@ -2678,6 +2706,10 @@ void MapleMarkIatDetour(void* detour) {
         || detour == reinterpret_cast<void*>(&Hook_MapleCallWindowProcA)
         || detour == reinterpret_cast<void*>(&Hook_MapleTranslateMessage)) {
         g_mapleDiag |= 0x10000;
+    }
+    // GetProcAddress 本身被补上，才拦得住「运行时动态解析 user32!GetKeyboardState」这类客户端。
+    if (detour == reinterpret_cast<void*>(&Hook_GetProcAddress)) {
+        g_mapleDiag |= kMapleIatGpaPatched;
     }
 }
 
@@ -3177,6 +3209,10 @@ void InstallMapleIatHooks() {
     // 禁止 Poll、禁止注入线程 CreateDevice。
     MapleHookDinputVtables();
     MaplePatchDiCachedAll();
+    // dinput8/dinput 常晚于注入才被游戏 LoadLibrary（日志特征：iatPoll=2 而 foundVt>0）。
+    // PEB 那一轮它们还没进进程，user32 IAT 自然一个槽都没补上；这里在 DI 阶段之后再补一次，
+    // 之后 iatPoll 应 ≥4（主程序 2 + 本地 dinput user32 的 GAKS/光标 2）。
+    MapleIatWalkGameDirDinputUser32();
     MaplePublishHits();
     // 164352 闪退：禁止假 WM_INPUT、禁止改 dinput8 可写节、禁止注入线程
     // RegisterRawInputDevices / SetCooperativeLevel / Prime SendMessage。

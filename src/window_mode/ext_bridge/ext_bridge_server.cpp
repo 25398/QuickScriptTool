@@ -12,6 +12,7 @@
 #include <sddl.h>
 #include <shellapi.h>
 
+#include "base64.h"
 #include "ext_bridge_server.h"
 #include "window_mode/window_mode_log.h"
 
@@ -107,28 +108,12 @@ bool Sha1(const void* data, size_t len, unsigned char out[20]) {
     return ok;
 }
 
-std::string Base64Encode(const unsigned char* data, size_t len) {
-    static const char* tbl =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        const unsigned v = (data[i] << 16)
-            | ((i + 1 < len ? data[i + 1] : 0) << 8)
-            | (i + 2 < len ? data[i + 2] : 0);
-        out.push_back(tbl[(v >> 18) & 63]);
-        out.push_back(tbl[(v >> 12) & 63]);
-        out.push_back(i + 1 < len ? tbl[(v >> 6) & 63] : '=');
-        out.push_back(i + 2 < len ? tbl[v & 63] : '=');
-    }
-    return out;
-}
-
 std::string MakeWsAccept(const std::string& key) {
     const std::string src = key + kWsGuid;
     unsigned char dig[20]{};
     if (!Sha1(src.data(), src.size(), dig)) return {};
-    return Base64Encode(dig, 20);
+    // Base64 唯一实现见 src/base64.h（原自研实现已收敛；语义完全一致）
+    return qst::base64::Encode(dig, sizeof(dig));
 }
 
 bool SendAll(SOCKET s, const char* data, int len) {

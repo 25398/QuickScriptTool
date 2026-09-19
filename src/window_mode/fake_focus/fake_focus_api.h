@@ -38,6 +38,10 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_HasSoftInput(void);
 /// 80=dinput已加载 100=Acquire 200=FgWnd 400=SetFg 800=GetDeviceState方法体JMP
 /// 1000=user32/win32u方法体JMP 必须为0 2000=GetDeviceData方法体JMP 必须为0
 /// 4000=GetDeviceData虚表槽 8000=软输入映射可读）。
+/// 宿主实际读的是共享内存 `mapleDiag`（见 fake_focus_soft_input.h），另含运行期「命中」高位：
+/// 20000=GetKeyState被调用过 40000=GetKeyboardState被调用过 80000=GetCursorPos被调用过
+/// 100000=GetProcAddress被调用过 200000=GetProcAddress的IAT槽已补 400000=dinput user32 IAT补到过槽。
+/// 高位全 0 且 gaks/diState 也全 0 ⇒ 客户端根本不走这些 API（不是钩子没装上）。
 /// 远程线程退出码即该值。低 16 位为 0 表示没挂上导入。
 FAKEFOCUS_API DWORD WINAPI FakeFocus_MapleIatCount(HWND unused);
 

@@ -565,3 +565,13 @@ Write-Host "For installer EXE:"
 Write-Host "  1) confirm tools\product_version.txt == installer MyAppVersion"
 Write-Host "  2) & `"`$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe`" installer\QuickScriptTool.iss"
 Write-Host "  3) re-run this script with -SkipBuild to sync website\downloads\"
+
+# ── dist 保留策略（架构评估 #15）──────────────────────────────────
+# dist\ 曾累积到 21 GB：只保留最近 N 个版本，旧的移入 dist\archive\，
+# 并清掉本次打包可能残留的 _edge_pack_stage_* 临时目录。
+$pruneScript = Join-Path $PSScriptRoot "prune_dist.ps1"
+if (Test-Path -LiteralPath $pruneScript) {
+    Write-Host ""
+    Write-Host "Pruning dist (keep last 5 versions per artifact series)..."
+    & $pruneScript -DistRoot $DistRoot
+}

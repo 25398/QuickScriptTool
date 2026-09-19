@@ -2,52 +2,44 @@
 setlocal EnableExtensions
 REM Build FakeFocus32.dll with the x86 MSVC toolset (called from CMake x64 builds).
 REM Usage: build_fakefocus32.cmd <source_root> <output_dir>
+REM NOTE: keep this file ASCII-only. A .cmd with UTF-8 Chinese comments is read as
+REM GBK on a zh-CN host and can corrupt quoting/parsing.
 
 set "SRCROOT=%~1"
 set "OUTDIR=%~2"
 if "%SRCROOT%"=="" exit /b 1
 if "%OUTDIR%"=="" exit /b 1
 
+REM Do NOT test "if defined ProgramFiles(x86)" directly: the parentheses break the
+REM if parser, so BuildTools installed under "Program Files (x86)" was never found
+REM and the 32-bit DLL was silently skipped. Copy to plain vars first.
+set "PF86=%ProgramFiles(x86)%"
+if not defined PF86 set "PF86=C:\Program Files (x86)"
+set "PF64=%ProgramFiles%"
+if not defined PF64 set "PF64=C:\Program Files"
+
 set "VCVARS="
 
-REM Prefer vswhere (quoted paths) - avoids "Program Files" splitting bugs.
-where /Q vswhere >nul 2>&1
-if not errorlevel 1 (
-  for /f "usebackq delims=" %%I in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
-    if exist "%%I\VC\Auxiliary\Build\vcvarsall.bat" (
-      set "VCVARS=%%I\VC\Auxiliary\Build\vcvarsall.bat"
-      goto :found_vcvars
-    )
+REM 1) vswhere: covers any edition/path, including BuildTools.
+set "VSWHERE=%PF86%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%PF64%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" (
+  for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
+    if exist "%%I\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%I\VC\Auxiliary\Build\vcvarsall.bat"
   )
 )
 
-if defined ProgramFiles (
-  if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
-    set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    goto :found_vcvars
-  )
-  if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" (
-    set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-    goto :found_vcvars
-  )
-  if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" (
-    set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
-    goto :found_vcvars
-  )
-)
-if defined ProgramFiles^(x86^) (
-  if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" (
-    set "VCVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-    goto :found_vcvars
-  )
-)
-if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
-  set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-  goto :found_vcvars
-)
+REM 2) Well-known fallbacks (64-bit Program Files, then 32-bit BuildTools).
+if not defined VCVARS if exist "%PF64%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%PF64%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "%PF64%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%PF64%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "%PF64%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%PF64%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "%PF86%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%PF86%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "%PF86%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%PF86%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 
-echo [FakeFocus32] vcvarsall.bat not found - skip 32-bit DLL
-exit /b 0
+if not defined VCVARS (
+  echo [FakeFocus32] vcvarsall.bat not found - skip 32-bit DLL
+  exit /b 0
+)
 
 :found_vcvars
 REM x86 native OR x64-host cross x86

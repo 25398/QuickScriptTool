@@ -1,5 +1,6 @@
 #include "agent_attachment.h"
 
+#include "base64.h"
 #include "opencv_runtime.h"
 #include "utils.h"
 
@@ -11,6 +12,9 @@
 #include <vector>
 
 namespace {
+
+// Base64 唯一实现见 src/base64.h（原三份重复实现已收敛）
+using qst::base64::Encode;
 
 std::wstring ToLowerExt(const std::wstring& path) {
     const auto pos = path.find_last_of(L'.');
@@ -24,23 +28,6 @@ std::vector<uint8_t> ReadBinaryFile(const std::wstring& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return {};
     return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-}
-
-std::string Base64Encode(const std::vector<uint8_t>& data) {
-    static const char kTable[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((data.size() + 2) / 3) * 4);
-    for (size_t i = 0; i < data.size(); i += 3) {
-        const uint32_t n = (static_cast<uint32_t>(data[i]) << 16)
-            | ((i + 1 < data.size()) ? static_cast<uint32_t>(data[i + 1]) << 8 : 0)
-            | ((i + 2 < data.size()) ? static_cast<uint32_t>(data[i + 2]) : 0);
-        out.push_back(kTable[(n >> 18) & 63]);
-        out.push_back(kTable[(n >> 12) & 63]);
-        out.push_back(i + 1 < data.size() ? kTable[(n >> 6) & 63] : '=');
-        out.push_back(i + 2 < data.size() ? kTable[n & 63] : '=');
-    }
-    return out;
 }
 
 HBITMAP CreateBitmapFromMatBGR(const cv::Mat& bgr, int size) {
@@ -212,7 +199,7 @@ bool BuildAttachmentFromImageMat(const cv::Mat& bgr, const std::wstring& fileNam
     item.fileName = fileName;
     item.isImage = true;
     item.mime = L"image/jpeg";
-    item.base64 = Base64Encode(encoded);
+    item.base64 = Encode(encoded);
     item.thumbnail = CreateBitmapFromMatBGR(bgr, 40);
     if (item.base64.empty()) {
         error = L"无法读取图片。";
@@ -246,7 +233,7 @@ std::wstring AgentMimeTypeForPath(const std::wstring& path) {
 }
 
 std::string AgentBase64EncodeFile(const std::wstring& path) {
-    return Base64Encode(ReadBinaryFile(path));
+    return Encode(ReadBinaryFile(path));
 }
 
 HBITMAP AgentCreateImageThumbnail(const std::wstring& path, int size) {

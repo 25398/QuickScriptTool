@@ -77,8 +77,9 @@ set(QST_ENGINE_SOURCES
     src/agent_webview.cpp
     src/macro_execute_tools.cpp
     src/page_snapshot.cpp
-    src/window_mode/window_mode_json.cpp
+    # window_mode_json.cpp 已移到 window_mode_common（STATIC，去重 A5）
     src/window_mode/window_mode_preview.cpp
+    src/engine/engine_ui_hooks.cpp
     src/engine/engine_runtime.cpp
     src/engine/engine_hotkeys.cpp
     src/engine/engine_script_run.cpp

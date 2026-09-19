@@ -8,8 +8,10 @@
 #include "ai_action_router.h"
 #include "ai_locate_verify.h"
 #include "ai_logic_convert.h"
+#include "base64.h"
 #include "color_match.h"
 #include "image_match.h"
+#include "json_util.h"
 #include "opencv_runtime.h"
 #include "macro_execute_tools.h"
 #include "page_snapshot.h"
@@ -93,68 +95,14 @@ namespace {
 
 
 
-std::string Base64Encode(const std::vector<uint8_t>& data) {
-
-    static const char kTable[] =
-
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    std::string out;
-
-    out.reserve(((data.size() + 2) / 3) * 4);
-
-    for (size_t i = 0; i < data.size(); i += 3) {
-
-        const uint32_t n = (static_cast<uint32_t>(data[i]) << 16)
-
-            | ((i + 1 < data.size()) ? static_cast<uint32_t>(data[i + 1]) << 8 : 0)
-
-            | ((i + 2 < data.size()) ? static_cast<uint32_t>(data[i + 2]) : 0);
-
-        out.push_back(kTable[(n >> 18) & 63]);
-
-        out.push_back(kTable[(n >> 12) & 63]);
-
-        out.push_back(i + 1 < data.size() ? kTable[(n >> 6) & 63] : '=');
-
-        out.push_back(i + 2 < data.size() ? kTable[n & 63] : '=');
-
-    }
-
-    return out;
-
-}
-
-std::vector<uint8_t> Base64Decode(const std::string& data) {
-    auto rev = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
-    std::vector<uint8_t> out;
-    out.reserve((data.size() / 4) * 3);
-    int buf = 0;
-    int bits = 0;
-    for (char c : data) {
-        if (c == '=') break;
-        const int v = rev(c);
-        if (v < 0) continue;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
-        }
-    }
-    return out;
-}
+// Base64 唯一实现见 src/base64.h；JSON 抽取唯一实现见 src/json_util.h
+using qst::base64::Encode;
+using qst::base64::Decode;
+using qst::jsonutil::ExtractFirstJsonArray;
 
 cv::Mat DecodeBase64Image(const std::string& base64) {
     if (base64.empty() || !OpenCvAvailable()) return {};
-    const std::vector<uint8_t> bytes = Base64Decode(base64);
+    const std::vector<uint8_t> bytes = Decode(base64);
     if (bytes.empty()) return {};
     try {
         cv::Mat raw = cv::imdecode(bytes, cv::IMREAD_COLOR);
@@ -207,43 +155,10 @@ std::wstring TruncateForLog(const std::wstring& text, size_t maxLen = 240) {
 
 
 
-std::wstring ExtractJsonArrayFromText(const std::wstring& text) {
-    // 跳过 [EXECUTED][OBSERVE] 等标记，找真正的 JSON 数组（首元素为 { 或 [）
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] != L'[') continue;
-        size_t j = i + 1;
-        while (j < text.size() && (text[j] == L' ' || text[j] == L'\t' || text[j] == L'\r' || text[j] == L'\n'))
-            ++j;
-        if (j >= text.size()) break;
-        if (text[j] != L'{' && text[j] != L'[') continue;
-        int depth = 0;
-        bool inStr = false;
-        bool esc = false;
-        for (size_t k = i; k < text.size(); ++k) {
-            const wchar_t c = text[k];
-            if (inStr) {
-                if (esc) esc = false;
-                else if (c == L'\\') esc = true;
-                else if (c == L'"') inStr = false;
-                continue;
-            }
-            if (c == L'"') { inStr = true; continue; }
-            if (c == L'[') ++depth;
-            else if (c == L']') {
-                --depth;
-                if (depth == 0) return text.substr(i, k - i + 1);
-            }
-        }
-        break;
-    }
-    return L"";
-}
-
-
 void LogSubmittedActionsBrief(AiMacroLogFn logFn, const std::wstring& headline,
     const std::wstring& jsonText, size_t maxItems = 16) {
     if (!logFn) return;
-    const std::wstring arr = ExtractJsonArrayFromText(jsonText);
+    const std::wstring arr = ExtractFirstJsonArray(jsonText);
     if (arr.empty()) {
         // 工具结果已改为短摘要（省 token），直接回显摘要行
         std::wstring brief = Trim(jsonText);
@@ -629,7 +544,7 @@ AgentSendCallbacks MakeAiMacroSendCallbacks(AiMacroLogFn logFn, const std::atomi
             return;
         }
 
-        const std::wstring arr = ExtractJsonArrayFromText(result);
+        const std::wstring arr = ExtractFirstJsonArray(result);
         if (arr.empty()) {
             logFn(L"  工具返回：非动作 JSON");
             return;
@@ -664,7 +579,7 @@ std::string BitmapToBase64Jpeg(HBITMAP hBitmap, int quality, double scale) {
         params.push_back(cv::IMWRITE_JPEG_QUALITY);
         params.push_back(std::clamp(quality, 10, 100));
         if (!cv::imencode(".jpg", mat, encoded, params)) return {};
-        return Base64Encode(encoded);
+        return Encode(encoded);
     } catch (...) {
         return {};
     }
@@ -979,7 +894,7 @@ std::wstring MergeAllSubmittedActionsJson(const AgentCore* core) {
 
     auto mergeJsonArray = [&](const std::wstring& text) {
 
-        const std::wstring arr = ExtractJsonArrayFromText(text);
+        const std::wstring arr = ExtractFirstJsonArray(text);
 
         if (arr.empty()) return;
 
@@ -1583,7 +1498,7 @@ AiActionResult FinalizeToolActionsResult(
 
     std::wstring actionsJson = ExtractSubmittedActionsJson(core);
 
-    if (actionsJson.empty()) actionsJson = ExtractJsonArrayFromText(Trim(response));
+    if (actionsJson.empty()) actionsJson = ExtractFirstJsonArray(Trim(response));
 
     LogExtractedActions(logFn, actionsJson);
 

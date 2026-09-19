@@ -59,4 +59,33 @@
 //      等目标处理完，再让调用方写下一步键态；冒险岛 DirectInput 共享内存路径除外。
 //    - 现场旋钮：`QST_NO_SOFT_KEY_BARRIER=1`（关屏障 A/B，恢复旧行为）。
 //    - 对应用例：`soft_key_combo_state_race`（WindowModeSelfTest）。
+//
+// 9) 后台窗口模式：**不得**为了目标窗口去 SendInput 真键
+//    - 方向键兜底（LCA/未登记游戏/冒险岛）只在「目标就是前台窗」时才 `SendKeyboardKey`：
+//      目标在后台时 SendInput 打的是当前前台窗（用户正在看的浏览器/视频会收到 ←/→/↑/↓，
+//      表现为 B 站等视频跳进度/调音量）。判据 `TargetOwnsForegroundWindow()`。
+//    - 冒险岛后台走路靠软键态 + DirectInput 软键，前提是**客户端在轮询**：2009 dinput8
+//      失焦即停轮询（靠 WM_ACTIVATE，不逐帧查前台）。IAT 吞失活只拦得住注入之后的失活，
+//      所以若点运行时游戏已经不在前台，必须在注入后补一次**真激活**（`WakeMapleStoryInputPolling`，
+//      不能用假 WM_ACTIVATE——给冒险岛灌假激活会冻客户端），等 `diState>0` 再把前台还给用户。
+//      诊断：`冒险岛钩命中 … diState=0 lastCb=0` + 全程 `gaks=0 gfw=0` ⇒ 客户端根本没在轮询。
+//    - 对应用例：`lca_arrow_key_lparam` / `maplestory_bg_fake_focus`（WindowModeSelfTest）。
+//
+// 10) 冒险岛诊断契约：必须能区分「钩子没装上」和「客户端根本不调这些 API」
+//    - 痛点：只原地平A 的日志里 `gfw/gaks/diState/lastCb` 全是 0，但 `diag` 又显示钩子装好了，
+//      光看计数器无法定论，容易反复猜（已浪费一轮）。
+//    - `fake_focus_dll.cpp` 在 `mapleDiag` **高位**写运行期命中位（低位 0x1..0x10000 是安装位，勿混用）：
+//      0x20000 GetKeyState 被调用过 / 0x40000 GetKeyboardState / 0x80000 GetCursorPos /
+//      0x100000 GetProcAddress / 0x200000 GetProcAddress 的 IAT 槽已补 /
+//      0x400000 dinput8|dinput 的 user32 IAT 补到过槽。
+//    - 宿主在 `冒险岛钩安装` 行尾输出 `pollHit=` 人话摘要 + `gpaIat=` + `dinputIat=`。
+//    - 判读：`pollHit=无` 且 `gaks=0 diState=0` ⇒ 客户端不走任何被拦的 API（**不是**钩子没装上），
+//      别再往「补钩子」方向使劲；`pollHit=GetCursorPos` 但无键态项 ⇒ 客户端确实在轮询 Win32，
+//      键态走的是别的入口（打包器手搓导出解析时只能上方法体 JMP，而冒险岛明令禁止）。
+//    - `iatPoll=2` 是**异常值**：本地 dinput8 存在时应 ≥4（主程序 2 + dinput user32 的 GAKS/光标 2）。
+//      成因是 dinput8/dinput 懒加载、PEB 那一轮还没进进程 —— `InstallMapleIatHooks` 末尾已在
+//      DI 虚表阶段之后补走一次 `MapleIatWalkGameDirDinputUser32()`。
+//    - 构建前提：`src/window_mode/fake_focus/build_fakefocus32.cmd` 必须真能编出 32 位 DLL。
+//      **禁止**用 `if defined ProgramFiles(x86)` 直接判断（括号会打断 if 解析，BuildTools 装在
+//      「Program Files (x86)」时永远走 not found，32 位 DLL 被静默跳过 —— 已修，勿回退）。
 // =============================================================================

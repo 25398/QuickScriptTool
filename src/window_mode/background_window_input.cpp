@@ -1142,6 +1142,21 @@ bool ShouldMirrorLcaNavKeyState(HWND hwnd) {
     return (ex & WS_EX_TOOLWINDOW) == 0;
 }
 
+/// 目标窗口（或其顶层）此刻是否就是前台窗。
+/// 方向键的本机键态兜底（SendInput）只在「目标就是前台」时才有意义：
+/// 目标在后台时 SendInput 打的是当前前台窗——用户正在看的浏览器/视频会收到 ←/→/↑/↓，
+/// 而目标本身（DirectInput 读设备态）因为失焦早就停了轮询，照样不会走。
+/// 所以后台一律不补真键，只写软键态 + PostMessage（后台走路靠 DI 软键）。
+bool TargetOwnsForegroundWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    if (fg == hwnd) return true;
+    HWND top = TopLevelTargetWindow(hwnd);
+    if (top && IsWindow(top) && (fg == top || IsChild(top, fg))) return true;
+    return false;
+}
+
 void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
     vk = NormalizeScriptKeyVk(vk, L"");
     if (vk > 255) vk = 0;
@@ -1188,13 +1203,16 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
                     gaks, diState, diData, lastCb, hitReady, gfw, focus)) {
                 mapleDiLive = diState > 0 && lastCb == 256;
             }
+            // 兜底真键只在目标就是前台窗时补：后台时它打的是遮挡窗（浏览器视频 ←→ 跳转）。
+            const bool mirrorLocalKey = !mapleDiLive && TargetOwnsForegroundWindow(send);
             static bool loggedArrowKeyState = false;
             if (!loggedArrowKeyState) {
                 loggedArrowKeyState = true;
                 WindowModeLogf(
                     L"[窗口模式] 方向键%s本机键态 vk=0x%02X lParam=0x%08X"
-                    L"（DI lastCb=%lu diState=%lu；钩未挂上时仍打本机键，遮挡窗会收到方向键）",
-                    mapleDiLive ? L"改走 DirectInput 软键、不再写" : L"兼写",
+                    L"（DI lastCb=%lu diState=%lu；仅目标为前台时才补真键，后台不再打进遮挡窗）",
+                    mapleDiLive ? L"改走 DirectInput 软键、不再写"
+                                : (mirrorLocalKey ? L"兼写" : L"目标在后台、不写"),
                     vk, static_cast<unsigned>(lp),
                     static_cast<unsigned long>(lastCb),
                     static_cast<unsigned long>(diState));
@@ -1215,7 +1233,7 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
                         static_cast<unsigned long>((diVt >> 8) & 0xFFu));
                 }
             }
-            if (!mapleDiLive) SendKeyboardKey(vk, down);
+            if (mirrorLocalKey) SendKeyboardKey(vk, down);
         }
         PostMessageW(send, down ? WM_KEYDOWN : WM_KEYUP, vk, lp);
         PostMessageW(send, WM_NULL, 0, 0);

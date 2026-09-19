@@ -40,6 +40,11 @@ $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
+# MCP 走 UTF-8 的 stdio JSON-RPC。.NET Framework 下 StandardOutputEncoding 默认取
+# 控制台代码页（本机 936/GBK），会把 UTF-8 中文（如 serverInfo.title）解成乱码，
+# 随后 ConvertFrom-Json 直接抛错 —— 冒烟从未真正通过的原因。必须显式指定 UTF-8。
+$psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+$psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $proc = [System.Diagnostics.Process]::Start($psi)
 foreach ($r in $requests) { $proc.StandardInput.WriteLine($r) }
 $proc.StandardInput.Close()

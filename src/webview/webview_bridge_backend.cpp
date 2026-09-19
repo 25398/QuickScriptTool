@@ -27,6 +27,8 @@
 #include "utils.h"
 #include "action_tree.h"
 #include "action_utils.h"
+#include "engine/engine_ui_hooks.h"
+#include "json_util.h"
 #include "window_mode/window_mode_json.h"
 #include "window_mode/window_mode_types.h"
 #include "window_mode/window_capture.h"
@@ -294,108 +296,13 @@ std::string ListJsonFilesCached(const std::wstring& dir, bool recordings) {
     return cache.json;
 }
 
-bool JsonGetNumber(const std::string& json, const char* key, double& out) {
-    const std::string pat = std::string("\"") + key + "\"";
-    const auto k = json.find(pat);
-    if (k == std::string::npos) return false;
-    const auto colon = json.find(':', k + pat.size());
-    if (colon == std::string::npos) return false;
-    size_t i = colon + 1;
-    while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) ++i;
-    try {
-        size_t n = 0;
-        out = std::stod(json.substr(i), &n);
-        return n > 0;
-    } catch (...) {
-        return false;
-    }
-}
-
-bool JsonGetBool(const std::string& json, const char* key, bool& out) {
-    const std::string pat = std::string("\"") + key + "\"";
-    const auto k = json.find(pat);
-    if (k == std::string::npos) return false;
-    const auto colon = json.find(':', k + pat.size());
-    if (colon == std::string::npos) return false;
-    size_t i = colon + 1;
-    while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r')) ++i;
-    if (json.compare(i, 4, "true") == 0) {
-        out = true;
-        return true;
-    }
-    if (json.compare(i, 5, "false") == 0) {
-        out = false;
-        return true;
-    }
-    return false;
-}
-
-bool JsonGetInt(const std::string& json, const char* key, int& out) {
-    double d = 0;
-    if (!JsonGetNumber(json, key, d)) return false;
-    out = static_cast<int>(d);
-    return true;
-}
-
-bool IsEditorActionTypeTokenUtf8(const std::string& s) {
-    if (s.empty() || s.size() > 64) return false;
-    for (const unsigned char c : s) {
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-            || (c >= '0' && c <= '9') || c == '_';
-        if (!ok) return false;
-    }
-    return true;
-}
-
-bool JsonGetStringArray(const std::string& json, const char* key, std::vector<std::wstring>& out) {
-    const std::string pat = std::string("\"") + key + "\"";
-    const auto k = json.find(pat);
-    if (k == std::string::npos) return false;
-    const auto colon = json.find(':', k + pat.size());
-    if (colon == std::string::npos) return false;
-    size_t tok = colon + 1;
-    while (tok < json.size() && (json[tok] == ' ' || json[tok] == '\t'
-        || json[tok] == '\n' || json[tok] == '\r')) {
-        ++tok;
-    }
-    if (tok >= json.size() || json[tok] != '[') return false;
-    const auto rb = FindMatchingJsonBracket(json, tok);
-    if (rb == std::string::npos) return false;
-    out.clear();
-    size_t i = tok + 1;
-    while (i < rb) {
-        while (i < rb && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n'
-            || json[i] == '\r' || json[i] == ',')) {
-            ++i;
-        }
-        if (i >= rb || json[i] != '"') break;
-        ++i;
-        std::string val;
-        bool esc = false;
-        for (; i < rb; ++i) {
-            const char c = json[i];
-            if (esc) {
-                val.push_back(c);
-                esc = false;
-                continue;
-            }
-            if (c == '\\') {
-                esc = true;
-                continue;
-            }
-            if (c == '"') {
-                ++i;
-                break;
-            }
-            val.push_back(c);
-        }
-        if (IsEditorActionTypeTokenUtf8(val) && out.size() < 80) {
-            const std::wstring w = FromUtf8(val);
-            if (std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
-        }
-    }
-    return true;
-}
+// JSON 读写统一走 src/json_util.h（nlohmann）；本文件不再手写字符扫描。
+using qst::jsonutil::GetActionTokenArray;
+using qst::jsonutil::GetBool;
+using qst::jsonutil::GetInt;
+using qst::jsonutil::GetNumber;
+using qst::jsonutil::GetStringArray;
+using qst::jsonutil::GetStringField;
 
 void AppendJsonStringArray(std::ostringstream& oss, const char* key, const std::vector<std::wstring>& items) {
     oss << "\"" << key << "\":[";
@@ -417,7 +324,13 @@ void SetJsPoster(std::function<void(std::string)> poster) {
     g_jsPoster = std::move(poster);
 }
 
-void PostToWebUi(std::string jsonUtf8) {
+// ── 壳侧 UI 能力实现（依赖倒置，架构评估 B1）──────────────────────
+// 这三个函数原先叫 qst::webview::PostToWebUi / SyncHomeSelectionCache /
+// NotifyWebDebugWindowSetting，被**引擎**直接调用 —— 于是 qst_engine 链接时
+// 依赖壳的符号，自检无法只链库（P1-5 的机制性根因）。
+// 现在：引擎侧 engine_ui_hooks.cpp 提供同名转发定义（默认 no-op），
+// 真实现留在壳内并改名为 Shell*，由 InstallBridgeUiHooks() 注入。
+void ShellPostToWebUi(std::string jsonUtf8) {
     std::function<void(std::string)> poster;
     {
         std::lock_guard<std::mutex> lock(g_mu);
@@ -442,7 +355,7 @@ void ReloadSettingsFromDisk() {
     }
 }
 
-void SyncHomeSelectionCache(const std::wstring& selectedScriptPath,
+void ShellSyncHomeSelectionCache(const std::wstring& selectedScriptPath,
     const std::wstring& selectedRecordingPath, int activeTab) {
     std::lock_guard<std::mutex> lock(g_mu);
     if (!g_settingsLoaded) {
@@ -456,7 +369,7 @@ void SyncHomeSelectionCache(const std::wstring& selectedScriptPath,
         g_ctx.settings.home.activeTab = activeTab;
 }
 
-void NotifyWebDebugWindowSetting(bool enabled) {
+void ShellNotifyWebDebugWindowSetting(bool enabled) {
     {
         std::lock_guard<std::mutex> lock(g_mu);
         if (!g_settingsLoaded) {
@@ -466,8 +379,26 @@ void NotifyWebDebugWindowSetting(bool enabled) {
         }
         g_ctx.settings.playback.enableDebugOutputWindow = enabled;
     }
-    PostToWebUi(std::string("{\"type\":\"settings.changed\",\"playback\":{\"enableDebugOutputWindow\":")
+    ShellPostToWebUi(std::string("{\"type\":\"settings.changed\",\"playback\":{\"enableDebugOutputWindow\":")
         + (enabled ? "true" : "false") + "}}");
+}
+
+// 把壳侧实现注入引擎钩子（架构评估 B1）。壳在 wWinMain 顶部调用一次。
+// 合并语义：SetUiBridgeHooks 只覆盖非空成员，所以壳的另一半（热键日志，
+// 定义在 qst_webview_shell.cpp）可以在同一启动序列里独立注册，互不覆盖。
+void InstallBridgeUiHooks() {
+    qst::engine::UiBridgeHooks hooks;
+    hooks.postToWebUi = [](std::string jsonUtf8) {
+        ShellPostToWebUi(std::move(jsonUtf8));
+    };
+    hooks.notifyWebDebugWindowSetting = [](bool enabled) {
+        ShellNotifyWebDebugWindowSetting(enabled);
+    };
+    hooks.syncHomeSelectionCache =
+        [](const std::wstring& a, const std::wstring& b, int c) {
+            ShellSyncHomeSelectionCache(a, b, c);
+        };
+    qst::engine::SetUiBridgeHooks(std::move(hooks));
 }
 
 void PersistFloatBallPlacement(bool docked, int edge, double xRatio, double yRatio,
@@ -496,7 +427,7 @@ void PersistShowFloatBall(bool show) {
         g_ctx.settings.other.showFloatBall = show;
         SaveAppSettings(g_ctx.settings);
     }
-    PostToWebUi(std::string("{\"type\":\"settings.changed\",\"other\":{\"showFloatBall\":")
+    ShellPostToWebUi(std::string("{\"type\":\"settings.changed\",\"other\":{\"showFloatBall\":")
         + (show ? "true" : "false") + "}}");
 }
 
@@ -770,6 +701,13 @@ std::string JsonAppBranding() {
 }
 
 bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err) {
+    // 诊断（架构评估验收 A2）：下面 ~100 个 `if (GetX(...))` 在 payload 非法时
+    // **全部**为假 → 各字段保持从磁盘加载的旧值 → 末尾 SaveAppSettings 把旧值写回
+    // → 返回 true → UI 提示「保存成功」。用户视角是「改设置提示成功但全部回滚」，
+    // 且外部完全看不出原因。这里做**一次**前置校验把根因报出来。
+    if (!qst::jsonutil::IsParseableObject(settingsObjJson)) {
+        qst::jsonutil::NoteParseFailure("ApplySaveSettingsJson.payload", settingsObjJson);
+    }
     EnsureSettingsLoaded();
     std::lock_guard<std::mutex> lock(g_mu);
     TryLoadAppSettings(g_ctx.settings);
@@ -777,138 +715,138 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
     bool b = false;
     int i = 0;
     double d = 0;
-    if (JsonGetBool(settingsObjJson, "enableRandomInterval", b)) s.click.enableRandomInterval = b;
-    if (JsonGetNumber(settingsObjJson, "randomIntervalMaxSeconds", d)) s.click.randomIntervalMaxSeconds = d;
-    if (JsonGetBool(settingsObjJson, "enablePressReleaseInterval", b)) s.click.enablePressReleaseInterval = b;
-    if (JsonGetNumber(settingsObjJson, "pressReleaseIntervalSeconds", d)) s.click.pressReleaseIntervalSeconds = d;
-    if (JsonGetBool(settingsObjJson, "enableCoordinateJitter", b)) s.click.enableCoordinateJitter = b;
-    if (JsonGetInt(settingsObjJson, "jitterX", i)) s.click.jitterX = i;
-    if (JsonGetInt(settingsObjJson, "jitterY", i)) s.click.jitterY = i;
-    if (JsonGetBool(settingsObjJson, "enableFixedCoordinates", b)) s.click.enableFixedCoordinates = b;
-    if (JsonGetInt(settingsObjJson, "fixedX", i)) s.click.fixedX = i;
-    if (JsonGetInt(settingsObjJson, "fixedY", i)) s.click.fixedY = i;
-    if (JsonGetBool(settingsObjJson, "enableClickCountLimit", b)) s.click.enableClickCountLimit = b;
-    if (JsonGetInt(settingsObjJson, "clickCountLimit", i)) s.click.clickCountLimit = i;
-    if (JsonGetInt(settingsObjJson, "themeId", i)) s.other.themeId = i;
-    if (JsonGetBool(settingsObjJson, "useCustomTheme", b)) s.other.useCustomTheme = b;
-    if (JsonGetInt(settingsObjJson, "customMainColor", i)) s.other.customMainColor = i;
-    if (JsonGetInt(settingsObjJson, "customAccentColor", i)) s.other.customAccentColor = i;
-    if (JsonGetBool(settingsObjJson, "preferDirect2D", b)) s.other.preferDirect2D = b;
-    if (JsonGetNumber(settingsObjJson, "holdThresholdSeconds", d))
+    if (GetBool(settingsObjJson, "enableRandomInterval", b)) s.click.enableRandomInterval = b;
+    if (GetNumber(settingsObjJson, "randomIntervalMaxSeconds", d)) s.click.randomIntervalMaxSeconds = d;
+    if (GetBool(settingsObjJson, "enablePressReleaseInterval", b)) s.click.enablePressReleaseInterval = b;
+    if (GetNumber(settingsObjJson, "pressReleaseIntervalSeconds", d)) s.click.pressReleaseIntervalSeconds = d;
+    if (GetBool(settingsObjJson, "enableCoordinateJitter", b)) s.click.enableCoordinateJitter = b;
+    if (GetInt(settingsObjJson, "jitterX", i)) s.click.jitterX = i;
+    if (GetInt(settingsObjJson, "jitterY", i)) s.click.jitterY = i;
+    if (GetBool(settingsObjJson, "enableFixedCoordinates", b)) s.click.enableFixedCoordinates = b;
+    if (GetInt(settingsObjJson, "fixedX", i)) s.click.fixedX = i;
+    if (GetInt(settingsObjJson, "fixedY", i)) s.click.fixedY = i;
+    if (GetBool(settingsObjJson, "enableClickCountLimit", b)) s.click.enableClickCountLimit = b;
+    if (GetInt(settingsObjJson, "clickCountLimit", i)) s.click.clickCountLimit = i;
+    if (GetInt(settingsObjJson, "themeId", i)) s.other.themeId = i;
+    if (GetBool(settingsObjJson, "useCustomTheme", b)) s.other.useCustomTheme = b;
+    if (GetInt(settingsObjJson, "customMainColor", i)) s.other.customMainColor = i;
+    if (GetInt(settingsObjJson, "customAccentColor", i)) s.other.customAccentColor = i;
+    if (GetBool(settingsObjJson, "preferDirect2D", b)) s.other.preferDirect2D = b;
+    if (GetNumber(settingsObjJson, "holdThresholdSeconds", d))
         s.other.holdThresholdSeconds = NormalizeHoldThresholdSeconds(d);
-    if (JsonGetNumber(settingsObjJson, "uiScaleFactor", d))
+    if (GetNumber(settingsObjJson, "uiScaleFactor", d))
         s.other.uiScaleFactor = quickscript::NormalizeUiScaleFactor(d);
     // 缺键不得写成 false：独立助手窗 collectSettings 没有 #setAutoHide 等控件。
-    if (JsonGetBool(settingsObjJson, "autoHideMainWindow", b)) s.other.autoHideMainWindow = b;
-    if (JsonGetBool(settingsObjJson, "playSoundOnStart", b)) s.other.playSoundOnStart = b;
-    if (JsonGetBool(settingsObjJson, "playSoundOnEnd", b)) s.other.playSoundOnEnd = b;
-    if (JsonGetBool(settingsObjJson, "hideBottomRightTip", b)) s.other.hideBottomRightTip = b;
-    if (JsonGetBool(settingsObjJson, "closeToTray", b)) s.other.closeToTray = b;
-    if (JsonGetBool(settingsObjJson, "autoStartOnBoot", b)) s.other.autoStartOnBoot = b;
-    if (JsonGetBool(settingsObjJson, "resolveImeConflict", b)) s.other.resolveImeConflict = b;
-    if (JsonGetBool(settingsObjJson, "showFloatBall", b)) s.other.showFloatBall = b;
-    if (JsonGetBool(settingsObjJson, "floatBallDocked", b)) s.other.floatBallDocked = b;
-    if (JsonGetInt(settingsObjJson, "floatBallEdge", i)) {
+    if (GetBool(settingsObjJson, "autoHideMainWindow", b)) s.other.autoHideMainWindow = b;
+    if (GetBool(settingsObjJson, "playSoundOnStart", b)) s.other.playSoundOnStart = b;
+    if (GetBool(settingsObjJson, "playSoundOnEnd", b)) s.other.playSoundOnEnd = b;
+    if (GetBool(settingsObjJson, "hideBottomRightTip", b)) s.other.hideBottomRightTip = b;
+    if (GetBool(settingsObjJson, "closeToTray", b)) s.other.closeToTray = b;
+    if (GetBool(settingsObjJson, "autoStartOnBoot", b)) s.other.autoStartOnBoot = b;
+    if (GetBool(settingsObjJson, "resolveImeConflict", b)) s.other.resolveImeConflict = b;
+    if (GetBool(settingsObjJson, "showFloatBall", b)) s.other.showFloatBall = b;
+    if (GetBool(settingsObjJson, "floatBallDocked", b)) s.other.floatBallDocked = b;
+    if (GetInt(settingsObjJson, "floatBallEdge", i)) {
         if (i < 0 || i > 3) i = 1;
         s.other.floatBallEdge = i;
     }
-    if (JsonGetNumber(settingsObjJson, "floatBallXRatio", d)) {
+    if (GetNumber(settingsObjJson, "floatBallXRatio", d)) {
         s.other.floatBallXRatio = d;
         if (!(s.other.floatBallXRatio >= 0.0)) s.other.floatBallXRatio = 0.0;
         if (s.other.floatBallXRatio > 1.0) s.other.floatBallXRatio = 1.0;
     }
-    if (JsonGetNumber(settingsObjJson, "floatBallYRatio", d)) {
+    if (GetNumber(settingsObjJson, "floatBallYRatio", d)) {
         s.other.floatBallYRatio = d;
         if (!(s.other.floatBallYRatio >= 0.0)) s.other.floatBallYRatio = 0.0;
         if (s.other.floatBallYRatio > 1.0) s.other.floatBallYRatio = 1.0;
     }
-    if (JsonGetBool(settingsObjJson, "visualLoopWrap", b)) s.other.visualLoopWrap = b;
-    if (JsonGetBool(settingsObjJson, "visualBlockCallWires", b)) s.other.visualBlockCallWires = b;
-    if (JsonGetBool(settingsObjJson, "visualIfWrap", b)) s.other.visualIfWrap = b;
-    if (JsonGetBool(settingsObjJson, "visualBlockWrap", b)) s.other.visualBlockWrap = b;
-    if (JsonGetBool(settingsObjJson, "visualWatchWrap", b)) s.other.visualWatchWrap = b;
-    if (JsonGetBool(settingsObjJson, "visualJumpWires", b)) s.other.visualJumpWires = b;
-    if (JsonGetBool(settingsObjJson, "visualShowGrid", b)) s.other.visualShowGrid = b;
-    if (JsonGetBool(settingsObjJson, "visualShowCardId", b)) s.other.visualShowCardId = b;
-    JsonGetStringArray(settingsObjJson, "editorActionOrder", s.other.editorActionOrder);
-    JsonGetStringArray(settingsObjJson, "editorHiddenActions", s.other.editorHiddenActions);
-    JsonGetStringArray(settingsObjJson, "editorCustomActionOrder", s.other.editorCustomActionOrder);
-    JsonGetStringArray(settingsObjJson, "editorCustomHiddenActions", s.other.editorCustomHiddenActions);
-    if (JsonGetBool(settingsObjJson, "editorSearchAllActions", b))
+    if (GetBool(settingsObjJson, "visualLoopWrap", b)) s.other.visualLoopWrap = b;
+    if (GetBool(settingsObjJson, "visualBlockCallWires", b)) s.other.visualBlockCallWires = b;
+    if (GetBool(settingsObjJson, "visualIfWrap", b)) s.other.visualIfWrap = b;
+    if (GetBool(settingsObjJson, "visualBlockWrap", b)) s.other.visualBlockWrap = b;
+    if (GetBool(settingsObjJson, "visualWatchWrap", b)) s.other.visualWatchWrap = b;
+    if (GetBool(settingsObjJson, "visualJumpWires", b)) s.other.visualJumpWires = b;
+    if (GetBool(settingsObjJson, "visualShowGrid", b)) s.other.visualShowGrid = b;
+    if (GetBool(settingsObjJson, "visualShowCardId", b)) s.other.visualShowCardId = b;
+    GetActionTokenArray(settingsObjJson, "editorActionOrder", s.other.editorActionOrder);
+    GetActionTokenArray(settingsObjJson, "editorHiddenActions", s.other.editorHiddenActions);
+    GetActionTokenArray(settingsObjJson, "editorCustomActionOrder", s.other.editorCustomActionOrder);
+    GetActionTokenArray(settingsObjJson, "editorCustomHiddenActions", s.other.editorCustomHiddenActions);
+    if (GetBool(settingsObjJson, "editorSearchAllActions", b))
         s.other.editorSearchAllActions = b;
-    if (JsonGetBool(settingsObjJson, "editorHideFixedVars", b))
+    if (GetBool(settingsObjJson, "editorHideFixedVars", b))
         s.other.editorHideFixedVars = b;
-    if (JsonGetBool(settingsObjJson, "editorHideCoordVars", b))
+    if (GetBool(settingsObjJson, "editorHideCoordVars", b))
         s.other.editorHideCoordVars = b;
-    if (JsonGetBool(settingsObjJson, "editorMultiResultPlaceholderOnly", b))
+    if (GetBool(settingsObjJson, "editorMultiResultPlaceholderOnly", b))
         s.other.editorMultiResultPlaceholderOnly = b;
-    if (JsonGetBool(settingsObjJson, "editorDisableModifyButton", b))
+    if (GetBool(settingsObjJson, "editorDisableModifyButton", b))
         s.other.editorDisableModifyButton = b;
-    if (JsonGetBool(settingsObjJson, "editorAutoSaveOnExit", b))
+    if (GetBool(settingsObjJson, "editorAutoSaveOnExit", b))
         s.other.editorAutoSaveOnExit = b;
-    if (JsonGetBool(settingsObjJson, "editorEnableBatchInsert", b))
+    if (GetBool(settingsObjJson, "editorEnableBatchInsert", b))
         s.other.editorEnableBatchInsert = b;
-    if (JsonGetBool(settingsObjJson, "showPreviewThumbnail", b)) s.windowMode.showPreviewThumbnail = b;
-    if (JsonGetInt(settingsObjJson, "previewRefreshMs", i)) {
+    if (GetBool(settingsObjJson, "showPreviewThumbnail", b)) s.windowMode.showPreviewThumbnail = b;
+    if (GetInt(settingsObjJson, "previewRefreshMs", i)) {
         s.windowMode.previewRefreshMs = std::clamp(i, 200, 5000);
     }
-    if (JsonGetBool(settingsObjJson, "blockRunWhenUnhealthy", b)) s.windowMode.blockRunWhenUnhealthy = b;
-    if (JsonGetBool(settingsObjJson, "allowForegroundInputFallback", b))
+    if (GetBool(settingsObjJson, "blockRunWhenUnhealthy", b)) s.windowMode.blockRunWhenUnhealthy = b;
+    if (GetBool(settingsObjJson, "allowForegroundInputFallback", b))
         s.windowMode.allowForegroundInputFallback = b;
-    if (JsonGetBool(settingsObjJson, "enableFakeFocusInjection", b))
+    if (GetBool(settingsObjJson, "enableFakeFocusInjection", b))
         s.windowMode.enableFakeFocusInjection = b;
-    if (JsonGetInt(settingsObjJson, "injectionTechnique", i)) {
+    if (GetInt(settingsObjJson, "injectionTechnique", i)) {
         s.windowMode.injectionTechnique = std::clamp(i, 0, 10);
     }
-    if (JsonGetBool(settingsObjJson, "hideInjectedModule", b))
+    if (GetBool(settingsObjJson, "hideInjectedModule", b))
         s.windowMode.hideInjectedModule = b;
-    if (JsonGetBool(settingsObjJson, "aiEnabled", b)) s.ai.enabled = b;
-    if (JsonGetBool(settingsObjJson, "enabled", b) && settingsObjJson.find("\"ai\"") != std::string::npos) {
+    if (GetBool(settingsObjJson, "aiEnabled", b)) s.ai.enabled = b;
+    if (GetBool(settingsObjJson, "enabled", b) && settingsObjJson.find("\"ai\"") != std::string::npos) {
         // prefer nested via flat keys from collectSettings
     }
     // playback (flat keys from collectSettings)
-    if (JsonGetBool(settingsObjJson, "enablePlaybackCount", b)) s.playback.enablePlaybackCount = b;
-    if (JsonGetInt(settingsObjJson, "playbackCount", i)) s.playback.playbackCount = (std::max)(0, i);
-    if (JsonGetBool(settingsObjJson, "enablePlaybackInterval", b)) s.playback.enablePlaybackInterval = b;
-    if (JsonGetNumber(settingsObjJson, "playbackIntervalMinSeconds", d))
+    if (GetBool(settingsObjJson, "enablePlaybackCount", b)) s.playback.enablePlaybackCount = b;
+    if (GetInt(settingsObjJson, "playbackCount", i)) s.playback.playbackCount = (std::max)(0, i);
+    if (GetBool(settingsObjJson, "enablePlaybackInterval", b)) s.playback.enablePlaybackInterval = b;
+    if (GetNumber(settingsObjJson, "playbackIntervalMinSeconds", d))
         s.playback.playbackIntervalMinSeconds = d;
-    if (JsonGetNumber(settingsObjJson, "playbackIntervalMaxSeconds", d))
+    if (GetNumber(settingsObjJson, "playbackIntervalMaxSeconds", d))
         s.playback.playbackIntervalMaxSeconds = d;
-    if (JsonGetBool(settingsObjJson, "enableDebugOutputWindow", b)) s.playback.enableDebugOutputWindow = b;
-    if (JsonGetBool(settingsObjJson, "autoOutputKeyFunctionDebug", b))
+    if (GetBool(settingsObjJson, "enableDebugOutputWindow", b)) s.playback.enableDebugOutputWindow = b;
+    if (GetBool(settingsObjJson, "autoOutputKeyFunctionDebug", b))
         s.playback.autoOutputKeyFunctionDebug = b;
-    if (JsonGetBool(settingsObjJson, "recordingClickCaptureEnabled", b))
+    if (GetBool(settingsObjJson, "recordingClickCaptureEnabled", b))
         s.playback.recordingClickCaptureEnabled = b;
-    if (JsonGetInt(settingsObjJson, "recordingClickCaptureHalfSize", i)) {
+    if (GetInt(settingsObjJson, "recordingClickCaptureHalfSize", i)) {
         if (i < 16) i = 16;
         if (i > 120) i = 120;
         s.playback.recordingClickCaptureHalfSize = i;
     }
-    if (JsonGetBool(settingsObjJson, "enablePlaybackSpeed", b))
+    if (GetBool(settingsObjJson, "enablePlaybackSpeed", b))
         s.playback.enablePlaybackSpeed = b;
-    if (JsonGetNumber(settingsObjJson, "playbackSpeed", d))
+    if (GetNumber(settingsObjJson, "playbackSpeed", d))
         s.playback.playbackSpeed = quickscript::ClampPlaybackSpeed(d);
-    if (JsonGetInt(settingsObjJson, "foregroundInputBackend", i)) {
+    if (GetInt(settingsObjJson, "foregroundInputBackend", i)) {
         s.playback.foregroundInputBackend = quickscript::ClampForegroundInputBackend(i);
         s.playback.enableHidDriverSimulation =
             s.playback.foregroundInputBackend != quickscript::ForegroundInputBackend::Software;
-    } else if (JsonGetBool(settingsObjJson, "enableHidDriverSimulation", b)) {
+    } else if (GetBool(settingsObjJson, "enableHidDriverSimulation", b)) {
         s.playback.enableHidDriverSimulation = b;
         s.playback.foregroundInputBackend = b
             ? quickscript::ForegroundInputBackend::Interception
             : quickscript::ForegroundInputBackend::Software;
     }
-    if (JsonGetInt(settingsObjJson, "scheduledTaskConflictPolicy", i)) {
+    if (GetInt(settingsObjJson, "scheduledTaskConflictPolicy", i)) {
         s.playback.scheduledTaskConflictPolicy = static_cast<int>(
             ClampScheduledTaskConflictPolicy(i));
     }
-    if (JsonGetBool(settingsObjJson, "scheduledTaskAutoResume", b))
+    if (GetBool(settingsObjJson, "scheduledTaskAutoResume", b))
         s.playback.scheduledTaskAutoResume = b;
-    if (JsonGetBool(settingsObjJson, "lowPerformanceMode", b))
+    if (GetBool(settingsObjJson, "lowPerformanceMode", b))
         s.playback.lowPerformanceMode = b;
-    if (JsonGetBool(settingsObjJson, "findImageGpuAccel", b))
+    if (GetBool(settingsObjJson, "findImageGpuAccel", b))
         s.playback.findImageGpuAccel = b;
-    if (JsonGetBool(settingsObjJson, "aiFastPaths", b))
+    if (GetBool(settingsObjJson, "aiFastPaths", b))
         s.playback.aiFastPaths = b;
     {
         auto getStr = [](const std::string& json, const char* key, std::string& out) -> bool {
@@ -958,9 +896,9 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
         // 空字符串不覆盖已有密钥：助手窗 collectSettings 时 DOM 可能未填，避免把主设置里的 key 冲掉
         if (getTopStr("apiKey", str) && !str.empty()) s.ai.apiKey = FromUtf8(str);
         if (getTopStr("modelName", str) && !str.empty()) s.ai.modelName = FromUtf8(str);
-        if (JsonGetBool(settingsObjJson, "aiEnabled", b)) s.ai.enabled = b;
-        if (JsonGetNumber(settingsObjJson, "temperature", d)) s.ai.temperature = d;
-        if (JsonGetInt(settingsObjJson, "maxTokens", i)) s.ai.maxTokens = i;
+        if (GetBool(settingsObjJson, "aiEnabled", b)) s.ai.enabled = b;
+        if (GetNumber(settingsObjJson, "temperature", d)) s.ai.temperature = d;
+        if (GetInt(settingsObjJson, "maxTokens", i)) s.ai.maxTokens = i;
         if (getTopStr("selectedScriptPath", str))
             s.home.selectedScriptPath = FromUtf8(str);
         if (getTopStr("selectedRecordingPath", str))
@@ -1002,8 +940,8 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
                         if (getStr(obj, "modelName", v)) m.modelName = FromUtf8(v);
                         double td = 0;
                         int ti = 0;
-                        if (JsonGetNumber(obj, "temperature", td)) m.temperature = td;
-                        if (JsonGetInt(obj, "maxTokens", ti)) m.maxTokens = ti;
+                        if (GetNumber(obj, "temperature", td)) m.temperature = td;
+                        if (GetInt(obj, "maxTokens", ti)) m.maxTokens = ti;
                         if (!m.modelName.empty() || !m.apiUrl.empty()) parsedModels.push_back(m);
                         pos = oe + 1;
                     }
@@ -1011,7 +949,7 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
             }
             const bool explicitClear =
                 settingsObjJson.find("\"savedModelsClear\"") != std::string::npos
-                && JsonGetBool(settingsObjJson, "savedModelsClear", b) && b;
+                && GetBool(settingsObjJson, "savedModelsClear", b) && b;
             if (!parsedModels.empty() || explicitClear) {
                 s.ai.savedModels = std::move(parsedModels);
             }
@@ -1035,38 +973,38 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
             if (hit->maxTokens > 0) s.ai.maxTokens = hit->maxTokens;
         }
     }
-    if (JsonGetInt(settingsObjJson, "clickerButton", i)) {
+    if (GetInt(settingsObjJson, "clickerButton", i)) {
         s.home.clickerButton = std::clamp(i, 0, 2);
         g_ctx.clicker.button = static_cast<quickscript::MouseButtonChoice>(s.home.clickerButton);
     }
-    if (JsonGetInt(settingsObjJson, "clickerIntervalMode", i)) {
+    if (GetInt(settingsObjJson, "clickerIntervalMode", i)) {
         s.home.clickerIntervalMode = std::clamp(i, 0, 2);
         g_ctx.clicker.intervalMode = static_cast<quickscript::ClickIntervalMode>(s.home.clickerIntervalMode);
     }
-    if (JsonGetNumber(settingsObjJson, "clickerCustomInterval", d)) {
+    if (GetNumber(settingsObjJson, "clickerCustomInterval", d)) {
         s.home.clickerCustomInterval = d;
         g_ctx.clicker.customIntervalSeconds = d;
     }
-    if (JsonGetInt(settingsObjJson, "recorderCaptureScope", i)) {
+    if (GetInt(settingsObjJson, "recorderCaptureScope", i)) {
         // 产品已去掉「当前窗口」入口，一律全局捕获
         s.home.recorderCaptureScope = 1;
     }
-    if (JsonGetInt(settingsObjJson, "recorderInputMode", i)) {
+    if (GetInt(settingsObjJson, "recorderInputMode", i)) {
         s.home.recorderInputMode = std::clamp(i, 0, 3);
     }
-    if (JsonGetInt(settingsObjJson, "recorderWindowMode", i)) {
+    if (GetInt(settingsObjJson, "recorderWindowMode", i)) {
         s.home.recorderWindowMode = i != 0 ? 1 : 0;
     }
-    if (JsonGetInt(settingsObjJson, "activeTab", i)) {
+    if (GetInt(settingsObjJson, "activeTab", i)) {
         s.home.activeTab = std::clamp(i, 0, 3);
     }
-    if (JsonGetInt(settingsObjJson, "clickerScrollOffset", i))
+    if (GetInt(settingsObjJson, "clickerScrollOffset", i))
         s.home.clickerScrollOffset = (std::max)(0, i);
-    if (JsonGetInt(settingsObjJson, "macroScrollOffset", i))
+    if (GetInt(settingsObjJson, "macroScrollOffset", i))
         s.home.macroScrollOffset = (std::max)(0, i);
-    if (JsonGetInt(settingsObjJson, "recorderScrollOffset", i))
+    if (GetInt(settingsObjJson, "recorderScrollOffset", i))
         s.home.recorderScrollOffset = (std::max)(0, i);
-    if (JsonGetInt(settingsObjJson, "scriptCustomScrollOffset", i))
+    if (GetInt(settingsObjJson, "scriptCustomScrollOffset", i))
         s.home.scriptCustomScrollOffset = (std::max)(0, i);
     if (!SaveAppSettings(s)) {
         err = "SaveAppSettings failed";
@@ -1108,15 +1046,15 @@ bool StartClickerFromOpts(const std::string& msgJson, std::string& err) {
         TryLoadAppSettings(g_ctx.settings);
         int i = 0;
         double d = 0;
-        if (JsonGetInt(msgJson, "button", i)) {
+        if (GetInt(msgJson, "button", i)) {
             g_ctx.settings.home.clickerButton = std::clamp(i, 0, 2);
             g_ctx.clicker.button = static_cast<quickscript::MouseButtonChoice>(g_ctx.settings.home.clickerButton);
         }
-        if (JsonGetInt(msgJson, "intervalMode", i)) {
+        if (GetInt(msgJson, "intervalMode", i)) {
             g_ctx.settings.home.clickerIntervalMode = std::clamp(i, 0, 2);
             g_ctx.clicker.intervalMode = static_cast<quickscript::ClickIntervalMode>(g_ctx.settings.home.clickerIntervalMode);
         }
-        if (JsonGetNumber(msgJson, "customInterval", d)) {
+        if (GetNumber(msgJson, "customInterval", d)) {
             g_ctx.settings.home.clickerCustomInterval = d;
             g_ctx.clicker.customIntervalSeconds = d;
         }
@@ -1480,7 +1418,7 @@ bool ParseDebugScriptJson(const std::string& msgJson, std::vector<ScriptAction>&
         }
     }
     stepMode = (mode == "step");
-    JsonGetInt(msgJson, "startIndex", startIndex);
+    GetInt(msgJson, "startIndex", startIndex);
     if (startIndex < 0 || startIndex >= static_cast<int>(actions.size())) {
         err = "调试起点超出动作列表";
         return false;
@@ -1506,8 +1444,8 @@ bool ParseDebugScriptJson(const std::string& msgJson, std::vector<ScriptAction>&
     }
 
     int vk = 0, mods = 0;
-    JsonGetInt(msgJson, "hotkeyVk", vk);
-    JsonGetInt(msgJson, "hotkeyModifiers", mods);
+    GetInt(msgJson, "hotkeyVk", vk);
+    GetInt(msgJson, "hotkeyModifiers", mods);
     debugHotkey.vk = static_cast<UINT>(vk);
     debugHotkey.modifiers = static_cast<UINT>(mods);
 
@@ -1526,7 +1464,7 @@ bool ParseDebugScriptJson(const std::string& msgJson, std::vector<ScriptAction>&
             }
         }
         int editorMode = -1;
-        JsonGetInt(msgJson, "editorMode", editorMode);
+        GetInt(msgJson, "editorMode", editorMode);
         if (editorMode == 0) {
             wmCfg.enabled = false;
             wmCfg.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
@@ -2350,7 +2288,7 @@ void RequestAiConversationTitleAsync(AgentConfig cfg, std::wstring id,
             if (g_agent.id == id) g_agent.name = title;
         }
         SetAgentConversationName(id, title);
-        PostToWebUi(std::string("{\"type\":\"agentConversation.title\",\"ok\":true,\"id\":\"")
+        ShellPostToWebUi(std::string("{\"type\":\"agentConversation.title\",\"ok\":true,\"id\":\"")
             + EscapeJson(ToUtf8(id)) + "\",\"name\":\"" + EscapeJson(ToUtf8(title))
             + "\",\"conversations\":" + JsonListAgentConversations() + "}");
     }).detach();
@@ -2544,55 +2482,15 @@ bool RevertAgentChangeById(const std::string& idUtf8, std::string& err) {
 
 namespace {
 
-bool JsonGetStringField(const std::string& json, const char* key, std::string& out) {
-    const std::string pat = std::string("\"") + key + "\"";
-    const auto k = json.find(pat);
-    if (k == std::string::npos) return false;
-    const auto colon = json.find(':', k + pat.size());
-    if (colon == std::string::npos) return false;
-    const auto q1 = json.find('"', colon + 1);
-    if (q1 == std::string::npos) return false;
-    std::string val;
-    for (size_t i = q1 + 1; i < json.size(); ++i) {
-        if (json[i] == '\\' && i + 1 < json.size()) { val.push_back(json[i + 1]); ++i; continue; }
-        if (json[i] == '"') { out = val; return true; }
-        val.push_back(json[i]);
-    }
-    return false;
-}
-
-std::vector<std::string> JsonGetStringArray(const std::string& json, const char* key) {
-    std::vector<std::string> out;
-    const std::string pat = std::string("\"") + key + "\"";
-    const auto k = json.find(pat);
-    if (k == std::string::npos) return out;
-    const auto lb = json.find('[', k + pat.size());
-    if (lb == std::string::npos) return out;
-    size_t i = lb + 1;
-    while (i < json.size()) {
-        while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r' || json[i] == ',')) ++i;
-        if (i >= json.size() || json[i] == ']') break;
-        if (json[i] != '"') break;
-        ++i;
-        std::string val;
-        for (; i < json.size(); ++i) {
-            if (json[i] == '\\' && i + 1 < json.size()) { val.push_back(json[i + 1]); ++i; continue; }
-            if (json[i] == '"') { out.push_back(val); ++i; break; }
-            val.push_back(json[i]);
-        }
-    }
-    return out;
-}
-
 }  // namespace
 
 bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
     std::string textUtf8, idUtf8, modelUtf8, panelKeyUtf8;
     int rewindUserIndex = -1;
-    JsonGetStringField(msgJson, "text", textUtf8);
-    JsonGetStringField(msgJson, "id", idUtf8);
-    JsonGetStringField(msgJson, "model", modelUtf8);
-    JsonGetStringField(msgJson, "panelKey", panelKeyUtf8);
+    GetStringField(msgJson, "text", textUtf8);
+    GetStringField(msgJson, "id", idUtf8);
+    GetStringField(msgJson, "model", modelUtf8);
+    GetStringField(msgJson, "panelKey", panelKeyUtf8);
     {
         const std::string pat = "\"rewindUserIndex\"";
         const auto k = msgJson.find(pat);
@@ -2615,7 +2513,7 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
         }
     }
     if (textUtf8.empty()) {
-        const auto paths = JsonGetStringArray(msgJson, "attachments");
+        const auto paths = GetStringArray(msgJson, "attachments");
         if (paths.empty()) {
             err = "empty text";
             return false;
@@ -2643,7 +2541,7 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
     }
 
     std::vector<AgentPendingAttachment> attachments;
-    for (const auto& pathUtf8 : JsonGetStringArray(msgJson, "attachments")) {
+    for (const auto& pathUtf8 : GetStringArray(msgJson, "attachments")) {
         if (pathUtf8.empty()) continue;
         AgentPendingAttachment item;
         std::wstring loadErr;
@@ -2747,24 +2645,24 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
         callbacks.cancelFlag = cancel.get();
         callbacks.httpAbort = &g_agent.httpAbort;
         callbacks.onContentDelta = [idJson, panelJson](const std::wstring& delta) {
-            PostToWebUi(std::string("{\"type\":\"sendAgentMessage.delta\",\"ok\":true,")
+            ShellPostToWebUi(std::string("{\"type\":\"sendAgentMessage.delta\",\"ok\":true,")
                 + idJson() + panelJson() + ",\"delta\":\"" + EscapeJson(ToUtf8(delta)) + "\"}");
         };
         callbacks.onStatus = [idJson, panelJson](const std::wstring& status) {
-            PostToWebUi(std::string("{\"type\":\"sendAgentMessage.status\",\"ok\":true,")
+            ShellPostToWebUi(std::string("{\"type\":\"sendAgentMessage.status\",\"ok\":true,")
                 + idJson() + panelJson() + ",\"status\":\"" + EscapeJson(ToUtf8(status)) + "\"}");
         };
         callbacks.onToolCall = [idJson, panelJson](const std::wstring& name, const std::wstring& args) {
-            PostToWebUi(std::string("{\"type\":\"sendAgentMessage.tool\",\"ok\":true,")
+            ShellPostToWebUi(std::string("{\"type\":\"sendAgentMessage.tool\",\"ok\":true,")
                 + idJson() + panelJson() + ",\"name\":\"" + EscapeJson(ToUtf8(name))
                 + "\",\"args\":\"" + EscapeJson(ToUtf8(args)) + "\"}");
         };
         callbacks.onReasoningDelta = [idJson, panelJson](const std::wstring& delta) {
-            PostToWebUi(std::string("{\"type\":\"sendAgentMessage.reasoningDelta\",\"ok\":true,")
+            ShellPostToWebUi(std::string("{\"type\":\"sendAgentMessage.reasoningDelta\",\"ok\":true,")
                 + idJson() + panelJson() + ",\"delta\":\"" + EscapeJson(ToUtf8(delta)) + "\"}");
         };
         callbacks.onReasoning = [idJson, panelJson](const std::wstring& reasoning) {
-            PostToWebUi(std::string("{\"type\":\"sendAgentMessage.reasoning\",\"ok\":true,")
+            ShellPostToWebUi(std::string("{\"type\":\"sendAgentMessage.reasoning\",\"ok\":true,")
                 + idJson() + panelJson() + ",\"reasoning\":\"" + EscapeJson(ToUtf8(reasoning)) + "\"}");
         };
 
@@ -2817,7 +2715,7 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
             << "\"conversations\":" << JsonListAgentConversations() << ","
             << "\"scripts\":" << JsonListScripts() << ","
             << "\"recordings\":" << JsonListRecordings() << "}";
-        PostToWebUi(oss.str());
+        ShellPostToWebUi(oss.str());
         if (requestTitle)
             RequestAiConversationTitleAsync(std::move(titleCfg), std::move(titleId),
                 std::move(titleUser), std::move(titleReply));
@@ -3175,7 +3073,7 @@ bool SaveScheduledTaskFromJson(const std::string& msgJson, bool isUpdate, std::s
 
     // 列表点状态：只改启用/禁用，不重写时间/路径，也不清 customFired。
     int statusOnly = 0;
-    JsonGetInt(msgJson, "statusOnly", statusOnly);
+    GetInt(msgJson, "statusOnly", statusOnly);
     if (isUpdate && statusOnly != 0) {
         if (idUtf8.empty()) {
             err = "缺少任务 ID";
@@ -3191,7 +3089,7 @@ bool SaveScheduledTaskFromJson(const std::string& msgJson, bool isUpdate, std::s
             return false;
         }
         int status = static_cast<int>(target->status);
-        JsonGetInt(msgJson, "status", status);
+        GetInt(msgJson, "status", status);
         target->status = (status == 0)
             ? ScheduledTaskStatus::Enabled
             : ScheduledTaskStatus::Disabled;
@@ -3204,17 +3102,17 @@ bool SaveScheduledTaskFromJson(const std::string& msgJson, bool isUpdate, std::s
     if (pathUtf8.empty()) getStr(msgJson, "targetFile", pathUtf8);
     int kind = 1, freq = 1, status = 0, weekDays = 0;
     int year = 0, month = 0, day = 0, hour = 9, minute = 0, second = 0, millisecond = 0;
-    JsonGetInt(msgJson, "kind", kind);
-    JsonGetInt(msgJson, "frequency", freq);
-    JsonGetInt(msgJson, "status", status);
-    JsonGetInt(msgJson, "weekDays", weekDays);
-    JsonGetInt(msgJson, "year", year);
-    JsonGetInt(msgJson, "month", month);
-    JsonGetInt(msgJson, "day", day);
-    JsonGetInt(msgJson, "hour", hour);
-    JsonGetInt(msgJson, "minute", minute);
-    const bool hasSecond = JsonGetInt(msgJson, "second", second);
-    const bool hasMillisecond = JsonGetInt(msgJson, "millisecond", millisecond);
+    GetInt(msgJson, "kind", kind);
+    GetInt(msgJson, "frequency", freq);
+    GetInt(msgJson, "status", status);
+    GetInt(msgJson, "weekDays", weekDays);
+    GetInt(msgJson, "year", year);
+    GetInt(msgJson, "month", month);
+    GetInt(msgJson, "day", day);
+    GetInt(msgJson, "hour", hour);
+    GetInt(msgJson, "minute", minute);
+    const bool hasSecond = GetInt(msgJson, "second", second);
+    const bool hasMillisecond = GetInt(msgJson, "millisecond", millisecond);
 
     if (pathUtf8.empty()) {
         err = "缺少脚本文件路径";
@@ -3398,9 +3296,9 @@ bool WaitMatchesFilterOp(int filterOp, double duration, double compareValue) {
 
 int ParseWaitFilterOp(const std::string& msgJson) {
     int op = 0;
-    if (JsonGetInt(msgJson, "waitFilter", op)) return std::clamp(op, 0, 6);
+    if (GetInt(msgJson, "waitFilter", op)) return std::clamp(op, 0, 6);
     std::string label;
-    if (!JsonGetStringField(msgJson, "waitFilter", label)) return 0;
+    if (!GetStringField(msgJson, "waitFilter", label)) return 0;
     static const char* kLabels[] = {
         "全部", "小于", "小于等于", "大于", "大于等于", "等于", "不等于"
     };
@@ -3429,12 +3327,12 @@ const char* RelativeMoveErr(bool forMerge) {
 bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::string& outExtraJson) {
     outExtraJson.clear();
     std::string pathUtf8;
-    JsonGetStringField(msgJson, "path", pathUtf8);
+    GetStringField(msgJson, "path", pathUtf8);
     std::wstring path;
     if (!ResolveScriptPath(pathUtf8, path, err)) return false;
 
     int scheme = 0;
-    JsonGetInt(msgJson, "scheme", scheme);
+    GetInt(msgJson, "scheme", scheme);
     // 必须 denorm：合并/压缩读的是像素 x/y；false 时只有 n*、x/y=0，会把轨迹冲掉。
     ScriptFileData data;
     if (g_optWork.active && SameOptPath(g_optWork.sourcePath, path)) {
@@ -3445,7 +3343,7 @@ bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::str
 
     if (scheme == 0) {
         int protect = 1;
-        JsonGetInt(msgJson, "protectKeyOps", protect);
+        GetInt(msgJson, "protectKeyOps", protect);
         const auto selected = ParseSelectedMask(msgJson, data.actions.size(), false);
         bool anySelected = false;
         for (char c : selected) {
@@ -3472,11 +3370,11 @@ bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::str
     } else if (scheme == 1) {
         // 对齐 RecordingOptimizeDialog::ApplyWaitAdjust + WaitMatchesFilter
         double newWait = 0.01;
-        JsonGetNumber(msgJson, "waitValue", newWait);
+        GetNumber(msgJson, "waitValue", newWait);
         const int filterOp = ParseWaitFilterOp(msgJson);
         double compareVal = 0.0;
-        if (!JsonGetNumber(msgJson, "compareValue", compareVal))
-            JsonGetNumber(msgJson, "waitCompare", compareVal);
+        if (!GetNumber(msgJson, "compareValue", compareVal))
+            GetNumber(msgJson, "waitCompare", compareVal);
         const auto selected = ParseSelectedMask(msgJson, data.actions.size(), false);
         int changed = 0;
         for (size_t i = 0; i < data.actions.size(); ++i) {
@@ -3503,17 +3401,17 @@ bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::str
         const auto selected = ParseSelectedMask(msgJson, data.actions.size(), false);
         recopt::OptimizeApplyResult applied;
         std::string waitCalc = "sum";
-        JsonGetStringField(msgJson, "waitCalculation", waitCalc);
+        GetStringField(msgJson, "waitCalculation", waitCalc);
         if (waitCalc.empty()) waitCalc = "sum";
         double mergeWait = 0.1;
-        JsonGetNumber(msgJson, "mergeWaitValue", mergeWait);
-        JsonGetNumber(msgJson, "waitValue", mergeWait);
+        GetNumber(msgJson, "mergeWaitValue", mergeWait);
+        GetNumber(msgJson, "waitValue", mergeWait);
         if (forMerge) {
             applied = recopt::MergeSelected(data.actions, selected, waitCalc, mergeWait);
         } else {
             double thr = 5.0;
-            JsonGetNumber(msgJson, "distanceThreshold", thr);
-            JsonGetNumber(msgJson, "compressWait", mergeWait);
+            GetNumber(msgJson, "distanceThreshold", thr);
+            GetNumber(msgJson, "compressWait", mergeWait);
             applied = recopt::CompressSelected(data.actions, selected, thr, waitCalc, mergeWait);
         }
         if (!applied.collectOk) {
@@ -3533,7 +3431,7 @@ bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::str
         ConvertToFindImageOptions copt{};
         copt.requireCapturePath = true;
         std::string findTime = "0";
-        JsonGetStringField(msgJson, "findTimeExpr", findTime);
+        GetStringField(msgJson, "findTimeExpr", findTime);
         if (findTime.empty()) findTime = "0";
         copt.findTimeExpr = FromUtf8(findTime);
         const auto selected = ParseSelectedMask(msgJson, data.actions.size(), false);
@@ -3561,13 +3459,13 @@ bool ApplyOptimizeAndSave(const std::string& msgJson, std::string& err, std::str
     g_optWork.active = true;
 
     int saveAsNew = 0;
-    JsonGetInt(msgJson, "saveAsNew", saveAsNew);
+    GetInt(msgJson, "saveAsNew", saveAsNew);
     if (saveAsNew) {
         EnsureScriptsDir();
         CreateDirectoryW(RecordingsDir().c_str(), nullptr);
         // 优先用前端 #optName 传入的 name；勿硬盖「原名-优化」
         std::string nameUtf8;
-        JsonGetStringField(msgJson, "name", nameUtf8);
+        GetStringField(msgJson, "name", nameUtf8);
         std::wstring baseName = nameUtf8.empty()
             ? (data.scriptName.empty()
                    ? std::filesystem::path(path).stem().wstring()
@@ -3611,7 +3509,7 @@ bool ParseWindowModePreviewRequest(const std::string& json,
         }
     }
     int editorMode = 0;
-    JsonGetInt(json, "editorMode", editorMode);
+    GetInt(json, "editorMode", editorMode);
     if (editorMode == 0) {
         outCfg.enabled = false;
         outCfg.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
