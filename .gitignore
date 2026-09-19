@@ -31,6 +31,15 @@ driver/qst_vhid/install_log.txt
 # Third-party binaries (install via scripts/setup_opencv.ps1)
 third_party/
 
+# 例外：src/third_party 是**随源码分发的单头依赖**（nlohmann/json.hpp），
+# 必须入库 —— 否则新克隆编译不过（src/agent_core.h 直接 include 它）。
+# 这条规则是 2026-09-19 首次跑 CI 时暴露的：CI 报
+#   src\agent_core.h(16): error C1083: Cannot open include file: 'nlohmann/json.hpp'
+# 根因就是 third_party/ 这条规则把它连带忽略了。
+# 注意顺序：先重新包含目录本身，再包含其内容，否则 git 不会递归恢复。
+!src/third_party/
+!src/third_party/**
+
 # Reference / analysis code
 flameshot_analysis/
 fetched_*.cpp
