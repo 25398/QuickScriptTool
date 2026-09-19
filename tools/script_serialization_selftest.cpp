@@ -27,6 +27,7 @@
 // =============================================================================
 #include "selftest_harness.h"
 
+#include "json_util.h"
 #include "script_io.h"
 #include "script_types.h"
 #include "utils.h"
@@ -53,6 +54,8 @@ const selftest::CaseInfo kCases[] = {
         L"中文与转义字符（引号/换行/反斜杠）往返不失真"},
     {L"roundtrip_varcompute_code", L"default",
         L"varCompute 的 computeCode 多行代码往返"},
+    {L"roundtrip_invalid_escape_path", L"default",
+        L"路径含单个反斜杠（JSON 非法转义）时动作不得被静默丢弃"},
     {L"save_is_deterministic", L"default",
         L"同一份数据连续保存两次，产物逐字节一致（无隐藏时间戳/顺序抖动）"},
     {L"corpus_roundtrip_clean", L"corpus",
@@ -98,6 +101,8 @@ struct RoundTripResult {
     bool reloaded = false;
     int actionsA = 0;
     int actionsB = 0;
+    int lexicalActions = 0;   // 词法上的动作块数（仅信息）
+    int unparsableBlocks = 0; // 解析不出 type 的块数 —— 这些会被静默丢弃
     std::vector<std::string> diffs;   // 已窄化，便于打进 JSON detail
     bool captureStamped = false;      // captureSize 被盖上当前屏幕（预期，单独计数）
 };
@@ -147,6 +152,23 @@ RoundTripResult RoundTripContent(const std::wstring& content, const std::wstring
     ScriptFileData a = ParseScriptContent(content);
     r.loaded = true;
     r.actionsA = static_cast<int>(a.actions.size());
+
+    // ── 交叉校验：解析出的动作数 vs 文件里**词法上**的动作块数 ──────────
+    // 为什么必须加这条（2026-09-19 D2 踩到的盲点）：
+    // 只比较「读→写→再读」的 A/B 时，如果**两次都丢掉同样的动作**，差异是 0，
+    // 看起来完全正常 —— 实测严格解析会把含非法转义的块整块丢掉，而 A/B 都是丢过的，
+    // 于是 D1 报「零差异」。这正是本项目反复出现的「用例全绿 ≠ 没坏」。
+    // 词法计数（CountActionsInJson）走的是与解析器**无关**的路径，能戳破这种系统性丢失。
+    r.lexicalActions = CountActionsInJson(content);
+    // 精确探测「静默丢动作」：ParseScriptContent 用 \ 跳过解析不出
+    // type 的块。块数对不上可能只是 NormalizeInputTiming 合法合并了相邻 Wait，
+    // 所以判据不是「数目相等」，而是**没有任何块解析不出 type**。
+    {
+        const auto blocks = ExtractJsonActionBlocks(content);
+        for (const auto& b : blocks) {
+            if (qst::jsonutil::WideObjectView(b).GetString(L"type").empty()) ++r.unparsableBlocks;
+        }
+    }
 
     if (!SaveScriptFileData(tmpPath, a)) {
         NoteDiff(r, "SaveScriptFileData failed");
@@ -199,9 +221,14 @@ std::wstring NarrowToWide(const std::string& s) {
 
 /// 内置用例共用的收尾：把结果打成一条 Emit
 void EmitRoundTrip(const wchar_t* name, const RoundTripResult& r) {
+    // noDrop：没有任何动作块解析不出 type（那会被静默丢弃 = 数据丢失）。
+    const bool noDrop = r.unparsableBlocks == 0;
     const bool ok = r.loaded && r.saved && r.reloaded && r.diffs.empty()
-        && r.actionsA == r.actionsB;
-    std::wstring detail = L"actions=" + std::to_wstring(r.actionsA);
+        && r.actionsA == r.actionsB && noDrop;
+    std::wstring detail = L"actions=" + std::to_wstring(r.actionsA)
+        + L"/块=" + std::to_wstring(r.lexicalActions);
+    if (!noDrop) detail += L" | 有 " + std::to_wstring(r.unparsableBlocks)
+        + L" 个动作块解析失败（会被静默丢弃）";
     if (!ok) {
         detail += L" | ";
         for (size_t i = 0; i < r.diffs.size(); ++i) {
@@ -307,6 +334,26 @@ void CaseSaveDeterministic() {
         ok ? L"两次保存逐字节一致" : L"两次保存产物不同（存在隐藏顺序/时间戳抖动）");
 }
 
+// 非法转义（单个反斜杠的 Windows 路径）：**动作绝不能被静默丢弃**。
+// 2026-09-19 D2 实测：严格解析遇到 `"images\a.png"`（JSON 里 `\a` 非法）会整块失败，
+// 旧代码静默跳过该动作 → 3 个动作变 2 个。产品自己写文件时会正确转义，但手改过的
+// 脚本可能没有；静默丢数据是本项目最忌讳的失败方式，所以这里钉死。
+void CaseInvalidEscapePath() {
+    const std::wstring content =
+        L"{\"scriptName\":\"selftest_bad_escape\",\"actions\":["
+        L"{\"type\":\"findImage\",\"imagePath\":\"images\\a.png\",\"findImageFollowUp\":0},"
+        L"{\"type\":\"wait\",\"duration\":1.5}"
+        L"]}";
+    const RoundTripResult r = RoundTripContent(content, TempPathFor(L"badesc"));
+    const bool noDrop = r.actionsA == 2;
+    const bool ok = r.loaded && noDrop && r.diffs.empty() && r.actionsA == r.actionsB;
+    std::wstring detail = L"actions=" + std::to_wstring(r.actionsA) + L"/块="
+        + std::to_wstring(r.lexicalActions) + L"/坏块="
+        + std::to_wstring(r.unparsableBlocks);
+    if (!noDrop) detail += L" | 非法转义导致动作被丢弃（数据丢失）";
+    Emit(L"roundtrip_invalid_escape_path", ok, detail.c_str());
+}
+
 // ── 语料往返（D1 基线）────────────────────────────────────────────
 int g_corpusTotal = 0;
 int g_corpusClean = 0;
@@ -344,11 +391,13 @@ void RunCorpus(const std::wstring& dir) {
         const std::wstring tmp = TempPathFor(L"corpus" + std::to_wstring(i));
         const RoundTripResult r = RoundTripContent(content, tmp);
         if (r.captureStamped) ++g_corpusCaptureStamped;
-        if (r.diffs.empty() && r.actionsA == r.actionsB) {
+        if (r.diffs.empty() && r.actionsA == r.actionsB && r.unparsableBlocks == 0) {
             ++g_corpusClean;
         } else if (g_corpusDiffs.size() < 10) {
             std::string line = ToUtf8(files[i].substr(DirName(dir).size()));
-            line += " -> ";
+            line += " (解析=" + std::to_string(r.actionsA)
+                + "/块=" + std::to_string(r.lexicalActions)
+                + "/坏块=" + std::to_string(r.unparsableBlocks) + ") -> ";
             for (size_t k = 0; k < r.diffs.size() && k < 3; ++k) {
                 if (k) line += " ; ";
                 line += r.diffs[k];
@@ -423,6 +472,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseWatchImageFields();
     CaseUnicodeAndEscapes();
     CaseVarComputeCode();
+    CaseInvalidEscapePath();
     CaseSaveDeterministic();
     if (!corpusDir.empty()) CaseCorpus(corpusDir);
 

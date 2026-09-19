@@ -1,5 +1,7 @@
 #include "script_io.h"
 
+#include "json_util.h"
+
 #include "action_utils.h"
 #include "app_settings.h"
 #include "coord_space.h"
@@ -14,32 +16,14 @@
 #include <sstream>
 
 std::wstring ExtractNamedJsonObject(const std::wstring& content, const wchar_t* key) {
-    if (!key || !*key) return {};
-    const std::wstring pat = std::wstring(L"\"") + key + L"\"";
-    size_t search = 0;
-    while (search < content.size()) {
-        const auto k = content.find(pat, search);
-        if (k == std::wstring::npos) return {};
-        size_t i = k + pat.size();
-        while (i < content.size() && (content[i] == L' ' || content[i] == L'\t'
-            || content[i] == L'\n' || content[i] == L'\r')) {
-            ++i;
-        }
-        if (i >= content.size() || content[i] != L':') {
-            search = k + pat.size();
-            continue;
-        }
-        ++i;
-        while (i < content.size() && (content[i] == L' ' || content[i] == L'\t'
-            || content[i] == L'\n' || content[i] == L'\r')) {
-            ++i;
-        }
-        if (i >= content.size() || content[i] != L'{') return {};
-        const auto end = FindMatchingJsonBrace(content, i);
-        if (end == std::wstring::npos) return {};
-        return content.substr(i, end - i + 1);
-    }
-    return {};
+    // 统一走 json_util（严格解析取配对子对象）；原手写扫描已删。
+    // 键是 ASCII 字面量，逐字符窄化（不要用 std::string(key, key+n)，那会触发
+    // C4244「wchar_t → char 可能丢数据」）。
+    std::string narrowKey;
+    for (const wchar_t* p = key; p && *p; ++p) narrowKey.push_back(static_cast<char>(*p));
+    std::string out;
+    if (!qst::jsonutil::GetSubObjectText(ToUtf8(content), narrowKey.c_str(), out)) return L"";
+    return FromUtf8(out);
 }
 
 namespace {
@@ -114,7 +98,8 @@ bool IsRecordingScriptPath(const std::wstring& path) {
 ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo,
     bool coordsNormalized) {
     ScriptAction a{};
-    const auto type = ExtractString(block, L"type");
+    const qst::jsonutil::WideObjectView J(block);
+    const auto type = J.GetString(L"type");
     if (type.empty()) return a;
     if (type == L"moveMouse") a.type = ActionType::MoveMouse;
     else if (type == L"moveMouseRelative") a.type = ActionType::MoveMouseRelative;
@@ -160,107 +145,107 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     else if (type == L"aiImageAnalysis") a.type = ActionType::AiImageAnalysis;
     else if (type == L"aiActionExecute") a.type = ActionType::AiActionExecute;
     else a.type = ActionType::CustomText;
-    a.customText = ExtractString(block, L"text");
-    a.remark = ExtractString(block, L"remark");
+    a.customText = J.GetString(L"text");
+    a.remark = J.GetString(L"remark");
     if (a.type == ActionType::CustomText && type != L"customText") {
         const std::wstring tag = L"[未知动作] " + type;
         if (a.remark.empty()) a.remark = tag;
         else if (a.remark.find(L"[未知动作]") == std::wstring::npos)
             a.remark = tag + L" " + a.remark;
     }
-    a.originalNo = static_cast<int>(ExtractNumber(block, L"no", static_cast<double>(fallbackNo + 1)));
-    a.indent = static_cast<int>(ExtractNumber(block, L"indent", 0));
+    a.originalNo = static_cast<int>(J.GetNumber(L"no", static_cast<double>(fallbackNo + 1)));
+    a.indent = static_cast<int>(J.GetNumber(L"indent", 0));
 
     if (a.type == ActionType::MoveMouseRelative) {
         // 相对位移始终为整型像素 dx/dy，不参与屏幕归一化
         a.coordsAreNormalized = false;
-        a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
-        a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
-        a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
-        a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
-        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
-        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
-        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
-        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
-        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
-        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
-        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
-        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
-        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
-        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
-    } else if (ExtractNumber(block, L"windowRelative", 0.0) != 0.0) {
+        a.x = static_cast<int>(J.GetNumber(L"x", 0));
+        a.y = static_cast<int>(J.GetNumber(L"y", 0));
+        a.randomX = static_cast<int>(J.GetNumber(L"randomX", 0));
+        a.randomY = static_cast<int>(J.GetNumber(L"randomY", 0));
+        a.searchX1 = static_cast<int>(J.GetNumber(L"searchX1", 0));
+        a.searchY1 = static_cast<int>(J.GetNumber(L"searchY1", 0));
+        a.searchX2 = static_cast<int>(J.GetNumber(L"searchX2", 0));
+        a.searchY2 = static_cast<int>(J.GetNumber(L"searchY2", 0));
+        a.offsetX = static_cast<int>(J.GetNumber(L"offsetX", 0));
+        a.offsetY = static_cast<int>(J.GetNumber(L"offsetY", 0));
+        a.aiSearchX1 = static_cast<int>(J.GetNumber(L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(J.GetNumber(L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(J.GetNumber(L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(J.GetNumber(L"aiSearchY2", 0));
+    } else if (J.GetNumber(L"windowRelative", 0.0) != 0.0) {
         // 窗口相对录制：x/y 是目标窗口客户区像素，无论文件是否带 coordMeta
         a.windowRelative = true;
         a.coordsAreNormalized = false;
-        a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
-        a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
-        a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
-        a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
-        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
-        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
-        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
-        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
-        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
-        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
-        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
-        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
-        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
-        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+        a.x = static_cast<int>(J.GetNumber(L"x", 0));
+        a.y = static_cast<int>(J.GetNumber(L"y", 0));
+        a.randomX = static_cast<int>(J.GetNumber(L"randomX", 0));
+        a.randomY = static_cast<int>(J.GetNumber(L"randomY", 0));
+        a.searchX1 = static_cast<int>(J.GetNumber(L"searchX1", 0));
+        a.searchY1 = static_cast<int>(J.GetNumber(L"searchY1", 0));
+        a.searchX2 = static_cast<int>(J.GetNumber(L"searchX2", 0));
+        a.searchY2 = static_cast<int>(J.GetNumber(L"searchY2", 0));
+        a.offsetX = static_cast<int>(J.GetNumber(L"offsetX", 0));
+        a.offsetY = static_cast<int>(J.GetNumber(L"offsetY", 0));
+        a.aiSearchX1 = static_cast<int>(J.GetNumber(L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(J.GetNumber(L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(J.GetNumber(L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(J.GetNumber(L"aiSearchY2", 0));
     } else if (coordsNormalized) {
         // 从 JSON 读取归一化坐标（0.0–1.0 浮点数）
         a.coordsAreNormalized = true;
-        a.nx = ExtractNumber(block, L"x", 0.0);
-        a.ny = ExtractNumber(block, L"y", 0.0);
-        a.nRandomX = ExtractNumber(block, L"randomX", 0.0);
-        a.nRandomY = ExtractNumber(block, L"randomY", 0.0);
-        a.nSearchX1 = ExtractNumber(block, L"searchX1", 0.0);
-        a.nSearchY1 = ExtractNumber(block, L"searchY1", 0.0);
-        a.nSearchX2 = ExtractNumber(block, L"searchX2", 0.0);
-        a.nSearchY2 = ExtractNumber(block, L"searchY2", 0.0);
-        a.nOffsetX = ExtractNumber(block, L"offsetX", 0.0);
-        a.nOffsetY = ExtractNumber(block, L"offsetY", 0.0);
-        a.nAiSearchX1 = ExtractNumber(block, L"aiSearchX1", 0.0);
-        a.nAiSearchY1 = ExtractNumber(block, L"aiSearchY1", 0.0);
-        a.nAiSearchX2 = ExtractNumber(block, L"aiSearchX2", 0.0);
-        a.nAiSearchY2 = ExtractNumber(block, L"aiSearchY2", 0.0);
+        a.nx = J.GetNumber(L"x", 0.0);
+        a.ny = J.GetNumber(L"y", 0.0);
+        a.nRandomX = J.GetNumber(L"randomX", 0.0);
+        a.nRandomY = J.GetNumber(L"randomY", 0.0);
+        a.nSearchX1 = J.GetNumber(L"searchX1", 0.0);
+        a.nSearchY1 = J.GetNumber(L"searchY1", 0.0);
+        a.nSearchX2 = J.GetNumber(L"searchX2", 0.0);
+        a.nSearchY2 = J.GetNumber(L"searchY2", 0.0);
+        a.nOffsetX = J.GetNumber(L"offsetX", 0.0);
+        a.nOffsetY = J.GetNumber(L"offsetY", 0.0);
+        a.nAiSearchX1 = J.GetNumber(L"aiSearchX1", 0.0);
+        a.nAiSearchY1 = J.GetNumber(L"aiSearchY1", 0.0);
+        a.nAiSearchX2 = J.GetNumber(L"aiSearchX2", 0.0);
+        a.nAiSearchY2 = J.GetNumber(L"aiSearchY2", 0.0);
     } else {
-        a.x = static_cast<int>(ExtractNumber(block, L"x", 0));
-        a.y = static_cast<int>(ExtractNumber(block, L"y", 0));
-        a.randomX = static_cast<int>(ExtractNumber(block, L"randomX", 0));
-        a.randomY = static_cast<int>(ExtractNumber(block, L"randomY", 0));
-        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
-        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
-        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
-        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
-        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
-        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
-        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
-        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
-        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
-        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+        a.x = static_cast<int>(J.GetNumber(L"x", 0));
+        a.y = static_cast<int>(J.GetNumber(L"y", 0));
+        a.randomX = static_cast<int>(J.GetNumber(L"randomX", 0));
+        a.randomY = static_cast<int>(J.GetNumber(L"randomY", 0));
+        a.searchX1 = static_cast<int>(J.GetNumber(L"searchX1", 0));
+        a.searchY1 = static_cast<int>(J.GetNumber(L"searchY1", 0));
+        a.searchX2 = static_cast<int>(J.GetNumber(L"searchX2", 0));
+        a.searchY2 = static_cast<int>(J.GetNumber(L"searchY2", 0));
+        a.offsetX = static_cast<int>(J.GetNumber(L"offsetX", 0));
+        a.offsetY = static_cast<int>(J.GetNumber(L"offsetY", 0));
+        a.aiSearchX1 = static_cast<int>(J.GetNumber(L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(J.GetNumber(L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(J.GetNumber(L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(J.GetNumber(L"aiSearchY2", 0));
     }
     if (a.coordsAreNormalized) {
-        a.nEndX = ExtractNumber(block, L"endX", 0.0);
-        a.nEndY = ExtractNumber(block, L"endY", 0.0);
-        a.nRandomEndX = ExtractNumber(block, L"randomEndX", 0.0);
-        a.nRandomEndY = ExtractNumber(block, L"randomEndY", 0.0);
+        a.nEndX = J.GetNumber(L"endX", 0.0);
+        a.nEndY = J.GetNumber(L"endY", 0.0);
+        a.nRandomEndX = J.GetNumber(L"randomEndX", 0.0);
+        a.nRandomEndY = J.GetNumber(L"randomEndY", 0.0);
     } else {
-        a.endX = static_cast<int>(ExtractNumber(block, L"endX", 0));
-        a.endY = static_cast<int>(ExtractNumber(block, L"endY", 0));
-        a.randomEndX = static_cast<int>(ExtractNumber(block, L"randomEndX", 0));
-        a.randomEndY = static_cast<int>(ExtractNumber(block, L"randomEndY", 0));
+        a.endX = static_cast<int>(J.GetNumber(L"endX", 0));
+        a.endY = static_cast<int>(J.GetNumber(L"endY", 0));
+        a.randomEndX = static_cast<int>(J.GetNumber(L"randomEndX", 0));
+        a.randomEndY = static_cast<int>(J.GetNumber(L"randomEndY", 0));
     }
-    a.imageLocate = ExtractBool(block, L"imageLocate", false);
-    a.moveFromVar = ExtractNumber(block, L"moveFromVar", 0) != 0;
-    a.moveVarExprX = ExtractString(block, L"moveVarExprX");
-    a.moveVarExprY = ExtractString(block, L"moveVarExprY");
-    const auto button = ExtractString(block, L"button");
+    a.imageLocate = J.GetBool(L"imageLocate", false);
+    a.moveFromVar = J.GetNumber(L"moveFromVar", 0) != 0;
+    a.moveVarExprX = J.GetString(L"moveVarExprX");
+    a.moveVarExprY = J.GetString(L"moveVarExprY");
+    const auto button = J.GetString(L"button");
     a.button = button == L"right" ? MouseButtonType::Right
         : button == L"middle" ? MouseButtonType::Middle
         : button == L"x1" ? MouseButtonType::X1
         : button == L"x2" ? MouseButtonType::X2
         : MouseButtonType::Left;
-    a.keyText = ExtractString(block, L"keyText");
+    a.keyText = J.GetString(L"keyText");
     // 仅对按键类动作补旧默认键，避免污染 runProgram/鼠标等非按键动作的字段
     if (a.keyText.empty()
         && (a.type == ActionType::KeyClick
@@ -269,36 +254,36 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         a.keyText = L"7";
     }
     a.keyVk = NormalizeScriptKeyVk(
-        static_cast<UINT>(ExtractNumber(block, L"keyVk",
+        static_cast<UINT>(J.GetNumber(L"keyVk",
             a.keyText.size() == 1 ? towupper(a.keyText[0]) : 0)),
         a.keyText);
-    a.holdLeftWin = ExtractNumber(block, L"holdLeftWin", 0) != 0;
-    a.holdRightWin = ExtractNumber(block, L"holdRightWin", 0) != 0;
-    a.holdLeftCtrl = ExtractNumber(block, L"holdLeftCtrl", 0) != 0;
-    a.holdRightCtrl = ExtractNumber(block, L"holdRightCtrl", 0) != 0;
-    a.holdLeftAlt = ExtractNumber(block, L"holdLeftAlt", 0) != 0;
-    a.holdRightAlt = ExtractNumber(block, L"holdRightAlt", 0) != 0;
-    a.holdLeftShift = ExtractNumber(block, L"holdLeftShift", 0) != 0;
-    a.holdRightShift = ExtractNumber(block, L"holdRightShift", 0) != 0;
-    a.clickCount = static_cast<int>(ExtractNumber(block, L"clickCount", 1));
+    a.holdLeftWin = J.GetNumber(L"holdLeftWin", 0) != 0;
+    a.holdRightWin = J.GetNumber(L"holdRightWin", 0) != 0;
+    a.holdLeftCtrl = J.GetNumber(L"holdLeftCtrl", 0) != 0;
+    a.holdRightCtrl = J.GetNumber(L"holdRightCtrl", 0) != 0;
+    a.holdLeftAlt = J.GetNumber(L"holdLeftAlt", 0) != 0;
+    a.holdRightAlt = J.GetNumber(L"holdRightAlt", 0) != 0;
+    a.holdLeftShift = J.GetNumber(L"holdLeftShift", 0) != 0;
+    a.holdRightShift = J.GetNumber(L"holdRightShift", 0) != 0;
+    a.clickCount = static_cast<int>(J.GetNumber(L"clickCount", 1));
     if (a.clickCount < 1) a.clickCount = 1;
     if (a.clickCount > 100000) a.clickCount = 100000;
     {
         double durationDefault = 0.1;
         if (ActionCarriesRecordingPreDelay(a.type)) durationDefault = 0.0;
-        a.duration = ExtractNumber(block, L"duration", durationDefault);
+        a.duration = J.GetNumber(L"duration", durationDefault);
     }
-    a.randomDuration = ExtractNumber(block, L"randomDuration", 0.0);
+    a.randomDuration = J.GetNumber(L"randomDuration", 0.0);
     a.timingUs = static_cast<uint64_t>(std::max(0.0,
-        ExtractNumber(block, L"timingUs", 0.0)));
-    a.loopCount = static_cast<int>(ExtractNumber(block, L"loopCount", -1));
-    a.loopVarName = ExtractString(block, L"loopVarName");
-    a.loopFromVar = ExtractNumber(block, L"loopFromVar", 0) != 0;
-    a.loopVarExpr = ExtractString(block, L"loopVarExpr");
-    a.blockName = ExtractString(block, L"blockName");
-    a.targetPath = ExtractString(block, L"targetPath");
+        J.GetNumber(L"timingUs", 0.0)));
+    a.loopCount = static_cast<int>(J.GetNumber(L"loopCount", -1));
+    a.loopVarName = J.GetString(L"loopVarName");
+    a.loopFromVar = J.GetNumber(L"loopFromVar", 0) != 0;
+    a.loopVarExpr = J.GetString(L"loopVarExpr");
+    a.blockName = J.GetString(L"blockName");
+    a.targetPath = J.GetString(L"targetPath");
     a.playbackSpeed = quickscript::ClampPlaybackSpeed(
-        ExtractNumber(block, L"playbackSpeed", 1.0));
+        J.GetNumber(L"playbackSpeed", 1.0));
     if (a.type == ActionType::RunMacro || a.type == ActionType::MousePlayback) {
         const auto useModePos = block.find(L"\"useMode\"");
         if (useModePos == std::wstring::npos) {
@@ -311,36 +296,36 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
                 ++i;
             }
             if (i < block.size() && block[i] == L'"') {
-                a.useMode = NestedUseModeFromText(ExtractString(block, L"useMode"));
+                a.useMode = NestedUseModeFromText(J.GetString(L"useMode"));
             } else {
                 a.useMode = NormalizeNestedUseMode(
-                    static_cast<int>(ExtractNumber(block, L"useMode", kNestedUseModeInherit)));
+                    static_cast<int>(J.GetNumber(L"useMode", kNestedUseModeInherit)));
             }
         }
         a.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
-            ExtractNumber(block, L"breakoutTimeSeconds", 0.0));
+            J.GetNumber(L"breakoutTimeSeconds", 0.0));
         const std::wstring nestedWm = ExtractNamedJsonObject(block, L"nestedWindowMode");
         if (!nestedWm.empty()) {
             a.nestedWindowMode = windowmode::ParseWindowModeConfigObject(nestedWm, false);
         }
     }
-    a.shortcutPreset = static_cast<int>(ExtractNumber(block, L"shortcutPreset", 0));
-    a.inputText = ExtractString(block, L"inputText");
-    a.charInterval = ExtractNumber(block, L"charInterval", 0.01);
-    a.parseEscapes = ExtractBool(block, L"parseEscapes", false);
-    a.scrollVertical = ExtractNumber(block, L"scrollVertical", 1) != 0;
-    a.scrollHorizontal = ExtractNumber(block, L"scrollHorizontal", 0) != 0;
-    a.scrollSteps = static_cast<int>(ExtractNumber(block, L"scrollSteps", 1));
-    a.scrollDirection = static_cast<int>(ExtractNumber(block, L"scrollDirection", 0));
+    a.shortcutPreset = static_cast<int>(J.GetNumber(L"shortcutPreset", 0));
+    a.inputText = J.GetString(L"inputText");
+    a.charInterval = J.GetNumber(L"charInterval", 0.01);
+    a.parseEscapes = J.GetBool(L"parseEscapes", false);
+    a.scrollVertical = J.GetNumber(L"scrollVertical", 1) != 0;
+    a.scrollHorizontal = J.GetNumber(L"scrollHorizontal", 0) != 0;
+    a.scrollSteps = static_cast<int>(J.GetNumber(L"scrollSteps", 1));
+    a.scrollDirection = static_cast<int>(J.GetNumber(L"scrollDirection", 0));
     if (!coordsNormalized) {
-        a.searchX1 = static_cast<int>(ExtractNumber(block, L"searchX1", 0));
-        a.searchY1 = static_cast<int>(ExtractNumber(block, L"searchY1", 0));
-        a.searchX2 = static_cast<int>(ExtractNumber(block, L"searchX2", 0));
-        a.searchY2 = static_cast<int>(ExtractNumber(block, L"searchY2", 0));
+        a.searchX1 = static_cast<int>(J.GetNumber(L"searchX1", 0));
+        a.searchY1 = static_cast<int>(J.GetNumber(L"searchY1", 0));
+        a.searchX2 = static_cast<int>(J.GetNumber(L"searchX2", 0));
+        a.searchY2 = static_cast<int>(J.GetNumber(L"searchY2", 0));
     }
-    a.searchFullScreen = ExtractNumber(block, L"searchFullScreen", 1) != 0;
-    a.imageUseVar = ExtractNumber(block, L"imageUseVar", 0) != 0;
-    a.imagePath = ExtractString(block, L"imagePath");
+    a.searchFullScreen = J.GetNumber(L"searchFullScreen", 1) != 0;
+    a.imageUseVar = J.GetNumber(L"imageUseVar", 0) != 0;
+    a.imagePath = J.GetString(L"imagePath");
     a.imagePaths = ExtractJsonStringArray(block, L"imagePaths");
     a.imageUseVars.clear();
     for (int flag : ExtractJsonIntArray(block, L"imageUseVars")) {
@@ -363,15 +348,15 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
             a.imagePaths[i] = ResolveImagePath(a.imagePaths[i]);
         }
     }
-    a.multiMatchMode = static_cast<int>(ExtractNumber(block, L"multiMatchMode", 0));
-    a.multiMatchMax = static_cast<int>(ExtractNumber(block, L"multiMatchMax", kMultiMatchMaxHits));
-    a.multiMatchSort = static_cast<int>(ExtractNumber(block, L"multiMatchSort", 0));
-    a.matchThreshold = ExtractNumber(block, L"matchThreshold", 65.0);
-    a.perfectMatch = ExtractNumber(block, L"perfectMatch", 0) != 0;
-    a.imageScale = ExtractNumber(block, L"imageScale", 1.0);
-    a.imageScaleMin = ExtractNumber(block, L"imageScaleMin", a.imageScale);
-    a.imageScaleMax = ExtractNumber(block, L"imageScaleMax", a.imageScale);
-    a.findImageFollowUp = static_cast<int>(ExtractNumber(block, L"findImageFollowUp", 0));
+    a.multiMatchMode = static_cast<int>(J.GetNumber(L"multiMatchMode", 0));
+    a.multiMatchMax = static_cast<int>(J.GetNumber(L"multiMatchMax", kMultiMatchMaxHits));
+    a.multiMatchSort = static_cast<int>(J.GetNumber(L"multiMatchSort", 0));
+    a.matchThreshold = J.GetNumber(L"matchThreshold", 65.0);
+    a.perfectMatch = J.GetNumber(L"perfectMatch", 0) != 0;
+    a.imageScale = J.GetNumber(L"imageScale", 1.0);
+    a.imageScaleMin = J.GetNumber(L"imageScaleMin", a.imageScale);
+    a.imageScaleMax = J.GetNumber(L"imageScaleMax", a.imageScale);
+    a.findImageFollowUp = static_cast<int>(J.GetNumber(L"findImageFollowUp", 0));
     if (a.findImageFollowUp < 0) a.findImageFollowUp = 0;
     if (a.type == ActionType::FindColor) {
         if (a.findImageFollowUp > 2) a.findImageFollowUp = 2;
@@ -381,11 +366,11 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         a.findImageFollowUp = 3;
     }
     if (!coordsNormalized) {
-        a.offsetX = static_cast<int>(ExtractNumber(block, L"offsetX", 0));
-        a.offsetY = static_cast<int>(ExtractNumber(block, L"offsetY", 0));
+        a.offsetX = static_cast<int>(J.GetNumber(L"offsetX", 0));
+        a.offsetY = static_cast<int>(J.GetNumber(L"offsetY", 0));
     }
-    a.findUntilFound = ExtractNumber(block, L"findUntilFound", 0) != 0;
-    a.findTimeExpr = ExtractString(block, L"findTimeExpr");
+    a.findUntilFound = J.GetNumber(L"findUntilFound", 0) != 0;
+    a.findTimeExpr = J.GetString(L"findTimeExpr");
     if (a.findTimeExpr.empty()) a.findTimeExpr = L"0";
     // 保存图片无模板是纯截屏，不需要等图；保存匹配度/有模板的保存图片与点击/移动一样走 findTimeExpr。
     if (a.type == ActionType::FindImage
@@ -393,7 +378,7 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         && a.imagePath.empty()) {
         a.findTimeExpr = L"0";
     }
-    a.matchVarName = ExtractString(block, L"matchVarName");
+    a.matchVarName = J.GetString(L"matchVarName");
     if (a.matchVarName.empty()) {
         if (a.type == ActionType::TextRecognition) a.matchVarName = L"a";
         else if (a.type == ActionType::GetColor || a.type == ActionType::FindColor
@@ -401,50 +386,50 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         else if (a.findImageFollowUp == 3) a.matchVarName = L"image";
         else a.matchVarName = L"matchRet";
     }
-    a.colorR = static_cast<int>(ExtractNumber(block, L"colorR", 0));
-    a.colorG = static_cast<int>(ExtractNumber(block, L"colorG", 0));
-    a.colorB = static_cast<int>(ExtractNumber(block, L"colorB", 0));
-    a.colorTolerance = static_cast<int>(ExtractNumber(block, L"colorTolerance", 16));
+    a.colorR = static_cast<int>(J.GetNumber(L"colorR", 0));
+    a.colorG = static_cast<int>(J.GetNumber(L"colorG", 0));
+    a.colorB = static_cast<int>(J.GetNumber(L"colorB", 0));
+    a.colorTolerance = static_cast<int>(J.GetNumber(L"colorTolerance", 16));
     if (a.colorTolerance < 0) a.colorTolerance = 0;
     if (a.colorTolerance > 255) a.colorTolerance = 255;
-    a.ocrResultMode = static_cast<int>(ExtractNumber(block, L"ocrResultMode", 0));
-    a.ocrRegionByImage = ExtractNumber(block, L"ocrRegionByImage", 0) != 0;
-    a.ocrDigitsOnly = ExtractNumber(block, L"ocrDigitsOnly", 0) != 0;
-    a.ocrSearchText = ExtractString(block, L"ocrSearchText");
-    a.ocrFollowUp = static_cast<int>(ExtractNumber(block, L"ocrFollowUp", 0));
-    a.conditionExpr = ExtractString(block, L"conditionExpr");
-    a.gotoStepExpr = ExtractString(block, L"gotoStepExpr");
-    a.resumeAfterWatch = ExtractNumber(block, L"resumeAfterWatch", 1) != 0;
+    a.ocrResultMode = static_cast<int>(J.GetNumber(L"ocrResultMode", 0));
+    a.ocrRegionByImage = J.GetNumber(L"ocrRegionByImage", 0) != 0;
+    a.ocrDigitsOnly = J.GetNumber(L"ocrDigitsOnly", 0) != 0;
+    a.ocrSearchText = J.GetString(L"ocrSearchText");
+    a.ocrFollowUp = static_cast<int>(J.GetNumber(L"ocrFollowUp", 0));
+    a.conditionExpr = J.GetString(L"conditionExpr");
+    a.gotoStepExpr = J.GetString(L"gotoStepExpr");
+    a.resumeAfterWatch = J.GetNumber(L"resumeAfterWatch", 1) != 0;
     a.watchMode = ParseWatchModeField(block);
     {
         // 缺 watchPollSeconds 时 ExtractNumber 默认 1 会挡住 watchPollInterval 别名
-        double poll = ExtractNumber(block, L"watchPollSeconds", 0.0);
-        if (!(poll > 0.0)) poll = ExtractNumber(block, L"watchPollInterval", 0.0);
+        double poll = J.GetNumber(L"watchPollSeconds", 0.0);
+        if (!(poll > 0.0)) poll = J.GetNumber(L"watchPollInterval", 0.0);
         if (!(poll > 0.0)) poll = 1.0;
         if (poll < 0.05) poll = 0.05;
         if (poll > 3600.0) poll = 3600.0;
         a.watchPollSeconds = poll;
     }
-    a.computeCode = ExtractString(block, L"computeCode");
+    a.computeCode = J.GetString(L"computeCode");
     if (a.type == ActionType::VarCompute && a.computeCode.empty())
         a.computeCode = a.inputText;
-    a.matchFileNameOnly = ExtractNumber(block, L"matchFileNameOnly", 0) != 0;
+    a.matchFileNameOnly = J.GetNumber(L"matchFileNameOnly", 0) != 0;
     // imageRegion*：模板内相对偏移。旧 OCR 锚点脚本把相对值写在 search* 上，需迁移。
     const bool hasImageRegionKey = block.find(L"\"imageRegionX1\"") != std::wstring::npos;
     if (coordsNormalized) {
-        a.nImageRegionX1 = ExtractNumber(block, L"imageRegionX1", 0.0);
-        a.nImageRegionY1 = ExtractNumber(block, L"imageRegionY1", 0.0);
-        a.nImageRegionX2 = ExtractNumber(block, L"imageRegionX2", 0.0);
-        a.nImageRegionY2 = ExtractNumber(block, L"imageRegionY2", 0.0);
-        a.imageRegionX1 = static_cast<int>(ExtractNumber(block, L"imageRegionX1", 0));
-        a.imageRegionY1 = static_cast<int>(ExtractNumber(block, L"imageRegionY1", 0));
-        a.imageRegionX2 = static_cast<int>(ExtractNumber(block, L"imageRegionX2", 0));
-        a.imageRegionY2 = static_cast<int>(ExtractNumber(block, L"imageRegionY2", 0));
+        a.nImageRegionX1 = J.GetNumber(L"imageRegionX1", 0.0);
+        a.nImageRegionY1 = J.GetNumber(L"imageRegionY1", 0.0);
+        a.nImageRegionX2 = J.GetNumber(L"imageRegionX2", 0.0);
+        a.nImageRegionY2 = J.GetNumber(L"imageRegionY2", 0.0);
+        a.imageRegionX1 = static_cast<int>(J.GetNumber(L"imageRegionX1", 0));
+        a.imageRegionY1 = static_cast<int>(J.GetNumber(L"imageRegionY1", 0));
+        a.imageRegionX2 = static_cast<int>(J.GetNumber(L"imageRegionX2", 0));
+        a.imageRegionY2 = static_cast<int>(J.GetNumber(L"imageRegionY2", 0));
     } else {
-        a.imageRegionX1 = static_cast<int>(ExtractNumber(block, L"imageRegionX1", 0));
-        a.imageRegionY1 = static_cast<int>(ExtractNumber(block, L"imageRegionY1", 0));
-        a.imageRegionX2 = static_cast<int>(ExtractNumber(block, L"imageRegionX2", 0));
-        a.imageRegionY2 = static_cast<int>(ExtractNumber(block, L"imageRegionY2", 0));
+        a.imageRegionX1 = static_cast<int>(J.GetNumber(L"imageRegionX1", 0));
+        a.imageRegionY1 = static_cast<int>(J.GetNumber(L"imageRegionY1", 0));
+        a.imageRegionX2 = static_cast<int>(J.GetNumber(L"imageRegionX2", 0));
+        a.imageRegionY2 = static_cast<int>(J.GetNumber(L"imageRegionY2", 0));
     }
     if (a.type == ActionType::TextRecognition && a.ocrRegionByImage && !hasImageRegionKey) {
         // 旧格式：search* 存相对偏移；识别区改为全屏绝对搜索
@@ -464,37 +449,37 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         a.searchFullScreen = true;
     }
     // ── AI 动作字段 ──
-    a.aiPrompt = ExtractString(block, L"aiPrompt");
-    a.aiOutputVarName = ExtractString(block, L"aiOutputVarName");
-    a.aiOutputType = static_cast<int>(ExtractNumber(block, L"aiOutputType", 0));
-    a.aiModelName = ExtractString(block, L"aiModelName");
-    a.aiContextMode = static_cast<int>(ExtractNumber(block, L"aiContextMode", 1));
-    a.aiTimeoutSec = static_cast<int>(ExtractNumber(block, L"aiTimeoutSec", 30));
-    a.aiImageScale = ExtractNumber(block, L"aiImageScale", 0.5);
-    a.aiRegionByImage = ExtractNumber(block, L"aiRegionByImage", 0) != 0;
-    a.aiImageUseVar = ExtractNumber(block, L"aiImageUseVar", 0) != 0;
-    a.aiTargetImagePath = ExtractString(block, L"aiTargetImagePath");
+    a.aiPrompt = J.GetString(L"aiPrompt");
+    a.aiOutputVarName = J.GetString(L"aiOutputVarName");
+    a.aiOutputType = static_cast<int>(J.GetNumber(L"aiOutputType", 0));
+    a.aiModelName = J.GetString(L"aiModelName");
+    a.aiContextMode = static_cast<int>(J.GetNumber(L"aiContextMode", 1));
+    a.aiTimeoutSec = static_cast<int>(J.GetNumber(L"aiTimeoutSec", 30));
+    a.aiImageScale = J.GetNumber(L"aiImageScale", 0.5);
+    a.aiRegionByImage = J.GetNumber(L"aiRegionByImage", 0) != 0;
+    a.aiImageUseVar = J.GetNumber(L"aiImageUseVar", 0) != 0;
+    a.aiTargetImagePath = J.GetString(L"aiTargetImagePath");
     if (!a.aiTargetImagePath.empty() && !a.aiImageUseVar) {
         a.aiTargetImagePath = ResolveImagePath(a.aiTargetImagePath);
     }
-    a.aiSearchRegion = static_cast<int>(ExtractNumber(block, L"aiSearchRegion", 0));
+    a.aiSearchRegion = static_cast<int>(J.GetNumber(L"aiSearchRegion", 0));
     if (!coordsNormalized) {
-        a.aiSearchX1 = static_cast<int>(ExtractNumber(block, L"aiSearchX1", 0));
-        a.aiSearchY1 = static_cast<int>(ExtractNumber(block, L"aiSearchY1", 0));
-        a.aiSearchX2 = static_cast<int>(ExtractNumber(block, L"aiSearchX2", 0));
-        a.aiSearchY2 = static_cast<int>(ExtractNumber(block, L"aiSearchY2", 0));
+        a.aiSearchX1 = static_cast<int>(J.GetNumber(L"aiSearchX1", 0));
+        a.aiSearchY1 = static_cast<int>(J.GetNumber(L"aiSearchY1", 0));
+        a.aiSearchX2 = static_cast<int>(J.GetNumber(L"aiSearchX2", 0));
+        a.aiSearchY2 = static_cast<int>(J.GetNumber(L"aiSearchY2", 0));
     }
-    a.aiMaxSteps = static_cast<int>(ExtractNumber(block, L"aiMaxSteps", 10));
-    a.aiWithImage = ExtractNumber(block, L"aiWithImage", 1) != 0;
-    a.aiLogicConvert = ExtractNumber(block, L"aiLogicConvert", 0) != 0;
-    a.aiLogicBlockName = ExtractString(block, L"aiLogicBlockName");
-    a.aiFallbackValue = ExtractString(block, L"aiFallbackValue");
-    a.recordedCapturePath = ExtractString(block, L"recordedCapturePath");
+    a.aiMaxSteps = static_cast<int>(J.GetNumber(L"aiMaxSteps", 10));
+    a.aiWithImage = J.GetNumber(L"aiWithImage", 1) != 0;
+    a.aiLogicConvert = J.GetNumber(L"aiLogicConvert", 0) != 0;
+    a.aiLogicBlockName = J.GetString(L"aiLogicBlockName");
+    a.aiFallbackValue = J.GetString(L"aiFallbackValue");
+    a.recordedCapturePath = J.GetString(L"recordedCapturePath");
     if (!a.recordedCapturePath.empty()) {
         a.recordedCapturePath = ResolveImagePath(a.recordedCapturePath);
     }
-    a.captureOffsetX = static_cast<int>(ExtractNumber(block, L"captureOffsetX", 0));
-    a.captureOffsetY = static_cast<int>(ExtractNumber(block, L"captureOffsetY", 0));
+    a.captureOffsetX = static_cast<int>(J.GetNumber(L"captureOffsetX", 0));
+    a.captureOffsetY = static_cast<int>(J.GetNumber(L"captureOffsetY", 0));
     NormalizeMultiMatchFields(a);
     return a;
 }
@@ -790,20 +775,21 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
     ScriptFileData data{};
     if (path.empty()) return data;
     const auto content = ReadAll(path);
-    data.scriptName = ExtractString(content, L"scriptName");
-    data.recordTime = ExtractString(content, L"recordTime");
-    data.durationSeconds = ExtractNumber(content, L"durationSeconds", 0);
+    const qst::jsonutil::WideObjectView JC(content);
+    data.scriptName = JC.GetString(L"scriptName");
+    data.recordTime = JC.GetString(L"recordTime");
+    data.durationSeconds = JC.GetNumber(L"durationSeconds", 0);
     data.recordingCaptureMode = static_cast<int>(
-        ExtractNumber(content, L"recordingCaptureMode", -1));
+        JC.GetNumber(L"recordingCaptureMode", -1));
     data.inputTimingVersion = std::max(0, static_cast<int>(
-        ExtractNumber(content, L"inputTimingVersion", 0)));
-    data.hotkey.text = ExtractString(content, L"hotkeyText");
-    data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
-    data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
-    data.hotkey.holdMode = ExtractBool(content, L"hotkeyHold", false);
+        JC.GetNumber(L"inputTimingVersion", 0)));
+    data.hotkey.text = JC.GetString(L"hotkeyText");
+    data.hotkey.vk = static_cast<UINT>(JC.GetNumber(L"hotkeyVk", 0));
+    data.hotkey.modifiers = static_cast<UINT>(JC.GetNumber(L"hotkeyModifiers", 0));
+    data.hotkey.holdMode = JC.GetBool(L"hotkeyHold", false);
     data.hotkey.enabled = data.hotkey.vk != 0;
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
-        ExtractNumber(content, L"breakoutTimeSeconds", 0));
+        JC.GetNumber(L"breakoutTimeSeconds", 0));
     data.windowMode = windowmode::ParseWindowModeJson(content);
     data.visualLayoutJson = ExtractNamedJsonObject(content, L"visualLayout");
     if (!VisualLayoutLooksValid(data.visualLayoutJson)) data.visualLayoutJson.clear();
@@ -826,7 +812,7 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
 
     const auto blocks = ExtractJsonActionBlocks(content);
     for (size_t i = 0; i < blocks.size(); ++i) {
-        const auto type = ExtractString(blocks[i], L"type");
+        const auto type = qst::jsonutil::WideObjectView(blocks[i]).GetString(L"type");
         if (!type.empty()) {
             data.actions.push_back(
                 ParseScriptActionBlock(blocks[i], i, data.coordsNormalized));
@@ -838,7 +824,7 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
         data.actions.clear();
         data.coordsNormalized = false;
         for (size_t i = 0; i < blocks.size(); ++i) {
-            const auto type = ExtractString(blocks[i], L"type");
+            const auto type = qst::jsonutil::WideObjectView(blocks[i]).GetString(L"type");
             if (!type.empty()) {
                 data.actions.push_back(ParseScriptActionBlock(blocks[i], i, false));
             }
@@ -864,21 +850,22 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
 
 ScriptFileData ParseScriptContent(const std::wstring& content) {
     ScriptFileData data{};
+    const qst::jsonutil::WideObjectView JC(content);
     if (content.empty()) return data;
-    data.scriptName = ExtractString(content, L"scriptName");
-    data.recordTime = ExtractString(content, L"recordTime");
-    data.durationSeconds = ExtractNumber(content, L"durationSeconds", 0);
+    data.scriptName = JC.GetString(L"scriptName");
+    data.recordTime = JC.GetString(L"recordTime");
+    data.durationSeconds = JC.GetNumber(L"durationSeconds", 0);
     data.recordingCaptureMode = static_cast<int>(
-        ExtractNumber(content, L"recordingCaptureMode", -1));
+        JC.GetNumber(L"recordingCaptureMode", -1));
     data.inputTimingVersion = std::max(0, static_cast<int>(
-        ExtractNumber(content, L"inputTimingVersion", 0)));
-    data.hotkey.text = ExtractString(content, L"hotkeyText");
-    data.hotkey.vk = static_cast<UINT>(ExtractNumber(content, L"hotkeyVk", 0));
-    data.hotkey.modifiers = static_cast<UINT>(ExtractNumber(content, L"hotkeyModifiers", 0));
-    data.hotkey.holdMode = ExtractBool(content, L"hotkeyHold", false);
+        JC.GetNumber(L"inputTimingVersion", 0)));
+    data.hotkey.text = JC.GetString(L"hotkeyText");
+    data.hotkey.vk = static_cast<UINT>(JC.GetNumber(L"hotkeyVk", 0));
+    data.hotkey.modifiers = static_cast<UINT>(JC.GetNumber(L"hotkeyModifiers", 0));
+    data.hotkey.holdMode = JC.GetBool(L"hotkeyHold", false);
     data.hotkey.enabled = data.hotkey.vk != 0;
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
-        ExtractNumber(content, L"breakoutTimeSeconds", 0));
+        JC.GetNumber(L"breakoutTimeSeconds", 0));
     data.windowMode = windowmode::ParseWindowModeJson(content);
     data.visualLayoutJson = ExtractNamedJsonObject(content, L"visualLayout");
     if (!VisualLayoutLooksValid(data.visualLayoutJson)) data.visualLayoutJson.clear();
@@ -895,7 +882,7 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
 
     const auto blocks = ExtractJsonActionBlocks(content);
     for (size_t i = 0; i < blocks.size(); ++i) {
-        const auto type = ExtractString(blocks[i], L"type");
+        const auto type = qst::jsonutil::WideObjectView(blocks[i]).GetString(L"type");
         if (!type.empty()) {
             data.actions.push_back(
                 ParseScriptActionBlock(blocks[i], i, data.coordsNormalized));

@@ -211,8 +211,103 @@ inline bool GetSubObjectText(const std::string& json, const char* key, std::stri
     return true;
 }
 
-/// 从自由文本（LLM 回复、带 [EXECUTED] 标记的日志）里抠出第一个 JSON 数组。
-/// 跳过 `[` 后不是 `{`/`[` 的方括号，按深度配对（字符串内的括号不计）。
+/// ── 已解析对象的字段视图（宽键 / 宽值）────────────────────────────
+/// 用途：**解析一次、多次取值**。典型场景是 src/script_io.cpp 的
+/// `ParseScriptActionBlock`：一个动作块要取 ~50 个字段，旧实现每次取值都调用
+/// utils.cpp 的 ExtractString/ExtractNumber/ExtractBool，而它们每次都要重新
+/// `FindTopLevelJsonKeyColon` 扫整个块 —— 一个动作 50 次、1.5 万步的录制就是
+/// 75 万次全块扫描。改成「整块解析一次 + 查表」既统一到 nlohmann，也更快。
+///
+/// 语义刻意与旧的 Extract* 对齐（这是替换的前提，不是巧合）：
+///   · GetString：键缺失 / 值不是字符串 → fallback（旧实现「值为数字时会取到
+///     下一个键名」是 bug，注释里已警告过，这里按正确语义处理）；
+///   · GetNumber：键缺失 / 值不是数字 → fallback（旧实现用 std::stod，字符串
+///     与 true/false 都会失败回落，行为一致）；
+///   · GetBool：布尔值直接返回；**数字非 0 视为 true**（旧实现支持 `1`/`0`，
+///     必须保留，否则 `"enabled":1` 的老脚本会静默失效）；其余 → fallback。
+class WideObjectView {
+public:
+    explicit WideObjectView(const std::wstring& jsonText) {
+        const std::string utf8 = ToUtf8(jsonText);
+        ok_ = TryParse(utf8, doc_) && doc_.is_object();
+        if (ok_) return;
+        // ── 唯一兜底：修掉**非法转义**后重试 ──────────────────────────
+        // 为什么必须有：脚本里的路径若写成单个反斜杠（`"images\a.png"`），
+        // JSON 里 `\a` 是非法转义。产品自己写文件时会正确转义（`\\`），但手改过的
+        // 脚本、或早期版本写出的文件可能是单反斜杠。
+        // 旧的词法扫描容忍这种输入；严格解析会**整块失败 → 该动作被静默丢弃**
+        // （2026-09-19 D2 实测：AgentAssistantSelfTest 的 3 个动作掉了 1 个）。
+        // 静默丢数据正是本项目最忌讳的失败方式，所以这里做一次精确修复：
+        // 只把「反斜杠 + 非合法转义字符」补成 `\\`，其余一律不动。
+        // **刻意不做更宽的容错** —— 那会让「残破 JSON 静默取到半个值」变回默认行为。
+        std::string fixed;
+        fixed.reserve(utf8.size());
+        for (size_t i = 0; i < utf8.size(); ++i) {
+            const char c = utf8[i];
+            if (c == '\\' && i + 1 < utf8.size()) {
+                const char n = utf8[i + 1];
+                if (n == '"' || n == '\\' || n == '/' || n == 'b' || n == 'f'
+                    || n == 'n' || n == 'r' || n == 't' || n == 'u') {
+                    fixed.push_back(c);
+                    fixed.push_back(n);
+                    ++i;
+                    continue;
+                }
+                fixed += "\\\\";   // 非法转义 → 还原成字面反斜杠
+                continue;
+            }
+            fixed.push_back(c);
+        }
+        ok_ = TryParse(fixed, doc_) && doc_.is_object();
+    }
+
+    bool valid() const { return ok_; }
+
+    bool Has(const wchar_t* key) const {
+        if (!ok_ || !key) return false;
+        return doc_.find(ToAsciiKey(key)) != doc_.end();
+    }
+
+    std::wstring GetString(const wchar_t* key, const std::wstring& fallback = {}) const {
+        if (!ok_ || !key) return fallback;
+        const auto it = doc_.find(ToAsciiKey(key));
+        if (it == doc_.end() || !it->is_string()) return fallback;
+        return FromUtf8(it->get<std::string>());
+    }
+
+    double GetNumber(const wchar_t* key, double fallback) const {
+        if (!ok_ || !key) return fallback;
+        const auto it = doc_.find(ToAsciiKey(key));
+        if (it == doc_.end() || !it->is_number()) return fallback;
+        return it->get<double>();
+    }
+
+    bool GetBool(const wchar_t* key, bool fallback) const {
+        if (!ok_ || !key) return fallback;
+        const auto it = doc_.find(ToAsciiKey(key));
+        if (it == doc_.end()) return fallback;
+        if (it->is_boolean()) return it->get<bool>();
+        // 兼容老脚本的 `1`/`0`
+        if (it->is_number()) return it->get<double>() != 0.0;
+        return fallback;
+    }
+
+    /// 直接拿已解析对象（少数需要遍历数组的场景）
+    const nlohmann::json& raw() const { return doc_; }
+
+private:
+    /// 字段名都是 ASCII 字面量（调用点全是 L"..." 形式，已核对），窄化安全。
+    static std::string ToAsciiKey(const wchar_t* key) {
+        std::string s;
+        for (const wchar_t* p = key; *p; ++p) s.push_back(static_cast<char>(*p));
+        return s;
+    }
+
+    nlohmann::json doc_;
+    bool ok_ = false;
+};
+
+/// 从自由文本（LLM 回复、带 [EXECUTED] 标记的日志）里抠出第一个 JSON 数组。/// 跳过 `[` 后不是 `{`/`[` 的方括号，按深度配对（字符串内的括号不计）。
 inline std::wstring ExtractFirstJsonArray(const std::wstring& text) {
     for (size_t i = 0; i < text.size(); ++i) {
         if (text[i] != L'[') continue;

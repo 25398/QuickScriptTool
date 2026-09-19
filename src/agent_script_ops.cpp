@@ -331,7 +331,15 @@ AgentScriptOpResult AgentSaveScriptContent(const std::wstring& fileName,
     if (content.empty()) return FailMsg(L"[错误] 缺少 content 参数。");
 
     ScriptFileData data = ParseScriptContent(content);
-    if (data.scriptName.empty()) return FailMsg(L"[错误] 内容缺少 scriptName 字段。");
+    if (data.scriptName.empty()) {
+        // 区分「JSON 本身非法」与「JSON 合法但没有 scriptName」——
+        // 前者给用户可操作的提示，后者说明格式缺字段。
+        nlohmann::json probe = nlohmann::json::parse(ToUtf8(content), nullptr, false);
+        if (probe.is_discarded()) {
+            return FailMsg(L"[错误] content 不是合法 JSON（请确认嵌入 actions 数组后括号配平）。");
+        }
+        return FailMsg(L"[错误] 内容缺少 scriptName 字段。");
+    }
     if (data.actions.empty()) return FailMsg(L"[错误] 内容中没有找到动作（actions 数组为空）。");
     if (dirHint == L"recordings") {
         data.windowMode = windowmode::DefaultWindowModeConfig();

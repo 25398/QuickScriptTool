@@ -679,9 +679,14 @@ void CaseWriteScriptAcceptsBuilt() {
     const std::wstring built = builder.execute(FromUtf8(params.dump()));
     const bool builtOk = built.find(L"已构建") != std::wstring::npos;
 
-    // 从 built 文本中截取 actions 数组，组装为完整脚本 content
+    // 从 built 文本中截取 actions 数组，组装为完整脚本 content。
+    // ⚠ 必须用**平衡括号**扫描：早期这里是 `built.find('[') .. built.rfind(']')`，
+    // 而 built 末尾还跟着中文「动作一览」，其中含 '[' → 截出来的不是合法 JSON。
+    // 产品当时的手写词法解析容忍了它，所以测试一直"通过"；D2 把文档级字段提取
+    // 换成严格解析后暴露出来（报错：unexpected '['; expected '}'）。
     const size_t lb = built.find(L'[');
-    const size_t rb = built.rfind(L']');
+    const size_t rb = lb == std::wstring::npos
+        ? std::wstring::npos : FindMatchingJsonBracket(built, lb);
     const std::wstring actionsJson =
         lb != std::wstring::npos && rb != std::wstring::npos && rb > lb
             ? built.substr(lb, rb - lb + 1) : L"";
