@@ -13,6 +13,15 @@
 - Bridge / 分期：[`docs/webview-bridge-api.md`](docs/webview-bridge-api.md)
 - 原生分层盘点：[`docs/webview-native-layering.md`](docs/webview-native-layering.md)
 - 打包：`powershell -File tools\package_webview_portable.ps1` → `dist\QstWebViewShell-Portable.zip`；完整发版 `tools\package_release.ps1`（主产物 Shell）
+- **一键发版**：`powershell -ExecutionPolicy Bypass -File tools\package_with_version.ps1 -Version 1.3.4`
+  —— 自动写版本号三处 → 构建 → 组装 dist + 便携 zip → 编安装包 → 同步 `website\downloads`。
+  刻意不依赖写死的东西：版本号用正则写入（不依赖行号）、构建目标从 `package_release.ps1` 解析 `--target`、
+  打包逻辑完全复用该脚本，所以后续新增源码 / UI / 扩展 / Skill 都不用改它。失败默认回滚版本号；
+  `-DryRun` 只看计划，`-SkipBuild` / `-SkipInstaller` 可裁剪步骤。
+  **需在普通 PowerShell / CMD 终端运行** —— 受限宿主（某些 AI 终端 / 沙箱）禁止启动 cmake/ISCC，脚本会提前提示。
+  最省事的入口是仓库根目录的 **`release.cmd`**（纯 ASCII，会先 `cd /d "%~dp0"`，所以在任何目录下调用都行；
+  双击时结束会 pause）：`release.cmd 1.3.4`、`release.cmd 1.3.4 -DryRun`，不带参数则提示输入版本号。
+  直接用 PowerShell 调用时**必须给绝对路径**（在别的目录下用相对路径会报「`-File` 形式参数不存在」）。
 - 发版版本：`tools\product_version.txt`（须同步 `installer\QuickScriptTool.iss` 的 `MyAppVersion` 与 `src\app_branding.cpp`）
 - 发版依赖：运行必需项（MSVC CRT 旁路、`WebView2Fixed`、`ui`、OpenCV、扩展、驱动**安装脚本**）必须进 zip/安装包；`interception.dll` / `.sys` 不进默认包（设置里下载 `QuickScriptTool-HidDriver.zip`）；OCR Python 可运行时再装
 
@@ -46,6 +55,9 @@ powershell -ExecutionPolicy Bypass -File tools\package_webview_portable.ps1
 | 连点时序 | `ClickerTimingSelfTest` | 见元 Skill FAIL 表 |
 | 录制回放 | `RecorderSelfTest` → `QstRecorderLogicTest.exe` | 见元 Skill FAIL 表 |
 | 虚拟 HID | `VirtualHidSelfTest` | `driver/qst_vhid/` + `src/input/virtual_hid.*` |
+| 桥接 JSON | `BridgeJsonSelfTest` | `src/json_util.h`（`GetSubObjectText` / 解析失败诊断） |
+| 桥接命令契约 | `BridgeContractSelfTest` | `src/webview/bridge_commands.h` ↔ C++ 分派 ↔ `ui/*.js` |
+| 引擎执行 | `ScriptRunnerSelfTest` | `src/engine/engine_ui_hooks.*` + 执行核心；`--engine` 跑 headless 动作 |
 
 共享 harness：`tools/selftest_harness.h`。各 exe：`tools/*_selftest.cpp`。
 
@@ -60,6 +72,42 @@ build\Release\<Target>.exe --json
 窗口模式可选烟雾：`--macro`。定时任务硬规则见 scheduled-task-debug skill。
 
 PowerShell 不要用 `/t:A;B` 拼多个 target（分号会拆命令）；分开跑。`--list` / `--json` 结果均在 stdout。
+
+### 一键跑全部自检（推荐入口）
+
+```powershell
+# 构建 + 跑 15 个纯逻辑 suite（CI 同款口径，失败即 exit != 0）
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1
+
+# 已构建过，只跑不编；同时落盘日志
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1 -SkipBuild -LogPath build\selftest.log
+
+# 加跑交互类（窗口模式 / 虚拟 HID / 注入，需桌面会话与已装驱动）
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1 -Tier full
+```
+
+CI：`.github/workflows/build.yml`（push/PR 自动构建产品壳 + **21 个** SelfTest 目标，跑其中的逻辑档
+—— 逻辑档当前 **18 个** suite；窗口模式 / 虚拟 HID / 注入 3 个只编不跑，需桌面会话与已装驱动）。
+> 数量会随新增 suite 变化，以 `tools/run_all_selftests.ps1` 的 `$LogicSuites` / `$InteractiveSuites` 为准。
+
+### 构建陷阱（踩过，别再踩）
+
+- **MSBuild + `https_proxy`/`HTTPS_PROXY` 并存 → 直接失败**。报错是
+  `MSB6001: "CL.exe"的命令行开关无效。System.ArgumentException: 已添加项。字典中的关键字:"https_proxy"…`，
+  看起来像编译开关问题，实际是 MSBuild 用大小写不敏感的字典构造子进程环境。
+  绕法：构建前在本进程内 `Remove-Item Env:HTTPS_PROXY`（`run_all_selftests.ps1` 已内置护栏）。
+- **OBJECT 库的 `.obj` 不会经由中间 OBJECT 库传递**。只链 `qst_engine` 会缺
+  `qst_desktop_tools` 的符号（`RenderBatchScope` / `UiEditorWidth` / `ResolveProgramLaunchPath`），
+  所以链接列表要像 `QstWebViewShell` 那样逐个列出。想让某个源只编一次，**必须用 STATIC 库**
+  （`qst_utils` 即此例），OBJECT 库做不到。
+- **`qst_engine` 目前无法脱离壳链接**：`qst::webview::PostToWebUi` / `HotkeyLogLine` /
+  `NotifyWebDebugWindowSetting` / `SyncHomeSelectionCache` 与 `g_instance` 只在
+  `src/webview/qst_webview_shell.cpp` 定义。SelfTest 链引擎需带上 `tools/engine_link_stubs.cpp`
+  （空实现）。彻底修法见 `docs/refactor-progress.md` §3.1。
+- **含中文的 `.ps1` 必须 UTF-8 带 BOM**（ANSI 代码页是 GB2312）。写文件用
+  `[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))`。
+  全仓自查：`tools/` 与 `driver/qst_vhid/` 下曾各有一批漏网的（含
+  `package_webview_portable.ps1`，会让便携包内的中文 README 整个乱码）。
 
 ## Edge 配套扩展（发版必带）
 

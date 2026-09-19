@@ -18,6 +18,20 @@ description: >-
 4) FAIL 的 name → 对照表改源码  5) 再编再跑直到 exit 0
 ```
 
+**批量回归（推荐先跑这个）**：`tools\run_all_selftests.ps1` —— 构建 + 跑全部纯逻辑 suite，
+按 exit code 判定，失败回显原始输出。CI（`.github/workflows/build.yml`）用的就是它，
+所以本地与 CI 判定口径一致。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1                 # 构建 + 跑全部逻辑 suite
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1 -SkipBuild      # 只跑不编
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1 -Tier full      # 加交互类（需桌面会话/驱动）
+powershell -ExecutionPolicy Bypass -File tools\run_all_selftests.ps1 -LogPath build\selftest.log
+```
+
+> 本机构建前必须 `unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy`，否则 MSBuild 抛
+> `MSB6001 … 字典中的关键字:"https_proxy"`（脚本已内置该护栏）。详见 AGENTS.md「构建陷阱」。
+
 ## 硬性约定
 
 | 项 | 约定 |
@@ -65,6 +79,9 @@ PowerShell 不要用分号拼多个 `/t:A;B`（会拆成多条命令）；多个
 | `recorder` | `RecorderSelfTest`（产物 `QstRecorderLogicTest.exe`） | 录制排序/转换/时间轴/调度器 | 下表 | `src/recorder*.cpp`, `src/input_timeline_scheduler.cpp` |
 | `virtual_hid` | `VirtualHidSelfTest` | VirtualHid 键/相对/绝对/滚轮注入；进程被杀须抬起（驱动 FileCleanup） | 下表 | `src/input/virtual_hid.*`, `input_emergency_teardown.*`, `driver/qst_vhid/` |
 | `injection` | `InjectionSelfTest` | 注入对抗测试：7 种注入技术 + PEB 隐藏 + XOR；`--inject <pid> <dll> <technique>` 驱动真实目标测试 | 见 `docs/anticheat-injection-testing.md` | `src/window_mode/injection/**`, `tools/injection_selftest.cpp`, `tools/injection_test_*.cpp` |
+| `bridge_json` | `BridgeJsonSelfTest` | **改桥接 JSON / `json_util.h` / `saveSettings` 全链路时必跑**：JS 消息形状 ↔ C++ 解析严格度、取子对象、解析失败诊断 | 见下 | `src/json_util.h`, `tools/bridge_json_selftest.cpp` |
+| `script_runner` | `ScriptRunnerSelfTest` | **改引擎→壳调用、`engine_ui_hooks.*`、或执行核心时必跑**：UI 钩子契约（默认）+ headless 跑 Wait/Loop/Goto/VarCompute（`--engine`） | 见下 | `src/engine/engine_ui_hooks.*`, `src/engine/engine_script_run.cpp` |
+| `bridge_contract` | `BridgeContractSelfTest` | **改桥接命令（加/改/删 `type`）时必跑**：命令表 ↔ C++ 入站分派 ↔ `ui/*.js` 发送侧 双向校验 | 见下 | `src/webview/bridge_commands.h`, `tools/bridge_contract_selftest.cpp` |
 
 ### 仍偏手工（无 exe）
 
@@ -410,6 +427,93 @@ Agent / `buildScriptActions` schema、`agent_reference`、工具描述须与此�
 | `mouse_abs_jump` | 仅更新内部状态（不发 Report ID 3）；桌面绝对由 SetCursorPos |
 | `mouse_wheel` | Report ID 2 wheel/hwheel |
 | `release_all_no_stick` | `ReleaseAll` / EndSession |
+
+### BridgeJsonSelfTest
+
+> 背景：2026-09-18 验收发现的 P0 —— `saveSettings` 静默失效（改设置提示成功、实际写回旧值）。
+> 根因是壳用 `substr(首个 '{')` 截到末尾，payload 多带外层 `}` → 非法 JSON；旧的手写字符
+> 扫描容忍它，换 nlohmann 严格解析后所有键取不到。641 个用例全绿也照不到，因为桥接层零覆盖。
+> 全文：`docs/refactor-acceptance.md` §3；测试规格：§7.3。
+
+| name | 优先查看 |
+|------|----------|
+| `subobject_last_key` / `subobject_not_last_key` | `jsonutil::GetSubObjectText`（严格解析取**配对**对象，禁止括号扫描） |
+| `subobject_brace_and_nested` | 同上（值里含 `}` 字符 / 嵌套对象不得被截断） |
+| `subobject_missing_or_null` | 同上（键缺失 / null / 非对象 → false） |
+| `subobject_invalid_json_no_throw` | `TryParse`（非抛异常）；`GetSubObjectText` 的 `dump(..., error_handler_t::replace)` |
+| `regression_trailing_outer_brace` | **本次事故的回归锁**：残破 payload 必须被 `IsParseableObject` 拒绝 |
+| `subobject_applyable_fields` | 子对象文本可被 `GetInt/GetBool/GetNumber/GetActionTokenArray` 直接消费 |
+| `diagnostics_silent_on_valid` | 合法输入**不得**产生诊断（否则日志噪音） |
+| `diagnostics_reports_invalid` | `NoteParseFailure` / `ParseFailureCount` / `SetParseFailureSink`；产品侧 sink 在 `qst_webview_shell.cpp` 写 `webview_boot.log`（`JSON: 解析失败 where=…`） |
+
+**改动本域时的硬规则**：
+
+- 取子对象**只能**用 `GetSubObjectText`；不要写 `json.find('{')` + `substr`（A/B 实测：
+  打回这种写法，本 suite 立刻 5 条变红）。
+- 不要把解析失败做成「宽容模式」开关 —— 那会让「残破 JSON 静默取到半个值」重新成为默认
+  （验收报告 §7.4）。严格解析是对的，错的是调用方构造了非法 JSON。
+- 新增桥接命令时同步 `ui/bridge.js`（见 #10 桥接契约正式化，`BridgeContractSelfTest`）。
+
+### ScriptRunnerSelfTest
+
+> 背景：此前 `qst_engine` **无法脱离壳链接**（缺 `PostToWebUi` / `HotkeyLogLine` /
+> `NotifyWebDebugWindowSetting` / `SyncHomeSelectionCache` / `g_instance`），所以没有任何
+> SelfTest 能链引擎 —— 这才是「引擎主循环零单测」的机制性根因。B 段把 4 个函数倒置成
+> 回调注入（`src/engine/engine_ui_hooks.*`）、`g_instance` 定义搬到 `qst_utils` 之后，
+> 引擎可独立链接。详见 `docs/refactor-acceptance.md` §7.2 B1/B3。
+
+| name | 优先查看 |
+|------|----------|
+| `hooks_default_noop` | 未装钩子时 4 个转发必须安全 no-op（引擎要能在无 UI 进程里跑） |
+| `hooks_installed_flag` / `hooks_forward_*` | `qst::engine::SetUiBridgeHooks` 与 4 个转发函数（`engine_ui_hooks.cpp`） |
+| `hooks_merge_semantics` | `SetUiBridgeHooks` **只覆盖非空成员** —— 壳的真实现分布在两个 TU（bridge backend 三个 + shell 热键日志一个），改成整体覆盖会互相清空 |
+| `engine_headless_start`（`--engine`） | `qst::engine::Start` / 测试进程需自抽消息 |
+| `engine_run_varcompute_wait` / `engine_run_loop_body` / `engine_run_goto_skips`（`--engine`） | `DebugRunActions` + 执行核心；断言用**时序语义**（循环重复→耗时成倍、goto→耗时骤减） |
+
+**改动本域时的硬规则（都是实测踩出来的）**：
+
+- 引擎调壳**只能**走 `engine_ui_hooks.h`。不要让引擎再 `#include "webview/webview_bridge_backend.h"`
+  ——那会把「引擎无法脱离壳链接」重新钉回去。
+- 测试里**不要**调 `qst::engine::Shutdown()`：headless 引擎窗的 `WM_DESTROY` 会走
+  `TerminateProcess`，直接把测试进程杀掉，且 stdout 是块缓冲 → **输出全丢、exit 还是 0**
+  （现象是「什么都没发生」，极难定位）。进程退出时由 OS 回收即可。
+- headless 跑动作时**必须自己 `PeekMessage` 抽消息**，否则收尾信号不派发、
+  `IsRunning()` 永远为真（实测跑完 2 步后 10s 仍不收尾）。
+- `ExecutedSteps()` 在收尾后被清零 → 只能在运行中采样取最大值；不要用「收尾后读步数」做断言。
+- 循环体编码：用 `FlattenNestedActionParamList`（生产构建器）生成，**不要手搓 indent**。
+  生产编码是 `[loop(indent=0), body(indent=1)]`，**不生成 endLoop**；显式塞一个
+  `indent=1` 的 endLoop 会把循环体提前切断（实测循环体只跑一遍）。
+
+### BridgeContractSelfTest
+
+> 背景：桥接层是「JS 发的消息形状」与「C++ 解析的严格度」之间的**隐式契约**，两侧各写各的
+> 字符串字面量，没有任何东西校验它们对得上——2026-09-18 的 `saveSettings` P0 就长在这条缝上。
+> 现在 C++ 入站命令面显式声明在 `src/webview/bridge_commands.h`，本 suite 双向校验。
+> 详见 `docs/refactor-acceptance.md` §7.2 C 段与 `docs/refactor-progress.md` §八。
+
+| name | 优先查看 |
+|------|----------|
+| `table_no_duplicates` | `kBridgeJsCommands` / `kBridgeCppOnlyCommands` 无重名且不交集 |
+| `table_all_handled_in_shell` | 表里每条，`qst_webview_shell.cpp` 的 `type == "..."` 分派里必须真有分支 |
+| `table_all_sent_by_js` | **表里每条，JS 侧必须真的会发**（防「加了 C++ 分支但没人调」） |
+| `table_sender_files_exist` | 表里登记的 sender 文件存在于 `ui/` 下 |
+| `shell_dispatch_all_declared` | C++ 分派全部已登记（防「加了 JS 调用忘加 C++ 分支」→ 静默无响应） |
+| `cpp_only_all_handled_and_reasoned` | 例外表每条有理由且确有分派 |
+| `cpp_only_not_sent_by_js` | 例外当前无人发；一旦被发就该升级进正式表 |
+| `js_sends_all_declared` | JS 实际发的每条都在表里（无孤儿命令） |
+
+**改动桥接时的硬规则**：
+
+- 新增 JS→C++ 命令的顺序：① 在 `bridge.js`（或 `debug.html` / `agent.html`）加发送方 →
+  ② 在 `kBridgeJsCommands` 登记（含 sender）→ ③ 在 `qst_webview_shell.cpp` 加入站分派。
+  三步缺一，本 suite 会红。
+- C++ 分支先落地、JS 侧还没接：登记到 `kBridgeCppOnlyCommands` 并写清理由。
+- **不要**把脚本动作 JSON 的 `type`（`loop`/`if`/`wait`/`mouseClick`…）当桥接命令。
+- 测试提取 JS 侧时必须区分**专用发送方**（`bridge.js`/`debug.html`/`agent.html`，整文件取 `type:`）
+  与**混合文件**（`app.js`/`pro-mode.js`/`visual_editor.js`/`index.html`，只取 `post(...)` 实参里的）；
+  不加区分会出现 `loop`/`else`/`macro`/`ai`/`rec`/`sched`/`paint` 等 7 个假阳性。
+- 壳收到未知命令会回 `{"type":"error"}`（`app.js:14403` 弹 toast）**并写 `webview_boot.log`**
+  —— 桥接层不允许「无痕失败」。
 
 ## 相关
 

@@ -36,6 +36,17 @@ flameshot_analysis/
 fetched_*.cpp
 .cvresearch/
 
+# Research scratch（调研草稿不入公开仓库；office 文档 IO 报告被 AGENTS.md 引用，保留）
+.research/*
+!.research/office-document-io-report.md
+.dsh-research/
+
+# 误提交的 CLI 输出残留（commit 09eb790）
+query
+
+# 遗留空目录
+archive/
+
 # Garbled / backup doc variants (e.g. *.md.fixed)
 *.md.fixed
 
