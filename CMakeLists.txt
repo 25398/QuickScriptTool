@@ -387,6 +387,18 @@ qst_add_selftest(ScriptIoSelfTest
         user32 gdi32 shell32 shlwapi
 )
 
+# D 段（#4 统一序列化）的安全网：脚本 读→写→再读 往返。
+# 默认跑内置合成用例（CI 安全）；--corpus <dir> 跑真实历史脚本库（D1 基线）。
+qst_add_selftest(ScriptSerializationSelfTest
+    tools/script_serialization_selftest.cpp
+    tools/window_mode_link_stubs.cpp
+    LIBS
+        script_action_builder_core
+        script_core_common
+        ${OpenCV_LIBS}
+        user32 gdi32 shell32 shlwapi
+)
+
 qst_add_selftest(ImageMatchSelfTest
     tools/image_match_selftest.cpp
     LIBS

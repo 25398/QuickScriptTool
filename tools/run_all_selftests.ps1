@@ -83,7 +83,8 @@ $LogicSuites = @(
     'RecorderSelfTest',
     'BridgeJsonSelfTest',
     'ScriptRunnerSelfTest',
-    'BridgeContractSelfTest'
+    'BridgeContractSelfTest',
+    'ScriptSerializationSelfTest'
 )
 
 # interactive：需要桌面会话（窗口模式）/ 已装内核驱动（虚拟 HID）/ 管理员（注入）。

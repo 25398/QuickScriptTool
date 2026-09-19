@@ -74,7 +74,7 @@ jobs:
           --target AiActionRouterSelfTest --target AgentAssistantSelfTest --target AppSettingsStoreSelfTest
           --target ThemeUiSelfTest --target BreakoutCooldownSelfTest --target HotkeyStopSelfTest
           --target ClickerTimingSelfTest --target ScheduledTaskSelfTest --target RecorderSelfTest
-          --target BridgeJsonSelfTest --target ScriptRunnerSelfTest --target BridgeContractSelfTest
+          --target BridgeJsonSelfTest --target ScriptRunnerSelfTest --target BridgeContractSelfTest --target ScriptSerializationSelfTest
           --target WindowModeSelfTest --target VirtualHidSelfTest --target InjectionSelfTest
 
       # ── 跑自检（--json，按 exit code 判定）─────────────────────────
