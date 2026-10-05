@@ -2983,13 +2983,16 @@ void WindowModeExecutor::PostMouseClickAtClient(int cx, int cy, MouseButtonType 
         if (!PrepareSoftInputFast(prepErr)) return;
     }
     if (!MapScriptPointToClient(cx, cy, scaleRecordedClient)) return;
+    // ⚠⚠ 2026-10-05：同 `PostMouseButtonAtClient` —— **必须先把 `(0,0)` 哨兵解析掉**
+    //   再交给 UIA，否则 UIA 拿到 `(0,0)` ⇒ `ClientToScreen` 得到**客户区原点**
+    //   ⇒ 跑到窗口左上角找元素。（这里原来也排在 UIA 分支之后。）
+    ResolveClickClientPos(cx, cy);
     // UWP/WinUI：与 PostMouseButtonAtClient 相同，不依赖 windowRelativeCoordinates。
     if (!IsCdpInputMode()
         && WindowUsesUiaClickFallback(TopLevelTargetWindow(TargetHwnd()))
         && TryUiaClickAtClient(cx, cy)) {
         return;
     }
-    ResolveClickClientPos(cx, cy);
     WindowModeLogEventf(L"[窗口/后台窗口模式] 点击 → 客户区(%d,%d) %s",
         cx, cy, button == MouseButtonType::Left ? L"左键"
             : button == MouseButtonType::Right ? L"右键"

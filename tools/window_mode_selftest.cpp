@@ -673,9 +673,16 @@ void TestUiaInvokeCrossProcess() {
         return;
     }
     HWND w = nullptr;
-    for (int i = 0; i < 60 && !w; ++i) {
+    // ⚠ 2026-10-05：原来只等 6 秒（60×100ms）—— 机器忙/并行构建时子进程可能起得慢，
+    //   会偶发「子进程窗口未出现」的**假失败**。放宽到 15 秒。
+    for (int i = 0; i < 150 && !w; ++i) {
         Sleep(100);
         w = FindWindowW(L"QstUiaXProcProbe", nullptr);
+        // 子进程若已退出（起不来/秒退），不必再等
+        if (!w && pi.hProcess
+            && WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+            break;
+        }
     }
     bool ok = false;
     std::wstring detail = L"子进程窗口未出现";
