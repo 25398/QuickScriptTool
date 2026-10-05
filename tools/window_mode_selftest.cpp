@@ -499,12 +499,19 @@ void TestScreenPointOcclusionCheck() {    // 屏幕外的点：WindowFromPoint �
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 60, 60, 420, 300,
         nullptr, nullptr, wc.hInstance, nullptr);
     bool insideOk = true;
+    std::wstring occluder;   // 诊断：若中心点被判「不属于前台」，是谁盖着它
     if (w) {
         ShowWindow(w, SW_SHOW);
         SetForegroundWindow(w);
-        // 只有真的抢到前台才验证「窗口内点= 属于前台」；抢不到（被别的程序挡住
-
-        // 测试机前台策略限制）就跳过这半条——否则这条会变成环境相关的假失败。
+        // ⚠⚠ 2026-10-05：`SetForegroundWindow` **不一定**能把测试窗口放到最上层 ——
+        //   用户机器上若有 `WS_EX_TOPMOST` 的窗口（实测：`Chrome_RenderWidgetHostHWND`），
+        //   它仍会盖住中心点 ⇒ `WindowFromPoint` 返回那个置顶窗
+        //   ⇒ 误报「窗口内点不属于前台」（实测 `inside=0 中心点被「Chrome_...」盖住`）。
+        //   ⇒ 临时把测试窗口置顶，判定完立即撤销（`NOACTIVATE`，不抢焦点）。
+        SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // 只有真的抢到前台才验证「窗口内点 = 属于前台」；抢不到（被别的程序挡住
+        // / 测试机前台策略限制）就跳过这半条 —— 否则这条会变成环境相关的假失败。
         HWND fgNow = GetForegroundWindow();
         const bool weAreForeground = fgNow && GetAncestor(fgNow, GA_ROOT) == GetAncestor(w, GA_ROOT);
         RECT rc{};
@@ -512,13 +519,25 @@ void TestScreenPointOcclusionCheck() {    // 屏幕外的点：WindowFromPoint �
             const int cx = (rc.left + rc.right) / 2;
             const int cy = (rc.top + rc.bottom) / 2;
             insideOk = windowmode::IsScreenPointOnForegroundWindow(cx, cy);
+            // ⚠ 2026-10-05：`insideOk` 默认 true，只有抢到前台才赋值 ⇒ 它变 0 意味着
+            //   「**窗口是前台，但中心点仍被判不属于前台**」⇒ 该点上**有东西盖着**
+            //   （置顶窗 / 输入法候选 / 悬浮球 / 我们的取点浮层）。原来只报 `inside=0`，
+            //   看不出是谁盖的 ⇒ 补上 `WindowFromPoint` 的结果。
+            if (!insideOk) {
+                POINT pt{cx, cy};
+                HWND at = WindowFromPoint(pt);
+                wchar_t cls[128]{};
+                if (at) GetClassNameW(at, cls, 128);
+                occluder = (at ? (cls[0] ? cls : L"(无类名)") : L"(null)");
+            }
         }
         DestroyWindow(w);
     }
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    selftest::Emit(L"screen_point_occlusion_check", outside && insideOk,
-        (L"outside=" + std::to_wstring(outside ? 1 : 0) + L" inside="
-            + std::to_wstring(insideOk ? 1 : 0)).c_str());
+    std::wstring detail = L"outside=" + std::to_wstring(outside ? 1 : 0)
+        + L" inside=" + std::to_wstring(insideOk ? 1 : 0);
+    if (!occluder.empty()) detail += L" 中心点被「" + occluder + L"」盖住";
+    selftest::Emit(L"screen_point_occlusion_check", outside && insideOk, detail.c_str());
 }
 
 void TestSoftInputFastPath() {

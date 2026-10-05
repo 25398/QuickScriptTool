@@ -1,6 +1,7 @@
 #include "background_uia_input.h"
 
 #include "com_apartment.h"
+#include "window_mode_log.h"
 
 #include <UIAutomation.h>
 #include <wrl/client.h>
@@ -17,6 +18,20 @@ namespace windowmode {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+/// ⚠⚠ 2026-10-05：UIA 兜底的**每条失败路径原来都是静默 `return false`**
+/// ⇒ 用户报「UWP 计算器点击没反应」时，日志里**连「试过 UIA」都看不出来**
+/// （只有**成功**才会打「UIA 点击 屏幕(x,y) 客户区(x,y)」）⇒ 只能靠读源码猜。
+/// ⇒ 失败必须能看见；**限流**（点击可能很频繁，只在首次失败打一条）。
+void LogUiaFailOnce(const wchar_t* stage, long hr, int sx, int sy) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] ⚠ UIA 兜底失败于「%s」hr=0x%08lX 屏幕(%d,%d)"
+        L" ⇒ 该点击会退回 PostMessage（UWP/WinUI 不响应 PostMessage ⇒ 表现为「点击没反应」）",
+        stage, static_cast<unsigned long>(hr), sx, sy);
+}
 
 bool TryValuePatternSet(IUIAutomationElement* element, const std::wstring& text) {
     if (!element) return false;
@@ -185,22 +200,30 @@ bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
     const HRESULT hrCo = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(&uia));
     if (FAILED(hrCo) || !uia) {
+        LogUiaFailOnce(L"CoCreateInstance(CUIAutomation)", static_cast<long>(hrCo), sx, sy);
         return false;
     }
     ComPtr<IUIAutomationElement> root;
-    if (FAILED(uia->ElementFromHandle(topLevel, &root)) || !root) {
+    const HRESULT hrRoot = uia->ElementFromHandle(topLevel, &root);
+    if (FAILED(hrRoot) || !root) {
+        LogUiaFailOnce(L"ElementFromHandle", static_cast<long>(hrRoot), sx, sy);
         return false;
     }
 
     ComPtr<IUIAutomationElementArray> arr;
     ComPtr<IUIAutomationCondition> allCond;
-    if (FAILED(uia->CreateTrueCondition(&allCond)) || !allCond) return false;
-    if (FAILED(root->FindAll(TreeScope_Descendants,
-            allCond.Get(), &arr)) || !arr) {
+    if (FAILED(uia->CreateTrueCondition(&allCond)) || !allCond) {
+        LogUiaFailOnce(L"CreateTrueCondition", 0, sx, sy);
+        return false;
+    }
+    const HRESULT hrFind = root->FindAll(TreeScope_Descendants, allCond.Get(), &arr);
+    if (FAILED(hrFind) || !arr) {
+        LogUiaFailOnce(L"FindAll(Descendants)", static_cast<long>(hrFind), sx, sy);
         return false;
     }
     int count = 0;
     if (FAILED(arr->get_Length(&count)) || count <= 0) {
+        LogUiaFailOnce(L"FindAll 返回 0 个元素（UWP 的 UIA 树为空？）", 0, sx, sy);
         return false;
     }
 
@@ -223,7 +246,12 @@ bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
         best = el;
         bestArea = area;
     }
-    if (!best) return false;
+    if (!best) {
+        LogUiaFailOnce(
+            L"该点下没有支持 Invoke/Toggle 的 UIA 元素（坐标不对？或该控件不走 UIA）",
+            0, sx, sy);
+        return false;
+    }
 
     // UIA Invoke 对 UWP 会激活窗口。标准做法（AHK / 后台键鼠）：
     // WS_EX_NOACTIVATE + LockSetForegroundWindow，尽量不让系统切前台。
