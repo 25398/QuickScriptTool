@@ -1,5 +1,10 @@
 #include "ocr_engine.h"
 
+#include "ocr_backend.h"
+
+/// 由 ocr_winrt.cpp 提供：把一行摘要送给已安装的诊断 sink
+void EmitOcrDiagnostic(const std::wstring& line);
+
 #include "base64.h"
 #include "image_match.h"
 #include "opencv_runtime.h"
@@ -53,6 +58,10 @@ bool EnsureDirectory(const std::wstring& path) {
 }
 
 constexpr wchar_t kOcrVenvDir[] = L"C:\\paddle_env\\venv";
+/// ★★ OCR 前降采样的**长边上限**（0=不降采样）。见 `RunOcrOnBitmap` 的说明：
+///   常驻会话接上后单次仍 9~12s，慢在「整屏喂给 Paddle」的推理本身。
+constexpr int kOcrDownscaleMaxLongEdge = 1280;
+
 constexpr wchar_t kOcrVenvPythonExe[] = L"C:\\paddle_env\\venv\\Scripts\\python.exe";
 constexpr wchar_t kOcrBasePythonExe[] = L"C:\\paddle_env\\python312\\python.exe";
 constexpr wchar_t kOcrBasePythonDir[] = L"C:\\paddle_env\\python312";
@@ -488,6 +497,57 @@ bool EncodeHbitmapPngBase64(HBITMAP bitmap, std::string& b64Out) {
     return !b64Out.empty();
 }
 
+}  // namespace（下面这些函数要被别的 TU 调用 ⇒ 必须外部链接，声明在 ocr_engine.h）
+
+namespace {
+
+/// 交付尺寸规则：长边不得超过 `maxLongEdge`（与 `BuildAttachmentFromImageMat` 同一条），
+/// 超出就按同一比例缩。**只缩不放** —— 放大交给 `zoom` 在裁剪阶段做。
+cv::Size AttachmentDeliverySize(int w, int h, int maxLongEdge) {
+    const int longEdge = (w > h) ? w : h;
+    if (maxLongEdge <= 0 || longEdge <= maxLongEdge || longEdge <= 0) return cv::Size(w, h);
+    const double scale = static_cast<double>(maxLongEdge) / static_cast<double>(longEdge);
+    return cv::Size((std::max)(1, static_cast<int>(w * scale + 0.5)),
+        (std::max)(1, static_cast<int>(h * scale + 0.5)));
+}
+
+}  // namespace
+
+// ⚠ 位置有讲究：**必须在上面那个 `}  // namespace` 之后**。第一版把它写在匿名 namespace
+//   里面 ⇒ 内部链接 ⇒ 别的 TU（`engine_script_run.cpp` 的 zoom 钩子）调用时 LNK2019
+//   （实测报 `无法解析的外部符号 SaveHbitmapJpeg`）。同一天在 `macro_execute_tools.cpp`
+//   也踩了同一形状（`MakeReadDocumentTool`）⇒ 加一个给别的 TU 用的函数，先问自己在不在
+//   匿名 namespace 里。
+bool SaveHbitmapJpeg(HBITMAP bitmap, const std::wstring& path, int quality, int maxLongEdge,
+    int* outWidth, int* outHeight, size_t* outBytes) {
+    if (outWidth) *outWidth = 0;
+    if (outHeight) *outHeight = 0;
+    if (outBytes) *outBytes = 0;
+    if (path.empty() || !OpenCvAvailable()) return false;
+    cv::Mat bgr = OcrBitmapToBgr(bitmap);
+    if (bgr.empty()) return false;
+    const cv::Size want = AttachmentDeliverySize(bgr.cols, bgr.rows, maxLongEdge);
+    if (want.width != bgr.cols || want.height != bgr.rows) {
+        cv::Mat resized;
+        cv::resize(bgr, resized, want, 0, 0, cv::INTER_AREA);
+        bgr = resized;
+    }
+    std::vector<uchar> jpg;
+    const std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, quality };
+    if (!cv::imencode(".jpg", bgr, jpg, params) || jpg.empty()) return false;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"wb") != 0 || !fp) return false;
+    const size_t wrote = fwrite(jpg.data(), 1, jpg.size(), fp);
+    fclose(fp);
+    if (wrote != jpg.size()) return false;
+    if (outWidth) *outWidth = bgr.cols;
+    if (outHeight) *outHeight = bgr.rows;
+    if (outBytes) *outBytes = jpg.size();
+    return true;
+}
+// 把 HBITMAP 存成 PNG（`zoom` 工具回传放大图靠它）。
+// ⚠ 内部经 `EncodeHbitmapPng` 走 **OpenCV 的 imencode**（那里已守 `OpenCvAvailable()`）——
+//    无 OpenCV 时它返回 false，调用方必须**如实报失败**，别假装拿到了图。
 bool SaveHbitmapPng(HBITMAP bitmap, const std::wstring& path) {
     std::vector<uchar> png;
     if (!EncodeHbitmapPng(bitmap, png) || png.empty()) return false;
@@ -497,6 +557,8 @@ bool SaveHbitmapPng(HBITMAP bitmap, const std::wstring& path) {
     fclose(fp);
     return wrote == png.size();
 }
+
+namespace {
 
 std::wstring NormalizeOcrSearchText(const std::wstring& text) {
     std::wstring out;
@@ -535,6 +597,15 @@ double OcrTextSimilarity(const std::wstring& a, const std::wstring& b) {
     if (denom <= 0) return 1.0;
     const int dist = LevenshteinDistance(a, b);
     return 1.0 - (static_cast<double>(dist) / static_cast<double>(denom));
+}
+
+/// 相似度(0~1) → **匹配度百分比(0~100)**，四舍五入。与找图 `.matchData` 同一把尺，
+/// 于是「文字查找」和「找图」的阈值写法一致（`if(a.matchData >= 65)`）。
+int OcrSimilarityPercent(double score) {
+    int pct = static_cast<int>(score * 100.0 + 0.5);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
 }
 
 OcrTextLine UnionOcrLines(const OcrTextLine& a, const OcrTextLine& b) {
@@ -1239,8 +1310,10 @@ OcrEngineOutput RunOcrOnImagePathOneShot(const std::wstring& imagePath, bool dig
     return ParseOcrJson(stdoutText);
 }
 
-OcrEngineOutput RequestOcrOnHbitmap(HBITMAP bmp, bool digitsOnly) {
+/// Python（venv + RapidOCR/PaddleOCR）后端。产品默认走这条。
+static OcrEngineOutput RequestOcrOnHbitmapPython(HBITMAP bmp, bool digitsOnly) {
     OcrEngineOutput output;
+
     std::string imageB64;
     const bool haveB64 = EncodeHbitmapPngBase64(bmp, imageB64);
     std::wstring imagePath;
@@ -1278,6 +1351,47 @@ OcrEngineOutput RequestOcrOnHbitmap(HBITMAP bmp, bool digitsOnly) {
     if (!imagePath.empty()) DeleteFileW(imagePath.c_str());
     return output;
 }
+
+OcrEngineOutput RequestOcrOnHbitmap(HBITMAP bmp, bool digitsOnly) {
+    // 按偏好给出的顺序依次尝试，第一个成功的就是结果。
+    //   Python（产品默认）→ 只走 Python，**行为与引入本层之前完全一致**
+    //   WinRt            → 只走系统 OCR
+    //   Auto（导出「走软件」）→ **Python 优先**，不可用才回退系统 OCR
+    //
+    // ⚠ Auto 为什么必须 Python 优先：它对应"复用已装软件里的组件"，
+    //   用户期望和软件里跑出**一样**的结果，而软件里用的就是 PaddleOCR。
+    //   反过来（先试系统 OCR）会让「走软件」永远用不上软件里的引擎 ——
+    //   实测踩过：某脚本靠 OCR 读血量数字决定是否按键，两种模式都变成了
+    //   系统 OCR 的数字，于是"软件里好好的、导出的 exe 就是不行"。
+    const auto order = OcrBackendAttemptOrder(OcrBackendPreference());
+    OcrEngineOutput last;
+    for (OcrBackend b : order) {
+        OcrEngineOutput out = (b == OcrBackend::Python)
+            ? RequestOcrOnHbitmapPython(bmp, digitsOnly)
+            : RunWinRtOcr(bmp, digitsOnly);
+        const wchar_t* label = (b == OcrBackend::Python) ? L"软件引擎" : L"系统OCR";
+        out.backend = label;
+        if (out.success) {
+            std::wstring joined;
+            for (const auto& l : out.lines) {
+                if (!joined.empty()) joined += L" ";
+                joined += l.text;
+            }
+            if (joined.size() > 60) joined = joined.substr(0, 60) + L"…";
+            EmitOcrDiagnostic(std::wstring(L"OCR[") + label + L"] 成功，读到 "
+                + std::to_wstring(out.lines.size()) + L" 行："
+                + (joined.empty() ? L"(空)" : joined));
+            return out;
+        }
+        if (b == OcrBackend::WinRt && out.error.empty()) out.error = L"系统 OCR 不可用";
+        EmitOcrDiagnostic(std::wstring(L"OCR[") + label + L"] 失败："
+            + (out.error.empty() ? L"未知原因" : out.error));
+        last = std::move(out);
+    }
+    if (last.error.empty()) last.error = L"OCR 后端不可用";
+    return last;
+}
+
 
 }  // namespace
 
@@ -1377,7 +1491,57 @@ OcrEngineOutput RunOcrOnBitmap(HBITMAP bmp, int coordOffsetX, int coordOffsetY, 
     }
 
     const auto start = std::chrono::steady_clock::now();
-    output = RequestOcrOnHbitmap(bmp, digitsOnly);
+
+    // ★★ **OCR 前降采样**（2026-09-29）—— 常驻会话接上后（日志 `会话=常驻`）单次仍要
+    //   9~12 秒：慢在**推理本身**（整屏 2560×1440 喂给 Paddle），不是进程启动。
+    //   这里把长边压到 `kOcrMaxLongEdge`（默认 1280，与"给模型看的观察帧"同量级）再识别，
+    //   然后把每行的框**按比例放大回原坐标**（调用方拿到的仍是原图坐标系，契约不变）。
+    //   ⚠ 契约不能变：`RunOcrOnBitmap` 的入参/出参都是**原图坐标 + coordOffset**，
+    //     降采样是**内部实现细节**（在别处缩放会让所有调用方的坐标一起错，本仓踩过这类）。
+    int srcW = 0;
+    int srcH = 0;
+    {
+        BITMAP bm{};
+        if (GetObject(bmp, sizeof(bm), &bm)) {
+            srcW = static_cast<int>(bm.bmWidth);
+            srcH = static_cast<int>(bm.bmHeight);
+        }
+    }
+    HBITMAP ocrBmp = bmp;
+    HBITMAP scaledBmp = nullptr;
+    double backScaleX = 1.0;
+    double backScaleY = 1.0;
+    if (srcW > 0 && srcH > 0) {
+        const int longEdge = (std::max)(srcW, srcH);
+        const int cap = kOcrDownscaleMaxLongEdge;
+        if (cap > 0 && longEdge > cap) {
+            const double f = static_cast<double>(cap) / static_cast<double>(longEdge);
+            const int dstW = (std::max)(1, static_cast<int>(std::lround(srcW * f)));
+            const int dstH = (std::max)(1, static_cast<int>(std::lround(srcH * f)));
+            HDC hdcScreen = GetDC(nullptr);
+            HDC hdcSrc = CreateCompatibleDC(hdcScreen);
+            HDC hdcDst = CreateCompatibleDC(hdcScreen);
+            scaledBmp = CreateCompatibleBitmap(hdcScreen, dstW, dstH);
+            if (scaledBmp) {
+                HBITMAP oldSrc = static_cast<HBITMAP>(SelectObject(hdcSrc, bmp));
+                HBITMAP oldDst = static_cast<HBITMAP>(SelectObject(hdcDst, scaledBmp));
+                SetStretchBltMode(hdcDst, HALFTONE);
+                SetBrushOrgEx(hdcDst, 0, 0, nullptr);
+                StretchBlt(hdcDst, 0, 0, dstW, dstH, hdcSrc, 0, 0, srcW, srcH, SRCCOPY);
+                SelectObject(hdcSrc, oldSrc);
+                SelectObject(hdcDst, oldDst);
+                ocrBmp = scaledBmp;
+                backScaleX = static_cast<double>(srcW) / static_cast<double>(dstW);
+                backScaleY = static_cast<double>(srcH) / static_cast<double>(dstH);
+            }
+            DeleteDC(hdcSrc);
+            DeleteDC(hdcDst);
+            ReleaseDC(nullptr, hdcScreen);
+        }
+    }
+
+    output = RequestOcrOnHbitmap(ocrBmp, digitsOnly);
+    if (scaledBmp) DeleteObject(scaledBmp);
 
     const auto elapsedMs = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1396,6 +1560,13 @@ OcrEngineOutput RunOcrOnBitmap(HBITMAP bmp, int coordOffsetX, int coordOffsetY, 
         cropH = std::max(1, static_cast<int>(bm.bmHeight));
     }
     for (auto& line : output.lines) {
+        // ① 先按降采样比例放大回原图坐标（降采样是内部细节，契约仍是原图坐标）
+        if (backScaleX != 1.0 || backScaleY != 1.0) {
+            line.x1 = static_cast<int>(std::lround(line.x1 * backScaleX));
+            line.x2 = static_cast<int>(std::lround(line.x2 * backScaleX));
+            line.y1 = static_cast<int>(std::lround(line.y1 * backScaleY));
+            line.y2 = static_cast<int>(std::lround(line.y2 * backScaleY));
+        }
         if (digitsOnly && (line.x2 <= line.x1 || line.y2 <= line.y1)) {
             line.x1 = 0;
             line.y1 = 0;
@@ -1421,18 +1592,26 @@ std::wstring ConcatOcrLines(const OcrEngineOutput& output) {
     return text;
 }
 
-std::optional<OcrTextLine> FindTextInOcrLines(
+std::optional<OcrTextMatch> FindTextInOcrLinesScored(
     const OcrEngineOutput& output, const std::wstring& target) {
     if (target.empty() || output.lines.empty()) return std::nullopt;
 
+    // 精确 / 归一化 / 邻行拼接命中：**完全命中**，匹配度 100。
+    auto fullHit = [](const OcrTextLine& line) {
+        OcrTextMatch m;
+        m.line = line;
+        m.matchData = 100;
+        return m;
+    };
+
     for (const auto& line : output.lines) {
-        if (line.text.find(target) != std::wstring::npos) return line;
+        if (line.text.find(target) != std::wstring::npos) return fullHit(line);
     }
 
     const std::wstring needle = NormalizeOcrSearchText(target);
     if (!needle.empty()) {
         for (const auto& line : output.lines) {
-            if (NormalizeOcrSearchText(line.text).find(needle) != std::wstring::npos) return line;
+            if (NormalizeOcrSearchText(line.text).find(needle) != std::wstring::npos) return fullHit(line);
         }
         const size_t n = output.lines.size();
         for (size_t i = 0; i < n; ++i) {
@@ -1441,7 +1620,7 @@ std::optional<OcrTextLine> FindTextInOcrLines(
             for (size_t j = i + 1; j < n && j < i + 4; ++j) {
                 acc = UnionOcrLines(acc, output.lines[j]);
                 norm = NormalizeOcrSearchText(acc.text);
-                if (norm.find(needle) != std::wstring::npos) return acc;
+                if (norm.find(needle) != std::wstring::npos) return fullHit(acc);
             }
         }
     }
@@ -1468,20 +1647,39 @@ std::optional<OcrTextLine> FindTextInOcrLines(
             }
         }
     }
-    if (best) return *best;
-    return std::nullopt;
+    if (!best) return std::nullopt;
+
+    OcrTextMatch m;
+    m.line = *best;
+    // 模糊命中：匹配度 = 相似度百分比（阈值 82 ⇒ 命中时最低 82）
+    m.matchData = OcrSimilarityPercent(bestScore);
+    return m;
 }
 
-OcrVarResult MakeOcrSearchVarResult(const OcrTextLine& line, bool found) {
+std::optional<OcrTextLine> FindTextInOcrLines(
+    const OcrEngineOutput& output, const std::wstring& target) {
+    const auto match = FindTextInOcrLinesScored(output, target);
+    if (!match) return std::nullopt;
+    return match->line;
+}
+
+OcrVarResult MakeOcrSearchVarResult(const OcrTextLine& line, int matchData) {
     OcrVarResult result;
     result.mode = OcrVarMode::Search;
-    result.found = found ? 1 : 0;
-    if (found) {
-        result.topLeftX = line.x1;
-        result.topLeftY = line.y1;
-        result.bottomRightX = line.x2;
-        result.bottomRightY = line.y2;
-    }
+    result.found = 1;
+    result.matchData = matchData;
+    result.topLeftX = line.x1;
+    result.topLeftY = line.y1;
+    result.bottomRightX = line.x2;
+    result.bottomRightY = line.y2;
+    return result;
+}
+
+OcrVarResult MakeOcrSearchMissingVarResult() {
+    OcrVarResult result;
+    result.mode = OcrVarMode::Search;
+    result.found = 0;
+    result.matchData = 0;
     return result;
 }
 

@@ -16,20 +16,25 @@
 // 分两档：
 //   [默认] UI 钩子契约 —— 锁住 B1 的倒置本身：谁再把引擎改成直接调壳，
 //          或把 SetUiBridgeHooks 改成整体覆盖（丢掉另一半注册），这里会红。
-//   [--engine] headless 引擎真实跑 Wait / Loop / VarCompute —— 引擎侧首次
-//          获得执行级覆盖。**不进 CI 逻辑档**：需要能创建窗口的会话，
+//   [--engine] headless 引擎真实跑 Wait / Loop / VarCompute / 变量运算失败日志 ——
+//          引擎侧首次获得执行级覆盖。**不进 CI 逻辑档**：需要能创建窗口的会话，
 //          CI runner（session 0）可能起不来；用 --engine 显式打开。
 //
-// 仍未覆盖：Goto / If 的分支语义、窗口模式分支、找图分支。它们要等 #1
+// 仍未覆盖：Goto / If 的分支语义、窗口/后台窗口模式分支、找图分支。它们要等 #1
 // 抽出 ActionContext 之后才能直接驱动（当前只能整条跑，观察粒度只有步数）。
 // =============================================================================
 #include "selftest_harness.h"
 
+#include "desktop_tools/desktop_tools.h"
 #include "engine/engine_ui_hooks.h"
 #include "script_action_builder.h"
+#include "script_io.h"
+#include "utils.h"
 #include "webview/qst_engine_host.h"
 
 #include <chrono>
+#include <cstdio>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -60,6 +65,11 @@ const selftest::CaseInfo kCases[] = {
         L"跑 [loop 3 { wait 0.12 } endLoop]：循环体确实重复执行（耗时成倍）"},
     {L"engine_run_goto_skips", L"engine",
         L"跑 [goto 3, wait 1.0, wait 0.05]：Goto 真的跳转（耗时骤减）"},
+    {L"engine_run_varcompute_logs_reason", L"engine",
+        L"变量运算失败时运行日志必须给出可判读原因（变量名 + 转义后的源文本）"},
+    {L"engine_emits_recorder_diag", L"engine",
+        L"端到端：跑 8 个相对移动后，recorder_diag.log 必须出现「请求=(0,0)/8包 … 位移一致」"
+        L"（不需要开宏调试窗口）"},
 };
 
 // ── 钩子探针 ─────────────────────────────────────────────────────
@@ -302,6 +312,25 @@ std::wstring EngineDetail(bool finished, int maxSteps, long long elapsed, const 
     return detail;
 }
 
+/// 等引擎自己收尾（正常回放入口用；不触发 DebugRunActions）。
+bool WaitEngineIdle(long long& elapsedMs, int& maxSteps) {
+    const auto t0 = std::chrono::steady_clock::now();
+    maxSteps = 0;
+    MSG msg{};
+    for (int i = 0; i < 400 && qst::engine::IsRunning(); ++i) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        const int s = qst::engine::ExecutedSteps();
+        if (s > maxSteps) maxSteps = s;
+        Sleep(25);
+    }
+    elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    return !qst::engine::IsRunning();
+}
+
 void CaseEngineHeadlessStart() {
     std::wstring why;
     const bool started = EnsureEngineStarted(why);
@@ -386,6 +415,197 @@ void CaseEngineRunGotoSkips() {
     Emit(L"engine_run_goto_skips", ok, EngineDetail(finished, maxSteps, elapsed, err).c_str());
 }
 
+// 引擎侧端到端：变量运算失败时，**运行日志里必须出现可判读的原因**。
+//
+// 现场事故：OCR 血量脚本报「变量运算失败：下标越界」，日志完全没提是哪个变量、当时的
+// 源文本是什么 —— 排查只能猜表达式。现在要求两条都在日志里：
+//   ① 「变量 X 未定义/为空（按 0 处理）」警告；
+//   ② 报错里带下标 + 长度 + **转义后**的源文本（全角括号会显示成 \uFF08，
+//      而 FormatOcrDebug 打的是原文，肉眼分不出全角/半角）。
+//
+// 断言方式：把 MacroDebug 切到 Web 通道并挂 poster，直接读推给壳的 JSON
+// （产品里这些行就是这么到调试面板的，所以这是真实链路，不是模拟）。
+void CaseEngineVarComputeLogsReason() {
+    std::wstring why;
+    if (!EnsureEngineStarted(why)) {
+        Emit(L"engine_run_varcompute_logs_reason", false, (L"引擎未启动：" + why).c_str());
+        return;
+    }
+
+    auto& dbg = qst::desktop_tools::MacroDebug();
+    dbg.SetWebUiEnabled(true);
+    dbg.Create(nullptr, nullptr, nullptr);  // Web 通道：只置 webCreated_，不建 GDI 窗
+
+    std::mutex mu;
+    std::vector<std::string> posted;
+    qst::desktop_tools::SetMacroDebugWebPoster([&](std::string s) {
+        std::lock_guard<std::mutex> lock(mu);
+        posted.push_back(std::move(s));
+    });
+
+    // 用户原始代码，但 hp 不在任何上下文里（等价于「OCR 那轮没写进变量」）
+    std::vector<ScriptAction> actions;
+    actions.push_back(MakeVarCompute(
+        L"string hp_have = split(hp,\"(\")\n"
+        L"a = split(hp_have[1],\"%\")\n"
+        L"result = a[0]\n"
+        L"return result\n"));
+
+    std::string err;
+    long long elapsed = 0;
+    int maxSteps = 0;
+    const bool finished = RunActionsAndWait(actions, err, elapsed, maxSteps);
+    dbg.FlushWebPendingLogs();
+
+    std::string joined;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        for (const auto& s : posted) joined += s;
+    }
+
+    // JsonEscapeUtf8 不转义非 ASCII（原样 UTF-8），所以中文可直接 find。
+    const bool hasWarn = joined.find("未定义（按 0 处理）") != std::string::npos;
+    const bool hasDetail = joined.find("超出长度") != std::string::npos
+        && joined.find("被拆分的文本=") != std::string::npos;
+
+    qst::desktop_tools::SetMacroDebugWebPoster({});
+    dbg.SetWebUiEnabled(false);
+
+    const bool ok = finished && hasWarn && hasDetail;
+    std::wstring detail = EngineDetail(finished, maxSteps, elapsed, err)
+        + L" | 未定义警告=" + (hasWarn ? L"有" : L"无")
+        + L" 报错详情=" + (hasDetail ? L"有" : L"无")
+        + L" 日志字节=" + std::to_wstring(joined.size());
+    Emit(L"engine_run_varcompute_logs_reason", ok, detail.c_str());
+}
+
+// ── 端到端：录制/回放诊断行必须真的产出（不依赖「宏调试窗口」） ──────────────
+//
+// 为什么值得一条 end-to-end 用例：`[回放保真]` / `[鼠标报告]` / `[录制结束]` 是判定
+// 「偏差在输入层还是目标侧」的唯一依据。它们曾经被 `enableDebugOutputWindow`（默认**关**）
+// 和「宏调试窗口已创建」挡在后面 —— 纯逻辑自检**永远发现不了「门控把它挡掉了」**，
+// 只有真跑一遍引擎、再从日志文件里读回来才行。这正是本轮之前真实踩过的坑。
+//
+// ⚠ 会真实注入相对移动（dx 交替 ±2 ⇒ 净位移 0，光标原地返回）并临时改 SPI 鼠标加速后
+//    还原（`MouseBallisticsGuard`，与真实回放同一条路径）。只在 `--engine` 档跑。
+std::wstring ReadWideFileRaw(const std::wstring& path) {
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return {};
+    fseek(fp, 0, SEEK_END);
+    const long bytes = ftell(fp);
+    if (bytes <= 0) {
+        fclose(fp);
+        return {};
+    }
+    std::vector<wchar_t> buf(static_cast<size_t>(bytes) / sizeof(wchar_t));
+    fseek(fp, 0, SEEK_SET);
+    const size_t got = fread(buf.data(), sizeof(wchar_t), buf.size(), fp);
+    fclose(fp);
+    return std::wstring(buf.data(), got);
+}
+
+/// 取最后一次出现的、以 prefix 开头的那一整行（日志是 UTF-16LE + 时间戳前缀）。
+std::wstring LastLineWithPrefix(const std::wstring& text, const std::wstring& prefix) {
+    const size_t at = text.rfind(prefix);
+    if (at == std::wstring::npos) return {};
+    size_t end = text.find(L'\n', at);
+    if (end == std::wstring::npos) end = text.size();
+    return text.substr(at, end - at);
+}
+
+void CaseEngineEmitsRecorderDiag() {
+    std::wstring why;
+    if (!EnsureEngineStarted(why)) {
+        Emit(L"engine_emits_recorder_diag", false, (L"引擎未启动：" + why).c_str());
+        return;
+    }
+    const std::wstring logPath = qst::desktop_tools::RecorderDiagLogPath();
+    if (logPath.empty()) {
+        Emit(L"engine_emits_recorder_diag", false, L"取不到诊断日志路径");
+        return;
+    }
+    // ⚠ 日志是**追加**的，而下面用 `rfind` 取最后一次出现 —— 若上一轮遗留的行还在，
+    //   会读到**别人的**读数（实测踩过：拿到「请求=(0,0)/0包 已收尾=1」的上一轮旧行 ⇒ 假失败）。
+    //   用例必须自己保证前置状态干净，不能依赖调用方先删文件。
+    DeleteFileW(logPath.c_str());
+
+    // ⚠ 必须走**正常回放入口** `RunScriptPath`：编辑器调试入口 `DebugRunActions` 在 worker 里
+    //   走 `if (debugMode_)` 分支，**不经过每轮的时间轴/保真统计** ⇒ 拿它测等于什么都没测
+    //   （第一版就是这么写的：日志文件建出来了、一行没写）。故把动作写成脚本文件再按路径运行。
+    // 8 个相对移动 + 显式 timingUs 间隔 ⇒ ScriptIsTimedInputSequence 为真 ⇒ 精密轴启用，
+    // [回放保真] 才会打。净位移 0 是为了不把正在用机器的人的光标带走。
+    std::vector<ScriptAction> actions;
+    for (int i = 0; i < 8; ++i) {
+        ScriptAction wait{};
+        wait.type = ActionType::Wait;
+        wait.timingUs = 2000;
+        wait.duration = 0.002;
+        actions.push_back(wait);
+        ScriptAction mv{};
+        mv.type = ActionType::MoveMouseRelative;
+        mv.x = (i % 2 == 0) ? 2 : -2;
+        mv.y = 0;
+        mv.duration = 0.0;
+        actions.push_back(mv);
+    }
+
+    ScriptFileData data{};
+    data.actions = actions;
+    const std::wstring scriptPath = ScriptsDir() + L"\\__selftest_recorder_diag.json";
+    if (!SaveScriptFileData(scriptPath, data)) {
+        Emit(L"engine_emits_recorder_diag", false,
+            (L"写测试脚本失败：" + scriptPath).c_str());
+        return;
+    }
+    std::string err;
+    if (!qst::engine::RunScriptPath(scriptPath, err)) {
+        DeleteFileW(scriptPath.c_str());
+        Emit(L"engine_emits_recorder_diag", false,
+            (L"正常回放入口未启动：" + std::wstring(err.begin(), err.end())).c_str());
+        return;
+    }
+    // ⚠ 引擎按「宏执行次数」跑，默认**不限次数** ⇒ 不会自己收尾。轮询到诊断行出现就主动停，
+    //   再等收尾（拿「收尾」当断言会永远失败，那不是诊断链的问题）。
+    std::wstring line;
+    MSG msg{};
+    for (int i = 0; i < 200 && line.empty(); ++i) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        line = LastLineWithPrefix(ReadWideFileRaw(logPath), L"[回放保真]");
+        if (line.empty()) Sleep(25);
+    }
+    const bool hasLine = !line.empty();
+    qst::engine::StopScript();
+    long long elapsed = 0;
+    int maxSteps = 0;
+    const bool finished = WaitEngineIdle(elapsed, maxSteps);
+    DeleteFileW(scriptPath.c_str());
+    const bool requestOk = line.find(L"请求=(0,0)/8包") != std::wstring::npos;
+    const bool matched = line.find(L"位移一致") != std::wstring::npos;
+    // 非窗口/后台窗口模式下必须走 SendInput 计数，不能落到「未统计」分支
+    const bool counted = line.find(L"未统计") == std::wstring::npos;
+
+    const bool ok = hasLine && requestOk && matched && counted && finished;
+    if (ok) {
+        Emit(L"engine_emits_recorder_diag", true, L"");
+        return;
+    }
+    std::wstring detail = L"hasLine=" + std::to_wstring(hasLine ? 1 : 0)
+        + L" 请求侧=" + std::to_wstring(requestOk ? 1 : 0)
+        + L" 位移一致=" + std::to_wstring(matched ? 1 : 0)
+        + L" 已计数=" + std::to_wstring(counted ? 1 : 0)
+        + L" 已收尾=" + std::to_wstring(finished ? 1 : 0)
+        + L" path=" + logPath + L" line=" + line;
+    if (!hasLine) {
+        detail += L"  ← 日志里没有这行：① 设置 autoOutputKeyFunctionDebug 必须为真；"
+            L"② 这行只在「时间轴脚本」下打（录制脚本，或带 timingUs 的手写脚本）——"
+            L"普通无 timingUs 的宏本来就不会出现";
+    }
+    Emit(L"engine_emits_recorder_diag", false, detail.c_str());
+}
+
 void PrintHelp() {
     std::fwprintf(stdout,
         L"ScriptRunnerSelfTest — 引擎执行侧：UI 钩子契约 + headless 跑动作\n"
@@ -393,8 +613,8 @@ void PrintHelp() {
         L"用法:\n"
         L"  ScriptRunnerSelfTest.exe [--json] [--list] [--help] [--engine]\n"
         L"\n"
-        L"  --engine  追加 headless 引擎真实跑 Wait/Loop/VarCompute（默认不跑：\n"
-        L"            需要能创建窗口的会话，CI runner 可能起不来）\n"
+        L"  --engine  追加 headless 引擎真实跑 Wait/Loop/VarCompute/变量运算失败日志\n"
+        L"            （默认不跑：需要能创建窗口的会话，CI runner 可能起不来）\n"
         L"\n"
         L"Agent: 见 .cursor/skills/module-selftest/SKILL.md\n"
         L"  源码: src/engine/engine_ui_hooks.*, src/engine/engine_script_run.cpp\n"
@@ -441,6 +661,8 @@ int wmain(int argc, wchar_t** argv) {
         CaseEngineRunVarComputeWait();
         CaseEngineRunLoopBody();
         CaseEngineRunGotoSkips();
+        CaseEngineVarComputeLogsReason();
+        CaseEngineEmitsRecorderDiag();
     }
 
     selftest::EmitSummary();

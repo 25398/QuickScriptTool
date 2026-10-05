@@ -1,8 +1,31 @@
 /* 键鼠工坊网页键鼠桥 — MV3 service worker（WebSocket 直接连本机桥） */
-const BRIDGE_VERSION = "1.0.20";
+const BRIDGE_VERSION = "1.0.43";
 const PORT_LO = 19228;
 const PORT_HI = 19240;
 const RECONNECT_MS = 1500;
+/**
+ * native 宿主（com.quickscripttool.bridge）的清单 path 指向主程序 exe，Chromium 每次
+ * connectNative 都会用管道拉起一个**完整进程**（并在宿主里重写一次注册表）。
+ * 本文件由 1.5s 轮询驱动 ⇒ 宿主没运行时会造成每天上万次进程创建。
+ * 因此：优先读宿主写入的 bridge_runtime.json（侧载扩展零进程），
+ * 只有读不到（打包 CRX）才问 native，且两次之间至少间隔 NATIVE_PROBE_MIN_MS。
+ */
+const NATIVE_PROBE_MIN_MS = 30000;
+let lastNativeProbeAt = 0;
+/**
+ * 「需要问 native 兜底」标志：宿主每次启动都会换随机 token，若 bridge_runtime.json
+ * 因故没被重写，扩展会一直拿着陈旧 token 连不上 —— 因此连接失败后必须允许再问一次
+ * native，否则等于把发现能力弄丢。连上后清零。
+ *
+ * ⚠⚠ 与之配套的是 `lastRejectedToken`（2026-09-27 真机）：只有"这个 token 已经被宿主
+ *   拒过"才算陈旧。**不能**把"上一轮没连上"当成陈旧 —— 宿主没在跑时每一轮都连不上，
+ *   那样每 1.5s 就会 connectNative 拉起一个完整宿主进程（本文件顶部那条注释警告的
+ *   正是这件事），浏览器里会攒出一串看不懂的进程。
+ *   宿主每次启动都换 token ⇒ 「同一 token 又失败一次」才是可靠且廉价的陈旧判据。
+ */
+let nativeProbeWanted = false;
+/** 上一次被桥拒掉的 token（`""` = 没有）。 */
+let lastRejectedToken = "";
 
 let ws = null;
 let bridgePort = 0;
@@ -412,10 +435,27 @@ async function listTargets() {
   }
 }
 
+/// 浏览器**内置页**（edge://… / chrome://…）扩展无权注入 content script，
+/// 这是 Chrome/Edge 的硬限制，不是配置问题。但用户/模型常在这里反复试：
+/// 抓不到 → 转 zoom 看截图 → 标题是省略号截断的 → 再 zoom …… 白烧好几轮。
+/// 所以回执必须**直接说穿**并给出唯一可行的替代路线（UIA）。
+const BUILTIN_PAGE_HINT =
+  "⚠ 当前只有浏览器内置页（edge:// / chrome://）在命中范围内。" +
+  "扩展**无法**在这类页面上注入脚本 —— 这是 Chrome/Edge 的硬限制，重试无效。" +
+  "请改走 UIA 路线：listUiControls（必要时加 typeFilter=\"列表项\"）拿到条目名，" +
+  "再用 invokeUiControl 触发；标题请读 UIA 名字（界面上是省略号截断的，别 zoom 看截图）。";
+
 async function pickBrowsePage(titleHint, opts) {
   const o = opts && typeof opts === "object" ? opts : {};
-  const pages = (await listTargets()).filter(
+  const allTargets = await listTargets();
+  const pages = allTargets.filter(
     (t) => t.type === "page" && typeof t.tabId === "number" && !isUtilityTarget(t)
+  );
+  // 命中范围内有没有浏览器内置页？有的话，模型这次的失败几乎必然是因为它 ——
+  // 回执里必须说穿，否则它会以为「只是没匹配上」，继续 zoom 烧 token。
+  const builtinTabs = allTargets.filter(
+    (t) => t.type === "page" && typeof t.tabId === "number"
+      && /^(edge|chrome|devtools|chrome-extension|extension):\/\//.test(t.url || "")
   );
   const candidates = pages.map((p) => p.title || p.url || "(无标题)");
   const urlHint = String(o.urlHint || "").trim().toLowerCase();
@@ -491,6 +531,16 @@ async function pickBrowsePage(titleHint, opts) {
     }
   }
   if (pages.length === 1) return { page: pages[0], candidates, pickNote: "browse:only" };
+  // 只剩内置页 ⇒ 这就是失败的真正原因，把候选列成 URL 并附上替代路线。
+  if (builtinTabs.length > 0 && pages.length === 0) {
+    return {
+      page: null,
+      candidates: builtinTabs.map((t) => t.url || "(无标题)"),
+      error: "NO_TAB",
+      message: BUILTIN_PAGE_HINT,
+      builtinOnly: true,
+    };
+  }
   return {
     page: null,
     candidates,
@@ -503,19 +553,28 @@ async function pickPage(titleHint, opts) {
   const hint = (titleHint || "").trim();
   const o = opts && typeof opts === "object" ? opts : {};
   if (o.preferPage) return pickBrowsePage(hint, o);
-  const pages = (await listTargets()).filter(
+  const allTargets = await listTargets();
+  const pages = allTargets.filter(
     (t) => t.type === "page" && typeof t.tabId === "number" && !isUtilityTarget(t)
   );
+  // 同 pickBrowsePage：只剩内置页时，必须把「扩展无权注入」说穿（见 BUILTIN_PAGE_HINT）。
+  const builtinOnly = pages.length === 0
+    && allTargets.some((t) => t.type === "page"
+      && /^(edge|chrome|devtools|chrome-extension|extension):\/\//.test(t.url || ""));
+  const builtinFallback = builtinOnly
+    ? { page: null, candidates: [], error: "NO_TAB", message: BUILTIN_PAGE_HINT, builtinOnly: true }
+    : null;
   const candidates = pages.map((p) => p.title || p.url || "(无标题)");
   if (!hint) {
     if (pages.length === 1) return { page: pages[0], candidates };
+    if (builtinFallback) return builtinFallback;
     return { page: null, candidates, error: pages.length ? "AMBIGUOUS" : "NO_TAB" };
   }
 
   const matched = pages
     .map((p) => ({ page: p, titleScore: titleMatchScore(hint, p.title || "") }))
     .filter((x) => x.titleScore > 0);
-  if (!matched.length) return { page: null, candidates };
+  if (!matched.length) return builtinFallback || { page: null, candidates };
 
   let focusedWinId = -1;
   try {
@@ -877,6 +936,7 @@ async function attachTab(titleHint, opts) {
   let pickNote = "";
   let error = "";
   let message = "";
+  let builtinOnly = false;
 
   if (Number.isFinite(wantTabId) && wantTabId > 0) {
     const pages = (await listTargets()).filter(
@@ -913,18 +973,25 @@ async function attachTab(titleHint, opts) {
     pickNote = picked.pickNote || "";
     error = picked.error || "";
     message = picked.message || "";
+    builtinOnly = picked.builtinOnly === true;
   }
 
   if (!page) {
     const errCode = error === "AMBIGUOUS" ? "AMBIGUOUS" : "NO_TAB";
     setStatus("no-tab", message || `未匹配到目标页（可见 ${candidates.length} 个）`);
-    return {
+    const out = {
       ok: false,
       error: errCode,
       message: message || (preferPage ? "未找到可抓取的网页标签" : "未找到匹配的游戏标签页"),
       candidates: (candidates || []).slice(0, 12),
       version: BRIDGE_VERSION,
     };
+    // ★ 说穿「这是浏览器内置页」：宿主可据此直接劝模型走 UIA，不必重试本工具。
+    if (builtinOnly) {
+      out.builtinPage = true;
+      out.hint = BUILTIN_PAGE_HINT;
+    }
+    return out;
   }
 
   await detachDebugger();
@@ -1589,10 +1656,6 @@ async function cdpShotB64(debuggee, opts) {
   // 勿 setWebLifecycleState / setDefaultBackgroundColorOverride：可见窗上会闪白。
   const r = await chrome.debugger.sendCommand(debuggee, "Page.captureScreenshot", opts);
   return r && r.data ? String(r.data) : "";
-}
-
-function sleepMs(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -2403,8 +2466,48 @@ async function sendCdp(method, params) {
 }
 
 function qstBuildPageSnapshot(opts) {
+
+  // ★★★ **容器标识**（2026-10-03 方向 1：抓取的通用性）
+  //
+  //   问题：原来分组靠 **y 坐标**（宿主侧几何聚类）⇒ 页面一滚动 y 全变 ⇒ 漏题 / 重复 ✓
+  //   做法：往上找**第一个含 ≥2 个同构孩子的祖先** —— 那就是"列表项容器"
+  //     （题 / 表格行 / 消息 / 卡片 都符合这个形状）⇒ 用它的 **标签+class+序号** 做 id ✓
+  //   ⚠ 这个 id **不依赖坐标** ⇒ 对滚动**天然稳定** ✓
+  //   ⚠ 通用性：判据是**结构**（同构兄弟）而不是 `radio/checkbox` 这种语义 ⇒
+  //     换任何列表型页面都成立，**不针对"练习题"写死** ✓
+  function qstListContainerKey(el) {
+    let p = el.parentElement;
+    for (let d = 0; p && d < 8; ++d, p = p.parentElement) {
+      const kids = Array.from(p.children || []);
+      let same = 0;
+      for (const c of kids) {
+        if (c.tagName === el.tagName && String(c.className) === String(el.className)) ++same;
+      }
+      if (same >= 2) {
+        const pp = p.parentElement;
+        const idx = pp ? Array.from(pp.children).indexOf(p) : 0;
+        const cls = String(p.className || "").split(/\s+/).filter(Boolean).slice(0, 2).join(".");
+        return p.tagName + (cls ? "." + cls : "") + "@" + idx;
+      }
+    }
+    return "";
+  }
   const light = !!(opts && opts.light);
-  const maxNodes = Math.min(80, Math.max(8, (opts && opts.maxNodes) || 64));
+  // ★★ 曾经这里是 `Math.min(80, ... || 64)`，并且在**排序之后** `take.slice(0, maxNodes)`。
+  //    后果（实测，超星「第1章概述练习题」50 题作业页）：节点按「可视区优先、阅读顺序」
+  //    排好序后砍到 64 条，而一道多选题的「题干 + 4~5 个选项」就吃掉 5~6 条 ⇒
+  //    **只有第 1~2 题进得了树，第 3 题以后整片消失**。宿主那侧看到的计数是
+  //    `n=21`、标注「屏外0 · 下17.6屏」—— 树自洽、看不出丢东西，
+  //    于是模型的行为退化成「盲滚 + 截图抄」，还抄不全。
+  //
+  //    教训：**列表型页面的枚举上限不能是一个「猜的常数」**。页有多长我们不知道，
+  //    但**丢了多少我们必须知道并说出来**。所以这里不再默认硬砍：
+  //      · 默认 **全量**（由宿主按自己的字符预算分页/截断，那边才知道 token 成本）；
+  //      · 确实要限流时才用 maxNodes，且**必须**回报 total/truncated 供调用方分页。
+  const askMax = Number((opts && opts.maxNodes) || 0);
+  const maxNodes = askMax > 0 ? Math.max(1, Math.min(20000, Math.floor(askMax))) : 0;
+  // 分页起点（宿主传 offset，配合 maxNodes 逐段取，长页才可能被完整枚举）
+  const offset = Math.max(0, Math.floor(Number((opts && opts.offset) || 0)));
   const query = String((opts && opts.query) || "")
     .trim()
     .toLowerCase();
@@ -2611,7 +2714,22 @@ function qstBuildPageSnapshot(opts) {
       }
     });
   } catch (_) {}
-  const candidates = raw.filter((el) => isVisible(el) || (isSpaceVideoLink(el) && isRenderable(el)));
+  // ★★ 这里曾经是 `raw.filter((el) => isVisible(el) || (isSpaceVideoLink(el) && isRenderable(el)))`。
+  //    `isVisible` 里有一条 `r.top > vh || r.left > vw ⇒ false` —— 它把**所有屏外元素**
+  //    在候选集阶段就丢掉了。后果（实测，超星 50 题作业页）：整页 300+ 个可枚举控件，
+  //    候选集只剩可视区内那 20~24 个 ⇒ `enumerateTotal` 与 `nodes` 一起被压死，
+  //    宿主回执永远是「可视23 · 屏外0」，**看起来自洽**，模型根本看不出「还有 30 题没给」。
+  //    然后它就退化成「盲滚 → 换一棵新树 → 再截一张图验收」，21 次截屏、20 次滚动，
+  //    成本和时间全耗在这个循环上（那次任务花了 3.77 CNY）。
+  //
+  //    教训：**「在不在可视区」是排版信息，不是可用性判据**。
+  //    长列表页的正确做法是「全量枚举 + 由调用方按 token 预算分页」，
+  //    分页参数（offset/maxNodes）和字符预算的关系宿主才清楚，扩展不该替它做决定。
+  //    ⇒ 候选集只排除「压根不可渲染」的（display:none / 尺寸为 0 / disabled），
+  //      **屏外元素保留**，交给下面的 `inView` 标记 + 排序 + 宿主分页。
+  const candidates = raw.filter(
+    (el) => isRenderable(el) || (isSpaceVideoLink(el) && isRenderable(el))
+  );
   let pageKind = "dom";
   if (canvasRatio >= 0.5 && candidates.length <= 6) pageKind = "canvas";
   else if (canvasRatio >= 0.22) pageKind = "mixed";
@@ -2786,7 +2904,12 @@ function qstBuildPageSnapshot(opts) {
       take = content.concat(chromeNodes).concat(off);
     }
   }
-  take = take.slice(0, maxNodes);
+  // ★ enumerateTotal = 排序后**完整**候选数（分页前的总量）；
+  //   returned = 本次真正返回的条数。两者一起回报，调用方才知道「有没有漏」。
+  const enumerateTotal = take.length;
+  const from = Math.min(offset, enumerateTotal);
+  if (maxNodes > 0) take = take.slice(from, from + maxNodes);
+  else if (from > 0) take = take.slice(from);
   const store = { gen: Date.now(), pageKind, nodes: new Map() };
   const nodes = [];
   take.forEach((item, i) => {
@@ -2802,9 +2925,23 @@ function qstBuildPageSnapshot(opts) {
       path: String(item.path || "").slice(0, 24),
       x: Math.round(r.x),
       y: Math.round(r.y),
+      // ★ 容器标识（见上面 qstListContainerKey）——宿主按它分组 ⇒ 对滚动稳定 ✓
+      group: qstListContainerKey(el),
       w: Math.round(r.width),
       h: Math.round(r.height),
       inView: !!item.inView,
+      // ★★ `absent` = 与视口**完全不相交**（必须滚动才看得见）。
+      //    它与 `inView` 用的是**同一个判据**（`viewportIntersect`）⇒ 当前恒有
+      //    `absent === !inView`。之所以两个都发，是因为**语义不同、将来可能分开**：
+      //      · `inView`   —— 宿主拿它算「可视 N」；
+      //      · `absent`   —— 宿主拿它算「屏外 M」（`PageSnapshotNodeAbsent`）。
+      //    分开的理由：以后若要支持「横跨可视区边界」的精细区分（部分可见的算可视，
+      //    完全在外面的才算屏外），只需改这一行；宿主侧不用动，
+      //    且**旧扩展不发 absent 时会回落到 y/vh 推断**，行为不变。
+      //    ⚠ 别把它当成「与 inView 反义」去简化掉 —— 宿主的旧扩展兼容路径依赖它的缺失。
+      absent: !(
+        r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw
+      ),
     };
     if (item.href) {
       let href = String(item.href);
@@ -2850,6 +2987,14 @@ function qstBuildPageSnapshot(opts) {
     contentInView,
     query: query || "",
     queryHits,
+    // ★覆盖度回执：让宿主能判断「这棵树是不是被砍过」，并据此分页。
+    //   enumerateTotal 是**排序后、分页前的完整候选数**（本次页面上真正可枚举的量）；
+    //   returned 是本次返回条数；nextOffset>0 表示还有下一段可继续取。
+    //   ⚠ 不回报这两个数 = 又把「丢了多少」藏起来，模型只能靠「下17.6屏」瞎猜。
+    enumerateTotal,
+    offset: from,
+    returned: nodes.length,
+    nextOffset: from + nodes.length < enumerateTotal ? from + nodes.length : 0,
     nodes,
   };
 }
@@ -3020,14 +3165,1994 @@ function mergePageKind(pageKind, pageInteractive, frameRatio) {
   return pageKind || "dom";
 }
 
+// ════════════════════════════════════════════════════════════════════
+// 网页版 AI 适配层（Web AI Backend）
+// 见 docs/web-ai-backend-design.md。
+//
+// 架构参考 chen-squared/browser-ai-bridge（MIT）：provider 配置化 selector +
+// 「忙闲判据 + 内容稳定」双条件判回答完成 + 提交确认信号。
+//
+// ⚠ 与既有代码的分工：
+//   · 输入框写入仍走 typeRef/qstFillRef（已有 contenteditable 分支），
+//     但富文本框架（TipTap/Lexical/ProseMirror）通常不认原生 input 事件，
+//     故另提供 **CDP 真实按键**通道：handleWebAiRichType（本文件下方实现）。
+//   · 读回答**不能**复用 qstBuildPageSnapshot：它的 isVisible() 只收视口内元素，
+//     回答区滚出视口就取不到（MEMORY.md §22 同类前科）。这里按 selector 取，
+//     并主动滚到回答区。
+// ════════════════════════════════════════════════════════════════════
+
+/// provider 配置缓存（web_ai_providers.json，随扩展目录分发）
+let webAiProvidersCache = null;
+
+async function loadWebAiProviders() {
+  if (webAiProvidersCache) return webAiProvidersCache;
+  try {
+    const url = chrome.runtime.getURL("web_ai_providers.json");
+    const res = await fetch(url);
+    const j = await res.json();
+    webAiProvidersCache = (j && j.providers) || {};
+  } catch (e) {
+    webAiProvidersCache = {};
+  }
+  return webAiProvidersCache;
+}
+
+async function resolveWebAiProvider(nameOrHint) {
+  const all = await loadWebAiProviders();
+  const want = String(nameOrHint || "").trim().toLowerCase();
+  if (!want) return null;
+  if (all[want]) return { id: want, ...all[want] };
+  for (const key of Object.keys(all)) {
+    const p = all[key];
+    const hint = String(p.urlHint || "").toLowerCase();
+    const label = String(p.label || "").toLowerCase();
+    if (hint && want.indexOf(hint) >= 0) return { id: key, ...p };
+    if (label && want.indexOf(label) >= 0) return { id: key, ...p };
+  }
+  return null;
+}
+
+/// 注入：按 provider selector 读取最后一条 assistant 回复。
+/// 返回 { ok, text, blocks, busy, truncated, totalBlocks, matchedBy }。
+/// ⚠ 与 qstBuildPageSnapshot 的关键差异：**不做视口可见性过滤**，
+///   因为回答文本是"读内容"而不是"点控件"，屏外文本同样有效（MEMORY.md §22）。
+function qstReadAssistantReply(cfg) {
+  const c = cfg || {};
+  const responseSelectors = c.responseSelectors || [];
+  const busySelectors = c.busySelectors || [];
+  const inputSelectors = c.inputSelectors || [];
+
+  // ★★ 排除"推荐追问 / 相关推荐"这类**干扰块**（2026-10-02 真机）
+  //   用户截图实证：豆包的推荐问题（"如何使用…？"那三行）被我们当成了**回答内容**
+  //   —— 它们在回答容器**下方**，而 `pickVisible` 取的是"最后一个可见的" ⇒ 正好选中它们。
+  //   ⚠ 各站点的 class 差异很大 ⇒ **可配置**：provider 里加 `replyExcludeSelectors`，
+  //     这里给一组**通用默认**（按语义匹配 suggest/related/recommend/guess 这类命名）。
+  const excludeSelectors = [].concat(
+    c.replyExcludeSelectors || [],
+    ["[class*='suggest']", "[class*='related']", "[class*='recommend']",
+     "[class*='guess']", "[class*='followup']", "[class*='question-list']",
+     // ★ 豆包实证（2026-10-02 用户给的 DOM）：
+     //   · 推荐追问：<span class="… suggest-list-item-title">…？</span>（含 suggest ⇒ 通用规则已覆盖）
+     //   · 搜索进度：<div class="… text-dbx-text-secondary">搜索 2 个关键词，参考 11 篇资料</div>
+     //     ⚠ 后者 class 里**没有语义关键词** ⇒ 只能按它精确排。
+     "[class*='text-dbx-text-secondary']"]
+  );
+  const isExcluded = (el) => {
+    for (const sel of excludeSelectors) {
+      try { if (el.closest(sel)) return true; } catch (_) { /* 选择器不合法就跳过 */ }
+    }
+    return false;
+  };
+
+  const pickVisible = (sels) => {
+    for (const sel of sels) {
+      let list = [];
+      try {
+        list = Array.from(document.querySelectorAll(sel));
+      } catch (_) {
+        continue;
+      }
+      if (!list.length) continue;
+      // 取最后一个「有实际尺寸」的（不要求视口内）
+      for (let i = list.length - 1; i >= 0; i--) {
+        const el = list[i];
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.width < 4 || r.height < 4) continue;
+          const st = window.getComputedStyle(el);
+          if (st.display === "none" || st.visibility === "hidden") continue;
+          if (isExcluded(el)) continue;   // ★ 推荐追问等干扰块，不算回答
+        } catch (_) {
+          continue;
+        }
+        return { el, matchedBy: sel };
+      }
+    }
+    return null;
+  };
+
+  const busy = (() => {
+    for (const sel of busySelectors) {
+      try {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width >= 4 && r.height >= 4) return true;
+        const st = window.getComputedStyle(el);
+        if (st.display !== "none" && st.visibility !== "hidden") return true;
+      } catch (_) {}
+    }
+    return false;
+  })();
+
+  // ★★ **绝不把"我们自己的提示词"当回答**（2026-09-30 实测事故）。
+  //
+  //   现象：宿主读到 `原始回复：【键鼠工坊・网页 AI 桥接】…`（4843 字符 = 我们刚写进去的
+  //   提示词），而页面上模型的**真回答**（`{"computer":"screenshot"}`）就在下面 ——
+  //   说明 responseSelectors 命中了**用户气泡**（页面把用户消息也渲染成了可匹配的消息块）。
+  //   ⇒ 排除"含我们横幅标识"的节点（`键鼠工坊` / `网页 AI 桥接` 只可能出现在我们发的内容里），
+  //     并在命中被排除时**改选最后一条干净的消息块**；一条干净块都没有就**如实回报**
+  //     `only-echo-blocks`（宿主据此报 REPLY_ECHOES_PROMPT，而不是拿回显去解析动作）。
+  const qstHasOurBanner = (el) => {
+    try {
+      const t = String(el.innerText || el.textContent || "");
+      return t.includes("键鼠工坊") || t.includes("网页 AI 桥接");
+    } catch (_) {
+      return false;
+    }
+  };
+  let hit = pickVisible(responseSelectors);
+  if (hit && qstHasOurBanner(hit.el)) {
+    const cand = [];
+    for (const sel of responseSelectors) {
+      try {
+        for (const el of document.querySelectorAll(sel)) cand.push(el);
+      } catch (_) {}
+    }
+    const clean = Array.from(new Set(cand)).filter((el) => !qstHasOurBanner(el)
+      && String(el.innerText || el.textContent || "").trim().length > 0);
+    if (clean.length) {
+      hit = { el: clean[clean.length - 1], matchedBy: String(hit.matchedBy || "") + "+skipEcho" };
+    } else {
+      return {
+        ok: false,
+        busy: busy,
+        reason: "only-echo-blocks",
+        triedSelectors: responseSelectors,
+        url: String(location.href || ""),
+        title: String(document.title || ""),
+      };
+    }
+  }
+  if (!hit) {
+    return {
+      ok: false,
+      busy: busy,
+      reason: "no-response-node",
+      triedSelectors: responseSelectors,
+      url: String(location.href || ""),
+      title: String(document.title || ""),
+    };
+  }
+
+  // 收集全部块（用于判断是否还在追加），并滚到最后一屏
+  const all = [];
+  for (const sel of responseSelectors) {
+    try {
+      const list = Array.from(document.querySelectorAll(sel));
+      for (const el of list) all.push(el);
+    } catch (_) {}
+  }
+  const uniq = Array.from(new Set(all));
+  const texts = [];
+  for (const el of uniq) {
+    const t = String(el.innerText || el.textContent || "").trim();
+    if (t) texts.push(t);
+  }
+
+  // ★★ 剔除"推荐追问"等干扰块（2026-10-02 真机）
+  //   用户给的实证 DOM：`<span class="title-sm8Wop suggest-list-item-title">…？</span>`
+  //   ⚠⚠ 干扰块通常是**被选中容器的子孙**（不是容器本身）⇒ 上面 `pickVisible` 里的
+  //     `closest()` 检查**查不到**它 ⇒ 必须**从文本里减去**这些子孙的文本。
+  const rawText0 = String(hit.el.innerText || hit.el.textContent || "").trim();
+  const rawText = (() => {
+    if (!rawText0) return rawText0;
+    let out = rawText0;
+    for (const sel of excludeSelectors) {
+      let subs = [];
+      try { subs = Array.from(hit.el.querySelectorAll(sel)); } catch (_) { continue; }
+      for (const sub of subs) {
+        const st = String(sub.innerText || sub.textContent || "").trim();
+        if (st && out.indexOf(st) >= 0) out = out.split(st).join("");
+      }
+    }
+    return out.trim();
+  })();
+  // 上限保护：超长时截断并**明说**（MEMORY.md §20：枚举型回执必须带覆盖度）
+  const MAX_CHARS = 12000;
+  const truncated = rawText.length > MAX_CHARS;
+  const text = truncated ? rawText.slice(0, MAX_CHARS) : rawText;
+
+  try {
+    hit.el.scrollIntoView({ block: "end" });
+  } catch (_) {}
+
+  // 输入框是否为空（提交确认信号之一）
+  // ⚠ 三种形态都要认：原生表单有 value；富文本有 innerText；而某些富文本实现
+  //   两者都不可靠（isContentEditable 为 false 且 value 为 undefined）⇒ 兜底
+  //   按 textContent 判。判不了就报 null（**不要**瞎猜成 false，否则宿主会把
+  //   「判不出」当成「没清空」，导致提交确认永远失败）。
+  let inputEmpty = null;
+  try {
+    const inp = (() => {
+      for (const sel of inputSelectors) {
+        try {
+          const el = document.querySelector(sel);
+          if (el) return el;
+        } catch (_) {}
+      }
+      return null;
+    })();
+    if (inp) {
+      const ce = inp.isContentEditable
+        || inp.getAttribute("contenteditable") === "true"
+        || inp.getAttribute("contenteditable") === "";
+      let v = null;
+      if (ce) v = String(inp.innerText || inp.textContent || "");
+      else if (typeof inp.value === "string") v = inp.value;
+      else v = String(inp.innerText || inp.textContent || "");
+      inputEmpty = v.trim().length === 0;
+    }
+  } catch (_) {}
+
+  return {
+    ok: true,
+    text: text,
+    textLength: rawText.length,
+    truncated: truncated,
+    totalBlocks: texts.length,
+    busy: busy,
+    inputEmpty: inputEmpty,
+    matchedBy: hit.matchedBy,
+    url: String(location.href || ""),
+    title: String(document.title || ""),
+  };
+}
+
+/// 注入：探针 —— 回报输入框的形态（tagName / contenteditable / role），
+/// 用于判断站点是否改版、以及富文本 vs 原生表单（见 docs §5.1 冒烟第 1 步）。
+function qstProbeComposer(cfg) {
+  const c = cfg || {};
+  const inputSelectors = c.inputSelectors || [];
+  const sendSelectors = c.sendButtonSelectors || [];
+  const probe = (sels) => {
+    for (const sel of sels) {
+      let el = null;
+      try {
+        el = document.querySelector(sel);
+      } catch (_) {
+        continue;
+      }
+      if (!el) continue;
+      const r = (() => {
+        try {
+          return el.getBoundingClientRect();
+        } catch (_) {
+          return { width: 0, height: 0 };
+        }
+      })();
+      return {
+        matchedBy: sel,
+        tagName: String(el.tagName || "").toLowerCase(),
+        role: String(el.getAttribute("role") || ""),
+        contentEditable: !!el.isContentEditable,
+        hasValue: typeof el.value === "string",
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+        visible: r.width >= 4 && r.height >= 4,
+      };
+    }
+    return null;
+  };
+  return {
+    ok: true,
+    input: probe(inputSelectors),
+    sendButton: probe(sendSelectors),
+    url: String(location.href || ""),
+    title: String(document.title || ""),
+  };
+}
+
+async function injectWebAiProbe(tabId, cfg) {
+  const r = await injectPageFn(tabId, qstProbeComposer, [cfg || {}]);
+  if (r.error) return { ok: false, error: "INJECT_FAILED", message: r.error };
+  return r.result;
+}
+
+async function injectReadAssistantReply(tabId, cfg) {
+  const r = await injectPageFn(tabId, qstReadAssistantReply, [cfg || {}]);
+  if (r.error) return { ok: false, reason: "inject:" + r.error };
+  return r.result;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ★★ 富文本写入：CDP 真实按键通道（qstFillRef 的兜底/替代）
+//
+// 为什么需要它：qstFillRef 的 contenteditable 分支用 execCommand("insertText")
+// + 派发一个 input 事件。对**普通 contenteditable** 够用，但豆包这类
+// TipTap / Lexical / ProseMirror / React 富文本**通常不认**：
+//   · execCommand 已废弃，部分框架拦截并忽略；
+//   · 直接写 textContent 绕过框架的虚拟 DOM ⇒ 状态与 DOM 不一致，提交时被清空；
+//   · 框架监听自己的合成事件系统，手搓 InputEvent 进不去。
+//
+// 这里改用 Chrome DevTools Protocol 的**真实输入**：
+//   ① Input.insertText —— 走浏览器输入管线，会触发真实 beforeinput/input
+//   ② 逐字 Input.dispatchKeyEvent —— 更接近人手，兜底最顽固的编辑器
+//   ③ 提交按 Enter（Input.dispatchKeyEvent，key=Enter）
+//
+// ⚠ 必须先 focus 目标元素，否则按键会打到别处（CDP 输入作用于**当前焦点**）。
+// ⚠ 与 MEMORY.md §17 的关系：那条讲的是**宿主 PostMessage** 不向子窗转发；
+//   这里走的是浏览器内部输入管线，不受影响。
+// ⚠ 与 §26 的关系：判「写没写进去」要**回读元素内容**，不能只看 API 返回 ok。
+// ────────────────────────────────────────────────────────────────────
+
+/// 注入一个**自包含**页面函数，并把「页面里抛错」这件事如实带出来。
+///
+/// ⚠⚠ 两个必踩的坑（2026-09-24 真机实测各踩一次）：
+///   ① `executeScript({func: X})` 只注入 X 的源码 ⇒ X 里调同文件的兄弟函数
+///      在页面里是 `ReferenceError`。**只能注入自包含函数**（只依赖全局）。
+///   ② 被注入函数抛错时，MV3 的 `executeScript` 是 **resolve** 成
+///      `{result: undefined, error: {...}}`（不是 reject）⇒ 只看 `result` 就会把
+///      「函数在页面里崩了」误读成「选择器没命中 / 元素不存在」，
+///      于是错误信息指向完全错误的方向（实测报成了误导性的 NO_COMPOSER）。
+async function injectPageFn(tabId, fn, args) {
+  const inj = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    func: fn,
+    args: args || [],
+  });
+  const first = inj && inj[0];
+  const err = first && first.error
+    ? String((first.error && first.error.message) || first.error)
+    : "";
+  return { result: first ? first.result : undefined, error: err };
+}
+
+/// 把 selector 列表解析成元素并 focus。返回 {ok, matchedBy, tag, isEditable}
+function qstFocusComposer(cfg) {
+  const sels = [].concat(
+    (cfg && cfg.inputSelectors) || [],
+    ["div[contenteditable='true'][role='textbox']", "div[contenteditable='true']", "textarea"]
+  );
+  const tried = [];
+  for (const s of sels) {
+    if (!s) continue;
+    tried.push(s);
+    let el = null;
+    try {
+      el = document.querySelector(s);
+    } catch (_) {
+      continue;
+    }
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    const visible = (r.width > 0 && r.height > 0);
+    // ★★ 不可见**不再跳过**（2026-09-26 真机）。
+    //   为什么：`getBoundingClientRect()` 在**后台标签页**里恒为 `0x0`（页面没渲染），
+    //   于是"可见性"判据把**已登录、但页面在后台**的站点一律判成"没有输入框"：
+    //     · 探测阶段 ⇒ `webAiPickProvider` 全站失败 ⇒ **`NO_WEB_AI_LOGIN`**
+    //       （用户原话："我已经登录了呀，我点开网页还是登录态"）
+    //     · 写入阶段 ⇒ **`NO_COMPOSER`**（用户原话："发消息都发不了"）
+    //   而 CDP 的 `Input.insertText` / `dispatchKeyEvent` **本来就不要求元素可见**
+    //   ⇒ 可见只是"优先选择"的依据，**不能当门槛**。
+    //   ⚠ 保留 `visible` 标记：**读回答**要站点真的渲染，诊断时用得上。
+    try {
+      el.scrollIntoView({ block: "center", behavior: "instant" });
+    } catch (_) {
+      try { el.scrollIntoView(); } catch (__) { /* ignore */ }
+    }
+    try {
+      el.focus();
+    } catch (_) { /* ignore */ }
+    // 富文本常需要点击才进入编辑态（focus 不够）
+    try {
+      el.click();
+    } catch (_) { /* ignore */ }
+    const active = document.activeElement;
+    const editable = !!(el.isContentEditable
+      || el.getAttribute("contenteditable") === "true"
+      || el.tagName === "TEXTAREA"
+      || el.tagName === "INPUT");
+    return {
+      ok: true,
+      matchedBy: s,
+      tagName: el.tagName,
+      isEditable: editable,
+      visible: visible,
+      // ⚠ 焦点是否真的落到它身上：CDP 按键打给「当前焦点」，这条必须核实
+      focusIsSelf: active === el,
+      activeTag: active ? active.tagName : "",
+      activeSnippet: active && active !== el ? String(active.className || "").slice(0, 60) : "",
+    };
+  }
+  return { ok: false, reason: "no-composer", triedSelectors: tried };
+}
+
+/// 清空输入框（CDP 前的准备）。返回清空后读回的内容长度。
+function qstComposerClearAndRead(cfg) {
+  const sels = [].concat(
+    (cfg && cfg.inputSelectors) || [],
+    ["div[contenteditable='true'][role='textbox']", "div[contenteditable='true']", "textarea"]
+  );
+  for (const s of sels) {
+    if (!s) continue;
+    let el = null;
+    try { el = document.querySelector(s); } catch (_) { continue; }
+    if (!el) continue;
+    try {
+      if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+        // 用 execCommand 清（比直接写 textContent 更友好；框架不认时走兜底）
+        el.focus();
+        try { document.execCommand("selectAll", false, null); } catch (_) {}
+        try { document.execCommand("delete", false, null); } catch (_) {}
+        const after = String(el.innerText || el.textContent || "");
+        if (after.length > 0) {
+          // execCommand 没清掉（框架拦截/废弃 API）⇒ 退回直接写。
+          // ⚠ innerText 与 textContent 都要清：两者是不同属性，
+          //   只写一个会让「回读」读到旧值 ⇒ 后面误判成「有残留」。
+          el.textContent = "";
+          if (typeof el.innerText !== "undefined") el.innerText = "";
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, data: "", inputType: "deleteContentBackward" }));
+        }
+      } else if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const d = Object.getOwnPropertyDescriptor(proto, "value");
+        if (d && d.set) d.set.call(el, ""); else el.value = "";
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, data: "", inputType: "deleteContentBackward" }));
+      }
+    } catch (_) { /* ignore */ }
+    // ⚠ 回读优先级：富文本看 innerText/textContent，原生表单看 value。
+    //   与 qstComposerReadText 保持**同一套读法**，否则「写完回读」和「清完回读」
+    //   会得出互相矛盾的结论（这是本函数第一次写错的地方）。
+    const isRich = !!(el.isContentEditable || el.getAttribute("contenteditable") === "true");
+    const now = String(isRich
+      ? ((typeof el.innerText === "string" && el.innerText) || el.textContent || "")
+      : (el.value || ""));
+    return { ok: true, matchedBy: s, textLength: now.length, text: now.slice(0, 120) };
+  }
+  return { ok: false, reason: "no-composer" };
+}
+
+/// 读回输入框当前内容（判「写没写进去」用，见 §26：要盯被保护对象本身）
+function qstComposerReadText(cfg) {
+  const sels = [].concat(
+    (cfg && cfg.inputSelectors) || [],
+    ["div[contenteditable='true'][role='textbox']", "div[contenteditable='true']", "textarea"]
+  );
+  for (const s of sels) {
+    if (!s) continue;
+    let el = null;
+    try { el = document.querySelector(s); } catch (_) { continue; }
+    if (!el) continue;
+    const isRich = !!(el.isContentEditable || el.getAttribute("contenteditable") === "true");
+    // ⚠ 与 qstComposerClearAndRead 用**同一套读法**（两处必须一致，
+    //   否则「清完回读」与「写完回读」会给出互相矛盾的结论）
+    const t = String(isRich
+      ? ((typeof el.innerText === "string" && el.innerText) || el.textContent || "")
+      : (el.value || ""));
+    return { ok: true, matchedBy: s, textLength: t.length, text: t.slice(0, 300) };
+  }
+  return { ok: false, reason: "no-composer" };
+}
+
+/// 富文本写入主流程（在 page 里跑，配合 CDP 使用）。
+/// ⚠ 分两段调用：① 先 focus（本函数）② 再 CDP insertText
+///   因为 CDP 的输入命令作用于**当前焦点**，必须先把焦点搬过去。
+function qstPrepareComposerForCdp(cfg) {
+  const f = qstFocusComposer(cfg);
+  if (!f.ok) return f;
+  const cleared = qstComposerClearAndRead(cfg);
+  return { ...f, cleared };
+}
+
+/// 轮询读回答，直到「内容稳定 且 不忙」或超时。
+/// 照抄 browser-ai-bridge 的三个 timeout 分工（见 docs §2.3(2)）：
+///   progressIdleTimeoutMs  内容无变化且不忙持续超时 ⇒ 放弃
+///   maxGenerationTimeoutMs 总时长上限（防卡死）
+async function handleWebAiReadReply(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    return { ok: false, error: "NO_PROVIDER", message: String(msg.provider || "") };
+  }
+  const tabId = webAiTargetTabId(msg);
+  if (!tabId) return { ok: false, error: "NO_TAB", message: "未 attach 任何标签页" };
+
+  const cfg = {
+    inputSelectors: provider.inputSelectors || [],
+    responseSelectors: provider.responseSelectors || [],
+    busySelectors: provider.busySelectors || [],
+  };
+  const idleTimeout = Number(msg.progressIdleTimeoutMs || provider.progressIdleTimeoutMs || 30000);
+  const maxTotal = Number(msg.maxGenerationTimeoutMs || provider.maxGenerationTimeoutMs || 600000);
+  const pollMs = 500;
+
+  const t0 = Date.now();
+  let lastText = "";
+  let lastChangeAt = Date.now();
+  let stableSince = 0;
+  let lastSnap = null;
+  let seenAnyText = false;
+
+  while (Date.now() - t0 < maxTotal) {
+    let snap = null;
+    try {
+      snap = await injectReadAssistantReply(tabId, cfg);
+    } catch (e) {
+      return { ok: false, error: "INJECT_FAILED", message: String((e && e.message) || e) };
+    }
+    if (!snap) return { ok: false, error: "NO_RESULT" };
+    if (snap.ok === false && snap.reason === "no-response-node") {
+      // 还没出回答节点：不算失败，继续等（首个 token 之前本来就没有容器）
+      lastSnap = snap;
+      if (Date.now() - t0 > idleTimeout) {
+        return {
+          ok: false,
+          error: "NO_RESPONSE_NODE",
+          message: "等待回答容器超时",
+          triedSelectors: snap.triedSelectors || [],
+        };
+      }
+      await sleepMs(pollMs);
+      continue;
+    }
+    lastSnap = snap;
+    const text = String(snap.text || "");
+    if (text !== lastText) {
+      lastText = text;
+      lastChangeAt = Date.now();
+      if (text) seenAnyText = true;
+    }
+    // 完成判据：不忙 且 内容已稳定 ≥1.2s 且 已有内容
+    const idleFor = Date.now() - lastChangeAt;
+    if (!snap.busy && seenAnyText && idleFor >= 1200) {
+      return {
+        ok: true,
+        text: lastText,
+        textLength: Number(snap.textLength) || lastText.length,
+        truncated: !!snap.truncated,
+        totalBlocks: Number(snap.totalBlocks) || 0,
+        provider: provider.id,
+        url: snap.url || "",
+        title: snap.title || "",
+        elapsedMs: Date.now() - t0,
+        matchedBy: snap.matchedBy || "",
+      };
+    }
+    // 空闲超时：既没变化也不忙，长时间没有进展
+    if (!snap.busy && idleFor >= idleTimeout) {
+      if (seenAnyText) {
+        return {
+          ok: true,
+          text: lastText,
+          textLength: Number(snap.textLength) || lastText.length,
+          truncated: !!snap.truncated,
+          totalBlocks: Number(snap.totalBlocks) || 0,
+          provider: provider.id,
+          url: snap.url || "",
+          title: snap.title || "",
+          elapsedMs: Date.now() - t0,
+          idleTimeoutHit: true,
+          matchedBy: snap.matchedBy || "",
+        };
+      }
+      return {
+        ok: false,
+        error: "IDLE_NO_CONTENT",
+        message: "空闲超时且未读到任何回答内容",
+        busy: !!snap.busy,
+      };
+    }
+    await sleepMs(pollMs);
+  }
+  return {
+    ok: seenAnyText,
+    error: seenAnyText ? "" : "MAX_TIMEOUT",
+    text: lastText,
+    message: seenAnyText ? "" : "超过总时长上限仍未读到回答",
+    truncated: !!(lastSnap && lastSnap.truncated),
+    elapsedMs: Date.now() - t0,
+  };
+}
+
+async function handleWebAiProbe(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    const all = await loadWebAiProviders();
+    return {
+      ok: false,
+      error: "NO_PROVIDER",
+      message: String(msg.provider || ""),
+      knownProviders: Object.keys(all || {}),
+    };
+  }
+  const tabId = webAiTargetTabId(msg);
+  if (!tabId) return { ok: false, error: "NO_TAB", message: "未 attach 任何标签页" };
+  const cfg = {
+    inputSelectors: provider.inputSelectors || [],
+    sendButtonSelectors: provider.sendButtonSelectors || [],
+  };
+  const r = await injectWebAiProbe(tabId, cfg);
+  return { ok: true, provider: provider.id, probe: r };
+}
+
+/// 列出所有已知 provider（供宿主做站点选择）
+async function handleWebAiProviders() {
+  const all = await loadWebAiProviders();
+  const out = [];
+  for (const key of Object.keys(all || {})) {
+    const p = all[key] || {};
+    out.push({
+      id: key,
+      label: p.label || key,
+      url: p.url || "",
+      urlHint: p.urlHint || "",
+      inputKind: p.inputKind || "unknown",
+    });
+  }
+  return { ok: true, providers: out, version: BRIDGE_VERSION };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ★★ 富文本写入（CDP 真实按键）—— 攻克「豆包输入框能不能写进去」这一关
+//
+// 三段式，每段都可独立判成败（不要只看最后一步）：
+//   ① prepare：page 里找输入框 + focus + 清空   → 拿到 matchedBy / focusIsSelf
+//   ② insert ：CDP Input.insertText             → 走浏览器输入管线
+//   ③ verify ：page 里回读内容                  → **必须回读**，API 返回 ok 不算数
+// 若 ② 后回读为空 ⇒ 自动降级「逐字 dispatchKeyEvent」（模拟人手）
+//
+// ⚠ focusIsSelf=false 时**不要**继续插字：CDP 按键会打到别的元素上
+//   （典型症状：字进去了但进的是搜索框，页面看着"没反应"）。必须先报错。
+// ────────────────────────────────────────────────────────────────────
+
+async function handleWebAiRichType(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    const all = await loadWebAiProviders();
+    return {
+      ok: false,
+      error: "NO_PROVIDER",
+      message: String(msg.provider || ""),
+      knownProviders: Object.keys(all || {}),
+    };
+  }
+  const tabId = webAiTargetTabId(msg);
+  if (!tabId) return { ok: false, error: "NO_TAB", message: "未 attach 任何标签页" };
+  const text = String(msg.text || "");
+  const cfg = { inputSelectors: provider.inputSelectors || [] };
+  const debuggee = webAiCdpTarget(msg);
+
+  const out = {
+    ok: false,
+    provider: provider.id,
+    textLength: text.length,
+    steps: {},
+  };
+
+  // ── ① prepare（page 侧，**分两次注入自包含函数**）──
+  // ⚠⚠ 这里踩过一次坑，务必按本写法：`chrome.scripting.executeScript({func: X})`
+  //   只把 **X 自己的源码** 序列化后注入页面 —— X 里调用**同文件里的兄弟函数**
+  //   在页面里是 `ReferenceError`（那些函数并不存在于页面作用域）。
+  //   `qstPrepareComposerForCdp` 正是这种"组合函数"（内部调 qstFocusComposer +
+  //   qstComposerClearAndRead），直接当 func: 传过去必然在页面里崩。
+  // ⇒ 只注入**自包含**函数（只依赖 document/window 这些全局），一次一个。
+  let prep = null;
+  try {
+    const f = await injectPageFn(tabId, qstFocusComposer, [cfg]);
+    if (f.error) {
+      out.steps.prepareError = f.error;
+      out.error = "PREPARE_FAILED";
+      out.message = "页面里 focus 输入框时抛错：" + f.error;
+      return out;
+    }
+    const fv = f.result;
+    out.steps.prepare = fv;
+    if (!fv || !fv.ok) {
+      out.error = "NO_COMPOSER";
+      out.message = "没找到可见的输入框（selector 全未命中）";
+      return out;
+    }
+    if (!fv.focusIsSelf) {
+      // ★ 焦点没落到输入框 ⇒ 继续插字会打到别处。这是必须报出来的硬错误。
+      out.error = "FOCUS_NOT_ON_COMPOSER";
+      out.message = "输入框没拿到焦点，CDP 按键会打到别的元素上（先别插字）"
+        + (fv.activeSnippet ? "；当前焦点在：" + fv.activeSnippet : "");
+      return out;
+    }
+    const c = await injectPageFn(tabId, qstComposerClearAndRead, [cfg]);
+    if (c.error) out.steps.clearError = c.error;
+    prep = { ...fv, cleared: c.result };
+  } catch (e) {
+    out.error = "PREPARE_FAILED";
+    out.message = String((e && e.message) || e);
+    return out;
+  }
+  out.steps.prepare = prep;
+
+  // ── ② insert（CDP 真实输入）──
+  // 优先 Input.insertText：一次性、最快，且走真实输入管线。
+  //
+  // ★★ **调试会话掉了就重挂**（2026-09-30 实测 `WRITE_FAILED`）：
+  //   宿主收到的错误是
+  //     `steps=fallbackKeyEvents: Debugger is not attached to the tab with id: 1738895684`
+  //   —— `webAiDebuggee` 里记着"已挂"，但 CDP 侧实际已经断开（另一个调试器挂过/被摘、
+  //   标签被替换、DevTools 打开过都会这样）⇒ `Input.insertText` 与逐字按键**全部写不进去**
+  //   ⇒ 整轮报废（用户看到的"又提前掉了"）。
+  //   ⇒ 写之前先探一下（一次廉价的 Runtime.evaluate），探不到就 **detach+attach 重挂**；
+  //     真写失败且错误里含 "not attached" 时，**再重挂并重试一次**。
+  const ensureCdpAttached = async () => {
+    try {
+      await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+        expression: "1", returnByValue: true,
+      });
+      return true;
+    } catch (_) { /* 没挂/已掉 ⇒ 往下重挂 */ }
+    try { await chrome.debugger.detach(debuggee); } catch (_) {}
+    try {
+      await chrome.debugger.attach(debuggee, "1.3");
+      out.steps.reattached = true;
+      return true;
+    } catch (e) {
+      out.steps.reattachError = String((e && e.message) || e);
+      return false;
+    }
+  };
+  await ensureCdpAttached();
+  let inserted = false;
+  let insertErr = "";
+  const tryInsert = async () => {
+    try {
+      await chrome.debugger.sendCommand(debuggee, "Input.insertText", { text });
+      return "";
+    } catch (e) {
+      return String((e && e.message) || e);
+    }
+  };
+  insertErr = await tryInsert();
+  inserted = !insertErr;
+  if (!inserted && /not attached/i.test(insertErr)) {
+    // 再重挂一次 + 重写一次（这是可恢复故障，不该报废整轮）
+    out.steps.retryAfterReattach = true;
+    await ensureCdpAttached();
+    insertErr = await tryInsert();
+    inserted = !insertErr;
+  }
+  out.steps.insertText = { ok: inserted, error: insertErr || undefined };
+
+  // ── ③ verify（page 侧回读）──
+  const readBack = async () => {
+    const r = await injectPageFn(tabId, qstComposerReadText, [cfg]);
+    if (r.error) return { ok: false, reason: "inject:" + r.error };
+    return r.result;
+  };
+  let read = await readBack();
+  out.steps.verify = read;
+  const wroteOk = !!(read && read.ok && read.textLength > 0);
+
+  // ── ②b 降级：逐字真实按键（insertText 无效时）──
+  if (!wroteOk) {
+    out.steps.fallbackKeyEvents = { attempted: true };
+    try {
+      // 先再清一次，避免 insertText 部分写进去造成重复
+      const c2 = await injectPageFn(tabId, qstComposerClearAndRead, [cfg]);
+      if (c2.error) out.steps.fallbackKeyEvents.clearError = c2.error;
+      for (const ch of Array.from(text)) {
+        await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+          type: "keyDown",
+          text: ch,
+          unmodifiedText: ch,
+          key: ch,
+        });
+        await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: ch,
+        });
+      }
+      read = await readBack();
+      out.steps.verifyAfterFallback = read;
+      out.steps.fallbackKeyEvents.ok = !!(read && read.ok && read.textLength > 0);
+    } catch (e) {
+      out.steps.fallbackKeyEvents.ok = false;
+      out.steps.fallbackKeyEvents.error = String((e && e.message) || e);
+    }
+  }
+
+  const final = out.steps.verifyAfterFallback || out.steps.verify;
+  const ok = !!(final && final.ok && final.textLength > 0);
+  out.ok = ok;
+  if (!ok) {
+    out.error = "WRITE_FAILED";
+    out.message =
+      "CDP insertText 与逐字按键都没写进去 —— selector 可能命中了只读装饰元素，"
+      + "或该编辑器需要更底层的输入方式";
+  } else {
+    out.wroteBack = final.textLength;
+  }
+  return out;
+}
+
+/// 提交（按 Enter）。⚠ 与写入分开，便于宿主在确认写入后再提交。
+async function handleWebAiSubmit(msg) {
+  const tabId = webAiTargetTabId(msg);
+  if (!tabId) return { ok: false, error: "NO_TAB", message: "未 attach 任何标签页" };
+  const debuggee = webAiCdpTarget(msg);
+  try {
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+    });
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+    });
+    return { ok: true, via: "cdp-enter" };
+  } catch (e) {
+    return { ok: false, error: "SUBMIT_FAILED", message: String((e && e.message) || e) };
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ★★ 网页版 AI 的**独立调试会话**与**专属标签页**
+//
+// 两个必须分开的东西（2026-09-25 真机事故后加的）：
+//
+//  ① **调试会话要独立**：脚本回放 / 找图用全局 `attachedDebuggee`，而 `attachTab()`
+//     开头就 `await detachDebugger()` —— 网页 AI 若走这条全局路，会**把正在跑的脚本的
+//     调试会话拆掉**（用户实测原话：「扩展桥自动关闭调试了」）。
+//     ⇒ 网页 AI 自己持一条 `webAiDebuggee`，谁也不动谁。
+//
+//  ② **标签页要专属**：此前 `EnsureAttached` 挑的是「第一个 URL 匹配的页面」——
+//     那往往正是**用户自己正在跟豆包聊的那个对话**。后果是事故级的：
+//       · 模型能看到用户的历史对话（隐私 + 上下文污染）；
+//       · 我们的请求被追加进用户的主对话，用户看到的"回答"混着两边内容。
+//     ⇒ 每个站点有且只有一个**属于本软件**的标签页，tabId 持久化在 `chrome.storage.local`；
+//       用户的标签页我们**一个都不碰**。
+// ────────────────────────────────────────────────────────────────────
+
+/** 网页 AI 专属的 debugger 会话（与脚本/找图的 `attachedDebuggee` 完全隔离） */
+let webAiDebuggee = null;
+
+/** `chrome.storage.local` 里存「我们的标签页」的键：`{ [ownKey]: tabId }` */
+const WEB_AI_OWN_TAB_KEY = "qstWebAiOwnTab";
+
+/** ★★ 记「上次挑中且可用的站点」。
+ *
+ *  ⚠⚠ 为什么必须有（2026-09-26 真机，用户报"发消息半天没反应"+"开一堆标签页"）：
+ *    原来的自动挑选是「**逐个打开 4 个站点**探测，每个等 20 秒」
+ *    ⇒ 一次提问要 **80 秒**，而且**开 4 个标签页**（用户切到浏览器看到一片狼藉）。
+ *    ⇒ 改成：**记住上次成功的站点**，之后**直接用它、零探测**；
+ *      只有第一次（或上次那个失效了）才真的去试。
+ */
+const WEB_AI_LAST_OK_KEY = "qstWebAiLastOk";
+
+/** ★★ 「我们的标签页」的 key：**按会话分**，不是按站点。
+ *
+ *  ⚠⚠ 为什么不按站点分（2026-09-26 真机）：UI 里同一个模型可以开多个对话，
+ *    若共用一个标签页 ⇒ 两个对话的内容落在**同一个网页对话**里互相污染，
+ *    用户看到"一个对话在回复后被打到了另一个网页端对话"。
+ *    会话 key 由宿主带下来（UI 的 `agentTabs[].key` → 请求体 `user` → 这里的 `sessionKey`）。
+ *
+ *  ⚠ 老前端 / 探针不带 `sessionKey` ⇒ **回退到 provider.id**（保持老行为，不会更差）。
+ */
+function webAiOwnKey(provider, msg) {
+  const k = String((msg && msg.sessionKey) || "").trim();
+  return k ? (String(provider.id || "") + "#" + k) : String(provider.id || "");
+}
+
+/** 网页 AI 的目标 tabId：**优先我们自己的**，没有才退回旧的 attachMeta（兼容老路径） */
+function webAiTargetTabId(msg) {
+  if (webAiDebuggee && typeof webAiDebuggee.tabId === "number" && webAiDebuggee.tabId > 0) {
+    return webAiDebuggee.tabId;
+  }
+  return Number((msg && msg.tabId) || (attachMeta && attachMeta.pageTabId) || 0);
+}
+
+/** 网页 AI 的 CDP 目标：我们自己的会话优先（见上方 ①） */
+function webAiCdpTarget(msg) {
+  if (webAiDebuggee && typeof webAiDebuggee.tabId === "number" && webAiDebuggee.tabId > 0) {
+    return webAiDebuggee;
+  }
+  const tabId = Number((msg && msg.tabId) || (attachMeta && attachMeta.pageTabId) || 0);
+  return { tabId };
+}
+
+async function loadOwnTabMap() {
+  try {
+    const got = await chrome.storage.local.get(WEB_AI_OWN_TAB_KEY);
+    const m = got && got[WEB_AI_OWN_TAB_KEY];
+    return m && typeof m === "object" ? m : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+async function saveOwnTabId(providerId, tabId) {
+  try {
+    const m = await loadOwnTabMap();
+    if (Number(tabId) > 0) m[providerId] = Number(tabId);
+    else delete m[providerId];
+    await chrome.storage.local.set({ [WEB_AI_OWN_TAB_KEY]: m });
+  } catch (_) {
+    /* 存储失败不影响本次会话（只是下次启动会另开一个标签页） */
+  }
+}
+
+/** 按 urlHint 穷举返回**所有**匹配标签页。
+ *
+ *  ⚠⚠ 为什么不能复用 `listPages`：那是给「挑游戏窗」用的 —— 按游戏 URL 打分、
+ *    **每个窗口只留分最高的一个**、最后**只返回前 8 条**。
+ *    豆包这类站点 URL 得 0 分，会被游戏页挤掉 ⇒ 宿主看到"页面明明开着却说没有"。
+ *    这里只做**域名匹配**，不排序、不截断、不丢弃。
+ */
+async function findProviderTabs(provider) {
+  const hint = String((provider && provider.urlHint) || "").toLowerCase();
+  const out = [];
+  if (!hint) return out;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (_) {
+    return out;
+  }
+  for (const t of tabs || []) {
+    if (typeof t.id !== "number" || t.id <= 0) continue;
+    const u = String(t.url || "").toLowerCase();
+    if (!u || u.indexOf(hint) < 0) continue;
+    if (u.startsWith("edge://") || u.startsWith("chrome://") || u.startsWith("devtools://")
+        || u.startsWith("chrome-extension://")) {
+      continue;
+    }
+    out.push({ tabId: t.id, title: t.title || "", url: t.url || "",
+               windowId: typeof t.windowId === "number" ? t.windowId : -1,
+               status: t.status || "" });
+  }
+  return out;
+}
+
+/** 打开一个**属于我们**的标签页；浏览器一个窗口都没有时，先建一个**不抢焦点**的窗口。
+ *
+ *  ⚠⚠ 为什么必须抽成公共函数（2026-09-26 真机）：
+ *    `EnsureTab` 与 `PickProvider` **都要开标签页**，我分开写了两份 ⇒
+ *    只给其中一份加了"没有窗口时建窗口"的兜底 ⇒ 另一份仍然抛异常 ⇒
+ *    **探针能成功（走 EnsureTab）、正常提问却失败（走 PickProvider）** ——
+ *    用户看到的症状是 `NO_WEB_AI_LOGIN`（因为逐个站点探测全失败）。
+ *    ⇒ **同一件事只留一处实现**，别写第二份。
+ *
+ *  @return {ok, tabId, error?, message?}
+ */
+async function webAiOpenOwnTab(provider, ownKey, active) {
+  const baseUrl = String(provider.url || "").trim();
+  let tabId = 0;
+  try {
+    const t = await chrome.tabs.create({ url: baseUrl, active: active === true });
+    tabId = Number(t && t.id) || 0;
+  } catch (e) {
+    const em = String((e && e.message) || e);
+    // ★ 浏览器**一个窗口都没有**时 `tabs.create` 会抛异常（用户"没打开浏览器"，
+    //   进程在后台跑、扩展 service worker 还活着）⇒ 退一步建窗口再试。
+    //   ⚠ `focused: false` ⇒ **不抢用户的前台**。
+    try {
+      const w = await chrome.windows.create({ url: baseUrl, focused: false });
+      const wt = (w && w.tabs) ? w.tabs : [];
+      tabId = Number((wt[0] && wt[0].id) || 0);
+    } catch (e2) {
+      return {
+        ok: false,
+        tabId: 0,
+        error: "OPEN_FAILED",
+        message: "新建标签页失败：" + em + "；建窗口重试也失败："
+                 + String((e2 && e2.message) || e2),
+      };
+    }
+  }
+  if (!tabId) {
+    return { ok: false, tabId: 0, error: "OPEN_FAILED", message: "tabs.create 未返回 id" };
+  }
+  if (ownKey) await saveOwnTabId(ownKey, tabId);
+  return { ok: true, tabId: tabId };
+}
+
+/** 等页面**真的**渲染出可用的输入框（不是只等 `status === "complete"`）。
+ *
+ *  ⚠⚠ 为什么必须等（2026-09-26 真机）：
+ *    `waitTabComplete` 只等**文档加载完**（`status === "complete"`），
+ *    但豆包这类 **SPA 的输入框是 JS 挂载的** ⇒ complete 时输入框**还不存在**
+ *    ⇒ 紧接着的 `webAiRichType` 报 `NO_COMPOSER: 没找到可见的输入框`。
+ *
+ *    实测对照（同一天）：
+ *      · 探针：`EnsureTab` 新建标签页 → 等 2.4s → 写文字 ⇒ **成功**（回读 5 字）
+ *      · 正常提问：`NewChat` 导航 → **立刻**写文字 ⇒ **NO_COMPOSER**
+ *    ⇒ 差别就是"有没有给页面渲染时间"。
+ *
+ *  @return 输入框可用返回 `"ok"`；否则返回最后一次的原因（供日志/诊断）
+ */
+async function webAiWaitComposer(tabId, cfg, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 15000);
+  let last = "";
+  while (Date.now() < deadline) {
+    try {
+      const r = await injectPageFn(tabId, qstFocusComposer, [cfg || {}]);
+      if (r && !r.error && r.result && r.result.ok) return "ok";
+      last = r && r.error ? String(r.error) : "NO_COMPOSER";
+    } catch (e) {
+      last = String((e && e.message) || e);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return last || "NO_COMPOSER";
+}
+
+/** 让页面**以为**自己是可见的（尽量**不抢前台**也能渲染）。
+ *
+ *  ⚠ 为什么需要：用户明确抱怨"占用了界面前台，使用此功能时用户无法正常使用浏览器和电脑"
+ *    （2026-09-26）。前台化确实能让站点渲染，但代价是**抢走用户的屏幕**。
+ *
+ *  ⚠⚠ **它只能骗过"读 `document.visibilityState` 决定要不要渲染"的站点**；
+ *    浏览器层面的渲染节流是内部行为，改不了 ⇒ 真读不到回答时**才**回退到前台化
+ *    （由宿主的 `activateTabDuringRun` 控制，默认关）。
+ */
+async function webAiInstallVisibilityOverride(debuggee) {
+  const src = [
+    "(() => { try {",
+    "  Object.defineProperty(document, 'visibilityState',",
+    "    { get: () => 'visible', configurable: true });",
+    "  Object.defineProperty(document, 'hidden',",
+    "    { get: () => false, configurable: true });",
+    "  document.addEventListener('visibilitychange',",
+    "    (e) => e.stopImmediatePropagation(), true);",
+    "} catch (e) {} })();",
+  ].join("\n");
+  const notes = [];
+  // ① 之后每次导航都自动装
+  try {
+    await chrome.debugger.sendCommand(debuggee, "Page.addScriptToEvaluateOnNewDocument",
+      { source: src });
+  } catch (e) {
+    notes.push("newdoc:" + String((e && e.message) || e));
+  }
+  // ② 当前这一页也立刻装上
+  try {
+    await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", { expression: src });
+  } catch (e) {
+    notes.push("now:" + String((e && e.message) || e));
+  }
+  return notes;
+}
+
+/** 让**后台标签页**尽可能保持"活着"（不冻结、不省电节流）。
+ *
+ *  为什么必须做：后台标签页里 `document.visibilityState === 'hidden'`，
+ *  Chrome 会冻结/节流渲染 ⇒ 站点的流式回答**不往 DOM 里写**
+ *  ⇒ 我们等半天读不到回复（用户实测：「必须我亲手手点网页前台…软件才能抓到对方的回复」）。
+ *
+ *  ⚠ 这两条**只能缓解**，不能把 `visibilityState` 变成 `visible`
+ *    ⇒ 真读不到时还要靠 `webAiActivateTab` 临时前台化（见下）。
+ */
+async function keepTargetAlive(debuggee) {
+  const notes = [];
+  try {
+    await chrome.debugger.sendCommand(debuggee, "Emulation.setFocusEmulationEnabled", {
+      enabled: true,
+    });
+  } catch (e) {
+    notes.push("focus:" + String((e && e.message) || e));
+  }
+  try {
+    await chrome.debugger.sendCommand(debuggee, "Page.setWebLifecycleState", {
+      state: "active",
+    });
+  } catch (e) {
+    notes.push("lifecycle:" + String((e && e.message) || e));
+  }
+  // ★ 再尽量**不抢前台**地让站点肯渲染（见 webAiInstallVisibilityOverride 的说明）
+  const vnotes = await webAiInstallVisibilityOverride(debuggee);
+  for (const n of vnotes) notes.push("vis:" + n);
+  return notes;
+}
+
+/** 列出该站点当前打开的页面（宿主的 `webAiFindPage` 用） */
+async function handleWebAiFindPage(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    const all = await loadWebAiProviders();
+    return {
+      ok: false,
+      error: "NO_PROVIDER",
+      message: String(msg.provider || ""),
+      knownProviders: Object.keys(all || {}),
+      version: BRIDGE_VERSION,
+    };
+  }
+  const pages = await findProviderTabs(provider);
+  return { ok: true, provider: provider.id, count: pages.length, pages, version: BRIDGE_VERSION };
+}
+
+/** 拿到**属于本软件**的站点标签页（没有就新建），并把网页 AI 的调试会话挂上去。
+ *
+ *  @param msg.active 新建时是否切到前台（默认 true：第一次用往往还要登录，后台开用户会看不到）
+ *  @return {ok, tabId, created, url, attached, attachError}
+ */
+async function handleWebAiEnsureTab(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    const all = await loadWebAiProviders();
+    return {
+      ok: false,
+      error: "NO_PROVIDER",
+      message: String(msg.provider || ""),
+      knownProviders: Object.keys(all || {}),
+      version: BRIDGE_VERSION,
+    };
+  }
+  const baseUrl = String(provider.url || "").trim();
+  if (!provider.urlHint || !/^https?:\/\//i.test(baseUrl)) {
+    return { ok: false, error: "BAD_PROVIDER",
+             message: "站点配置缺 url/urlHint", version: BRIDGE_VERSION };
+  }
+
+  const ownKey = webAiOwnKey(provider, msg);
+  const map = await loadOwnTabMap();
+  const known = Number(map[ownKey]) || 0;
+  let tabId = 0;
+  let created = false;
+  let url = "";
+
+  // ① 我们那个还在、且还在这个站点上？⇒ 就是它
+  //   ⚠ 必须同时校验 URL：用户可能把那个标签页导航去别处了，tabId 还在但不能用。
+  if (known > 0) {
+    try {
+      const t = await chrome.tabs.get(known);
+      // ⚠⚠ 用 `pendingUrl` 兜底（2026-09-26 真机：用户看到**两个豆包标签页**）：
+      //   `chrome.tabs.create({url})` 返回后、页面还没导航完时，`t.url` 是 `about:blank`
+      //   （目标 URL 在 `t.pendingUrl` 里）⇒ 只比对 `t.url` 会判"这个标签页不是该站点的"
+      //   ⇒ **又开一个** ⇒ 每次提问多一个标签页。
+      const u = String((t && (t.url || t.pendingUrl)) || "").toLowerCase();
+      const hint = String(provider.urlHint || "").toLowerCase();
+      if (u && hint && u.indexOf(hint) >= 0) {
+        tabId = known;
+        url = t.url;
+      } else if (!u || u === "about:blank" || u === "edge://newtab/"
+                 || (t && t.status && t.status !== "complete")) {
+        // ★ 我们**刚创建、还没导航到站点**的标签页 ⇒ 照样复用（否则必然重复开）
+        tabId = known;
+        url = t.url || baseUrl;
+      }
+    } catch (_) {
+      /* 已关闭 ⇒ 走新建 */
+    }
+  }
+
+  // ② 没有 ⇒ 新建一个属于我们的（走公共函数，兜底逻辑只有一份）
+  if (!tabId) {
+    const opened = await webAiOpenOwnTab(provider, ownKey, msg.active);
+    if (!opened.ok) {
+      return { ok: false, error: opened.error, message: opened.message,
+               version: BRIDGE_VERSION };
+    }
+    tabId = opened.tabId;
+    created = true;
+    url = baseUrl;
+  }
+
+  // ②b 新建的标签页**必须等它加载完**再往下走
+  //   ⚠ `waitTabComplete` 返回的是 **boolean**（见它自己的实现），不是状态字符串。
+  let ready = true;
+  if (created) {
+    ready = await waitTabComplete(tabId, 25000);
+  }
+
+  // ③ 挂上**我们自己的**调试会话（不碰脚本回放那条全局的）+ 保活
+  let attached = false;
+  let attachError = "";
+  let aliveNotes = [];
+  try {
+    if (!webAiDebuggee || webAiDebuggee.tabId !== tabId) {
+      try { await chrome.debugger.detach(webAiDebuggee); } catch (_) { /* 没挂过 */ }
+      await chrome.debugger.attach({ tabId }, "1.3");
+      webAiDebuggee = { tabId };
+    }
+    attached = true;
+    aliveNotes = await keepTargetAlive(webAiDebuggee);
+  } catch (e) {
+    attachError = String((e && e.message) || e);
+    webAiDebuggee = null;
+  }
+
+  // ④ 页面可见性诊断
+  //   ⚠⚠ 注意：我们注入过 `visibilityState` 覆盖（`webAiInstallVisibilityOverride`），
+  //     所以这里的值是**被模拟过的**，不能当"真实可见性"用 —— 只作参考。
+  let pageState = null;
+  try {
+    const v = await injectPageFn(tabId, function () {
+      return {
+        visibility: String(document.visibilityState || ""),
+        hidden: !!document.hidden,
+        hasFocus: !!document.hasFocus(),
+      };
+    }, []);
+    pageState = (v && v.result) || null;
+  } catch (_) {
+    /* 诊断失败不影响主流程 */
+  }
+
+  // ★ 双保险：返回前确认输入框真的可用（新建给足时间，复用只等一会儿）
+  const composerReady = await webAiWaitComposer(
+    tabId, { inputSelectors: provider.inputSelectors || [] }, created ? 15000 : 4000);
+
+  // ⚠ 回执是**跨进程协议** ⇒ 每个字段都显式定型（`String`/`Number`/`!!`）
+  return {
+    ok: true,
+    provider: String(provider.id || ""),
+    ownKey: ownKey,
+    composer: composerReady,
+    tabId: Number(tabId) || 0,
+    created: !!created,
+    url: String(url || ""),
+    status: created ? (ready ? "complete" : "timeout") : undefined,
+    attached: !!attached,
+    attachError: attachError ? String(attachError) : undefined,
+    aliveNotes: aliveNotes.length ? aliveNotes.map((x) => String(x)) : undefined,
+    pageState: pageState || undefined,
+    version: BRIDGE_VERSION,
+  };
+}
+
+/** 开新对话：把我们自己的标签页导航到站点入口，并等**输入框渲染出来**。
+ *
+ *  ⚠⚠ 2026-09-26 事故：上一版编辑时**替换范围吃掉了这个函数头**，
+ *    导致它的函数体被并进 `handleWebAiEnsureTab`，而 `target` 在那边**未定义**
+ *    ⇒ 走到 `chrome.tabs.update(tabId, { url: target })` 就 `ReferenceError`。
+ *    ⚠ `node --check` **完全通过**（两个函数拼成一个，语法照样合法）——
+ *    这是第三类"语法检查抓不到"的事故，靠 `tools/verify/ext_lint.py` 才发现。
+ */
+async function handleWebAiNewChat(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    return { ok: false, error: "NO_PROVIDER", message: String(msg.provider || ""),
+             version: BRIDGE_VERSION };
+  }
+  const target = String(msg.newChatUrl || provider.newChatUrl || provider.url || "").trim();
+  if (!/^https?:\/\//i.test(target)) {
+    return { ok: false, error: "BAD_URL", message: "新对话 URL 非法", version: BRIDGE_VERSION };
+  }
+  let tabId = Number(msg.tabId) || 0;
+  if (!tabId) {
+    const map = await loadOwnTabMap();
+    tabId = Number(map[webAiOwnKey(provider, msg)]) || 0;
+  }
+  if (!tabId) {
+    return { ok: false, error: "NO_TAB",
+             message: "还没有属于本软件的标签页（先调 webAiEnsureTab）", version: BRIDGE_VERSION };
+  }
+  try {
+    await chrome.tabs.update(tabId, { url: target });
+  } catch (e) {
+    return { ok: false, error: "NAV_FAIL", message: String((e && e.message) || e),
+             version: BRIDGE_VERSION };
+  }
+
+  // 等页面进入 complete（最多 25s）。⚠ 不等的话后面的 attach/insertText 会打在半截页面上。
+  // ⚠ 返回值是 **boolean**（见 `waitTabComplete` 实现）—— 回执里转成字符串，
+  //   别把 boolean 直接塞进 `status`（宿主按字符串读，会抛类型异常 ⇒ 闪退）。
+  const ready = await waitTabComplete(tabId, 25000);
+  // ★★ `complete` **不等于**"输入框已经渲染出来"（SPA 的输入框是 JS 挂载的）
+  //   ⇒ 这里必须再等输入框真的可用，否则紧接着的写文字会报 NO_COMPOSER。
+  const composer = await webAiWaitComposer(tabId, {
+    inputSelectors: provider.inputSelectors || [],
+  }, 15000);
+  return {
+    ok: true,
+    tabId: Number(tabId) || 0,
+    url: String(target || ""),
+    status: ready ? "complete" : "timeout",
+    composer: composer,
+    version: BRIDGE_VERSION,
+  };
+}
+
+/** ★ 自动挑一个能用的站点（宿主的 `web` 模型走这条）。
+ *
+ *  规则（用户 2026-09-25 指定）：
+ *    ① **已经开着**的站点优先 —— 你开着豆包就用豆包，开着元宝就用元宝；
+ *    ② 都没开 ⇒ 按内置顺序**逐个打开探测**，第一个"能拿到输入框"的（≈ 已登录）就用它；
+ *       探测失败的标签页**由我们关掉**（不给你留一堆登录页）；
+ *    ③ 全都不行 ⇒ 报 `NO_WEB_AI_LOGIN`，宿主在界面上提示"至少登录一个网页 AI"。
+ *
+ *  ⚠ 「已登录」的判据就是**页面上能找到可见的输入框** —— 不用去猜各家 cookie 名，
+ *    而且这正是我们后续真正要用的东西（找不到输入框本来也用不了）。
+ */
+async function handleWebAiPickProvider(msg) {
+  const all = await loadWebAiProviders();
+  const ids = Object.keys(all || {});
+  if (!ids.length) {
+    return { ok: false, error: "NO_PROVIDER", message: "扩展没读到 web_ai_providers.json",
+             version: BRIDGE_VERSION };
+  }
+
+  // ① 已经开着页面？⇒ 用第一个（按 JSON 里的顺序，豆包在前）
+  const opened = [];
+  for (const id of ids) {
+    const p = { id, ...(all[id] || {}) };
+    const tabs = await findProviderTabs(p);
+    if (tabs.length) {
+      opened.push({ provider: id, tabId: tabs[0].tabId, url: tabs[0].url, reason: "open" });
+    }
+  }
+  if (opened.length) {
+    return { ok: true, picked: opened[0], candidates: opened, reason: "open",
+             version: BRIDGE_VERSION };
+  }
+
+  // ② ★ 上次成功的站点 ⇒ **直接用它，不探测**（这一步把 80 秒变成 0 秒）
+  try {
+    const got = await chrome.storage.local.get(WEB_AI_LAST_OK_KEY);
+    const lastOk = String((got && got[WEB_AI_LAST_OK_KEY]) || "");
+    if (lastOk && all[lastOk]) {
+      return {
+        ok: true,
+        picked: { provider: lastOk, tabId: 0, url: String((all[lastOk] || {}).url || ""),
+                  reason: "lastOk" },
+        reason: "lastOk",
+        version: BRIDGE_VERSION,
+      };
+    }
+  } catch (_) { /* 读不到就当没有 */ }
+
+  // ③ 都没有 ⇒ 逐个打开探测（**只在第一次**；失败的标签页立刻关掉）
+  //   ⚠ 每个只等 8 秒（不是 20）—— 4 个站点最多 32 秒，而不是 80 秒。
+  const tried = [];
+  for (const id of ids) {
+    const p = { id, ...(all[id] || {}) };
+    if (!p.urlHint || !/^https?:\/\//i.test(String(p.url || ""))) {
+      tried.push({ provider: id, ok: false, why: "BAD_PROVIDER" });
+      continue;
+    }
+    // ★★ 先看这个会话是不是**已经有我们的标签页**了（哪怕它还在加载）
+    //   —— 不先看就会重复开（用户看到两个豆包标签页，2026-09-26 真机）。
+    {
+      const key0 = webAiOwnKey(p, msg);
+      const m0 = await loadOwnTabMap();
+      const k0 = Number(m0[key0]) || 0;
+      if (k0 > 0) {
+        try {
+          const t0 = await chrome.tabs.get(k0);
+          const u0 = String((t0 && (t0.url || t0.pendingUrl)) || "").toLowerCase();
+          const hint0 = String(p.urlHint || "").toLowerCase();
+          if (u0.indexOf(hint0) >= 0 || !u0 || u0 === "about:blank"
+              || (t0 && t0.status && t0.status !== "complete")) {
+            const w0 = await webAiWaitComposer(k0, { inputSelectors: p.inputSelectors || [] }, 8000);
+            if (w0 === "ok") {
+              try { await chrome.storage.local.set({ [WEB_AI_LAST_OK_KEY]: id }); } catch (_) {}
+              tried.push({ provider: id, ok: true, tabId: k0, url: p.url, why: "own-tab" });
+              return { ok: true,
+                       picked: { provider: id, tabId: k0, url: p.url, reason: "own-tab" },
+                       tried, version: BRIDGE_VERSION };
+            }
+          }
+        } catch (_) { /* 已关闭 ⇒ 走新建 */ }
+      }
+    }
+
+    // ★ 走公共函数（浏览器没有窗口时会自动建一个不抢焦点的窗口）——
+    //   ⚠ 这里原本自己写了一份 `tabs.create`，**漏了那个兜底** ⇒ 没有窗口时全站失败。
+    // ⚠ 变量名用 `openRes`：上面已有一个 `opened`（"已经开着的站点"数组），
+    //   重名会遮蔽，以后改代码时极易看错。
+    const openRes = await webAiOpenOwnTab(p, webAiOwnKey(p, msg), msg.active);
+    if (!openRes.ok) {
+      tried.push({ provider: id, ok: false, why: openRes.error + ": " + (openRes.message || "") });
+      continue;
+    }
+    let tabId = openRes.tabId;
+    try {
+      await waitTabComplete(tabId, 25000);
+
+      // 能不能找到可见的输入框 = 能不能用（≈ 已登录）
+      const cfg = { inputSelectors: p.inputSelectors || [] };
+      // ★ 等输入框**真的渲染出来**（`waitTabComplete` 只等文档加载完，
+      //   SPA 的输入框是 JS 挂载的 ⇒ 立刻探测必然失败 ⇒ 全站判"没登录"）。
+      //   ⚠ 判据已放宽到"不可见也算"（见 `qstFocusComposer`），所以后台标签页也能探测到。
+      const waitRes = await webAiWaitComposer(tabId, cfg, 8000);
+      const found = (waitRes === "ok");
+      // ⚠⚠ 这里**只能**用 `waitRes`。2026-09-26 真机事故：我上一版把上面那行换成
+      //   `webAiWaitComposer` 后**漏改了这一行**，`r` 已经不存在 ⇒ `ReferenceError`
+      //   ⇒ 每个站点的探测都失败 ⇒ 用户看到 `NO_WEB_AI_LOGIN`
+      //   （而探针走的是 `EnsureTab`，不受影响 ⇒ 表现为"探针能成功、提问不行"）。
+      tried.push({ provider: id, ok: found, tabId, url: p.url,
+                   why: found ? "login" : String(waitRes || "NO_COMPOSER") });
+      if (found) {
+        // ★ 记下"上次成功的站点" ⇒ 之后直接用它，不再探测
+        try { await chrome.storage.local.set({ [WEB_AI_LAST_OK_KEY]: id }); } catch (_) {}
+        // 标签页已在 `webAiOpenOwnTab` 里登记成"我们的"（按会话 key）
+        return { ok: true, picked: { provider: id, tabId, url: p.url, reason: "login" },
+                 tried, version: BRIDGE_VERSION };
+      }
+    } catch (e) {
+      tried.push({ provider: id, ok: false, why: String((e && e.message) || e) });
+    }
+    // 探测失败 ⇒ 关掉，不留垃圾（这是我们自己开的）
+    if (tabId) {
+      try { await chrome.tabs.remove(tabId); } catch (_) { /* ignore */ }
+      await saveOwnTabId(webAiOwnKey(p, msg), 0);
+    }
+  }
+
+  return {
+    ok: false,
+    error: "NO_WEB_AI_LOGIN",
+    message: "没找到可用的网页 AI：豆包 / DeepSeek / 元宝 都没有已登录的页面",
+    tried,
+    providers: ids,
+    version: BRIDGE_VERSION,
+  };
+}
+
+/** 临时把我们的标签页切到前台（读回答需要它真的渲染）。
+ *
+ *  为什么必须：后台标签页 `visibilityState === 'hidden'` ⇒ 站点的流式回答不往 DOM 写
+ *  ⇒ 读不到回复（用户实测：「必须我亲手手点网页前台…软件才能抓到对方的回复」）。
+ *  `keepTargetAlive` 只能缓解，不能把 hidden 变成 visible。
+ *
+ *  @return {ok, prevTabId, prevWindowId} —— 宿主读完要调 `webAiRestoreTab` 还回去。
+ */
+async function handleWebAiActivateTab(msg) {
+  let tabId = Number(msg.tabId) || 0;
+  if (!tabId && webAiDebuggee) tabId = Number(webAiDebuggee.tabId) || 0;
+  if (!tabId) {
+    const provider = await resolveWebAiProvider(msg.provider || "");
+    if (provider) {
+      const map = await loadOwnTabMap();
+      tabId = Number(map[provider.id]) || 0;
+    }
+  }
+  if (!tabId) return { ok: false, error: "NO_TAB", version: BRIDGE_VERSION };
+
+  let prevTabId = 0;
+  let prevWindowId = -1;
+  try {
+    const t = await chrome.tabs.get(tabId);
+    prevWindowId = typeof t.windowId === "number" ? t.windowId : -1;
+    const act = await chrome.tabs.query({ active: true, windowId: prevWindowId });
+    if (act && act.length && typeof act[0].id === "number") prevTabId = act[0].id;
+  } catch (_) { /* ignore */ }
+
+  try {
+    if (prevTabId === tabId) {
+      return { ok: true, alreadyActive: true, tabId, prevTabId, prevWindowId,
+               version: BRIDGE_VERSION };
+    }
+    await chrome.tabs.update(tabId, { active: true });
+    if (prevWindowId >= 0) {
+      try { await chrome.windows.update(prevWindowId, { focused: true }); } catch (_) {}
+    }
+    return { ok: true, alreadyActive: false, tabId, prevTabId, prevWindowId,
+             version: BRIDGE_VERSION };
+  } catch (e) {
+    return { ok: false, error: "ACTIVATE_FAILED", message: String((e && e.message) || e),
+             version: BRIDGE_VERSION };
+  }
+}
+
+/** 把前台还给用户原来那个标签页（只在"我们那个还是活动标签页"时还，避免抢回用户已切走的）。 */
+async function handleWebAiRestoreTab(msg) {
+  const prevTabId = Number(msg.prevTabId) || 0;
+  const ourTabId = Number(msg.tabId) || 0;
+  if (!prevTabId || prevTabId === ourTabId) {
+    return { ok: true, skipped: true, version: BRIDGE_VERSION };
+  }
+  try {
+    if (ourTabId) {
+      const cur = await chrome.tabs.query({ active: true });
+      if (cur && cur.length && Number(cur[0].id) !== ourTabId) {
+        // 用户自己已经切走了 ⇒ 别抢回来
+        return { ok: true, skipped: "user-moved", version: BRIDGE_VERSION };
+      }
+    }
+    await chrome.tabs.update(prevTabId, { active: true });
+    return { ok: true, restored: prevTabId, version: BRIDGE_VERSION };
+  } catch (e) {
+    return { ok: false, error: "RESTORE_FAILED", message: String((e && e.message) || e),
+             version: BRIDGE_VERSION };
+  }
+}
+
+// ── 传图（网页版 AI 的图片通道）─────────────────────────────────────
+// 宿主把请求里的 data URL 落成临时文件，这里用 CDP 挂到页面的 <input type=file>。
+//
+// ⚠⚠ 为什么不能用 JS 直接塞：`input.files` 是**只读** FileList；用 DataTransfer
+//   造个 File 塞进去，页面大多不认（那不是"用户选择"的结果，且部分框架在 change
+//   里校验事件来源）。CDP 的 `DOM.setFileInputFiles` 走浏览器进程的**真实文件选择
+//   管线**，派发的事件与真人选文件完全一致 —— 这是唯一可靠的路子。
+//
+// 两条路（先 A 后 B，A 覆盖绝大多数站点）：
+//   A. 页面上**已经存在** <input type=file>（含 open shadow root）⇒ 直接挂。
+//   B. 找不到 ⇒ 说明输入框是「点附件按钮时才动态创建」的 ⇒
+//      用 `Page.setInterceptFileChooserDialog` 拦住文件选择器 → 点一下附件按钮 →
+//      从 `Page.fileChooserOpened` 事件里取 backendNodeId → 再挂。
+//      （富文本编辑器站点常见 B 形态：input 用完即删）
+//
+// ⚠ 回读校验是**必须**的：`DOM.setFileInputFiles` 不报错 ≠ 页面认了。
+//   有些站点在 change 里校验类型/大小并**静默清空** input ⇒ 必须读 `files.length`。
+
+/** 自包含：数一数页面上**用户可见的图片缩略图**（`blob:` / `data:` 的 img）。
+ *
+ *  ⚠⚠ 为什么这是**传图是否成功**的正确判据：
+ *    站点（豆包等）的附件流程是「读走 `files[0]` → 上传/本地预览 → **主动清空 input**」
+ *    —— 清空是为了让用户能再选同一个文件。所以挂载后 `input.files.length === 0`
+ *    **完全可能是成功的**（2026-09-26 真机踩到：我们据此判失败，其实图已经挂上了）。
+ *    而"图真的挂上了"会有一个**与类名无关**的硬信号：
+ *    页面里出现了新的 `blob:` / `data:` 图片元素（缩略图）。
+ *    ⇒ 用它当判据，比"input 里还有没有文件"可靠得多。
+ */
+function qstCountThumbs() {
+  let n = 0;
+  try {
+    const imgs = document.querySelectorAll("img");
+    for (const im of imgs) {
+      const src = String(im.getAttribute("src") || im.src || "");
+      if (src.startsWith("blob:") || src.startsWith("data:image")) n++;
+    }
+  } catch (_) {}
+  return n;
+}
+
+/** 自包含：列出页面上**所有** file input 的概要（诊断 + 择优）。
+ *
+ *  ⚠ 为什么必须"全列"：2026-09-25 真机 `UPLOAD_NOT_ACCEPTED`（挂上了但页面把 files 清空）
+ *    有两种完全不同的可能 —— ① 我们**选错了** input（页面上有多个）；
+ *    ② 站点**读走就清空**（很多站点读完 files[0] 后主动清空，让用户能再选同一个文件，
+ *    此时 `files.length===0` 其实是**成功**）。不把全部 input 列出来就分不清。
+ */
+function qstListFileInputs(cfg) {
+  const sels = [].concat((cfg && cfg.fileInputSelectors) || [], ["input[type='file']"]);
+  const seen = [];
+  const walk = (root, depth) => {
+    for (const s of sels) {
+      let list = [];
+      try { list = Array.from(root.querySelectorAll(s)); } catch (_) { continue; }
+      for (const el of list) if (seen.indexOf(el) < 0) seen.push(el);
+    }
+    if (depth > 0) {
+      let nodes = [];
+      try { nodes = root.querySelectorAll("*"); } catch (_) { return; }
+      for (const n of nodes) if (n.shadowRoot) walk(n.shadowRoot, depth - 1);
+    }
+  };
+  walk(document, 3);
+  const out = [];
+  for (let i = 0; i < seen.length; i++) {
+    const el = seen[i];
+    let w = 0, h = 0;
+    try { const r = el.getBoundingClientRect(); w = Math.round(r.width); h = Math.round(r.height); } catch (_) {}
+    let fc = -1;
+    try { fc = el.files ? el.files.length : -1; } catch (_) {}
+    out.push({
+      idx: i,
+      accept: String(el.getAttribute("accept") || ""),
+      multiple: !!el.multiple,
+      disabled: !!el.disabled,
+      visible: (w > 0 && h > 0),
+      w: w, h: h,
+      name: String(el.getAttribute("name") || ""),
+      id: String(el.id || ""),
+      cls: String(el.className || "").slice(0, 60),
+      fileCount: fc,
+    });
+  }
+  return { count: out.length, inputs: out };
+}
+
+/** 自包含：按 `idx` 取第 idx 个 file input（**返回元素本身**，供 CDP 拿 objectId）。
+ *
+ *  排序规则：`accept` 含 image 的优先 → 不限类型的次之 → 可见的优先 → 离输入框近的优先。
+ *  ⚠ 排序只是"先试哪个"，**不是判据** —— 真正的判据是挂上之后页面认不认（回读）。
+ */
+function qstPickFileInput(cfg, idx) {
+  const sels = [].concat((cfg && cfg.fileInputSelectors) || [], ["input[type='file']"]);
+  const seen = [];
+  const walk = (root, depth) => {
+    for (const s of sels) {
+      let list = [];
+      try { list = Array.from(root.querySelectorAll(s)); } catch (_) { continue; }
+      for (const el of list) if (seen.indexOf(el) < 0) seen.push(el);
+    }
+    if (depth > 0) {
+      let nodes = [];
+      try { nodes = root.querySelectorAll("*"); } catch (_) { return; }
+      for (const n of nodes) if (n.shadowRoot) walk(n.shadowRoot, depth - 1);
+    }
+  };
+  walk(document, 3);
+
+  // 参考点：输入框（附件 input 通常在它附近）
+  let anchor = null;
+  for (const s of ((cfg && cfg.inputSelectors) || [])) {
+    try { const el = document.querySelector(s); if (el) { anchor = el; break; } } catch (_) {}
+  }
+  let ar = null;
+  try { ar = anchor ? anchor.getBoundingClientRect() : null; } catch (_) {}
+
+  const score = (el) => {
+    let v = 0;
+    const acc = String(el.getAttribute("accept") || "").toLowerCase();
+    if (acc.indexOf("image") >= 0) v += 100;
+    else if (!acc) v += 10;
+    if (el.multiple) v += 5;
+    if (el.disabled) v -= 200;
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) v += 3;
+      if (ar) {
+        const dy = Math.abs((r.top + r.height / 2) - (ar.top + ar.height / 2));
+        v += Math.max(0, 60 - Math.round(dy / 10));   // 越近越高
+      }
+    } catch (_) {}
+    return v;
+  };
+  const ranked = seen.slice().sort((a, b) => score(b) - score(a));
+  const el = ranked[idx];
+  return el || null;
+}
+
+/** 自包含：找 file input（先按配置的 selector，再全文档兜底；含 open shadow root） */
+function qstFindFileInput(cfg) {
+  const sels = [].concat((cfg && cfg.fileInputSelectors) || [], ["input[type='file']"]);
+  const search = (root, depth) => {
+    for (const s of sels) {
+      if (!s) continue;
+      try {
+        const el = root.querySelector(s);
+        if (el) return el;
+      } catch (_) {
+        /* 非法 selector 跳过 */
+      }
+    }
+    if (depth > 0) {
+      let all = [];
+      try {
+        all = root.querySelectorAll("*");
+      } catch (_) {
+        return null;
+      }
+      for (const n of all) {
+        const sr = n.shadowRoot;
+        if (sr) {
+          const hit = search(sr, depth - 1);
+          if (hit) return hit;
+        }
+      }
+    }
+    return null;
+  };
+  return search(document, 3);
+}
+
+/** 自包含：读回 file input 的状态（诊断用） */
+function qstReadFileInputState(cfg) {
+  const el = qstFindFileInput(cfg);
+  if (!el) {
+    let n = 0;
+    try {
+      n = document.querySelectorAll("input[type='file']").length;
+    } catch (_) {
+      /* ignore */
+    }
+    return { ok: false, reason: "NO_INPUT", inputCount: n };
+  }
+  const files = [];
+  try {
+    for (let i = 0; i < el.files.length; i++) {
+      files.push({ name: el.files[i].name, size: el.files[i].size });
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return {
+    ok: files.length > 0,
+    count: files.length,
+    files,
+    accept: el.getAttribute("accept") || "",
+    multiple: !!el.multiple,
+    disabled: !!el.disabled,
+  };
+}
+
+/** 自包含：点一下站点的「附件 / 上传」按钮（为 B 路触发文件选择器） */
+function qstClickFileButton(cfg) {
+  const sels = (cfg && cfg.fileButtonSelectors) || [];
+  const hit = [];
+  for (const s of sels) {
+    if (!s) continue;
+    let el = null;
+    try {
+      el = document.querySelector(s);
+    } catch (_) {
+      hit.push(s + " (bad selector)");
+      continue;
+    }
+    if (!el) {
+      hit.push(s + " (miss)");
+      continue;
+    }
+    try {
+      el.click();
+      return { ok: true, matchedBy: s, tried: hit };
+    } catch (e) {
+      hit.push(s + " (click: " + String((e && e.message) || e) + ")");
+    }
+  }
+  return { ok: false, tried: hit };
+}
+
+async function handleWebAiUploadImages(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    const all = await loadWebAiProviders();
+    return {
+      ok: false,
+      error: "NO_PROVIDER",
+      message: String(msg.provider || ""),
+      knownProviders: Object.keys(all || {}),
+      version: BRIDGE_VERSION,
+    };
+  }
+  const tabId = webAiTargetTabId(msg);
+  if (!tabId) {
+    return { ok: false, error: "NO_TAB", message: "未 attach 任何标签页", version: BRIDGE_VERSION };
+  }
+
+  const files = (Array.isArray(msg.files) ? msg.files : [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+  if (!files.length) {
+    return { ok: false, error: "NO_FILES", message: "没有给出任何本地图片路径", version: BRIDGE_VERSION };
+  }
+
+  const cfg = {
+    inputSelectors: provider.inputSelectors || [],
+    fileInputSelectors: provider.fileInputSelectors || [],
+    fileButtonSelectors: provider.fileButtonSelectors || [],
+  };
+  const debuggee = webAiCdpTarget(msg);
+  const out = {
+    ok: false,
+    provider: String(provider.id || ""),
+    fileCount: files.length,
+    steps: {},
+    version: BRIDGE_VERSION,
+  };
+
+  const evalValue = async (expr) => {
+    const r = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+      expression: expr,
+      returnByValue: true,
+    });
+    return r && r.result ? r.result.value : undefined;
+  };
+  const readBack = async () => {
+    try {
+      return await evalValue(
+        "(" + qstReadFileInputState.toString() + ")(" + JSON.stringify(cfg) + ")");
+    } catch (e) {
+      return { ok: false, reason: "inject:" + String((e && e.message) || e) };
+    }
+  };
+
+  // ── 诊断：页面上到底有几个 file input + 挂载前的缩略图数 ──────────────
+  //   ⚠ 这两条是"选错 input"与"站点读走就清空"唯一的分辨手段，必须有。
+  try {
+    out.steps.listBefore = await evalValue(
+      "(" + qstListFileInputs.toString() + ")(" + JSON.stringify(cfg) + ")");
+  } catch (e) {
+    out.steps.listError = String((e && e.message) || e);
+  }
+  const countThumbs = async () => {
+    try {
+      return await evalValue("(" + qstCountThumbs.toString() + ")()");
+    } catch (_) {
+      return -1;
+    }
+  };
+  const thumbBefore = await countThumbs();
+  out.steps.thumbsBefore = thumbBefore;
+
+  // ── 路 A：**逐个**候选 input 尝试（不是只试第一个）──────────────────
+  //   前科（2026-09-26 真机 `UPLOAD_NOT_ACCEPTED`）：只试第一个 + 只在最后回读一次
+  //   ⇒ 选错 input 就直接报失败，而且分不清"选错了"和"页面读走就清空"。
+  const total = (out.steps.listBefore && out.steps.listBefore.count) || 0;
+  const tried = [];
+  for (let i = 0; i < Math.min(total, 3); i++) {
+    let objId = "";
+    try {
+      const r = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+        expression:
+          "(" + qstPickFileInput.toString() + ")(" + JSON.stringify(cfg) + "," + i + ")",
+        returnByValue: false,
+      });
+      objId = (r && r.result && r.result.objectId) || "";
+    } catch (e) {
+      tried.push({ idx: i, error: String((e && e.message) || e) });
+      continue;
+    }
+    if (!objId) {
+      tried.push({ idx: i, error: "no-objectId" });
+      continue;
+    }
+    try {
+      await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", { files, objectId: objId });
+    } catch (e) {
+      tried.push({ idx: i, error: String((e && e.message) || e) });
+      continue;
+    }
+    const st = await readBack();
+    const thumbNow = await countThumbs();
+    // ★ 成功判据（任一成立）：
+    //   ① input 里还留着文件（少数站点）；
+    //   ② **页面上出现了新的缩略图**（`blob:`/`data:` img 变多）——
+    //      这是"站点读走文件并渲染了预览"的硬信号，与类名无关。
+    const okNow = !!(st && st.ok) || (thumbBefore >= 0 && thumbNow > thumbBefore);
+    tried.push({ idx: i, after: st ? st.count : -1, thumbs: thumbNow, ok: okNow });
+    if (okNow) {
+      out.ok = true;
+      out.via = (st && st.ok) ? ("direct#" + i) : ("direct#" + i + "+thumb");
+      out.verifiedCount = (st && st.count) || 0;
+      out.steps.tried = tried;
+      out.steps.thumbsAfter = thumbNow;
+      out.steps.listAfter = await evalValue(
+        "(" + qstListFileInputs.toString() + ")(" + JSON.stringify(cfg) + ")");
+      return out;
+    }
+  }
+  out.steps.tried = tried;
+
+  // ── 路 B：拦截文件选择器 + 点附件按钮（input 是"点按钮才动态创建"时走这条）──
+  let backendNodeId = 0;
+  const onEv = (source, method, params) => {
+    if (method === "Page.fileChooserOpened" && params && !backendNodeId) {
+      backendNodeId = Number(params.backendNodeId) || 0;
+    }
+  };
+  try {
+    try { chrome.debugger.onEvent.addListener(onEv); } catch (_) { /* ignore */ }
+    await chrome.debugger.sendCommand(debuggee, "Page.setInterceptFileChooserDialog", { enabled: true });
+    out.steps.fileButton = (await evalValue(
+      "(" + qstClickFileButton.toString() + ")(" + JSON.stringify(cfg) + ")")) || null;
+    await new Promise((r) => setTimeout(r, 3000));
+    out.steps.chooser = { backendNodeId: backendNodeId, got: backendNodeId > 0 };
+    if (backendNodeId) {
+      await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
+        files,
+        backendNodeId: backendNodeId,
+      });
+      const st = await readBack();
+      const thumbNow = await countThumbs();
+      out.steps.afterChooser = st;
+      out.steps.thumbsAfter = thumbNow;
+      if ((st && st.ok) || (thumbBefore >= 0 && thumbNow > thumbBefore)) {
+        out.ok = true;
+        out.via = (st && st.ok) ? "fileChooser" : "fileChooser+thumb";
+        out.verifiedCount = (st && st.count) || 0;
+        return out;
+      }
+    }
+  } catch (e) {
+    out.steps.chooserError = String((e && e.message) || e);
+  } finally {
+    try { chrome.debugger.onEvent.removeListener(onEv); } catch (_) { /* ignore */ }
+    try {
+      await chrome.debugger.sendCommand(debuggee, "Page.setInterceptFileChooserDialog", { enabled: false });
+    } catch (_) { /* 老版本 Chrome 没这个方法；不影响主流程 */ }
+  }
+
+  out.steps.listAfter = await evalValue(
+    "(" + qstListFileInputs.toString() + ")(" + JSON.stringify(cfg) + ")");
+
+  // ── 挂上了但被清空：**可能是"读走就清空"（成功）**，也可能是真丢弃 ──
+  //   ⚠ 不猜：如实报 `ACCEPTED_THEN_CLEARED` + 全部诊断，由宿主决定怎么说。
+  out.error = "ACCEPTED_THEN_CLEARED";
+  out.message =
+    "CDP 已把文件挂到 file input 上，但既没回读到 files，也没看到新的缩略图。" +
+    "可能是选错了 input、或站点把文件丢弃了。详见 steps 诊断" +
+    "（`listBefore/listAfter` 是页面上所有 file input 的概要，`tried` 是逐个尝试的结果）。";
+  return out;
+}
+
+/// 打开（或复用）目标站点页面。
+///
+/// 用途：用户在「设置 → AI助手」里选了网页版 AI 模型后，**不需要自己去开页面** ——
+/// 宿主的第一次请求发现页面不在，就让扩展把它开出来。
+///
+/// ⚠ 只在「一个都没开」时才真的 `tabs.create`：已经开着就复用（不重复开、
+///   不动用户当前那个标签页的滚动位置）。判据用 provider 的 `urlHint`（域名片段），
+///   而不是完整 URL —— 站点会带各种 path/query（`/chat/xxx?conversation=...`）。
+async function handleWebAiOpenPage(msg) {
+  const provider = await resolveWebAiProvider(msg.provider || msg.urlHint || "");
+  if (!provider) {
+    const all = await loadWebAiProviders();
+    return {
+      ok: false,
+      error: "NO_PROVIDER",
+      message: String(msg.provider || ""),
+      knownProviders: Object.keys(all || {}),
+      version: BRIDGE_VERSION,
+    };
+  }
+  const url = String(msg.url || provider.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return { ok: false, error: "BAD_URL", message: "url 须为 http(s)", version: BRIDGE_VERSION };
+  }
+
+  // ① 已经开着？直接复用（**不**新建、**不**导航 —— 用户可能正在那个页面上）
+  //   ⚠ 用 `findProviderTabs`（穷举、不截断），不要用 `listPages`（游戏打分 + 每窗留一 + 前 8）
+  const found = await findProviderTabs(provider);
+  if (found.length) {
+    return {
+      ok: true,
+      reused: true,
+      tabId: found[0].tabId,
+      url: found[0].url,
+      version: BRIDGE_VERSION,
+    };
+  }
+
+  // ② 新建标签页。
+  //    ⚠⚠ `active` 默认 **false**（2026-09-26 改）：原来写的是 `msg.active !== false`
+  //      ⇒ `undefined !== false` 为 **true** ⇒ **默认就抢前台**，
+  //      用户反复抱怨"占用了界面前台，无法正常使用浏览器和电脑"。
+  //      ⇒ 想让它前台化必须**显式**传 `active: true`。
+  try {
+    const active = msg.active === true;
+    const created = await chrome.tabs.create({ url, active });
+    return {
+      ok: true,
+      reused: false,
+      tabId: created && created.id,
+      url,
+      version: BRIDGE_VERSION,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: "OPEN_FAILED",
+      message: String((e && e.message) || e),
+      version: BRIDGE_VERSION,
+    };
+  }
+}
+
 async function injectPageSnapshot(tabId, opts) {
   const o = opts && typeof opts === "object" ? opts : {};
+  // ★★★ 节点上限**默认放开**（2026-10-03 用户报"看题只看半边"）
+  //
+  //   ⚠⚠ 原来是**硬编码 64** ⇒ 一屏 4~6 题的选择题页面**根本装不下**
+  //     （每题 = 题干 + 4 个选项 ⇒ 5 题就要 ~25 条，加上导航/按钮轻松超 64）
+  //     ⇒ **屏幕外的选项不在快照里** ⇒ 模型只在可见选项里选 ⇒ **必然答错** ✓
+  //   ⇒ 默认改成 600，并**允许调用方传 `maxNodes` 覆盖** ✓
+  //   ⚠ 上限仍保留（防超大页面撑爆提示词）：600 ≈ "一屏题量 × 20 倍"的安全值 ✓
+  //   ⚠ 通用性：**不要**针对"练习题"写死，任何长列表页（题/表格/消息流）都受益 ✓
+  const askMax = Number(o.maxNodes || 0);
+  const maxNodes = askMax > 0 ? Math.max(1, Math.min(4000, Math.floor(askMax))) : 600;
   const inj = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [0] },
     func: qstBuildPageSnapshot,
     args: [{
       light: !!o.light,
-      maxNodes: 64,
+      maxNodes,
       query: String(o.query || ""),
     }],
   });
@@ -3622,9 +5747,31 @@ async function onMessage(raw) {
       version: BRIDGE_VERSION,
       role: "extension",
       vision: true,
-      capabilities: ["vision", "mouse", "keys", "layout", "pageSnapshot", "typeRef", "navigatePage"],
+      capabilities: ["vision", "mouse", "keys", "layout", "pageSnapshot", "typeRef", "navigatePage", "readAssistantReply", "webAiProbe", "webAiRichType", "webAiSubmit", "webAiUploadImages", "webAiOpenPage", "webAiFindPage", "webAiEnsureTab", "webAiNewChat", "webAiPickProvider", "webAiActivateTab", "webAiRestoreTab"],
     });
     setStatus("ready", `已握手 v${BRIDGE_VERSION} vision`);
+    // ★★★ SW 重启 / 掉线重连后**自动恢复调试会话**（2026-10-02 真机事故）
+    //
+    //   ⚠⚠ 根因：`attachMeta` / `attachedDebuggee` 是**模块级变量** ——
+    //     扩展 Service Worker 一重启（掉线重连、空闲回收）就**全丢**，
+    //     于是 `clickRef` / `typeRef` 等**所有需要会话的 handler** 都报
+    //     `NO_TAB: 尚未 observePage / attach`（真机：收割循环跑到第 5 题突然失败）✓
+    //   ⇒ 握手成功后**自动重新 attach** 到「我们那个标签页」——
+    //     它在 `chrome.storage` 里**是持久化的**（`qstWebAiOwnTab`），SW 重启不会丢 ✓
+    //   ⚠ 标签页可能已被用户关掉 ⇒ 先 `chrome.tabs.get` 确认存在再 attach。
+    //   ⚠ 失败**不致命**（下次 observePage 会重新 attach）⇒ 静默 catch。
+    void (async () => {
+      try {
+        const st = await chrome.storage.local.get([WEB_AI_OWN_TAB_KEY]);
+        const tid = Number(st && st[WEB_AI_OWN_TAB_KEY]) || 0;
+        if (!tid) return;
+        let alive = false;
+        try { await chrome.tabs.get(tid); alive = true; } catch (_) { alive = false; }
+        if (!alive) return;
+        await attachTab("", { tabId: tid });
+        setStatus("ready", `已握手 v${BRIDGE_VERSION}（已恢复会话 tab=${tid}）`);
+      } catch (_) { /* 恢复失败不致命 */ }
+    })();
     return;
   }
   if (type === "attach") {
@@ -3691,6 +5838,59 @@ async function onMessage(raw) {
   }
   if (type === "navigatePage") {
     reply(msg, await handleNavigatePage(msg));
+    return;
+  }
+  // ── 网页版 AI 适配层（见 docs/web-ai-backend-design.md）──
+  if (type === "webAiProviders") {
+    reply(msg, await handleWebAiProviders());
+    return;
+  }
+  if (type === "webAiProbe") {
+    reply(msg, await handleWebAiProbe(msg));
+    return;
+  }
+  if (type === "readAssistantReply") {
+    reply(msg, await handleWebAiReadReply(msg));
+    return;
+  }
+  if (type === "webAiRichType") {
+    reply(msg, await handleWebAiRichType(msg));
+    return;
+  }
+  if (type === "webAiSubmit") {
+    reply(msg, await handleWebAiSubmit(msg));
+    return;
+  }
+  if (type === "webAiUploadImages") {
+    reply(msg, await handleWebAiUploadImages(msg));
+    return;
+  }
+  if (type === "webAiOpenPage") {
+    reply(msg, await handleWebAiOpenPage(msg));
+    return;
+  }
+  if (type === "webAiFindPage") {
+    reply(msg, await handleWebAiFindPage(msg));
+    return;
+  }
+  if (type === "webAiEnsureTab") {
+    reply(msg, await handleWebAiEnsureTab(msg));
+    return;
+  }
+  if (type === "webAiNewChat") {
+    reply(msg, await handleWebAiNewChat(msg));
+    return;
+  }
+  if (type === "webAiPickProvider") {
+    reply(msg, await handleWebAiPickProvider(msg));
+    return;
+  }
+  if (type === "webAiActivateTab") {
+    reply(msg, await handleWebAiActivateTab(msg));
+    return;
+  }
+  if (type === "webAiRestoreTab") {
+    reply(msg, await handleWebAiRestoreTab(msg));
     return;
   }
   reply(msg, { ok: false, error: "UNKNOWN", message: type });
@@ -3772,11 +5972,8 @@ async function loadAllBridgeRuntimes() {
     seen.add(key);
     out.push({ port, token: String(info.token) });
   };
-  try {
-    add(await loadBridgeRuntimeFromNative());
-  } catch (_) {
-    /* native host is optional for unpacked */
-  }
+  // ① 宿主每次启动都会重写 bridge_runtime.json；侧载扩展直接读它 —— 零进程开销。
+  //    （host 侧 WriteUtf8AclFile 的 DACL 含 (A;;FR;;;AU)，普通用户令牌可读。）
   try {
     const res = await fetch(chrome.runtime.getURL("bridge_runtime.json"), {
       cache: "no-store",
@@ -3784,6 +5981,25 @@ async function loadAllBridgeRuntimes() {
     if (res.ok) add(await res.json());
   } catch (_) {
     /* packed CRX has no host-written json */
+  }
+  // ② 文件拿不到，或**文件里那个 token 已经被桥拒过**才问 native host，且必须节流。
+  //
+  //   ⚠⚠ 这里刻意**不**用 `nativeProbeWanted`（"上一轮没连上"）：宿主没在跑时每一轮都
+  //     连不上，用它就变成每 1.5s `connectNative` 拉一个完整宿主进程
+  //     （见文件顶部那条注释警告的现象）。陈旧判据要盯**被拒的那个 token**：
+  //     宿主每次启动都换 token ⇒ 「同一 token 又失败一次」才是可靠信号。
+  const fileTok = out.length ? out[0].token : "";
+  const fileLooksStale = !!fileTok && fileTok === lastRejectedToken;
+  if (out.length === 0 || fileLooksStale) {
+    const now = Date.now();
+    if (now - lastNativeProbeAt >= NATIVE_PROBE_MIN_MS) {
+      lastNativeProbeAt = now;
+      try {
+        add(await loadBridgeRuntimeFromNative());
+      } catch (_) {
+        /* native host is optional for unpacked */
+      }
+    }
   }
   return out;
 }
@@ -3816,7 +6032,15 @@ function connectWebSocket(port, token) {
       bridgePort = port;
       bridgeToken = token;
       setStatus("connected", `ws port=${port} v${BRIDGE_VERSION}`);
-      socket.send(JSON.stringify({ id: 0, type: "hello", token }));
+      // ★★ 自报浏览器（`userAgent`）：宿主据此记住"**上次连过桥的浏览器**"，
+      //   下次浏览器没开时优先把它拉起来（一键式）。
+      //   ⚠ 扩展**拿不到自己的 exe 路径**（浏览器安全限制）⇒ 只能报 UA，由宿主解析品牌串。
+      socket.send(JSON.stringify({
+        id: 0,
+        type: "hello",
+        token,
+        browser: String((typeof navigator !== "undefined" && navigator.userAgent) || ""),
+      }));
       done(true);
     };
     socket.onmessage = (ev) => {
@@ -3857,21 +6081,39 @@ async function tryDiscoverAndConnect() {
   try {
     const runtimes = await loadAllBridgeRuntimes();
     if (!runtimes.length) {
+      nativeProbeWanted = true;  // 没有任何候选 -> 下一轮允许问 native
       setStatus("disconnected", "等待宿主写入桥凭证");
       return;
     }
     setStatus("connecting", `v${BRIDGE_VERSION} 直连本机桥`);
     for (const runtime of runtimes) {
-      if (await connectWebSocket(runtime.port, runtime.token)) return;
+      if (await connectWebSocket(runtime.port, runtime.token)) {
+        nativeProbeWanted = false;
+        lastRejectedToken = "";
+        // ★ 记下**这一次连上用的**凭证：`/qst/shot` 等取图路由要拿它拼 URL
+        //   （`bridgeToken` 原本只在 onopen 里赋值，重连后若走别的分支就会留着旧值）。
+        bridgePort = runtime.port;
+        bridgeToken = runtime.token;
+        return;
+      }
     }
+    // 全部连不上：把**文件里那个** token 记为"已被拒" ⇒ 下一轮才允许问 native
+    // （判据见 `loadAllBridgeRuntimes`：盯被拒的 token，不盯"上一轮失败"）。
+    lastRejectedToken = runtimes[0].token;
+    nativeProbeWanted = true;
     setStatus("waiting", "未发现键鼠工坊桥（请先运行键鼠工坊）");
   } finally {
     discoverBusy = false;
   }
 }
 
-chrome.runtime.onInstalled.addListener(() => {
-  setStatus("installed", `v${BRIDGE_VERSION} 已安装`);
+// ★★ 启动痕迹（2026-09-26）：扩展"离线"时**完全看不出卡在哪一步** ——
+//   下面这对 log 让 `edge://extensions/` 的 Service Worker 控制台直接告诉你答案：
+//     · 只看到「启动」没看到「注册完成」 ⇒ **中间某一步抛异常**（后面的注册全没生效）
+//     · 两条都在、却仍连不上桥 ⇒ 问题在**连接**（端口/token/浏览器没开），不在加载
+console.log("[qst] SW 启动 v" + BRIDGE_VERSION);
+
+chrome.runtime.onInstalled.addListener(() => {  setStatus("installed", `v${BRIDGE_VERSION} 已安装`);
   tryDiscoverAndConnect();
 });
 
@@ -3953,12 +6195,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
   if (msg && msg.type === "reconnect") {
+    // ★ 用户显式按了「重新连接」⇒ 解除两个节流/记忆：否则只是把**同一个陈旧 token**
+    //   再撞一次（`loadAllBridgeRuntimes` 会判它"还没被拒过"而不问 native），
+    //   用户会觉得这个按钮没用 —— 而它正是扩展离线时唯一的自助出口。
+    lastNativeProbeAt = 0;
+    lastRejectedToken = "";
+    nativeProbeWanted = true;
     closeWs();
     tryDiscoverAndConnect().then(() => sendResponse(lastStatus));
     return true;
   }
   return false;
 });
+
+console.log("[qst] SW 注册完成（消息/定时/调试器监听都已就绪）");
 
 let connectKickTimer = 0;
 function kickBridgeConnect() {

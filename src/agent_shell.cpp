@@ -1,11 +1,15 @@
 #include "agent_shell.h"
 
+#include "agent_mcp.h"
 #include "agent_undo.h"
+#include "ooxml/xlsx_doc.h"
 #include "utils.h"
 
 #include <nlohmann/json.hpp>
 
 #include <shellapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 
 #include <algorithm>
 #include <cwchar>
@@ -336,7 +340,7 @@ bool IsSelfTestTarget(const std::wstring& target) {
         L"ScriptActionBuilderSelfTest", L"CoordSpaceSelfTest", L"ScriptIoSelfTest",
         L"ImageMatchSelfTest", L"AiActionRouterSelfTest", L"AppSettingsStoreSelfTest",
         L"ThemeUiSelfTest", L"RecorderSelfTest", L"VirtualHidSelfTest",
-        L"AgentAssistantSelfTest", L"OcrSelfTest"
+        L"AgentAssistantSelfTest", L"AgentDesktopTaskSelfTest", L"OcrSelfTest"
     };
     for (const auto* t : kTargets) {
         if (_wcsicmp(target.c_str(), t) == 0) return true;
@@ -468,9 +472,21 @@ std::wstring ValidateCommand(const std::wstring& command, const std::wstring& cw
         return L"msbuild";
     }
 
-    if (programLower.size() > 4
-        && (programLower.rfind(L"selftest.exe") == programLower.size() - 12
-            || programLower.rfind(L"logictest.exe") == programLower.size() - 13)) {
+    // ⚠⚠ 这里的长度守卫**必须是 `>=` 而不是 `> 4`**（2026-09-23 实测抓到的 bug）：
+    //   `programLower.size() - 12` 是 size_t 运算，`size < 12` 时**下溢**成
+    //   `2^64 - (12 - size)`，而它**恰好等于 `npos`**（= 2^64-1）当且仅当 `size == 11`。
+    //   `rfind` 找不到时返回 npos ⇒ 于是**任何长度为 11 的程序名都会被误判成自检 exe**
+    //   （实测：`libreoffice` 正好 11 个字符，报的是「自检 exe 必须位于 …\build\Release」
+    //   而不是「程序不在白名单」—— 提示完全误导，很难联想）。
+    //   同理第二条在 `size == 12` 时也会误判。
+    //   ⇒ 不是安全漏洞（这条分支随后仍会拒绝），但**判据本身是坏的**，必须修。
+    // ⚠ A/B 验证过：把这里的 `>= 12` 改回旧的 `> 4` ⇒ AgentAssistantSelfTest 的
+    //   `shell_rejects_third_party` 转红（rejected=7/9，两个 11/12 字符的名字被误判）。
+    const bool isSelfTestExe = programLower.size() >= 12
+        && programLower.rfind(L"selftest.exe") == programLower.size() - 12;
+    const bool isLogicTestExe = programLower.size() >= 13
+        && programLower.rfind(L"logictest.exe") == programLower.size() - 13;
+    if (isSelfTestExe || isLogicTestExe) {
         if (RepoRoot().empty()) {
             error = L"未检测到开发仓库，自检 exe 不可用";
             return L"";
@@ -514,6 +530,19 @@ std::wstring ValidateCommand(const std::wstring& command, const std::wstring& cw
         return L"where";
     }
 
+    // ⚠ 这里原来有一条 `genoffice` 白名单分支（放行 GenOffice CLI 的读/写子命令，
+    //   并把它解析成绝对路径）——**已删除**（2026-09-23）。
+    //
+    // 删掉的理由（产品原则，别再加回来）：本产品**不依赖任何别人的软件运行**。
+    // 给某个第三方工具开白名单特例，等于把「写 xlsx/docx/pptx」这项能力外包出去：
+    // 对方没装就能力缺失、版本不同就行为不同，而且这份子命令清单还要跟着对方发版维护
+    // （它一改我们就得改，否则白名单静默失效）。
+    //
+    // 正确做法：借鉴它的**做法与思路**（工具层不调模型 / 字节保留式编辑 / 产物可验收），
+    // 在**我们自己的引擎里实现**办公文档能力 —— 见 `src/ooxml/`。
+    // 用户若仍想接它，走**厂商中立**的通用 MCP 配置（`mcp_servers.json`），
+    // 产品不替任何人做决定、也不主动探测任何东西。
+
     error = L"程序不在白名单：" + program
         + L"。允许：git（只读）、MSBuild（自检）、build\\Release\\*SelfTest.exe、where";
     return L"";
@@ -538,7 +567,8 @@ std::wstring BuildCommandLine(const std::vector<std::wstring>& argv) {
     return line;
 }
 
-std::wstring RunProcess(const std::wstring& commandLine, const std::wstring& cwd) {
+std::wstring RunProcess(const std::wstring& commandLine, const std::wstring& cwd,
+    DWORD timeoutMs = kCommandTimeoutMs) {
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -575,14 +605,17 @@ std::wstring RunProcess(const std::wstring& commandLine, const std::wstring& cwd
 
     std::string outBuf, errBuf;
     char buf[4096];
-    const DWORD deadline = GetTickCount() + kCommandTimeoutMs;
+    // ⚠ 必须用 GetTickCount64 + 显式 startTick：GetTickCount() 是 32 位、约 49.7 天回绕，
+    //   而 `deadline > GetTickCount()` 这种比较在回绕点附近会立刻判成「已超时」
+    //   ⇒ 命令被无故杀掉。超时给到 300s（GenOffice）后这个窗口更值得避开。
+    const ULONGLONG startTick = GetTickCount64();
     DWORD exitCode = STILL_ACTIVE;
     while (exitCode == STILL_ACTIVE) {
-        const DWORD remaining = deadline > GetTickCount() ? deadline - GetTickCount() : 0;
-        if (remaining == 0) {
+        const ULONGLONG elapsed = GetTickCount64() - startTick;
+        if (elapsed >= timeoutMs) {
             TerminateProcess(pi.hProcess, 1);
             exitCode = 1;
-            outBuf += "\n[超时] 命令超过 60 秒已终止";
+            outBuf += "\n[超时] 命令超过 " + std::to_string(timeoutMs / 1000) + " 秒已终止";
             break;
         }
         DWORD n = 0;
@@ -683,7 +716,9 @@ AgentTool MakeRunAgentCommandTool() {
         L"在受限白名单内运行命令行工具。允许：git（只读子命令）、MSBuild（仅自检 Target，如 "
         L"/t:WindowModeSelfTest /p:Configuration=Release）、build\\Release\\*SelfTest.exe（--json/--list）、where。"
         L"参数由白名单逐条校验，不经 cmd/powershell。cwd 可选，必须位于允许目录内。"
-        L"自检流程见 readAgentSkill section=shell。";
+        L"自检流程见 readAgentSkill section=shell；办公文件见 section=office。"
+        L"⚠ 想跑白名单外的程序（含第三方办公工具）请走 MCP：让用户把 server 写进 "
+        L"mcp_servers.json，别指望这里放行 —— 产品不为任何第三方软件开特例。";
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
@@ -720,7 +755,7 @@ AgentTool MakeRunAgentCommandTool() {
         const std::wstring kind = ValidateCommand(command, cwd, err, argv);
         if (kind.empty()) return L"[错误] " + err;
         const std::wstring cmdLine = BuildCommandLine(argv);
-        return RunProcess(cmdLine, cwd);
+        return RunProcess(cmdLine, cwd, kCommandTimeoutMs);
     };
     return tool;
 }
@@ -1026,6 +1061,271 @@ AgentTool MakePasteAgentClipboardTextTool() {
         GlobalUnlock(h);
         CloseClipboard();
         return L"剪贴板文本（" + std::to_wstring(text.size()) + L" 字符）：\n" + text;
+    };
+    return tool;
+}
+
+namespace {
+
+/// 用户「桌面 / 文档 / 下载」——**只给 writeSpreadsheet 用**的额外可写根。
+///
+/// 为什么需要：`AgentWriteRoots()` 只覆盖 scripts/recordings/images/docs/skills（那是
+/// `writeAgentFile` 的边界，刻意很窄）。但「把这堆数据做成 xlsx 放桌面」是办公场景的
+/// **主用例**，落在桌面上完全合理 —— 不放宽的话这个工具基本没法用。
+/// ⇒ **只给这一个工具**放宽到这三个用户目录，**不去动 `AgentWriteRoots()`**
+///   （别顺手把 `writeAgentFile` 也放宽了，那是另一件事）。
+/// ⚠ 放宽的只是「在哪儿写」：`IsSensitiveAgentPath()` 仍拦 app_settings.json / .exe /
+///   仓库内部文件；`create` 默认不覆盖；`setCells` 改前先落字节级备份。
+std::vector<std::wstring> SpreadsheetWriteRoots() {
+    std::vector<std::wstring> roots = AgentWriteRoots();
+    for (REFKNOWNFOLDERID id : { FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads }) {
+        PWSTR raw = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw)) && raw) {
+            roots.push_back(NormalizeSlashes(raw));
+            CoTaskMemFree(raw);
+        }
+    }
+    return roots;
+}
+
+}  // namespace
+
+// ── writeSpreadsheet：xlsx 读写（**不依赖 Office、不依赖任何第三方库**）────────────
+// 为什么值得单独做一个工具：在此之前，助手要写 .xlsx 只有一条路 —— `runCommand` + Excel COM，
+// 也就是**必须装 Office**。没装就只能出 CSV。这里用自研的 `src/ooxml/` 补上。
+//
+// 两种模式的分工（**这不是可有可无的选项，是安全边界**）：
+//   · `create`  新建文件。默认**拒绝覆盖**已存在的文件（`overwrite=true` 才覆盖）。
+//               撤销走撤销日志：`existed=false` ⇒ 恢复 = 删掉这个文件。**二进制无关**，所以成立。
+//   · `setCells` 改已有文件的指定单元格。⚠ **字节保留**：只改那几个 `<c>`，
+//               图表 / 公式 / 样式 / 别的表一字不动（见 src/ooxml/xlsx_doc.h 的说明）。
+//               ⚠⚠ **改前必须先落一份字节级备份**：撤销日志存的是 UTF-8 文本，装不下二进制 xlsx
+//                  —— 拿它当撤销会**把用户的文件清空**。所以这里备份到我们自己的目录，
+//                  并把路径明确告诉用户（不假装它进了「撤销」列表）。
+AgentTool MakeWriteSpreadsheetTool() {
+    AgentTool tool;
+    tool.name = L"writeSpreadsheet";
+    tool.description =
+        L"写 Excel 文件（.xlsx）。**不需要装 Office**。两种模式：\n"
+        L"· mode=\"create\"（默认）：新建一个 xlsx，用 `tsv` 填内容（制表符分隔，首行通常是表头）。\n"
+        L"  ⚠ 目标文件已存在时**默认拒绝**，要覆盖得显式传 overwrite=true。\n"
+        L"· mode=\"setCells\"：改**已有**文件的指定单元格。**只动那几个格子** ——\n"
+        L"  图表 / 公式 / 条件格式 / 样式 / 别的表**原样保留**（这是「另存一份」做不到的）。\n"
+        L"  ⚠ 改前会自动备份一份原始文件，路径在返回里给你。\n"
+        L"写完会把结果读回来给你核对（不用另开工具）。";
+    tool.parameters_json = LR"({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "目标 .xlsx 路径" },
+            "mode": { "type": "string", "enum": ["create", "setCells"], "description": "默认 create" },
+            "sheet": { "type": "string", "description": "工作表名（可选；create 时默认 Sheet1，setCells 时默认第一张表）" },
+            "tsv": { "type": "string", "description": "create 用：制表符分隔的内容，一行一记录" },
+            "overwrite": { "type": "boolean", "description": "create 时是否允许覆盖已存在文件，默认 false" },
+            "cells": {
+                "type": "array",
+                "description": "setCells 用：要改的单元格",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ref": { "type": "string", "description": "如 B2" },
+                        "text": { "type": "string" },
+                        "number": { "type": "number" },
+                        "bool": { "type": "boolean" },
+                        "formula": { "type": "string", "description": "不含前导 = 的公式原文" },
+                        "cached": { "type": "string", "description": "公式的缓存值（可选；不给就留空，Excel 打开时重算）" }
+                    },
+                    "required": ["ref"]
+                }
+            }
+        },
+        "required": ["path"]
+    })";
+    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
+        json params;
+        std::wstring err;
+        if (!ParseToolParamJson(paramsJson, params, err).empty()) return L"[错误] " + err;
+
+        const std::wstring abs = ResolveAbsolutePath(FromUtf8(params.value("path", "")));
+        if (abs.empty()) return L"[错误] path 不能为空";
+        const std::wstring low = LowerCopy(abs);
+        if (low.size() < 5
+            || (low.rfind(L".xlsx") != low.size() - 5 && low.rfind(L".xlsm") != low.size() - 5)) {
+            return L"[错误] 只支持 .xlsx / .xlsm（老格式 .xls 请先用 Excel 另存为 .xlsx）。目标：" + abs;
+        }
+        if (!IsPathInAnyRoot(SpreadsheetWriteRoots(), abs)) {
+            return L"[错误] 目标路径不在可写目录内（脚本/录制/图片/文档/技能 或 桌面/文档/下载）：" + abs;
+        }
+        if (IsSensitiveAgentPath(abs)) {
+            return L"[错误] 该路径受保护，禁止助手写入：" + abs;
+        }
+
+        const std::wstring mode = FromUtf8(params.value("mode", "create"));
+        const bool exists = GetFileAttributesW(abs.c_str()) != INVALID_FILE_ATTRIBUTES;
+
+        qst::ooxml::XlsxDoc doc;
+        if (mode == L"create") {
+            if (exists && !params.value("overwrite", false)) {
+                return L"[错误] 文件已存在，未覆盖：" + abs
+                    + L"。要覆盖请显式传 overwrite=true（或换一个文件名）。";
+            }
+            std::wstring sheet = FromUtf8(params.value("sheet", ""));
+            if (sheet.empty()) sheet = L"Sheet1";
+            std::string cerr;
+            if (!qst::ooxml::XlsxDoc::CreateNew(ToUtf8(sheet), doc, cerr)) {
+                return L"[错误] 新建 xlsx 失败：" + FromUtf8(cerr);
+            }
+        } else if (mode == L"setCells") {
+            if (!exists) {
+                return L"[错误] 文件不存在：" + abs + L"（要新建请用 mode=create）";
+            }
+            std::string cerr;
+            if (!doc.LoadFromFile(abs, cerr)) {
+                return L"[错误] 打不开这个 xlsx：" + FromUtf8(cerr)
+                    + L"。加密文件 / 老 .xls / 损坏文件都读不了。";
+            }
+        } else {
+            return L"[错误] mode 只能是 create 或 setCells，收到：" + mode;
+        }
+
+        // 选表
+        std::wstring sheetName = FromUtf8(params.value("sheet", ""));
+        if (sheetName.empty()) {
+            if (doc.Sheets().empty()) return L"[错误] 这个工作簿里没有工作表";
+            sheetName = FromUtf8(doc.Sheets()[0].name);
+        } else if (doc.FindSheet(ToUtf8(sheetName)) == nullptr) {
+            std::wstring have;
+            for (const auto& s : doc.Sheets()) {
+                if (!have.empty()) have += L"、";
+                have += FromUtf8(s.name);
+            }
+            return L"[错误] 没有这张工作表：" + sheetName + L"。现有：" + have;
+        }
+
+        int written = 0;
+        if (mode == L"create") {
+            const std::wstring tsv = FromUtf8(params.value("tsv", ""));
+            if (tsv.empty()) return L"[错误] create 模式需要 tsv（制表符分隔的内容）";
+            int row = 1;
+            size_t pos = 0;
+            while (pos <= tsv.size()) {
+                size_t nl = tsv.find(L'\n', pos);
+                if (nl == std::wstring::npos) nl = tsv.size();
+                std::wstring line = tsv.substr(pos, nl - pos);
+                if (!line.empty() && line.back() == L'\r') line.pop_back();
+                int col = 0;
+                size_t cp = 0;
+                while (cp <= line.size()) {
+                    size_t tab = line.find(L'\t', cp);
+                    if (tab == std::wstring::npos) tab = line.size();
+                    std::wstring field = line.substr(cp, tab - cp);
+                    const std::string ref =
+                        qst::ooxml::ColumnIndexToName(col) + std::to_string(row);
+                    std::string cerr;
+                    if (!field.empty()) {
+                        // 数字自动识别：整串是数字（且没有前导 0，避免把「007」「手机号」变成数）
+                        const std::wstring t = Trim(field);
+                        bool isNum = !t.empty();
+                        for (wchar_t ch : t) {
+                            if (!((ch >= L'0' && ch <= L'9') || ch == L'-' || ch == L'.'
+                                || ch == L'e' || ch == L'E' || ch == L'+')) { isNum = false; break; }
+                        }
+                        if (isNum && t.size() > 1 && t[0] == L'0' && t[1] != L'.') isNum = false;
+                        if (isNum) {
+                            doc.SetCellNumber(ToUtf8(sheetName), ref, _wtof(t.c_str()), cerr);
+                        } else {
+                            doc.SetCellText(ToUtf8(sheetName), ref, ToUtf8(field), cerr);
+                        }
+                        ++written;
+                    }
+                    if (tab >= line.size()) break;
+                    cp = tab + 1;
+                    ++col;
+                }
+                if (nl >= tsv.size()) break;
+                pos = nl + 1;
+                ++row;
+            }
+        } else {
+            if (!params.contains("cells") || !params["cells"].is_array()
+                || params["cells"].empty()) {
+                return L"[错误] setCells 模式需要 cells 数组";
+            }
+            for (const auto& c : params["cells"]) {
+                if (!c.is_object()) continue;
+                const std::wstring ref = FromUtf8(c.value("ref", ""));
+                if (ref.empty()) return L"[错误] cells 里有一项缺 ref";
+                std::string cerr;
+                bool ok = false;
+                if (c.contains("formula") && c["formula"].is_string()) {
+                    ok = doc.SetCellFormula(ToUtf8(sheetName), ToUtf8(ref),
+                        c["formula"].get<std::string>(), c.value("cached", ""), cerr);
+                } else if (c.contains("number") && c["number"].is_number()) {
+                    ok = doc.SetCellNumber(ToUtf8(sheetName), ToUtf8(ref),
+                        c["number"].get<double>(), cerr);
+                } else if (c.contains("bool") && c["bool"].is_boolean()) {
+                    qst::ooxml::CellValue v;
+                    v.kind = qst::ooxml::CellKind::Bool;
+                    v.boolean = c["bool"].get<bool>();
+                    ok = doc.SetCell(ToUtf8(sheetName), ToUtf8(ref), v, cerr);
+                } else if (c.contains("text") && c["text"].is_string()) {
+                    ok = doc.SetCellText(ToUtf8(sheetName), ToUtf8(ref),
+                        c["text"].get<std::string>(), cerr);
+                } else {
+                    qst::ooxml::CellValue v;   // 清空该格
+                    ok = doc.SetCell(ToUtf8(sheetName), ToUtf8(ref), v, cerr);
+                }
+                if (!ok) return L"[错误] 写 " + ref + L" 失败：" + FromUtf8(cerr);
+                ++written;
+            }
+        }
+
+        // ★ setCells 改的是**用户的文件**，而撤销日志装不下二进制 ⇒ 改前先落字节级备份
+        std::wstring backupPath;
+        if (mode == L"setCells") {
+            std::wstring dir = AgentChangesDir();
+            EnsureDirectoryTree(dir);
+            const std::wstring base = Basename(abs);
+            std::wstring stamp = NowText();
+            for (auto& ch : stamp) { if (ch == L':' || ch == L' ' || ch == L'/') ch = L'-'; }
+            backupPath = dir + L"\\xlsx_backup_" + base + L"_" + stamp + L".xlsx";
+            std::vector<uint8_t> original;
+            if (!qst::ooxml::ReadZipFileBytes(abs, original)
+                || !qst::ooxml::WriteZipFileBytes(backupPath, original)) {
+                return L"[错误] 备份原始文件失败，**已中止**（不敢在没有退路的情况下改你的文件）："
+                    + backupPath;
+            }
+        }
+
+        std::string serr;
+        if (!doc.SaveToFile(abs, serr)) {
+            return L"[错误] 写入失败：" + FromUtf8(serr);
+        }
+
+        // 撤销登记：只有「新建」是二进制无关的（existed=false ⇒ 恢复=删除文件）。
+        std::wstring undoNote;
+        if (mode == L"create") {
+            const std::wstring id = AgentUndoBegin(L"writeSpreadsheet",
+                L"新建表格 " + Basename(abs), abs, std::wstring(), false);
+            if (!id.empty()) {
+                AgentUndoFinish(id, std::wstring(), true);
+                undoNote = L"\n可在「撤销」里恢复（会删掉这个文件）。";
+            }
+        } else {
+            undoNote = L"\n⚠ 原始文件已备份到：" + backupPath
+                + L"\n（xlsx 是二进制，撤销日志装不下，所以走备份文件；要还原就把它复制回去。）";
+        }
+
+        // 产物可验收：写完读回来给模型核对（不用再调一次读工具）
+        std::string dump;
+        std::string derr;
+        std::wstring verify = L"\n[读回核对失败：" ;
+        if (doc.DumpSheetAsTsv(ToUtf8(sheetName), 50, 20, dump, derr)) {
+            verify = L"\n[读回核对 " + sheetName + L"]\n" + FromUtf8(dump);
+        } else {
+            verify += FromUtf8(derr) + L"]";
+        }
+        return L"[已写入 " + std::to_wstring(written) + L" 个单元格] " + abs
+            + L"\n工作表：" + sheetName + undoNote + verify;
     };
     return tool;
 }

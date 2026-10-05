@@ -25,4 +25,13 @@ std::wstring QueryHwndProcessImagePath(HWND) {
     return {};
 }
 
+/// 逻辑档里**不写**窗口模式日志。
+///
+/// 需要它的是 WebAiSelfTest：`web_ai_prompt.cpp`（纯逻辑那半边）会调
+/// `WindowModeLogEventf` 留痕，而真身 `window_mode_log.cpp` 依赖
+/// VirtualDesktopAccessor / window_target（整个 window_mode_core）——
+/// 逻辑档不背这些依赖，也不该往用户日志文件里写东西（自检结果不能有副作用）。
+void WindowModeLogEventf(const wchar_t* /*fmt*/, ...) {
+}
+
 }  // namespace windowmode

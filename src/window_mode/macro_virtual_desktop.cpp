@@ -238,7 +238,7 @@ bool MacroVirtualDesktop::OpenOrCreate() {
             desktopIndex_ = g_macroDesktopCache.index;
             LoadMacroDesktopId(desktopIndex_, desktopId_);
             ready_ = true;
-            WindowModeLogEventf(L"[窗口模式] 复用已缓存「%s」桌面 idx=%d（未新建）",
+            WindowModeLogEventf(L"[窗口/后台窗口模式] 复用已缓存「%s」桌面 idx=%d（未新建）",
                 kMacroDesktopDisplayName, desktopIndex_);
             restoreUserView();
             return true;
@@ -248,7 +248,7 @@ bool MacroVirtualDesktop::OpenOrCreate() {
 
     if (RefreshDesktopList()) {
         ready_ = true;
-        WindowModeLogEventf(L"[窗口模式] 找到已存在「%s」桌面 idx=%d（未新建，via %s）",
+        WindowModeLogEventf(L"[窗口/后台窗口模式] 找到已存在「%s」桌面 idx=%d（未新建，via %s）",
             kMacroDesktopDisplayName, desktopIndex_, vda.LoadedDllName().c_str());
         restoreUserView();
         return true;
@@ -277,7 +277,7 @@ bool MacroVirtualDesktop::OpenOrCreate() {
     SaveMacroDesktopCache(desktopIndex_, desktopId_);
     ready_ = true;
     restoreUserView();
-    WindowModeLogEventf(L"[窗口模式] 新建了「%s」虚拟桌面 idx=%d（via %s）——只有窗口模式运行才会走到这里",
+    WindowModeLogEventf(L"[窗口/后台窗口模式] 新建了「%s」虚拟桌面 idx=%d（via %s）——只有窗口模式运行才会走到这里",
         kMacroDesktopDisplayName, desktopIndex_, vda.LoadedDllName().c_str());
     return true;
 }
@@ -299,7 +299,7 @@ void WarmupAtProcessStartBody() {
     if (!vda.EnsureLoaded(err)) return;
     const int index = vda.FindDesktopIndexByName(kMacroDesktopDisplayName);
     if (index < 0) {
-        WindowModeLogEvent(L"[窗口模式] 预热：未找到「鼠标宏」桌面，本次进程不创建");
+        WindowModeLogEvent(L"[窗口/后台窗口模式] 预热：未找到「鼠标宏」桌面，本次进程不创建");
         return;
     }
     GUID id{};
@@ -309,7 +309,7 @@ void WarmupAtProcessStartBody() {
     if (!GuidIsEmpty(id)) {
         SaveMacroDesktopCache(index, id);
     }
-    WindowModeLogEventf(L"[窗口模式] 预热：检测到已存在「鼠标宏」桌面 idx=%d（上次窗口模式遗留；本次未创建）",
+    WindowModeLogEventf(L"[窗口/后台窗口模式] 预热：检测到已存在「鼠标宏」桌面 idx=%d（上次窗口模式遗留；本次未创建）",
         index);
 }
 
@@ -345,7 +345,7 @@ bool MacroVirtualDesktop::MoveWindowToMacroDesktop(HWND hwnd) {
     }
 
     if (LooksLikeFullscreenGameTarget(hwnd)) {
-        WindowModeLog(L"[窗口模式] 全屏游戏：不搬到「鼠标宏」桌面（避免拆 DXGI 独占）");
+        WindowModeLog(L"[窗口/后台窗口模式] 全屏游戏：不搬到「鼠标宏」桌面（避免拆 DXGI 独占）");
         return true;
     }
 
@@ -494,7 +494,7 @@ bool MacroVirtualDesktop::LaunchProcess(const std::wstring& exe, const std::wstr
             ShowWindow(byPath, SW_SHOWMINNOACTIVE);
         } else {
             SquashProcessTopWindowsQuiet(outPi.dwProcessId);
-            WindowModeLogf(L"[窗口模式] 进程已启动 pid=%lu，等待主窗口出现…",
+            WindowModeLogf(L"[窗口/后台窗口模式] 进程已启动 pid=%lu，等待主窗口出现…",
                 static_cast<unsigned long>(outPi.dwProcessId));
         }
     }

@@ -29,8 +29,8 @@ AgentTool MakeBuildScriptActionsTool();
 /// 规划脚本动作树（嵌套 children），不保存；含循环/条件时先核对父子再构建
 AgentTool MakePlanScriptActionsTool();
 
-/// AI 动作执行专用：提交本批次要执行的宏动作（返回纯 JSON 数组，与 buildScriptActions 构建逻辑一致）
-AgentTool MakeSubmitMacroActionsTool();
+// ⚠ 原 `MakeSubmitMacroActionsTool()` 已删（2026-10-02）：全仓无调用点，且描述与真身
+//   （`macro_execute_tools.cpp` 的 `MakeSubmitMacroActionsToolLocal()`）语义相反。见 LESSONS §80。
 
 /// 创建鼠标宏（buildScriptActions + 保存到 scripts，并刷新主界面）
 AgentTool MakeCreateMacroScriptTool();
@@ -54,6 +54,17 @@ AgentTool MakeUpdateScheduledTaskTool();
 
 /// 删除定时任务
 AgentTool MakeDeleteScheduledTaskTool();
+
+// ── 桌面执行（Phase 1：让助手能「自己去做事」）────────────────────
+//
+// 背景：此前助手的工具全是「产出物」型（改文件 / 改配置 / 生成脚本 JSON），
+// 用户说「帮我把这件事做了」，助手只能生成一个脚本。桌面执行闭环在宏侧早就成熟
+// （ExecuteAiActionExecute + 引擎的 agentHooks），缺的只是接口 —— 见
+// docs/agent-capability-expansion.md。
+
+/// 把一句自然语言目标交给桌面执行闭环去**做完**（不是生成脚本，是真的做）。
+/// 实现走「临时脚本 + 引擎正常回放链路」，复用宏侧全部观察/定位/中断能力。
+AgentTool MakeRunDesktopTaskTool();
 
 // ── 应用设置修改 ──────────────────────────────────────────────────
 

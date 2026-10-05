@@ -3,6 +3,8 @@
 #include "utils.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cwchar>
 #include <cwctype>
 #include <memory>
 #include <unordered_set>
@@ -75,6 +77,20 @@ std::wstring TrimWs(const std::wstring& s) {
     return s.substr(a, b - a);
 }
 
+// 裸标识符是否能在上下文中找到（用于「未定义变量」提示）。
+// 带 . 或 [ ] 的（属性/下标引用）一律视为「可能有效」，避免误报。
+bool NameExistsInContext(const std::wstring& name, const MacroVariableContext& ctx) {
+    if (name.empty()) return false;
+    if (name.find(L'.') != std::wstring::npos || name.find(L'[') != std::wstring::npos) return true;
+    if (name.rfind(L"ctrl:", 0) == 0) return true;
+    auto has = [&name](const auto* m) {
+        return m && m->find(name) != m->end();
+    };
+    return has(ctx.matchVars) || has(ctx.matchListVars) || has(ctx.ocrVars)
+        || has(ctx.aiVars) || has(ctx.userVars) || has(ctx.imageVars)
+        || has(ctx.loopVars) || has(ctx.timerStarts);
+}
+
 std::wstring FormatExport(const Value& v) {
     if (v.isArray) {
         std::wstring out;
@@ -89,6 +105,20 @@ std::wstring FormatExport(const Value& v) {
         && v.number >= -2147483647.0 && v.number <= 2147483647.0) {
         return std::to_wstring(static_cast<int>(std::round(v.number)));
     }
+    // 非整数：to_wstring 会给 6 位小数（74.27 → "74.270000"），导出/日志里很脏。
+    // 这里固定 6 位小数后去掉尾随 0（与 to_wstring 同样的定点表示，只做美化）。
+    wchar_t buf[64]{};
+    if (std::isfinite(v.number) && swprintf(buf, 64, L"%.6f", v.number) > 0) {
+        std::wstring s = buf;
+        const size_t dot = s.find(L'.');
+        if (dot != std::wstring::npos) {
+            size_t last = s.size();
+            while (last > dot + 1 && s[last - 1] == L'0') --last;
+            if (last == dot + 1) --last;  // "74." → "74"
+            s.resize(last);
+        }
+        return s;
+    }
     return std::to_wstring(v.number);
 }
 
@@ -97,6 +127,32 @@ bool IsIdentStart(wchar_t c) {
 }
 bool IsIdentChar(wchar_t c) {
     return IsIdentStart(c) || (c >= L'0' && c <= L'9');
+}
+
+// 报错文本里预览外部值：非 ASCII 一律转义成 \uXXXX。
+// 目的：OCR 常见的「全角/形近括号」（U+FF08（ U+FE59﹙）在日志里和 ASCII "(" 长得一样，
+// 只靠肉眼看不出差别 —— 现场就踩过「日志里明明是 127723(74.27%)，split(hp,"(") 却拆不开」。
+std::wstring PreviewText(const std::wstring& s, size_t maxLen = 96) {
+    std::wstring out;
+    size_t n = 0;
+    for (wchar_t c : s) {
+        if (n >= maxLen) { out += L"..."; break; }
+        if (c == L'\n') { out += L"\\n"; n += 2; }
+        else if (c == L'\r') { out += L"\\r"; n += 2; }
+        else if (c == L'\t') { out += L"\\t"; n += 2; }
+        else if (c >= 0x20 && c < 0x7F) { out += c; ++n; }
+        else {
+            static const wchar_t kHex[] = L"0123456789ABCDEF";
+            const unsigned cp = static_cast<unsigned>(c);
+            out += L"\\u";
+            out += kHex[(cp >> 12) & 0xF];
+            out += kHex[(cp >> 8) & 0xF];
+            out += kHex[(cp >> 4) & 0xF];
+            out += kHex[cp & 0xF];
+            n += 6;
+        }
+    }
+    return out;
 }
 
 struct Lexer {
@@ -676,6 +732,8 @@ struct Engine {
     int ops = 0;
     bool returned = false;
     std::unordered_map<std::wstring, std::wstring> exported;
+    std::vector<std::wstring> warnings;
+    std::unordered_set<std::wstring> warnedNames;
 
     bool Tick() {
         if (++ops > kMaxOps) { err = L"运算步数超限"; return false; }
@@ -697,12 +755,28 @@ struct Engine {
             return Value::Str(ResolveClipboardVarCompute(ctx));
         }
         const std::wstring raw = ResolveMacroOperand(name, ctx);
-        if (raw.empty()) return Value::Num(0);
+        if (raw.empty()) {
+            // 变量不存在/为空时静默按 0 处理，会把「OCR 没写进变量」变成后续莫名其妙的
+            // 「下标越界」。这里记一条警告（按名字去重），运行日志里直接可见。
+            WarnEmptyVar(name, NameExistsInContext(name, ctx));
+            return Value::Num(0);
+        }
         double n = 0;
         wchar_t* end = nullptr;
         n = wcstod(raw.c_str(), &end);
         if (end != raw.c_str() && *end == L'\0') return Value::Num(n);
         return Value::Str(raw);
+    }
+
+    void WarnEmptyVar(const std::wstring& name, bool exists) {
+        if (name.empty() || warnedNames.count(name)) return;
+        if (warnedNames.size() >= 32) return;
+        warnedNames.insert(name);
+        warnings.push_back(exists
+            ? (L"变量运算：变量 " + name
+                + L" 当前为空（按 0 处理）；若来自文字识别，说明这一步没识别到文字")
+            : (L"变量运算：变量 " + name
+                + L" 未定义（按 0 处理）；若来自文字识别，请检查那一步是否真的保存到这个变量名"));
     }
 
     Value* LocalPtr(const std::wstring& name) {
@@ -773,8 +847,15 @@ struct Engine {
             return false;
         }
         long long i = std::llround(v.number);
+        const long long raw = i;
         if (i < 0) i += static_cast<long long>(n);
-        if (i < 0 || static_cast<size_t>(i) >= n) { err = L"下标越界"; return false; }
+        if (i < 0 || static_cast<size_t>(i) >= n) {
+            // 带上长度与实际下标：只写「下标越界」时，用户无法判断是「变量为空」还是
+            // 「分隔符没匹配上」——现场排查全靠猜。
+            err = L"下标越界：[" + std::to_wstring(raw) + L"] 超出长度 "
+                + std::to_wstring(n);
+            return false;
+        }
         out = static_cast<int>(i);
         return true;
     }
@@ -782,12 +863,18 @@ struct Engine {
     Value IndexValue(const Value& coll, const Value& idx) {
         if (coll.isArray) {
             int i = 0;
-            if (!AsIndex(idx, i, coll.items.size())) return {};
+            if (!AsIndex(idx, i, coll.items.size())) {
+                err += L"（被拆分的文本=\"" + PreviewText(FormatExport(coll)) + L"\"）";
+                return {};
+            }
             return coll.items[static_cast<size_t>(i)];
         }
         if (coll.isString) {
             int i = 0;
-            if (!AsIndex(idx, i, coll.str.size())) return {};
+            if (!AsIndex(idx, i, coll.str.size())) {
+                err += L"（字符串=\"" + PreviewText(coll.str) + L"\"）";
+                return {};
+            }
             return Value::Str(std::wstring(1, coll.str[static_cast<size_t>(i)]));
         }
         err = L"只能对字符串或 split 结果取下标";
@@ -901,7 +988,62 @@ struct Engine {
             if (args[0].isArray) { err = L"不能 trim 数组"; return {}; }
             return Value::Str(TrimWs(FormatExport(args[0])));
         }
-        err = L"未知函数: " + name + L"（可用 split / toInt / toString / trim）";
+        if (name == L"replace") {
+            if (args.size() != 3) { err = L"replace 需要 3 个参数：replace(文本, 被替换, 替换为)"; return {}; }
+            for (const auto& a : args) {
+                if (a.isArray) { err = L"replace 的参数不能是数组"; return {}; }
+            }
+            const std::wstring s = FormatExport(args[0]);
+            const std::wstring from = FormatExport(args[1]);
+            const std::wstring to = FormatExport(args[2]);
+            if (from.empty()) return Value::Str(s);
+            std::wstring out;
+            size_t i = 0;
+            while (i < s.size()) {
+                if (s.compare(i, from.size(), from) == 0) {
+                    out += to;
+                    i += from.size();
+                    if (out.size() > kMaxString) { err = L"字符串过长"; return {}; }
+                } else {
+                    out.push_back(s[i++]);
+                }
+            }
+            return Value::Str(std::move(out));
+        }
+        if (name == L"numbers") {
+            // OCR 后处理：把文本里所有数字抠出来（支持负号与小数点）。
+            // 比 split(文本,"(") 稳：识别引擎换版本后括号/百分号可能是全角（U+FF08/U+FF05），
+            // 按字符拆会直接拆不开。
+            if (args.size() != 1) { err = L"numbers 需要 1 个参数"; return {}; }
+            if (args[0].isArray) { err = L"numbers 的参数不能是数组"; return {}; }
+            const std::wstring s = FormatExport(args[0]);
+            std::vector<Value> out;
+            size_t i = 0;
+            while (i < s.size()) {
+                if (s[i] == L'-' || (s[i] >= L'0' && s[i] <= L'9')) {
+                    size_t j = i;
+                    if (s[j] == L'-') ++j;
+                    bool digits = false;
+                    while (j < s.size() && ((s[j] >= L'0' && s[j] <= L'9') || s[j] == L'.')) {
+                        if (s[j] != L'.') digits = true;
+                        ++j;
+                    }
+                    if (digits) {
+                        if (out.size() >= kMaxArray) { err = L"数字过多"; return {}; }
+                        const std::wstring numText = s.substr(i, j - i);
+                        wchar_t* end = nullptr;
+                        const double num = wcstod(numText.c_str(), &end);
+                        out.push_back(Value::Num(num));
+                    }
+                    i = j;
+                } else {
+                    ++i;
+                }
+            }
+            return Value::Arr(std::move(out));
+        }
+        err = L"未知函数: " + name
+            + L"（可用 split / replace / numbers / toInt / toDouble / toString / trim）";
         return {};
     }
 
@@ -1216,6 +1358,7 @@ VarComputeResult RunVarCompute(const std::wstring& source, const MacroVariableCo
     for (const auto& s : prog) {
         if (!eng.Exec(s.get()) || eng.returned) break;
     }
+    out.warnings = std::move(eng.warnings);
     if (!eng.err.empty()) {
         out.error = eng.err;
         return out;

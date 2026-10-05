@@ -18,7 +18,9 @@
 #include "macro_debug_window.h"
 #include "ocr_engine.h"
 #include "ocr_overlay.h"
+#include "overlay_input_guard.h"
 #include "process_utils.h"
+#include "recorder_diag_log.h"
 #include "screenshot_overlay.h"
 #include "utils.h"
 #include "window_mode/window_target.h"
@@ -49,6 +51,73 @@ namespace qst::desktop_tools {
 namespace {
 
 std::mutex g_diagMu;
+
+/// 诊断日志落盘路径（recorder_diag / ai_action_debug 共用这一份解析与回退逻辑）。
+///
+/// 优先 `AppDir()`（与 findimage_diag.log 同级，用户随手就能找到）；
+/// 装到 `Program Files` 等只读目录时 `AppDir()` 不可写，那就退回
+/// `%LOCALAPPDATA%\QuickScriptTool\`（与 shell_startup.log 的回退策略一致）。
+/// 不做这个回退的后果是**静默没有日志**：用户按指引去找文件却不存在，排查比不做还糟。
+/// 探测方式 = 能否以追加方式打开。
+/// ★`fileName` 是参数而不是写死的 —— 两处日志走**同一套**逻辑，别各写一份。
+std::wstring ResolveDiagPath(const wchar_t* fileName) {
+    const std::wstring local = AppDir() + L"\\" + fileName;
+    FILE* probe = nullptr;
+    if (_wfopen_s(&probe, local.c_str(), L"ab") == 0 && probe) {
+        fclose(probe);
+        return local;
+    }
+    wchar_t buf[MAX_PATH]{};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr,
+            SHGFP_TYPE_CURRENT, buf))) {
+        const std::wstring dir = std::wstring(buf) + L"\\QuickScriptTool";
+        SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        return dir + L"\\" + fileName;
+    }
+    return local;
+}
+
+/// 诊断日志超限时保留尾部约一半，并按**行边界**切（切到半行会像乱码）。
+/// 行边界规则本身在 `src/recorder_diag_log.h`（纯逻辑，有自检）。
+void TrimDiagIfNeeded(const std::wstring& path, long long maxBytes) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return;
+    const long long size = (static_cast<long long>(fad.nFileSizeHigh) << 32)
+        | static_cast<long long>(fad.nFileSizeLow);
+    if (!qst_recorder::DiagLogNeedsTrim(size, maxBytes)) return;
+
+    // 日志是 UTF-16LE（2 字节/字符）⇒ 保留尾部约一半的**字符数**
+    const size_t keepChars = qst_recorder::DiagTrimKeepChars(maxBytes);
+    if (keepChars == 0) return;
+    std::vector<wchar_t> buf(keepChars);
+    FILE* rp = nullptr;
+    if (_wfopen_s(&rp, path.c_str(), L"rb") != 0 || !rp) return;
+    if (size < static_cast<long long>(keepChars * sizeof(wchar_t))) { fclose(rp); return; }
+    _fseeki64(rp, size - static_cast<long long>(keepChars * sizeof(wchar_t)), SEEK_SET);
+    const size_t got = fread(buf.data(), sizeof(wchar_t), keepChars, rp);
+    fclose(rp);
+    if (got == 0) return;
+    const size_t start = qst_recorder::RecorderDiagLineStart(buf.data(), got);
+    FILE* wp = nullptr;
+    if (_wfopen_s(&wp, path.c_str(), L"wb") != 0 || !wp) return;
+    fwrite(buf.data() + start, sizeof(wchar_t), got - start, wp);
+    fclose(wp);
+}
+
+/// 往某个诊断日志追加一行（**调用方持锁**）：先按上限裁剪，再带时间戳追加。
+/// 时间戳带**日期**：这个文件跨多次运行，只有时分秒无法判断「这是哪一局」。
+void AppendDiagLineLocked(const std::wstring& path, const std::wstring& line,
+    long long maxBytes) {
+    TrimDiagIfNeeded(path, maxBytes);
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"ab") != 0 || !fp) return;
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fwprintf(fp, L"%04d-%02d-%02d %02d:%02d:%02d.%03d  %s\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+        st.wMilliseconds, line.c_str());
+    fclose(fp);
+}
 
 void AppendFindImageDiag(const std::wstring& line) {
     std::lock_guard<std::mutex> lock(g_diagMu);
@@ -708,6 +777,44 @@ namespace {
 std::atomic_uint g_webCropFileSeq{0};
 }  // namespace
 
+namespace {
+
+/// 按**身份**找目标顶层窗口：**路径 + 类名是硬门，标题只作提示**（2026-10-05）。
+/// ⚠ 判据与引擎侧 `ResolveWindowModeSelectMethod` 的 `windowNameIsHintOnly` 语义保持一致 ——
+///   标题易变（换文档 / 换标签页 / 游戏换场景），当硬匹配门会枚举不到窗口。
+/// 返回 nullptr = 没找到（调用方必须**降级为屏幕坐标并说明**，不许静默）。
+HWND FindWindowByIdentity(const std::wstring& className, const std::wstring& exePath) {
+    if (className.empty() && exePath.empty()) return nullptr;
+    struct Ctx {
+        const std::wstring* cls;
+        const std::wstring* exe;
+        HWND found;
+    } ctx{&className, &exePath, nullptr};
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;  // 只要顶层（跳过 owned 弹窗）
+        if (!c->cls->empty()) {
+            wchar_t buf[256]{};
+            if (!GetClassNameW(hwnd, buf, 256)) return TRUE;
+            if (_wcsicmp(buf, c->cls->c_str()) != 0) return TRUE;
+        }
+        if (!c->exe->empty()) {
+            RECT rc{};
+            if (!GetWindowRect(hwnd, &rc)) return TRUE;
+            const std::wstring p = GetProcessPathFromPoint(
+                (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+            if (p.empty() || _wcsicmp(p.c_str(), c->exe->c_str()) != 0) return TRUE;
+        }
+        c->found = hwnd;
+        return FALSE;  // 找到第一个就停
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+}  // namespace
+
 FindImageCropResult FindImageCropRect(const std::wstring& imagePathOrStored,
     int offsetX, int offsetY, int cropX, int cropY, int cropW, int cropH) {
     FindImageCropResult out;
@@ -769,7 +876,8 @@ FindImageCropResult FindImageCropRect(const std::wstring& imagePathOrStored,
     return out;
 }
 
-CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8) {
+CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8,
+    const CrosshairPickOptions* opts) {
     CrosshairPickResult out;
     out.modeUtf8 = modeUtf8.empty() ? "coordinates" : modeUtf8;
     if (!owner || !IsWindow(owner)) {
@@ -809,7 +917,21 @@ CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8) {
     bool armed = startedWithButtonDown;
 
     MSG msg{};
-    while (drag.IsActive() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    while (drag.IsActive()) {
+        // ★★ 兜底（overlay_input_guard.h）：drag.Begin() 把**主窗口挪到屏外**并 SetCapture(owner)。
+        //   终止事件（抬起）一旦丢了 —— 远控注入丢事件、抬起落到别的窗口都会 —— 裸 GetMessage
+        //   会永久阻塞：主窗口永远留在屏外 + 我们一直扣着用户的鼠标捕获 ⇒
+        //   用户「看得见屏幕、点不动、也关不掉我们」。本地还能按 Esc，**远控下几乎没有别的入口**。
+        //   ⇒ 循环必须能超时醒来，超时后自检；判定丢了就自己收尾。
+        if (!overlay_guard::WaitMessageWithTimeout(msg, overlay_guard::kGuardTickMs)) {
+            if (overlay_guard::ShouldAbortStuckCaptureNow(owner)) {
+                cancelled = true;
+                drag.End();
+                break;
+            }
+            continue;
+        }
+        if (msg.message == WM_QUIT) break;
         const UINT m = msg.message;
         if (m == WM_LBUTTONDOWN || m == WM_NCLBUTTONDOWN) armed = true;
         if ((m == WM_LBUTTONUP || m == WM_NCLBUTTONUP) && !armed) {
@@ -863,6 +985,40 @@ CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8) {
         haveReleasePt = true;
     }
 
+    // ── 坐标系转换（2026-10-05）──────────────────────────────────────────────
+    // 默认 `lastX/lastY` 是**屏幕绝对坐标**；`opts->windowClient` 为真时转成目标窗口
+    // **客户区**坐标（对标 AutoHotkey 的 `CoordMode, Mouse, Client`）。
+    // ⚠ 找不到窗口 / 转换失败 ⇒ **降级为屏幕坐标**，但必须在 JSON 里带 `coordNote` 说清
+    //   原因（判据是「用户能看见」，不许静默回退）。
+    bool useClient = false;
+    int clientW = 0, clientH = 0;
+    int cx = lastX, cy = lastY;
+    bool outside = false;
+    std::wstring coordNote;
+    if (opts && opts->windowClient && mode == CrosshairDragMode::Coordinates) {
+        const HWND basis = FindWindowByIdentity(opts->windowClassName, opts->exePath);
+        if (!basis || !IsWindow(basis)) {
+            coordNote = L"未找到目标窗口（按路径+类名），已回退屏幕坐标";
+        } else {
+            RECT crc{};
+            if (GetClientRect(basis, &crc)) {
+                clientW = static_cast<int>(crc.right - crc.left);
+                clientH = static_cast<int>(crc.bottom - crc.top);
+            }
+            POINT pt{lastX, lastY};
+            if (ScreenToClient(basis, &pt)) {
+                cx = pt.x;
+                cy = pt.y;
+                useClient = true;
+                // ⚠ 允许负值（对「找图 + 偏移」是合法的），只标记 + 让 UI 提示
+                outside = (clientW > 0 && clientH > 0
+                    && (pt.x < 0 || pt.y < 0 || pt.x >= clientW || pt.y >= clientH));
+            } else {
+                coordNote = L"ScreenToClient 失败，已回退屏幕坐标";
+            }
+        }
+    }
+
     std::ostringstream oss;
     if (mode == CrosshairDragMode::ProgramPath) {
         if (programPath.empty()) programPath = GetProcessPathFromPoint(lastX, lastY);
@@ -879,7 +1035,19 @@ CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8) {
             << ",\"processPath\":" << JsonStringW(info.processPath)
             << ",\"documentPath\":" << JsonStringW(info.documentPath) << "}";
     } else {
-        oss << "{\"x\":" << lastX << ",\"y\":" << lastY << "}";
+        // ⚠ 坐标语义 + 屏幕坐标**都**给：`x/y` 是本次坐标系下的值（默认屏幕坐标），
+        //   `screenX/screenY` 恒为屏幕坐标供核对（老 JS 忽略新字段 ⇒ 向后兼容）。
+        oss << "{\"x\":" << cx << ",\"y\":" << cy
+            << ",\"coordSpace\":\"" << (useClient ? "windowClient" : "screenAbsolute") << "\""
+            << ",\"screenX\":" << lastX << ",\"screenY\":" << lastY;
+        if (useClient) {
+            oss << ",\"clientW\":" << clientW << ",\"clientH\":" << clientH
+                << ",\"outside\":" << (outside ? 1 : 0);
+        }
+        if (!coordNote.empty()) {
+            oss << ",\"coordNote\":" << JsonStringW(coordNote);
+        }
+        oss << "}";
     }
     out.ok = true;
     out.pickJson = oss.str();
@@ -915,7 +1083,17 @@ WindowTargetResult PickWindowTarget(HWND owner) {
     bool armed = startedWithButtonDown;
 
     MSG msg{};
-    while (drag.IsActive() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    while (drag.IsActive()) {
+        // ★★ 兜底：同上（Begin 会把主窗口挪到屏外 + SetCapture）。见 overlay_input_guard.h。
+        if (!overlay_guard::WaitMessageWithTimeout(msg, overlay_guard::kGuardTickMs)) {
+            if (overlay_guard::ShouldAbortStuckCaptureNow(owner)) {
+                cancelled = true;
+                drag.End();
+                break;
+            }
+            continue;
+        }
+        if (msg.message == WM_QUIT) break;
         const UINT m = msg.message;
         if (m == WM_LBUTTONDOWN || m == WM_NCLBUTTONDOWN) armed = true;
         if ((m == WM_LBUTTONUP || m == WM_NCLBUTTONUP) && !armed) {
@@ -1663,6 +1841,11 @@ void ScheduleWebLogFlush(MacroDebugController* self, std::atomic<bool>& schedule
 }  // namespace
 
 void MacroDebugController::AppendLog(const std::wstring& text) {
+    // ★★先落盘，再管窗口（docs §61）：调试窗是**视图**，不是记录本身。
+    //   原先「窗没建就 return」⇒ 现场直接没了，用户报的现象只能靠猜。
+    //   ⚠ 这条路上**绝不能阻塞**（§69）：本函数是引擎线程与看门狗线程都会调的，
+    //   落盘内部用有界等待 + 丢行，任何情况下都不许把流水线攥住。
+    AppendMacroDebugLogFile(text);
     if (webUi_) {
         if (!webCreated_) return;
         {
@@ -1677,6 +1860,7 @@ void MacroDebugController::AppendLog(const std::wstring& text) {
 }
 
 void MacroDebugController::AppendLogBatch(const std::vector<std::wstring>& lines) {
+    for (const auto& line : lines) AppendMacroDebugLogFile(line);
     if (webUi_) {
         if (!webCreated_ || lines.empty()) return;
         {
@@ -1691,6 +1875,9 @@ void MacroDebugController::AppendLogBatch(const std::vector<std::wstring>& lines
 }
 
 void MacroDebugController::ClearLog() {
+    // 「清空日志」在用户眼里是一件事：窗口与落盘两个出口都要清
+    // （只清窗口会留下看起来"没清掉"的文件；只清文件会让窗口继续显示旧内容）。
+    ClearMacroDebugLogFile();
     if (webUi_) {
         if (!webCreated_) return;
         {
@@ -1708,8 +1895,76 @@ MacroDebugController& MacroDebug() {
     return g_macroDebug;
 }
 
+// ── 诊断日志落盘：录制诊断 + AI/宏调试日志（docs §61 / §69）────────────────
+// 【为什么必须落盘】调试窗是**视图**，不是记录本身。`AppendLog` 原先在
+// `!IsCreated()` 时**直接丢弃** ⇒ 「放了一个僵尸就卡住」「选了一张卡就退出选卡界面」
+// 这类现象**没有任何可读的现场**，排查只能靠猜。这正是它存在的理由。
+//
+// ★★§69：落盘**绝不允许阻塞调用方**，也绝不允许成为死锁的一环。
+//   事故（真机日志）：一次运行的最后一行停在流式响应的一个思考片段上，之后**连每 5 秒
+//   一条的 `流式等待 Ns` 心跳都没有了** —— 而心跳是**独立线程**按墙钟打的、与网络无关
+//   ⇒ 不是"网关卡住"，是**宿主进程自己停住了**。而 §61 恰好给这条路上新加了**一把全局锁**
+//   （原先 `!IsCreated()` 直接 return，既没有锁也没有文件 IO）：`AppendLog` 是
+//   **引擎线程与看门狗线程都会调**的，而锁**跨着**路径探测（`_wfopen_s` + 可能
+//   `SHCreateDirectoryExW`）与**整文件裁剪**（读 1MB + 重写）。
+//   ⇒ 三条纪律：① 日志有**自己的一把锁**（不与 recorder_diag 共用 `g_diagMu`）；
+//   ② 拿不到锁就**丢这一行**（有界等待），绝不无限等；③ 丢了多少行**要如实补记**。
+std::timed_mutex g_aiDebugLogMu;
+std::atomic<int> g_aiDebugLogDropped{0};
+constexpr unsigned kAiDebugLogTryLockMs = 200;
+
+std::wstring MacroDebugLogFilePath() {
+    std::unique_lock<std::timed_mutex> lock(g_aiDebugLogMu,
+        std::chrono::milliseconds(kAiDebugLogTryLockMs));
+    if (!lock.owns_lock()) return std::wstring();
+    return ResolveDiagPath(L"ai_action_debug.log");
+}
+
+void AppendMacroDebugLogFile(const std::wstring& text) {
+    if (text.empty()) return;
+    // 单行上限：一行几万字的诊断（请求体/图片 base64）会把文件瞬间顶满，
+    // 而裁剪是按行切的 ⇒ 超大行会挤掉其余所有行。**如实标注被截断**，不假装完整。
+    const std::wstring line = qst_recorder::ClampDiagLogLine(
+        text, kMacroDebugLogMaxLineChars);
+    std::unique_lock<std::timed_mutex> lock(g_aiDebugLogMu,
+        std::chrono::milliseconds(kAiDebugLogTryLockMs));
+    if (!lock.owns_lock()) {
+        g_aiDebugLogDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const std::wstring path = ResolveDiagPath(L"ai_action_debug.log");
+    const int dropped = g_aiDebugLogDropped.exchange(0, std::memory_order_relaxed);
+    if (dropped > 0) {
+        AppendDiagLineLocked(path,
+            L"[日志缺口] 上一段共有 " + std::to_wstring(dropped)
+                + L" 行因为日志锁被占用而未能落盘（产品未受影响）",
+            static_cast<long long>(kMacroDebugLogMaxBytes));
+    }
+    AppendDiagLineLocked(path, line,
+        static_cast<long long>(kMacroDebugLogMaxBytes));
+}
+
+void ClearMacroDebugLogFile() {
+    std::unique_lock<std::timed_mutex> lock(g_aiDebugLogMu,
+        std::chrono::milliseconds(kAiDebugLogTryLockMs));
+    if (!lock.owns_lock()) return;      // 清不掉就算了，绝不阻塞
+    DeleteFileW(ResolveDiagPath(L"ai_action_debug.log").c_str());
+}
+
 void DestroyMacroDebug() {
     g_macroDebug.Destroy();
+}
+
+void AppendRecorderDiagLog(const std::wstring& line) {
+    if (line.empty()) return;
+    std::lock_guard<std::mutex> lock(g_diagMu);
+    AppendDiagLineLocked(ResolveDiagPath(L"recorder_diag.log"), line,
+        qst_recorder::kRecorderDiagMaxBytes);
+}
+
+std::wstring RecorderDiagLogPath() {
+    std::lock_guard<std::mutex> lock(g_diagMu);
+    return ResolveDiagPath(L"recorder_diag.log");
 }
 
 }  // namespace qst::desktop_tools

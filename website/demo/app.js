@@ -48,7 +48,7 @@
     addPreview: null,
     editDraft: null, // 选中动作的右栏草稿；点「修改」才写回列表（对齐原生）
     recMode: 0,
-    recWindowMode: 0, // 0=全屏模式 1=窗口模式（窗口相对录制）
+    recWindowMode: 0, // 0=前台模式（屏幕绝对坐标） 1=后台窗口模式（窗口相对录制）
     uiMode: "simple", // 极简 / 专业（专业模式主界面为设计稿样式）
     hideBottomRightTip: true,
     pendingPath: "",
@@ -70,6 +70,14 @@
     _executedSteps: 0,
     _runningMacroName: "",
     _editorSnapshot: "",
+    // 可视化画布改动单独跟踪：画布布局不进 _editorSnapshot（自动布局 / 缩放 / 滚动都不算改动），
+    // 只有用户在画布上真正动手（拖卡片、连线、增删节点、拖起始点、拖走线）才置 true。
+    _editorLayoutDirty: false,
+    _editorLayoutBaseline: "",
+    _editorRevertPayload: null,
+    _saveEditorIntent: "",
+    _saveEditorBusy: false,
+    _editorAutosaveTimer: 0,
     _pendingRunKind: "",
     _gotScripts: false,
     _gotRecordings: false,
@@ -110,12 +118,12 @@
   ];
   const ED_MODES = [
     { t: "默认模式", v: 0 },
-    { t: "窗口模式", v: 1 },
+    { t: "独立桌面模式", v: 1 },
     { t: "后台窗口模式", v: 2 },
   ];
   const NESTED_USE_MODES = [
     { t: "默认模式", v: 0 },
-    { t: "窗口模式", v: 1 },
+    { t: "独立桌面模式", v: 1 },
     { t: "后台窗口模式", v: 2 },
     { t: "继承模式", v: 3 },
   ];
@@ -135,6 +143,7 @@
     { t: "移动鼠标到", v: "moveMouse" },
     { t: "等待", v: "wait" },
     { t: "鼠标点击", v: "mouseClick" },
+    { t: "鼠标拖拽", v: "mouseDrag" },
     { t: "运行录制回放", v: "mousePlayback" },
     { t: "运行鼠标宏", v: "runMacro" },
     { t: "鼠标按下", v: "mouseDown" },
@@ -150,6 +159,9 @@
     { t: "定义宏指令块", v: "defineBlock" },
     { t: "运行宏指令块", v: "runBlock" },
     { t: "找图", v: "findImage" },
+    { t: "找图监视", v: "watchImage" },
+    { t: "多图匹配", v: "multiMatch" },
+    { t: "变量运算", v: "varCompute" },
     { t: "获取颜色", v: "getColor" },
     { t: "找色", v: "findColor" },
     { t: "颜色匹配", v: "colorMatch" },
@@ -173,8 +185,53 @@
     { t: "相对移动鼠标", v: "moveMouseRelative" },
   ];
   const MERGE_CONTAINER_TYPES = ACTION_TYPES.filter(
-    (a) => a.v === "loop" || a.v === "defineBlock" || a.v === "if" || a.v === "else"
+    (a) => a.v === "loop" || a.v === "defineBlock" || a.v === "watchImage" || a.v === "if" || a.v === "else"
   );
+  const ACTION_PY = {
+    moveMouse: "ydsbd yidongshubiaodao",
+    wait: "dd dengdai",
+    mouseClick: "sbdj shubiaodianji",
+    mouseDrag: "sbtz shubiaotuozhuai tuozhuai",
+    mousePlayback: "yxlzhf yunxingluzhihuifang",
+    runMacro: "yxsbh yunxingshubiaohong",
+    mouseDown: "sbax shubiaanxia",
+    mouseUp: "sbsk shubiaosongkai",
+    scrollWheel: "gdgl gundonggunlun",
+    keyClick: "ajdj anjiandianji",
+    keyDown: "jpax jianpananxia",
+    keyUp: "jpsk jianpansongkai",
+    hotkeyShortcut: "kjaj kuaijieanjian",
+    quickInput: "kjsr kuaijieshuru",
+    loop: "xh xunhuan",
+    endLoop: "tcxh tiaochuxunhuan",
+    defineBlock: "dyhzlk dingyihongzhilingkuai",
+    runBlock: "yxhzlk yunxinghongzhilingkuai",
+    findImage: "zt zhaotu",
+    multiMatch: "dtpp duotupipei duotu",
+    watchImage: "ztjs zhaotujianshi jianshi",
+    varCompute: "blys bianliangyunsuan",
+    getColor: "hqys huoquyanse",
+    findColor: "zs zhaose",
+    colorMatch: "yspp yansepipei",
+    textRecognition: "wzsb wenzishibie ocr",
+    if: "tjrg tiaojianruguo",
+    else: "tjfz tiaojianfouze",
+    lockScreenshot: "sdjp suodingjieping",
+    unlockScreenshot: "jsjp jiesuojieping",
+    stopMacro: "jshyx jieshuhongyunxing",
+    runProgram: "yxcx yunxingchengxu",
+    closeProgram: "gbcx guanbichengxu",
+    openWebpage: "dkwy dakaiwangye",
+    openFile: "dkwj dakaiwenjian",
+    activateWindow: "jhck jihuochuangkou",
+    timerRecordTime: "jsqjlsj jishiqijilushijian",
+    aiTextAnalysis: "aiwzfx",
+    aiImageAnalysis: "aitpfx",
+    aiActionExecute: "aidzzx",
+    getCursorPos: "hqdqgbwz huoquguangbiao",
+    goto: "tz tiaozhuan",
+    moveMouseRelative: "xdydsb xiangduiyidongshubiao",
+  };
   let _mergeUiOn = false;
 
   function knownActionTypeMap() {
@@ -197,6 +254,17 @@
     for (const t of known) {
       if (!seen.has(t)) order.push(t);
     }
+    {
+      const mm = order.indexOf("multiMatch");
+      const fi = order.indexOf("findImage");
+      const wi = order.indexOf("watchImage");
+      if (fi >= 0 && mm === fi + 1 && wi > mm) {
+        order.splice(mm, 1);
+        const wi2 = order.indexOf("watchImage");
+        if (wi2 >= 0) order.splice(wi2 + 1, 0, "multiMatch");
+        else order.splice(mm, 0, "multiMatch");
+      }
+    }
     const rawHidden = Array.isArray(other && other.editorHiddenActions)
       ? other.editorHiddenActions
       : [];
@@ -215,14 +283,161 @@
     return { order, hidden };
   }
 
-  function pickerActionTypes(extraType) {
+  const CAT_PRESET_VISIBLE = {
+    simple: [
+      "moveMouse", "wait", "mouseClick", "keyClick", "quickInput",
+      "loop", "endLoop", "if", "else", "findImage",
+    ],
+    office: [
+      "moveMouse", "wait", "mouseClick", "keyClick", "quickInput", "loop", "endLoop", "if", "else",
+      "findImage",
+      "hotkeyShortcut", "runProgram", "closeProgram", "openWebpage", "openFile",
+      "activateWindow", "textRecognition",
+    ],
+    game: [
+      "moveMouse", "wait", "mouseClick", "keyClick", "quickInput", "loop", "if",
+      "findImage", "watchImage", "multiMatch", "mouseDrag", "findColor", "getColor", "colorMatch",
+      "textRecognition", "else", "varCompute", "endLoop",
+    ],
+  };
+
+  function normalizeCatalogPreset(v) {
+    return v === "simple" || v === "office" || v === "game" || v === "all" || v === "custom"
+      ? v
+      : "all";
+  }
+
+  function sameStrList(a, b) {
+    const x = Array.isArray(a) ? a : [];
+    const y = Array.isArray(b) ? b : [];
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+
+  function catalogPresetPayload(id) {
+    const known = ACTION_TYPES.map((a) => a.v);
+    if (id === "all") {
+      return { editorActionOrder: [], editorHiddenActions: [], editorCatalogPreset: "all" };
+    }
+    const visible = (CAT_PRESET_VISIBLE[id] || []).filter((t) => known.indexOf(t) >= 0);
+    const visSet = new Set(visible);
+    const hidden = known.filter((t) => !visSet.has(t));
+    return {
+      editorActionOrder: visible.concat(hidden),
+      editorHiddenActions: hidden,
+      editorCatalogPreset: id,
+    };
+  }
+
+  function catalogPresetIdFrom(order, hidden) {
+    const o = Array.isArray(order) ? order : [];
+    const h = Array.isArray(hidden) ? hidden : [];
+    if (!o.length && !h.length) return "all";
+    const def = ACTION_TYPES.map((a) => a.v);
+    if (!h.length && sameStrList(o, def)) return "all";
+    for (const id of ["simple", "office", "game"]) {
+      const p = catalogPresetPayload(id);
+      if (sameStrList(o, p.editorActionOrder) && sameStrList(h, p.editorHiddenActions)) return id;
+    }
+    return "custom";
+  }
+
+  function cloneCatalogSnapshot(src) {
+    return {
+      editorActionOrder: Array.isArray(src && src.editorActionOrder)
+        ? src.editorActionOrder.slice()
+        : [],
+      editorHiddenActions: Array.isArray(src && src.editorHiddenActions)
+        ? src.editorHiddenActions.slice()
+        : [],
+    };
+  }
+
+  function catalogSnapshotHasItems(src) {
+    return !!(
+      src &&
+      ((src.editorActionOrder && src.editorActionOrder.length) ||
+        (src.editorHiddenActions && src.editorHiddenActions.length))
+    );
+  }
+
+  function sidecarCustomPartial() {
+    const c = state._edCatCustom || cloneCatalogSnapshot(null);
+    return {
+      editorCustomActionOrder: Array.isArray(c.editorActionOrder) ? c.editorActionOrder.slice() : [],
+      editorCustomHiddenActions: Array.isArray(c.editorHiddenActions)
+        ? c.editorHiddenActions.slice()
+        : [],
+    };
+  }
+
+  function catalogPartialFromRows() {
+    const rows = $$("#edActionCatalog .ed-cat-row");
+    if (!rows.length) {
+      if (catalogSnapshotHasItems(state._edCatCustom)) return cloneCatalogSnapshot(state._edCatCustom);
+      return cloneCatalogSnapshot((state.settings && state.settings.other) || {});
+    }
+    const order = [];
+    const hidden = [];
+    rows.forEach((row) => {
+      const v = row.dataset.type;
+      if (!v) return;
+      order.push(v);
+      if (!row.querySelector(".chk")?.classList.contains("on")) hidden.push(v);
+    });
+    if (hidden.length >= order.length && order.length) {
+      const idx = hidden.indexOf(order[0]);
+      if (idx >= 0) hidden.splice(idx, 1);
+    }
+    return { editorActionOrder: order, editorHiddenActions: hidden };
+  }
+
+  function syncCatalogPresetUi(id) {
+    const preset = normalizeCatalogPreset(id);
+    state._edCatPreset = preset;
+    $$("#edCatalogPresets [data-cat-preset]").forEach((btn) => {
+      btn.classList.toggle("on", btn.dataset.catPreset === preset);
+    });
+  }
+
+  function applyCatalogPreset(id) {
+    const next = normalizeCatalogPreset(id);
+    if (next === "custom") {
+      if (catalogSnapshotHasItems(state._edCatCustom)) {
+        renderEditorActionCatalog(state._edCatCustom);
+      } else {
+        state._edCatCustom = catalogPartialFromRows();
+      }
+      syncCatalogPresetUi("custom");
+      return;
+    }
+    if (state._edCatPreset === "custom") {
+      state._edCatCustom = catalogPartialFromRows();
+    }
+    const p = catalogPresetPayload(next);
+    renderEditorActionCatalog(p);
+    syncCatalogPresetUi(p.editorCatalogPreset);
+  }
+
+  function markCatalogPresetCustom() {
+    state._edCatCustom = catalogPartialFromRows();
+    if (state._edCatPreset === "custom") return;
+    syncCatalogPresetUi("custom");
+  }
+
+  function pickerActionTypes(extraType, opts) {
+    const includeHidden = !!(opts && opts.includeHidden);
     const other = (state.settings && state.settings.other) || {};
     const { order, hidden } = normalizeActionCatalog(other);
     const hiddenSet = new Set(hidden);
     const byV = knownActionTypeMap();
     const list = [];
     for (const v of order) {
-      if (hiddenSet.has(v) && v !== extraType) continue;
+      if (!includeHidden && hiddenSet.has(v) && v !== extraType) continue;
+      if (state.findImageEngine === false
+          && (v === "findImage" || v === "watchImage" || v === "multiMatch")
+          && v !== extraType) continue;
       const a = byV.get(v);
       if (a) list.push(a);
     }
@@ -230,11 +445,20 @@
       const a = byV.get(extraType);
       if (a) list.push(a);
     }
-    return list.length ? list : ACTION_TYPES.slice();
+    if (list.length) return list;
+    if (state.findImageEngine === false) {
+      return ACTION_TYPES.filter((a) =>
+        a.v !== "findImage" && a.v !== "watchImage" && a.v !== "multiMatch");
+    }
+    return ACTION_TYPES.slice();
+  }
+
+  function editorSearchAllActionsOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorSearchAllActions", false);
   }
 
   function pickerMergeContainerTypes() {
-    const allowed = new Set(["loop", "defineBlock", "if", "else"]);
+    const allowed = new Set(["loop", "defineBlock", "watchImage", "if", "else"]);
     const list = pickerActionTypes().filter((a) => allowed.has(a.v));
     return list.length ? list : MERGE_CONTAINER_TYPES.slice();
   }
@@ -252,21 +476,40 @@
     );
     const prev = state.addActionType;
     if (state.addActionType && hidden.has(state.addActionType) && state.addActionType !== keep) {
-      state.addActionType = firstVisibleActionType();
+      if (!editorSearchAllActionsOn()) state.addActionType = firstVisibleActionType();
     }
     const typeCombo = $("#edActionType");
     if (!typeCombo) return;
-    const mergeOn = typeof isMergeEligible === "function" && isMergeEligible();
-    const types = mergeOn ? pickerMergeContainerTypes() : pickerActionTypes(state.addActionType);
+    const mergeLock = typeof mergePickerLocked === "function" && mergePickerLocked();
+    const types = mergeLock ? pickerMergeContainerTypes() : pickerActionTypes(state.addActionType);
     let cur = types.find((a) => a.v === state.addActionType);
     if (!cur) {
       cur = types[0];
       if (cur) state.addActionType = cur.v;
     }
-    if (cur) typeCombo.textContent = cur.t;
+    if (cur) setActionTypeComboText(cur.t);
     if (state.editor && state.addPreview && prev !== state.addActionType && prev !== keep) {
       showAddTypePreview();
     }
+  }
+
+  function actionTypeComboBox() {
+    return $("#edActionTypeBox") || $("#edActionType");
+  }
+
+  function setActionTypeComboText(label) {
+    const el = $("#edActionType");
+    if (!el) return;
+    const text = label == null ? "" : String(label);
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") el.value = text;
+    else el.textContent = text;
+  }
+
+  function actionTypeComboText() {
+    const el = $("#edActionType");
+    if (!el) return "";
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return String(el.value || "");
+    return String(el.textContent || "");
   }
 
   function toast(msg) {
@@ -287,17 +530,34 @@
   function appendDebugLogLines(lines) {
     const log = $("#debugLog");
     if (!log || !lines || !lines.length) return;
-    const chunk = lines.map((t) => String(t || "")).join("\n");
-    if (!chunk) return;
-    log.textContent += (log.textContent ? "\n" : "") + chunk;
-    // 行数计数：仅在超预算时整段裁剪，避免每条消息都全量 split/join（O(n²)）
+    // ⚠ 不要用 `textContent +=`：它会把已有内容整体重解析一遍，高频日志下是 O(n²)。
+    // 长时运行（几万条动作、每步一条日志）实测会把调试窗卡到「未响应」。
+    // 这里按「一批一个文本节点」追加，裁剪时从头部删节点，都不碰已有内容。
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+    const node = document.createTextNode(
+      (log.childNodes.length ? "\n" : "") + lines.map((t) => String(t || "")).join("\n")
+    );
+    node._qstLines = lines.length;
+    log.appendChild(node);
     log._qstLineCount = (log._qstLineCount | 0) + lines.length;
-    if (log._qstLineCount > DEBUG_LOG_MAX + 200) {
-      const parts = log.textContent.split("\n");
-      log.textContent = parts.slice(Math.max(0, parts.length - DEBUG_LOG_MAX)).join("\n");
-      log._qstLineCount = DEBUG_LOG_MAX;
+    if (log._qstLineCount > DEBUG_LOG_MAX + 400) {
+      let remove = log._qstLineCount - DEBUG_LOG_MAX;
+      while (remove > 0 && log.firstChild) {
+        const n = log.firstChild;
+        const nl = n._qstLines | 0 || 1;
+        log.removeChild(n);
+        remove -= nl;
+        log._qstLineCount -= nl;
+      }
+      if (log._qstLineCount < 0) log._qstLineCount = 0;
     }
-    log.scrollTop = log.scrollHeight;
+    // 只在用户本来就在底部时自动跟随，并且每帧最多滚一次（滚动会触发布局）。
+    if (atBottom && !log._qstScrollRaf) {
+      log._qstScrollRaf = requestAnimationFrame(() => {
+        log._qstScrollRaf = 0;
+        log.scrollTop = log.scrollHeight;
+      });
+    }
   }
 
   function showDebugFloat(opts) {
@@ -342,13 +602,55 @@
    * UI 设计要求（用户确认；细节见 ui/index.html :root 注释）：
    * - 主界面客户区 1552×960（黄金分割）；宏编辑器 1800×1230（HWND 由壳保证）
    * - 键鼠录制优化弹窗 1640×1140（壳 setMode opt）
-   * - 设置 / AI 助手组件与主界面同一 --qst-u=1.5，禁止 JS zoom
+   * - 设置 / AI 助手组件与主界面同一 --qst-u 基准 1.5，再乘布局缩放（分辨率自适应 × 用户倍率）
+   * - 禁止 JS zoom
    */
   const SHELL_CLIENT = {
     home: { w: 1552, h: 960 },
     editor: { w: 1800, h: 1230 },
     opt: { w: 1640, h: 1140 },
   };
+  const QST_U_BASE = 1.5;
+  const QST_OPT_U_BASE = 1.491;
+
+  function currentLayoutScale() {
+    const s = Number(state._uiLayoutScale);
+    if (Number.isFinite(s) && s > 0) return s;
+    const u = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--qst-u")
+    );
+    if (Number.isFinite(u) && u > 0) return u / QST_U_BASE;
+    return 1;
+  }
+
+  function applyUiLayoutScale(scale) {
+    const s = Number(scale);
+    if (!(Number.isFinite(s) && s > 0)) return;
+    state._uiLayoutScale = s;
+    const root = document.documentElement;
+    root.style.setProperty("--qst-u", String(QST_U_BASE * s));
+    root.style.setProperty("--qst-opt-u", String(QST_OPT_U_BASE * s));
+  }
+
+  function formatUiScaleFactor(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return "1.0";
+    let s = n.toFixed(4).replace(/\.?0+$/, "");
+    if (s.indexOf(".") < 0) s += ".0";
+    return s;
+  }
+
+  function readUiScaleFactorInput(strict) {
+    const raw = ($("#setUiScale")?.textContent || "").trim();
+    const n = parseFloat(raw);
+    if (Number.isFinite(n) && n > 0) {
+      return Math.min(3, Math.max(0.25, n));
+    }
+    if (strict) return null;
+    const prev = state.settings && state.settings.other && state.settings.other.uiScaleFactor;
+    if (Number.isFinite(Number(prev)) && Number(prev) > 0) return Number(prev);
+    return 1;
+  }
 
   function applyShellScale() {
     // 仅同步客户区记录；组件大小由 CSS --qst-u 负责，不做运行时 zoom
@@ -399,8 +701,11 @@
       runMacro: "运行鼠标宏",
       hotkeyShortcut: "快捷按键",
       defineBlock: "定义宏指令块",
+      watchImage: "找图监视",
+      varCompute: "变量运算",
       runBlock: "运行宏指令块",
       findImage: "找图",
+      multiMatch: "多图匹配",
       getColor: "获取颜色",
       findColor: "找色",
       colorMatch: "颜色匹配",
@@ -513,7 +818,26 @@
           "鼠标点击" +
           (holds ? holds + "+" : "") +
           buttonText(a.button) +
+          ((a.x | 0) || (a.y | 0) ? " 先到(" + (a.x | 0) + "," + (a.y | 0) + ")" : "（当前位置）") +
           repeatInfo(a)
+        );
+      case "mouseDrag":
+        return (
+          "鼠标拖拽" +
+          (holds ? holds + "+" : "") +
+          buttonText(a.button) +
+          (a.imageLocate ? " 相对图" : "") +
+          "(" +
+          (a.x | 0) +
+          "," +
+          (a.y | 0) +
+          ")→(" +
+          (a.endX | 0) +
+          "," +
+          (a.endY | 0) +
+          ") " +
+          f3(a.duration) +
+          "秒"
         );
       case "keyDown":
         return "键盘按下" + (holds ? holds + "+" : "") + (a.keyText || "");
@@ -585,13 +909,71 @@
           "]"
         );
       }
+      case "multiMatch": {
+        const fu = a.findImageFollowUp | 0;
+        const mode = (a.multiMatchMode | 0) === 1 ? "一图多处" : "多图择一";
+        const follow =
+          fu === 2
+            ? mode === "一图多处"
+              ? "保存全部"
+              : "保存匹配度"
+            : fu === 1
+              ? "移动到"
+              : mode === "一图多处"
+                ? "依次点击"
+                : "点击";
+        const thr = matchThresholdPercent(a.matchThreshold);
+        return (
+          "多图匹配[" +
+          mode +
+          "," +
+          follow +
+          "," +
+          (a.perfectMatch ? "完美匹配" : "匹配>" + thr + "%") +
+          ",缩放" +
+          f3(a.imageScaleMin ?? 1) +
+          "-" +
+          f3(a.imageScaleMax ?? 1) +
+          "]"
+        );
+      }
+      case "watchImage": {
+        const thr = matchThresholdPercent(a.matchThreshold);
+        const timed = (a.watchMode | 0) !== 0;
+        const poll = Number(a.watchPollSeconds);
+        const pollTxt = timed
+          ? ",时间监视" + (poll > 0 ? f3(poll) + "秒" : "")
+          : ",动作监视";
+        return (
+          "找图监视[匹配>" +
+          thr +
+          "%" +
+          pollTxt +
+          "," +
+          ((a.resumeAfterWatch | 0) !== 0 ? "从原处继续" : "从监视后继续") +
+          ",缩放" +
+          f3(a.imageScaleMin ?? 1) +
+          "-" +
+          f3(a.imageScaleMax ?? 1) +
+          "]"
+        );
+      }
+      case "varCompute": {
+        let preview = String(a.computeCode || a.inputText || "");
+        preview = preview.replace(/\s+/g, " ");
+        if (preview.length > 24) preview = preview.slice(0, 24) + "...";
+        return "变量运算[" + preview + "]";
+      }
       case "textRecognition": {
-        const mode = (a.ocrResultMode | 0) === 1 ? "文字查找" : "获取文字";
+        const search = (a.ocrResultMode | 0) === 1;
+        const mode = search ? "文字查找" : "获取文字";
         const follow =
           (a.ocrFollowUp | 0) === 1
             ? "移动到"
             : (a.ocrFollowUp | 0) === 2
-              ? "保存变量"
+              ? search
+                ? "保存匹配度"
+                : "保存文字"
               : "点击";
         return "文字识别[" + mode + "," + follow + "]";
       }
@@ -636,6 +1018,37 @@
         return "计时器记录时间[" + (a.loopVarName || "未命名") + "]";
       case "getCursorPos":
         return "获取当前光标位置→[" + (a.matchVarName || "未命名") + "]";
+      case "getColor":
+        return (
+          "获取颜色" +
+          (a.imageLocate ? "（找图定位）" : "") +
+          "@" +
+          (a.x | 0) +
+          "," +
+          (a.y | 0) +
+          "→[" +
+          (a.matchVarName || "colorRet") +
+          "]"
+        );
+      case "findColor": {
+        const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
+        const follow = fu === 1 ? "移动到" : fu === 2 ? "保存到变量" : "点击";
+        return (
+          "找色[" +
+          follow +
+          (a.imageLocate ? ",找图定位" : "") +
+          "]"
+        );
+      }
+      case "colorMatch":
+        return (
+          "颜色匹配" +
+          (a.imageLocate ? "（找图定位）" : "") +
+          "@" +
+          (a.x | 0) +
+          "," +
+          (a.y | 0)
+        );
       case "aiTextAnalysis":
       case "aiImageAnalysis":
       case "aiActionExecute": {
@@ -699,20 +1112,27 @@
 
   function syncFormIntoSelectedBeforeSave() {
     // 对齐原生 SyncFormIntoActionsBeforeRun：保存前把右栏草稿写入选中项
+    if (state.batchMode || state.addPreview) return;
     if (state.actionSel < 0 || !state.editorActions[state.actionSel]) return;
     if (!state.editDraft) return;
     readParamPanelInto(state.editDraft);
     const remark = ($("#edRemark")?.textContent || "").trim();
     state.editDraft.remark = remark;
     const prev = state.editorActions[state.actionSel];
-    if (state.editDraft.type === "defineBlock" && !isValidBlockName(state.editDraft.blockName)) return;
-    if (
-      state.editDraft.type === "endLoop" &&
-      !hasLoopParentAt(state.editorActions, state.actionSel, prev.indent | 0)
-    ) {
-      return;
+    // 未勾选「不启用修改」时，换类型必须点「修改」：避免保存/定时保存把循环子节点清掉
+    if (!editorDisableModifyOn() && prev && prev.type !== state.editDraft.type) return;
+    const result = applyDraftToActionIndex(state.actionSel, state.editDraft, { silent: true });
+    if (!result) return;
+    state.editDraft = JSON.parse(JSON.stringify(state.editorActions[state.actionSel]));
+  }
+
+  function cloneDraftOntoTarget(draft, prev) {
+    let next;
+    try {
+      next = JSON.parse(JSON.stringify(draft));
+    } catch (_) {
+      next = Object.assign({}, draft);
     }
-    const next = Object.assign({}, state.editDraft);
     next.indent = prev.indent;
     if (typeof prev._vx === "number") next._vx = prev._vx;
     if (typeof prev._vy === "number") next._vy = prev._vy;
@@ -720,8 +1140,123 @@
     if (prev.originalNo != null) next.originalNo = prev.originalNo;
     next.name = typeLabel(next.type);
     delete next._preview;
-    state.editorActions[state.actionSel] = next;
-    state.editDraft = JSON.parse(JSON.stringify(next));
+    mmNormalizeForSave(next);
+    return next;
+  }
+
+  function dropContainerChildrenAt(index) {
+    const end = subtreeEnd(index);
+    if (end <= index + 1) return 0;
+    const n = end - (index + 1);
+    state.editorActions.splice(index + 1, n);
+    visualOnDelete(index + 1, n);
+    remapCollapsedAfterDelete(index + 1, end);
+    delete state.collapsedContainers[index];
+    if (state.actionSel > index && state.actionSel < end) state.actionSel = index;
+    else if (state.actionSel >= end) state.actionSel -= n;
+    return n;
+  }
+
+  function applyDraftToActionIndex(index, draft, opts) {
+    const prev = state.editorActions[index];
+    if (!prev || !draft) return null;
+    const silent = !!(opts && opts.silent);
+    if (draft.type === "defineBlock") {
+      if (!validateDefineBlockName(draft.blockName, index)) return null;
+    }
+    if (
+      draft.type === "endLoop" &&
+      !hasLoopParentAt(state.editorActions, index, prev.indent | 0)
+    ) {
+      if (!silent) toast(END_LOOP_NEEDS_LOOP_MSG);
+      return null;
+    }
+    const oldType = prev.type;
+    const dropKids = isSubtreeContainerType(oldType) && !isSubtreeContainerType(draft.type);
+    if (dropKids) dropContainerChildrenAt(index);
+    const next = cloneDraftOntoTarget(draft, state.editorActions[index]);
+    state.editorActions[index] = next;
+    return {
+      typeChanged: oldType !== next.type,
+      droppedKids: !!dropKids,
+    };
+  }
+
+  function patchActionListRow(index) {
+    const a = state.editorActions[index];
+    if (!a) return;
+    const row = document.querySelector('#actionList .arow[data-i="' + index + '"]');
+    if (!row) return;
+    const name = row.querySelector(".aname-text");
+    if (name) name.textContent = displayActionName(a);
+    const aname = row.querySelector(".aname");
+    const remarkEl = aname ? aname.nextElementSibling : null;
+    if (remarkEl && remarkEl.tagName === "SPAN") remarkEl.textContent = a.remark || "";
+  }
+
+  function liveModifyEnabled() {
+    return (
+      !!state.editor &&
+      editorDisableModifyOn() &&
+      !state.batchMode &&
+      !isEditorVisualMode() &&
+      state.actionSel >= 0 &&
+      !state.addPreview
+    );
+  }
+
+  /** 换选中/点列表前先写回：列表 mousedown 会 preventDefault，输入框来不及 blur */
+  function flushPendingLiveEdit() {
+    if (state._flushingLiveEdit) return false;
+    state._flushingLiveEdit = true;
+    try {
+      return liveCommitSelectedIfEnabled();
+    } finally {
+      state._flushingLiveEdit = false;
+    }
+  }
+
+  function liveCommitSelectedIfEnabled() {
+    if (state._inLiveCommit) return false;
+    if (!liveModifyEnabled()) return false;
+    if (state.actionSel < 0 || !state.editorActions[state.actionSel]) return false;
+    if (!state.editDraft) loadEditDraftFromSelection();
+    if (!state.editDraft) return false;
+    readParamPanelInto(state.editDraft);
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    state.editDraft.remark = remark;
+    const idx = state.actionSel;
+    const prev = state.editorActions[idx];
+    const dropKids =
+      isSubtreeContainerType(prev.type) && !isSubtreeContainerType(state.editDraft.type);
+    if (!dropKids) {
+      const guess = cloneDraftOntoTarget(state.editDraft, prev);
+      if (JSON.stringify(guess) === JSON.stringify(prev)) return true;
+    }
+    visualNoteUndo();
+    const result = applyDraftToActionIndex(idx, state.editDraft, { silent: false });
+    if (!result) {
+      revertLastEditorHistory();
+      return false;
+    }
+    state._inLiveCommit = true;
+    try {
+      state.editDraft = JSON.parse(JSON.stringify(state.editorActions[idx]));
+      state.addPreview = null;
+      if (result.typeChanged || result.droppedKids) {
+        state._keepParamPanel = true;
+        state._skipReadback = true;
+        renderEditorActions(state.editorActions);
+        state._skipReadback = false;
+        state._keepParamPanel = false;
+      } else {
+        patchActionListRow(idx);
+        syncActionListRowName(idx);
+      }
+    } finally {
+      state._inLiveCommit = false;
+    }
+    return true;
   }
 
   function commitModifySelected() {
@@ -735,31 +1270,46 @@
     readParamPanelInto(state.editDraft);
     const remark = ($("#edRemark")?.textContent || "").trim();
     state.editDraft.remark = remark;
-    const prev = state.editorActions[state.actionSel];
-    if (state.editDraft.type === "defineBlock") {
-      if (!validateDefineBlockName(state.editDraft.blockName, state.actionSel)) return false;
-    }
-    if (
-      state.editDraft.type === "endLoop" &&
-      !hasLoopParentAt(state.editorActions, state.actionSel, prev.indent | 0)
-    ) {
-      toast(END_LOOP_NEEDS_LOOP_MSG);
+    visualNoteUndo();
+    const result = applyDraftToActionIndex(state.actionSel, state.editDraft, { silent: false });
+    if (!result) {
+      revertLastEditorHistory();
       return false;
     }
-    const next = Object.assign({}, state.editDraft);
-    next.indent = prev.indent;
-    if (typeof prev._vx === "number") next._vx = prev._vx;
-    if (typeof prev._vy === "number") next._vy = prev._vy;
-    if (prev.no != null) next.no = prev.no;
-    if (prev.originalNo != null) next.originalNo = prev.originalNo;
-    next.name = typeLabel(next.type);
-    delete next._preview;
-    state.editorActions[state.actionSel] = next;
-    state.editDraft = JSON.parse(JSON.stringify(next));
+    state.editDraft = JSON.parse(JSON.stringify(state.editorActions[state.actionSel]));
     state.addPreview = null;
     state._skipReadback = true;
     renderEditorActions(state.editorActions);
     state._skipReadback = false;
+    return true;
+  }
+
+  function commitModifyBatch() {
+    const idxs = selectedBatchIndices();
+    if (!idxs.length) {
+      toast("请先勾选动作");
+      return false;
+    }
+    const src = currentAddActionFromForm();
+    visualNoteUndo();
+    const sorted = idxs.slice().sort((a, b) => b - a);
+    let n = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      const idx = sorted[i];
+      if (idx < 0 || idx >= state.editorActions.length) continue;
+      let one = src;
+      try {
+        one = JSON.parse(JSON.stringify(src));
+      } catch (_) {}
+      if (applyDraftToActionIndex(idx, one, { silent: true })) n += 1;
+    }
+    if (!n) {
+      revertLastEditorHistory();
+      toast("没有可修改的动作");
+      return false;
+    }
+    renderEditorActions(state.editorActions);
+    toast("已修改 " + n + " 条");
     return true;
   }
 
@@ -829,6 +1379,8 @@
       imageScale: 1,
       imageScaleMin: 1,
       imageScaleMax: 1,
+      imageLocate: 0,
+      findTimeExpr: "0",
       findImageFollowUp: 0,
       offsetX: 0,
       offsetY: 0,
@@ -839,6 +1391,9 @@
       scrollDirection: 0,
       scrollVertical: 1,
       scrollHorizontal: 0,
+      resumeAfterWatch: 1,
+      watchMode: 0,
+      watchPollSeconds: 1,
     };
     if (t === "wait") base.duration = 0.5;
     if (t === "findImage") {
@@ -847,8 +1402,35 @@
       base.matchThreshold = 65;
       applyFullScreenSearchCoords(base);
     }
+    if (t === "multiMatch") {
+      base.duration = 0.05;
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      base.imagePaths = [];
+      base.imageUseVars = [];
+      base.multiMatchMode = 0;
+      base.multiMatchMax = 20;
+      base.multiMatchSort = 0;
+      base.matchVarName = "matchRet";
+      base.findImageFollowUp = 0;
+      applyFullScreenSearchCoords(base);
+    }
+    if (t === "watchImage") {
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      base.resumeAfterWatch = 1;
+      base.watchMode = 0;
+      base.watchPollSeconds = 1;
+      applyFullScreenSearchCoords(base);
+    }
+    if (t === "varCompute") {
+      base.computeCode = "";
+    }
     if (t === "getColor") {
       base.matchVarName = "colorRet";
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      applyFullScreenSearchCoords(base);
     }
     if (t === "findColor") {
       base.colorR = 255;
@@ -866,8 +1448,23 @@
       base.colorB = 0;
       base.colorTolerance = 16;
       base.matchVarName = "colorRet";
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      applyFullScreenSearchCoords(base);
     }
     if (t === "mouseClick") base.duration = 0.01;
+    if (t === "mouseDrag") {
+      base.duration = 0.3;
+      base.endX = 0;
+      base.endY = 0;
+      base.randomEndX = 0;
+      base.randomEndY = 0;
+      base.imageLocate = 0;
+      base.searchFullScreen = 1;
+      base.matchThreshold = 65;
+      base.findTimeExpr = "0";
+      applyFullScreenSearchCoords(base);
+    }
     if (t === "keyClick") base.duration = 0.01;
     if (t === "mousePlayback") {
       base.blockName = "";
@@ -1084,6 +1681,11 @@
       if (p.closest("#ov-editor-settings")) return;
       p.classList.toggle("active", p.dataset.pane === stab);
     });
+    // ★ 切到「AI 助手」页时刷新窗口 Agents 列表并接好准星按钮
+    //   （列表要问原生"进程在不在跑 / 校准没有"，所以不在页面初始化时预取）
+    if (stab === "ai" && typeof loadWindowAgents === "function") {
+      loadWindowAgents();
+    }
   }
 
   function quietSaveSettings(partial) {
@@ -1131,11 +1733,13 @@
         const cur =
           pickerActionTypes(state.addActionType).find((a) => a.v === state.addActionType) ||
           ACTION_TYPES[0];
-        typeCombo.textContent = cur.t;
+        if (typeCombo && cur) setActionTypeComboText(cur.t);
       }
       showAddTypePreview();
     } else if (kind === "opt") {
       showContentSkeleton("optList", 14);
+      // 骨架期作废窗口化状态：否则滚动事件会拿上一份录制的 actions 往骨架里塞行
+      state._optVirt = null;
       if ($("#optSelCount")) $("#optSelCount").textContent = "…";
       if ($("#optSelN")) $("#optSelN").textContent = "0";
     }
@@ -1196,7 +1800,13 @@
     if (state.editor) {
       // silent：启动恢复 / 列表重匹配不得把刚打开的编辑器关掉
       if (silent) return;
-      exitEditor();
+      if (editorAutoSaveOn()) {
+        requestLeaveEditor("x");
+        if (state.editor) return;
+      } else {
+        exitEditor();
+        if (state.editor) return;
+      }
     }
     const map = { clicker: 0, recorder: 1, macro: 2, ai: 3 };
     const engTab = map[tab] != null ? map[tab] : 0;
@@ -1462,7 +2072,7 @@
     const hint = $("#recModeHint");
     if (hint) hint.hidden = (state.recMode | 0) !== 3;
     const wmEl = $("#recWindowMode");
-    if (wmEl) wmEl.textContent = (state.recWindowMode | 0) === 1 ? "窗口模式 ▾" : "全屏模式 ▾";
+    if (wmEl) wmEl.textContent = (state.recWindowMode | 0) === 1 ? "后台窗口模式 ▾" : "前台模式 ▾";
     const wmHint = $("#recWindowHint");
     if (wmHint) wmHint.hidden = (state.recWindowMode | 0) !== 1;
   }
@@ -1525,12 +2135,13 @@
     if (views) views.style.display = pro ? "none" : "";
     document.documentElement.classList.toggle("pro-ui", !!pro);
     syncSettingsGear();
-    // 仅首次打开主界面居中；之后（含模式切换）保持原位
+    // 仅首次打开主界面居中；之后（含模式切换）保持原位。
+    // 独立助手窗与主壳不同 WebView：禁止 setHomeSize，否则会把主窗口拉去主屏并改尺寸。
     const center =
       opts && Object.prototype.hasOwnProperty.call(opts, "center")
         ? !!opts.center
         : !_homeCenteredOnce;
-    if (window.qst && typeof qst.setHomeSize === "function") {
+    if (!AGENT_SHELL && window.qst && typeof qst.setHomeSize === "function") {
       qst.setHomeSize(SHELL_CLIENT.home.w, SHELL_CLIENT.home.h, { center });
       if (center) _homeCenteredOnce = true;
     }
@@ -1704,10 +2315,10 @@
           const runMode = state._runningMode | 0;
           const mode =
             runMode === 2
-              ? "后台窗口"
+              ? "后台窗口模式"
               : runMode === 1
-                ? "窗口模式"
-                : "默认";
+                ? "独立桌面模式"
+                : "默认模式";
           const steps = state._executedSteps | 0;
           const rwm = state._runningWindowMode || {};
           const target =
@@ -2002,6 +2613,9 @@
       tech.style.opacity = on ? "" : "0.45";
       tech.style.pointerEvents = on ? "" : "none";
     }
+    // 窗口变速**不**依赖假焦点注入：注入关掉时窗口/后台窗口模式会改为「仅注入时钟补丁」，
+    // 所以这里绝不能把它置灰 —— 置灰会让人以为「必须先开注入才能变速」（曾经就是这样，
+    // 结果用户把两个开关都试了一遍都以为坏了）。
   }
 
   const PLAYBACK_SPEED_NODES = [0.25, 0.5, 0.75, 1, 1.25, 2, 4];
@@ -2108,10 +2722,10 @@
 
   function persistPlaybackSpeedSettings() {
     if (!window.qst || typeof quietSaveSettings !== "function") return;
-    quietSaveSettings({
-      playbackSpeed: readPlaybackSpeedValue(),
-      enablePlaybackSpeed: !!$("#setPlaySpeedEn")?.classList.contains("on"),
-    });
+    const payload = { playbackSpeed: readPlaybackSpeedValue() };
+    const en = $("#setPlaySpeedEn");
+    if (en) payload.enablePlaybackSpeed = en.classList.contains("on");
+    quietSaveSettings(payload);
   }
 
   function bindSpeedSliderRoot(root, opts) {
@@ -2205,6 +2819,7 @@
       visualBlockCallWires: otherFlag(other, "visualBlockCallWires", true),
       visualIfWrap: otherFlag(other, "visualIfWrap", true),
       visualBlockWrap: otherFlag(other, "visualBlockWrap", true),
+      visualWatchWrap: otherFlag(other, "visualWatchWrap", true),
       visualJumpWires: otherFlag(other, "visualJumpWires", true),
       visualShowGrid: otherFlag(other, "visualShowGrid", true),
       visualShowCardId: otherFlag(other, "visualShowCardId", true),
@@ -2212,11 +2827,58 @@
       editorHiddenActions: Array.isArray(other.editorHiddenActions)
         ? other.editorHiddenActions.slice()
         : [],
+      editorCatalogPreset: normalizeCatalogPreset(other.editorCatalogPreset),
+      editorCustomActionOrder: Array.isArray(other.editorCustomActionOrder)
+        ? other.editorCustomActionOrder.slice()
+        : [],
+      editorCustomHiddenActions: Array.isArray(other.editorCustomHiddenActions)
+        ? other.editorCustomHiddenActions.slice()
+        : [],
+      editorSearchAllActions: otherFlag(other, "editorSearchAllActions", false),
+      editorHideFixedVars: otherFlag(other, "editorHideFixedVars", false),
+      editorHideCoordVars: otherFlag(other, "editorHideCoordVars", false),
+      editorMultiResultPlaceholderOnly: otherFlag(other, "editorMultiResultPlaceholderOnly", false),
+      editorDisableModifyButton: otherFlag(other, "editorDisableModifyButton", false),
+      editorAutoSaveOnExit: otherFlag(other, "editorAutoSaveOnExit", false),
+      editorEnableBatchInsert: otherFlag(other, "editorEnableBatchInsert", false),
     };
   }
 
+  function editorDisableModifyOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorDisableModifyButton", false);
+  }
+
+  function editorAutoSaveOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorAutoSaveOnExit", false);
+  }
+
+  function editorBatchInsertOn() {
+    return otherFlag((state.settings && state.settings.other) || {}, "editorEnableBatchInsert", false);
+  }
+
+  function mergePickerLocked() {
+    return !!(
+      state.batchMode &&
+      typeof isMergeEligible === "function" &&
+      isMergeEligible() &&
+      !editorBatchInsertOn()
+    );
+  }
+
+  function syncEditorGeneralChrome() {
+    const noMod = editorDisableModifyOn();
+    const auto = editorAutoSaveOn();
+    document.body.classList.toggle("editor-no-modify", !!(state.editor && noMod));
+    document.body.classList.toggle("editor-autosave", !!(state.editor && auto));
+    if (state.editor) {
+      if (auto) startEditorAutosaveTimer();
+      else stopEditorAutosaveTimer();
+    }
+  }
+
   function setEditorSettingsTab(tab) {
-    const t = tab === "general" ? "general" : "visual";
+    const t =
+      tab === "general" || tab === "vars" || tab === "common" ? tab : "visual";
     $$("#editorSettingsTabs .st-tab").forEach((el) =>
       el.classList.toggle("active", el.dataset.edtab === t)
     );
@@ -2251,29 +2913,46 @@
   }
 
   function collectEditorCatalogPartial() {
-    const rows = $$("#edActionCatalog .ed-cat-row");
-    if (!rows.length) {
-      const other = (state.settings && state.settings.other) || {};
+    const preset = normalizeCatalogPreset(state._edCatPreset);
+    const sidecar = sidecarCustomPartial();
+    if (preset === "all") {
       return {
-        editorActionOrder: Array.isArray(other.editorActionOrder) ? other.editorActionOrder.slice() : [],
-        editorHiddenActions: Array.isArray(other.editorHiddenActions)
-          ? other.editorHiddenActions.slice()
-          : [],
+        editorActionOrder: [],
+        editorHiddenActions: [],
+        editorCatalogPreset: "all",
+        ...sidecar,
       };
     }
-    const order = [];
-    const hidden = [];
-    rows.forEach((row) => {
-      const v = row.dataset.type;
-      if (!v) return;
-      order.push(v);
-      if (!row.querySelector(".chk")?.classList.contains("on")) hidden.push(v);
-    });
-    if (hidden.length >= order.length && order.length) {
-      const idx = hidden.indexOf(order[0]);
-      if (idx >= 0) hidden.splice(idx, 1);
+    if (preset === "custom") {
+      const rows = catalogPartialFromRows();
+      state._edCatCustom = cloneCatalogSnapshot(rows);
+      return {
+        editorActionOrder: rows.editorActionOrder,
+        editorHiddenActions: rows.editorHiddenActions,
+        editorCatalogPreset: "custom",
+        editorCustomActionOrder: rows.editorActionOrder.slice(),
+        editorCustomHiddenActions: rows.editorHiddenActions.slice(),
+      };
     }
-    return { editorActionOrder: order, editorHiddenActions: hidden };
+    const p = catalogPresetPayload(preset);
+    return {
+      editorActionOrder: p.editorActionOrder,
+      editorHiddenActions: p.editorHiddenActions,
+      editorCatalogPreset: preset,
+      ...sidecar,
+    };
+  }
+
+  function bindEditorCatalogPresets() {
+    const host = $("#edCatalogPresets");
+    if (!host || host._boundPresets) return;
+    host._boundPresets = true;
+    host.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-cat-preset]");
+      if (!btn || !host.contains(btn)) return;
+      e.preventDefault();
+      applyCatalogPreset(btn.dataset.catPreset);
+    });
   }
 
   function bindEditorActionCatalog() {
@@ -2290,12 +2969,14 @@
         e.preventDefault();
         const prev = row.previousElementSibling;
         if (prev) host.insertBefore(row, prev);
+        markCatalogPresetCustom();
         return;
       }
       if (dn) {
         e.preventDefault();
         const next = row.nextElementSibling;
         if (next) host.insertBefore(next, row);
+        markCatalogPresetCustom();
         return;
       }
       const chk = e.target.closest(".chk");
@@ -2316,6 +2997,7 @@
       const i = chk.querySelector("i");
       if (i) i.textContent = "";
       row.classList.toggle("is-hidden-type", !chk.classList.contains("on"));
+      markCatalogPresetCustom();
     });
     host.addEventListener("dragstart", (e) => {
       const row = e.target.closest(".ed-cat-row");
@@ -2334,6 +3016,7 @@
     host.addEventListener("dragend", () => {
       if (dragEl) dragEl.classList.remove("dragging");
       dragEl = null;
+      markCatalogPresetCustom();
     });
     host.addEventListener("dragover", (e) => {
       e.preventDefault();
@@ -2361,10 +3044,42 @@
     setChk($("#edSetCallWires"), otherFlag(other, "visualBlockCallWires", true));
     setChk($("#edSetIfWrap"), otherFlag(other, "visualIfWrap", true));
     setChk($("#edSetBlockWrap"), otherFlag(other, "visualBlockWrap", true));
+    setChk($("#edSetWatchWrap"), otherFlag(other, "visualWatchWrap", true));
     setChk($("#edSetJumpWires"), otherFlag(other, "visualJumpWires", true));
     setChk($("#edSetShowGrid"), otherFlag(other, "visualShowGrid", true));
     setChk($("#edSetShowCardId"), otherFlag(other, "visualShowCardId", true));
-    renderEditorActionCatalog(other);
+    setChk($("#edSetSearchAllActions"), otherFlag(other, "editorSearchAllActions", false));
+    setChk($("#edSetHideFixedVars"), otherFlag(other, "editorHideFixedVars", false));
+    setChk($("#edSetHideCoordVars"), otherFlag(other, "editorHideCoordVars", false));
+    setChk($("#edSetMultiResultPlaceholder"), otherFlag(other, "editorMultiResultPlaceholderOnly", false));
+    setChk($("#edSetDisableModify"), otherFlag(other, "editorDisableModifyButton", false));
+    setChk($("#edSetAutoSaveOnExit"), otherFlag(other, "editorAutoSaveOnExit", false));
+    setChk($("#edSetEnableBatchInsert"), otherFlag(other, "editorEnableBatchInsert", false));
+    {
+      const stored = normalizeCatalogPreset(other.editorCatalogPreset);
+      const cat = normalizeActionCatalog(other);
+      const detected = catalogPresetIdFrom(cat.order, cat.hidden);
+      let custom = {
+        editorActionOrder: Array.isArray(other.editorCustomActionOrder)
+          ? other.editorCustomActionOrder.slice()
+          : [],
+        editorHiddenActions: Array.isArray(other.editorCustomHiddenActions)
+          ? other.editorCustomHiddenActions.slice()
+          : [],
+      };
+      const sidecarEmpty = !catalogSnapshotHasItems(custom);
+      if (sidecarEmpty && (stored === "custom" || (stored === "all" && detected === "custom"))) {
+        custom = { editorActionOrder: cat.order.slice(), editorHiddenActions: cat.hidden.slice() };
+      }
+      state._edCatCustom = custom;
+      if (stored === "custom" || (stored === "all" && detected === "custom" && sidecarEmpty)) {
+        renderEditorActionCatalog(state._edCatCustom);
+        syncCatalogPresetUi("custom");
+      } else {
+        renderEditorActionCatalog(catalogPresetPayload(stored));
+        syncCatalogPresetUi(stored);
+      }
+    }
   }
 
   function collectEditorSettingsPartial() {
@@ -2375,9 +3090,17 @@
       visualBlockCallWires: !!$("#edSetCallWires")?.classList.contains("on"),
       visualIfWrap: !!$("#edSetIfWrap")?.classList.contains("on"),
       visualBlockWrap: !!$("#edSetBlockWrap")?.classList.contains("on"),
+      visualWatchWrap: !!$("#edSetWatchWrap")?.classList.contains("on"),
       visualJumpWires: !!$("#edSetJumpWires")?.classList.contains("on"),
       visualShowGrid: !!$("#edSetShowGrid")?.classList.contains("on"),
       visualShowCardId: !!$("#edSetShowCardId")?.classList.contains("on"),
+      editorSearchAllActions: !!$("#edSetSearchAllActions")?.classList.contains("on"),
+      editorHideFixedVars: !!$("#edSetHideFixedVars")?.classList.contains("on"),
+      editorHideCoordVars: !!$("#edSetHideCoordVars")?.classList.contains("on"),
+      editorMultiResultPlaceholderOnly: !!$("#edSetMultiResultPlaceholder")?.classList.contains("on"),
+      editorDisableModifyButton: !!$("#edSetDisableModify")?.classList.contains("on"),
+      editorAutoSaveOnExit: !!$("#edSetAutoSaveOnExit")?.classList.contains("on"),
+      editorEnableBatchInsert: !!$("#edSetEnableBatchInsert")?.classList.contains("on"),
       ...collectEditorCatalogPartial(),
     };
   }
@@ -2394,6 +3117,8 @@
     Object.assign(state.settings.other, partial);
     applyEditorVisualPrefs();
     syncEditorActionTypeCombo();
+    syncEditorGeneralChrome();
+    if (state.editor && state.batchMode && typeof syncMergeModeUi === "function") syncMergeModeUi();
     if (window.qst) {
       if (announce) state._announceSettingsSave = true;
       quietSaveSettings(partial);
@@ -2406,11 +3131,18 @@
     fillEditorSettingsForm((state.settings && state.settings.other) || {});
     setEditorSettingsTab("visual");
     bindEditorActionCatalog();
+    bindEditorCatalogPresets();
     openOv("editor-settings");
   }
 
   function fillSettings(s) {
     state.settings = s || {};
+    const prevFi = state.findImageEngine;
+    state.findImageEngine = s.findImageEngine !== false;
+    if (prevFi !== false && state.findImageEngine === false && !state._toldNoFindImage) {
+      state._toldNoFindImage = true;
+      toast("找图引擎不可用（OpenCV 缺失或被隔离）。连点、脚本编辑和界面仍可使用");
+    }
     const click = s.click || {};
     const other = s.other || {};
     const home = s.home || {};
@@ -2460,6 +3192,22 @@
       playback.autoOutputKeyFunctionDebug == null ? true : !!playback.autoOutputKeyFunctionDebug
     );
     setChk(
+      $("#setLowPerfMode"),
+      playback.lowPerformanceMode == null ? false : !!playback.lowPerformanceMode
+    );
+    setChk(
+      $("#setSpreadRelMoves"),
+      playback.spreadRelativeMovePackets == null ? false : !!playback.spreadRelativeMovePackets
+    );
+    setChk(
+      $("#setFindGpuAccel"),
+      playback.findImageGpuAccel == null ? false : !!playback.findImageGpuAccel
+    );
+    setChk(
+      $("#setAiFastPaths"),
+      playback.aiFastPaths == null ? true : !!playback.aiFastPaths
+    );
+    setChk(
       $("#setRecCaptureEn"),
       playback.recordingClickCaptureEnabled == null ? true : !!playback.recordingClickCaptureEnabled
     );
@@ -2480,6 +3228,7 @@
     setChk($("#setAutoHide"), other.autoHideMainWindow == null ? true : !!other.autoHideMainWindow);
     setChk($("#setPlaySound"), other.playSoundOnStart == null ? true : !!other.playSoundOnStart);
     setChk($("#setPlaySoundEnd"), other.playSoundOnEnd == null ? true : !!other.playSoundOnEnd);
+    setChk($("#setExportAsZip"), !!other.exportScriptAsZip);
     setChk($("#setHideTip"), other.hideBottomRightTip == null ? true : !!other.hideBottomRightTip);
     setChk($("#setCloseTray"), other.closeToTray == null ? true : !!other.closeToTray);
     setChk($("#setFloatBall"), other.showFloatBall == null ? true : !!other.showFloatBall);
@@ -2490,6 +3239,10 @@
     applyEditorVisualPrefs();
     if ($("#setHoldSec") && other.holdThresholdSeconds != null)
       $("#setHoldSec").textContent = String(other.holdThresholdSeconds);
+    if ($("#setUiScale")) {
+      const scaleV = other.uiScaleFactor != null ? other.uiScaleFactor : 1;
+      $("#setUiScale").textContent = formatUiScaleFactor(scaleV);
+    }
     state.hideBottomRightTip =
       other.hideBottomRightTip == null ? true : !!other.hideBottomRightTip;
 
@@ -2516,6 +3269,10 @@
     const wmTechEl = $("#setWmInjectTech");
     if (wmTechEl) wmTechEl.textContent = (wmTechItem || WM_TECH_LIST[0]).t;
     setChk($("#setWmHideModule"), !!windowMode.hideInjectedModule);
+    setChk(
+      $("#setWmTimeScale"),
+      windowMode.enableWindowTimeScale == null ? true : !!windowMode.enableWindowTimeScale
+    );
     syncWmInjectUi();
 
     if (typeof home.clickerButton === "number") state.clickBtn = home.clickerButton;
@@ -2571,6 +3328,7 @@
     updateCtas();
     applyThemeFromSettings(s);
     if (state.editor) applyEditorVisualPrefs();
+    if (state.editor) syncEditorGeneralChrome();
   }
 
   function findAiSavedProfile(modelName) {
@@ -2641,8 +3399,189 @@
     };
   }
 
-  function refreshAiModelCombos() {
-    const models = Array.isArray(state._aiSavedModels) ? state._aiSavedModels : [];
+  // ── 窗口 Agents：把客户端窗口登记成模型 ───────────────────────────────
+  //   ★ 设置页是**两套互斥组件**（用户 2026-09-27 明确要求）：
+  //     · 选中的是普通 API 模型 ⇒ 只显示 API 地址/密钥/模型名称/温度；
+  //     · 选中的是**窗口应用**（豆包客户端 / Cursor…）⇒ 只显示窗口应用那一组
+  //       （应用名 / 进程 / 状态 / 选择·解绑），**API 那几个框一个都不显示**。
+  //   判据 = 当前选中的模型名是否命中窗口档案 id（原生 `windowAgentList` 给的 clients）。
+  const waState = { clients: [], windows: [], picked: null };
+
+  function waSelectedModelName() {
+    const combo = $("#aiModelCombo");
+    const t = combo ? String(combo.textContent || "").trim() : "";
+    return t || String(state.agentModel || "").trim();
+  }
+
+  function waModelIsWindowAgent() {
+    const name = waSelectedModelName();
+    if (!name) return false;
+    return waState.clients.some((c) => String(c.id) === name);
+  }
+
+  /** 按"选中模型是 API 还是窗口应用"切换两套组件（互斥显示） */
+  function syncAiPaneMode() {
+    const isApp = waModelIsWindowAgent();
+    if ($("#aiApiFields")) $("#aiApiFields").hidden = isApp;
+    if ($("#aiWindowAgentFields")) $("#aiWindowAgentFields").hidden = !isApp;
+    if ($("#aiModelBtns")) $("#aiModelBtns").style.display = isApp ? "none" : "";
+    if ($("#aiPanelTitle")) $("#aiPanelTitle").textContent = isApp ? "窗口应用" : "模型配置";
+    if ($("#aiPanelSub")) {
+      $("#aiPanelSub").textContent = isApp
+        ? "把这个客户端窗口当成模型（会抢前台）"
+        : "OpenAI 兼容";
+    }
+    if (isApp) {
+      const cur = waState.clients.find((c) => String(c.id) === waSelectedModelName()) || {};
+      if ($("#waPanelApp")) $("#waPanelApp").textContent = cur.label || cur.id || "";
+      if ($("#waPanelProcess")) $("#waPanelProcess").textContent = (cur.processNames || []).join(" / ");
+      const st = $("#waPanelState");
+      if (st) {
+        const bits = [];
+        bits.push(cur.running
+          ? (cur.foreground ? "窗口在前台" : "窗口在后台（跑之前请切到前台）")
+          : "**客户端没在运行**");
+        bits.push(cur.calibrated
+          ? "几何判据已校准"
+          : "**几何判据未校准** ⇒ 请先用窗口探针量出输入框/操作栏");
+        st.textContent = bits.join(" · ");
+      }
+      const un = $("#btnWaPanelUnbind");
+      if (un) un.disabled = !cur.id;
+      waSummary();
+    }
+  }
+
+  function waSummary() {
+    const bound = waState.clients.filter((c) => c.bound);
+    const el = $("#windowAgentSummary");
+    if (!el) return;
+    el.textContent = bound.length
+      ? `已绑定 ${bound.length} 个窗口应用：${bound.map((c) => c.label || c.id).join("、")}`
+      : "还没有绑定窗口应用。点上面的「选择窗口应用…」用准星指定一个客户端窗口。";
+  }
+
+  function waRenderPicked() {
+    const p = waState.picked;
+    if ($("#waPickedTitle")) $("#waPickedTitle").textContent = p ? p.title || "(无标题)" : "";
+    if ($("#waPickedProcess")) $("#waPickedProcess").textContent = p ? p.process || "" : "";
+    const st = $("#waPickedState");
+    if (st) {
+      if (!p) st.textContent = "还没有选择窗口";
+      else if (p.client) {
+        const c = waState.clients.find((x) => x.id === p.client) || {};
+        st.textContent = `${c.label || p.client} · 已匹配档案`
+          + (c.calibrated ? "（几何判据已校准，可直接用）" : "（**几何判据未校准** ⇒ 需先用窗口探针量出输入框/操作栏）");
+      } else {
+        st.textContent = "没有匹配到档案 ⇒ 绑定会按进程名新建一条**骨架**档案，仍需用探针校准";
+      }
+    }
+    const bindBtn = $("#btnWaBind");
+    const unbindBtn = $("#btnWaUnbind");
+    const boundIds = waState.clients.filter((c) => c.bound).map((c) => c.id);
+    const pid = p ? p.client : "";
+    if (bindBtn) bindBtn.disabled = !p || !pid || boundIds.includes(pid);
+    if (unbindBtn) unbindBtn.disabled = !p || !pid || !boundIds.includes(pid);
+  }
+
+  function waPickFromWindowInfo(info) {
+    waState.picked = info;
+    waRenderPicked();
+  }
+
+  function waRenderWindows() {
+    const box = $("#waWindowList");
+    if (!box) return;
+    const ws = Array.isArray(waState.windows) ? waState.windows : [];
+    if (!ws.length) {
+      box.innerHTML = `<div class="row"><p class="hint">没有检测到可切换的窗口</p></div>`;
+      return;
+    }
+    box.innerHTML = "";
+    ws.forEach((w) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.style.cursor = "pointer";
+      const title = (w.title || "").replace(/</g, "&lt;");
+      row.innerHTML = `<span class="lbl-w">${w.process || ""}</span>
+        <span class="hint" style="margin-left:8px">${title}</span>`;
+      row.addEventListener("click", () => {
+        waPickFromWindowInfo({ process: w.process || "", title: w.title || "", client: w.client || "" });
+      });
+      box.appendChild(row);
+    });
+  }
+
+  function waOpen() {
+    if (typeof openOv === "function") openOv("window-agent");
+    if (window.qst && qst.windowAgentList) qst.windowAgentList();
+  }
+
+  function waBindPicked(unbind) {
+    const p = waState.picked;
+    if (!p || !window.qst || !qst.windowAgentBind) return;
+    if (p.client) {
+      qst.windowAgentBind({ client: p.client, unbind: !!unbind });
+    } else if (p.process) {
+      qst.windowAgentBind({ process: p.process, title: p.title || "", unbind: !!unbind });
+    }
+  }
+
+  function waWire() {
+    const openBtn = $("#btnWindowAgentOpen");
+    if (openBtn && !openBtn._qstWaOpen) {
+      openBtn._qstWaOpen = true;
+      openBtn.addEventListener("click", waOpen);
+    }
+    const cx = $("#btnWaCrosshair");
+    if (cx) wireCrosshairPointerDown(cx, "window", "windowAgent");
+    const bindBtn = $("#btnWaBind");
+    if (bindBtn && !bindBtn._qstWaBind) {
+      bindBtn._qstWaBind = true;
+      bindBtn.addEventListener("click", () => waBindPicked(false));
+    }
+    const unbindBtn = $("#btnWaUnbind");
+    if (unbindBtn && !unbindBtn._qstWaUnbind) {
+      unbindBtn._qstWaUnbind = true;
+      unbindBtn.addEventListener("click", () => waBindPicked(true));
+    }
+    // 设置页里那个「解除绑定」（窗口应用模式下的组件）
+    const panelUnbind = $("#btnWaPanelUnbind");
+    if (panelUnbind && !panelUnbind._qstWaPanelUnbind) {
+      panelUnbind._qstWaPanelUnbind = true;
+      panelUnbind.addEventListener("click", () => {
+        const id = waSelectedModelName();
+        if (id && window.qst && qst.windowAgentBind) qst.windowAgentBind({ client: id, unbind: true });
+      });
+    }
+  }
+
+  function renderWindowAgents(payload) {
+    payload = payload || {};
+    waState.clients = Array.isArray(payload.clients) ? payload.clients : [];
+    waState.windows = Array.isArray(payload.windows) ? payload.windows : [];
+    // 把"这个窗口属于哪个已注册档案"标出来（原生按进程名匹配好了）
+    waState.windows.forEach((w) => {
+      const hit = waState.clients.find((c) => (c.processNames || []).some(
+        (p) => String(p).toLowerCase() === String(w.process || "").toLowerCase()));
+      w.client = hit ? hit.id : "";
+    });
+    waSummary();
+    waRenderWindows();
+    waRenderPicked();
+    waWire();
+    // ★ 列表回来后要**按"选中模型是不是窗口应用"重排设置页的两套组件**
+    //   （列表是异步到的，第一帧还不知道哪些模型是窗口应用）
+    if (typeof syncAiPaneMode === "function") syncAiPaneMode();
+  }
+
+  function loadWindowAgents() {
+    waWire();
+    if (!window.qst || !qst.windowAgentList) return;
+    qst.windowAgentList();
+  }
+
+  function refreshAiModelCombos() {    const models = Array.isArray(state._aiSavedModels) ? state._aiSavedModels : [];
     const modelLabels = models.length
       ? models.map((m) => ({ t: m.modelName || "model", v: m.modelName, profile: m }))
       : [];
@@ -2661,6 +3600,8 @@
     }
     if ($("#aiModelCombo")) $("#aiModelCombo").textContent = label;
     if ($("#agentModelCombo")) $("#agentModelCombo").textContent = label;
+    // ★ 选中的模型变了 ⇒ 立刻切换设置页的两套组件（API ↔ 窗口应用）
+    if (typeof syncAiPaneMode === "function") syncAiPaneMode();
     const tab = typeof activeAgentTab === "function" ? activeAgentTab() : null;
     if (tab && label && label !== "未添加模型") tab.model = label;
   }
@@ -3255,51 +4196,37 @@
   function collectSettings() {
     if (!state._gotSettings) return null;
     const aiCfg = resolveActiveAiConfig();
+    // 设置页控件不在当前文档时不得写成 false：独立助手窗没有 #setAutoHide 等，
+    // 切模型/保存模型列表会把「运行后自动隐藏主窗口」等勾选冲掉。
+    const assignChk = (obj, key, id) => {
+      const el = $("#" + id);
+      if (!el) return;
+      obj[key] = el.classList.contains("on");
+    };
     const out = {
-      enableRandomInterval: false,
       randomIntervalMaxSeconds: 0.5,
-      enablePressReleaseInterval: false,
       pressReleaseIntervalSeconds: 0.001,
-      enableCoordinateJitter: false,
       jitterX: 2,
       jitterY: 2,
-      enableFixedCoordinates: false,
       fixedX: 0,
       fixedY: 0,
-      enableClickCountLimit: false,
       clickCountLimit: 0,
       themeId: state.themeId | 0,
       useCustomTheme: !!state.useCustomTheme,
       customMainColor: (state.settings && state.settings.other && state.settings.other.customMainColor) || 0,
       customAccentColor:
         (state.settings && state.settings.other && state.settings.other.customAccentColor) || 0,
-      autoHideMainWindow: !!$("#setAutoHide")?.classList.contains("on"),
-      playSoundOnStart: !!$("#setPlaySound")?.classList.contains("on"),
-      playSoundOnEnd: !!$("#setPlaySoundEnd")?.classList.contains("on"),
-      hideBottomRightTip: !!$("#setHideTip")?.classList.contains("on"),
-      closeToTray: !!$("#setCloseTray")?.classList.contains("on"),
-      showFloatBall: !!$("#setFloatBall")?.classList.contains("on"),
-      autoStartOnBoot: !!$("#setAutoBoot")?.classList.contains("on"),
-      resolveImeConflict: !!$("#setImeConflict")?.classList.contains("on"),
       ...editorVisualFromState(),
       // Direct2D 开关已移除：保留磁盘既有值
       preferDirect2D: !!(state.settings && state.settings.other && state.settings.other.preferDirect2D),
       holdThresholdSeconds: parseFloat($("#setHoldSec")?.textContent || "0.2") || 0.2,
-      enablePlaybackCount: !!$("#setPlayCountEn")?.classList.contains("on"),
+      uiScaleFactor: readUiScaleFactorInput(false),
       playbackCount: parseInt($("#setPlayCount")?.textContent || "1", 10) || 0,
-      enablePlaybackInterval: !!$("#setPlayIntervalEn")?.classList.contains("on"),
       playbackIntervalMinSeconds: parseFloat($("#setPlayIntervalMin")?.textContent || "0.5") || 0.5,
       playbackIntervalMaxSeconds: parseFloat($("#setPlayIntervalMax")?.textContent || "1") || 1,
-      enableDebugOutputWindow: !!$("#setDebugWin")?.classList.contains("on"),
-      autoOutputKeyFunctionDebug: !!$("#setAutoKeyDebug")?.classList.contains("on"),
-      recordingClickCaptureEnabled: !!$("#setRecCaptureEn")?.classList.contains("on"),
       recordingClickCaptureHalfSize: parseInt($("#setRecCaptureHalf")?.textContent || "40", 10) || 40,
-      enablePlaybackSpeed: !!$("#setPlaySpeedEn")?.classList.contains("on"),
       playbackSpeed: readPlaybackSpeedValue(),
       uiMode: (window.ProMode ? window.ProMode.mode() : state.uiMode) || "simple",
-      foregroundInputBackend: 0,
-      scheduledTaskConflictPolicy: 0,
-      scheduledTaskAutoResume: false,
       clickerButton: state.clickBtn,
       clickerIntervalMode: state.intervalMode,
       clickerCustomInterval: state.customInterval,
@@ -3318,29 +4245,50 @@
       maxTokens: parseInt($("#aiTokens")?.textContent || "4096", 10) || 4096,
       savedModels: Array.isArray(state._aiSavedModels) ? state._aiSavedModels : [],
     };
+    assignChk(out, "autoHideMainWindow", "setAutoHide");
+    assignChk(out, "playSoundOnStart", "setPlaySound");
+    assignChk(out, "playSoundOnEnd", "setPlaySoundEnd");
+    assignChk(out, "exportScriptAsZip", "setExportAsZip");
+    assignChk(out, "hideBottomRightTip", "setHideTip");
+    assignChk(out, "closeToTray", "setCloseTray");
+    assignChk(out, "showFloatBall", "setFloatBall");
+    assignChk(out, "autoStartOnBoot", "setAutoBoot");
+    assignChk(out, "resolveImeConflict", "setImeConflict");
     const backendOn = document.querySelector(
       '.set-pane[data-pane="play"] .radio[data-backend].on'
     );
     if (backendOn) out.foregroundInputBackend = backendOn.dataset.backend | 0;
     const schedPrioOn = $("#setSchedPrioRadios .radio.on");
     if (schedPrioOn) out.scheduledTaskConflictPolicy = schedPrioOn.dataset.schedPrio | 0;
-    out.scheduledTaskAutoResume = !!$("#setSchedResumeEn")?.classList.contains("on");
-    state.hideBottomRightTip = out.hideBottomRightTip;
+    assignChk(out, "scheduledTaskAutoResume", "setSchedResumeEn");
+    if (Object.prototype.hasOwnProperty.call(out, "hideBottomRightTip")) {
+      state.hideBottomRightTip = out.hideBottomRightTip;
+    }
 
-    out.enableRandomInterval = !!$("#setRandomIntervalEn")?.classList.contains("on");
+    assignChk(out, "enableRandomInterval", "setRandomIntervalEn");
+    assignChk(out, "enablePlaybackCount", "setPlayCountEn");
+    assignChk(out, "enablePlaybackInterval", "setPlayIntervalEn");
+    assignChk(out, "enableDebugOutputWindow", "setDebugWin");
+    assignChk(out, "autoOutputKeyFunctionDebug", "setAutoKeyDebug");
+    assignChk(out, "lowPerformanceMode", "setLowPerfMode");
+    assignChk(out, "spreadRelativeMovePackets", "setSpreadRelMoves");
+    assignChk(out, "findImageGpuAccel", "setFindGpuAccel");
+    assignChk(out, "aiFastPaths", "setAiFastPaths");
+    assignChk(out, "recordingClickCaptureEnabled", "setRecCaptureEn");
+    assignChk(out, "enablePlaybackSpeed", "setPlaySpeedEn");
     out.randomIntervalMaxSeconds = parseFloat($("#setRandomMax")?.textContent || "0.5") || 0;
-    out.enablePressReleaseInterval = !!$("#setPressReleaseEn")?.classList.contains("on");
+    assignChk(out, "enablePressReleaseInterval", "setPressReleaseEn");
     out.pressReleaseIntervalSeconds = parseFloat($("#setPressRelease")?.textContent || "0.001") || 0;
-    out.enableCoordinateJitter = !!$("#setJitterEn")?.classList.contains("on");
+    assignChk(out, "enableCoordinateJitter", "setJitterEn");
     out.jitterX = parseInt($("#setJitterX")?.textContent || "0", 10) || 0;
     out.jitterY = parseInt($("#setJitterY")?.textContent || "0", 10) || 0;
-    out.enableFixedCoordinates = !!$("#setFixedCoordEn")?.classList.contains("on");
+    assignChk(out, "enableFixedCoordinates", "setFixedCoordEn");
     out.fixedX = parseInt($("#setFixedX")?.textContent || "0", 10) || 0;
     out.fixedY = parseInt($("#setFixedY")?.textContent || "0", 10) || 0;
-    out.enableClickCountLimit = !!$("#setClickLimitEn")?.classList.contains("on");
+    assignChk(out, "enableClickCountLimit", "setClickLimitEn");
     out.clickCountLimit = parseInt($("#setClickCountLimit")?.textContent || "0", 10) || 0;
 
-    out.showPreviewThumbnail = !!$("#setWmPreviewThumb")?.classList.contains("on");
+    assignChk(out, "showPreviewThumbnail", "setWmPreviewThumb");
     {
       let ms = parseInt($("#setWmPreviewMs")?.textContent || "500", 10);
       if (!Number.isFinite(ms)) ms = 500;
@@ -3348,16 +4296,17 @@
       if (ms > 5000) ms = 5000;
       out.previewRefreshMs = ms;
     }
-    out.blockRunWhenUnhealthy = !!$("#setWmBlockUnhealthy")?.classList.contains("on");
-    out.allowForegroundInputFallback = !!$("#setWmFgFallback")?.classList.contains("on");
+    assignChk(out, "blockRunWhenUnhealthy", "setWmBlockUnhealthy");
+    assignChk(out, "allowForegroundInputFallback", "setWmFgFallback");
     {
       const injectEl = $("#setWmEnableInject");
       // 设置页未挂载时不得写成 false，否则下次运行冒险岛只会 PostMessage、角色不动。
-      out.enableFakeFocusInjection = injectEl ? injectEl.classList.contains("on") : true;
+      if (injectEl) out.enableFakeFocusInjection = injectEl.classList.contains("on");
     }
     out.injectionTechnique =
       typeof state._wmInjectTech === "number" ? state._wmInjectTech : 0;
-    out.hideInjectedModule = !!$("#setWmHideModule")?.classList.contains("on");
+    assignChk(out, "hideInjectedModule", "setWmHideModule");
+    assignChk(out, "enableWindowTimeScale", "setWmTimeScale");
 
     out.clickerScrollOffset = state._clickerScrollOffset | 0;
     out.macroScrollOffset = state._macroScrollOffset | 0;
@@ -3365,9 +4314,22 @@
     out.scriptCustomScrollOffset = state._aiScrollOffset | 0;
 
     if (AGENT_SHELL) {
-      delete out.uiMode;
-      delete out.playbackSpeed;
-      delete out.enablePlaybackSpeed;
+      const aiOnly = {
+        aiEnabled: out.aiEnabled,
+        apiUrl: out.apiUrl,
+        apiKey: out.apiKey,
+        modelName: out.modelName,
+        savedModels: out.savedModels,
+      };
+      const ai = (state.settings && state.settings.ai) || {};
+      const t = Number(ai.temperature);
+      if (Number.isFinite(t)) aiOnly.temperature = t;
+      else if ($("#aiTemp")) aiOnly.temperature = out.temperature;
+      const tok = parseInt(ai.maxTokens, 10);
+      if (Number.isFinite(tok) && tok > 0) aiOnly.maxTokens = tok;
+      else if ($("#aiTokens")) aiOnly.maxTokens = out.maxTokens;
+      if (out.savedModelsClear) aiOnly.savedModelsClear = true;
+      return aiOnly;
     }
 
     if (!state.settings) state.settings = {};
@@ -3377,6 +4339,7 @@
     state.settings.other.visualBlockCallWires = out.visualBlockCallWires;
     state.settings.other.visualIfWrap = out.visualIfWrap;
     state.settings.other.visualBlockWrap = out.visualBlockWrap;
+    state.settings.other.visualWatchWrap = out.visualWatchWrap;
     state.settings.other.visualJumpWires = out.visualJumpWires;
     state.settings.other.visualShowGrid = out.visualShowGrid;
     state.settings.other.visualShowCardId = out.visualShowCardId;
@@ -3386,6 +4349,21 @@
     state.settings.other.editorHiddenActions = Array.isArray(out.editorHiddenActions)
       ? out.editorHiddenActions
       : [];
+    state.settings.other.editorCatalogPreset = normalizeCatalogPreset(out.editorCatalogPreset);
+    state.settings.other.editorCustomActionOrder = Array.isArray(out.editorCustomActionOrder)
+      ? out.editorCustomActionOrder
+      : [];
+    state.settings.other.editorCustomHiddenActions = Array.isArray(out.editorCustomHiddenActions)
+      ? out.editorCustomHiddenActions
+      : [];
+    state.settings.other.editorSearchAllActions = !!out.editorSearchAllActions;
+    state.settings.other.editorHideFixedVars = !!out.editorHideFixedVars;
+    state.settings.other.editorHideCoordVars = !!out.editorHideCoordVars;
+    state.settings.other.editorMultiResultPlaceholderOnly = !!out.editorMultiResultPlaceholderOnly;
+    state.settings.other.editorDisableModifyButton = !!out.editorDisableModifyButton;
+    state.settings.other.editorAutoSaveOnExit = !!out.editorAutoSaveOnExit;
+    state.settings.other.editorEnableBatchInsert = !!out.editorEnableBatchInsert;
+    state.settings.other.uiScaleFactor = out.uiScaleFactor;
 
     return out;
   }
@@ -3434,8 +4412,32 @@
     const y2 = a[px + "Y2"] | 0;
     if (x2 <= x1 || y2 <= y1) applyFullScreenSearchCoords(a, prefix);
   }
+  function editorUsesWindowTarget() {
+    return (state.editorMode | 0) === 1 || (state.editorMode | 0) === 2;
+  }
+  function windowModeWholeWindowHint(forImageRegion) {
+    return (
+      `<p class="hint">窗口/后台窗口模式：默认在整个目标窗口内搜索，不再使用屏幕「选取区域」。` +
+      (forImageRegion
+        ? `勾选「根据图片选取区域」后，会先在窗口内找图，再按相对区域筛选。</p>`
+        : `</p>`)
+    );
+  }
+  function withWindowTargetFindOpts(opts) {
+    const o = opts || {};
+    if (!editorUsesWindowTarget()) return o;
+    const wm = state.windowMode || {};
+    o.constrainToWindow = 1;
+    o.windowClassName = String(wm.windowClassName || "");
+    o.windowTitle = String(wm.windowTitle || wm.windowName || "");
+    o.targetExePath = String(wm.targetExePath || "");
+    return o;
+  }
   /** 绝对识别区域：标签 + 全图/选取区域 + X1Y1X2Y2 */
   function absSearchRegionHtml(a, prefix) {
+    if (editorUsesWindowTarget()) {
+      return windowModeWholeWindowHint(true);
+    }
     const px = prefix || "search";
     const fiFull = px === "aiSearch" ? "aiFull" : "full";
     // OCR/找图共用 search* 时，绝对选区勿走 findImageMatch(region)（那是相对偏移拾取）
@@ -3492,10 +4494,10 @@
     return `<div class="inp ${cls}" contenteditable="true" data-k="${esc(key)}">${esc(val)}</div>`;
   }
 
-  function area3rowHtml(key, val) {
+  function area3rowHtml(key, val, extra) {
     return `<div class="fline"><div class="inp ed-area fixed-3row" contenteditable="true" data-k="${esc(
       key
-    )}">${esc(val || "")}</div></div>`;
+    )}"${extra || ""}>${esc(val || "")}</div></div>`;
   }
 
   /** X:[主=剩余区φ] ±随机:[占同行剩余]；与变量表达式主框同宽 */
@@ -3525,10 +4527,10 @@
     return `<div class="combo ed-full" data-k="${esc(key)}">${esc(text)}</div>`;
   }
 
-  function chkLabeled(key, label, on) {
-    return `<span class="chk ${on ? "on" : ""}" data-k="${esc(key)}"><i></i><span class="chk-lab">${esc(
-      label
-    )}</span></span>`;
+  function chkLabeled(key, label, on, extraAttrs) {
+    return `<span class="chk ${on ? "on" : ""}" data-k="${esc(key)}"${
+      extraAttrs || ""
+    }><i></i><span class="chk-lab">${esc(label)}</span></span>`;
   }
 
   function modBlock(a) {
@@ -3561,33 +4563,133 @@
     );
   }
 
-  function findImageModuleHtml(a, mode) {
+  function attrPath(p) {
+    return esc(String(p || "").replace(/\\/g, "/"));
+  }
+
+  function mmUseVarAt(a, slot) {
+    const vars = Array.isArray(a && a.imageUseVars) ? a.imageUseVars : [];
+    if (slot >= 0 && slot < vars.length) return !!(vars[slot] | 0);
+    return slot === 0 && !!(a && a.imageUseVar);
+  }
+
+  function mmPathAt(a, slot) {
+    const paths = Array.isArray(a && a.imagePaths) ? a.imagePaths : [];
+    if (slot >= 0 && slot < paths.length) return String(paths[slot] || "");
+    if (slot === 0) return String((a && a.imagePath) || "");
+    return "";
+  }
+
+  function mmSetPath(a, slot, path) {
+    if (!a) return;
+    if (!Array.isArray(a.imagePaths)) a.imagePaths = [];
+    if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+    while (a.imagePaths.length <= slot) a.imagePaths.push("");
+    while (a.imageUseVars.length < a.imagePaths.length) a.imageUseVars.push(0);
+    a.imagePaths[slot] = String(path || "");
+    if (slot === 0) a.imagePath = a.imagePaths[0] || "";
+  }
+
+  function mmSetUseVar(a, slot, on) {
+    if (!a) return;
+    if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+    if (!Array.isArray(a.imagePaths)) a.imagePaths = [];
+    while (a.imageUseVars.length <= slot) a.imageUseVars.push(0);
+    while (a.imagePaths.length < a.imageUseVars.length) a.imagePaths.push("");
+    a.imageUseVars[slot] = on ? 1 : 0;
+    if (slot === 0) a.imageUseVar = on ? 1 : 0;
+  }
+
+  function mmDisplayCount(a) {
+    if (!a) return 1;
+    if ((a.multiMatchMode | 0) === 1) return 1;
+    const n = a._mmCount | 0;
+    const paths = Array.isArray(a.imagePaths) ? a.imagePaths.length : 0;
+    const c = n > 0 ? n : Math.max(1, paths);
+    return Math.max(1, Math.min(8, c));
+  }
+
+  function mmNormalizeForSave(a) {
+    if (!a || a.type !== "multiMatch") return a;
+    if (!Array.isArray(a.imagePaths)) a.imagePaths = a.imagePath ? [String(a.imagePath)] : [];
+    if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+    const paths = [];
+    const vars = [];
+    const n = Math.max(a.imagePaths.length, a.imageUseVars.length);
+    for (let i = 0; i < n; i++) {
+      const p = String(a.imagePaths[i] || "").trim();
+      if (!p) continue;
+      paths.push(p);
+      vars.push(mmUseVarAt(a, i) ? 1 : 0);
+    }
+    a.imagePaths = paths;
+    a.imageUseVars = vars;
+    a.imagePath = paths[0] || "";
+    a.imageUseVar = vars[0] ? 1 : 0;
+    delete a._mmCount;
+    return a;
+  }
+
+  function mmSlotFromEl(el) {
+    const host = el && el.closest ? el.closest("[data-mm-slot]") : null;
+    if (!host) return -1;
+    const n = parseInt(host.dataset.mmSlot, 10);
+    return Number.isFinite(n) ? n : -1;
+  }
+
+  function applyMmImagePath(a, path, slot) {
+    const p = String(path || "").trim();
+    if (!a || !p) return false;
+    const i = Number.isInteger(slot) && slot >= 0 ? slot : 0;
+    mmSetPath(a, i, p);
+    return true;
+  }
+
+  function findImageModuleHtml(a, mode, opts) {
+    opts = opts || {};
     const isAi = mode === "ai";
     const isOcr = mode === "ocr";
-    const useVarKey = isAi ? "aiImageUseVar" : "imageUseVar";
-    const useVar = !!(isAi ? a.aiImageUseVar : a.imageUseVar);
-    const path = isAi ? a.aiTargetImagePath || "" : a.imagePath || "";
+    const isMm = Number.isInteger(opts.slot);
+    const slot = isMm ? opts.slot : -1;
+    const useVarKey = isMm ? "_mmUseVar" : isAi ? "aiImageUseVar" : "imageUseVar";
+    const useVar = isMm
+      ? mmUseVarAt(a, slot)
+      : !!(isAi ? a.aiImageUseVar : a.imageUseVar);
+    const path = isMm
+      ? mmPathAt(a, slot)
+      : isAi
+        ? a.aiTargetImagePath || ""
+        : a.imagePath || "";
     const previewInner =
       !useVar && path
-        ? `<img class="fi-thumb" alt="" data-img-path="${esc(path)}" src="" />`
+        ? `<img class="fi-thumb" alt="" data-img-path="${attrPath(path)}" src="" />`
         : useVar
           ? `<span class="fi-empty">变量模式</span>`
           : "";
-    const varChk = chkLabeled(useVarKey, "变量", useVar);
-    // 仅找图动作顶栏带「测试」；OCR/AI 无此按钮（OCR 底部另有测试）
+    const varChk = chkLabeled(
+      useVarKey,
+      "变量",
+      useVar,
+      isMm ? ` data-mm-slot="${slot}"` : ""
+    );
     const withTest = !isAi && !isOcr;
+    const countCombo = opts.showCount
+      ? `<div class="combo find-mod-count" data-k="_mmCount">${esc(String(opts.countValue || 1))}</div>`
+      : "";
+    const lab = opts.label || "要查找的图";
     const topRow = withTest
       ? `<div class="find-mod-top find-mod-top--with-test">
           <div class="find-mod-top-main">
-            <span class="find-mod-lab">要查找的图</span>
+            <span class="find-mod-lab">${esc(lab)}</span>
             <span class="find-mod-var">${varChk}</span>
+            ${countCombo}
           </div>
           <button type="button" class="btn ghost sm" data-fi="test"${
             useVar ? " disabled" : ""
           }>测试</button>
         </div>`
       : `<div class="find-mod-top find-mod-top--no-test">
-          <span class="find-mod-lab">要查找的图</span>
+          <span class="find-mod-lab">${esc(lab)}</span>
           <span class="find-mod-var">${varChk}</span>
         </div>`;
     const dis = useVar ? " disabled" : "";
@@ -3598,7 +4700,8 @@
       : `<button type="button" class="btn ghost find-btn" data-fi="screen"${dis}>屏幕截图</button>
         <button type="button" class="btn ghost find-btn" data-fi="pick"${dis}>本地图片</button>
         <button type="button" class="btn ghost find-btn" data-fi="clear">清除图片</button>`;
-    return `<div class="find-mod">
+    const slotAttr = isMm ? ` data-mm-slot="${slot}"` : "";
+    return `<div class="find-mod"${slotAttr}>
       ${topRow}
       <div class="find-mod-grid">
         <div class="fm-preview" data-fi="${isAi ? "aiCrop" : "crop"}">${previewInner}</div>
@@ -3623,10 +4726,19 @@
   }
 
   /** 变量模式下：「变量/路径」整排输入（在范围上方） */
-  function findImageVarPathHtml(a, mode) {
+  function findImageVarPathHtml(a, mode, slot) {
     const isAi = mode === "ai";
-    const useVar = !!(isAi ? a.aiImageUseVar : a.imageUseVar);
+    const isMm = Number.isInteger(slot);
+    const useVar = isMm
+      ? mmUseVarAt(a, slot)
+      : !!(isAi ? a.aiImageUseVar : a.imageUseVar);
     if (!useVar) return "";
+    if (isMm) {
+      return (
+        labOnly("变量/路径") +
+        area3rowHtml("_mmPath", mmPathAt(a, slot), ` data-mm-slot="${slot}"`)
+      );
+    }
     const key = isAi ? "aiTargetImagePath" : "imagePath";
     const val = isAi ? a.aiTargetImagePath || "" : a.imagePath || "";
     return labOnly("变量/路径") + area3rowHtml(key, val);
@@ -3648,6 +4760,81 @@
     return fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
   }
 
+  function usesImageLocateOffsetPick(a) {
+    return !!(
+      a &&
+      a.imageLocate &&
+      (a.type === "mouseDrag" || a.type === "getColor" || a.type === "colorMatch")
+    );
+  }
+
+  function imageLocateSearchRegionHtml(a, regionLab) {
+    if (editorUsesWindowTarget()) {
+      return windowModeWholeWindowHint(false);
+    }
+    ensureFullScreenCoordsVisible(a);
+    const lab = regionLab || "搜索区域";
+    return (
+      `<div class="fline"><span class="tl grow-lab">${esc(lab)}</span><div class="inline-btns">
+        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
+        <button type="button" class="btn ghost sm" data-fi="absRegion">选取区域</button>
+      </div></div>` +
+      flineXy(
+        "X1",
+        inpField("searchX1", a.searchX1 ?? 0),
+        "Y1",
+        inpField("searchY1", a.searchY1 ?? 0)
+      ) +
+      flineXy(
+        "X2",
+        inpField("searchX2", a.searchX2 ?? 0),
+        "Y2",
+        inpField("searchY2", a.searchY2 ?? 0)
+      )
+    );
+  }
+
+  function findImageAbsRegionHtml(a, regionLab) {
+    if (editorUsesWindowTarget()) {
+      return windowModeWholeWindowHint(false);
+    }
+    ensureFullScreenCoordsVisible(a);
+    const lab = regionLab || "找图区域";
+    return (
+      `<div class="fline"><span class="tl grow-lab">${esc(lab)}</span><div class="inline-btns">
+        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
+        <button type="button" class="btn ghost sm" data-fi="absRegion">选取区域</button>
+      </div></div>` +
+      flineXy(
+        "X1",
+        inpField("searchX1", a.searchX1 ?? 0),
+        "Y1",
+        inpField("searchY1", a.searchY1 ?? 0)
+      ) +
+      flineXy(
+        "X2",
+        inpField("searchX2", a.searchX2 ?? 0),
+        "Y2",
+        inpField("searchY2", a.searchY2 ?? 0)
+      )
+    );
+  }
+
+  function imageLocateTemplateHtml(a, hint) {
+    let html = findImageModuleHtml(a);
+    html += findImageVarPathHtml(a);
+    html += matchThresholdRowHtml(a);
+    html += flineXy(
+      "最小",
+      inpField("imageScaleMin", a.imageScaleMin ?? 1),
+      "最大",
+      inpField("imageScaleMax", a.imageScaleMax ?? 1)
+    );
+    html += fline("时间", inpField("findTimeExpr", a.findTimeExpr || "0"));
+    if (hint) html += `<p class="hint">${hint}</p>`;
+    return html;
+  }
+
   function looksLikeFilePath(s) {
     const t = String(s || "").trim();
     if (!t) return false;
@@ -3656,6 +4843,19 @@
       return true;
     }
     return false;
+  }
+
+  /** 推断变量图锚框时扫描到哪里（不含当前正在编辑的消费步）。新增预览会把选中的上一步算进去。 */
+  function imageVarAnchorBeforeIndex() {
+    const acts = state.editorActions || [];
+    const sel = Number.isInteger(state.actionSel) ? state.actionSel : -1;
+    const cur = editorParamAction();
+    if (cur && cur._preview) {
+      if (sel >= 0) return Math.min(acts.length, sel + 1);
+      return acts.length;
+    }
+    if (sel < 0) return acts.length;
+    return Math.min(acts.length, sel);
   }
 
   /** 编辑期推断图片变量锚框尺寸（用于合成选区）。找不到则返回 null。 */
@@ -3667,18 +4867,19 @@
       return { w: 0, h: 0, pathOnly: true };
     }
     const acts = state.editorActions || [];
-    const end = Math.min(acts.length, Math.max(0, beforeIndex));
+    const end =
+      beforeIndex == null ? imageVarAnchorBeforeIndex() : Math.min(acts.length, Math.max(0, beforeIndex));
     for (let i = end - 1; i >= 0; --i) {
       const p = acts[i];
-      if (!p || p.type !== "findImage" || (p.findImageFollowUp | 0) !== 3) continue;
+      if (!p || p._preview || p.type !== "findImage" || (p.findImageFollowUp | 0) !== 3) continue;
       const vn = String(p.matchVarName || "image").trim() || "image";
       if (vn !== name) continue;
       const hasTpl = findImageHasTemplate(p);
       if (!hasTpl) {
         const w = Math.abs((p.searchX2 | 0) - (p.searchX1 | 0));
         const h = Math.abs((p.searchY2 | 0) - (p.searchY1 | 0));
-        if (w >= 8 && h >= 8) return { w, h };
-        continue;
+        if ((p.searchFullScreen | 0) === 1 || w < 8 || h < 8) return { useScreen: true };
+        return { w, h };
       }
       const rx1 = p.imageRegionX1 | 0;
       const ry1 = p.imageRegionY1 | 0;
@@ -3693,75 +4894,146 @@
     return null;
   }
 
-  function buildEditorVarItems() {
-    const items = [];
-    const seen = new Set();
-    const push = (code, tip) => {
-      const c = String(code || "").trim();
-      if (!c || seen.has(c)) return;
-      seen.add(c);
-      items.push({ t: c, v: c, code: c, insert: "{" + c + "}", d: tip || "" });
-    };
-    (state.editorActions || []).forEach((a) => {
-      if (!a || a._preview) return;
-      const t = a.type || "";
-      if (t === "findImage") {
-        const fu = a.findImageFollowUp | 0;
-        if (fu === 3) {
-          const n = (a.matchVarName || "image").trim() || "image";
-          if (!n.includes("\\") && !n.includes("/") && !(n.length >= 2 && n[1] === ":")) {
-            push(n, "图片变量");
-          }
-        } else {
-          const n = (a.matchVarName || "matchRet").trim() || "matchRet";
-          push(n + ".matchData", "找图匹配度");
-          push(n + ".x", "找图左上角 X");
-          push(n + ".y", "找图左上角 Y");
-          push(n + ".x1", "找图右下角 X");
-          push(n + ".y1", "找图右下角 Y");
-        }
-      } else if (t === "textRecognition") {
-        const n = (a.matchVarName || "a").trim() || "a";
-        push(n, "OCR 结果");
-        push(n + ".x", "OCR 区域 X");
-        push(n + ".y", "OCR 区域 Y");
-      } else if (t === "loop") {
-        const n = (a.loopVarName || "").trim();
-        if (n) push(n, "循环计数");
-      } else if (t === "getCursorPos") {
-        const n = (a.matchVarName || "a").trim() || "a";
-        push(n + ".x", "光标 X");
-        push(n + ".y", "光标 Y");
-      } else if (t === "timerRecordTime") {
-        const n = (a.loopVarName || a.matchVarName || "t").trim() || "t";
-        push(n, "计时秒数");
-      } else if (
-        t === "aiTextAnalysis" ||
-        t === "aiImageAnalysis" ||
-        t === "aiActionExecute"
-      ) {
-        const n = (a.aiOutputVarName || "aiResult").trim() || "aiResult";
-        push(n, "AI 输出");
-      }
-    });
-    // 固定变量：无论脚本是否添加了动作，始终可用
-    const fixed = [
+  // ⚠ 原先这里还有一个 JS 版 `collectVarComputeReturnNames`（解析 `return a, b` 取变量名）。
+  //   变量清单已统一由引擎算（C++ 的 `CollectVarComputeReturnNames` 在 BuildQuickInputVarItems
+  //   里用它），JS 这份成了第二事实来源 ⇒ 已删。要加新规则请改 C++ 那份。
+
+  function startSyntheticAnchorOverlay(mode, imagePath) {
+    if (!window.qst) {
+      toast("无桥接");
+      return false;
+    }
+    const path = String(imagePath || "").trim();
+    const size = inferImageVarAnchorSize(path);
+    const opts = { mode };
+    if (size && size.useScreen) {
+      opts.syntheticUseScreen = 1;
+      opts.syntheticW = 0;
+      opts.syntheticH = 0;
+    } else if (size && size.pathOnly) {
+      opts.imagePath = size.path || path;
+      opts.syntheticW = 0;
+      opts.syntheticH = 0;
+    } else if (size) {
+      opts.syntheticW = size.w;
+      opts.syntheticH = size.h;
+    } else if (looksLikeFilePath(path)) {
+      opts.imagePath = path;
+      opts.syntheticW = 0;
+      opts.syntheticH = 0;
+    } else {
+      toast(
+        mode === "offsetBySize"
+          ? "无法推断变量图尺寸，无法在屏幕中心画出锚框。请先用「保存图片」生成该变量，或在变量/路径填磁盘图片。"
+          : "无法推断图片尺寸，请手填相对区域坐标"
+      );
+      return false;
+    }
+    qst.findImageMatch(opts);
+    return true;
+  }
+
+  /**
+   * 编辑器变量清单 —— **规则只有一份，在 C++**（`BuildQuickInputVarItems`）。
+   *
+   * 为什么改成这样（2026-09-30）：这里原先另抄了一份「哪种动作产出哪些变量」的规则，
+   * 两份必然漂移 —— 实测找图漏 `.cx/.cy`、C++ 那份漏 `aiActionExecute`、颜色动作两边都漏。
+   * 现在把动作原样发给引擎（`qst.editorVarItems`），用**构建宏时的同一份实现**算清单。
+   *
+   * ⚠ 拿不到引擎清单时（演示版 bridge.stub / 首次渲染 / 桥接失败）**只显示固定变量**：
+   *   宁可少显示，也不要在 JS 里再猜一份 —— 猜的那份就是漂移的来源。
+   */
+  function fixedEditorVarItems() {
+    return [
       ["ctrl:CurLoops()", "宏运行次数：当前宏从头执行的第几次（固定变量）"],
       ["ctrl:Random()", "随机变量：每次引用随机取 1~100 的整数（固定变量）"],
       ["ctrl:Hour()", "当前小时：本地时 0–23（固定变量）"],
       ["ctrl:Minute()", "当前分钟：本地时 0–59（固定变量）"],
       ["ctrl:Clipboard()", "剪贴板：条件里有内容为1否则0；输入展开文字或全部文件路径；AI图片分析/动作可附图（固定变量）"],
-    ];
-    fixed.forEach(([code, tip]) => push(code, tip));
-    if (!items.length) {
+    ].map(([code, tip]) => ({
+      t: code,
+      v: code,
+      code,
+      insert: "{" + code + "}",
+      d: tip,
+    }));
+  }
+
+  /** 引擎清单（+ 固定变量）→ 下拉项；**不含** C++ 之外的任何「猜」规则。 */
+  function editorVarItemsRaw() {
+    const fromEngine = Array.isArray(state.editorVarItemsFromEngine)
+      ? state.editorVarItemsFromEngine
+      : [];
+    const merged = fromEngine.concat(fixedEditorVarItems());
+    const items = [];
+    const seen = new Set();
+    merged.forEach((it) => {
+      const code = String((it && it.code) || "").trim();
+      if (!code || seen.has(code)) return;
+      seen.add(code);
       items.push({
+        t: code,
+        v: code,
+        code,
+        insert: (it && it.insert) || "{" + code + "}",
+        d: (it && (it.d || it.tip)) || "",
+      });
+    });
+    return items;
+  }
+
+  /** 拉一份最新清单（异步）。桥不可用/超时/失败 ⇒ 保留现有缓存（至少固定变量还在）。 */
+  function fetchEditorVarItems() {
+    return new Promise((resolve) => {
+      const local = buildEditorVarItems();
+      if (!window.qst || typeof qst.editorVarItems !== "function") {
+        resolve(local);
+        return;
+      }
+      const actions = (state.editorActions || []).filter((x) => x && !x._preview);
+      const reqId = "vars-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+      if (!state._varItemsWaiters) state._varItemsWaiters = {};
+      const timer = setTimeout(() => {
+        if (state._varItemsWaiters && state._varItemsWaiters[reqId]) {
+          delete state._varItemsWaiters[reqId];
+          resolve(local);
+        }
+      }, 5000);
+      state._varItemsWaiters[reqId] = (msg) => {
+        clearTimeout(timer);
+        if (msg && msg.ok && Array.isArray(msg.items)) {
+          state.editorVarItemsFromEngine = msg.items;
+          resolve(buildEditorVarItems());
+        } else {
+          resolve(local);
+        }
+      };
+      qst.editorVarItems(actions, reqId);
+    });
+  }
+
+  function buildEditorVarItems() {
+    const items = editorVarItemsRaw();
+    const other = (state.settings && state.settings.other) || {};
+    const hideFixed = otherFlag(other, "editorHideFixedVars", false);
+    const hideCoord = otherFlag(other, "editorHideCoordVars", false);
+    const placeholderOnly = otherFlag(other, "editorMultiResultPlaceholderOnly", false);
+    const filtered = items.filter((it) => {
+      const c = it.code || "";
+      if (hideFixed && /^ctrl:/.test(c)) return false;
+      if (hideCoord && /\.(x|y|x1|y1|cx|cy)$/.test(c)) return false;
+      if (placeholderOnly && /\[[0-9]+\]/.test(c)) return false;
+      return true;
+    });
+    if (!filtered.length) {
+      filtered.push({
         t: "（暂无可用变量）",
         v: "",
         code: "",
-        d: "固定变量已内置：宏次数/随机/时分/剪贴板",
+        d: hideFixed ? "当前设置隐藏了固定变量" : "固定变量已内置：宏次数/随机/时分/剪贴板",
       });
     }
-    return items;
+    return filtered;
   }
 
   function requestFindImageThumbs(root) {
@@ -3793,10 +5065,42 @@
     $$("[data-k]", panel).forEach((el) => {
       const k = el.dataset.k;
       if (!k) return;
+      if (k === "watchMode") {
+        const on = el.querySelector ? el.querySelector(".radio.on") : null;
+        action.watchMode = on ? parseInt(on.dataset.v, 10) || 0 : 0;
+        return;
+      }
+      if (k === "multiMatchMode") {
+        const on = el.querySelector ? el.querySelector(".radio.on") : null;
+        action.multiMatchMode = on ? parseInt(on.dataset.v, 10) || 0 : 0;
+        return;
+      }
+      if (k === "_mmCount" || k === "_mmUseVar") return;
+      if (k === "_mmPath") {
+        let pathVal;
+        if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") pathVal = el.value;
+        else if (el.isContentEditable) {
+          pathVal = el.classList.contains("ed-area")
+            ? String(el.innerText != null ? el.innerText : el.textContent || "")
+            : String(el.textContent || "").trim();
+        } else pathVal = String(el.textContent || "").trim();
+        mmSetPath(action, parseInt(el.dataset.mmSlot, 10) || 0, pathVal);
+        return;
+      }
       if (k.startsWith("_if") && k !== "_ifValue") return;
-      let v = (el.textContent || "").trim();
+      let v;
       if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
         v = el.value;
+      } else if (el.isContentEditable) {
+        v = el.classList.contains("ed-area")
+          ? String(el.innerText != null ? el.innerText : el.textContent || "")
+          : String(el.textContent || "").trim();
+      } else {
+        v = String(el.textContent || "").trim();
+      }
+      if (k === "computeCode") {
+        action.computeCode = String(v || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        return;
       }
       if (k === "_ifValue") {
         action._ifValue = v;
@@ -3826,6 +5130,15 @@
           return;
         }
         if (k === "useMode") {
+          // ⚠ 先按**标签精确查表**：`v.includes("窗口")` 认不出「独立桌面模式」(v=1)，
+          //   会把它落到 else ⇒ 被静默改回「默认模式」。下面的子串分支只为兼容旧文案。
+          const exactMode = NESTED_USE_MODES.find(
+            (x) => x.t === String(v || "").trim()
+          );
+          if (exactMode) {
+            action.useMode = exactMode.v;
+            return;
+          }
           if (v.includes("继承")) action.useMode = 3;
           else if (v.includes("后台")) action.useMode = 2;
           else if (v.includes("窗口")) action.useMode = 1;
@@ -3843,10 +5156,21 @@
             else action.findImageFollowUp = 0;
             return;
           }
+          if (action.type === "multiMatch") {
+            if (v.includes("保存") || v.includes("匹配度") || v.includes("全部") || v.includes("变量")) {
+              action.findImageFollowUp = 2;
+            } else if (v.includes("移动")) action.findImageFollowUp = 1;
+            else action.findImageFollowUp = 0;
+            return;
+          }
           if (v.includes("图片")) action.findImageFollowUp = 3;
           else if (v.includes("匹配度") || v.includes("变量")) action.findImageFollowUp = 2;
           else if (v.includes("移动")) action.findImageFollowUp = 1;
           else action.findImageFollowUp = 0;
+          return;
+        }
+        if (k === "multiMatchSort") {
+          action.multiMatchSort = v.includes("匹配度") ? 1 : 0;
           return;
         }
         if (k === "ocrResultMode") {
@@ -3854,9 +5178,13 @@
           return;
         }
         if (k === "ocrFollowUp") {
-          if (v.includes("变量")) action.ocrFollowUp = 2;
-          else if (v.includes("移动")) action.ocrFollowUp = 1;
-          else action.ocrFollowUp = 0;
+          // ⚠ 文案按模式分流（文字查找=「保存匹配度」、获取文字=「保存文字到变量」），所以
+          //   **不能**再写 `v.includes("变量")`：前者不含「变量」，会被判成「点击」——
+          //   用户选了「保存匹配度」，一改别的字段就被静默改回点击。
+          //   查选项表本身（标签的唯一来源），以后改文案也不会漂。
+          const ocrFuAll = ocrFollowUpOptions(true).concat(ocrFollowUpOptions(false));
+          const ocrFuHit = ocrFuAll.find((o) => o.t === String(v || "").trim());
+          action.ocrFollowUp = ocrFuHit ? ocrFuHit.v : 0;
           return;
         }
         if (k === "shortcutPreset") {
@@ -3894,6 +5222,10 @@
           "y",
           "randomX",
           "randomY",
+          "endX",
+          "endY",
+          "randomEndX",
+          "randomEndY",
           "clickCount",
           "keyVk",
           "searchX1",
@@ -3909,6 +5241,9 @@
           "loopCount",
           "scrollSteps",
           "findImageFollowUp",
+          "multiMatchMode",
+          "multiMatchMax",
+          "multiMatchSort",
           "searchFullScreen",
           "aiOutputType",
           "aiContextMode",
@@ -3933,6 +5268,8 @@
           "ocrFollowUp",
           "findUntilFound",
           "matchFileNameOnly",
+          "resumeAfterWatch",
+          "watchMode",
           "holdLeftWin",
           "holdRightWin",
           "holdLeftCtrl",
@@ -3946,6 +5283,7 @@
           "colorR",
           "colorG",
           "colorB",
+          "imageLocate",
         ].includes(k)
       ) {
         action[k] = parseInt(v, 10) || 0;
@@ -3958,6 +5296,7 @@
           "aiImageScale",
           "imageScaleMin",
           "imageScaleMax",
+          "watchPollSeconds",
           "breakoutTimeSeconds",
         ].includes(k)
       ) {
@@ -3967,6 +5306,11 @@
           if (n <= 1) n *= 100;
           if (n < 1) n = 1;
           if (n > 100) n = 100;
+        }
+        if (k === "watchPollSeconds") {
+          if (!(n > 0)) n = 1;
+          if (n < 0.05) n = 0.05;
+          if (n > 3600) n = 3600;
         }
         action[k] = n || 0;
       } else {
@@ -4011,9 +5355,14 @@
       action.imageScaleMin != null &&
       action.imageScaleMax != null &&
       (action.type === "findImage" ||
+        action.type === "watchImage" ||
         action.type === "textRecognition" ||
         action.type === "aiImageAnalysis" ||
-        action.type === "aiActionExecute")
+        action.type === "aiActionExecute" ||
+        action.type === "mouseDrag" ||
+        action.type === "getColor" ||
+        action.type === "findColor" ||
+        action.type === "colorMatch")
     ) {
       const lo = Number(action.imageScaleMin);
       const hi = Number(action.imageScaleMax);
@@ -4081,9 +5430,27 @@
     action.nestedWindowMode = wm;
   }
 
+  /**
+   * 选中「要运行的鼠标宏 / 录制」后，把**调用方**的使用模式对齐到目标脚本自己的模式，
+   * 并把它的窗口绑定预填进 nestedWindowMode（用户可在此基础上再改）。
+   * 返回实际采用/推导出的模式（供调用方提示），失败返回 -1。
+   * ⚠ 模式与目标一致才叫「按目标宏运行」：目标是后台窗口模式 ⇒ 调用方也用后台窗口模式，
+   *   否则嵌套脚本会跑到独立桌面/默认模式下去，行为与它自己单独跑时不同。
+   */
   function applyTargetScriptUseMode(a, meta) {
-    if (!a || !meta) return;
-    const mode = typeof meta.mode === "number" ? meta.mode | 0 : 0;
+    if (!a || !meta) return -1;
+    // 优先用 C++ 给的 mode；缺字段（老数据/录制）时从 windowMode 现推，
+    // 免得「读到了目标但模式字段没有」被当成默认模式。
+    let mode = typeof meta.mode === "number" ? meta.mode | 0 : -1;
+    if (mode < 0) {
+      const wm0 = meta.windowMode && typeof meta.windowMode === "object" ? meta.windowMode : null;
+      if (wm0 && (wm0.enabled | 0)) {
+        mode = String(wm0.executionKind || "") === "backgroundWindow" ? 2 : 1;
+      } else {
+        mode = 0;
+      }
+    }
+    if (mode !== 1 && mode !== 2) mode = 0;
     if (mode === 1 || mode === 2) {
       a.useMode = mode;
       const src = meta.windowMode && typeof meta.windowMode === "object" ? meta.windowMode : {};
@@ -4111,6 +5478,25 @@
         a.breakoutTimeSeconds = Number.isFinite(n) && n > 0 ? n : 0;
       }
     }
+    return mode;
+  }
+
+  /** 选中目标宏/录制后的统一收尾：对齐模式 + 如实提示 + 重画面板 */
+  function afterPickTargetScript(a, msg) {
+    if (msg && msg.ok) {
+      const mode = applyTargetScriptUseMode(a, msg);
+      if (mode >= 0) {
+        toast("已按目标宏切换使用模式：" + nestedUseModeLabel(mode) + "（可再改）");
+      } else {
+        // 理论上到不了（meta 非空）；真到了就**别说**切了，否则提示本身在撒谎
+        toast("读不到目标宏的模式，使用模式保持不变");
+      }
+    } else {
+      // 读不到目标脚本头就不能猜模式：**保持原样**并说明，
+      // 免得用户以为「模式自己变回默认了」（这正是改这一处的起因）。
+      toast((msg && msg.detail) || "读不到目标宏的模式，使用模式保持不变");
+    }
+    renderParamPanel(a);
   }
 
   function nestedUseModeHtml(a) {
@@ -4168,11 +5554,31 @@
     return `<div class="chk ${on ? "on" : ""}" data-k="${esc(key)}"><i>✓</i></div>`;
   }
 
+  /**
+   * 文字识别的「后续操作」选项。
+   * ★两种模式的 followUp=2 **存的不是同一样东西**，所以文案必须按模式分流：
+   *   获取文字 → 存识别到的文字；文字查找 → 存**匹配度**（{变量}.matchData，0~100）。
+   * ⚠ 渲染与下拉弹窗都从这里取，别在两处各写一份字面量（写死两句必然漂移）。
+   */
+  function ocrFollowUpOptions(searchMode) {
+    return [
+      { t: "点击", v: 0 },
+      { t: "鼠标移动到", v: 1 },
+      { t: searchMode ? "保存匹配度" : "保存文字到变量", v: 2 },
+    ];
+  }
+
   function renderParamPanel(a) {
     const panel = $("#paramPanel");
     const tag = $("#paramTag");
     if (!panel) return;
+    const nextKey = a
+      ? `${a.type}:${a._preview ? "preview" : String(state.actionSel | 0)}`
+      : "";
+    const keepScroll =
+      a && panel.dataset.paramKey === nextKey ? panel.scrollTop : 0;
     if (!a) {
+      delete panel.dataset.paramKey;
       panel.innerHTML =
         '<div class="panel-empty">在左侧选中一条动作后，在此编辑参数</div>';
       if (tag) tag.textContent = "未选择";
@@ -4219,6 +5625,52 @@
       html += labOnly("同时按住");
       html += modBlock(a);
       if (t === "mouseClick") html += repeatBlock(a);
+      html += `<p class="hint">*默认在鼠标当前位置点击。紧跟找图/OCR「移动到」时会点回找图落点（远程桌面把光标拖走也不例外）。更稳的做法是找图后续直接选「点击」并设循环次数。</p>`;
+      if ((a.x | 0) || (a.y | 0)) {
+        html += `<p class="hint">当前会先移动到 ${a.x | 0},${a.y | 0} 再点击（改动作类型时可能带过来）。找图之后的连点会忽略这些残留坐标。</p>`;
+        html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="clickHere">改为在当前位置点击</button></div>`;
+      }
+    } else if (t === "mouseDrag") {
+      const btnMap = {
+        left: "左键",
+        right: "右键",
+        middle: "中键",
+        x1: "侧键1",
+        x2: "侧键2",
+      };
+      const btnText = btnMap[a.button] || "左键";
+      const locate = !!(a.imageLocate | 0);
+      html += labOnly("选择鼠标键");
+      html += fline("", comboField("button", btnText));
+      html += labOnly("同时按住");
+      html += modBlock(a);
+      html += flineStack(
+        "拖拽时间",
+        inpField("duration", a.duration ?? 0.3) + `<span class="tl">秒</span>`
+      );
+      html += flineStack(
+        "最大随机时间",
+        inpField("randomDuration", a.randomDuration ?? 0) + `<span class="tl">秒</span>`
+      );
+      html += `<p class="hint">*拖拽总时间=拖拽时间+随机(0~最大随机时间)。这是按下到松开的时长，不是点击的重复间隔。</p>`;
+      html += labOnly(locate ? "相对图中心偏移（起点→终点）" : "起点 / 终点");
+      html += flineCoord("起点X:", "x", "randomX", a);
+      html += flineCoord("起点Y:", "y", "randomY", a);
+      html += flineCoord("终点X:", "endX", "randomEndX", a);
+      html += flineCoord("终点Y:", "endY", "randomEndY", a);
+      if (!locate) {
+        html += `<div class="fline"><button type="button" class="btn primary fluid" data-fi="pickDrag">选取拖拽</button></div>`;
+      }
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoord">准星取起点</button></div>`;
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoordEnd">准星取终点</button></div>`;
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateSearchRegionHtml(a, "搜索区域");
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后起点/终点是相对找到的图中心的偏移。请用「准星取起点/终点」在图上选偏移点。未找到则跳过本步拖拽。"
+        );
+      }
     } else if (t === "wait") {
       html += flineStack(
         "等待时间",
@@ -4237,50 +5689,73 @@
       html += modBlock(a);
       if (t === "keyClick") html += repeatBlock(a);
     } else if (t === "getColor") {
+      const locate = !!(a.imageLocate | 0);
+      html += labOnly(locate ? "相对图中心偏移" : "读取位置");
       html += flineXy("X", inpField("x", a.x ?? 0), "Y", inpField("y", a.y ?? 0));
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoord">拖动准星获取坐标</button></div>`;
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateSearchRegionHtml(a, "搜索区域");
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后 X/Y 是相对找到的图中心的偏移。请用准星在图上选偏移点。未找到则跳过本步。"
+        );
+      }
       html += fline("保存到", inpField("matchVarName", a.matchVarName || "colorRet"));
-      html += `<p class="hint">*提示:读取屏幕坐标颜色，写入变量（#RRGGBB）</p>`;
+      html += `<p class="hint">*提示:读取屏幕坐标颜色，写入变量（#RRGGBB）；取点失败写空（不保留上一次的颜色）。</p>`;
     } else if (t === "findColor") {
       const followLabs = ["点击", "鼠标移动到", "保存到变量"];
       const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
-      ensureFullScreenCoordsVisible(a);
+      const locate = !!(a.imageLocate | 0);
       html += fline("目标颜色", inpField("inputText", a.inputText || `#${((a.colorR|0)<<16|(a.colorG|0)<<8|(a.colorB|0)).toString(16).padStart(6,"0")}`));
       html += fline("容差", inpField("colorTolerance", a.colorTolerance ?? 16));
-      html += `<div class="fline"><span class="tl grow-lab">搜索区域</span><div class="inline-btns">
-        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
-        <button type="button" class="btn ghost sm" data-fi="region">选取区域</button>
-      </div></div>`;
-      html += flineXy("X1", inpField("searchX1", a.searchX1 ?? 0), "Y1", inpField("searchY1", a.searchY1 ?? 0));
-      html += flineXy("X2", inpField("searchX2", a.searchX2 ?? 0), "Y2", inpField("searchY2", a.searchY2 ?? 0));
+      html += imageLocateSearchRegionHtml(a, locate ? "找图区域" : "搜索区域");
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后先在区域内找图，再在命中图范围内找色（不是文字识别那种模板内裁切）。未找到图则跳过本步。"
+        );
+      }
       html += fline("后续操作", comboField("findImageFollowUp", followLabs[fu]));
+      if (fu === 0 || fu === 1) {
+        html += flineXy(
+          "X偏",
+          inpField("offsetX", a.offsetX ?? 0),
+          "Y偏",
+          inpField("offsetY", a.offsetY ?? 0)
+        );
+      }
+      if (fu === 0) {
+        html += repeatBlock(a);
+        html += `<p class="hint">循环次数是在找到的颜色位置重复点击。</p>`;
+      }
       html += fline("变量名", inpField("matchVarName", a.matchVarName || "colorRet"));
+      html += `<p class="hint">*点击/移动到找到的颜色位置；保存到变量只写入结果、不点不移。三种后续都会写入变量：{变量}=命中点实际颜色(#RRGGBB)，未命中/失败写空；{变量}.matchData=匹配度(0~100，未命中 0)；{变量}.x/.y=命中点坐标。找色没有「保存图片」。</p>`;
     } else if (t === "colorMatch") {
+      const locate = !!(a.imageLocate | 0);
+      html += labOnly(locate ? "相对图中心偏移" : "读取位置");
       html += flineXy("X", inpField("x", a.x ?? 0), "Y", inpField("y", a.y ?? 0));
+      html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="pickCoord">拖动准星获取坐标</button></div>`;
+      html += `<div class="fline wrap">${chkLabeled("imageLocate", "找图定位", locate)}</div>`;
+      if (locate) {
+        html += imageLocateSearchRegionHtml(a, "搜索区域");
+        html += imageLocateTemplateHtml(
+          a,
+          "*勾选后 X/Y 是相对找到的图中心的偏移。请用准星在图上选偏移点。未找到则跳过本步。"
+        );
+      }
       html += fline("目标颜色", inpField("inputText", a.inputText || `#${((a.colorR|0)<<16|(a.colorG|0)<<8|(a.colorB|0)).toString(16).padStart(6,"0")}`));
       html += fline("容差", inpField("colorTolerance", a.colorTolerance ?? 16));
       html += fline("变量名", inpField("matchVarName", a.matchVarName || "colorRet"));
+      // 这里存的是「该点实际颜色」，**不是**是否匹配 —— 判断匹配请用 {变量}.matchData
+      html += `<p class="hint">*{变量}=该点实际颜色(#RRGGBB)；{变量}.matchData=匹配度(0~100，未匹配为 0)；{变量}.x/.y=坐标。取点失败时两者都写空/0（不保留上一次）。</p>`;
     } else if (t === "findImage") {
       const followLabs = ["点击", "鼠标移动到", "保存匹配度", "保存图片"];
       const fu = Math.min(3, Math.max(0, a.findImageFollowUp | 0));
       const hasTpl = findImageHasTemplate(a);
       const regionLab = fu === 3 && !hasTpl ? "截图区域" : "找图区域";
-      ensureFullScreenCoordsVisible(a);
-      html += `<div class="fline"><span class="tl grow-lab">${esc(regionLab)}</span><div class="inline-btns">
-        <button type="button" class="btn ghost sm" data-fi="full">全图</button>
-        <button type="button" class="btn ghost sm" data-fi="region">选取区域</button>
-      </div></div>`;
-      html += flineXy(
-        "X1",
-        inpField("searchX1", a.searchX1 ?? 0),
-        "Y1",
-        inpField("searchY1", a.searchY1 ?? 0)
-      );
-      html += flineXy(
-        "X2",
-        inpField("searchX2", a.searchX2 ?? 0),
-        "Y2",
-        inpField("searchY2", a.searchY2 ?? 0)
-      );
+      html += findImageAbsRegionHtml(a, regionLab);
       html += findImageModuleHtml(a);
       html += findImageVarPathHtml(a);
       html += matchThresholdRowHtml(a);
@@ -4299,6 +5774,9 @@
           "匹配度保存到",
           inpField("matchVarName", a.matchVarName || "matchRet")
         );
+        // 找图变量是「属性型」：{变量} 本身解析不到，能用的是这些属性。
+        // 别写成「{变量}=是否找到(0/1)」—— 那是多图匹配的 {变量[0]} 才有的事。
+        html += `<p class="hint">*{变量}.matchData=匹配度(0~100)；{变量}.x/.y=左上角坐标；{变量}.x1/.y1=右下角坐标；{变量}.cx/.cy=中心坐标。</p>`;
       } else if (fu === 3) {
         const saveImg =
           !a.matchVarName || a.matchVarName === "matchRet" ? "image" : a.matchVarName;
@@ -4313,8 +5791,120 @@
           inpField("offsetY", a.offsetY ?? 0)
         );
         html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="offset">选择偏移点击位置</button></div>`;
+        if (fu === 0) {
+          html += repeatBlock(a);
+          html += `<p class="hint">循环次数是在找图落点（含偏移）重复点击，不必再加「鼠标点击」。默认模式会先激活落点窗口并用绝对坐标点下去；游戏不在前台时请先点进游戏，或改用后台窗口模式。</p>`;
+        }
       }
       if (findImageShowsFindTime(a)) html += findImageTimeRowHtml(a);
+    } else if (t === "multiMatch") {
+      const mode = (a.multiMatchMode | 0) === 1 ? 1 : 0;
+      const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
+      const followLabs =
+        mode === 1 ? ["依次点击", "移动到第一处", "保存全部"] : ["点击", "鼠标移动到", "保存匹配度"];
+      const sortLabs = ["从左到右", "匹配度高到低"];
+      if (!Array.isArray(a.imagePaths)) a.imagePaths = a.imagePath ? [a.imagePath] : [];
+      if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+      while (a.imageUseVars.length < a.imagePaths.length) a.imageUseVars.push(0);
+      const slotN = mmDisplayCount(a);
+      a._mmCount = slotN;
+      ensureFullScreenCoordsVisible(a);
+      html += `<div class="fline wrap"><span class="tl grow-lab">匹配方式</span><div class="radios" data-k="multiMatchMode">
+        <span class="radio${mode === 0 ? " on" : ""}" data-v="0"><i></i>多图择一</span>
+        <span class="radio${mode === 1 ? " on" : ""}" data-v="1"><i></i>一图多处</span>
+      </div></div>`;
+      html += `<p class="hint">${
+        mode === 1
+          ? "只用下面这一张图，同一帧找出多处（最多 20）。切模式不会删图。"
+          : "按从上到下顺序找，第一张过阈值就停。右边数字是同时展示几张找图。切模式不会删图。"
+      }</p>`;
+      html += findImageAbsRegionHtml(a, "找图区域");
+      for (let si = 0; si < slotN; si++) {
+        html += findImageModuleHtml(a, "", {
+          slot: si,
+          showCount: mode === 0 && si === 0,
+          countValue: slotN,
+          label: mode === 0 && slotN > 1 ? "要查找的图 " + (si + 1) : "要查找的图",
+        });
+        html += findImageVarPathHtml(a, "", si);
+      }
+      html += matchThresholdRowHtml(a);
+      html += flineXy(
+        "最小",
+        inpField("imageScaleMin", a.imageScaleMin ?? 1),
+        "最大",
+        inpField("imageScaleMax", a.imageScaleMax ?? 1)
+      );
+      if (mode === 1) {
+        html += fline("最多处数", inpField("multiMatchMax", a.multiMatchMax ?? 20));
+        html += fline("排序", comboField("multiMatchSort", sortLabs[(a.multiMatchSort | 0) === 1 ? 1 : 0]));
+      }
+      html += fline("后续操作", comboField("findImageFollowUp", followLabs[fu]));
+      if (fu === 2) {
+        html += flineStack("匹配度保存到", inpField("matchVarName", a.matchVarName || "matchRet"));
+        html += `<p class="hint">用 matchRet[0].x 取第一处左上角 X；matchRet.count 是命中个数。</p>`;
+      } else {
+        html += flineXy(
+          "X偏",
+          inpField("offsetX", a.offsetX ?? 0),
+          "Y偏",
+          inpField("offsetY", a.offsetY ?? 0)
+        );
+        html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="offset">选择偏移点击位置</button></div>`;
+        if (fu === 0 && mode !== 1) {
+          html += repeatBlock(a);
+          html += `<p class="hint">循环次数是在命中落点重复点击。</p>`;
+        }
+        if (mode === 1 && fu === 0) {
+          html += fline(
+            "点击间隔",
+            inpField("duration", a.duration ?? 0.05) + `<span class="tl">秒</span>`
+          );
+          html += fline(
+            "随机间隔",
+            inpField("randomDuration", a.randomDuration ?? 0) + `<span class="tl">秒</span>`
+          );
+          html += `<p class="hint">多处依次点击之间的间隔，不是等待找图的时间。</p>`;
+        }
+      }
+      html += fline(
+        "时间",
+        inpField("findTimeExpr", a.findTimeExpr || "0") + `<span class="tl">秒</span>`
+      );
+      html += `<p class="hint">等到至少一处后再继续；0=只找一次，与找图相同。</p>`;
+    } else if (t === "watchImage") {
+      html += findImageAbsRegionHtml(a, "监视区域");
+      html += findImageModuleHtml(a);
+      html += findImageVarPathHtml(a);
+      html += matchThresholdRowHtml(a);
+      html += flineXy(
+        "最小",
+        inpField("imageScaleMin", a.imageScaleMin ?? 1),
+        "最大",
+        inpField("imageScaleMax", a.imageScaleMax ?? 1)
+      );
+      html += `<div class="fline wrap">${chkLabeled(
+        "resumeAfterWatch",
+        "中断后从原处继续执行",
+        a.resumeAfterWatch == null ? true : !!a.resumeAfterWatch
+      )}</div>`;
+      const watchMode = (a.watchMode | 0) !== 0 ? 1 : 0;
+      html += `<div class="fline wrap"><span class="tl grow-lab">监视方式</span><div class="radios" data-k="watchMode">
+        <span class="radio${watchMode === 0 ? " on" : ""}" data-v="0"><i></i>动作监视</span>
+        <span class="radio${watchMode === 1 ? " on" : ""}" data-v="1"><i></i>时间监视</span>
+      </div></div>`;
+      html += `<div${watchMode === 1 ? "" : " hidden"} data-watch-poll-row>${flineStack(
+        "轮询间隔",
+        inpField("watchPollSeconds", a.watchPollSeconds == null ? 1 : a.watchPollSeconds) +
+          `<span class="tl">秒</span>`
+      )}</div>`;
+      html += `<p class="hint">*主流程不执行本动作。动作监视：任意找图等待时顺带搜监视用图。时间监视：每隔指定秒数搜索一次。命中后跑子动作；子树里若执行了跳转则以跳转为准。</p>`;
+    } else if (t === "varCompute") {
+      html += labOnly("运算代码");
+      html += `<div class="fline"><textarea class="inp ed-area ed-code" data-k="computeCode" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" placeholder="int a = 2&#10;return a">${esc(
+        a.computeCode || ""
+      )}</textarea></div>`;
+      html += `<p class="hint">*类 C：int/double/string、if/else、for/while。字符串用 "+" 或 '+'（裸写 + 是加法）。split(s, "/") 按你写的分隔符拆成数组，用 parts[0]、parts.count（可负下标）。replace(s,"a","b") 替换文本；numbers(s) 抠出文本里所有数字（数组，解析 OCR 结果优先用它——识别引擎换版本后括号/百分号可能是全角，split(hp,"(") 会拆不开，取 [1] 就报「下标越界」）。<b>比较注意类型</b>：split 出来的是字符串，<code>a[0] &lt;= 60</code> 走字典序（"9.5" 会被判为大于 "60"），要数值比较请用 numbers()/toInt() 转成数字。toInt("123") 转数字，toString(x) 转文字，trim(s) 去首尾空格。行末可省略分号。局部变量默认销毁；末尾 return a, b 导出。ctrl:Clipboard() 为文本或文件路径，不是 0/1。</p>`;
     } else if (t === "quickInput") {
       const parseOn = a.parseEscapes == null ? false : !!a.parseEscapes;
       html += `<div class="fline"><span class="tl">要输入的文字</span>${chkLabeled(
@@ -4403,18 +5993,21 @@
       const ocrMode = searchMode ? "文字查找" : "获取文字";
       html += fline("结果处理", comboField("ocrResultMode", ocrMode));
       if (searchMode) {
-        html += fline(
+        // 标签单独一排；「查找文字输入框 + 插入变量」占下一整排。
+        // ⚠ 别再改回 fline("查找文字", rowHtml)：两者挤在标签同一行时，窄侧栏下
+        //   输入框被压出面板、插入变量按钮被裁掉（用户截图报障的那一处）。
+        html += flineStack(
           "查找文字",
-          `<div class="row" style="gap:6px;flex:1;min-width:0">${inpField(
+          `<div class="ocr-search-row">${inpField(
             "ocrSearchText",
             a.ocrSearchText || "",
-            120
+            "full"
           )}<button type="button" class="btn ghost sm" data-fi="insertVar" data-target="ocrSearchText">插入变量</button></div>`
         );
       }
-      const ocrFuLabs = ["点击", "鼠标移动到", "保存到变量"];
+      const ocrFuOpts = ocrFollowUpOptions(searchMode);
       const ofu = Math.min(2, Math.max(0, a.ocrFollowUp | 0));
-      html += fline("后续操作", comboField("ocrFollowUp", ocrFuLabs[ofu]));
+      html += fline("后续操作", comboField("ocrFollowUp", ocrFuOpts[ofu].t));
       if (searchMode) {
         html += `<div class="fline wrap">${chkLabeled(
           "findUntilFound",
@@ -4432,8 +6025,18 @@
         if (!searchMode) {
           html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="ocrOffset">选择偏移位置</button></div>`;
         }
+        if (ofu === 0) {
+          html += repeatBlock(a);
+          html += `<p class="hint">循环次数是在识别落点重复点击。</p>`;
+        }
+      } else if (searchMode) {
+        // 文字查找存的是「是否找到 + 匹配度 + 命中框坐标」，不是一个值 —— 名字与
+        // 字段都写清楚，别让「保存匹配度」被误读成 {变量} 本身就是匹配度。
+        html += flineStack("查找结果保存到", inpField("matchVarName", a.matchVarName || "a"));
+        html += `<p class="hint">*{变量}=是否找到(0/1)；{变量}.matchData=匹配度(0~100)；{变量}.x/.y/.x1/.y1=命中文字框坐标。</p>`;
       } else {
-        html += flineStack("结果保存到", inpField("matchVarName", a.matchVarName || "a"));
+        html += flineStack("文字保存到", inpField("matchVarName", a.matchVarName || "a"));
+        html += `<p class="hint">*{变量}=识别到的整段文字（可直接用 {变量} 引用，或做文字查找/条件判断）。</p>`;
       }
       html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="ocrTest">测试</button></div>`;
     } else if (t === "customText") {
@@ -4692,14 +6295,65 @@
     }
     html += "</div></div>";
     panel.innerHTML = html;
+    panel.dataset.paramKey = nextKey;
+    panel.scrollTop = keepScroll;
     requestFindImageThumbs(panel);
     wireParamPanelEvents(a, t);
     if (!a._preview && state.actionSel >= 0) syncActionListRowName(state.actionSel);
+    if (!state._suppressLiveCommit && a && !a._preview) liveCommitSelectedIfEnabled();
   }
 
   function wireParamPanelEvents(a, t) {
     const panel = $("#paramPanel");
     if (!panel || !a) return;
+    panel.querySelectorAll("[data-k='watchMode'] .radio").forEach((r) => {
+      r.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const host = r.closest("[data-k='watchMode']");
+        if (host) host.querySelectorAll(".radio").forEach((x) => x.classList.remove("on"));
+        r.classList.add("on");
+        const mode = parseInt(r.dataset.v, 10) || 0;
+        a.watchMode = mode;
+        if (mode === 1 && !(Number(a.watchPollSeconds) > 0)) a.watchPollSeconds = 1;
+        const row = panel.querySelector("[data-watch-poll-row]");
+        if (row) {
+          if (mode === 1) row.removeAttribute("hidden");
+          else row.setAttribute("hidden", "");
+        }
+        if (!a._preview && state.actionSel >= 0) syncActionListRowName(state.actionSel);
+        liveCommitSelectedIfEnabled();
+      });
+    });
+    panel.querySelectorAll("[data-k='multiMatchMode'] .radio").forEach((r) => {
+      r.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const host = r.closest("[data-k='multiMatchMode']");
+        if (host) host.querySelectorAll(".radio").forEach((x) => x.classList.remove("on"));
+        r.classList.add("on");
+        a.multiMatchMode = parseInt(r.dataset.v, 10) || 0;
+        if ((a.findImageFollowUp | 0) > 2) a.findImageFollowUp = 2;
+        renderParamPanel(a);
+        liveCommitSelectedIfEnabled();
+      });
+    });
+    const mmCountCombo = panel.querySelector('[data-k="_mmCount"]');
+    if (mmCountCombo) {
+      mmCountCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const items = [];
+        for (let n = 1; n <= 8; n++) items.push({ t: String(n), v: n });
+        showPopup(mmCountCombo, items, (it) => {
+          a._mmCount = it.v;
+          if (!Array.isArray(a.imagePaths)) a.imagePaths = [];
+          if (!Array.isArray(a.imageUseVars)) a.imageUseVars = [];
+          while (a.imagePaths.length < it.v) a.imagePaths.push("");
+          while (a.imageUseVars.length < a.imagePaths.length) a.imageUseVars.push(0);
+          renderParamPanel(a);
+        });
+      });
+    }
     const edSpeed = panel.querySelector('.speed-slider[data-speed-scope="action"]');
     if (edSpeed && t === "mousePlayback") {
       bindSpeedSliderRoot(edSpeed, {
@@ -4792,22 +6446,57 @@
     if (followCombo) {
       followCombo.addEventListener("click", (e) => {
         e.stopPropagation();
-        showPopup(
-          followCombo,
-          [
-            { t: "点击", v: 0 },
-            { t: "鼠标移动到", v: 1 },
-            { t: "保存匹配度", v: 2 },
-            { t: "保存图片", v: 3 },
-          ],
-          (it) => {
-            a.findImageFollowUp = it.v;
-            // 在默认名之间切换：保存图片→image，保存匹配度→matchRet；自定义名保留
+        const colorFollow =
+          a.type === "findColor"
+            ? [
+                { t: "点击", v: 0 },
+                { t: "鼠标移动到", v: 1 },
+                { t: "保存到变量", v: 2 },
+              ]
+            : a.type === "multiMatch"
+              ? (a.multiMatchMode | 0) === 1
+                ? [
+                    { t: "依次点击", v: 0 },
+                    { t: "移动到第一处", v: 1 },
+                    { t: "保存全部", v: 2 },
+                  ]
+                : [
+                    { t: "点击", v: 0 },
+                    { t: "鼠标移动到", v: 1 },
+                    { t: "保存匹配度", v: 2 },
+                  ]
+              : [
+                { t: "点击", v: 0 },
+                { t: "鼠标移动到", v: 1 },
+                { t: "保存匹配度", v: 2 },
+                { t: "保存图片", v: 3 },
+              ];
+        showPopup(followCombo, colorFollow, (it) => {
+          a.findImageFollowUp = it.v;
+          if (a.type !== "findColor" && a.type !== "multiMatch") {
             const vn = (a.matchVarName || "").trim();
             if (it.v === 3 && (!vn || vn === "matchRet")) a.matchVarName = "image";
             if (it.v === 2 && (!vn || vn === "image")) a.matchVarName = "matchRet";
-            followCombo.textContent = it.t;
-            renderParamPanel(a);
+          }
+          if (a.type === "multiMatch" && (a.findImageFollowUp | 0) > 2) a.findImageFollowUp = 2;
+          followCombo.textContent = it.t;
+          renderParamPanel(a);
+        });
+      });
+    }
+    const mmSortCombo = panel.querySelector('[data-k="multiMatchSort"]');
+    if (mmSortCombo) {
+      mmSortCombo.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showPopup(
+          mmSortCombo,
+          [
+            { t: "从左到右", v: 0 },
+            { t: "匹配度高到低", v: 1 },
+          ],
+          (it) => {
+            a.multiMatchSort = it.v;
+            mmSortCombo.textContent = it.t;
           }
         );
       });
@@ -4835,11 +6524,7 @@
         e.stopPropagation();
         showPopup(
           ocrFuCombo,
-          [
-            { t: "点击", v: 0 },
-            { t: "鼠标移动到", v: 1 },
-            { t: "保存到变量", v: 2 },
-          ],
+          ocrFollowUpOptions((a.ocrResultMode | 0) === 1),
           (it) => {
             a.ocrFollowUp = it.v;
             renderParamPanel(a);
@@ -5000,6 +6685,13 @@
       el.addEventListener("click", (e) => {
         e.stopPropagation();
         el.classList.toggle("on");
+        if (el.dataset.k === "_mmUseVar") {
+          const slot = mmSlotFromEl(el);
+          mmSetUseVar(a, slot < 0 ? 0 : slot, el.classList.contains("on"));
+          renderParamPanel(a);
+          liveCommitSelectedIfEnabled();
+          return;
+        }
         a[el.dataset.k] = el.classList.contains("on") ? 1 : 0;
         if (el.dataset.k === "_nwmFakeFocus") {
           const wm = ensureNestedWindowMode(a);
@@ -5035,6 +6727,12 @@
           el.dataset.k === "perfectMatch"
         ) {
           renderParamPanel(a);
+        } else if (el.dataset.k === "imageLocate") {
+          if (el.classList.contains("on")) {
+            if (!(a.searchFullScreen | 0)) a.searchFullScreen = 1;
+            ensureFullScreenCoordsVisible(a);
+          }
+          renderParamPanel(a);
         } else if (
           el.dataset.k === "moveFromVar" ||
           el.dataset.k === "loopFromVar"
@@ -5043,6 +6741,7 @@
         } else if (!a._preview && state.actionSel >= 0) {
           syncActionListRowName(state.actionSel);
         }
+        liveCommitSelectedIfEnabled();
       });
     });
     // 参数变更时同步左侧动作名（对齐原生 ActionName 实时刷新）
@@ -5055,7 +6754,23 @@
         }
       };
       el.addEventListener("input", sync);
-      el.addEventListener("blur", sync);
+      el.addEventListener("blur", () => {
+        sync();
+        liveCommitSelectedIfEnabled();
+      });
+    });
+    panel.querySelectorAll("textarea.ed-code").forEach((el) => {
+      el.addEventListener("blur", () => liveCommitSelectedIfEnabled());
+      el.addEventListener("keydown", (e) => {
+        if (e.key !== "Tab") return;
+        e.preventDefault();
+        const start = el.selectionStart | 0;
+        const end = el.selectionEnd | 0;
+        const v = el.value || "";
+        el.value = v.slice(0, start) + "    " + v.slice(end);
+        el.selectionStart = el.selectionEnd = start + 4;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      });
     });
     // 条件-如果：变量 / 判断 / 连接 + 添加
     if (t === "if") {
@@ -5079,15 +6794,20 @@
       if (varCombo) {
         varCombo.addEventListener("click", (e) => {
           e.stopPropagation();
-          const items = buildEditorVarItems().filter((x) => x.code);
-          if (!items.length) {
-            toast("暂无可用变量");
-            return;
-          }
-          showPopup(varCombo, items, (it) => {
-            a._ifVarCode = it.code;
-            a._ifVarLabel = it.t;
-            varCombo.textContent = it.t;
+          // 清单来自引擎（唯一实现）⇒ 先取再弹，别用旧缓存弹一个可能过期的表
+          fetchEditorVarItems().then((all) => {
+            const items = all.filter((x) => x.code);
+            if (!items.length) {
+              toast("暂无可用变量");
+              return;
+            }
+            // 异步等待期间面板可能已重绘：锚点被移除时改挂面板，否则弹窗会跑到屏幕左上角
+            const anchor = varCombo.isConnected ? varCombo : panel;
+            showPopup(anchor, items, (it) => {
+              a._ifVarCode = it.code;
+              a._ifVarLabel = it.t;
+              varCombo.textContent = it.t;
+            });
           });
         });
       }
@@ -5136,10 +6856,7 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          peekScriptActions(a.targetPath).then((msg) => {
-            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
-            renderParamPanel(a);
-          });
+          peekScriptActions(a.targetPath).then((msg) => afterPickTargetScript(a, msg));
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -5173,10 +6890,7 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          peekScriptActions(a.targetPath).then((msg) => {
-            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
-            renderParamPanel(a);
-          });
+          peekScriptActions(a.targetPath).then((msg) => afterPickTargetScript(a, msg));
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -5189,12 +6903,86 @@
     open();
   }
 
+  function startDragImageOffsetPick(a, which) {
+    readParamPanelInto(a);
+    if (!window.qst) {
+      toast("无桥接");
+      return;
+    }
+    if (!a.imagePath) {
+      toast("请先截图或选择图片");
+      return;
+    }
+    if (a.imageUseVar) {
+      state._pendingDragOffset = which === "end" ? "end" : "start";
+      if (!startSyntheticAnchorOverlay("offsetBySize", a.imagePath)) {
+        state._pendingDragOffset = "";
+      }
+      return;
+    }
+    state._pendingDragOffset = which === "end" ? "end" : "start";
+    const full =
+      (a.searchFullScreen | 0) === 1 ||
+      (a.searchX2 | 0) <= (a.searchX1 | 0) ||
+      (a.searchY2 | 0) <= (a.searchY1 | 0);
+    qst.findImageMatch(
+      withWindowTargetFindOpts({
+      imagePath: a.imagePath,
+      mode: "offset",
+      searchFullScreen: full ? 1 : 0,
+      searchX1: a.searchX1 | 0,
+      searchY1: a.searchY1 | 0,
+      searchX2: a.searchX2 | 0,
+      searchY2: a.searchY2 | 0,
+      matchThreshold: matchThresholdPercent(a.matchThreshold),
+      perfectMatch: a.perfectMatch ? 1 : 0,
+      imageScaleMin: a.imageScaleMin ?? 0.9,
+      imageScaleMax: a.imageScaleMax ?? 1.1,
+      maxMatches: 1,
+    })
+    );
+  }
+
   function wireFindImageButtons(panel, a) {
     if (!panel || !a) return;
     panel.querySelectorAll("[data-fi]").forEach((btn) => {
       const act = btn.dataset.fi;
+      if (act === "clickHere") {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          a.x = 0;
+          a.y = 0;
+          a.nx = 0;
+          a.ny = 0;
+          a.randomX = 0;
+          a.randomY = 0;
+          renderParamPanel(a);
+          toast("已改为在当前位置点击");
+        });
+        return;
+      }
       if (act === "pickCoord") {
+        if (usesImageLocateOffsetPick(a)) {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            startDragImageOffsetPick(a, "start");
+          });
+          return;
+        }
         wireCrosshairPointerDown(btn, "coordinates", "coord", () => readParamPanelInto(a));
+        return;
+      }
+      if (act === "pickCoordEnd") {
+        if (a.type === "mouseDrag" && a.imageLocate) {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            startDragImageOffsetPick(a, "end");
+          });
+          return;
+        }
+        wireCrosshairPointerDown(btn, "coordinates", "coordEnd", () => readParamPanelInto(a));
         return;
       }
       if (act === "pickProg") {
@@ -5213,17 +7001,35 @@
         e.preventDefault();
         e.stopPropagation();
         readParamPanelInto(a);
+        const mmSlot = mmSlotFromEl(btn);
         if (act === "clear") {
-          a.imagePath = "";
+          if (mmSlot >= 0) mmSetPath(a, mmSlot, "");
+          else a.imagePath = "";
           renderParamPanel(a);
           return;
         }
         if (act === "full") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           applyFullScreenSearchCoords(a);
           renderParamPanel(a);
           return;
         }
+        if (act === "pickDrag") {
+          if (!window.qst) {
+            toast("无桥接");
+            return;
+          }
+          qst.pickScreenDrag();
+          return;
+        }
         if (act === "absRegion") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           state._pendingRegionTarget = "search";
           if (window.qst) qst.pickScreenRegion();
           else toast("无桥接");
@@ -5265,22 +7071,26 @@
         }
         if (act === "insertVar") {
           const target = btn.dataset.target || "inputText";
-          const items = buildEditorVarItems().filter((x) => x.code);
-          if (!items.length) {
-            toast("暂无可用变量");
-            return;
-          }
-          showPopup(btn, items, (it) => {
-            const el = panel.querySelector(`[data-k="${target}"]`);
-            const insert = it.insert || "{" + it.code + "}";
-            if (el) {
-              const cur = el.textContent || "";
-              el.textContent = cur + insert;
-              a[target] = el.textContent;
-            } else {
-              a[target] = (a[target] || "") + insert;
-              renderParamPanel(a);
+          fetchEditorVarItems().then((all) => {
+            const items = all.filter((x) => x.code);
+            if (!items.length) {
+              toast("暂无可用变量");
+              return;
             }
+            // 同 varCombo：异步期间按钮可能已被重绘移除，别拿一个脱离 DOM 的锚点去定位
+            const anchor = btn.isConnected ? btn : panel;
+            showPopup(anchor, items, (it) => {
+              const el = panel.querySelector(`[data-k="${target}"]`);
+              const insert = it.insert || "{" + it.code + "}";
+              if (el) {
+                const cur = el.textContent || "";
+                el.textContent = cur + insert;
+                a[target] = el.textContent;
+              } else {
+                a[target] = (a[target] || "") + insert;
+                renderParamPanel(a);
+              }
+            });
           });
           return;
         }
@@ -5305,7 +7115,8 @@
             toast("请先输入要在结果中查找的文字");
             return;
           }
-          qst.testOcr({
+          qst.testOcr(
+            withWindowTargetFindOpts({
             mode: act === "ocrOffset" ? "offset" : "test",
             ocrRegionByImage: a.ocrRegionByImage ? 1 : 0,
             ocrDigitsOnly: a.ocrDigitsOnly ? 1 : 0,
@@ -5325,7 +7136,8 @@
             imagePath: a.imagePath || "",
             ocrSearchText: a.ocrSearchText || "",
             ocrResultMode: a.ocrResultMode | 0,
-          });
+          })
+          );
           return;
         }
         if (act === "browseFile") {
@@ -5339,16 +7151,14 @@
           return;
         }
         if (act === "ocrInstall") {
-          state._ocrRepair = false;
           if ($("#ocrDlgTitle"))
             $("#ocrDlgTitle").childNodes[0].textContent = "键鼠工坊-插件安装 ";
           if ($("#btnOcrInstall")) {
             $("#btnOcrInstall").disabled = false;
-            $("#btnOcrInstall").textContent = "安装插件";
+            $("#btnOcrInstall").textContent = "安装 / 修复";
           }
-          if ($("#btnOcrRepair")) $("#btnOcrRepair").disabled = false;
           if ($("#ocrStatus"))
-            $("#ocrStatus").textContent = "已就绪，点击安装开始下载安装…";
+            $("#ocrStatus").textContent = "已就绪，点击下方按钮开始安装或修复…";
           if ($("#ocrBar")) $("#ocrBar").style.width = "0%";
           openOv("ocr");
           return;
@@ -5356,6 +7166,7 @@
         if (act === "screen" || act === "aiScreen") {
           if (window.qst) {
             state._pendingAiTemplateShot = act === "aiScreen";
+            state._pendingMmSlot = mmSlot;
             qst.captureTemplateScreenshot();
           } else toast("无桥接");
           return;
@@ -5366,6 +7177,7 @@
         }
         if (act === "pick" || act === "pickAiImg") {
           state._pendingImageField = act === "pickAiImg" ? "aiTargetImagePath" : "imagePath";
+          state._pendingMmSlot = mmSlot;
           qst.pickImageFile();
           return;
         }
@@ -5397,22 +7209,32 @@
           return;
         }
         if (act === "aiFull") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           a.aiSearchRegion = 0;
           applyFullScreenSearchCoords(a, "aiSearch");
           renderParamPanel(a);
           return;
         }
         if (act === "aiRegion") {
+          if (editorUsesWindowTarget()) {
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            return;
+          }
           state._pendingRegionTarget = "ai";
           qst.pickScreenRegion();
           return;
         }
         if (act === "crop") {
-          if (!a.imagePath) {
+          const cropPath = mmSlot >= 0 ? mmPathAt(a, mmSlot) : a.imagePath;
+          if (!cropPath) {
             toast("请先截图或选择图片");
             return;
           }
-          openWebFindImageCrop(a);
+          state._pendingMmSlot = mmSlot;
+          openWebFindImageCrop(a, cropPath);
           return;
         }
         if (act === "pickImageRegion") {
@@ -5434,26 +7256,15 @@
           state._pendingImageRegionPick = true;
 
           if (useVar) {
-            const size = inferImageVarAnchorSize(path, state.actionSel | 0);
-            if (!size) {
-              toast("无法推断图片尺寸，请手填 X1Y1X2Y2 相对坐标");
+            if (!startSyntheticAnchorOverlay("regionBySize", path)) {
               state._pendingImageRegionPick = false;
               return;
             }
-            const opts = { mode: "regionBySize" };
-            if (size.pathOnly) {
-              opts.imagePath = size.path || path;
-              opts.syntheticW = 0;
-              opts.syntheticH = 0;
-            } else {
-              opts.syntheticW = size.w;
-              opts.syntheticH = size.h;
-            }
-            qst.findImageMatch(opts);
             return;
           }
 
-          qst.findImageMatch({
+          qst.findImageMatch(
+            withWindowTargetFindOpts({
             imagePath: path,
             mode: "region",
             searchFullScreen: full ? 1 : 0,
@@ -5466,25 +7277,53 @@
             imageScaleMin: a.imageScaleMin ?? 0.9,
             imageScaleMax: a.imageScaleMax ?? 1.1,
             maxMatches: 1,
-          });
+          })
+          );
           return;
         }
         if (act === "test" || act === "offset" || act === "region") {
-          if (act === "region" && !a.imagePath) {
+          const imgPath =
+            mmSlot >= 0
+              ? mmPathAt(a, mmSlot)
+              : a.type === "multiMatch"
+                ? mmPathAt(a, 0)
+                : a.imagePath;
+          if (act === "region" && !imgPath) {
+            if (editorUsesWindowTarget()) {
+              toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+              return;
+            }
             state._pendingRegionTarget = "search";
             qst.pickScreenRegion();
             return;
           }
-          if (!a.imagePath) {
+          if (!imgPath) {
             toast("请先截图或选择图片");
+            return;
+          }
+          const useVar =
+            mmSlot >= 0
+              ? mmUseVarAt(a, mmSlot)
+              : a.type === "multiMatch"
+                ? mmUseVarAt(a, 0)
+                : !!(a.imageUseVar);
+          if (act === "offset" && useVar) {
+            startSyntheticAnchorOverlay("offsetBySize", imgPath);
             return;
           }
           const full =
             (a.searchFullScreen | 0) === 1 ||
             (a.searchX2 | 0) <= (a.searchX1 | 0) ||
             (a.searchY2 | 0) <= (a.searchY1 | 0);
-          qst.findImageMatch({
-            imagePath: a.imagePath,
+          const maxMatches =
+            act === "offset" || act === "region"
+              ? 1
+              : a.type === "multiMatch" && (a.multiMatchMode | 0) === 1
+                ? Math.max(1, Math.min(20, a.multiMatchMax | 0 || 20))
+                : 20;
+          qst.findImageMatch(
+            withWindowTargetFindOpts({
+            imagePath: imgPath,
             mode: act === "test" ? "test" : act === "offset" ? "offset" : "region",
             searchFullScreen: full ? 1 : 0,
             searchX1: a.searchX1 | 0,
@@ -5495,8 +7334,9 @@
             perfectMatch: a.perfectMatch ? 1 : 0,
             imageScaleMin: a.imageScaleMin ?? 0.9,
             imageScaleMax: a.imageScaleMax ?? 1.1,
-            maxMatches: act === "offset" || act === "region" ? 1 : 20,
-          });
+            maxMatches,
+          })
+          );
         }
       });
     });
@@ -5548,7 +7388,7 @@
       showWm &&
       (methodV === "useEditorWindowClass" || methodV === "noSelect");
     const showClassBtn = showWm && methodV === "useEditorWindowClass";
-    const showFocus = showWm && (mode === 1 || mode === 2); // 窗口模式 / 后台窗口模式
+    const showFocus = showWm && (mode === 1 || mode === 2); // 独立桌面模式 / 后台窗口模式
     const showTargetRow = showPathChrome || showClassBtn || showFocus;
 
     if ($("#edTargetPath")) {
@@ -5730,7 +7570,7 @@
       }
       if (classText) wm.windowClassName = classText;
     }
-    // 假焦点：窗口模式与后台窗口模式均可写（Unity 等游戏会自动启用，勾选可强制）
+    // 假焦点：独立桌面模式与后台窗口模式均可写（Unity 等游戏会自动启用，勾选可强制）
     if (state.editorMode === 1 || state.editorMode === 2) {
       wm.fakeFocusEnabled = $("#edFocus")?.classList.contains("on") ? 1 : 0;
     } else {
@@ -5977,6 +7817,10 @@
   }
 
   function closeAgentWindow() {
+    if (anyAgentTabBusy()) {
+      toast("请先取消或等待当前回复");
+      return;
+    }
     state.agentMinimized = false;
     persistAgentDraft(undefined, true);
     clearAgentEditMode();
@@ -6749,6 +8593,7 @@
   }
 
   function enterEditorBatch(on) {
+    if (on) flushPendingLiveEdit();
     state.batchMode = !!on;
     state.batchSel = {};
     state._batchAnchor = -1;
@@ -6757,7 +8602,6 @@
       state.actionSel = -1;
       state.editDraft = null;
       state.addPreview = null;
-      renderParamPanel(null);
     }
     // 列表已在时只改勾选/选中态，禁止 innerHTML 把滚动条拆掉重建
     if (!state._actionListRendering && patchActionListBatchMode(on)) {
@@ -6808,15 +8652,24 @@
     refreshEditorBatchSelectionUi();
   }
 
-  function showEditorBatchContextMenu(clientX, clientY) {
+  function showEditorBatchContextMenu(clientX, clientY, extra) {
+    extra = extra || {};
     const hasSel = selectedBatchIndices().length > 0;
     const items = [
       { t: "剪切", v: "cut", disabled: !hasSel },
       { t: "复制", v: "copy", disabled: !hasSel },
       { t: "合并到动作", v: "merge", disabled: !isMergeEligible() },
-      { t: "调试选中的步骤（单步）", v: "step", disabled: !hasSel },
-      { t: "调试选中的步骤（运行）", v: "run", disabled: !hasSel },
     ];
+    if (extra.clickIndex >= 0 && !isEditorVisualMode()) {
+      items.push(
+        { t: "插入到此项前", v: "insertBefore" },
+        { t: "插入到此项后", v: "insertAfter" }
+      );
+    }
+    items.push(
+      { t: "调试选中的步骤（单步）", v: "step", disabled: !hasSel },
+      { t: "调试选中的步骤（运行）", v: "run", disabled: !hasSel }
+    );
     requestAnimationFrame(() => {
       showPopup(
         { clientX: clientX, clientY: clientY },
@@ -6828,7 +8681,30 @@
           } else if (it.v === "copy") {
             if (!copySelectedEditorActions()) toast("请先勾选动作");
           } else if (it.v === "merge") mergeBatchSelectionBefore();
-          else if (it.v === "step") debugSelectedBatch(true);
+          else if (it.v === "insertBefore" || it.v === "insertAfter") {
+            const place = it.v === "insertBefore" ? "before" : "after";
+            const prior = Array.isArray(extra.priorSel) ? extra.priorSel : [];
+            const targets = prior.length
+              ? prior
+              : extra.clickIndex >= 0
+                ? [extra.clickIndex]
+                : [];
+            if (!targets.length) {
+              toast("请先勾选动作");
+              return;
+            }
+            const inserted = insertFormActionsForTargets(targets, place);
+            if (!inserted.length) return;
+            state.batchSel = {};
+            inserted.forEach((idx) => {
+              state.batchSel[idx] = true;
+            });
+            renderEditorActions(state.editorActions);
+            if (inserted.length === 1 && !prior.length) {
+              enterEditorBatch(false);
+              selectEditorAction(inserted[0]);
+            }
+          } else if (it.v === "step") debugSelectedBatch(true);
           else if (it.v === "run") debugSelectedBatch(false);
         },
         { preferUp: true }
@@ -6897,8 +8773,8 @@
     }
     const type = (state.addPreview && state.addPreview.type) || state.addActionType;
     const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
-    if (type === "defineBlock" || (plan && plan.contiguous)) {
-      runMergeWithPlacement(type === "defineBlock" ? "first" : "inplace");
+    if (type === "defineBlock" || type === "watchImage" || (plan && plan.contiguous)) {
+      runMergeWithPlacement(type === "defineBlock" || type === "watchImage" ? "first" : "inplace");
       return;
     }
     const pop = $("#mergePlacementPopup");
@@ -6923,6 +8799,7 @@
     return (
       type === "loop" ||
       type === "defineBlock" ||
+      type === "watchImage" ||
       type === "if" ||
       type === "else"
     );
@@ -7105,7 +8982,7 @@
         state.addActionType = a.type;
         const typeCombo = $("#edActionType");
         const cur = ACTION_TYPES.find((x) => x.v === a.type);
-        if (typeCombo && cur) typeCombo.textContent = cur.t;
+        if (typeCombo && cur) setActionTypeComboText(cur.t);
       }
     } else {
       showAddTypePreview();
@@ -7143,7 +9020,7 @@
     }
     const destIndent = clampIndent(target.indent);
     const t = target.type;
-    if (t === "loop" || t === "if" || t === "else" || t === "defineBlock") {
+    if (t === "loop" || t === "if" || t === "else" || t === "defineBlock" || t === "watchImage") {
       const body = copyContainerBody(actions, index);
       if (!body.length) {
         toast("没有可拆解的子动作");
@@ -7199,7 +9076,7 @@
   }
 
   function isMergeContainerType(type) {
-    return type === "loop" || type === "if" || type === "else" || type === "defineBlock";
+    return type === "loop" || type === "if" || type === "else" || type === "defineBlock" || type === "watchImage";
   }
 
   function mergeSubtreeEndOn(actions, fromIdx) {
@@ -7361,7 +9238,7 @@
     if (placement === "inplace" && !plan.contiguous) {
       return { ok: false, error: "所选动作不连续，请选择插入位置" };
     }
-    const asDefine = container.type === "defineBlock";
+    const asDefine = container.type === "defineBlock" || container.type === "watchImage";
     const destIndent = asDefine ? 0 : plan.indent;
     const ranges = [];
     const body = [];
@@ -7499,9 +9376,14 @@
     const on = isMergeEligible();
     const was = _mergeUiOn;
     _mergeUiOn = on;
-    if (lbl) lbl.textContent = on ? "请选择要并入的宏" : "请选择要添加的宏";
+    const lock = on && !editorBatchInsertOn();
+    const type = (state.addPreview && state.addPreview.type) || state.addActionType;
+    if (lbl) {
+      lbl.textContent =
+        on && (lock || isMergeContainerType(type)) ? "请选择要并入的宏" : "请选择要添加的宏";
+    }
     if (on && !was) {
-      if (!isMergeContainerType(state.addActionType)) state.addActionType = "loop";
+      if (lock && !isMergeContainerType(state.addActionType)) state.addActionType = "loop";
       showAddTypePreview();
       return "enter";
     }
@@ -7511,8 +9393,13 @@
       return "leave";
     }
     if (!on) {
-      renderParamPanel(null);
+      if (!state.addPreview) showAddTypePreview();
+      else renderParamPanel(state.addPreview);
       return "batch";
+    }
+    if (lock && !isMergeContainerType(state.addActionType)) {
+      state.addActionType = "loop";
+      showAddTypePreview();
     }
     return "stay";
   }
@@ -7925,6 +9812,7 @@
         delete a._preview;
         a.name = typeLabel(a.type);
         if (a.type === "defineBlock") a.blockName = uniquifyPastedBlockName(a.blockName, usedNames);
+        mmNormalizeForSave(a);
         toInsert.push(a);
       }
     }
@@ -8182,6 +10070,7 @@
     i = i | 0;
     if (i < 0 || i >= (state.editorActions || []).length) return;
     opts = opts || {};
+    if (!(opts && opts.skipFlush) && i !== state.actionSel) flushPendingLiveEdit();
     if (
       opts.keepDraft &&
       state.actionSel === i &&
@@ -8203,7 +10092,7 @@
         state.addActionType = a.type;
         const typeCombo = $("#edActionType");
         const cur = ACTION_TYPES.find((x) => x.v === a.type);
-        if (typeCombo && cur) typeCombo.textContent = cur.t;
+        if (typeCombo && cur) setActionTypeComboText(cur.t);
       }
     }
     state._skipReadback = true;
@@ -8214,9 +10103,10 @@
     focusEditorActionList();
   }
 
-  function insertEditorAction(action, pos, indentOverride) {
+  function insertEditorAction(action, pos, indentOverride, opts) {
     const a = Object.assign({}, action);
     delete a._preview;
+    mmNormalizeForSave(a);
     if (typeof indentOverride === "number" && indentOverride >= 0) {
       a.indent = clampIndent(indentOverride);
     } else if (a.indent == null) {
@@ -8224,8 +10114,8 @@
     } else {
       a.indent = clampIndent(a.indent);
     }
-    if (a.type === "defineBlock") {
-      if (!validateDefineBlockName(a.blockName, -1)) return false;
+    if (a.type === "defineBlock" || a.type === "watchImage") {
+      if (a.type === "defineBlock" && !validateDefineBlockName(a.blockName, -1)) return false;
       pos = 0;
       a.indent = 0;
     }
@@ -8235,11 +10125,230 @@
       toast(END_LOOP_NEEDS_LOOP_MSG);
       return false;
     }
-    visualNoteUndo();
+    if (!(opts && opts.skipUndo)) visualNoteUndo();
     list.splice(pos, 0, a);
     visualOnInsert(pos);
     shiftCollapsedAfterInsert(pos);
     if (isSubtreeContainerType(a.type)) delete state.collapsedContainers[pos];
+    return true;
+  }
+
+  const KEY_EXEC_ACTION_TYPES = new Set([
+    "moveMouseRelative", "mouseClick", "mouseDown", "mouseUp", "scrollWheel", "mouseDrag",
+    "keyClick", "keyDown", "keyUp", "hotkeyShortcut", "quickInput",
+    "findImage", "multiMatch", "findColor", "textRecognition",
+    "runProgram", "closeProgram", "activateWindow", "openFile", "openWebpage",
+    "runMacro", "runBlock", "mousePlayback",
+  ]);
+
+  function currentAddActionFromForm() {
+    const remark = ($("#edRemark")?.textContent || "").trim();
+    let a;
+    if (state.addPreview && state.addPreview.type === state.addActionType) {
+      readParamPanelInto(state.addPreview);
+      a = Object.assign({}, state.addPreview);
+      delete a._preview;
+      a.remark = remark;
+      a.name = typeLabel(a.type);
+    } else if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
+      if (!state.editDraft) loadEditDraftFromSelection();
+      if (state.editDraft) {
+        readParamPanelInto(state.editDraft);
+        a = Object.assign({}, state.editDraft);
+        delete a._preview;
+        a.remark = remark;
+        a.name = typeLabel(a.type);
+      } else {
+        a = defaultAction(state.addActionType, remark);
+      }
+    } else {
+      a = defaultAction(state.addActionType, remark);
+    }
+    mmNormalizeForSave(a);
+    return a;
+  }
+
+  function addPlacementMenuItems(hasSel, selAct, formAction, fromContextMenu) {
+    const items = hasSel
+      ? [
+          { t: "添加到最后", v: "last" },
+          { t: "插入到最前", v: "first" },
+          { t: "插入到选择项前", v: "before" },
+          { t: "插入到选择项后", v: "after" },
+        ]
+      : [
+          { t: "添加到最后", v: "last" },
+          { t: "插入到最前", v: "first" },
+        ];
+    if (hasSel && selAct && isSubtreeContainerType(selAct.type)) {
+      items.push({ t: "添加为子节点", v: "asChild" });
+    }
+    if (fromContextMenu && formAction && formAction.type === "wait") {
+      items.push({ t: "插入到所有关键执行动作间", v: "betweenKey" });
+    }
+    return items;
+  }
+
+  function applyAddPlacement(it, a, sel, selAct, finishInsert) {
+    if (!it) return;
+    if (it.v === "betweenKey") {
+      insertWaitsBetweenKeyActions(a);
+      return;
+    }
+    let pos = state.editorActions.length;
+    let indent = -1;
+    if (it.v === "first") {
+      pos = 0;
+      indent = 0;
+    } else if (it.v === "before" && selAct) {
+      pos = sel;
+      indent = selAct.indent | 0;
+    } else if (it.v === "after" && selAct) {
+      pos = subtreeEnd(sel);
+      indent = selAct.indent | 0;
+    } else if (it.v === "asChild" && selAct) {
+      pos = subtreeEnd(sel);
+      indent = (selAct.indent | 0) + 1;
+    } else {
+      pos = state.editorActions.length;
+      indent = 0;
+    }
+    finishInsert(pos, indent);
+  }
+
+  function insertWaitsBetweenKeyActions(waitSrc) {
+    const list = state.editorActions || [];
+    const slots = [];
+    for (let i = 0; i < list.length - 1; i++) {
+      const cur = list[i];
+      const nxt = list[i + 1];
+      if (!cur || !nxt) continue;
+      if (!KEY_EXEC_ACTION_TYPES.has(cur.type) || !KEY_EXEC_ACTION_TYPES.has(nxt.type)) continue;
+      if ((cur.indent | 0) !== (nxt.indent | 0)) continue;
+      slots.push(i + 1);
+    }
+    if (!slots.length) {
+      toast("没有可插入的位置");
+      return;
+    }
+    visualNoteUndo();
+    let added = 0;
+    for (let s = slots.length - 1; s >= 0; s--) {
+      const pos = slots[s];
+      const indent = list[pos - 1].indent | 0;
+      const w = defaultAction("wait", waitSrc.remark || "");
+      w.duration = waitSrc.duration;
+      w.randomDuration = waitSrc.randomDuration;
+      w.indent = clampIndent(indent);
+      delete w._preview;
+      list.splice(pos, 0, w);
+      visualOnInsert(pos);
+      shiftCollapsedAfterInsert(pos);
+      added += 1;
+    }
+    state.actionSel = -1;
+    state.batchMode = false;
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    const remarkEl = $("#edRemark");
+    if (remarkEl) remarkEl.textContent = "";
+    showAddTypePreview();
+    toast("已插入 " + added + " 处等待");
+  }
+
+  function finishAddInsert(a, pos, indent) {
+    if (!insertEditorAction(a, pos, indent)) return;
+    state.actionSel = -1;
+    state.batchMode = false;
+    state.addPreview = null;
+    renderEditorActions(state.editorActions);
+    const remarkEl = $("#edRemark");
+    if (remarkEl) remarkEl.textContent = "";
+    showAddTypePreview();
+  }
+
+  function insertFormActionRelativeTo(index, placement, opts) {
+    const a = JSON.parse(JSON.stringify(currentAddActionFromForm()));
+    const selAct = state.editorActions[index];
+    if (!selAct) return -1;
+    let pos = index;
+    let indent = selAct.indent | 0;
+    if (placement === "before") {
+      pos = index;
+      indent = selAct.indent | 0;
+    } else if (placement === "asChild") {
+      pos = subtreeEnd(index);
+      indent = (selAct.indent | 0) + 1;
+    } else {
+      pos = subtreeEnd(index);
+      indent = selAct.indent | 0;
+    }
+    if (!insertEditorAction(a, pos, indent, opts)) return -1;
+    if (a.type === "defineBlock" || a.type === "watchImage") return 0;
+    return pos;
+  }
+
+  function insertAndSelectFormAction(index, placement) {
+    flushPendingLiveEdit();
+    if (index < 0 || index >= (state.editorActions || []).length) return false;
+    const pos = insertFormActionRelativeTo(index, placement);
+    if (pos < 0) return false;
+    state.batchMode = false;
+    state.batchSel = {};
+    state.addPreview = null;
+    state.actionSel = pos;
+    state.editDraft = null;
+    renderEditorActions(state.editorActions);
+    selectEditorAction(pos);
+    return true;
+  }
+
+  function insertFormActionsForTargets(indices, placement) {
+    flushPendingLiveEdit();
+    const targets = (indices || []).filter((i) => i >= 0 && i < (state.editorActions || []).length);
+    if (!targets.length) return [];
+    visualNoteUndo();
+    const inserted = [];
+    const sorted = targets.slice().sort((a, b) => b - a);
+    for (let i = 0; i < sorted.length; i++) {
+      const pos = insertFormActionRelativeTo(sorted[i], placement, { skipUndo: true });
+      if (pos < 0) continue;
+      for (let k = 0; k < inserted.length; k++) {
+        if (inserted[k] >= pos) inserted[k] += 1;
+      }
+      inserted.push(pos);
+    }
+    if (!inserted.length) {
+      revertLastEditorHistory();
+      return [];
+    }
+    return inserted.sort((a, b) => a - b);
+  }
+
+  function editorBatchAddType() {
+    return (state.addPreview && state.addPreview.type) || state.addActionType;
+  }
+
+  function shouldBatchInsertOnAdd() {
+    if (!state.batchMode || !editorBatchInsertOn()) return false;
+    if (isMergeContainerType(editorBatchAddType())) return false;
+    return selectedBatchIndices().length >= 2;
+  }
+
+  function commitBatchInsertAtSelection(placement) {
+    const targets = selectedBatchIndices();
+    if (targets.length < 1) {
+      toast("请先勾选动作");
+      return false;
+    }
+    const inserted = insertFormActionsForTargets(targets, placement || "after");
+    if (!inserted.length) return false;
+    state.batchSel = {};
+    inserted.forEach((idx) => {
+      state.batchSel[idx] = true;
+    });
+    renderEditorActions(state.editorActions);
+    toast("已插入 " + inserted.length + " 条");
     return true;
   }
 
@@ -8336,7 +10445,7 @@
     if (typeCombo) {
       const cur =
         ACTION_TYPES.find((a) => a.v === state.addActionType) || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      setActionTypeComboText(cur.t);
     }
     renderParamPanel(preview);
   }
@@ -8760,6 +10869,17 @@
     const finishRender = () => {
       if (onProgressive) endProgressiveLoad();
       ensureActionInsertLine(list);
+      if (state._keepParamPanel) {
+        syncEditorBatchChrome();
+        wireActionListDrag();
+        list.scrollTop = keepScroll;
+        state._actionListRendering = false;
+        state._actionListScrollTop = list.scrollTop | 0;
+        visualActionsChanged();
+        return;
+      }
+      state._suppressLiveCommit = true;
+      try {
       if (state.batchMode) {
         syncMergeModeUi();
       } else if (state.actionSel >= 0 && !state.addPreview) {
@@ -8769,6 +10889,9 @@
         renderParamPanel(state.addPreview);
       } else {
         showAddTypePreview();
+      }
+      } finally {
+        state._suppressLiveCommit = false;
       }
       syncEdRemarkFromSelection();
       syncEditorBatchChrome();
@@ -8824,9 +10947,19 @@
     if (V && typeof V.syncSelectionUi === "function") V.syncSelectionUi();
     if (nextSel >= 0 && !state.addPreview) {
       if (!state.editDraft) loadEditDraftFromSelection();
-      renderParamPanel(state.editDraft);
+      state._suppressLiveCommit = true;
+      try {
+        renderParamPanel(state.editDraft);
+      } finally {
+        state._suppressLiveCommit = false;
+      }
     } else if (state.addPreview) {
-      renderParamPanel(state.addPreview);
+      state._suppressLiveCommit = true;
+      try {
+        renderParamPanel(state.addPreview);
+      } finally {
+        state._suppressLiveCommit = false;
+      }
     } else {
       showAddTypePreview();
     }
@@ -8849,6 +10982,7 @@
       if (ev.target.closest("[data-act='copy'], [data-act='del'], [data-act='expand-toggle'], .op-a, .chk, .exp-toggle")) return;
       const fromIdx = +row.dataset.i;
       if (!(fromIdx >= 0)) return;
+      flushPendingLiveEdit();
 
       const startX = ev.clientX;
       const startY = ev.clientY;
@@ -8926,8 +11060,12 @@
     state.collapsedContainers = {};
     state._actionListScrollTop = 0;
     state.editorPath = path || "";
+    state._editorOpenedNew = !state.editorPath;
     state.editorName = name || "";
     state.editorActions = [];
+    // 换脚本 ⇒ 引擎变量清单必须作废（否则下拉里短暂显示上一个脚本的变量名）
+    state.editorVarItemsFromEngine = null;
+    state._varItemsWaiters = {};
     state.editDraft = null;
     state.addActionType = firstVisibleActionType();
     resetEditorHistory();
@@ -8988,19 +11126,264 @@
       return c;
     };
     return JSON.stringify({
-      name: state.editorName || "",
+      name:
+        ($("#edName")?.textContent || "").trim() || state.editorName || "",
       mode: state.editorMode | 0,
       breakout: ($("#edBreakout")?.textContent || "").trim(),
-      windowMode: state.windowMode || {},
+      windowMode: collectWindowModeForSave() || {},
       actions: (state.editorActions || []).map(scrub),
-      visualLayout: collectVisualLayoutForSave() || null,
     });
+  }
+
+  /// 画布（可视化布局）改动登记：由 visual_editor.js 在用户真正改动画布时回调。
+  /// 刻意不进 captureEditorSnapshot —— 「切到可视化」会触发生成默认布局 / 缩放 / 滚动，
+  /// 那些都不是用户改动，不能算「未保存的改动」。
+  function markVisualLayoutDirty() {
+    if (!state.editor) return;
+    state._editorLayoutDirty = true;
+  }
+
+  /// 布局内容指纹（不含 viewMode / zoom / scroll）。无布局时为空串。
+  function currentVisualLayoutKey() {
+    const V = window.QstVisualEditor;
+    if (!V || typeof V.collectLayoutCore !== "function") return "";
+    const core = V.collectLayoutCore();
+    return core ? JSON.stringify(core) : "";
+  }
+
+  /// 刷新布局基线（进入/离开可视化、打开编辑器、保存成功后调用）。
+  /// 已有未保存的画布改动时不覆盖基线，避免把用户的改动「洗白」。
+  function refreshVisualLayoutBaseline() {
+    if (!state.editor) return;
+    if (state._editorLayoutDirty) return;
+    state._editorLayoutBaseline = currentVisualLayoutKey();
+  }
+
+  function resetEditorDirtyBaseline() {
+    state._editorSnapshot = captureEditorSnapshot();
+    state._editorLayoutDirty = false;
+    state._editorLayoutBaseline = currentVisualLayoutKey();
   }
 
   function isEditorDirty() {
     if (!state.editor) return false;
     if (!state._editorSnapshot) return false;
+    if (state._editorLayoutDirty) {
+      // 拖回原位 / 撤销回原样：布局与基线一致即视为无改动
+      if (currentVisualLayoutKey() === state._editorLayoutBaseline) {
+        state._editorLayoutDirty = false;
+      } else {
+        return true;
+      }
+    }
     return captureEditorSnapshot() !== state._editorSnapshot;
+  }
+
+  const EDITOR_AUTOSAVE_MS = 10000;
+
+  function stopEditorAutosaveTimer() {
+    if (state._editorAutosaveTimer) {
+      clearInterval(state._editorAutosaveTimer);
+      state._editorAutosaveTimer = 0;
+    }
+  }
+
+  function startEditorAutosaveTimer() {
+    stopEditorAutosaveTimer();
+    if (!state.editor || !editorAutoSaveOn()) return;
+    state._editorAutosaveTimer = setInterval(() => {
+      if (!state.editor || !editorAutoSaveOn() || state._saveEditorBusy) return;
+      if (!isEditorDirty()) return;
+      saveEditorNow({ intent: "autosave", skipVisualConfirm: true });
+    }, EDITOR_AUTOSAVE_MS);
+  }
+
+  function collectEditorSavePayload() {
+    const name =
+      ($("#edName")?.textContent || "").trim() ||
+      state.editorName ||
+      "鼠标宏-" + Math.floor(Date.now() / 1000);
+    state.editorName = name;
+    const layout = collectVisualLayoutForSave();
+    return {
+      path: state.editorPath || "",
+      name,
+      breakoutTimeSeconds: parseFloat($("#edBreakout")?.textContent || "0") || 0,
+      mode: state.editorMode | 0,
+      windowMode: collectWindowModeForSave(),
+      actions: JSON.parse(JSON.stringify(state.editorActions || [])),
+      visualLayout: layout == null ? undefined : JSON.parse(JSON.stringify(layout)),
+    };
+  }
+
+  function revertPayloadWithCurrentPath() {
+    const payload = state._editorRevertPayload
+      ? JSON.parse(JSON.stringify(state._editorRevertPayload))
+      : collectEditorSavePayload();
+    payload.path = state.editorPath || payload.path || "";
+    return payload;
+  }
+
+  function ackAppClosing() {
+    if (window.qst && typeof qst.post === "function") qst.post({ type: "app.closingAck" });
+  }
+
+  function saveEditorNow(opts) {
+    opts = opts || {};
+    const intent = opts.intent || "manual";
+    if (state._saveEditorBusy) {
+      if (intent === "appclose") state._saveEditorQueuedClose = true;
+      else if (intent === "exit") state._saveEditorQueuedExit = true;
+      return false;
+    }
+    if (intent !== "revert") {
+      syncFormIntoSelectedBeforeSave();
+      if (!opts.skipValidate) {
+        if (!validateEditorBeforeSave()) {
+          if (intent === "autosave") return false;
+          if (intent === "appclose") ackAppClosing();
+          return false;
+        }
+      }
+      const wm = collectWindowModeForSave();
+      if (!validateWindowModeForSave(wm)) {
+        if (intent === "autosave") return false;
+        if (intent === "appclose") ackAppClosing();
+        return false;
+      }
+    }
+    if (!window.qst) {
+      if (intent === "revert" || intent === "exit") {
+        exitEditor(true);
+        return true;
+      }
+      if (intent !== "autosave") toast("无桥接环境");
+      if (intent === "appclose") ackAppClosing();
+      return false;
+    }
+    const doSave = () => {
+      state._saveEditorIntent = intent;
+      state._saveEditorBusy = true;
+      const payload =
+        intent === "revert" ? revertPayloadWithCurrentPath() : collectEditorSavePayload();
+      qst.saveEditor(payload);
+    };
+    const V = window.QstVisualEditor;
+    if (
+      !opts.skipVisualConfirm &&
+      intent !== "autosave" &&
+      intent !== "revert" &&
+      V &&
+      typeof V.isVisual === "function" &&
+      V.isVisual() &&
+      typeof V.commitGraphToList === "function"
+    ) {
+      V.commitGraphToList(function (ok) {
+        if (ok) doSave();
+        else if (intent === "appclose") ackAppClosing();
+      }, "与初始节点无关的流程会直接删除，确定保存？");
+      return true;
+    }
+    doSave();
+    return true;
+  }
+
+  function afterEditorSaveSuccess(msg, intent) {
+    if (Array.isArray(msg.scripts)) state.macros = msg.scripts;
+    if (msg.path) {
+      state.editorPath = msg.path;
+      if (state._editorRevertPayload && !state._editorRevertPayload.path)
+        state._editorRevertPayload.path = msg.path;
+    }
+    state._editorSnapshot = captureEditorSnapshot();
+    state._editorLayoutDirty = false;
+    state._editorLayoutBaseline = currentVisualLayoutKey();
+    if (intent === "autosave") {
+      if (state._saveEditorQueuedClose) {
+        state._saveEditorQueuedClose = false;
+        saveEditorNow({
+          intent: "appclose",
+          skipVisualConfirm: true,
+          skipValidate: true,
+        });
+        return;
+      }
+      if (state._saveEditorQueuedExit) {
+        state._saveEditorQueuedExit = false;
+        if (isEditorDirty()) {
+          saveEditorNow({ intent: "exit", skipVisualConfirm: true });
+        } else {
+          finishLeaveEditor();
+        }
+      }
+      return;
+    }
+    if (intent === "appclose") {
+      ackAppClosing();
+      return;
+    }
+    if (intent === "revert") {
+      finishLeaveEditor();
+      if (window.qst) qst.listScripts();
+      return;
+    }
+    toast("已保存");
+    finishLeaveEditor();
+    renderLists();
+    updateCtas();
+    if (msg.path) selectPathInLists(msg.path, "macro");
+    else syncEngineHomeSelection();
+    if (window.qst) qst.listScripts();
+  }
+
+  function finishLeaveEditor() {
+    exitEditor(true);
+    renderLists();
+    updateCtas();
+    syncEngineHomeSelection();
+  }
+
+  function discardNewEditorFileThenLeave() {
+    const path = state.editorPath || "";
+    if (path && window.qst && typeof qst.deleteScript === "function") {
+      state._quietDeleteScript = true;
+      qst.deleteScript(path);
+    }
+    finishLeaveEditor();
+    if (window.qst) qst.listScripts();
+  }
+
+  function requestLeaveEditor(reason) {
+    if (!state.editor) return;
+    if (reason === "cancel") {
+      if (editorAutoSaveOn()) {
+        if (state._editorOpenedNew) {
+          discardNewEditorFileThenLeave();
+          return;
+        }
+        saveEditorNow({ intent: "revert", skipVisualConfirm: true, skipValidate: true });
+        return;
+      }
+      exitEditor();
+      return;
+    }
+    if (editorAutoSaveOn()) {
+      if (!isEditorDirty() && state.editorPath) {
+        exitEditor(true);
+        return;
+      }
+      saveEditorNow({
+        intent: reason === "appclose" ? "appclose" : "exit",
+        skipVisualConfirm: true,
+        skipValidate: reason === "appclose",
+      });
+      return;
+    }
+    if (reason === "appclose") {
+      ackAppClosing();
+      return;
+    }
+    exitEditor();
   }
 
   function exitEditor(force) {
@@ -9008,6 +11391,14 @@
       askConfirm("有未保存的改动，确定离开编辑器？", () => exitEditor(true));
       return;
     }
+    stopEditorAutosaveTimer();
+    document.body.classList.remove("editor-no-modify", "editor-autosave");
+    state._editorRevertPayload = null;
+    state._editorOpenedNew = false;
+    state._saveEditorIntent = "";
+    state._saveEditorBusy = false;
+    state._saveEditorQueuedClose = false;
+    state._saveEditorQueuedExit = false;
     const ed = $("#editor");
     if (ed) ed.style.pointerEvents = "";
     endProgressiveLoad(true);
@@ -9017,6 +11408,8 @@
     state.actionSel = -1;
     state.editorPath = "";
     state._editorSnapshot = "";
+    state._editorLayoutDirty = false;
+    state._editorLayoutBaseline = "";
     // 动作详情草稿/预览缓存：退出编辑器后清掉，避免下次进入残留
     state.addPreview = null;
     state.editDraft = null;
@@ -9041,7 +11434,7 @@
     const typeCombo = $("#edActionType");
     if (typeCombo) {
       const cur = ACTION_TYPES.find((a) => a.v === state.addActionType) || ACTION_TYPES[0];
-      typeCombo.textContent = cur.t;
+      setActionTypeComboText(cur.t);
     }
     const remark = $("#edRemark");
     if (remark) remark.textContent = "";
@@ -9153,6 +11546,135 @@
 
   function itemPath(item) {
     return (item && (item.path || item.id)) || "";
+  }
+
+  // ── 导出脚本：按设置决定走 zip 还是独立 EXE ─────────────────────
+  // 「其他设置 → 导出脚本默认为 zip 格式」勾选 → 老路径（zip 脚本包）；
+  // 默认（不勾）→ 直接走独立 EXE（免安装、能被本软件导入）。
+  function startExport(path, name) {
+    if (!path) {
+      toast("请先选中要导出的脚本");
+      return;
+    }
+    state._exportPath = path;
+    state._exportName = name || "";
+    const other = (state.settings && state.settings.other) || {};
+    if (other.exportScriptAsZip) {
+      if (window.qst) qst.exportScript(path);
+      return;
+    }
+    beginExportExe();
+  }
+  // 专业模式的右键菜单在 pro-mode.js 里，通过这个全局入口复用同一套流程
+  window.QstExport = { open: startExport };
+
+  function fmtBytes(n) {
+    const v = Number(n) || 0;
+    if (v <= 0) return "—";
+    if (v >= 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+    if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+    return `${v} B`;
+  }
+
+  function renderExportScan(scan) {
+    const el = $("#expScan");
+    if (!el) return;
+    const rows = [];
+    rows.push(`动作 <b>${scan.totalActions | 0}</b> 个`);
+    if (scan.imageActions > 0) rows.push(`找图 / 找色 <b>${scan.imageActions}</b> 处`);
+    if (scan.ocrActions > 0) rows.push(`文字识别 <b>${scan.ocrActions}</b> 处`);
+    if (scan.aiActions > 0) rows.push(`AI 动作 <b>${scan.aiActions}</b> 处`);
+    if (scan.windowMode) rows.push(`后台窗口模式 <b>是</b>`);
+    if (scan.nestedScripts > 0) rows.push(`引用的子脚本 <b>${scan.nestedScripts}</b> 个（已打包）`);
+    let html = rows.join(" · ");
+    if (!scan.templateAvailable) {
+      html += `<br><span class="warn">缺少播放器模板，无法导出 EXE（重装「键鼠工坊」可恢复）。</span>`;
+    }
+    if (scan.aiActions > 0) {
+      html += `<br><span class="warn">注意：AI 动作需要目标电脑配置自己的 API Key，否则该动作会失败。</span>`;
+    }
+    const missing = Array.isArray(scan.missingRefs) ? scan.missingRefs : [];
+    if (missing.length) {
+      html += `<br><span class="warn">有 ${missing.length} 个引用的子脚本找不到，不会被导出：${esc(missing.slice(0, 3).join("、"))}</span>`;
+    }
+    if (scan.selfContainedOnly) {
+      html += `<br>这个脚本不依赖任何外部组件，导出的体积最小、最省心。`;
+    }
+    el.innerHTML = html;
+
+    const adv = $("#expAdvanced");
+    if (adv) adv.hidden = !(scan.imageActions > 0 || scan.ocrActions > 0);
+    const chkOcv = $("#expBundledOpenCv");
+    const chkOcr = $("#expBundledOcr");
+    if (chkOcv) chkOcv.parentElement.hidden = !(scan.imageActions > 0);
+    if (chkOcr) chkOcr.parentElement.hidden = !(scan.ocrActions > 0);
+    updateExportSize(scan);
+  }
+
+  function updateExportSize(scan) {
+    const el = $("#expSize");
+    if (!el) return;
+    const s = scan || state._exportScan || {};
+    let bytes = Number(s.templateBytes) || 0;
+    if ((s.imageActions | 0) > 0 && $("#expBundledOpenCv")?.classList.contains("on")) {
+      bytes += Number(s.openCvBytes) || 0;
+    }
+    if (s.windowMode) bytes += Number(s.fakeFocusBytes) || 0;
+    const extra = [];
+    if ((s.imageActions | 0) > 0) {
+      extra.push(
+        $("#expBundledOpenCv")?.classList.contains("on")
+          ? "图像识别组件：自带"
+          : "图像识别组件：用软件里的"
+      );
+    }
+    if ((s.ocrActions | 0) > 0) {
+      extra.push(
+        $("#expBundledOcr")?.classList.contains("on")
+          ? "文字识别：系统 OCR"
+          : "文字识别：用软件里的"
+      );
+    }
+    el.textContent =
+      `预计体积：约 ${fmtBytes(bytes)}` + (extra.length ? `（${extra.join("；")}）` : "");
+  }
+
+  function syncExportTargetRadios() {
+    const bundled = $("#expTargetRadios .radio.on")?.dataset.v !== "installed";
+    const ocv = $("#expBundledOpenCv");
+    const ocr = $("#expBundledOcr");
+    if (ocv) ocv.classList.toggle("on", bundled);
+    if (ocr) ocr.classList.toggle("on", bundled);
+    updateExportSize();
+  }
+
+  function beginExportExe() {
+    const path = state._exportPath;
+    if (!path) return;
+    state._exportScan = null;
+    const scanEl = $("#expScan");
+    if (scanEl) scanEl.textContent = "正在检查脚本…";
+    const sizeEl = $("#expSize");
+    if (sizeEl) sizeEl.textContent = "预计体积：—";
+    openOv("export-exe");
+    if (window.qst && typeof qst.scanScriptForExport === "function") {
+      qst.scanScriptForExport(path);
+    } else if (scanEl) {
+      scanEl.textContent = "当前版本不支持导出 EXE。";
+    }
+  }
+
+  function confirmExportExe() {
+    const path = state._exportPath;
+    if (!path) return;
+    if (window.qst && typeof qst.exportScriptAsExe === "function") {
+      qst.exportScriptAsExe({
+        path,
+        bundledOpenCv: $("#expBundledOpenCv")?.classList.contains("on") ? 1 : 0,
+        bundledOcr: $("#expBundledOcr")?.classList.contains("on") ? 1 : 0,
+        bundledFakeFocus: 1,
+      });
+    }
   }
 
   function askConfirm(msg, onOk) {
@@ -9429,13 +11951,14 @@
     setCropSelCss(sel, r.left, r.top, r.width, r.height);
   }
 
-  function openWebFindImageCrop(a) {
-    if (!a || !a.imagePath) {
+  function openWebFindImageCrop(a, pathOverride) {
+    const path = String(pathOverride || (a && a.imagePath) || "").trim();
+    if (!a || !path) {
       toast("请先截图或选择图片");
       return;
     }
     _cropPending = {
-      imagePath: a.imagePath,
+      imagePath: path,
       offsetX: a.offsetX | 0,
       offsetY: a.offsetY | 0,
       followUpSaveVar: (a.findImageFollowUp | 0) === 2 ? 1 : 0,
@@ -9452,7 +11975,7 @@
     }
     const reqId = "crop_" + Date.now();
     state._pendingCropReqId = reqId;
-    qst.readImageDataUrl(a.imagePath, reqId);
+    qst.readImageDataUrl(path, reqId);
   }
 
   function confirmWebFindImageCrop() {
@@ -9983,6 +12506,63 @@
   }
 
   /** 对齐原生：pointerdown 按住即开始准星拖拽（同步 HostObject，避免松手后再拾取） */
+  /** 坐标系选项（2026-10-05）：只在「窗口模式 / 后台窗口模式」且已绑定窗口时启用
+   *  窗口基准 —— 默认模式回放不做坐标换算，给客户区坐标反而会错。
+   *  ⚠ 判「是不是窗口模式」**只信 `state.editorMode`**（UI 的实时选择）：
+   *    `wm.enabled` 只在保存时被 `collectWindowModeForSave` 同步，新开编辑器时可能是旧值。 */
+  function crosshairCoordOptions() {
+    const wm = state.windowMode || {};
+    if (!(state.editorMode > 0)) return {};
+    const cls = wm.windowClassName || "";
+    const exe = wm.targetExePath || "";
+    if (!cls && !exe) return {};   // 没身份 ⇒ 原生找不到窗口，给了也白给
+    return {
+      windowClient: 1,
+      windowClassName: cls,
+      targetExePath: exe,
+      windowTitle: wm.windowName || "",
+    };
+  }
+
+  /** 一次性确认框。⚠ WebView2 里 `window.confirm` 默认不可用（宿主没处理
+   *  ScriptDialogOpening）⇒ 自建 DOM 模态框。返回 Promise<boolean>：
+   *  true = 继续用窗口相对；false = **放弃本次取点**（不写值、不改脚本）。
+   *  ⚠ 刻意**不提供**「本次用屏幕坐标」：坐标系是**脚本级**的
+   *  （`collectWindowModeForSave` 的 `anyRel` 只要 `wm.windowRelativeCoordinates`
+   *   或任一动作 `windowRelative` 为真就整脚本切客户区）⇒ 单个动作存屏幕坐标会被
+   *   当成客户区解释，**静默错位**。要么整脚本客户区，要么整脚本屏幕。 */
+  function askCoordSpaceConfirm() {
+    return new Promise((resolve) => {
+      const mask = document.createElement("div");
+      mask.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);"
+        + "display:flex;align-items:center;justify-content:center;z-index:99999";
+      const box = document.createElement("div");
+      box.style.cssText = "max-width:460px;background:#fff;color:#222;border-radius:10px;"
+        + "padding:18px 20px;box-shadow:0 8px 32px rgba(0,0,0,.25);font-size:13px;line-height:1.7";
+      box.innerHTML =
+        '<div style="font-weight:600;font-size:14px;margin-bottom:8px">将以「窗口相对坐标」取点</div>'
+        + '<div style="margin-bottom:14px">取到的点以 <b>目标窗口客户区</b> 为基准，窗口移动也不会失效。<br>'
+        + '⚠ 坐标系是<b>整脚本</b>的：本脚本<b>已有的坐标动作</b>会一起按客户区解释 —— '
+        + '如果你之前是按屏幕坐标录的，请重新取点。<br>'
+        + '（只想放弃这一次取点，点「取消」。）</div>';
+      const actions = document.createElement("div");
+      actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end";
+      const bCancel = document.createElement("button");
+      bCancel.className = "btn";
+      bCancel.textContent = "取消";
+      const bOk = document.createElement("button");
+      bOk.className = "btn primary";
+      bOk.textContent = "继续（窗口相对）";
+      const done = (v) => { mask.remove(); resolve(v); };
+      bCancel.onclick = () => done(false);
+      bOk.onclick = () => done(true);
+      actions.append(bCancel, bOk);
+      box.append(actions);
+      mask.append(box);
+      document.body.append(mask);
+    });
+  }
+
   function startNativeCrosshair(mode, pending) {
     state._pendingCrosshair = pending || mode;
     state._crosshairMode = mode;
@@ -9996,9 +12576,11 @@
       chrome.webview.hostObjects &&
       chrome.webview.hostObjects.sync &&
       chrome.webview.hostObjects.sync.qst;
+    const coordOpts = crosshairCoordOptions();
     if (syncHost && typeof syncHost.crosshairPick === "function") {
       try {
-        const raw = syncHost.crosshairPick(String(mode || "coordinates"));
+        const raw = syncHost.crosshairPick(String(mode || "coordinates"),
+          JSON.stringify(coordOpts));
         let msg = raw;
         if (typeof raw === "string") {
           try {
@@ -10017,7 +12599,7 @@
         console.warn("sync crosshairPick failed, fallback async", err);
       }
     }
-    qst.crosshairPick(mode);
+    qst.crosshairPick(mode, coordOpts);
   }
 
   function openCrosshairWeb(mode, pending) {
@@ -10090,7 +12672,14 @@
   function showPopup(anchor, items, onPick, opts) {
     opts = opts || {};
     if (popupEl && popupAnchor === anchor) {
-      hidePopup();
+      if (opts.updateItems) {
+        refreshPopupItems(items, opts.selectedIndex);
+        return;
+      }
+      if (!opts.forceOpen) {
+        hidePopup();
+        return;
+      }
       return;
     }
     hidePopup();
@@ -10114,6 +12703,7 @@
     popupEl = document.createElement("div");
     popupEl.className = "popup-menu show" + (opts.preferUp ? " popup-up" : "");
     popupEl.setAttribute("role", "listbox");
+    popupEl._qstPickItems = items;
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
     const spaceBelow = Math.max(0, vh - rect.bottom - 8);
@@ -10140,12 +12730,13 @@
     popupEl.innerHTML = items
       .map((it, idx) => {
         const on = idx === selectedIdx ? " on" : "";
+        const dis = it && it.disabled ? " disabled" : "";
         if (it.d) {
-          return `<div class="mi wide${on}" data-i="${idx}" role="option"><span>${esc(it.t || it.v || "")}</span><span class="d">${esc(
+          return `<div class="mi wide${on}${dis}" data-i="${idx}" role="option"><span>${esc(it.t || it.v || "")}</span><span class="d">${esc(
             it.d
           )}</span></div>`;
         }
-        return `<div class="mi${on}" data-i="${idx}" role="option">${esc(it.t || it.v || "")}</div>`;
+        return `<div class="mi${on}${dis}" data-i="${idx}" role="option">${esc(it.t || it.v || "")}</div>`;
       })
       .join("");
     // 挂到当前 overlay 内，避免 body 级菜单在 WebView2 里被全屏遮罩抢走点击
@@ -10221,9 +12812,16 @@
       e.stopPropagation();
       if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
       if (picked) return;
-      picked = true;
       const idx = +item.dataset.i;
-      const chosen = items[idx];
+      const liveItems = (popupEl && popupEl._qstPickItems) || items;
+      const chosen = liveItems[idx];
+      if (chosen && chosen.disabled) return;
+      picked = true;
+      const fromParam =
+        popupAnchor &&
+        typeof popupAnchor.closest === "function" &&
+        $("#paramPanel") &&
+        $("#paramPanel").contains(popupAnchor);
       hidePopup();
       if (chosen && typeof onPick === "function") {
         try {
@@ -10231,6 +12829,7 @@
         } catch (err) {
           console.error("popup onPick", err);
         }
+        if (fromParam) liveCommitSelectedIfEnabled();
       }
     };
     // 捕获阶段选中，避免 document mousedown(capture) 先关掉菜单
@@ -10259,6 +12858,150 @@
       window.removeEventListener("wheel", onWheel, true);
       window.removeEventListener("scroll", onScroll, true);
     };
+  }
+
+  function refreshPopupItems(items, selectedIndex) {
+    if (!popupEl || !items) return;
+    const selectedIdx = selectedIndex == null ? -1 : selectedIndex | 0;
+    popupEl.innerHTML = items
+      .map((it, idx) => {
+        const on = idx === selectedIdx ? " on" : "";
+        const dis = it && it.disabled ? " disabled" : "";
+        if (it.d) {
+          return `<div class="mi wide${on}${dis}" data-i="${idx}" role="option"><span>${esc(it.t || it.v || "")}</span><span class="d">${esc(
+            it.d
+          )}</span></div>`;
+        }
+        return `<div class="mi${on}${dis}" data-i="${idx}" role="option">${esc(it.t || it.v || "")}</div>`;
+      })
+      .join("");
+    popupEl._qstItems = items;
+    popupEl._qstPickItems = items;
+    if (selectedIdx >= 0) {
+      const selEl = popupEl.querySelector(`.mi[data-i="${selectedIdx}"]`);
+      if (selEl) {
+        const maxScroll = Math.max(0, popupEl.scrollHeight - popupEl.clientHeight);
+        popupEl.scrollTop = Math.min(Math.max(0, selEl.offsetTop - 2), maxScroll);
+      }
+    }
+  }
+
+  function actionTypeFilterQuery() {
+    const raw = actionTypeComboText().trim();
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const curType = (shown && shown.type) || state.addActionType;
+    const cur =
+      ACTION_TYPES.find((a) => a.v === curType) ||
+      pickerActionTypes(curType).find((a) => a.v === curType);
+    if (cur && raw === cur.t) return "";
+    return raw;
+  }
+
+  function filteredActionTypes(query) {
+    const mergeLock = typeof mergePickerLocked === "function" && mergePickerLocked();
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const curType = (shown && shown.type) || state.addActionType;
+    const raw = String(query || "").trim();
+    const searchAll = editorSearchAllActionsOn() && !!raw;
+    const types = mergeLock
+      ? (searchAll
+          ? pickerActionTypes(curType, { includeHidden: true }).filter((a) =>
+              a && (a.v === "loop" || a.v === "defineBlock" || a.v === "watchImage" || a.v === "if" || a.v === "else")
+            )
+          : pickerMergeContainerTypes())
+      : pickerActionTypes(curType, { includeHidden: searchAll });
+    const pool = types.length
+      ? types
+      : mergeLock
+        ? MERGE_CONTAINER_TYPES.slice()
+        : ACTION_TYPES.slice();
+    if (!raw) return pool;
+    const q = raw.toLowerCase();
+    return pool.filter((a) => {
+      if (!a) return false;
+      if (String(a.t || "").indexOf(raw) >= 0) return true;
+      if (String(a.t || "").toLowerCase().indexOf(q) >= 0) return true;
+      if (String(a.v || "").toLowerCase().indexOf(q) >= 0) return true;
+      const py = ACTION_PY[a.v] || "";
+      return py.toLowerCase().indexOf(q) >= 0;
+    });
+  }
+
+  function applyPickedActionType(it) {
+    if (!it || !it.v) return;
+    const mergeOn = typeof isMergeEligible === "function" && isMergeEligible();
+    state.addActionType = it.v;
+    setActionTypeComboText(it.t);
+    hidePopup();
+    if (mergeOn) {
+      showAddTypePreview();
+      if (typeof syncMergeModeUi === "function") syncMergeModeUi();
+      return;
+    }
+    if (
+      state.actionSel >= 0 &&
+      state.editorActions[state.actionSel] &&
+      !state.addPreview
+    ) {
+      if (!state.editDraft) loadEditDraftFromSelection();
+      if (state.editDraft) {
+        readParamPanelInto(state.editDraft);
+        const remark = ($("#edRemark")?.textContent || "").trim() || state.editDraft.remark;
+        const fresh = defaultAction(it.v, remark);
+        const merged = Object.assign({}, fresh, state.editDraft);
+        merged.type = it.v;
+        merged.name = typeLabel(it.v);
+        merged.remark = remark;
+        if (it.v === "mouseClick" || it.v === "mouseDown" || it.v === "mouseUp") {
+          merged.x = 0;
+          merged.y = 0;
+          merged.nx = 0;
+          merged.ny = 0;
+          merged.randomX = 0;
+          merged.randomY = 0;
+          merged.moveFromVar = 0;
+        }
+        delete merged._preview;
+        state.editDraft = merged;
+        state.addPreview = null;
+        renderParamPanel(state.editDraft);
+        if (liveModifyEnabled()) liveCommitSelectedIfEnabled();
+        return;
+      }
+    }
+    showAddTypePreview();
+  }
+
+  function openActionTypeMenu(opts) {
+    opts = opts || {};
+    const box = actionTypeComboBox();
+    if (!box) return;
+    if (opts.toggle && popupEl && popupAnchor === box) {
+      hidePopup();
+      return;
+    }
+    const types = filteredActionTypes(actionTypeFilterQuery());
+    const shown = typeof editorParamAction === "function" ? editorParamAction() : null;
+    const curType = (shown && shown.type) || state.addActionType;
+    const sel = types.findIndex((a) => a.v === curType);
+    const items = types.length
+      ? types
+      : [{ t: "无匹配动作", v: "", disabled: true }];
+    if (popupEl && popupAnchor === box) {
+      refreshPopupItems(items, sel >= 0 ? sel : 0);
+      popupEl._qstPickItems = items;
+      return;
+    }
+    showPopup(
+      box,
+      items,
+      (picked) => applyPickedActionType(picked),
+      {
+        minRows: 10,
+        selectedIndex: sel >= 0 ? sel : 0,
+        forceOpen: true,
+      }
+    );
   }
 
   function bindDynamic(root) {
@@ -10306,6 +13049,11 @@
   function onBridge(ev) {
     const msg = ev.detail || {};
     const type = msg.type || "";
+    if (type === "app.closing") {
+      if (state.editor) requestLeaveEditor("appclose");
+      else ackAppClosing();
+      return;
+    }
     if (type === "listScripts.result" && msg.ok) {
       state.macros = Array.isArray(msg.scripts) ? msg.scripts : [];
       rematchListSelectionByPath();
@@ -10373,6 +13121,7 @@
       }
       return;
     }
+    if (type === "engine.toast") {
       if (msg.text) toast(String(msg.text));
       return;
     }
@@ -10425,6 +13174,21 @@
       applyThemeFromSettings(state.settings || {});
       return;
     }
+    // ★ 窗口 Agents：列表 / 绑定结果。绑定成功后**立刻重列**（用户要看到状态变了）
+    if (type === "windowAgentList.result") {
+      renderWindowAgents(msg.payload || {});
+      return;
+    }
+    if (type === "windowAgentBind.result") {
+      const payload = msg.payload || {};
+      if (payload.ok) {
+        toast(payload.bound === false ? "已解除绑定" : "已绑定窗口 Agent");
+        loadWindowAgents();
+      } else {
+        toast(payload.error || "绑定失败");
+      }
+      return;
+    }
     if (type === "debugWindow.needTheme") {
       pushThemeCssToDebug();
       return;
@@ -10466,14 +13230,18 @@
       if (msg.rebootPending) {
         label = "检测到旧版安装留下的开机任务，请点「卸载并修复」，不要再重启进 BIOS";
         if (bar) bar.style.width = "40%";
+      } else if (msg.driverNeedsUpdate) {
+        label = "已安装但权限过旧，请重新安装（点「重新安装」更新驱动 ACL）";
+        if (btn) btn.textContent = "重新安装";
+        if (bar) bar.style.width = "70%";
       } else if (msg.driverReady) {
         label = "虚拟 HID 驱动已安装，设备可用";
         if (btn) btn.textContent = "重新安装";
         if (bar) bar.style.width = "100%";
         const root = $("#vhidSteps");
         if (root) $$(".driver-step", root).forEach((s) => s.classList.add("done"));
-      } else if (!msg.installScriptPresent) {
-        label = "未找到驱动安装文件，请使用完整发版包";
+      } else if (!msg.packagePresent) {
+        label = "本地尚无内核驱动文件。点「开始安装」将先从官网下载驱动包，再弹出 UAC";
       } else if (msg.lastExitCode === 3) {
         label = "上次安装因驱动签名不被当前系统信任而拒绝，未改启动配置";
       } else if (msg.lastExitCode === 5) {
@@ -10585,16 +13353,53 @@
         if ($("#setFixedY")) $("#setFixedY").textContent = String(pick.y | 0);
         setChk($("#setFixedCoordEn"), true);
         toast(`定点 ${pick.x | 0},${pick.y | 0}`);
-      } else if (mode === "coordinates" || pending === "coord") {
+      } else if (mode === "coordinates" || pending === "coord" || pending === "coordEnd") {
         const a = editorParamAction();
-        if (a) {
-          a.x = pick.x | 0;
-          a.y = pick.y | 0;
-          renderParamPanel(a);
+        if (!a) {
+          toast("请先选中或添加动作");
         } else {
-          toast("请先选中或添加「移动鼠标」动作");
+          // ── 坐标系（2026-10-05）────────────────────────────────────────────
+          // 原生在「窗口模式 + 已绑定窗口」时返回 coordSpace:"windowClient"
+          // ⇒ 取到的 x/y 已是客户区像素。给动作打 windowRelative 标记 ——
+          //   保存时 collectWindowModeForSave 的 anyRel 会把**整脚本**切到 windowClient。
+          const isClient = pick.coordSpace === "windowClient";
+          const apply = (useClient) => {
+            const px = useClient ? pick.x : (pick.screenX != null ? pick.screenX : pick.x);
+            const py = useClient ? pick.y : (pick.screenY != null ? pick.screenY : pick.y);
+            if (pending === "coordEnd") {
+              a.endX = px | 0;
+              a.endY = py | 0;
+            } else {
+              a.x = px | 0;
+              a.y = py | 0;
+            }
+            a.windowRelative = !!useClient;
+            renderParamPanel(a);
+            const tag = useClient ? "窗口相对坐标" : "屏幕坐标";
+            const out = (useClient && pick.outside) ? "（此点在窗口外）" : "";
+            toast(pending === "coordEnd"
+              ? `${tag} 终点 ${a.endX},${a.endY}${out}`
+              : `${tag} ${a.x},${a.y}${out}`);
+          };
+          if (!isClient) {
+            // 原生没给客户区坐标（未启用窗口模式 / 找不到窗口 / 转换失败）
+            // ⇒ 走原来的屏幕坐标路径，**行为与旧版一致**
+            apply(false);
+          } else if (state._wmCoordPref === true) {
+            apply(true);   // 用户已确认过「继续用窗口相对」⇒ 不再打扰
+          } else {
+            // 首次切到窗口相对 ⇒ **确认框**（它会改变整脚本的解释方式，值得打断一次）
+            askCoordSpaceConfirm().then((ok) => {
+              if (ok) {
+                state._wmCoordPref = true;
+                apply(true);
+              } else {
+                toast("已取消本次取点");
+              }
+            });
+          }
+          if (pick.coordNote) toast(String(pick.coordNote));
         }
-        if (a) toast(`坐标 ${a.x},${a.y}`);
       } else if (mode === "programPath" || pending === "program") {
         const a = editorParamAction();
         if (a && pick.processPath) {
@@ -10605,13 +13410,25 @@
         } else {
           toast(pick.processPath || "未获取路径");
         }
-      } else if (
-        mode === "windowTarget" ||
-        pending === "windowClass" ||
-        pending === "window" ||
-        pending === "nestedWm" ||
-        pending === "nestedWmClass"
-      ) {
+      } else if (pending === "windowAgent") {
+        // ★ 窗口 Agents 绑定：准星拾取到的窗口 → 交给原生匹配/新建档案并写 windowClients。
+        //   ⚠ 拾取结果里**没有 hwnd**（原生 WindowTargetResult 只给路径/标题/类名）
+        //     ⇒ 按 **exe 文件名 + 标题** 交给原生去匹配内置档案。
+        //   ⚠ 拾取结果里**没有 hwnd**（原生 WindowTargetResult 只给路径/标题/类名）
+        //     ⇒ 按 **exe 文件名 + 标题** 交给原生匹配档案；匹配不到就建骨架档案。
+        //   ★ 只做"选中"：绑定要用户在浮层里按「绑定为模型」确认（别一点就改配置）
+        const exeName = String(pick.processPath || "").split("\\").pop() || "";
+        if (!exeName) {
+          toast("没拿到进程名，请对准客户端的窗口本体再松手");
+        } else {
+          const hit = (typeof waState !== "undefined" ? waState.clients : []).find((c) =>
+            (c.processNames || []).some((p) => String(p).toLowerCase() === exeName.toLowerCase()));
+          waPickFromWindowInfo({ process: exeName, title: pick.windowTitle || "", client: hit ? hit.id : "" });
+          if (typeof waOpen === "function") waOpen();
+          toast(`已选中 ${exeName}`);
+        }
+      } else if (mode === "windowTarget" || pending === "windowClass" || pending === "window"
+          || pending === "nestedWm" || pending === "nestedWmClass") {
         if (pending === "nestedWm" || pending === "nestedWmClass") {
           applyWindowPickToNestedAction(pick, pending);
           fillPickOverlay(pick);
@@ -10622,6 +13439,7 @@
         } else {
           applyWindowPickToEditor(pick, pending);
           fillPickOverlay(pick);
+          // 指定窗口类：打开浮层细调；准星绑定：已写入编辑器字段，仅在无路径时再开浮层
           if (pending === "windowClass" || !pick.processPath) openOv("pick");
           else toast(pick.processPath || pick.windowTitle || "已绑定窗口");
         }
@@ -10684,17 +13502,21 @@
       if (!msg.ok) {
         if (msg.detail !== "cancelled") toast(msg.detail || "截图取消");
         state._pendingAiTemplateShot = false;
+        state._pendingMmSlot = -1;
         return;
       }
       const a = editorParamAction();
       if (a) {
         const path = msg.imagePath || msg.resolvedPath || "";
         if (state._pendingAiTemplateShot) a.aiTargetImagePath = path;
+        else if (a.type === "multiMatch")
+          applyMmImagePath(a, path, Number.isInteger(state._pendingMmSlot) ? state._pendingMmSlot : 0);
         else a.imagePath = path;
         renderParamPanel(a);
         toast("模板已保存");
       }
       state._pendingAiTemplateShot = false;
+      state._pendingMmSlot = -1;
       return;
     }
     if (type === "readImageDataUrl.result") {
@@ -10851,6 +13673,12 @@
       }
       return;
     }
+    if (type === "uiScale.apply") {
+      if (msg.scale != null) applyUiLayoutScale(msg.scale);
+      else if (msg.qstU != null) applyUiLayoutScale(Number(msg.qstU) / QST_U_BASE);
+      applyShellScale();
+      return;
+    }
     if (type === "window.clientSize") {
       state._clientW = msg.clientW | 0;
       state._clientH = msg.clientH | 0;
@@ -10867,10 +13695,11 @@
           msg.dpi
         );
       }
+      const expectW = Math.round(SHELL_CLIENT.editor.w * currentLayoutScale());
       if (
         state.editor &&
         (state._clientW | 0) > 0 &&
-        (state._clientW | 0) < 1600 &&
+        (state._clientW | 0) < expectW - 48 &&
         window.qst &&
         !state._resizeRetry
       ) {
@@ -11043,12 +13872,21 @@
       return;
     }
     if (type === "pickImageFile.result") {
-      if (!msg.ok) return;
+      if (!msg.ok) {
+        state._pendingMmSlot = -1;
+        state._pendingImageField = "";
+        return;
+      }
       const a = editorParamAction();
-      if (a && state._pendingImageField) {
+      const mmSlot = Number.isInteger(state._pendingMmSlot) ? state._pendingMmSlot : -1;
+      if (a && a.type === "multiMatch" && mmSlot >= 0) {
+        applyMmImagePath(a, msg.path || "", mmSlot);
+        renderParamPanel(a);
+      } else if (a && state._pendingImageField) {
         a[state._pendingImageField] = msg.path || "";
         renderParamPanel(a);
       }
+      state._pendingMmSlot = -1;
       state._pendingImageField = "";
       return;
     }
@@ -11059,11 +13897,18 @@
       }
       const a = editorParamAction();
       if (a && !msg.unchanged) {
-        if (msg.imagePath) a.imagePath = msg.imagePath;
+        if (a.type === "multiMatch" && msg.imagePath)
+          applyMmImagePath(
+            a,
+            msg.imagePath,
+            Number.isInteger(state._pendingMmSlot) ? state._pendingMmSlot : 0
+          );
+        else if (msg.imagePath) a.imagePath = msg.imagePath;
         if (msg.offsetX != null) a.offsetX = msg.offsetX;
         if (msg.offsetY != null) a.offsetY = msg.offsetY;
         renderParamPanel(a);
       }
+      state._pendingMmSlot = -1;
       if ($("#ov-crop")?.classList.contains("show")) {
         closeAllOv();
         if (msg.unchanged) toast("未裁切（全图）");
@@ -11073,14 +13918,38 @@
     }
     if (type === "findImageMatch.result") {
       if (!msg.ok) {
+        state._pendingDragOffset = "";
+        state._pendingImageRegionPick = false;
         if (msg.detail && msg.detail !== "cancelled") toast(msg.detail);
         return;
       }
       const a = editorParamAction();
       if (a) {
-        if (msg.mode === "offset") {
-          a.offsetX = msg.offsetX | 0;
-          a.offsetY = msg.offsetY | 0;
+        if (msg.mode === "offset" || msg.mode === "offsetBySize") {
+          const pending = state._pendingDragOffset;
+          state._pendingDragOffset = "";
+          if (
+            (a.type === "mouseDrag" || a.type === "getColor" || a.type === "colorMatch") &&
+            pending
+          ) {
+            const ox = msg.offsetX | 0;
+            const oy = msg.offsetY | 0;
+            if (a.type === "mouseDrag" && pending === "end") {
+              a.endX = ox;
+              a.endY = oy;
+              toast(`终点偏移 ${ox},${oy}`);
+            } else {
+              a.x = ox;
+              a.y = oy;
+              toast(
+                a.type === "mouseDrag" ? `起点偏移 ${ox},${oy}` : `相对图偏移 ${ox},${oy}`
+              );
+            }
+          } else {
+            a.offsetX = msg.offsetX | 0;
+            a.offsetY = msg.offsetY | 0;
+            toast(`偏移 ${a.offsetX},${a.offsetY}`);
+          }
         } else if (
           (msg.mode === "region" || msg.mode === "regionBySize") &&
           msg.regionValid
@@ -11103,13 +13972,22 @@
         }
         if (msg.mode === "test") {
           if (msg.found) {
+            const n = msg.matchCount != null ? msg.matchCount | 0 : 0;
             const score =
               msg.bestScore != null ? Math.round(Number(msg.bestScore) || 0) : null;
-            toast(
-              score != null
-                ? `测试：已找到匹配（最高 ${score}%）`
-                : "测试：已找到匹配"
-            );
+            if (n > 1) {
+              toast(
+                score != null
+                  ? `测试：找到 ${n} 处（最高 ${score}%）`
+                  : `测试：找到 ${n} 处`
+              );
+            } else {
+              toast(
+                score != null
+                  ? `测试：已找到匹配（最高 ${score}%）`
+                  : "测试：已找到匹配"
+              );
+            }
           } else {
             toast("测试：未找到匹配");
           }
@@ -11140,6 +14018,24 @@
         renderParamPanel(a);
       }
       state._pendingRegionTarget = "";
+      return;
+    }
+    if (type === "pickScreenDrag.result" || type === "pickTemplateDrag.result") {
+      if (!msg.ok) {
+        if (msg.detail !== "cancelled") toast(msg.detail || "选取取消");
+        return;
+      }
+      const a = editorParamAction();
+      if (!a) return;
+      a.x = msg.x1 | 0;
+      a.y = msg.y1 | 0;
+      a.endX = msg.x2 | 0;
+      a.endY = msg.y2 | 0;
+      let dur = Number(msg.duration);
+      if (!Number.isFinite(dur) || dur < 0.05) dur = 0.05;
+      a.duration = dur;
+      renderParamPanel(a);
+      toast("已写入拖拽 " + (a.x | 0) + "," + (a.y | 0) + "→" + (a.endX | 0) + "," + (a.endY | 0));
       return;
     }
     if (type === "saveSettings.result") {
@@ -11177,7 +14073,7 @@
           wm.windowClassName ||
           wm.windowTitle ||
           "目标窗口";
-        if (lab) lab.textContent = "窗口模式目标 · " + label;
+        if (lab) lab.textContent = "后台窗口目标 · " + label;
         if (target && msg.dataUrl) {
           target.style.backgroundImage = `url("${msg.dataUrl}")`;
           target.style.backgroundSize = "cover";
@@ -11266,6 +14162,15 @@
       }
       return;
     }
+    if (type === "editorVarItems.result") {
+      const reqId = String(msg.reqId || "");
+      const waiter = state._varItemsWaiters && state._varItemsWaiters[reqId];
+      if (waiter) {
+        delete state._varItemsWaiters[reqId];
+        waiter(msg);
+      }
+      return;
+    }
     if (type === "openEditor.result") {
       if (state._editorOpenWatchdog) {
         clearTimeout(state._editorOpenWatchdog);
@@ -11337,6 +14242,14 @@
       showAddTypePreview();
       resetEditorHistory({ keepClipboard: true });
       state._editorSnapshot = captureEditorSnapshot();
+      state._editorLayoutDirty = false;
+      state._editorLayoutBaseline = currentVisualLayoutKey();
+      try {
+        state._editorRevertPayload = collectEditorSavePayload();
+      } catch (_) {
+        state._editorRevertPayload = null;
+      }
+      syncEditorGeneralChrome();
       // 内容已齐：再放大窗体（cloak 中），setMode.result 里揭开
       state._pendingModeReveal = "editor";
       if (window.qst) qst.setMode("editor");
@@ -11349,19 +14262,15 @@
       return;
     }
     if (type === "saveEditor.result") {
+      const intent = state._saveEditorIntent || "manual";
+      state._saveEditorIntent = "";
+      state._saveEditorBusy = false;
       if (!msg.ok) {
-        toast(msg.detail || "保存失败");
+        if (intent !== "autosave") toast(msg.detail || "保存失败");
+        if (intent === "appclose") ackAppClosing();
         return;
       }
-      toast("已保存");
-      if (Array.isArray(msg.scripts)) state.macros = msg.scripts;
-      state._editorSnapshot = captureEditorSnapshot();
-      exitEditor(true);
-      renderLists();
-      updateCtas();
-      if (msg.path) selectPathInLists(msg.path, "macro");
-      else syncEngineHomeSelection();
-      if (window.qst) qst.listScripts();
+      afterEditorSaveSuccess(msg, intent);
       return;
     }
     if (
@@ -11389,7 +14298,10 @@
       } else {
         syncEngineHomeSelection();
       }
-      if (type === "deleteScript.result") toast("已删除");
+      if (type === "deleteScript.result") {
+        if (state._quietDeleteScript) state._quietDeleteScript = false;
+        else toast("已删除");
+      }
       if (type === "renameScript.result") toast("已重命名");
       if (type === "setScriptHotkey.result") {
         toast(
@@ -11400,12 +14312,43 @@
       closeAllOv();
       return;
     }
+    if (type === "scanScriptForExport.result") {
+      if (!msg.ok) {
+        const el = $("#expScan");
+        if (el) el.textContent = msg.detail || "检查失败";
+        return;
+      }
+      state._exportScan = msg;
+      renderExportScan(msg);
+      return;
+    }
+    if (type === "exportScriptAsExe.result") {
+      if (!msg.ok) {
+        if (msg.detail && msg.detail !== "cancelled") toast(msg.detail);
+        return;
+      }
+      const missing = Array.isArray(msg.missingRefs) ? msg.missingRefs : [];
+      if (missing.length) {
+        toast(`已导出，但有 ${missing.length} 个引用的子脚本没找到`);
+      } else if ((msg.skipped | 0) > 0) {
+        toast(`已导出，但有 ${msg.skipped} 个文件被跳过`);
+      } else {
+        toast(`已导出独立 EXE（${fmtBytes(msg.bytes)}）`);
+      }
+      if (msg.aiKeyEmbedded) {
+        toast("注意：AI 密钥已随 exe 打包，请只发给可信的人");
+      }
+      closeAllOv();
+      return;
+    }
     if (type === "exportScript.result") {
       if (!msg.ok) {
         if (msg.detail && msg.detail !== "cancelled") toast(msg.detail);
         return;
       }
       const skipped = msg.skipped | 0;
+      const missing = Array.isArray(msg.missingRefs) ? msg.missingRefs : [];
+      const parts = [];
       if (skipped > 0) {
         const files = Array.isArray(msg.skippedFiles) ? msg.skippedFiles : [];
         const names = files
@@ -11413,11 +14356,19 @@
           .filter(Boolean)
           .slice(0, 5);
         const more = files.length > 5 ? ` 等${files.length}个` : "";
-        toast(
+        parts.push(
           names.length
-            ? `导出成功，但有 ${skipped} 个文件被跳过：${names.join("、")}${more}`
-            : `导出成功，但有 ${skipped} 个文件被跳过`
+            ? `${skipped} 个文件被跳过：${names.join("、")}${more}`
+            : `${skipped} 个文件被跳过`
         );
+      }
+      if (missing.length) {
+        const names = missing.slice(0, 3).join("、");
+        const more = missing.length > 3 ? ` 等${missing.length}个` : "";
+        parts.push(`引用的子脚本找不到，未打包：${names}${more}`);
+      }
+      if (parts.length) {
+        toast(`导出成功，但${parts.join("；")}`);
       } else {
         toast("已导出");
       }
@@ -11427,13 +14378,12 @@
       if (!msg.ok) {
         if (msg.needInstall) {
           askConfirm("OCR 未就绪，是否打开安装/修复？", () => {
-            state._ocrRepair = false;
             if ($("#ocrStatus"))
-              $("#ocrStatus").textContent = "已就绪，点击安装开始下载安装…";
+              $("#ocrStatus").textContent = "已就绪，点击下方按钮开始安装或修复…";
             if ($("#ocrBar")) $("#ocrBar").style.width = "0%";
             if ($("#btnOcrInstall")) {
               $("#btnOcrInstall").disabled = false;
-              $("#btnOcrInstall").textContent = "安装插件";
+              $("#btnOcrInstall").textContent = "安装 / 修复";
             }
             openOv("ocr");
           });
@@ -11514,6 +14464,11 @@
       return;
     }
     if (type === "loadOptimizeRecording.result") {
+      // ⚠ 加载已挪到**后台线程**（大录制解析要几百 ms），结果可能晚到 —— 若用户在这期间
+      // 已经关掉优化窗，就丢弃它：否则下面的 tryRevealOptMode → revealModeAfterPaint
+      // 会对着一个已经关掉的界面调 qst.modeReady()，让壳按优化模式改窗口尺寸。
+      // （C++ 侧另有请求序号去重；这里只管「面板不在了」这一种。）
+      if (!document.body.classList.contains("opt-open")) return;
       if (!msg.ok) {
         endModeTransition("force");
         toast(msg.detail || "加载录制失败");
@@ -11719,6 +14674,7 @@
       const id = String(msg.id || "");
       const name = String(msg.name || "").trim();
       if (!id || !name) return;
+      if (/\[错误\]|\[提示\]|API\s*请求失败/.test(name)) return;
       const tab = findAgentTabById(id) || activeAgentTab();
       if (tab && (!tab.id || String(tab.id) === id)) {
         tab.id = id;
@@ -11813,7 +14769,7 @@
             /已取消|cancelled/i.test(String(msg.detail || "")) ||
             /已取消|cancelled/i.test(String(msg.reply || ""));
           state._agentCancelRequested = false;
-          toast(cancelled ? "已取消" : msg.detail || "发送失败");
+          toast(cancelled ? "已取消" : msg.detail || msg.reply || "发送失败");
           return;
         }
         if (tab.key === state.agentTabKey) {
@@ -11860,7 +14816,7 @@
         state.agentBusy = false;
         syncAgentSendBtn();
         if (!msg.ok) {
-          toast(msg.detail || "发送失败");
+          toast(msg.detail || msg.reply || "发送失败");
           return;
         }
       }
@@ -12061,12 +15017,10 @@
       if (track) track.classList.remove("indeterminate");
       if (bar) bar.style.width = msg.ok ? "100%" : "0%";
       const btn = $("#btnOcrInstall");
-      const repairBtn = $("#btnOcrRepair");
       if (btn) {
         btn.disabled = false;
-        btn.textContent = msg.ok ? "完成" : state._ocrRepair ? "修复/更新" : "安装插件";
+        btn.textContent = msg.ok ? "完成" : "安装 / 修复";
       }
-      if (repairBtn) repairBtn.disabled = false;
       if (msg.ok) {
         if ($("#ocrStatus")) $("#ocrStatus").textContent = msg.detail || "安装成功";
         toast("OCR 插件已安装");
@@ -12524,11 +15478,116 @@
     return "选中范围内至少需要两个鼠标移动点。";
   }
 
-  /** 只改勾选/高亮 class，避免整表 innerHTML 重绘闪烁 */
+  /// ── 优化列表选择态 ────────────────────────────────────────────
+  /// 选择态**只**存在 state.optSelected（下标数组，后端要的就是它）。
+  /// 渲染时一律**实时**读取，绝不在渲染时做快照 —— 原实现把
+  /// `new Set(optSelected)` 存进渲染批次里，于是「全选」之后滚动新出现的行
+  /// 仍是未选中态（用户报的「全选只能选到已加载的部分」就是这么来的）。
+  /// Set 只是查询缓存：改动选择后置 dirty，下次读取时重建。
+  function optSelSet() {
+    if (state._optSelDirty !== false || !(state._optSelSet instanceof Set)) {
+      state._optSelSet = new Set(Array.isArray(state.optSelected) ? state.optSelected : []);
+      state._optSelDirty = false;
+    }
+    return state._optSelSet;
+  }
+
+  function markOptSelDirty() {
+    state._optSelDirty = true;
+  }
+
+  // ── @opt-virtual-math:begin ──
+  // 纯函数：无 DOM、无 state 依赖。tools/verify/opt_list_virtual_scroll.js
+  // 提取本段源码做边界断言（改签名要同步改那个测试）。
+  /** 由滚动位置算需要渲染的行区间 [start, end)。overscan 上下各多渲染几行。 */
+  function computeOptWindow(scrollTop, viewH, rowH, total, overscan) {
+    if (!(total > 0) || !(rowH > 0)) return { start: 0, end: 0 };
+    const over = Math.max(0, overscan | 0);
+    const top = Math.max(0, Number(scrollTop) || 0);
+    const vh = Math.max(1, Number(viewH) || 1);
+    let start = Math.floor(top / rowH) - over;
+    if (start < 0) start = 0;
+    let end = Math.ceil((top + vh) / rowH) + over;
+    if (end > total) end = total;
+    if (end < start) end = start;
+    return { start, end };
+  }
+
+  /**
+   * 超长列表的**滚动压缩映射**（browser 单元素高度上限 ≈ 33,554,432px，
+   * 保守取 16,000,000 —— Safari/Firefox 更低，官网 Demo 要在真浏览器里跑）。
+   * 超过上限时 scrollbar 会失效、**滚不到列表末尾**（静默），所以必须压缩。
+   *
+   * 行**仍按真实行高渲染**（不视觉压扁），只把「可滚动区间」线性对齐：
+   *
+   *   realMax = actualSize  − viewH     （真实可滚距离）
+   *   virtMax = virtualSize − viewH     （压缩后可滚距离）
+   *   ratio   = virtMax / realMax
+   *   actualOffset = scrollTop / ratio  （压缩位置 → 真实偏移）
+   *
+   * ⚠⚠ 必须对齐**可滚动区间**，不能直接按总高比例（ratio = virtualSize/actualSize）：
+   *   后者滚到底时真实偏移只能到 `actualSize − viewH/ratio`，于是**最后一屏
+   *   （viewH/ratio/rowH 行）永远滚不到** —— 列表越长漏得越多（70 万条漏约 39 行）。
+   *   对齐区间后：scrollTop=0 → 顶部；scrollTop=virtMax → 真实偏移正好
+   *   `actualSize − viewH` ⇒ 最后一行落在视口内。
+   * 该映射是双射 ⇒ 每个行号都可达；ratio === 1 时退化为恒等（零行为变化）。
+   */
+  function computeOptScale(total, rowH, maxVirtual, viewH) {
+    const n = Number(total);
+    const h = Number(rowH);
+    const cap = Number(maxVirtual);
+    const vh = Number(viewH);
+    // 非有限值一律当 0 处理：Infinity 会一路传成 spacer 高度/scrollTop 的 NaN，
+    // 静默把列表弄成空白（虽然 actions.length 不可能无穷，但这条路径零成本兜底）。
+    const actualSize =
+      Number.isFinite(n) && n > 0 && Number.isFinite(h) && h > 0 ? n * h : 0;
+    const view = Number.isFinite(vh) && vh > 0 ? vh : 0;
+    if (!(actualSize > 0) || !Number.isFinite(cap) || !(cap > 0) || actualSize <= cap) {
+      return { actualSize, virtualSize: actualSize, ratio: 1 };
+    }
+    const virtualSize = cap;
+    const realMax = Math.max(0, actualSize - view);
+    const virtMax = Math.max(0, virtualSize - view);
+    return {
+      actualSize,
+      virtualSize,
+      ratio: realMax > 0 && virtMax > 0 ? virtMax / realMax : 1,
+    };
+  }
+  // ── @opt-virtual-math:end ──
+
+  /// 浏览器单元素高度的保守上限（Chrome/Edge ≈33.5M、Firefox ≈17.8M、Safari ≈16.7M）。
+  /// 官网 Demo 用的是同一份 app.js、跑在真浏览器里 ⇒ 取跨浏览器安全值。
+  const OPT_MAX_VSPACE_PX = 16_000_000;
+  /// 窗口还不可见（clientHeight=0）时的视口高估值，仅用于首帧算窗口范围。
+  const OPT_FALLBACK_VIEW_H = 900;
+
+  /// 单个优化行的高度（px）。CSS 里 `.opt-list .arow{height:38px * --qst-opt-u}`
+  /// 是固定的 ⇒ 虚拟滚动可以纯数学定位，不必逐行测量。
+  /// 优先用实测值（calibrateOptRowHeight 写入），否则由 --qst-opt-u 推算。
+  function optRowHeightPx() {
+    const cached = Number(state._optRowH);
+    if (Number.isFinite(cached) && cached > 1) return cached;
+    const u = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--qst-opt-u")
+    );
+    return Number.isFinite(u) && u > 0 ? 38 * u : 38 * 1.491;
+  }
+
+  /// 当前列表视口高（px）。窗口还不可见时用估值，只影响首帧窗口范围与压缩比。
+  /// ⚠ 压缩比依赖它（见 computeOptScale）：行按真实行高渲染 ⇒ 视口容量恒为 viewH。
+  function optViewportH(list) {
+    const el = list || $("#optList");
+    const h = el ? el.clientHeight : 0;
+    return h > 1 ? h : OPT_FALLBACK_VIEW_H;
+  }
+
+  /** 只改勾选/高亮 class，避免整表 innerHTML 重绘闪烁。
+   *  窗口化之后 #optList 里只有窗口内的几十行 ⇒ 这里是 O(窗口)，不再随条数增长。 */
   function syncOptListSelectionUi() {
     const list = $("#optList");
     if (!list) return;
-    const selSet = new Set(state.optSelected || []);
+    const selSet = optSelSet();
     list.querySelectorAll(".arow").forEach((row) => {
       const i = row.dataset.i | 0;
       const on = selSet.has(i);
@@ -12549,64 +15608,226 @@
     syncOptSelCount();
     if (state.optHighlight >= 0) {
       const hiRow = list.querySelector(`.arow[data-i="${state.optHighlight}"]`);
-      hiRow?.scrollIntoView({ block: "nearest" });
+      // 窗口化后高亮行常常不在当前窗口里 ⇒ 先把它滚进来，再交给 CSS 定位
+      if (hiRow) hiRow.scrollIntoView({ block: "nearest" });
+      else scrollOptToIndex(state.optHighlight);
     }
+  }
+
+  /// 单行 HTML（原逻辑原样抽出，供窗口化复用）。
+  function optRowHtml(a, i, selSet, progressive) {
+    const label = optActionDisplayName(a);
+    const on = selSet.has(i);
+    const hi = state.optHighlight === i;
+    const keyOp = isOptKeyOperation(a);
+    const tone = keyOp ? "" : i % 2 === 0 ? "tone-a" : "tone-b";
+    const cls = [
+      "arow",
+      on ? "checked" : "",
+      hi ? "focus" : "",
+      keyOp ? "key-op" : "",
+      tone,
+      progressive ? "reveal-in" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const delay = progressive ? ` style="animation-delay:${Math.min(i, 40) * 10}ms"` : "";
+    return `<div class="${cls}" data-i="${i}"${delay}>
+        <span class="chk ${on ? "on" : ""}" data-opt-sel="${i}"><i>${on ? "✓" : ""}</i></span>
+        <span class="${on ? "" : "muted"}">${String(i + 1)}</span>
+        <span class="opt-aname">${esc(label)}</span>
+        <span class="${on ? "" : "muted"}">${esc(a.remark || "")}</span>
+      </div>`;
+  }
+
+  /// ── 优化列表虚拟滚动（窗口化）──────────────────────────────────
+  /// 原「分批追加」只解决了首屏：DOM 仍随滚动**无限累积**，5.8 万行时光滚动
+  /// 就卡死（每行还带 tone/checked 的 inset 阴影，几十万个节点一起重绘）。
+  /// 现在改成真·窗口化：DOM 恒定 = 视口行数 + 上下 overscan，条数再多也不影响滚动。
+  /// 行高固定（CSS `height:38px * --qst-opt-u`）⇒ spacer 撑总高 + 窗口绝对定位，
+  /// 纯数学定位，不需要逐行测量。
+  const OPT_VIRT_OVERSCAN = 12;
+  /// 小数据量仍走一次性渲染（保留入场动画，视觉与旧版一致）。
+  const OPT_RENDER_CHUNK = 300;
+
+  /** 建窗口骨架：spacer 撑起 virtualSize 的总高，窗口在其中绝对定位。 */
+  function buildOptViewport(list, actions) {
+    state._optRowH = 0; // 每次打开都按当前缩放倍率重推，别吃上一次的缓存
+    const rowH = optRowHeightPx();
+    const sc = computeOptScale(actions.length, rowH, OPT_MAX_VSPACE_PX, optViewportH(list));
+    list.innerHTML =
+      '<div class="opt-vspace" id="optVspace"><div class="opt-vwin" id="optWin"></div></div>';
+    const vspace = $("#optVspace");
+    if (vspace) vspace.style.height = sc.virtualSize + "px";
+    state._optVirt = {
+      total: actions.length,
+      rowH,
+      start: -1,
+      end: -1,
+      actions,
+      actualSize: sc.actualSize,
+      virtualSize: sc.virtualSize,
+      ratio: sc.ratio,
+    };
+    return state._optVirt;
+  }
+
+  /// 行高 / 视口变化（首窗口实测校准、缩放倍率变化、壳切模式）后，重算总高与压缩比。
+  function applyOptRowHeight(v, h) {
+    v.rowH = h;
+    const sc = computeOptScale(v.total, h, OPT_MAX_VSPACE_PX, optViewportH());
+    v.actualSize = sc.actualSize;
+    v.virtualSize = sc.virtualSize;
+    v.ratio = sc.ratio;
+    const vspace = $("#optVspace");
+    if (vspace) vspace.style.height = sc.virtualSize + "px";
+    v.start = -1;
+    v.end = -1;
+  }
+
+  /** 只渲染窗口内的行。start/end 没变就直接返回（滚动时会大量调用）。 */
+  function renderOptWindow(force) {
+    const list = $("#optList");
+    const v = state._optVirt;
+    if (!list || !v) return;
+    const win = $("#optWin");
+    if (!win) return;
+    const viewH = optViewportH(list);
+    const scrollTop = list.scrollTop;
+    // 压缩映射：scrollTop 在「压缩空间」，行位置在「真实空间」。
+    // 行按真实行高渲染 ⇒ 视口在真实空间里也只装得下 viewH（不是 viewH/ratio）。
+    const actualOffset = v.ratio === 1 ? scrollTop : scrollTop / v.ratio;
+    const w = computeOptWindow(actualOffset, viewH, v.rowH, v.total, OPT_VIRT_OVERSCAN);
+    if (!force && w.start === v.start && w.end === v.end) return;
+    v.start = w.start;
+    v.end = w.end;
+    const selSet = optSelSet(); // 实时读取 ⇒ 全选后滚到哪儿都是勾选态
+    const parts = [];
+    for (let i = w.start; i < w.end; ++i) {
+      parts.push(optRowHtml(v.actions[i], i, selSet, false));
+    }
+    win.innerHTML = parts.join("");
+    // 窗口贴住视口：元素的 content 坐标 = 当前 scrollTop + (首行的真实位置 − 当前真实偏移)。
+    // 这样窗口在视口里的位置恒等于「首行相对视口的偏移」，压缩与否都成立。
+    win.style.transform =
+      "translateY(" + (scrollTop + w.start * v.rowH - actualOffset) + "px)";
+  }
+
+  /// 首窗口渲染后量一次真实行高：CSS 的 u 缩放有取整误差，
+  /// 累积到 5.8 万行会明显漂移（滚动条位置与内容错位）。
+  function calibrateOptRowHeight() {
+    const v = state._optVirt;
+    const win = $("#optWin");
+    const row = win && win.firstElementChild;
+    if (!v || !row) return;
+    const h = row.getBoundingClientRect().height;
+    if (!(h > 1) || Math.abs(h - v.rowH) < 0.5) return;
+    applyOptRowHeight(v, h);
+    renderOptWindow(true);
+  }
+
+  /** 滚动 / 视口变化只绑一次（#optList 是静态 DOM，跨多次加载复用）。 */
+  function bindOptVirtualScroll(list) {
+    if (list._qstVirtBound) return;
+    list._qstVirtBound = true;
+    list.addEventListener(
+      "scroll",
+      () => {
+        if (!state._optVirt) return;
+        if (state._optScrollRaf) return;
+        state._optScrollRaf = requestAnimationFrame(() => {
+          state._optScrollRaf = 0;
+          renderOptWindow(false);
+        });
+      },
+      { passive: true }
+    );
+    // 壳 setMode / 用户改缩放倍率都会改变视口与行高 ⇒ 重算总高并重绘。
+    if (typeof ResizeObserver === "function") {
+      const ro = new ResizeObserver(() => {
+        if (!state._optVirt) return;
+        if (state._optResizeRaf) return;
+        state._optResizeRaf = requestAnimationFrame(() => {
+          state._optResizeRaf = 0;
+          const v = state._optVirt;
+          if (!v) return;
+          state._optRowH = 0; // 倍率可能变了 ⇒ 重新推算
+          applyOptRowHeight(v, optRowHeightPx());
+          renderOptWindow(true);
+          requestAnimationFrame(calibrateOptRowHeight);
+        });
+      });
+      ro.observe(list);
+      state._optResizeObserver = ro;
+    }
+  }
+
+  /** 滚到指定行（关键操作查找 / 高亮定位）。小数据量走原生 scrollIntoView。 */
+  function scrollOptToIndex(i) {
+    const list = $("#optList");
+    const v = state._optVirt;
+    if (!list) return;
+    if (!v) {
+      list.querySelector(`.arow[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    const viewH = optViewportH(list);
+    const viewActual = viewH; // 行按真实行高渲染 ⇒ 视口真实容量就是 viewH
+    const scrollTop = list.scrollTop;
+    const curActual = v.ratio === 1 ? scrollTop : scrollTop / v.ratio;
+    const rowTop = i * v.rowH;
+    const rowBottom = rowTop + v.rowH;
+    let wantActual = curActual;
+    if (rowTop < curActual) wantActual = rowTop - v.rowH * 2;
+    else if (rowBottom > curActual + viewActual) wantActual = rowBottom - viewActual + v.rowH * 2;
+    if (wantActual !== curActual) {
+      // 真实偏移 → 压缩空间；再夹到可滚动范围（压缩后 maxScroll = virtualSize − viewH）
+      const maxTop = Math.max(0, v.virtualSize - viewH);
+      list.scrollTop = Math.max(0, Math.min(maxTop, wantActual * v.ratio));
+    }
+    v.start = -1;
+    v.end = -1;
+    renderOptWindow(true);
   }
 
   function renderOptListRows(opts) {
     const list = $("#optList");
     if (!list) return;
     if (!Array.isArray(state.optSelected)) state.optSelected = [];
-    const selSet = new Set(state.optSelected);
+    markOptSelDirty();
     const actions = state.optActions || [];
     const progressive =
       !!opts?.progressive || document.body.classList.contains("progressive-opt");
-    const rows = actions.map((a, i) => {
-      const label = optActionDisplayName(a);
-      const on = selSet.has(i);
-      const hi = state.optHighlight === i;
-      const keyOp = isOptKeyOperation(a);
-      const tone = keyOp ? "" : i % 2 === 0 ? "tone-a" : "tone-b";
-      const cls = [
-        "arow",
-        on ? "checked" : "",
-        hi ? "focus" : "",
-        keyOp ? "key-op" : "",
-        tone,
-        progressive ? "reveal-in" : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
-      const delay = progressive ? ` style="animation-delay:${Math.min(i, 40) * 10}ms"` : "";
-      return `<div class="${cls}" data-i="${i}"${delay}>
-          <span class="chk ${on ? "on" : ""}" data-opt-sel="${i}"><i>${on ? "✓" : ""}</i></span>
-          <span class="${on ? "" : "muted"}">${String(i + 1)}</span>
-          <span class="opt-aname">${esc(label)}</span>
-          <span class="${on ? "" : "muted"}">${esc(a.remark || "")}</span>
-        </div>`;
-    });
+
     const finish = () => {
       syncOptSelCount();
       if (state.optHighlight >= 0) {
         const hiRow = list.querySelector(`.arow[data-i="${state.optHighlight}"]`);
-        hiRow?.scrollIntoView({ block: "nearest" });
+        if (hiRow) hiRow.scrollIntoView({ block: "nearest" });
+        else scrollOptToIndex(state.optHighlight);
       }
       if (opts && typeof opts.onDone === "function") opts.onDone();
     };
-    const CHUNK = 48;
-    if (!progressive || rows.length <= CHUNK) {
-      list.innerHTML = rows.join("");
+
+    // 小数据量：保持原路径（一次性渲染 + 入场动画）。
+    if (actions.length <= OPT_RENDER_CHUNK) {
+      state._optVirt = null;
+      const selSet = optSelSet();
+      list.innerHTML = actions.map((a, i) => optRowHtml(a, i, selSet, progressive)).join("");
       finish();
       return;
     }
-    list.innerHTML = "";
-    // 先揭开模糊，再分批填入动作行（时长跟数据量/帧率走）
+
+    // 大数据量：窗口化。只渲染首窗口，之后滚动只是替换窗口内容（DOM 恒定）。
     endProgressiveLoad();
-    const chunks = [];
-    for (let i = 0; i < rows.length; i += CHUNK) {
-      chunks.push(rows.slice(i, i + CHUNK).join(""));
-    }
-    appendActionRowsChunked(list, chunks, finish);
+    // 让上一次还没跑完的渐进流程失效。
+    state._progressiveToken = (state._progressiveToken | 0) + 1;
+    buildOptViewport(list, actions);
+    list.scrollTop = 0;
+    bindOptVirtualScroll(list);
+    renderOptWindow(true);
+    requestAnimationFrame(calibrateOptRowHeight);
+    finish();
   }
 
   function fillOptUi(rec, opts) {
@@ -12614,6 +15835,12 @@
     state.optPath = rec.path || state.optPath || "";
     state.optSelected = [];
     state.optHighlight = -1;
+    // 上一份录制的窗口化状态作废（总条数/行高缓存都要重来）
+    state._optVirt = null;
+    state._optRowH = 0;
+    // 「关键操作查找」的游标也要重置，否则换一份录制后仍从上一份的行号往下找
+    state._optKeySearchIdx = null;
+    markOptSelDirty();
     if (!opts?.keepName && $("#optName")) $("#optName").textContent = rec.name || "";
     const dur = Number(rec.durationSeconds);
     const durTxt = Number.isFinite(dur) ? dur.toFixed(2) + "s" : "—";
@@ -12797,7 +16024,7 @@
       if (state.editor) openEditorSettings();
       else openOv("settings");
     });
-    window.addEventListener("qst:exit-editor", () => exitEditor());
+    window.addEventListener("qst:exit-editor", () => requestLeaveEditor("x"));
     installPlainTextPaste();
     bindTypingHotkeyMute();
     bindEditorActionShortcuts();
@@ -13035,6 +16262,8 @@
         const p = it.profile || findAiSavedProfile(it.v);
         if (p) applyAiProfileToForm(p);
         else if ($("#aiModelName")) $("#aiModelName").textContent = state.agentModel;
+        // ★ 切换模型 ⇒ 立刻重排设置页：API 组件 ↔ 窗口应用组件（互斥显示）
+        if (typeof syncAiPaneMode === "function") syncAiPaneMode();
         quietSaveSettings(collectSettings());
       });
     });
@@ -13053,8 +16282,8 @@
       showPopup(
         e.currentTarget,
         [
-          { t: "全屏模式", v: 0 },
-          { t: "窗口模式", v: 1 },
+          { t: "前台模式", v: 0 },
+          { t: "后台窗口模式", v: 1 },
         ],
         (it) => {
           state.recWindowMode = it.v | 0;
@@ -13537,6 +16766,22 @@
     $("#recList")?.addEventListener("scroll", onListScroll, { passive: true });
     $("#aiList")?.addEventListener("scroll", onListScroll, { passive: true });
 
+    $("#btnExportExeOk")?.addEventListener("click", confirmExportExe);
+    $("#expTargetRadios")?.addEventListener("click", (ev) => {
+      const item = ev.target.closest(".radio");
+      if (!item) return;
+      $$("#expTargetRadios .radio").forEach((r) => r.classList.toggle("on", r === item));
+      syncExportTargetRadios();
+    });
+    $("#expBundledOpenCv")?.addEventListener("click", (ev) => {
+      ev.currentTarget.classList.toggle("on");
+      updateExportSize();
+    });
+    $("#expBundledOcr")?.addEventListener("click", (ev) => {
+      ev.currentTarget.classList.toggle("on");
+      updateExportSize();
+    });
+
     $("#btnMacroImport")?.addEventListener("click", () => {
       if (window.qst) qst.importScript("macro");
     });
@@ -13546,7 +16791,7 @@
         toast("请先选中要导出的宏");
         return;
       }
-      if (window.qst) qst.exportScript(itemPath(m));
+      startExport(itemPath(m), m.name);
     });
     $("#btnRecImport")?.addEventListener("click", () => {
       if (window.qst) qst.importScript("recording");
@@ -13557,70 +16802,86 @@
         toast("请先选中要导出的录制");
         return;
       }
-      if (window.qst) qst.exportScript(itemPath(r));
+      startExport(itemPath(r), r.name);
     });
 
-    $("#edActionType")?.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const anchor = e.currentTarget;
-      const mergeOn = isMergeEligible();
-      const shown = editorParamAction();
-      const curType = (shown && shown.type) || state.addActionType;
-      const types = mergeOn
-        ? pickerMergeContainerTypes()
-        : pickerActionTypes(curType);
-      const sel = types.findIndex((a) => a.v === curType);
-      showPopup(
-        anchor,
-        types,
-        (it) => {
-          if (!it) return;
-          state.addActionType = it.v;
-          anchor.textContent = it.t;
-          if (mergeOn) {
-            showAddTypePreview();
-            return;
+    const bindActionTypeCombo = () => {
+      const input = $("#edActionType");
+      const caret = $("#edActionTypeCaret");
+      const box = $("#edActionTypeBox");
+      if (input && !input._qstTypeBound) {
+        input._qstTypeBound = true;
+        input.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openActionTypeMenu();
+        });
+        input.addEventListener("focus", () => {
+          const cur = ACTION_TYPES.find((a) => a.v === state.addActionType);
+          if (cur && actionTypeComboText().trim() === cur.t) {
+            try {
+              input.select();
+            } catch (err) {}
           }
-          // 选中动作时：切换类型 = 转换当前动作草稿（对齐原生 ActionFromForm +
-          // ModifySelected）。未选中时保持“添加新动作”预览语义。
-          if (
-            state.actionSel >= 0 &&
-            state.editorActions[state.actionSel] &&
-            !state.addPreview
-          ) {
-            if (!state.editDraft) loadEditDraftFromSelection();
-            if (state.editDraft) {
-              readParamPanelInto(state.editDraft);
-              const remark = ($("#edRemark")?.textContent || "").trim() || state.editDraft.remark;
-              const fresh = defaultAction(it.v, remark);
-              const merged = Object.assign({}, fresh, state.editDraft);
-              merged.type = it.v;
-              merged.name = typeLabel(it.v);
-              merged.remark = remark;
-              delete merged._preview;
-              state.editDraft = merged;
-              state.addPreview = null;
-              renderParamPanel(state.editDraft);
-              return;
-            }
+          openActionTypeMenu();
+        });
+        input.addEventListener("input", () => {
+          openActionTypeMenu();
+        });
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            hidePopup();
+            syncEditorActionTypeCombo();
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            const types = filteredActionTypes(actionTypeFilterQuery());
+            if (types[0] && types[0].v) applyPickedActionType(types[0]);
+            else hidePopup();
+          } else if (e.key === "ArrowDown") {
+            e.preventDefault();
+            openActionTypeMenu();
           }
-          showAddTypePreview();
-        },
-        { minRows: 10, selectedIndex: sel >= 0 ? sel : 0 }
-      );
-    });
+        });
+      }
+      if (caret && !caret._qstTypeBound) {
+        caret._qstTypeBound = true;
+        caret.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+        caret.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openActionTypeMenu({ toggle: true });
+        });
+      }
+      if (box && !box._qstTypeBound) {
+        box._qstTypeBound = true;
+        box.addEventListener("click", (e) => {
+          if (e.target === caret || (caret && caret.contains(e.target))) return;
+          if (e.target === input) return;
+          e.stopPropagation();
+          openActionTypeMenu();
+        });
+      }
+    };
+    bindActionTypeCombo();
 
     // 右键动作：剪切/复制/粘贴 + 断点 / 从这里开始调试
     $("#actionList")?.addEventListener("contextmenu", (e) => {
       if (state.debugging) return;
+      flushPendingLiveEdit();
       if (state.batchMode) {
         e.preventDefault();
         e.stopPropagation();
         const row = e.target.closest(".arow");
         const i = row ? +row.dataset.i : -1;
+        const priorSel = selectedBatchIndices();
         prepareBatchContextSelection(i);
-        showEditorBatchContextMenu(e.clientX, e.clientY);
+        showEditorBatchContextMenu(e.clientX, e.clientY, {
+          clickIndex: i,
+          priorSel: priorSel,
+        });
         return;
       }
       const row = e.target.closest(".arow");
@@ -13643,6 +16904,15 @@
           { t: "转到可视化", v: "visual" }
         );
         const act = state.editorActions[i];
+        if (editorDisableModifyOn() && !isEditorVisualMode()) {
+          items.push(
+            { t: "插入到此项前", v: "insertBefore" },
+            { t: "插入到此项后", v: "insertAfter" }
+          );
+          if (act && isSubtreeContainerType(act.type)) {
+            items.push({ t: "添加为子节点", v: "insertChild" });
+          }
+        }
         if (act && isDisassemblableType(act.type)) {
           items.push({ t: "拆解为动作", v: "disassemble" });
         }
@@ -13675,7 +16945,10 @@
                   requestAnimationFrame(() => V.selectAction(i));
                 }
               }
-            } else if (it.v === "disassemble") disassembleEditorAction(i);
+            } else if (it.v === "insertBefore") insertAndSelectFormAction(i, "before");
+            else if (it.v === "insertAfter") insertAndSelectFormAction(i, "after");
+            else if (it.v === "insertChild") insertAndSelectFormAction(i, "asChild");
+            else if (it.v === "disassemble") disassembleEditorAction(i);
           },
           { preferUp: true }
         );
@@ -13693,6 +16966,7 @@
       const i = +row.dataset.i;
       const act = e.target.closest("[data-act]")?.dataset.act;
       if (act === "expand-toggle") {
+        flushPendingLiveEdit();
         toggleContainerExpand(i);
         renderEditorActions(state.editorActions);
         return;
@@ -13708,6 +16982,7 @@
       }
       if (act === "batch-toggle") return;
       if (act === "copy") {
+        flushPendingLiveEdit();
         const src = state.editorActions[i];
         if (!src) return;
         e.preventDefault();
@@ -13746,13 +17021,15 @@
         return;
       }
       if (act === "del") {
+        if (i !== state.actionSel) flushPendingLiveEdit();
         deleteSubtreeAt(i);
         state.addPreview = null;
         renderEditorActions(state.editorActions);
         if (state.actionSel < 0) showAddTypePreview();
         return;
       }
-      // 对齐 exe：再点已选中行 → 取消选中并恢复添加草稿（未点修改的改动丢弃）
+      flushPendingLiveEdit();
+      // 再点已选中行：写回后取消选中，恢复添加预览
       if (state.actionSel === i) {
         const prev = state.actionSel;
         state.actionSel = -1;
@@ -13766,33 +17043,21 @@
         state._skipReadback = false;
         return;
       }
-      const prevSel = state.actionSel;
-      state.actionSel = i;
-      state.addPreview = null;
-      loadEditDraftFromSelection();
-      {
-        const a = state.editDraft;
-        if (a && a.type) {
-          state.addActionType = a.type;
-          const typeCombo = $("#edActionType");
-          const cur = ACTION_TYPES.find((x) => x.v === a.type);
-          if (typeCombo && cur) typeCombo.textContent = cur.t;
-        }
-      }
-      state._skipReadback = true;
-      updateEditorSelectionUi(prevSel, i);
-      state._skipReadback = false;
-      focusEditorActionList();
+      selectEditorAction(i);
     });
 
     $("#btnEdAdd")?.addEventListener("click", (e) => {
       if (e.button !== 0) return;
+      if (shouldBatchInsertOnAdd()) {
+        commitBatchInsertAtSelection("after");
+        return;
+      }
       if (state.batchMode && isMergeEligible()) {
         const plan = analyzeMergeSelection(state.editorActions, selectedBatchIndices());
         const type =
           (state.addPreview && state.addPreview.type) || state.addActionType;
-        if (type === "defineBlock" || (plan && plan.contiguous)) {
-          runMergeWithPlacement(type === "defineBlock" ? "first" : "inplace");
+        if (type === "defineBlock" || type === "watchImage" || (plan && plan.contiguous)) {
+          runMergeWithPlacement(type === "defineBlock" || type === "watchImage" ? "first" : "inplace");
           return;
         }
         const point = { clientX: e.clientX, clientY: e.clientY };
@@ -13815,148 +17080,69 @@
         return;
       }
 
-      const remark = ($("#edRemark")?.textContent || "").trim();
-      let a;
-      if (state.addPreview && state.addPreview.type === state.addActionType) {
-        readParamPanelInto(state.addPreview);
-        a = Object.assign({}, state.addPreview);
-        delete a._preview;
-        a.remark = remark;
-        a.name = typeLabel(a.type);
-      } else if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
-        // 对齐原生 ActionFromForm：选中列表项时，添加的是右栏「动作详情」当前内容
-        // （含尚未点「修改」的改动），而不是重置成默认空动作
-        if (!state.editDraft) loadEditDraftFromSelection();
-        if (state.editDraft) {
-          readParamPanelInto(state.editDraft);
-          a = Object.assign({}, state.editDraft);
-          delete a._preview;
-          a.remark = remark;
-          a.name = typeLabel(a.type);
-        } else {
-          a = defaultAction(state.addActionType, remark);
-        }
-      } else {
-        a = defaultAction(state.addActionType, remark);
-      }
-
-      const finishInsert = (pos, indent) => {
-        if (!insertEditorAction(a, pos, indent)) return;
-        state.actionSel = -1;
-        state.batchMode = false;
-        state.addPreview = null;
-        renderEditorActions(state.editorActions);
-        // 对齐原生 TryInsertActionFromForm：添加成功后清空备注栏，避免下一条动作继承
-        const remarkEl = $("#edRemark");
-        if (remarkEl) remarkEl.textContent = "";
-        showAddTypePreview();
-      };
-
-      // DefineBlock：强制列表顶部 indent=0
-      if (a.type === "defineBlock") {
-        finishInsert(0, 0);
+      flushPendingLiveEdit();
+      const a = currentAddActionFromForm();
+      if (a.type === "defineBlock" || a.type === "watchImage") {
+        finishAddInsert(a, 0, 0);
         return;
       }
-
-      // 无选中：直接末尾，顶层缩进（勿因上一条是容器而变成其子节点）
       if (state.actionSel < 0 || state.actionSel >= state.editorActions.length) {
-        finishInsert(state.editorActions.length, 0);
+        finishAddInsert(a, state.editorActions.length, 0);
         return;
       }
-
       const sel = state.actionSel;
       const selAct = state.editorActions[sel];
-      finishInsert(subtreeEnd(sel), selAct.indent | 0);
+      applyAddPlacement({ v: "after" }, a, sel, selAct, (pos, indent) => finishAddInsert(a, pos, indent));
     });
     $("#btnEdAdd")?.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      const remark = ($("#edRemark")?.textContent || "").trim();
-      let a;
-      if (state.addPreview && state.addPreview.type === state.addActionType) {
-        readParamPanelInto(state.addPreview);
-        a = Object.assign({}, state.addPreview);
-        delete a._preview;
-        a.remark = remark;
-        a.name = typeLabel(a.type);
-      } else if (state.actionSel >= 0 && state.editorActions[state.actionSel]) {
-        if (!state.editDraft) loadEditDraftFromSelection();
-        if (state.editDraft) {
-          readParamPanelInto(state.editDraft);
-          a = Object.assign({}, state.editDraft);
-          delete a._preview;
-          a.remark = remark;
-          a.name = typeLabel(a.type);
-        } else {
-          a = defaultAction(state.addActionType, remark);
-        }
-      } else {
-        a = defaultAction(state.addActionType, remark);
+      if (shouldBatchInsertOnAdd()) {
+        const point = { clientX: e.clientX, clientY: e.clientY };
+        requestAnimationFrame(() => {
+          showPopup(
+            point,
+            [
+              { t: "插入到选择项前", v: "before" },
+              { t: "插入到选择项后", v: "after" },
+            ],
+            (it) => {
+              if (!it) return;
+              commitBatchInsertAtSelection(it.v);
+            },
+            { preferUp: true }
+          );
+        });
+        return;
       }
-
-      const finishInsert = (pos, indent) => {
-        if (!insertEditorAction(a, pos, indent)) return;
-        state.actionSel = -1;
-        state.batchMode = false;
-        state.addPreview = null;
-        renderEditorActions(state.editorActions);
-        const remarkEl = $("#edRemark");
-        if (remarkEl) remarkEl.textContent = "";
-        showAddTypePreview();
-      };
-
+      flushPendingLiveEdit();
+      const a = currentAddActionFromForm();
       const hasSel = state.actionSel >= 0 && state.actionSel < state.editorActions.length;
       const sel = hasSel ? state.actionSel : -1;
       const selAct = hasSel ? state.editorActions[sel] : null;
-      const items = hasSel
-        ? [
-            { t: "添加到最后", v: "last" },
-            { t: "插入到最前", v: "first" },
-            { t: "插入到选择项前", v: "before" },
-            { t: "插入到选择项后", v: "after" },
-          ]
-        : [
-            { t: "添加到最后", v: "last" },
-            { t: "插入到最前", v: "first" },
-          ];
-      if (hasSel && selAct && isSubtreeContainerType(selAct.type)) {
-        items.push({ t: "添加为子节点", v: "asChild" });
-      }
+      const items = addPlacementMenuItems(hasSel, selAct, a, true);
       const point = { clientX: e.clientX, clientY: e.clientY };
       requestAnimationFrame(() => {
         showPopup(point, items, (it) => {
-          if (!it) return;
-          if (a.type === "defineBlock") {
-            if (it.v !== "betweenKey") {
-              finishInsert(0, 0);
+          if (a.type === "defineBlock" || a.type === "watchImage") {
+            if (it && it.v !== "betweenKey") {
+              finishAddInsert(a, 0, 0);
               return;
             }
           }
-          let pos = state.editorActions.length;
-          let indent = -1;
-          if (it.v === "first") {
-            pos = 0;
-            indent = 0;
-          } else if (it.v === "before" && selAct) {
-            pos = sel;
-            indent = selAct.indent | 0;
-          } else if (it.v === "after" && selAct) {
-            pos = subtreeEnd(sel);
-            indent = selAct.indent | 0;
-          } else if (it.v === "asChild" && selAct) {
-            pos = subtreeEnd(sel);
-            indent = (selAct.indent | 0) + 1;
-          } else {
-            pos = state.editorActions.length;
-            indent = 0;
-          }
-          finishInsert(pos, indent);
+          applyAddPlacement(it, a, sel, selAct, (pos, indent) => finishAddInsert(a, pos, indent));
         }, { preferUp: true });
       });
     });
     $("#btnEdRemark")?.addEventListener("click", () => {
+      if (state.batchMode) {
+        if (editorDisableModifyOn()) return;
+        commitModifyBatch();
+        return;
+      }
       commitModifySelected();
     });
+    $("#edRemark")?.addEventListener("blur", () => liveCommitSelectedIfEnabled());
     $("#btnEdClear")?.addEventListener("click", () => {
         askConfirm("确定清空动作列表？", () => {
           visualNoteUndo();
@@ -14112,42 +17298,14 @@
       closeAllOv();
     });
 
-    $("#btnBackHome")?.addEventListener("click", () => exitEditor());
-    $("#btnEdCancel")?.addEventListener("click", () => exitEditor());
+    $("#btnBackHome")?.addEventListener("click", () => requestLeaveEditor("x"));
+    $("#btnEdCancel")?.addEventListener("click", () => requestLeaveEditor("cancel"));
     $("#btnDebugHotkey")?.addEventListener("click", () => openDebugHotkeyCapture());
     $("#btnEdSave")?.addEventListener("click", () => {
-      syncFormIntoSelectedBeforeSave();
-      if (!validateEditorBeforeSave()) return;
-      const wm = collectWindowModeForSave();
-      if (!validateWindowModeForSave(wm)) return;
-      const name =
-        ($("#edName")?.textContent || "").trim() || state.editorName || ("鼠标宏-" + Math.floor(Date.now() / 1000));
-      if (!window.qst) {
-        toast("无桥接环境");
-        return;
-      }
-      const doSave = () => {
-        qst.saveEditor({
-          path: state.editorPath || "",
-          name,
-          breakoutTimeSeconds: parseFloat(($("#edBreakout")?.textContent || "0")) || 0,
-          mode: state.editorMode | 0,
-          windowMode: wm,
-          actions: state.editorActions,
-          visualLayout: collectVisualLayoutForSave(),
-        });
-      };
-      const V = window.QstVisualEditor;
-      if (V && typeof V.isVisual === "function" && V.isVisual() && typeof V.commitGraphToList === "function") {
-        V.commitGraphToList(function (ok) {
-          if (ok) doSave();
-        }, "与初始节点无关的流程会直接删除，确定保存？");
-        return;
-      }
-      doSave();
+      saveEditorNow({ intent: "manual" });
     });
     $$("[data-exit-editor]").forEach((b) =>
-      b.addEventListener("click", () => exitEditor())
+      b.addEventListener("click", () => requestLeaveEditor("x"))
     );
 
     $("#btnRenameOk")?.addEventListener("click", () => {
@@ -14275,6 +17433,10 @@
     // 脚本/启停热键：Web #ov-hotkey + LL（不再走原生 HotkeyCapture）
     $("#ov-settings .dlg-foot .btn.primary")?.addEventListener("click", () => {
       if (!window.qst) return;
+      if (readUiScaleFactorInput(true) == null) {
+        toast("界面缩放倍率必须为正数");
+        return;
+      }
       const wantDebug = !!$("#setDebugWin")?.classList.contains("on");
       state._announceSettingsSave = true;
       const payload = collectSettings();
@@ -14304,11 +17466,22 @@
           visualBlockCallWires: true,
           visualIfWrap: true,
           visualBlockWrap: true,
+          visualWatchWrap: true,
           visualJumpWires: true,
           visualShowGrid: true,
           visualShowCardId: true,
           editorActionOrder: [],
           editorHiddenActions: [],
+          editorCatalogPreset: "all",
+          editorCustomActionOrder: [],
+          editorCustomHiddenActions: [],
+          editorSearchAllActions: false,
+          editorHideFixedVars: false,
+          editorHideCoordVars: false,
+          editorMultiResultPlaceholderOnly: false,
+          editorDisableModifyButton: false,
+          editorAutoSaveOnExit: false,
+          editorEnableBatchInsert: false,
         };
         fillEditorSettingsForm(defaults);
         persistEditorSettings(defaults, true);
@@ -14534,9 +17707,15 @@
         toast(err);
         return;
       }
+      const compressOn = $("#optCompressRadios .radio.on");
+      const waitCalculation = (compressOn && compressOn.dataset.merge) || "first";
+      const waitVal = parseFloat($("#optCompressWait")?.textContent || "0.1") || 0.1;
       applyOptimizePayload({
         scheme: 3,
-        compressWait: parseFloat($("#optCompressWait")?.textContent || "0.1") || 0.1,
+        waitCalculation,
+        mergeWaitValue: waitVal,
+        waitValue: waitVal,
+        compressWait: waitVal,
         distanceThreshold: parseFloat($("#optCompressDist")?.textContent || "1") || 1,
       });
     });
@@ -14558,16 +17737,35 @@
       const custom = $("#optMergeCustom");
       if (custom) custom.style.display = r.dataset.merge === "fixed" ? "" : "none";
     });
+    $("#optCompressRadios")?.addEventListener("click", (e) => {
+      const r = e.target.closest(".radio");
+      if (!r) return;
+      $$("#optCompressRadios .radio").forEach((x) => x.classList.remove("on"));
+      r.classList.add("on");
+      const custom = $("#optCompressCustom");
+      if (custom) custom.style.display = r.dataset.merge === "fixed" ? "" : "none";
+    });
     $("#optList")?.addEventListener("click", (e) => {
       const row = e.target.closest(".arow");
       if (!row || !row.closest("#optList")) return;
       const i = row.dataset.i | 0;
       if (!Array.isArray(state.optSelected)) state.optSelected = [];
       const pos = state.optSelected.indexOf(i);
-      if (pos >= 0) state.optSelected.splice(pos, 1);
-      else state.optSelected.push(i);
-      state.optSelected.sort((a, b) => a - b);
+      if (pos >= 0) {
+        state.optSelected.splice(pos, 1);
+      } else {
+        // 保持有序（后端按序处理）：二分插入，别每次都全量 sort 几万项
+        let lo = 0;
+        let hi = state.optSelected.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (state.optSelected[mid] < i) lo = mid + 1;
+          else hi = mid;
+        }
+        state.optSelected.splice(lo, 0, i);
+      }
       state.optHighlight = i;
+      markOptSelDirty();
       // 就地更新勾选态，禁止整表重绘（否则 reveal 动画导致整列闪烁）
       syncOptListSelectionUi();
     });
@@ -14617,6 +17815,8 @@
         }
         state._optKeySearchIdx = found;
         state.optHighlight = found;
+        // 窗口化后目标行很可能不在 DOM 里 ⇒ 先滚过去（会渲染出该行）再高亮
+        scrollOptToIndex(found);
         syncOptListSelectionUi();
         toast(`关键操作 #${found + 1}`);
       });
@@ -14690,6 +17890,10 @@
           for (let i = sorted[0]; i <= sorted[sorted.length - 1]; ++i) next.push(i);
         }
         state.optSelected = next;
+        markOptSelDirty();
+        // 窗口化：重绘当前窗口，让**可见**的行立刻显示新勾选态；
+        // 窗口外的行不需要处理 —— 滚到时按最新 optSelected 渲染（不再有渲染快照）。
+        renderOptWindow(true);
         syncOptListSelectionUi();
       });
     });
@@ -14706,14 +17910,11 @@
         return;
       }
       if (state._ocrBusy) return;
-      const repair = !!state._ocrRepair;
       state._ocrBusy = true;
       if ($("#ocrDlgTitle"))
-        $("#ocrDlgTitle").childNodes[0].textContent = repair
-          ? "键鼠工坊-插件修复 "
-          : "键鼠工坊-插件安装 ";
+        $("#ocrDlgTitle").childNodes[0].textContent = "键鼠工坊-插件安装 ";
       if ($("#ocrStatus"))
-        $("#ocrStatus").textContent = repair ? "正在准备修复…" : "正在准备安装…";
+        $("#ocrStatus").textContent = "正在准备安装…";
       const bar = $("#ocrBar");
       const track = bar && bar.parentElement;
       if (track) track.classList.remove("indeterminate");
@@ -14722,18 +17923,7 @@
         btn.disabled = true;
         btn.textContent = "安装中...";
       }
-      if ($("#btnOcrRepair")) $("#btnOcrRepair").disabled = true;
-      qst.installOcr(repair);
-    });
-    $("#btnOcrRepair")?.addEventListener("click", () => {
-      if (state._ocrBusy) return;
-      state._ocrRepair = true;
-      if ($("#ocrDlgTitle"))
-        $("#ocrDlgTitle").childNodes[0].textContent = "键鼠工坊-插件修复 ";
-      if ($("#btnOcrInstall")) $("#btnOcrInstall").textContent = "修复/更新";
-      if ($("#ocrStatus"))
-        $("#ocrStatus").textContent = "已就绪，点击下方按钮开始修复/更新…";
-      $("#btnOcrInstall")?.click();
+      qst.installOcr(true);
     });
 
     // 调试窗勾选：产品路径 Web #debugFloat（引擎推送 debugWindow.*）
@@ -14875,14 +18065,14 @@
       if (!window.qst) return;
       if (state.macroRunning) {
         if ((state._runningMode | 0) <= 0) {
-          toast("正在运行的脚本未启用窗口模式");
+          toast("正在运行的脚本未启用窗口/后台窗口模式");
           return;
         }
         qst.showWindowModePreview({ fromRunning: 1 });
         return;
       }
       if ((state.editorMode | 0) === 0 && !(state.windowMode && state.windowMode.enabled)) {
-        toast("请先在编辑器启用窗口模式");
+        toast("请先在编辑器启用窗口/后台窗口模式");
         return;
       }
       qst.showWindowModePreview({
@@ -15007,6 +18197,11 @@
     setEditorVisualSelection,
     mergeVisualSelection,
     commitModifySelected,
+    flushPendingLiveEdit,
+    saveEditorNow,
+    editorAutoSaveOn,
+    markVisualLayoutDirty,
+    refreshVisualLayoutBaseline,
     syncEdRemarkFromSelection,
     editorParamAction,
     readParamPanelInto,

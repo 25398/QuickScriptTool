@@ -35,6 +35,15 @@ struct ScopedHideShell {
 
 /// AI/找图/截屏/点击前隐藏本进程用户可见窗（主壳、宏调试、AI 助手），避免进画面或挡点击。
 /// 析构时按原可见性恢复（SHOWNOACTIVATE，不抢前台）。
+///
+/// ★★**通用规则（docs §70.4）：凡是「给模型看的」或「用来做判断的」截图，都必须先构造它。**
+///   这不是"顺手好看"：AI 调试窗是**最顶层**的，而且它在**滚动追加模型自己的思考文本** ——
+///   漏藏一次，模型就会在自己的放大图里读到自己的独白，然后花整轮去猜"那是什么窗口、
+///   要不要点它的最小化按钮"（实测就这么烧掉过一轮 7KB 思考 / 14.6s）。
+///   已经藏了的：观察帧（`captureObservationNow` / `runWithOptionalAutoCapture`）、
+///   找图模板裁剪、OCR 区域动作、切窗台账、**`zoom` 放大图**、**`ocrProbeText` 落点复核**。
+///   ⚠ 加新的截图点（新工具、新复核、新裁剪）时，**先问这一句再写代码**：
+///     「这张图会给模型看、或会被本地拿去当判据吗？」是 → 把它包进这个作用域。
 struct ScopedHideOwnUiForCapture {
     std::vector<HWND> hwnds;
     std::vector<char> wasVisible; // 0/1，避免 vector<bool>
@@ -100,6 +109,25 @@ struct FindImageCropResult : OpError {
     bool unchanged = false;
     std::wstring imagePath;
     int offsetX = 0, offsetY = 0;
+};
+
+/// 准星取点的**坐标系选项**（2026-10-05）。
+///
+/// 背景：默认取到的是**屏幕绝对坐标**，而「后台窗口模式」回放时按**当前**窗口位置换算
+/// ⇒ 窗口一动，所有坐标动作整体偏移（用户报障：「后台窗口模式貌似使用的坐标是绝对坐标，
+/// 窗口移动后就不能使用了」）。⇒ 在**取点这一步**就把坐标转成目标窗口客户区，
+/// 从源头消除这个缺陷。对标 AutoHotkey 的 `CoordMode, Mouse, Client`。
+///
+/// ⚠ 匹配判据（**路径 + 类名是硬门，标题只作提示**）与引擎侧
+///   `ResolveWindowModeSelectMethod` 的 `windowNameIsHintOnly` 语义保持一致 ——
+///   标题易变（换文档 / 换标签页 / 游戏换场景），当硬匹配门会枚举不到窗口。
+struct CrosshairPickOptions {
+    /// true = 按目标窗口客户区取点（`x/y` 返回客户区像素，**允许负值**表示点在窗口外）。
+    /// false（默认）= 与旧行为**完全一致**，返回屏幕坐标。
+    bool windowClient = false;
+    std::wstring windowClassName;   ///< 顶层窗口类名（硬判据）
+    std::wstring exePath;           ///< 目标进程完整路径（硬判据，大小写不敏感）
+    std::wstring title;             ///< 标题（**仅提示/日志**，不参与匹配）
 };
 
 struct CrosshairPickResult : OpError {
@@ -205,7 +233,9 @@ FindImageMatchResult FindImageMatch(HWND owner, const FindImageMatchParams& para
 FindImageCropResult FindImageCropRect(const std::wstring& imagePathOrStored,
     int offsetX, int offsetY, int cropX, int cropY, int cropW, int cropH);
 /// 勿 ScopedHideShell：Crosshair 靠 SetCapture(owner)。
-CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8);
+/// ⚠ `opts` 传 nullptr = 旧行为（屏幕坐标），保证向后兼容。
+CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8,
+    const CrosshairPickOptions* opts = nullptr);
 WindowTargetResult PickWindowTarget(HWND owner);
 ActionKeyResult CaptureActionKey(HWND owner, const Hotkey& oldValue);
 HotkeyCaptureResult CaptureHotkey(HWND owner, const HotkeyCaptureParams& params);
@@ -217,6 +247,11 @@ BrowsePathResult BrowsePath(HWND owner, bool executableOnly);
 BrowsePathResult PickImageFile(HWND owner);
 
 /// 宏调试输出：GDI 用独立 MacroDebugWindow；Web 壳（SetWebUiEnabled）推 debugWindow.* JSON。
+///
+/// ★★**同时落一份盘**（`AppDir()\ai_action_debug.log`，见 docs §61）：
+///   调试窗是**视图**，不是记录本身。`AppendLog` 原先在「窗没建」时**直接丢弃**
+///   ⇒ 用户报的现象**没有任何可读的现场**，排查只能靠猜（这正是加它的原因）。
+///   落盘**不依赖** `IsCreated()`；上限 `kMacroDebugLogMaxBytes` 满了轮转一代 `.1`。
 class MacroDebugController {
 public:
     void SetWebUiEnabled(bool enabled);
@@ -236,6 +271,7 @@ public:
 
     void AppendLog(const std::wstring& text);
     void AppendLogBatch(const std::vector<std::wstring>& lines);
+    /// 清空**窗口**并截断**落盘日志**（「清空日志」在用户眼里是一件事，两个出口都必须清）。
     void ClearLog();
     /// Web 调试日志合并刷出（Timer Queue 回调）
     void FlushWebPendingLogs();
@@ -254,6 +290,16 @@ private:
     std::atomic<bool> webLogFlushScheduled_{false};
 };
 
+/// 落盘日志的**单行上限**与**文件上限**（超过则轮转一代 `.1`）。公开只是为了自检能断言。
+constexpr size_t kMacroDebugLogMaxLineChars = 4000;
+constexpr unsigned long long kMacroDebugLogMaxBytes = 4ull * 1024ull * 1024ull;
+/// 落盘日志路径（`AppDir()\ai_action_debug.log`）。自检与打包/文档都从这里取，别另写字面量。
+std::wstring MacroDebugLogFilePath();
+/// 直接往落盘日志追加一行（**不经过窗口**：即使调试窗从未创建也照写）。
+void AppendMacroDebugLogFile(const std::wstring& text);
+/// 截断落盘日志（`ClearLog` 用；也供自检复位）。
+void ClearMacroDebugLogFile();
+
 /// Shell 安装：与 PostToJs / SetJsPoster 同一通道。
 void SetMacroDebugWebPoster(std::function<void(std::string)> poster);
 
@@ -262,5 +308,20 @@ void DestroyMacroDebug();
 
 /// 打开调试窗：调用方传入 ReloadSettings / ApplyDebugWindowSetting。
 void RequestShowDebugWindow(const std::function<void()>& applyDebugWindowSetting);
+
+/// 录制 / 回放精度诊断行落盘：追加到 `AppDir()\recorder_diag.log`（与 findimage_diag.log
+/// 同级同格式，UTF-16LE + 时间戳）。
+///
+/// 为什么单独落盘：`[鼠标报告]` / `[录制结束]` / `[回放保真]` 这三行是判定「偏差在输入层
+/// 还是目标侧」的唯一依据，但它们原先只在**宏调试窗口已打开**时可见，而调试浮窗没有
+/// 复制/导出按钮 ⇒ 用户拿不出来，排查无法闭环。落盘后「把三行发我」= 发这个文件。
+///
+/// 不自己做门控（由调用方决定要不要写）；超限裁剪的行边界规则见
+/// `src/recorder_diag_log.h`（纯逻辑，有自检）。
+void AppendRecorderDiagLog(const std::wstring& line);
+
+/// 上述日志的**实际**路径（可能因只读安装目录回退到 `%LOCALAPPDATA%`）。
+/// 给自检读回、以及给用户排查时确认「文件到底在哪」。
+std::wstring RecorderDiagLogPath();
 
 }  // namespace qst::desktop_tools

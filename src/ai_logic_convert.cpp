@@ -390,7 +390,7 @@ ScriptAction MakeOcrCapture(const std::wstring& varName, int indent,
     a.type = ActionType::TextRecognition;
     a.searchFullScreen = true;
     a.ocrResultMode = 0; // 获取文字
-    a.ocrFollowUp = 2;   // 保存变量
+    a.ocrFollowUp = 2;   // 保存结果（mode=0 ⇒ 存识别到的文字）
     a.matchVarName = varName;
     a.indent = indent;
     a.remark = L"文字识别：动态列表";

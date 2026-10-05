@@ -499,7 +499,7 @@ bool RelaunchChromiumWithRemoteDebuggingImpl(const std::wstring& browserExe, int
     if (port <= 0) port = 9222;
     const std::wstring leaf = BrowserProcessLeafName(browserExe);
 
-    WindowModeLogf(L"[窗口模式] 自动兼容重启浏览器（恢复标签 + remote-debugging-port=%d），无需手动调试",
+    WindowModeLogf(L"[窗口/后台窗口模式] 自动兼容重启浏览器（恢复标签 + remote-debugging-port=%d），无需手动调试",
         port);
 
     CloseChromiumTopWindows(leaf);
@@ -508,7 +508,7 @@ bool RelaunchChromiumWithRemoteDebuggingImpl(const std::wstring& browserExe, int
         Sleep(300);
     }
     if (AnyBrowserProcessRunning(leaf)) {
-        WindowModeLog(L"[窗口模式] 浏览器未完全退出，强制结束进程…");
+        WindowModeLog(L"[窗口/后台窗口模式] 浏览器未完全退出，强制结束进程…");
         ForceKillBrowserProcesses(leaf);
         Sleep(800);
     }
@@ -533,14 +533,14 @@ bool RelaunchChromiumWithRemoteDebuggingImpl(const std::wstring& browserExe, int
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    WindowModeLogf(L"[窗口模式] 已启动: %s", cmd.c_str());
+    WindowModeLogf(L"[窗口/后台窗口模式] 已启动: %s", cmd.c_str());
 
     int readyPort = 0;
     if (!WaitForAnyCdpPort(port, 45000, &readyPort)) {
         err = L"浏览器已重启，但远程调试端口仍未就绪";
         return false;
     }
-    WindowModeLogf(L"[窗口模式] 兼容重启完成，CDP 端口=%d", readyPort);
+    WindowModeLogf(L"[窗口/后台窗口模式] 兼容重启完成，CDP 端口=%d", readyPort);
     err.clear();
     return true;
 }
@@ -609,7 +609,7 @@ bool TryToggleRemoteDebuggingOnHwnd(HWND edgeTop) {
         if (nameBstr) SysFreeString(nameBstr);
         if (!NameSuggestsRemoteDebugToggle(name)) continue;
         if (TryActivateRemoteDebugControl(el.Get())) {
-            WindowModeLogf(L"[窗口模式] 已启用远程调试控件: %s", name.c_str());
+            WindowModeLogf(L"[窗口/后台窗口模式] 已启用远程调试控件: %s", name.c_str());
             return true;
         }
     }
@@ -661,7 +661,7 @@ bool OpenChromiumInspectRemoteDebuggingPage(HWND edgeTop, const std::wstring& br
         const HINSTANCE hi = ShellExecuteW(nullptr, L"open", browserExe.c_str(), params.c_str(),
             nullptr, SW_SHOWNOACTIVATE);
         if (reinterpret_cast<INT_PTR>(hi) > 32) {
-            WindowModeLogf(L"[窗口模式] 已在现有浏览器新开标签: %s（游戏页保留，不重启）", kUrl);
+            WindowModeLogf(L"[窗口/后台窗口模式] 已在现有浏览器新开标签: %s（游戏页保留，不重启）", kUrl);
             return true;
         }
     }
@@ -669,7 +669,7 @@ bool OpenChromiumInspectRemoteDebuggingPage(HWND edgeTop, const std::wstring& br
         const HINSTANCE hi2 = ShellExecuteW(nullptr, L"open",
             L"microsoft-edge:edge://inspect/#remote-debugging", nullptr, nullptr, SW_SHOWNOACTIVATE);
         if (reinterpret_cast<INT_PTR>(hi2) > 32) {
-            WindowModeLog(L"[窗口模式] 已通过协议打开远程调试页（游戏页保留）");
+            WindowModeLog(L"[窗口/后台窗口模式] 已通过协议打开远程调试页（游戏页保留）");
             return true;
         }
     }
@@ -731,7 +731,7 @@ bool TryEnableChromiumRemoteDebuggingInPlace(HWND top, int preferredPort, std::w
         }
     }
     if (!toggled) {
-        WindowModeLog(L"[窗口模式] 未自动勾选到远程调试开关，继续检测 DevToolsActivePort…");
+        WindowModeLog(L"[窗口/后台窗口模式] 未自动勾选到远程调试开关，继续检测 DevToolsActivePort…");
     }
 
     int port = 0;
@@ -741,7 +741,7 @@ bool TryEnableChromiumRemoteDebuggingInPlace(HWND top, int preferredPort, std::w
               L"或后续使用配套扩展方案（无需每次勾选）。";
         return false;
     }
-    WindowModeLogf(L"[窗口模式] 现有浏览器远程调试已可用 port=%d（未重启）", port);
+    WindowModeLogf(L"[窗口/后台窗口模式] 现有浏览器远程调试已可用 port=%d（未重启）", port);
     err.clear();
     return true;
 }
@@ -786,7 +786,7 @@ bool EnableChromiumRemoteDebuggingWithoutRestart(HWND top, int preferredPort, st
     (void)preferredPort;
     // 注入 / inspect 勾选已停用；未开调试端口时改走配套扩展桥。
     err = L"请安装配套扩展（extension\\edge），无需开启 remote-debugging-port";
-    WindowModeLog(L"[窗口模式] 已停用 CDP 注入/inspect；请使用配套扩展桥");
+    WindowModeLog(L"[窗口/后台窗口模式] 已停用 CDP 注入/inspect；请使用配套扩展桥");
     return false;
 }
 
@@ -973,11 +973,11 @@ bool CdpInputSession::ConnectForWindow(HWND top, int preferredPort,
 
     std::wstring callErr;
     if (!Call("Emulation.setFocusEmulationEnabled", "{\"enabled\":true}", callErr)) {
-        WindowModeLogf(L"[窗口模式] CDP setFocusEmulationEnabled 失败（继续）: %s", callErr.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] CDP setFocusEmulationEnabled 失败（继续）: %s", callErr.c_str());
     }
     Call("Page.bringToFront", "{}", callErr);
 
-    WindowModeLogf(L"[窗口模式] CDP 已连接 port=%d title=%s",
+    WindowModeLogf(L"[窗口/后台窗口模式] CDP 已连接 port=%d title=%s",
         usedPort, Utf8ToWide(best->title).c_str());
     return true;
 }

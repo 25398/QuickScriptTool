@@ -28,8 +28,12 @@ powershell -NoProfile -Command "Get-ChildItem -LiteralPath . -Filter 'FakeFocus*
 echo.>> "%REPORT%"
 echo [window_mode_debug.log]>> "%REPORT%"
 if exist "window_mode_debug.log" (
-  echo --- last 120 lines --- >> "%REPORT%"
-  powershell -NoProfile -Command "Get-Content -LiteralPath 'window_mode_debug.log' -Tail 120 -ErrorAction SilentlyContinue" >> "%REPORT%"
+  rem ⚠ 2026-10-04：原来是 -Tail 120。窗口模式的诊断行分布在**每轮的开头**
+  rem   （「坐标语义 …」「假焦点决策 …」「…假焦点已注入 …」以及紧跟的三行体检），
+  rem   一轮约 80 行 ⇒ 只抓 120 行时，跑两轮以上就会把**关键行截掉**，
+  rem   导出的报告里只剩结尾的 EndRun，查不出东西。放宽到 600 行（约 7 轮）。
+  echo --- last 600 lines --- >> "%REPORT%"
+  powershell -NoProfile -Command "Get-Content -LiteralPath 'window_mode_debug.log' -Tail 600 -ErrorAction SilentlyContinue" >> "%REPORT%"
 ) else (
   echo window_mode_debug.log=MISSING>> "%REPORT%"
 )

@@ -221,7 +221,7 @@ HWND ResolveBindHwnd(HWND top, const WindowModeScriptConfig& config, bool /*back
     top = TopLevelTargetWindow(top);
 
     // 桌面模拟器/Unity/传奇：假焦点绑顶层；冒险岛/LCA 也绑顶层（子控件不吃键）。
-    if (UsesFakeFocus(config) || UsesFakeFocusForTarget(config, top)
+    if (UsesFakeFocus(config, top) || UsesFakeFocusForTarget(config, top)
         || PrefersLcaBackgroundMessages(config, top)) {
         return top;
     }
@@ -368,7 +368,7 @@ bool WaitForBindHwnd(HWND top, const WindowModeScriptConfig& config, bool backgr
     if (!top || !IsWindow(top)) return false;
 
     // DeSmuME 等假焦点目标必须绑顶层；冒险岛同样绑顶层（LCA 后台一也是绑 MapleStory 主窗）。
-    if (UsesFakeFocus(config) || IsDesktopEmulatorTarget(top, &config)
+    if (UsesFakeFocus(config, top) || IsDesktopEmulatorTarget(top, &config)
         || UsesFakeFocusForTarget(config, top)
         || PrefersLcaBackgroundMessages(config, top)) {
         outHwnd = top;
@@ -455,7 +455,7 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
                 if (ww >= 640 && wh >= 400) {
                     state.clientW = ww;
                     state.clientH = wh;
-                    WindowModeLogf(L"[窗口模式] 客户区异常，改用窗口外框 %dx%d", ww, wh);
+                    WindowModeLogf(L"[窗口/后台窗口模式] 客户区异常，改用窗口外框 %dx%d", ww, wh);
                 }
             }
         }
@@ -479,7 +479,7 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
                 state.health = WindowModeHealth::PermissionMismatch;
                 err = HealthToUserHint(state.health);
                 state.lastError = err;
-                WindowModeLogf(L"[窗口模式] 后台绑窗权限检查失败 pid=%lu（目标完整性更高，禁止自动打开）",
+                WindowModeLogf(L"[窗口/后台窗口模式] 后台绑窗权限检查失败 pid=%lu（目标完整性更高，禁止自动打开）",
                     static_cast<unsigned long>(pidCheck));
                 state.targetHwnd = nullptr;
                 state.targetPid = 0;
@@ -501,7 +501,7 @@ bool ApplyBoundTargetState(HWND top, HWND bindHwnd, WindowModeSessionState& stat
             static_cast<unsigned long>(pid), top, bindHwnd, title);
             if (bindPid != 0 && pid != 0 && bindPid != pid) {
                 WindowModeLogf(
-                    L"[窗口模式] 跨进程宿主：顶层 pid=%lu 输入窗 pid=%lu（UWP 计算器等；存活判定按输入窗）",
+                    L"[窗口/后台窗口模式] 跨进程宿主：顶层 pid=%lu 输入窗 pid=%lu（UWP 计算器等；存活判定按输入窗）",
                     static_cast<unsigned long>(pid), static_cast<unsigned long>(bindPid));
             }
     }
@@ -563,7 +563,7 @@ void SquashBackgroundLaunchedWindow(HWND hwnd, const std::atomic_bool* cancelFla
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (root) hwnd = root;
     if (IsRemoteDesktopWindow(hwnd) || LooksLikeFullscreenGameTarget(hwnd)) {
-        WindowModeLog(L"[窗口模式] 远程桌面/全屏游戏：跳过启动后压窗隐藏");
+        WindowModeLog(L"[窗口/后台窗口模式] 远程桌面/全屏游戏：跳过启动后压窗隐藏");
         return;
     }
     DWORD pid = 0;
@@ -875,7 +875,7 @@ bool WindowModeSession::EnsureDesktop(std::wstring& err) {
         && ConfigLooksLikeEmulatorTarget(config_)) {
         config_.executionKind = WindowModeExecutionKind::BackgroundWindow;
         WindowModeLogEvent(
-            L"[窗口模式] EnsureDesktop：模拟器目标强制后台窗口（跳过创建「鼠标宏」桌面）");
+            L"[窗口/后台窗口模式] EnsureDesktop：模拟器目标强制后台窗口（跳过创建「鼠标宏」桌面）");
     }
     if (config_.executionKind == WindowModeExecutionKind::BackgroundWindow) {
         state_.macroDesktopId = GUID{};
@@ -930,17 +930,17 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
             return candidate;
         }
         if (LooksLikeFullscreenGameTarget(candidate)) {
-            WindowModeLog(L"[窗口模式] 全屏游戏：绑定已有窗口，不搬「鼠标宏」/不置底");
+            WindowModeLog(L"[窗口/后台窗口模式] 全屏游戏：绑定已有窗口，不搬「鼠标宏」/不置底");
             return candidate;
         }
         if (IsRemoteDesktopWindow(candidate)) {
-            WindowModeLog(L"[窗口模式] 远程桌面：绑定已有窗口，不搬「鼠标宏」（SendInput 只打当前桌面前台）");
+            WindowModeLog(L"[窗口/后台窗口模式] 远程桌面：绑定已有窗口，不搬「鼠标宏」（SendInput 只打当前桌面前台）");
             return candidate;
         }
         if (ConfigLooksLikeEmulatorTarget(config_)
             || LooksLikeEmulatorTarget(config_, candidate)
             || IsAndroidEmulatorTarget(candidate, &config_)) {
-            WindowModeLogEvent(L"[窗口模式] 模拟器：绑定已有窗口，不搬「鼠标宏」（请用后台窗口模式）");
+            WindowModeLogEvent(L"[窗口/后台窗口模式] 模拟器：绑定已有窗口，不搬「鼠标宏」（请用后台窗口模式）");
             return candidate;
         }
         const bool cdp = UsesCdpInput(config_);
@@ -1240,7 +1240,7 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
         if (hwnd) {
             HWND top = TopLevelWindow(hwnd);
             if (IsRemoteDesktopWindow(top)) {
-                WindowModeLog(L"[窗口模式] 远程桌面：跳过迁入「鼠标宏」桌面（与后台窗口模式相同，仅假前台本机输入）");
+                WindowModeLog(L"[窗口/后台窗口模式] 远程桌面：跳过迁入「鼠标宏」桌面（与后台窗口模式相同，仅假前台本机输入）");
             } else if (!LooksLikeFullscreenGameTarget(top)
                 && !IsWindowOnVirtualDesktopIndex(top, macroDesktopIndex)) {
                 MinimizeForQuietDesktopMove(top);
@@ -1322,8 +1322,8 @@ bool WindowModeSession::BindTargetWindow(std::wstring& err) {
 
     if (LooksLikeFullscreenGameTarget(top) || IsRemoteDesktopWindow(top)) {
         WindowModeLog(LooksLikeFullscreenGameTarget(top)
-            ? L"[窗口模式] 全屏游戏：绑定后不置底/不最小化（避免拆 DXGI 独占）"
-            : L"[窗口模式] 远程桌面：绑定后不置底/不最小化/不隐藏（避免会话窗消失）");
+            ? L"[窗口/后台窗口模式] 全屏游戏：绑定后不置底/不最小化（避免拆 DXGI 独占）"
+            : L"[窗口/后台窗口模式] 远程桌面：绑定后不置底/不最小化/不隐藏（避免会话窗消失）");
     } else if (!background) {
         if (UsesCdpInput(config_)) {
             PrepareMacroDesktopForCdpBind(top);
@@ -1377,12 +1377,12 @@ bool WindowModeSession::Start(const WindowModeScriptConfig& config, std::wstring
         state_.health = WindowModeHealth::Unknown;
         return true;
     }
-    // 模拟器误选「窗口模式」会 CreateDesktop + 搬窗，易崩 MuMu/DeSmuME/melonDS；自动降级后台窗口。
+    // 模拟器误选「独立桌面模式」会 CreateDesktop + 搬窗，易崩 MuMu/DeSmuME/melonDS；自动降级后台窗口模式。
     if (config_.executionKind == WindowModeExecutionKind::HiddenDesktop
         && ConfigLooksLikeEmulatorTarget(config_)) {
         config_.executionKind = WindowModeExecutionKind::BackgroundWindow;
         WindowModeLogEvent(
-            L"[窗口模式] 模拟器目标：已从「窗口模式」自动切换为「后台窗口模式」"
+            L"[窗口/后台窗口模式] 模拟器目标：已从「窗口模式」自动切换为「后台窗口模式」"
             L"（不创建虚拟桌面、不搬窗）");
     }
     if (!EnsureDesktop(err)) return false;
@@ -1442,7 +1442,7 @@ void WindowModeSession::RestoreSavedTargetTopPlacement() {
 
     if (savedTargetTopHwnd_ && IsWindow(savedTargetTopHwnd_)) {
         RestoreBoundTargetTopWindow(savedTargetTopHwnd_, savedTargetTopWp_);
-        WindowModeLog(L"[窗口模式] 会话结束: 已还原目标窗口绑定时的最小化/位置状态");
+        WindowModeLog(L"[窗口/后台窗口模式] 会话结束: 已还原目标窗口绑定时的最小化/位置状态");
     }
 
     hasSavedTargetTopPlacement_ = false;
@@ -1483,7 +1483,7 @@ bool WindowModeSession::EnsureMacroDesktopReady(std::wstring& err) {
         return true;
     }
     if (LooksLikeFullscreenGameTarget(top)) {
-        WindowModeLog(L"[窗口模式] 全屏游戏：不搬到「鼠标宏」桌面（避免独占呈现冻结）");
+        WindowModeLog(L"[窗口/后台窗口模式] 全屏游戏：不搬到「鼠标宏」桌面（避免独占呈现冻结）");
         return true;
     }
 
@@ -1598,7 +1598,7 @@ bool WindowModeSession::LaunchTargetOnDesktop(std::wstring& err) {
     // 「指定窗口类」有标题但无本地文档：禁止开空白记事本；先绑已有窗。
     // CDP/浏览器：标题是网页名，不是本地文件 —— 禁止报「文档参数缺失」。
     if (editorNeedsIdentity && documentFile.empty()) {
-        WindowModeLog(L"[窗口模式] 指定窗口类：无可用文档路径，尝试绑定已有标题窗（不开空白）");
+        WindowModeLog(L"[窗口/后台窗口模式] 指定窗口类：无可用文档路径，尝试绑定已有标题窗（不开空白）");
         if (BindTargetWindow(err)) return true;
         const bool browserTarget =
             UsesCdpInput(config_)
@@ -1624,7 +1624,7 @@ bool WindowModeSession::LaunchTargetOnDesktop(std::wstring& err) {
                     && ApplyBoundTargetState(hit, bindHwnd, state_, config_, err, false, false)) {
                     err.clear();
                     state_.lastError.clear();
-                    WindowModeLog(L"[窗口模式] CDP：已按浏览器窗绑定（跳过文档启动）");
+                    WindowModeLog(L"[窗口/后台窗口模式] CDP：已按浏览器窗绑定（跳过文档启动）");
                     return true;
                 }
             }
@@ -1635,11 +1635,11 @@ bool WindowModeSession::LaunchTargetOnDesktop(std::wstring& err) {
                     || (args.size() >= 8 && _wcsnicmp(args.c_str(), L"https://", 8) == 0));
             if (!looksUrl && args.empty()) {
                 err = L"未找到标题含「" + expectTitle + L"」的浏览器窗口。"
-                      L"请先打开该网页后再运行（浏览器窗口模式不需要本地文档参数）。";
+                      L"请先打开该网页后再运行（浏览器窗口/后台窗口模式不需要本地文档参数）。";
                 state_.lastError = err;
                 return false;
             }
-            WindowModeLog(L"[窗口模式] CDP/浏览器：无已有窗，使用启动参数打开（非本地文档）");
+            WindowModeLog(L"[窗口/后台窗口模式] CDP/浏览器：无已有窗，使用启动参数打开（非本地文档）");
         } else {
             err = L"指定窗口类需要标题对应文档，但未解析到文件"
                   L"（请设置完整启动参数，或把文件放在脚本目录）";
@@ -1813,7 +1813,7 @@ bool WindowModeSession::LaunchTargetOnDefaultDesktop(std::wstring& err) {
     hasLaunchTimeUtc_ = true;
 
     if (editorNeedsIdentity && documentFile.empty()) {
-        WindowModeLog(L"[窗口模式] 后台指定窗口类：无文档路径，仅绑定已有标题窗");
+        WindowModeLog(L"[窗口/后台窗口模式] 后台指定窗口类：无文档路径，仅绑定已有标题窗");
         if (BindTargetWindow(err)) return true;
         const bool browserTarget =
             UsesCdpInput(config_)
@@ -1826,11 +1826,11 @@ bool WindowModeSession::LaunchTargetOnDefaultDesktop(std::wstring& err) {
                     || (args.size() >= 8 && _wcsnicmp(args.c_str(), L"https://", 8) == 0));
             if (!looksUrl && args.empty()) {
                 err = L"未找到标题含「" + expectTitle + L"」的浏览器窗口。"
-                      L"请先打开该网页后再运行（浏览器窗口模式不需要本地文档参数）。";
+                      L"请先打开该网页后再运行（浏览器窗口/后台窗口模式不需要本地文档参数）。";
                 state_.lastError = err;
                 return false;
             }
-            WindowModeLog(L"[窗口模式] 后台 CDP/浏览器：使用启动参数打开（非本地文档）");
+            WindowModeLog(L"[窗口/后台窗口模式] 后台 CDP/浏览器：使用启动参数打开（非本地文档）");
         } else {
             err = L"指定窗口类需要标题对应文档，但未解析到文件"
                   L"（请设置完整启动参数，或把文件放在脚本目录）";

@@ -242,7 +242,7 @@ void CaseResolveClick() {
 }
 
 void CaseResolveClickRemappedBox() {
-    // 窗口模式把命中从截图 80x80 映射到客户区 40x40 后，偏移必须跟框缩放，
+    // 窗口/后台窗口模式把命中从截图 80x80 映射到客户区 40x40 后，偏移必须跟框缩放，
     // 不能仍按 origTpl=80 × scale=1 加到客户区中心。
     ImageMatchResult m{};
     m.found = true;

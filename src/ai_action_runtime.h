@@ -40,10 +40,22 @@ inline bool ConsumeAiStep(AiStepFrame& frame) {
 struct AiSessionSlot {
     std::unique_ptr<AgentCore> core;
     std::wstring model;
+    /// ★★ 本槽对应的**桥会话 key**（网页版 AI 靠它分对话）。
+    ///
+    /// 规定见 `script_action_builder.cpp` 的 `aiContextMode`：
+    ///   0=每次独立请求；1=宏级（同一脚本共用一个对话）；2=循环级（按嵌套深度分槽）；
+    ///   3=块级。⇒ key 必须**跟着槽走**，而不是跟着"一次执行"走：
+    ///   槽是跨轮次存活的，那正是"上下文"这三个字的含义。
+    ///
+    /// ⚠ 槽的 core 重建（换模型 / 被清空）时必须**换新 key** —— 桥按 key 记
+    ///   "已发到第几条"（见 `agent_core.h` 的说明）；对话换了而 key 没换，
+    ///   第二轮起内容就错乱。
+    std::string sessionKey;
 
     void Reset() {
         core.reset();
         model.clear();
+        sessionKey.clear();   // 清上下文 ⇒ 下一次是新对话
     }
 };
 

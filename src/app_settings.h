@@ -45,7 +45,15 @@ struct ClickTabSettings {
 };
 
 struct PlaybackTabSettings {
-    bool enablePlaybackCount = false;
+    /// 回放次数限制：**默认开启、默认 1 次**（2026-09-28 用户要求）。
+    ///
+    /// 为什么默认要开：关掉 = 无限循环（`engine_script_run.cpp:8000` 按它决定 break）。
+    /// 而"线性脚本跑完就该退出"是最自然的预期 —— 关着的时候，一条 `mouseClick` 会一直点下去，
+    /// 用户只能靠热键停。默认 1 次让"双击就跑、跑完自退"成立；
+    /// **要挂机循环就显式把次数调大或关掉这个勾选**（脚本里也能用 `loop(-1)` 表达）。
+    /// ⚠ 这条默认值同时影响**导出的 exe**：播放器读 `AppDir()\app_settings.json`，
+    ///   包里不带该键时就用这里的默认值。
+    bool enablePlaybackCount = true;
     int playbackCount = 1;
     bool enablePlaybackInterval = false;
     double playbackIntervalMinSeconds = 0.5;
@@ -77,9 +85,13 @@ struct PlaybackTabSettings {
     /// 不勾选时行为与之前完全一致。开关在 Load/SaveAppSettings 里同步到进程级原子量，
     /// 保存后立即生效、无需重启。详见 docs/ai-action-exec-optimization.md §19。
     bool lowPerformanceMode = false;
-    /// AI 高级加速（默认开）：布局记忆 + 相对网格 + 观察帧省上传/文字索引。
+    /// 把每个相对位移按窗口细分成多份铺满窗口，摊平「游戏帧边界相位」对每帧
+    /// 累积位移的影响（详见 recorder_timeline.cpp 的 SpreadRelativeMovePackets）。
+    /// 默认关闭：它让回放更「可复现」，但与录制时的整包量化结果不完全相同，需 A/B。
+    bool spreadRelativeMovePackets = false;
+    /// AI 高级加速（默认开）：观察帧省上传 + 文字索引 + 元素索引。
     /// 出问题（点错位置/界面看不懂）时可一键关掉，退回「每步真识图 + 每轮回传整帧」。
-    /// 见 src/ai_fast_paths.h。
+    /// ⚠ 记忆型加速（布局记忆/定位模板缓存/相对网格）已整体撤销，见 src/ai_fast_paths.h。
     bool aiFastPaths = true;
     /// 找图 GPU 加速（OpenCL）：大区域全屏找图走显卡（实测 ~2.9x），区域找图自动走 CPU。
     /// 勾选但机器没有 OpenCL 设备时自动回落 CPU（只写一次调试日志，不报错）。
@@ -98,6 +110,9 @@ struct OtherTabSettings {
     bool autoHideMainWindow = true;
     bool playSoundOnStart = true;
     bool playSoundOnEnd = true;
+    /// 导出脚本时默认用 zip 脚本包（true）还是独立 EXE（false，默认）。
+    /// 独立 EXE 免安装、能被本软件导入，所以是默认；zip 留给"体积优先"的场景。
+    bool exportScriptAsZip = false;
     bool hideBottomRightTip = true;
     bool closeToTray = true;
     bool autoStartOnBoot = false;
@@ -174,7 +189,7 @@ struct WindowModeSettings {
     bool blockRunWhenUnhealthy = true;
     /// 仅当后台输入全部失败时，才短暂抢焦点用系统键盘输入（会打扰用户）
     bool allowForegroundInputFallback = false;
-    /// 是否允许假焦点 DLL 注入（关闭后窗口模式只走 PostMessage / 必要时假前台，不注入）
+    /// 是否允许假焦点 DLL 注入（关闭后窗口/后台窗口模式只走 PostMessage / 必要时假前台，不注入）
     bool enableFakeFocusInjection = true;
     /// 假焦点注入技术（对抗性测试用，对应 windowmode::inject::Technique）：
     /// 0=经典远线程 1=NtCreateThreadEx 2=APC 3=线程劫持
@@ -184,6 +199,10 @@ struct WindowModeSettings {
     int injectionTechnique = 0;
     /// 注入后从 PEB 模块链表摘除（测试模块枚举检测；卸载时自动恢复）
     bool hideInjectedModule = false;
+    /// 窗口变速（变速齿轮）：回放倍速同时作用于目标窗口进程的时钟，
+    /// 让游戏冷却 / 动画 / 帧间隔与脚本一起加速（提高变速脚本对游戏的兼容性）。
+    /// 默认开启；仅在后台窗口模式 + 已注入假焦点时生效，倍率为 1.0 时不改变目标行为。
+    bool enableWindowTimeScale = true;
 };
 
 struct AiModelProfile {
@@ -215,7 +234,7 @@ struct HomeState {
     // 录制设置（捕获范围固定全局；窗口过滤入口已移除）
     int recorderCaptureScope = 1;
     int recorderInputMode = 0;        // 0=自动 1=绝对坐标 2=相对坐标 3=图片定位
-    int recorderWindowMode = 0;       // 0=全屏模式 1=窗口模式（窗口相对录制）
+    int recorderWindowMode = 0;       // 0=前台模式 1=后台窗口模式（窗口相对录制）
     // 选中项（用文件路径标识，如果文件被删除则自动忽略）
     std::wstring selectedScriptPath;
     std::wstring selectedRecordingPath;

@@ -10,6 +10,35 @@ namespace windowmode {
 
 namespace {
 
+/// ★★ 变参格式化到**动态缓冲**（2026-09-25）。
+///
+/// ⚠⚠ 为什么不能用 `wchar_t buf[1024]{} + vswprintf_s(buf, fmt, args)`：
+///   `vswprintf_s` 在**截断**时返回 -1 并调用 **invalid parameter handler**，
+///   而默认 handler 会**直接终止进程** —— 也就是说
+///   **一条过长的日志就能让软件静默闪退**（没有日志、没有退出码，极难定位）。
+///   本仓的日志里会拼入网页返回的错误消息、URL、路径，长度不受我们控制 ⇒ 必须动态。
+std::wstring FormatVarArgs(const wchar_t* fmt, va_list args) {
+    va_list probe;
+    va_copy(probe, args);
+    // 先量需要多少（_vscwprintf 不写缓冲，不会触发 invalid parameter handler）
+    const int need = _vscwprintf(fmt, probe);
+    va_end(probe);
+    if (need < 0) return std::wstring(fmt);   // 格式串本身有问题：原样返回，绝不终止进程
+    std::wstring out(static_cast<size_t>(need) + 1, L'\0');
+    va_list once;
+    va_copy(once, args);
+    const int wrote = _vsnwprintf_s(out.data(), out.size(), _TRUNCATE, fmt, once);
+    va_end(once);
+    if (wrote < 0) out.resize(out.size() - 1);   // 理论到不了；保险
+    else out.resize(static_cast<size_t>(wrote));
+    return out;
+}
+
+}  // namespace
+
+
+namespace {
+
 std::mutex gLogMutex;
 WindowModeLogSink gSink;
 
@@ -38,12 +67,11 @@ void WindowModeLog(const wchar_t* line) {
 
 void WindowModeLogf(const wchar_t* fmt, ...) {
     if (!fmt) return;
-    wchar_t buf[1024]{};
     va_list args;
     va_start(args, fmt);
-    vswprintf_s(buf, fmt, args);
+    const std::wstring line = FormatVarArgs(fmt, args);
     va_end(args);
-    Emit(buf);
+    Emit(line);
 }
 
 void WindowModeLogVerbose(const std::wstring& line) {
@@ -53,12 +81,11 @@ void WindowModeLogVerbose(const std::wstring& line) {
 
 void WindowModeLogVerbosef(const wchar_t* fmt, ...) {
     if (!fmt) return;
-    wchar_t buf[1024]{};
     va_list args;
     va_start(args, fmt);
-    vswprintf_s(buf, fmt, args);
+    const std::wstring line = FormatVarArgs(fmt, args);
     va_end(args);
-    WindowModeLogVerbose(buf);
+    WindowModeLogVerbose(line);
 }
 
 namespace {
@@ -89,19 +116,18 @@ void WindowModeLogEvent(const std::wstring& line) {
 
 void WindowModeLogEventf(const wchar_t* fmt, ...) {
     if (!fmt) return;
-    wchar_t buf[1024]{};
     va_list args;
     va_start(args, fmt);
-    vswprintf_s(buf, fmt, args);
+    const std::wstring line = FormatVarArgs(fmt, args);
     va_end(args);
-    WindowModeLogEvent(buf);
+    WindowModeLogEvent(line);
 }
 
 void WindowModeLogDesktopSnap(const wchar_t* tag, HWND hwnd) {
     HWND root = TopLevelTargetWindow(hwnd);
     if (!root) root = hwnd;
     if (!root) {
-        WindowModeLogf(L"[窗口模式] %s (无效 HWND)", tag ? tag : L"?");
+        WindowModeLogf(L"[窗口/后台窗口模式] %s (无效 HWND)", tag ? tag : L"?");
         return;
     }
 
@@ -130,7 +156,7 @@ void WindowModeLogDesktopSnap(const wchar_t* tag, HWND hwnd) {
     }
 
     WindowModeLogf(
-        L"[窗口模式] %s UserDesk=%d TargetDesk=%d(%s) OnCurrentVD=%d Iconic=%d showCmd=%u Layered=%d FgDesk=%d hwnd=0x%p",
+        L"[窗口/后台窗口模式] %s UserDesk=%d TargetDesk=%d(%s) OnCurrentVD=%d Iconic=%d showCmd=%u Layered=%d FgDesk=%d hwnd=0x%p",
         tag ? tag : L"snap",
         userDesk, targetDesk,
         deskName.empty() ? L"?" : deskName.c_str(),

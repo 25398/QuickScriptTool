@@ -72,6 +72,7 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block,
     cfg.windowName = ExtractString(block, L"windowName");
     cfg.windowClassName = ExtractString(block, L"windowClassName");
     cfg.childWindowClassName = ExtractString(block, L"childWindowClassName");
+    cfg.windowNameIsHintOnly = ParseBool01(block, L"windowNameIsHintOnly", false);
     cfg.useTopLevelWindow = ParseBool01(block, L"useTopLevelWindow", true);
     cfg.targetPickX = static_cast<int>(ExtractNumber(block, L"targetPickX", 0.0));
     cfg.targetPickY = static_cast<int>(ExtractNumber(block, L"targetPickY", 0.0));
@@ -103,7 +104,7 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block,
             cfg.enabled = true;
         }
     }
-    // 关闭窗口模式时清掉目标身份，避免残留误绑。
+    // 关闭窗口/后台窗口模式时清掉目标身份，避免残留误绑。
     // 窗口相对脚本除外：编辑器默认模式可能把 enabled 写成 0，身份留给 Finalize 复活。
     if (sanitizeDisabled && enabledKeyPresent && !cfg.enabled && !cfg.windowRelativeCoordinates) {
         cfg.targetExePath.clear();
@@ -121,7 +122,7 @@ WindowModeScriptConfig ParseWindowModeConfigObject(const std::wstring& block,
 std::wstring WindowModeConfigSummary(const WindowModeScriptConfig& cfg) {
     if (!cfg.enabled) return L"默认模式";
     if (cfg.executionKind == WindowModeExecutionKind::BackgroundWindow) return L"后台窗口模式";
-    return L"窗口模式";
+    return L"独立桌面模式";
 }
 
 WindowModeScriptConfig ParseWindowModeJson(const std::wstring& content) {
@@ -188,6 +189,9 @@ void AppendWindowModeObject(std::wstring& out, const wchar_t* key,
     out += inner + L"\"windowName\": \"" + EscapeJson(w.windowName) + L"\",\n";
     out += inner + L"\"windowClassName\": \"" + EscapeJson(w.windowClassName) + L"\",\n";
     out += inner + L"\"childWindowClassName\": \"" + EscapeJson(w.childWindowClassName) + L"\",\n";
+    // windowName 仅作参考（窗口相对录制产物）：回放不拿它当硬匹配门。见类型定义处说明。
+    out += inner + L"\"windowNameIsHintOnly\": "
+        + std::wstring(w.windowNameIsHintOnly ? L"1" : L"0") + L",\n";
     out += inner + L"\"useTopLevelWindow\": " + std::to_wstring(w.useTopLevelWindow ? 1 : 0) + L",\n";
     out += inner + L"\"targetPickX\": " + std::to_wstring(w.targetPickX) + L",\n";
     out += inner + L"\"targetPickY\": " + std::to_wstring(w.targetPickY) + L",\n";

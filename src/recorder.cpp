@@ -9,6 +9,7 @@
 
 #include "image_match.h"
 #include "input/input_emergency_teardown.h"
+#include "recorder_report_interval.h"
 #include "recording_to_findimage.h"
 #include "utils.h"
 
@@ -41,13 +42,24 @@ std::atomic<int64_t> g_recordStartQpc{0};
 std::atomic<int64_t> g_qpcFreq{0};
 std::atomic<uint64_t> g_lastAbsMoveUs{0};
 std::atomic<uint64_t> g_lastRelStampUs{0};
-/// 相对移动报告间隔 EMA（µs）；队列积压时用它拉开时间戳，贴近 HID 真实间距。
-std::atomic<uint64_t> g_relReportIntervalUs{8000};
+/// 相对移动报告周期估计（µs）。旧实现是下限 1000µs 的 EMA，学不到 2kHz 以上
+/// 鼠标的真实周期（4kHz 被拉伸 4 倍）；改用中位数模型，见 recorder_report_interval.h。
+qst_recorder::ReportIntervalModel g_relIntervalModel;
+std::atomic<uint64_t> g_relReportIntervalUs{qst_recorder::kFallbackReportIntervalUs};
+/// 诊断：本录制被重建时间戳（判定为积压/被系统合并）的相对包数。
+std::atomic<uint64_t> g_relStampRebuilt{0};
+/// 诊断：本录制被丢弃（过短、不入统计）的相对间隔数。
+std::atomic<uint64_t> g_relGapDropped{0};
+/// 采集通道切换记账：0=未定 1=绝对 2=相对。切换频繁 = 游戏在抓取/菜单间抖动，
+/// 或有真实模式切换（此时粘滞窗口内会录到幻影相对位移）。
+std::atomic<int> g_lastCaptureKind{0};
+std::atomic<uint64_t> g_captureSwitchToAbs{0};
+std::atomic<uint64_t> g_captureSwitchToRel{0};
 std::atomic<uint64_t> g_eventSequence{0};
 std::atomic<RecordingCaptureMode> g_captureMode{RecordingCaptureMode::Auto};
-/// Auto 模式：最近一次判定为相对采集的录制时间戳；用于短时粘滞，避免进游戏后光标闪一下就混入绝对 Move。
+/// Auto 模式：最近一次判定为相对采集的录制时间戳；粘滞窗口见 recorder.h 的
+/// `kAutoRelativeStickyUs`（纯逻辑判定在 `EvaluateRelativeCapture`）。
 std::atomic<uint64_t> g_lastRelativeActiveUs{0};
-constexpr uint64_t kAutoRelativeStickyUs = 250000; // 250ms
 
 std::atomic<int> g_captureScope{1}; // 默认全局，与「未配置」安全侧一致；Start 前由设置覆盖
 std::mutex g_scopeMu;
@@ -431,22 +443,39 @@ uint64_t NextEventSequence() {
     return g_eventSequence.fetch_add(1, std::memory_order_relaxed);
 }
 
+/// 采集通道切换最多打印多少条（防止抖动时刷爆调试窗）。
+constexpr uint64_t kMaxLoggedCaptureSwitches = 8;
+
+void NoteCaptureKind(bool relative, uint64_t nowUs) {
+    const int kind = relative ? 2 : 1;
+    const int prev = g_lastCaptureKind.exchange(kind, std::memory_order_relaxed);
+    if (prev == 0 || prev == kind) return; // 首次定档 / 未变化
+    if (kind == 2) g_captureSwitchToRel.fetch_add(1, std::memory_order_relaxed);
+    else g_captureSwitchToAbs.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t total = g_captureSwitchToRel.load(std::memory_order_relaxed)
+        + g_captureSwitchToAbs.load(std::memory_order_relaxed);
+    if (total > kMaxLoggedCaptureSwitches) return;
+    // 模式切换是「幻影位移」的直接证据：切到绝对时，粘滞窗口内的移动仍按相对记账。
+    EmitRecordingDebug(FormatRecordingStamp(nowUs)
+        + (relative
+            ? L"采集通道 → 相对（Raw 位移；目标正在抓取光标）"
+            : L"采集通道 → 绝对（屏幕/客户区坐标；目标已释放光标）"));
+}
+
 bool ShouldCaptureRelativeNow() {
-    switch (g_captureMode.load(std::memory_order_relaxed)) {
-    case RecordingCaptureMode::Relative: return true;
-    case RecordingCaptureMode::Absolute: return false;
-    case RecordingCaptureMode::Auto: default: {
-        if (IsRelativeMouseCaptureActive()) {
-            g_lastRelativeActiveUs.store(RecordingOffsetUs(), std::memory_order_relaxed);
-            return true;
-        }
-        // 粘滞：刚离开相对态的短时间内仍走 Raw，避免与强制 FPS 相对模式效果不一致。
-        const uint64_t last = g_lastRelativeActiveUs.load(std::memory_order_relaxed);
-        if (last == 0) return false;
-        const uint64_t now = RecordingOffsetUs();
-        return now >= last && (now - last) < kAutoRelativeStickyUs;
+    const RecordingCaptureMode mode = g_captureMode.load(std::memory_order_relaxed);
+    const bool relativeActiveNow = (mode == RecordingCaptureMode::Auto)
+        ? IsRelativeMouseCaptureActive()
+        : false;
+    const uint64_t now = RecordingOffsetUs();
+    if (mode == RecordingCaptureMode::Auto && relativeActiveNow) {
+        g_lastRelativeActiveUs.store(now, std::memory_order_relaxed);
     }
-    }
+    const bool relative = EvaluateRelativeCapture(mode, relativeActiveNow,
+        g_lastRelativeActiveUs.load(std::memory_order_relaxed), now,
+        kAutoRelativeStickyUs);
+    NoteCaptureKind(relative, now);
+    return relative;
 }
 
 void EmitRelativeMoveEvent(int dx, int dy, uint64_t nowUs) {
@@ -454,25 +483,23 @@ void EmitRelativeMoveEvent(int dx, int dy, uint64_t nowUs) {
     if (!g_recording.load(std::memory_order_relaxed)) return;
     if (!RecordingScopeAllowsEvent(true, 0, 0)) return; // 相对视角：跟前台窗
 
-    // 队列积压时多个 WM_INPUT 会在短时间内被处理：QPC 戳挤在亚毫秒内。
-    // 用 EMA 报告间隔拉开，避免回放时在同一游戏帧内连发。
+    // 队列积压 / 系统合并时多个 WM_INPUT 会在同一瞬间被处理：QPC 戳挤在亚毫秒内。
+    // 只有这种「明显短于本机报告周期」的间隔才需要重建时间戳；其余一律保留真实戳 ——
+    // 旧实现把所有 <500µs 的间隔都拉到 1000µs 的 EMA 上，2kHz 以上鼠标会被整体拉伸。
     uint64_t stamp = nowUs;
     uint64_t prev = g_lastRelStampUs.load(std::memory_order_relaxed);
-    uint64_t interval = g_relReportIntervalUs.load(std::memory_order_relaxed);
-    if (interval < 1000) interval = 1000;
-    if (interval > 16000) interval = 16000;
-
-    if (prev > 0 && stamp > prev) {
-        const uint64_t gap = stamp - prev;
-        if (gap >= 500 && gap <= 20000) {
-            const uint64_t ema = (interval * 7 + gap * 3) / 10;
-            g_relReportIntervalUs.store(ema, std::memory_order_relaxed);
-            interval = ema;
-        } else if (gap < interval / 2 && gap < 2000) {
+    if (prev > 0) {
+        const uint64_t gap = stamp > prev ? stamp - prev : 0;
+        g_relIntervalModel.ObserveGap(gap);
+        if (gap < qst_recorder::kMinReportIntervalUs)
+            g_relGapDropped.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t interval = g_relIntervalModel.MedianUs();
+        g_relReportIntervalUs.store(interval, std::memory_order_relaxed);
+        if (gap == 0 || g_relIntervalModel.IsCompressedGap(gap)) {
             stamp = prev + interval;
+            g_relIntervalModel.NoteCompressed();
+            g_relStampRebuilt.fetch_add(1, std::memory_order_relaxed);
         }
-    } else if (stamp <= prev) {
-        stamp = prev + interval;
     }
     g_lastRelStampUs.store(stamp, std::memory_order_relaxed);
 
@@ -649,7 +676,13 @@ void InitRecordingClock() {
     g_recordStartQpc.store(counter.QuadPart, std::memory_order_relaxed);
     g_lastAbsMoveUs.store(0, std::memory_order_relaxed);
     g_lastRelStampUs.store(0, std::memory_order_relaxed);
-    g_relReportIntervalUs.store(8000, std::memory_order_relaxed);
+    g_relIntervalModel.Reset();
+    g_relReportIntervalUs.store(qst_recorder::kFallbackReportIntervalUs, std::memory_order_relaxed);
+    g_relStampRebuilt.store(0, std::memory_order_relaxed);
+    g_relGapDropped.store(0, std::memory_order_relaxed);
+    g_lastCaptureKind.store(0, std::memory_order_relaxed);
+    g_captureSwitchToAbs.store(0, std::memory_order_relaxed);
+    g_captureSwitchToRel.store(0, std::memory_order_relaxed);
     g_lastRelativeActiveUs.store(0, std::memory_order_relaxed);
     g_eventSequence.store(0, std::memory_order_relaxed);
     {
@@ -797,6 +830,11 @@ void ClearRecordingDebugStats() {
     g_dbgWheel.store(0, std::memory_order_relaxed);
     g_dbgAbsMove.store(0, std::memory_order_relaxed);
     g_dbgRelMove.store(0, std::memory_order_relaxed);
+    g_relStampRebuilt.store(0, std::memory_order_relaxed);
+    g_relGapDropped.store(0, std::memory_order_relaxed);
+    g_lastCaptureKind.store(0, std::memory_order_relaxed);
+    g_captureSwitchToAbs.store(0, std::memory_order_relaxed);
+    g_captureSwitchToRel.store(0, std::memory_order_relaxed);
 }
 
 RecordingDebugStats GetRecordingDebugStats() {
@@ -809,6 +847,11 @@ RecordingDebugStats GetRecordingDebugStats() {
     s.wheel = g_dbgWheel.load(std::memory_order_relaxed);
     s.absMove = g_dbgAbsMove.load(std::memory_order_relaxed);
     s.relMove = g_dbgRelMove.load(std::memory_order_relaxed);
+    s.relReportIntervalUs = g_relReportIntervalUs.load(std::memory_order_relaxed);
+    s.relStampRebuilt = g_relStampRebuilt.load(std::memory_order_relaxed);
+    s.relGapDropped = g_relGapDropped.load(std::memory_order_relaxed);
+    s.captureSwitchToAbs = g_captureSwitchToAbs.load(std::memory_order_relaxed);
+    s.captureSwitchToRel = g_captureSwitchToRel.load(std::memory_order_relaxed);
     return s;
 }
 

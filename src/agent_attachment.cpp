@@ -179,7 +179,7 @@ bool BuildAttachmentFromImageMat(const cv::Mat& bgr, const std::wstring& fileNam
     }
 
     cv::Mat apiImage = bgr;
-    constexpr int kMaxLongEdge = 1280;
+    constexpr int kMaxLongEdge = kAgentAttachmentMaxLongEdge;
     const int longEdge = std::max(apiImage.cols, apiImage.rows);
     if (longEdge > kMaxLongEdge) {
         const double scale = static_cast<double>(kMaxLongEdge) / longEdge;
@@ -189,7 +189,7 @@ bool BuildAttachmentFromImageMat(const cv::Mat& bgr, const std::wstring& fileNam
     }
 
     std::vector<uint8_t> encoded;
-    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 82};
+    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, kAgentAttachmentJpegQuality};
     if (!cv::imencode(".jpg", apiImage, encoded, params)) {
         error = L"无法编码图片。";
         return false;
@@ -398,11 +398,47 @@ bool AgentExtractImageMarkers(const std::wstring& text, std::wstring& textOut,
 bool AgentBuildImageParts(const std::vector<std::wstring>& paths,
                           std::vector<ChatContentPart>& parts,
                           std::wstring& skipped,
-                          size_t maxCount) {
+                          size_t maxCount,
+                          const std::vector<std::wstring>* labels,
+                          size_t maxTotalBytes) {
     if (paths.empty()) return false;
     if (maxCount == 0) maxCount = 8;
+    if (maxTotalBytes == 0) maxTotalBytes = kAgentImageBudgetBytes;
+    // ★★单轮附图**总字节预算**（docs §57）：原先的上限只管**张数**（8 张），不管体量。
+    //   实测一局：`图 956 KB（**3 张**）`、请求体 1037 KB ⇒ **92% 是图**，每轮上传 ~1 MB、
+    //   单轮 5~14 s —— 用户看到的就是「卡在那里半天没有反应」。
+    //   成因：`zoom` 按**区域**交付，一张图就能 100~363 KB（长边 1280 只是**单张**上限），
+    //   而 `image_keep_rounds=2` 又让上一轮的图继续跟着 ⇒ 三张就压垮一轮。
+    //   处置与 `image_keep_rounds` 同一取向：**保新弃旧**；并且**逐张写明被丢了**
+    //   （丢了不说是回执说谎 —— §38③）。
+    //   ⚠ **至少保最新一张**：单张就超预算时也发它，否则模型这一轮什么都看不到，
+    //   比发一张大图更糟（那是「静默不点」的另一种形态）。
+    //   ⚠ 体量用**磁盘字节**度量：`zoom` 落盘就是交付形态（JPEG q82 / 长边 ≤1280，
+    //     见 docs §53.3）⇒ 磁盘字节数**就是**模型收到的字节数。
+    std::vector<char> keep(paths.size(), 1);
+    {
+        unsigned long long total = 0;
+        size_t keptByBudget = 0;
+        for (size_t i = paths.size(); i-- > 0;) {
+            if (keptByBudget >= maxCount) { keep[i] = 0; continue; }
+            std::ifstream f(paths[i], std::ios::binary | std::ios::ate);
+            const unsigned long long sz = f
+                ? static_cast<unsigned long long>(f.tellg()) : 0ULL;
+            if (keptByBudget > 0 && total + sz > maxTotalBytes) { keep[i] = 0; continue; }
+            total += sz;
+            ++keptByBudget;
+        }
+    }
     size_t embedded = 0;
-    for (const auto& path : paths) {
+    for (size_t pi = 0; pi < paths.size(); ++pi) {
+        const auto& path = paths[pi];
+        if (!keep[pi]) {
+            if (!skipped.empty()) skipped += L"\n";
+            skipped += L"[已跳过] 这一轮的附图总量超过单轮预算（"
+                + std::to_wstring(maxTotalBytes / 1024)
+                + L"KB，保新弃旧）：" + path;
+            continue;
+        }
         if (embedded >= maxCount) {
             if (!skipped.empty()) skipped += L"\n";
             skipped += L"[已跳过] 图片超过单轮嵌入上限（" + std::to_wstring(maxCount)
@@ -421,6 +457,14 @@ bool AgentBuildImageParts(const std::vector<std::wstring>& paths,
             if (!skipped.empty()) skipped += L"\n";
             skipped += L"[跳过] 非图片或编码失败：" + path;
             continue;
+        }
+        // ★图前标题（与图同序号、同一循环里 push ⇒ 顺序天然对齐）：模型靠它把
+        //   「这一张」和「哪一次工具调用」对上；没有它，一轮里两张图只能靠猜。
+        if (labels && pi < labels->size() && !(*labels)[pi].empty()) {
+            ChatContentPart title;
+            title.type = L"text";
+            title.text = (*labels)[pi];
+            parts.push_back(std::move(title));
         }
         ChatContentPart part;
         part.type = L"image_url";

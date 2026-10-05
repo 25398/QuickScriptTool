@@ -1,10 +1,13 @@
 EXPORTS
     FakeFocus_Install
     FakeFocus_InstallLite
+    FakeFocus_InstallTimeScaleOnly
+    FakeFocus_DisableFakeFocus
     FakeFocus_UpdateTarget
     FakeFocus_Uninstall
     FakeFocus_IsInstalled
     FakeFocus_HasSoftInput
+    FakeFocus_TimeScaleDiag
     FakeFocus_MapleIatCount
     FakeFocus_MapleHookHits
     FakeFocus_HookProc

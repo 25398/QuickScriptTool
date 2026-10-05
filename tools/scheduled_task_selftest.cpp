@@ -214,6 +214,46 @@ void CaseTickRunsAllDueTasks() {
         ok ? L"" : L"TickAt must invoke callback for every due task in the same second");
 }
 
+/// 已触发过的时刻必须**跨进程**去重。
+/// 去重键原来只存在内存 map 里，进程一死就丢 ⇒ 强杀后重开会在同一秒**再触发一次**
+/// （用户实测：「卡死强杀后重开又自动开始回放」）。落盘后任何已触发时刻都不可重复触发。
+void CaseFireKeySurvivesRestart() {
+    auto task = MakeTask(ScheduledFrequency::Daily);   // 不用 Custom：避免 customFired 干扰判据
+    const SYSTEMTIME now = MakeSt(task.time.year, task.time.month, task.time.day,
+        task.time.hour, task.time.minute, task.time.second, 0, 2);
+
+    // 第一个「进程」：正常触发，去重键写回任务（真实路径随即 Save 落盘）。
+    ScheduledTaskScheduler first;
+    int firesA = 0;
+    first.SetRunCallback([&](const std::wstring&) { ++firesA; });
+    first.SetTasks({task});
+    first.TickAt(now);
+    const bool persisted = !first.Tasks().empty() && !first.Tasks()[0].lastFireKey.empty();
+
+    // 第二个「进程」：拿落盘后的任务重建调度器，同一秒不得再触发。
+    ScheduledTaskScheduler second;
+    int firesB = 0;
+    second.SetRunCallback([&](const std::wstring&) { ++firesB; });
+    second.SetTasks(first.Tasks());
+    second.TickAt(now);
+
+    // 换到**第二天同一时刻**应能正常触发（Daily 忽略日期，去重键含日期 ⇒ 不同键）。
+    // 确认落盘去重不是把任务永久堵死。
+    ScheduledTaskScheduler third;
+    int firesC = 0;
+    third.SetRunCallback([&](const std::wstring&) { ++firesC; });
+    third.SetTasks(first.Tasks());
+    third.TickAt(MakeSt(task.time.year, task.time.month, task.time.day + 1,
+        task.time.hour, task.time.minute, task.time.second, 0, 2));
+
+    const bool ok = firesA == 1 && persisted && firesB == 0 && firesC == 1;
+    wchar_t detail[220]{};
+    swprintf_s(detail, L"a=%d persisted=%d b=%d c=%d", firesA, persisted ? 1 : 0, firesB, firesC);
+    Emit(L"fire_key_survives_restart", ok,
+        ok ? L"lastFireKey 落盘 ⇒ 重开进程不会重复触发同一时刻，且不堵死下一周期"
+           : detail);
+}
+
 void CaseCustomFormatIncludesYear() {
     auto task = MakeTask(ScheduledFrequency::Custom);
     task.time.year = 2026;
@@ -666,6 +706,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseCustomOnceViaTick();
     CaseTickFiresOncePerSecondKey();
     CaseTickRunsAllDueTasks();
+    CaseFireKeySurvivesRestart();
     CaseCustomFormatIncludesYear();
     CaseParseBoolTokenNotSubstring();
     CaseParseGlobalDisabledTrue();

@@ -4,6 +4,7 @@
 #include "agent_attachment.h"
 #include "agent_conversation_store.h"
 #include "agent_core.h"
+#include "agent_desktop_task.h"
 #include "agent_script_ops.h"
 #include "agent_system_prompt.h"
 #include "agent_tools.h"
@@ -15,6 +16,7 @@
 #include "ui_scale.h"
 #include "desktop_tools/desktop_tools.h"
 #include "image_match.h"
+#include "macro_variables.h"
 #include "main_features.h"
 #include "recording_optimize_ops.h"
 #include "recording_to_findimage.h"
@@ -22,9 +24,12 @@
 #include "scheduled_task_store.h"
 #include "scheduled_task_types.h"
 #include "script_io.h"
+#include "script_package.h"
 #include "app_branding.h"
 #include "opencv_runtime.h"
 #include "utils.h"
+#include "web_ai/web_ai_config.h"
+#include "web_ai/web_ai_prompt.h"   // IsWebAiApiUrl / ApplyProfileOverride
 #include "action_tree.h"
 #include "action_utils.h"
 #include "engine/engine_ui_hooks.h"
@@ -98,6 +103,10 @@ void ApplyLoadedSettingsToClicker() {
 void EnsureSettingsLoaded() {
     if (g_settingsLoaded) return;
     LoadAppSettings(g_ctx.settings);
+    // 网页版 AI（web_ai_config.json enabled=true 才生效；关闭时它只做一次清理）：
+    //   助手窗的 AI 总闸（webview_bridge_backend.cpp 的 `ai.enabled` 检查）与
+    //   模型解析都读这份 settings ⇒ 必须在这里注入，否则「勾了开关却提示未启用」。
+    quickscript::webai::EnsureProfileInSettings(g_ctx.settings.ai);
     ApplyLoadedSettingsToClicker();
     g_settingsLoaded = true;
 }
@@ -188,6 +197,12 @@ std::string ListJsonFiles(const std::wstring& dir, bool recordings) {
     if (recordings) CreateDirectoryW(RecordingsDir().c_str(), nullptr);
     std::vector<ScriptFileEntry> files;
     EnumerateScriptJsonFiles(dir, files);
+    // 助手「动手」层（runDesktopTask）的临时任务脚本**不是用户脚本**，绝不进列表。
+    // 正常路径跑完即删；崩溃/强杀会留残留（启动时另有清扫）—— 这里兜住「看得见」的那一半。
+    // ⚠ 只在**列表出口**过滤：引擎靠 `ResolveLibraryScriptPath` 找它，别去改通用枚举。
+    files.erase(std::remove_if(files.begin(), files.end(),
+        [](const ScriptFileEntry& e) { return IsAgentTaskTempFileName(e.fileName); }),
+        files.end());
     std::ostringstream oss;
     oss << "[";
     bool first = true;
@@ -344,12 +359,19 @@ void ReloadSettingsFromDisk() {
     quickscript::AppSettings loaded;
     if (TryLoadAppSettings(loaded)) {
         g_ctx.settings = std::move(loaded);
+        // ★★ 必须在这里也注入一次网页版 AI 档案！
+        //   本函数**整体覆盖** `g_ctx.settings`（用磁盘那份），而磁盘那份**没有**我们注入的
+        //   档案 ⇒ 不补这一句，「设置 → AI助手」的模型下拉里就**看不到**「网页版 AI」这个选项。
+        //   ⚠ 这正是用户报的"设置里面没有显示这个选项"的第二条成因（第一条是开关的判据太严）。
+        //   调用链：`JsonOpenSettings()` → `ReloadSettingsFromDisk()` → 序列化给前端。
+        quickscript::webai::EnsureProfileInSettings(g_ctx.settings.ai);
         ApplyLoadedSettingsToClicker();
         g_settingsLoaded = true;
         return;
     }
     if (!g_settingsLoaded) {
         LoadAppSettings(g_ctx.settings);
+        quickscript::webai::EnsureProfileInSettings(g_ctx.settings.ai);
         ApplyLoadedSettingsToClicker();
         g_settingsLoaded = true;
     }
@@ -530,6 +552,13 @@ std::string JsonOpenSettings() {
     // 每次打开设置都从磁盘刷新，避免引擎侧（如关调试窗）写盘后 g_ctx 仍是旧值。
     ReloadSettingsFromDisk();
     std::lock_guard<std::mutex> lock(g_mu);
+    // ★★ 这里是「前端能看到的设置」的**唯一咽喉** ⇒ 网页版 AI 档案的注入放在这里兜底。
+    //   为什么不能只靠上游那几条 `LoadAppSettings`：本文件里有 10+ 处
+    //   `LoadAppSettings(g_ctx.settings)` / `TryLoadAppSettings(g_ctx.settings)`，
+    //   **逐条补注入必然会漏**（而且以后新增一条又会漏）。
+    //   ⚠ 漏了它的症状就是用户报的那句"设置里面没有显示这个选项"。
+    //   （`ReloadSettingsFromDisk` 里也注了一次，那是给**非序列化**的消费者用的。）
+    quickscript::webai::EnsureProfileInSettings(g_ctx.settings.ai);
     const auto& s = g_ctx.settings;
     std::ostringstream oss;
     oss << "{"
@@ -638,7 +667,9 @@ std::string JsonOpenSettings() {
         << "\"aiFastPaths\":"
         << (s.playback.aiFastPaths ? "true" : "false") << ","
         << "\"findImageGpuAccel\":"
-        << (s.playback.findImageGpuAccel ? "true" : "false")
+        << (s.playback.findImageGpuAccel ? "true" : "false") << ","
+        << "\"spreadRelativeMovePackets\":"
+        << (s.playback.spreadRelativeMovePackets ? "true" : "false")
         << "},"
         << "\"ai\":{"
         << "\"enabled\":" << (s.ai.enabled ? "true" : "false") << ","
@@ -745,6 +776,14 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
     if (GetBool(settingsObjJson, "autoStartOnBoot", b)) s.other.autoStartOnBoot = b;
     if (GetBool(settingsObjJson, "resolveImeConflict", b)) s.other.resolveImeConflict = b;
     if (GetBool(settingsObjJson, "showFloatBall", b)) s.other.showFloatBall = b;
+    // ⚠ `exportScriptAsZip` 是 2026-09-28 补的：`app.js` 的 collectSettings() **一直在发**
+    //   这个扁平键（「设置 → 其他 → 导出脚本默认为 zip 格式」，app.js:4246），
+    //   `startExport()` 也一直按 `other.exportScriptAsZip` 分流（app.js:11497），
+    //   读出端/写出端（app_settings_store.cpp:303/514）都齐 —— 唯独这里漏了映射，
+    //   于是这个勾选**存不下去**：改完保存、下次打开又回到默认，用户完全看不出为什么。
+    //   是 tools/verify/demo_settings_parity.js 的「collectSettings 发出的每个扁平键
+    //   都要有归宿」这条判据把它揪出来的（同一判据还揪出了 enableWindowTimeScale）。
+    if (GetBool(settingsObjJson, "exportScriptAsZip", b)) s.other.exportScriptAsZip = b;
     if (GetBool(settingsObjJson, "floatBallDocked", b)) s.other.floatBallDocked = b;
     if (GetInt(settingsObjJson, "floatBallEdge", i)) {
         if (i < 0 || i > 3) i = 1;
@@ -800,6 +839,14 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
     }
     if (GetBool(settingsObjJson, "hideInjectedModule", b))
         s.windowMode.hideInjectedModule = b;
+    // ⚠ 同理（2026-09-28 补）：`app.js` 的 collectSettings() 一直在发扁平的
+    //   `enableWindowTimeScale`（「设置 → 窗口模式 → 窗口时间缩放」，app.js:4304），
+    //   引擎也真的按 `windowMode.enableWindowTimeScale` 工作（engine_script_run.cpp:847），
+    //   但这里漏了映射 ⇒ 勾选永远存不下去。更隐蔽的是 `fillSettings()` 在读到
+    //   `null` 时**默认显示为勾选**（app.js:3269 `== null ? true : ...`），
+    //   所以界面看起来"一直是开的"，用户根本不会怀疑是保存坏了。
+    if (GetBool(settingsObjJson, "enableWindowTimeScale", b))
+        s.windowMode.enableWindowTimeScale = b;
     if (GetBool(settingsObjJson, "aiEnabled", b)) s.ai.enabled = b;
     if (GetBool(settingsObjJson, "enabled", b) && settingsObjJson.find("\"ai\"") != std::string::npos) {
         // prefer nested via flat keys from collectSettings
@@ -846,6 +893,8 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
         s.playback.lowPerformanceMode = b;
     if (GetBool(settingsObjJson, "findImageGpuAccel", b))
         s.playback.findImageGpuAccel = b;
+    if (GetBool(settingsObjJson, "spreadRelativeMovePackets", b))
+        s.playback.spreadRelativeMovePackets = b;
     if (GetBool(settingsObjJson, "aiFastPaths", b))
         s.playback.aiFastPaths = b;
     {
@@ -1006,6 +1055,11 @@ bool ApplySaveSettingsJson(const std::string& settingsObjJson, std::string& err)
         s.home.recorderScrollOffset = (std::max)(0, i);
     if (GetInt(settingsObjJson, "scriptCustomScrollOffset", i))
         s.home.scriptCustomScrollOffset = (std::max)(0, i);
+    // ★ 网页版 AI：用户在模型下拉里选了「网页版」就**立刻**生效，不必等下次重启。
+    //   `EnsureProfileInSettings` 是唯一能同时看到「站点配置」与「用户设置」的地方，
+    //   它顺带刷新 `Enabled()` 的判据（选中即启用）。放在保存**之前**，
+    //   这样落盘的那份也带着正确的端口/token 与总闸状态。
+    quickscript::webai::EnsureProfileInSettings(s.ai);
     if (!SaveAppSettings(s)) {
         err = "SaveAppSettings failed";
         return false;
@@ -1361,6 +1415,15 @@ bool ParseEditorActionsJson(const std::string& msgJson, std::vector<ScriptAction
 }
 
 }  // namespace
+
+std::string JsonEditorVarItems(const std::string& msgJson, std::string& err) {
+    // ⚠ 必须放在匿名 namespace **之后**：ParseEditorActionsJson 是文件内的实现细节，
+    //   放在它前面会报 C3861（找不到标识符）。
+    err.clear();
+    std::vector<ScriptAction> actions;
+    if (!ParseEditorActionsJson(msgJson, actions, err)) return std::string();
+    return ToUtf8(QuickInputVarItemsJson(actions));
+}
 
 bool ParseDebugScriptJson(const std::string& msgJson, std::vector<ScriptAction>& actions,
     int& startIndex, bool& stepMode, std::vector<int>& breakpoints,
@@ -1813,7 +1876,11 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
     ofn.lpstrFile = fileBuf;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter =
-        L"脚本文件 (*.zip;*.json)\0*.zip;*.json\0ZIP 脚本包 (*.zip)\0*.zip\0JSON 脚本 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0";
+        L"脚本文件 (*.zip;*.json;*.exe)\0*.zip;*.json;*.exe\0"
+        L"独立 EXE 脚本 (*.exe)\0*.exe\0"
+        L"ZIP 脚本包 (*.zip)\0*.zip\0"
+        L"JSON 脚本 (*.json)\0*.json\0"
+        L"所有文件 (*.*)\0*.*\0";
     ofn.nFilterIndex = 1;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
     if (!GetOpenFileNameW(&ofn)) {
@@ -1825,7 +1892,35 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
     std::wstring lower = src;
     std::transform(lower.begin(), lower.end(), lower.begin(),
         [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
-    const bool isZip = lower.size() >= 4 && lower.substr(lower.size() - 4) == L".zip";
+    bool isZip = lower.size() >= 4 && lower.substr(lower.size() - 4) == L".zip";
+
+    // 导出的「独立 EXE」：尾部带 QSTPKG01 payload，而 payload 本身就是个标准 zip
+    // （store 模式）。把它 dump 成临时 zip，后面完全走既有的 zip 导入路径 ——
+    // 导入端一行都不用知道 exe 的存在。
+    // 于是「导出的 exe 也能被本软件导入」是**天然成立**的，不需要额外格式。
+    std::wstring payloadZipPath;
+    std::wstring effectiveSrc = src;
+    if (!isZip) {
+        scriptpkg::PayloadInfo payloadInfo;
+        if (scriptpkg::ReadPayloadInfo(src, payloadInfo)) {
+            wchar_t tmpBuf[MAX_PATH]{};
+            if (GetTempPathW(MAX_PATH, tmpBuf) > 0) {
+                payloadZipPath = std::wstring(tmpBuf) + L"qst_import_payload_"
+                    + std::to_wstring(GetTickCount()) + L".zip";
+                if (scriptpkg::DumpPayloadToZip(src, payloadInfo, payloadZipPath)) {
+                    effectiveSrc = payloadZipPath;
+                    isZip = true;
+                } else {
+                    payloadZipPath.clear();
+                }
+            }
+        }
+    }
+    // 无论成功失败都要删临时文件（失败时 zip 可能没写出来，DeleteFile 无害）
+    struct TempZipGuard {
+        std::wstring* path;
+        ~TempZipGuard() { if (path && !path->empty()) DeleteFileW(path->c_str()); }
+    } tempZipGuard{ &payloadZipPath };
 
     auto safeName = [](std::wstring name) {
         if (Trim(name).empty()) name = TimestampName();
@@ -1847,7 +1942,7 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
     CreateDirectoryW(destDir.c_str(), nullptr);
 
     if (!isZip) {
-        const auto content = ReadAll(src);
+        const auto content = ReadAll(effectiveSrc);
         ScriptFileData data = ParseScriptContent(content);
         if (data.scriptName.empty()) {
             // 纯 CopyFile 回退：无 scriptName 时仍复制
@@ -1876,7 +1971,8 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
     }
 
     // ZIP：script.json + 图片（对齐原生 ImportScriptFromZipFile）
-    std::string jsonUtf8 = ReadTextFromZip(src, "script.json");
+    // 注意用 effectiveSrc —— 独立 EXE 的情况这里指向 dump 出来的临时 zip。
+    std::string jsonUtf8 = ReadTextFromZip(effectiveSrc, "script.json");
     if (jsonUtf8.empty()) {
         err = "ZIP missing script.json";
         return false;
@@ -1891,14 +1987,16 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
     wchar_t tempDir[MAX_PATH]{};
     GetTempPathW(MAX_PATH, tempDir);
     const std::wstring extractDir = std::wstring(tempDir) + L"qs_import_" + std::to_wstring(GetTickCount());
-    if (ExtractZipFile(src, extractDir) < 0) {
+    if (ExtractZipFile(effectiveSrc, extractDir) < 0) {
         err = "ExtractZipFile failed";
         return false;
     }
 
     EnsureFindImagesDir();
-    std::wstring modifiedContent = content;
     const auto imgDir = FindImagesDir();
+    // 图片映射先收集、后统一应用 —— 嵌套脚本也要吃到同一份映射
+    // （旧实现只改根脚本，嵌套脚本里的图片路径会原样留下源机器相对路径）。
+    std::vector<std::pair<std::wstring, std::wstring>> imageRemap;
     WIN32_FIND_DATAW fd{};
     HANDLE hFind = FindFirstFileW((extractDir + L"\\*").c_str(), &fd);
     if (hFind != INVALID_HANDLE_VALUE) {
@@ -1906,6 +2004,7 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             std::wstring fileName(fd.cFileName);
             if (_wcsicmp(fileName.c_str(), L"script.json") == 0) continue;
+            if (_wcsicmp(fileName.c_str(), L"package.json") == 0) continue;
             auto dotPos = fileName.find_last_of(L'.');
             if (dotPos == std::wstring::npos) continue;
             std::wstring ext = fileName.substr(dotPos);
@@ -1921,23 +2020,94 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
             }
             if (!CopyFileW(extractedFile.c_str(), destPath.c_str(), FALSE)) continue;
 
-            const std::wstring relPath = ImagePathForJson(destPath);
-            RemapImportedImagePathInScriptJson(modifiedContent, fileName, relPath);
+            imageRemap.emplace_back(fileName, ImagePathForJson(destPath));
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
+    auto applyImageRemap = [&](std::wstring& text) {
+        for (const auto& kv : imageRemap)
+            RemapImportedImagePathInScriptJson(text, kv.first, kv.second);
+    };
 
-    // cleanup temp
-    WIN32_FIND_DATAW fd2{};
-    HANDLE hFind2 = FindFirstFileW((extractDir + L"\\*").c_str(), &fd2);
-    if (hFind2 != INVALID_HANDLE_VALUE) {
-        do {
-            if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                DeleteFileW((extractDir + L"\\" + fd2.cFileName).c_str());
-        } while (FindNextFileW(hFind2, &fd2));
-        FindClose(hFind2);
+    // ── 嵌套脚本还原（清单存在时）────────────────────────────────────
+    // 目标：把 scripts/<名>.json 落回 destDir，并把父脚本里 targetPath 的
+    // 可移植引用改写成**还原后的真实文件名**，否则对方机器上找不到子脚本。
+    std::vector<std::pair<std::wstring, std::wstring>> nestedRemap;  // 可移植引用 → 新文件名
+    std::vector<std::pair<std::wstring, std::wstring>> nestedSave;   // 新路径 → 内容
+    {
+        const std::string manifestUtf8 = ReadTextFromZip(effectiveSrc, "package.json");
+        std::vector<scriptpkg::ManifestEntry> manifest;
+        if (!manifestUtf8.empty())
+            scriptpkg::ParsePackageManifestJson(FromUtf8(manifestUtf8), manifest);
+        for (const auto& me : manifest) {
+            std::wstring rel = me.entryName;
+            for (wchar_t& ch : rel) {
+                if (ch == L'/') ch = L'\\';
+            }
+            std::wstring nested = ReadAll(extractDir + L"\\" + rel);
+            if (nested.empty()) continue;
+            applyImageRemap(nested);
+
+            const std::wstring stem = safeName(me.displayName.empty() ? L"script" : me.displayName);
+            std::wstring target = destDir + L"\\" + stem + L".json";
+            int suffix = 1;
+            while (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                target = destDir + L"\\" + stem + L"-" + std::to_wstring(suffix++) + L".json";
+            }
+            // 立刻占位，避免同一批里多个条目抢同一个名字
+            HANDLE ph = CreateFileW(target.c_str(), GENERIC_WRITE, 0, nullptr,
+                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (ph == INVALID_HANDLE_VALUE) continue;
+            CloseHandle(ph);
+
+            const auto slash = target.find_last_of(L'\\');
+            const std::wstring fileName = target.substr(slash + 1);
+            if (!me.portableRef.empty()) nestedRemap.emplace_back(me.portableRef, fileName);
+            if (!me.displayName.empty()) nestedRemap.emplace_back(me.displayName, fileName);
+            nestedSave.emplace_back(target, std::move(nested));
+        }
     }
-    RemoveDirectoryW(extractDir.c_str());
+
+    // 嵌套脚本内部的 targetPath 也要改写（多层嵌套）
+    for (auto& kv : nestedSave) {
+        if (!nestedRemap.empty()) scriptpkg::RewriteNestedTargetPaths(kv.second, nestedRemap);
+    }
+
+    // cleanup temp（含 scripts 子目录）
+    // 递归 lambda 必须显式给 std::function：auto 版不能自引用。
+    std::function<void(const std::wstring&)> removeTree = [&](const std::wstring& dir) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == 0
+                    || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) continue;
+                const std::wstring child = dir + L"\\" + fd.cFileName;
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    removeTree(child);
+                } else {
+                    DeleteFileW(child.c_str());
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryW(dir.c_str());
+    };
+    removeTree(extractDir);
+
+    std::wstring modifiedContent = content;
+    applyImageRemap(modifiedContent);
+    if (!nestedRemap.empty()) scriptpkg::RewriteNestedTargetPaths(modifiedContent, nestedRemap);
+
+    // 落盘嵌套脚本（内容已在内存里改写好）
+    for (const auto& kv : nestedSave) {
+        std::ofstream out(kv.first, std::ios::binary);
+        if (!out) continue;
+        out.write("\xEF\xBB\xBF", 3);
+        const auto bytes = ToUtf8(kv.second);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+    }
 
     ScriptFileData importData = ParseScriptContent(modifiedContent);
     if (importData.scriptName.empty()) importData.scriptName = name;
@@ -1954,10 +2124,140 @@ bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err
     return true;
 }
 
+namespace {
+
+/// 播放器模板路径（随产品分发：`<AppDir>\tools\player\QstPlayer.exe`）。
+/// 导出只做「复制模板 + 追加数据」，所以 player 版本永远与主程序一致，
+/// 也不依赖网络或任何编译工具链。
+std::wstring PlayerTemplatePath() {
+    return AppDir() + L"\\tools\\player\\QstPlayer.exe";
+}
+
+/// 生成**便携版** AI 设置 JSON（密钥明文）。
+/// ⚠ 绝对不能用 SaveAppSettings 走一遍：它内部用 `CryptProtectData`
+///   （**用户级 DPAPI**）加密 apiKey，换一台机器 / 换一个用户就解不开，
+///   打进 exe 等于把 AI 动作弄坏。而 `UnprotectSecret` 对不以 "dpapi:" 开头的值
+///   是**原样返回**的 —— 所以这里直接写明文，目标机就能直接用。
+/// 只写 ai 段：其它设置（主题/界面/选中项）不该跟着 exe 跑到别人机器上。
+void AddRuntimeEntry(std::vector<std::pair<std::wstring, std::wstring>>& entries,
+    const std::wstring& srcPath, const wchar_t* entryBaseName) {
+    if (GetFileAttributesW(srcPath.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    entries.emplace_back(std::wstring(L"rt\\") + entryBaseName, srcPath);
+}
+
+/// 把依赖计划打成脚本包 zip（导出 zip 与导出 exe 共用这一份）。
+/// extraEntries：额外条目（zip 内名, 本地路径）。**必须用 `rt\` 前缀** ——
+/// 播放器会把 `rt\` 里的文件挪到运行时目录根，因为假焦点注入器按
+/// `ModuleDirectory()` 找 DLL、OpenCV 也从 exe 旁边加载。
+bool BuildPackageZip(const scriptpkg::PackagePlan& plan,
+    const scriptpkg::PlayerManifest& player,
+    const std::vector<std::pair<std::wstring, std::wstring>>& extraEntries,
+    const std::wstring& zipPath,
+    std::vector<std::wstring>& skippedFiles,
+    std::string& err) {
+    // 改写表：原始引用（targetPath / blockName 原值）→ 可移植引用（裸文件名）。
+    // 必须按**原值**匹配而不是 srcPath —— 引用可能是 blockName 回退解析来的。
+    std::vector<std::pair<std::wstring, std::wstring>> remap;
+    for (const auto& e : plan.scripts) {
+        if (e.isRoot || e.portableRef.empty()) continue;
+        for (const auto& ref : e.originalRefs) {
+            const std::wstring key = Trim(ref);
+            if (!key.empty()) remap.emplace_back(key, e.portableRef);
+        }
+    }
+
+    // 改写后的脚本必须先落到临时文件（CreateZipFile 按本地路径读），打完包就删。
+    wchar_t tempRoot[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempRoot);
+    const std::wstring tempDir = std::wstring(tempRoot) + L"qst_export_"
+        + std::to_wstring(GetTickCount());
+    if (!EnsureDirectoryTree(tempDir)) {
+        err = "无法创建临时目录";
+        return false;
+    }
+
+    std::vector<std::wstring> tempFiles;
+    auto cleanupTemp = [&]() {
+        for (const auto& f : tempFiles) DeleteFileW(f.c_str());
+        RemoveDirectoryW(tempDir.c_str());
+    };
+
+    std::vector<std::pair<std::wstring, std::wstring>> zipFiles;
+    for (size_t i = 0; i < plan.scripts.size(); ++i) {
+        const auto& e = plan.scripts[i];
+        std::wstring content = ReadAll(e.srcPath);
+        if (content.empty()) {
+            cleanupTemp();
+            err = "读取脚本失败：" + ToUtf8(e.displayName);
+            return false;
+        }
+        if (!remap.empty()) scriptpkg::RewriteNestedTargetPaths(content, remap);
+        const std::wstring local = tempDir + L"\\s" + std::to_wstring(i) + L".json";
+        std::ofstream out(local, std::ios::binary);
+        if (!out) {
+            cleanupTemp();
+            err = "写临时脚本失败";
+            return false;
+        }
+        out.write("\xEF\xBB\xBF", 3);
+        const auto bytes = ToUtf8(content);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        const bool ok = out.good();
+        out.close();
+        if (!ok) {
+            cleanupTemp();
+            err = "写临时脚本失败";
+            return false;
+        }
+        tempFiles.push_back(local);
+        zipFiles.push_back({e.entryName, local});
+    }
+
+    // 图片保持既有扁平命名（基名），与旧导入逻辑兼容
+    for (const auto& imgPath : plan.images) {
+        const auto slashPos = imgPath.find_last_of(L"\\/");
+        std::wstring imgName = (slashPos == std::wstring::npos)
+            ? imgPath : imgPath.substr(slashPos + 1);
+        if (imgName.empty()) continue;
+        zipFiles.push_back({imgName, imgPath});
+    }
+
+    // 运行时组件（OpenCV / FakeFocus）放 rt\ 前缀
+    for (const auto& kv : extraEntries) zipFiles.push_back(kv);
+
+    // 清单：让导入侧知道哪些条目是脚本、要还原到哪个相对路径；
+    // 让播放器知道「找图 / OCR 用哪一份」。
+    const std::wstring manifestLocal = tempDir + L"\\package.json";
+    {
+        std::ofstream out(manifestLocal, std::ios::binary);
+        if (out) {
+            out.write("\xEF\xBB\xBF", 3);
+            const auto bytes = ToUtf8(scriptpkg::BuildPackageManifestJson(plan, player));
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            out.close();
+            tempFiles.push_back(manifestLocal);
+            zipFiles.push_back({scriptpkg::kManifestEntry, manifestLocal});
+        }
+    }
+
+    const auto zipResult = CreateZipFile(zipPath, zipFiles,
+        zipFiles.empty() ? std::wstring() : zipFiles.front().second);
+    cleanupTemp();
+    if (!zipResult.success) {
+        err = "CreateZipFile failed";
+        return false;
+    }
+    skippedFiles = zipResult.skippedFiles;
+    return true;
+}
+
+}  // namespace
+
 bool ExportScriptFile(const std::string& pathUtf8, std::string& err,
-    int* outSkipped, std::string* outSkippedFilesJson) {
+    int* outSkipped, std::string* outSkippedFilesJson, std::string* outMissingRefsJson) {
     if (outSkipped) *outSkipped = 0;
     if (outSkippedFilesJson) outSkippedFilesJson->clear();
+    if (outMissingRefsJson) outMissingRefsJson->clear();
     std::wstring path;
     if (!ResolveScriptPath(pathUtf8, path, err)) {
         err.clear();
@@ -1967,86 +2267,343 @@ bool ExportScriptFile(const std::string& pathUtf8, std::string& err,
             return false;
         }
     }
-    const auto content = ReadAll(path);
-    const auto imgPaths = CollectImagePathsFromJson(content);
-    ScriptFileData data = ParseScriptContent(content);
-    std::wstring baseName = data.scriptName.empty()
-        ? ([&]() {
-            const auto slash = path.find_last_of(L"\\/");
-            std::wstring n = slash == std::wstring::npos ? path : path.substr(slash + 1);
-            const auto dot = n.find_last_of(L'.');
-            if (dot != std::wstring::npos) n = n.substr(0, dot);
-            return n;
-        })()
-        : data.scriptName;
+
+    // 递归收集依赖：根脚本 + 嵌套脚本（RunMacro/MousePlayback 的 targetPath）+ 全部模板图。
+    // 旧实现只收集**根脚本自己**的图片，嵌套脚本整份丢包 —— 对方导入后嵌套动作必然失败。
+    scriptpkg::PackagePlan plan;
+    std::wstring planErr;
+    if (!scriptpkg::BuildPackagePlan(path, plan, planErr)) {
+        err = ToUtf8(planErr.empty() ? L"构建脚本包失败" : planErr);
+        return false;
+    }
+    if (outMissingRefsJson && !plan.missingRefs.empty()) {
+        std::ostringstream oss;
+        oss << "[";
+        for (size_t i = 0; i < plan.missingRefs.size(); ++i) {
+            if (i) oss << ",";
+            oss << "\"" << EscapeJson(ToUtf8(plan.missingRefs[i])) << "\"";
+        }
+        oss << "]";
+        *outMissingRefsJson = oss.str();
+    }
+
+    std::wstring baseName = plan.scripts.empty() ? std::wstring() : plan.scripts.front().displayName;
     for (wchar_t& ch : baseName) {
         if (wcschr(L"<>:\"/\\|?*", ch)) ch = L'_';
     }
     if (baseName.empty()) baseName = TimestampName();
 
-    if (!imgPaths.empty()) {
+    const bool needZip = plan.hasNested || !plan.images.empty();
+    if (!needZip) {
         wchar_t fileBuf[MAX_PATH]{};
-        wcsncpy_s(fileBuf, (baseName + L".zip").c_str(), _TRUNCATE);
+        wcsncpy_s(fileBuf, (baseName + L".json").c_str(), _TRUNCATE);
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = GetForegroundWindow();
         ofn.lpstrFile = fileBuf;
         ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = L"ZIP 脚本包 (*.zip)\0*.zip\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFilter = L"JSON Scripts\0*.json\0All\0*.*\0";
         ofn.nFilterIndex = 1;
-        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-        ofn.lpstrDefExt = L"zip";
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_EXPLORER;
+        ofn.lpstrDefExt = L"json";
         if (!GetSaveFileNameW(&ofn)) {
             err = "cancelled";
             return false;
         }
-        std::wstring zipPath(fileBuf);
-        if (zipPath.size() < 4 || _wcsicmp(zipPath.substr(zipPath.size() - 4).c_str(), L".zip") != 0)
-            zipPath += L".zip";
-        std::vector<std::pair<std::wstring, std::wstring>> files;
-        files.push_back({L"script.json", path});
-        for (const auto& imgPath : imgPaths) {
-            const auto slashPos = imgPath.find_last_of(L"\\/");
-            std::wstring imgName = (slashPos == std::wstring::npos) ? imgPath : imgPath.substr(slashPos + 1);
-            files.push_back({imgName, imgPath});
-        }
-        const auto zipResult = CreateZipFile(zipPath, files, path);
-        if (!zipResult.success) {
-            err = "CreateZipFile failed";
+        if (!CopyFileW(path.c_str(), fileBuf, FALSE)) {
+            err = "CopyFile failed";
             return false;
-        }
-        if (outSkipped) *outSkipped = static_cast<int>(zipResult.skippedFiles.size());
-        if (outSkippedFilesJson) {
-            std::ostringstream oss;
-            oss << "[";
-            for (size_t i = 0; i < zipResult.skippedFiles.size(); ++i) {
-                if (i) oss << ",";
-                oss << "\"" << EscapeJson(ToUtf8(zipResult.skippedFiles[i])) << "\"";
-            }
-            oss << "]";
-            *outSkippedFilesJson = oss.str();
         }
         return true;
     }
 
+    // ── ZIP 脚本包分支 ──────────────────────────────────────────────
     wchar_t fileBuf[MAX_PATH]{};
-    wcsncpy_s(fileBuf, (baseName + L".json").c_str(), _TRUNCATE);
+    wcsncpy_s(fileBuf, (baseName + L".zip").c_str(), _TRUNCATE);
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = GetForegroundWindow();
     ofn.lpstrFile = fileBuf;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"JSON Scripts\0*.json\0All\0*.*\0";
+    ofn.lpstrFilter = L"ZIP 脚本包 (*.zip)\0*.zip\0所有文件 (*.*)\0*.*\0";
     ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_EXPLORER;
-    ofn.lpstrDefExt = L"json";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    ofn.lpstrDefExt = L"zip";
     if (!GetSaveFileNameW(&ofn)) {
         err = "cancelled";
         return false;
     }
-    if (!CopyFileW(path.c_str(), fileBuf, FALSE)) {
-        err = "CopyFile failed";
+    std::wstring zipPath(fileBuf);
+    if (zipPath.size() < 4 || _wcsicmp(zipPath.substr(zipPath.size() - 4).c_str(), L".zip") != 0)
+        zipPath += L".zip";
+
+    std::vector<std::wstring> skipped;
+    if (!BuildPackageZip(plan, scriptpkg::PlayerManifest{}, {}, zipPath, skipped, err)) {
         return false;
+    }
+    if (outSkipped) *outSkipped = static_cast<int>(skipped.size());
+    if (outSkippedFilesJson) {
+        std::ostringstream oss;
+        oss << "[";
+        for (size_t i = 0; i < skipped.size(); ++i) {
+            if (i) oss << ",";
+            oss << "\"" << EscapeJson(ToUtf8(skipped[i])) << "\"";
+        }
+        oss << "]";
+        *outSkippedFilesJson = oss.str();
+    }
+    return true;
+}
+namespace {
+
+uint64_t FileSizeOrZero(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return 0;
+    return (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+}
+
+/// 解析脚本路径（允许传库内 id/名字，也允许绝对路径）。
+bool ResolveForExport(const std::string& pathUtf8, std::wstring& path, std::string& err) {
+    if (!ResolveScriptPath(pathUtf8, path, err)) {
+        err.clear();
+        path = FromUtf8(pathUtf8);
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            err = "file not found";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::wstring SanitizeBaseName(std::wstring name) {
+    for (wchar_t& ch : name) {
+        if (wcschr(L"<>:\"/\\|?*", ch)) ch = L'_';
+    }
+    if (name.empty()) name = TimestampName();
+    return name;
+}
+
+}  // namespace
+
+std::string ScanScriptForExportJson(const std::string& pathUtf8, std::string& err) {
+    err.clear();
+    std::wstring path;
+    if (!ResolveForExport(pathUtf8, path, err)) return std::string();
+
+    scriptpkg::PackagePlan plan;
+    std::wstring planErr;
+    if (!scriptpkg::BuildPackagePlan(path, plan, planErr)) {
+        err = ToUtf8(planErr.empty() ? L"构建脚本包失败" : planErr);
+        return std::string();
+    }
+    const scriptpkg::CapabilityScan scan = scriptpkg::ScanPackageCapabilities(plan);
+
+    const uint64_t templateBytes = FileSizeOrZero(PlayerTemplatePath());
+    const uint64_t openCvBytes = FileSizeOrZero(AppDir() + L"\\opencv_world4100.dll");
+    const uint64_t fakeFocusBytes = FileSizeOrZero(AppDir() + L"\\FakeFocus64.dll")
+        + FileSizeOrZero(AppDir() + L"\\FakeFocus32.dll");
+
+    std::ostringstream oss;
+    oss << "{"
+        << "\"ok\":true"
+        << ",\"scriptName\":\"" << EscapeJson(ToUtf8(plan.scripts.empty()
+            ? std::wstring() : plan.scripts.front().displayName)) << "\""
+        << ",\"totalActions\":" << scan.totalActions
+        << ",\"imageActions\":" << scan.imageActions
+        << ",\"ocrActions\":" << scan.ocrActions
+        << ",\"aiActions\":" << scan.aiActions
+        << ",\"externalActions\":" << scan.externalActions
+        << ",\"windowMode\":" << (scan.windowMode ? 1 : 0)
+        << ",\"hasHotkey\":" << (scan.hasHotkey ? 1 : 0)
+        << ",\"nestedScripts\":" << (plan.scripts.empty() ? 0 : plan.scripts.size() - 1)
+        << ",\"selfContainedOnly\":" << (scan.IsSelfContainedOnly() ? 1 : 0)
+        << ",\"templateAvailable\":" << (templateBytes > 0 ? 1 : 0)
+        << ",\"templateBytes\":" << templateBytes
+        << ",\"openCvBytes\":" << openCvBytes
+        << ",\"fakeFocusBytes\":" << fakeFocusBytes
+        << ",\"missingRefs\":[";
+    for (size_t i = 0; i < plan.missingRefs.size(); ++i) {
+        if (i) oss << ",";
+        oss << "\"" << EscapeJson(ToUtf8(plan.missingRefs[i])) << "\"";
+    }
+    oss << "]}";
+    return oss.str();
+}
+
+bool ExportScriptAsExe(const std::string& pathUtf8, const std::string& outPathUtf8,
+    bool bundledOpenCv, bool bundledOcr, bool bundledFakeFocus,
+    std::string& err, std::string* outInfoJson) {
+    err.clear();
+    if (outInfoJson) outInfoJson->clear();
+
+    std::wstring path;
+    if (!ResolveForExport(pathUtf8, path, err)) return false;
+
+    const std::wstring templatePath = PlayerTemplatePath();
+    if (GetFileAttributesW(templatePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        err = "缺少脚本播放器模板：\n" + ToUtf8(templatePath)
+            + "\n\n这是安装包的一部分，重装「键鼠工坊」即可恢复。";
+        return false;
+    }
+
+    scriptpkg::PackagePlan plan;
+    std::wstring planErr;
+    if (!scriptpkg::BuildPackagePlan(path, plan, planErr)) {
+        err = ToUtf8(planErr.empty() ? L"构建脚本包失败" : planErr);
+        return false;
+    }
+    const scriptpkg::CapabilityScan scan = scriptpkg::ScanPackageCapabilities(plan);
+
+    std::wstring outPath;
+    if (!outPathUtf8.empty()) {
+        outPath = FromUtf8(outPathUtf8);
+    } else {
+        const std::wstring base = SanitizeBaseName(plan.scripts.empty()
+            ? std::wstring() : plan.scripts.front().displayName);
+        wchar_t fileBuf[MAX_PATH]{};
+        wcsncpy_s(fileBuf, (base + L".exe").c_str(), _TRUNCATE);
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = GetForegroundWindow();
+        ofn.lpstrFile = fileBuf;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFilter = L"独立 EXE 脚本 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+        ofn.lpstrDefExt = L"exe";
+        if (!GetSaveFileNameW(&ofn)) {
+            err = "cancelled";
+            return false;
+        }
+        outPath = fileBuf;
+        if (outPath.size() < 4
+            || _wcsicmp(outPath.substr(outPath.size() - 4).c_str(), L".exe") != 0) {
+            outPath += L".exe";
+        }
+    }
+
+    // 运行配置写进清单：播放器据此决定「找图 / OCR 用哪一份」
+    scriptpkg::PlayerManifest pm;
+    pm.needOpenCv = scan.NeedsOpenCv();
+    pm.needOcr = scan.NeedsOcr();
+    pm.needFakeFocus = scan.NeedsFakeFocus();
+    pm.mode.bundledOpenCv = bundledOpenCv;
+    pm.mode.bundledOcr = bundledOcr;
+    pm.mode.bundledFakeFocus = bundledFakeFocus;
+    pm.createdBy = quickscript::AppBranding::Version();
+
+    // 需要才带运行时组件；「走软件」模式不带（播放器会去已装软件目录加载）
+    std::vector<std::pair<std::wstring, std::wstring>> extra;
+    // 给"导出时临时生成的文件"（如 app_settings.json）用的暂存目录
+    wchar_t extraTmpRoot[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, extraTmpRoot);
+    const std::wstring tempDirForExtra = std::wstring(extraTmpRoot) + L"qst_exe_extra_"
+        + std::to_wstring(GetTickCount());
+    struct ExtraDirGuard {
+        std::wstring dir;
+        ~ExtraDirGuard() {
+            if (dir.empty()) return;
+            WIN32_FIND_DATAW fd{};
+            HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+            RemoveDirectoryW(dir.c_str());
+        }
+    } extraDirGuard{ tempDirForExtra };
+    if (scan.NeedsOpenCv() && bundledOpenCv) {
+        AddRuntimeEntry(extra, AppDir() + L"\\opencv_world4100.dll", L"opencv_world4100.dll");
+    }
+    if (scan.NeedsFakeFocus() && bundledFakeFocus) {
+        // 32/64 两份都带：目标进程位数在导出时无法确定
+        AddRuntimeEntry(extra, AppDir() + L"\\FakeFocus64.dll", L"FakeFocus64.dll");
+        AddRuntimeEntry(extra, AppDir() + L"\\FakeFocus32.dll", L"FakeFocus32.dll");
+    }
+    // 提示音：引擎按 AppDir() 找 startup/finish.wav，播放器暂停时找 pause.wav。
+    // 三个加起来不到 100KB，**无条件带**（脚本是否"用得到"取决于运行时分支，
+    // 导出时判不出来；少一个就变成系统提示音，用户会觉得"音效没了"）。
+    AddRuntimeEntry(extra, AppDir() + L"\\startup.wav", L"startup.wav");
+    AddRuntimeEntry(extra, AppDir() + L"\\finish.wav", L"finish.wav");
+    AddRuntimeEntry(extra, AppDir() + L"\\pause.wav", L"pause.wav");
+
+    // ── 设置快照：**导出时是什么设置，exe 里就是什么设置** ──────────────
+    // 目的：exe 跑出来的效果和"用软件跑同一个脚本"一模一样。
+    // 覆盖回放次数、回放间隔/随机间隔、倍速、低性能模式、找图 GPU 加速、
+    // AI 高级加速、前台注入后端、窗口模式（假焦点注入 / 注入技术 / 隐藏模块 /
+    // 前台回退 / **窗口变速**）、以及 AI 的 url/model/密钥。
+    //
+    // 两个关键点：
+    //  ① 复用**同一个序列化器** `SerializeAppSettings`，不另写"便携版" ——
+    //     漏一个字段就是一处行为差异；
+    //  ② `portableSecrets=true` 让 apiKey 写**明文**：DPAPI 是用户级的，
+    //     换机器/换用户解不开，加密后打进 exe 等于把 AI 动作静默弄坏。
+    bool settingsEmbedded = false;
+    bool aiKeyEmbedded = false;
+    {
+        quickscript::AppSettings cur{};
+        if (LoadAppSettings(cur)) {
+            const std::wstring local = tempDirForExtra + L"\\app_settings.json";
+            if (EnsureDirectoryTree(tempDirForExtra)) {
+                std::ofstream out(local, std::ios::binary);
+                if (out) {
+                    out.write("\xEF\xBB\xBF", 3);
+                    const auto bytes = ToUtf8(SerializeAppSettings(cur, /*portableSecrets=*/true));
+                    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                    out.close();
+                    extra.emplace_back(L"rt\\app_settings.json", local);
+                    settingsEmbedded = true;
+                    aiKeyEmbedded = scan.NeedsAi() && !cur.ai.apiKey.empty();
+                }
+            }
+        }
+    }
+
+    wchar_t tempRoot[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempRoot);
+    const std::wstring zipPath = std::wstring(tempRoot) + L"qst_exe_payload_"
+        + std::to_wstring(GetTickCount()) + L".zip";
+    struct ZipGuard {
+        std::wstring path;
+        ~ZipGuard() { if (!path.empty()) DeleteFileW(path.c_str()); }
+    } zipGuard{ zipPath };
+
+    std::vector<std::wstring> skipped;
+    if (!BuildPackageZip(plan, pm, extra, zipPath, skipped, err)) return false;
+
+    if (!CopyFileW(templatePath.c_str(), outPath.c_str(), FALSE)) {
+        err = "无法写出文件：\n" + ToUtf8(outPath)
+            + "\n\n目标目录可能不可写，或文件正被占用。";
+        return false;
+    }
+    scriptpkg::PayloadInfo info;
+    if (!scriptpkg::AppendPayloadToExe(outPath, zipPath, &info)) {
+        DeleteFileW(outPath.c_str());
+        err = "写入脚本数据失败（磁盘空间不足或被杀毒软件拦截）。";
+        return false;
+    }
+
+    if (outInfoJson) {
+        std::ostringstream oss;
+        oss << "{\"ok\":true,\"path\":\"" << EscapeJson(ToUtf8(outPath)) << "\""
+            << ",\"bytes\":" << FileSizeOrZero(outPath)
+            << ",\"payloadBytes\":" << info.size
+            << ",\"skipped\":" << skipped.size()
+            << ",\"usedOpenCv\":" << ((scan.NeedsOpenCv() && bundledOpenCv) ? 1 : 0)
+            << ",\"usedFakeFocus\":" << ((scan.NeedsFakeFocus() && bundledFakeFocus) ? 1 : 0)
+            << ",\"settingsEmbedded\":" << (settingsEmbedded ? 1 : 0)
+            << ",\"aiKeyEmbedded\":" << (aiKeyEmbedded ? 1 : 0)
+            << ",\"needsAi\":" << (scan.NeedsAi() ? 1 : 0)
+            << ",\"missingRefs\":[";
+        for (size_t i = 0; i < plan.missingRefs.size(); ++i) {
+            if (i) oss << ",";
+            oss << "\"" << EscapeJson(ToUtf8(plan.missingRefs[i])) << "\"";
+        }
+        oss << "]}";
+        *outInfoJson = oss.str();
     }
     return true;
 }
@@ -2158,13 +2715,31 @@ AgentConfig BuildCfgFromSettings(const quickscript::AiApiSettings& ai) {
     cfg.apiUrl = ai.apiUrl;
     cfg.apiKey = ai.apiKey;
     cfg.model = ai.modelName;
+
+    // ★★ 网页版 AI 的**端口与密钥每次启动都会重新生成**，而设置里存的是**上一次**的值。
+    //   AI 动作那条路径调了 `ApplyProfileOverride` 兜底刷新，**助手这条路径漏了**
+    //   ⇒ 用旧 token 发请求 ⇒ 桥回 **401 BAD_TOKEN**（2026-09-26 真机，
+    //   用户看到"HTTP 401 /v1/chat/completions（无响应正文）"）。
+    //   ⇒ 这里复用同一个（已被自检覆盖的）纯函数刷新，别另写一套。
+    if (quickscript::webai::IsWebAiApiUrl(ToUtf8(ai.apiUrl))) {
+        quickscript::AiModelProfile tmp;
+        tmp.modelName = ai.modelName;
+        tmp.apiUrl = ai.apiUrl;
+        tmp.apiKey = ai.apiKey;
+        if (quickscript::webai::ApplyProfileOverride(tmp)) {
+            cfg.apiUrl = tmp.apiUrl;
+            cfg.apiKey = tmp.apiKey;
+        }
+    }
     cfg.temperature = ai.temperature;
     cfg.maxTokens = ai.maxTokens;
-    if (cfg.maxTokens > 393216) cfg.maxTokens = 393216;
-    if (cfg.maxTokens < 1) cfg.maxTokens = 4096;
-    // 聊天助手输出上限 8192：脚本 JSON 加总结足够；更重要的是思考型模型
-    // 会把 max_tokens 当思考预算，32768 实测可让单轮思考拖到数分钟（表现为「卡死」）。
-    if (cfg.maxTokens > 8192) cfg.maxTokens = 8192;
+    // ★★设置里写多少就发多少（docs §55）。旧代码在这里 `if (cfg.maxTokens > 8192)
+    //   cfg.maxTokens = 8192;` —— 设置界面写 393216、实际发 8192，**任何地方都不说**，
+    //   用户只能看到「我设的数字不起作用」（原话：「这个预算是哪里来的？不是设置界面
+    //   设置的吗？」）。模型相关的输出上限只有 `ClampApiMaxTokens` 那一份（协议要求），
+    //   而且实发值已经写进「请求体拆解」那行，谁收敛了、收敛到多少，一眼可见。
+    //   这里只留**下限**：给 1 会把任何一次回答都截断。
+    if (cfg.maxTokens < 4096) cfg.maxTokens = 4096;
     // 单轮最坏等待必须有界：无上限的 maxTokens×25ms 会把超时抬到
     // 17 分钟（40969 tokens）甚至数小时（393216 tokens），
     // 配合思考模式/慢响应就表现为「卡死」。上限 5 分钟，够长输出也够失败兜底。
@@ -2258,9 +2833,17 @@ std::wstring SanitizeAiConversationTitle(std::wstring raw) {
 }
 
 void RequestAiConversationTitleAsync(AgentConfig cfg, std::wstring id,
-    std::wstring userText, std::wstring replyText) {
+    std::wstring userText, std::wstring replyText, std::string panelKey) {
     std::thread([cfg = std::move(cfg), id = std::move(id),
-                 userText = std::move(userText), replyText = std::move(replyText)]() {
+                 userText = std::move(userText), replyText = std::move(replyText),
+                 panelKey = std::move(panelKey)]() {
+        // ★★ 这两行是"一次新对话开两个对话"的修复（2026-09-26 真机）：
+        //   ① 带上**和提问相同的会话 key** ⇒ 复用同一个网页标签页（不新开标签页）；
+        //   ② 声明"**别开新对话**" ⇒ 后端不会把它当新会话去导航。
+        //   ⚠ 不设的话：它不带 key ⇒ 被当新会话 ⇒ `turns==0` ⇒ 豆包那边**又开一个对话**
+        //     （那个对话的内容就是"根据对话内容起一个简短中文标题…"）。
+        SetAgentSessionKeyForThisThread(panelKey);
+        SetAgentNoNewChatForThisThread(true);
         std::wstring title;
         try {
             AgentCore titleCore(
@@ -2633,6 +3216,8 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
         streamIdUtf8 = ToUtf8(g_agent.id);
     }
     std::thread([core, cancel, userMsg = std::move(userMsg), streamIdUtf8, panelKeyUtf8]() {
+        // ★ 把 UI 的会话 key 带下去（网页版 AI 后端靠它按会话分状态）
+        SetAgentSessionKeyForThisThread(panelKeyUtf8);
         const auto idJson = [&]() {
             return std::string("\"id\":\"") + EscapeJson(streamIdUtf8) + "\"";
         };
@@ -2718,7 +3303,7 @@ bool BeginSendAgentMessage(const std::string& msgJson, std::string& err) {
         ShellPostToWebUi(oss.str());
         if (requestTitle)
             RequestAiConversationTitleAsync(std::move(titleCfg), std::move(titleId),
-                std::move(titleUser), std::move(titleReply));
+                std::move(titleUser), std::move(titleReply), panelKeyUtf8);
     }).detach();
 
     return true;
@@ -2740,6 +3325,10 @@ bool CancelAgentMessage(std::string& err) {
     if (cancel) cancel->store(true);
     g_agent.httpAbort.Abort();
     if (core) core->AbortActiveHttp();
+    // 桌面任务（runDesktopTask）跑在工具线程里，拿不到 cancelFlag —— 它轮询这个
+    // 进程级标志，看到就调 engine::StopScript 并把控制权交回来。
+    // 不设这一条的话：助手面板点了「取消」，HTTP 断了，但桌面上的鼠标键盘还在动。
+    qst::agent::RequestDesktopTaskCancel();
     return true;
 }
 

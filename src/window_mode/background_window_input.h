@@ -19,6 +19,20 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down);
 /// SendInput 打的是当前前台窗（用户正在看的浏览器/视频会收到 ←/→/↑/↓），
 /// 而目标自己失焦停轮询，照样不走 —— 所以后台一律不补真键。
 bool TargetOwnsForegroundWindow(HWND hwnd);
+/// 松开本会话用 SendInput 补过 KEYDOWN 的方向键。
+/// BeginRun 开头与 EndRun 都要调：脚本中途停止 / 目标闪退 / 用户切走都可能让
+/// 某一对 DOWN/UP 不配对，留下**系统级卡键**（游戏朝一个方向一直走）。
+void ReleaseMirroredLcaNavKeys();
+
+/// 方向键兜底真键（SendInput）到底发不发。
+/// - `down`：**只在目标就是前台窗**时补。后台时 SendInput 打的是当前前台窗
+///   （用户正在看的浏览器/视频会收到 ←/→/↑/↓）。
+/// - `up`：**只看当初有没有补过**，与此刻是否前台无关。若按「此刻不在前台就不补」跳过，
+///   按下时在前台、松开时用户已切走 ⇒ 真键**永久卡在按下状态**：游戏朝那个方向一直走，
+///   而且整个系统都认为该键被按住。
+inline bool ShouldMirrorNavKeySend(bool down, bool targetOwnsForeground, bool mirroredDown) {
+    return down ? targetOwnsForeground : mirroredDown;
+}
 /// WM_KEYDOWN/UP 的 lParam（方向键扫描码 0x4B 等 + KF_EXTENDED）。
 LPARAM BuildWindowKeyLParam(UINT vk, bool down);
 /// BeginRun/EndRun：本会话走 LCA 后台窗口消息（假焦点失败回退或未登记游戏）。
@@ -32,6 +46,17 @@ bool WaitSoftKeyPostTurn(HWND target, int timeoutMs = 80);
 void PostMouseMoveToWindow(HWND hwnd, int cx, int cy);
 void PostMouseButtonToWindow(HWND hwnd, int cx, int cy, MouseButtonType button, bool down);
 void PostScrollWheelToWindow(HWND hwnd, int cx, int cy, int steps, bool vertical, bool positive);
+
+/// 自检用：鼠标/滚轮的**投递目标选择**（纯选择，不发消息）。
+///
+/// ★ 为什么必须把它暴露出来：2026-09-30 真机报障「后台窗口滚动没效果」的根因就在
+///   **选窗**这一步 —— 绑定的是 `RichEditD2DPT`，实际投给了包着它的容器
+///   （`Microsoft.UI.Content.DesktopChildSiteBridge`），日志还如实报「成功=1/1」。
+///   而"投出去之后消息落在哪"在我们自建的假 WndProc 上**不可观测**
+///   （`SendNotifyMessage` + `DefWindowProc` 的行为不由我们决定），
+///   所以用例必须直接钉**选择结果**，而不是去数消息条数。
+/// @param cx,cy 进出参：客户区坐标，函数内会换算到被选中窗口的客户区
+HWND ResolveMousePostTargetForTest(HWND bound, int& cx, int& cy);
 
 /// Last client position posted via soft mouse APIs (for GetCursorPos in window modes).
 bool GetLastSoftMouseClientPos(HWND hwnd, int& cx, int& cy);

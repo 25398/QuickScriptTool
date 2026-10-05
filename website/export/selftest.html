@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>导出链路自检 · 在线脚本工坊</title>
+<link rel="stylesheet" href="../css/site.css" />
+<style>
+  body { background: var(--sky-50); font-family: var(--font); color: var(--text); padding: 28px; }
+  .box { max-width: 900px; margin: 0 auto; background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  p.sub { margin: 0 0 18px; color: var(--text-3); font-size: 13px; }
+  ul { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  li { padding: 6px 0; border-bottom: 1px dashed var(--line-soft); display: flex; gap: 10px; }
+  li .m { width: 18px; flex-shrink: 0; }
+  li.ok .m { color: #0f766e; } li.bad .m { color: #b91c1c; } li.bad { color: #b91c1c; }
+  li .d { color: var(--text-3); margin-left: auto; font-family: var(--mono); font-size: 12px; }
+  #sum { margin-top: 16px; font-weight: 700; font-size: 14px; }
+  #sum.ok { color: #0f766e; } #sum.bad { color: #b91c1c; }
+  code { background: var(--sky-50); padding: 1px 5px; border-radius: 5px; font-family: var(--mono); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>导出链路自检</h1>
+  <p class="sub">
+    上传官网后打开这个页面，确认「在线导出 EXE」这条链路在**真实部署环境**里是通的
+    （尤其是 <code>export/player/QstPlayer.exe</code> 有没有传上去、服务器有没有改写二进制）。
+    本页只读本机文件，不发送任何数据。
+  </p>
+  <ul id="list"></ul>
+  <div id="sum">正在自检…</div>
+</div>
+
+<script src="qst-web-export.js"></script>
+<script>
+(function () {
+  "use strict";
+  var list = document.getElementById("list");
+  var sum = document.getElementById("sum");
+  var pass = 0, fail = 0;
+
+  function row(name, ok, detail) {
+    var li = document.createElement("li");
+    li.className = ok ? "ok" : "bad";
+    var m = document.createElement("span"); m.className = "m"; m.textContent = ok ? "✔" : "✖";
+    li.appendChild(m);
+    li.appendChild(document.createTextNode(name));
+    if (detail) { var d = document.createElement("span"); d.className = "d"; d.textContent = detail; li.appendChild(d); }
+    list.appendChild(li);
+    if (ok) pass++; else fail++;
+    return ok;
+  }
+
+  function check(name, fn) {
+    try { var r = fn(); row(name, !!r.ok, r.detail || ""); }
+    catch (e) { row(name, false, String(e && e.message || e)); }
+  }
+
+  var W = window.QstWebExport;
+  if (!W) { sum.textContent = "✖ qst-web-export.js 没加载成功"; sum.className = "bad"; return; }
+
+  row("qst-web-export.js 已加载", true, "v" + W.VERSION);
+
+  check("CRC32 定值向量（\"123456789\" → 0xCBF43926）", function () {
+    var v = W.crc32(new TextEncoder().encode("123456789"));
+    return { ok: v === 0xCBF43926, detail: "0x" + v.toString(16) };
+  });
+
+  check("FNV-1a64 用的是本仓自有常量（不是标准 FNV）", function () {
+    // 空串只有 basis 参与；标准 FNV 的 basis 是 14695981039346656037，本仓是 ...603
+    var v = W.fnv1a64(new Uint8Array(0));
+    return { ok: v === 1469598103934665603n, detail: String(v) };
+  });
+
+  check("stored ZIP 能自洽读回（method=0 / CRC 对得上）", function () {
+    var payload = "{\"a\":1}";
+    var zip = W.buildStoredZip([
+      { name: "script.json", data: payload },
+      { name: "rt/app_settings.json", data: "{}" },
+    ]);
+    var dv = new DataView(zip.buffer);
+    var eocd = -1;
+    for (var i = zip.length - 22; i >= 0; i--) {
+      if (dv.getUint32(i, true) === 0x06054b50
+          && dv.getUint32(i + 16, true) + dv.getUint32(i + 12, true) === i) { eocd = i; break; }
+    }
+    if (eocd < 0) return { ok: false, detail: "找不到自洽 EOCD" };
+    var total = dv.getUint16(eocd + 10, true);
+    var cdOff = dv.getUint32(eocd + 16, true);
+    var method = dv.getUint16(cdOff + 10, true);
+    var crc = dv.getUint32(cdOff + 16, true);
+    var compSize = dv.getUint32(cdOff + 20, true);
+    var localOff = dv.getUint32(cdOff + 42, true);
+    var nameLen = dv.getUint16(localOff + 26, true);
+    var body = zip.slice(localOff + 30 + nameLen, localOff + 30 + nameLen + compSize);
+    var text = new TextDecoder().decode(body);
+    return {
+      ok: total === 2 && method === 0 && crc === W.crc32(body) && text === payload,
+      detail: "entries=" + total + " method=" + method + " body=" + JSON.stringify(text),
+    };
+  });
+
+  // ⚠ 这一条是本页最重要的：模板有没有真的传到服务器上
+  W.fetchPlayer().then(function (player) {
+    row("播放器模板可下载且是有效 PE", player.length > 1024 && player[0] === 0x4D && player[1] === 0x5A,
+      (player.length / 1024 / 1024).toFixed(2) + " MB");
+
+    var t0 = performance.now();
+    return W.buildExe({
+      name: "自检脚本",
+      uiActions: [{ type: "mouseClick", px: 100, py: 100, button: "left", count: 0, interval: 2 }],
+      screenW: 1920, screenH: 1080,
+      playerBytes: player,
+    }).then(function (r) {
+      var ms = Math.round(performance.now() - t0);
+      var tail = W.readTail(r.bytes);
+      row("工坊路径：产出 exe 尾标自洽", !!tail && tail.valid === true,
+        (r.bytes.length / 1024 / 1024).toFixed(2) + " MB / " + ms + " ms");
+      return W.buildExeFromEditor({
+        name: "自检-编辑器",
+        editorActions: [
+          { type: "keyClick", keyText: "A", keyVk: 65, clickCount: 3, duration: 1, indent: 0 },
+          { type: "stopMacro", indent: 0 },
+        ],
+        screenW: 1920, screenH: 1080, playerBytes: player,
+      });
+    }).then(function (r2) {
+      var tail2 = W.readTail(r2.bytes);
+      row("Demo 路径：产出 exe 尾标自洽", !!tail2 && tail2.valid === true,
+        (r2.bytes.length / 1024 / 1024).toFixed(2) + " MB");
+      var st = JSON.parse(r2.settingsJson);
+      row("设置快照已关掉「无限循环」（否则线性脚本永不退出）",
+        st.playback.enablePlaybackCount === true && st.playback.playbackCount === 1,
+        JSON.stringify(st.playback));
+      finish();
+    });
+  }).catch(function (e) {
+    row("播放器模板可下载且是有效 PE", false, String(e && e.message || e));
+    finish();
+  });
+
+  function finish() {
+    sum.textContent = (fail === 0 ? "✔ 全部通过" : "✖ 有失败项") + "：" + pass + " 通过 / " + fail + " 失败";
+    sum.className = fail === 0 ? "ok" : "bad";
+    document.title = (fail === 0 ? "[PASS] " : "[FAIL] ") + "导出链路自检";
+  }
+})();
+</script>
+</body>
+</html>

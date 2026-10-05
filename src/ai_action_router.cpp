@@ -151,6 +151,104 @@ AiActionRouteKind ClassifyAiActionRoute(const std::wstring& prompt, bool withIma
     return AiActionRouteKind::ToolExecute;
 }
 
+// ★★「打开目标」解析：把模型给的**自然表达**变成可直接打开的 URL（2026-09-28 加）
+//
+// 为什么需要它（用户实测报障「卡在莫名其妙的地方」，第一轮就白烧两轮）：
+//   任务写「帮我打开哔哩哔哩」，模型就照着说 `openWebpage`（**不带地址**）⇒
+//   旧实现回一句 `targetPath 不能为空` ⇒ 模型再试一次同样的调用 ⇒ 又失败。
+//   而"打开哔哩哔哩"本来就该能打开 —— 这不是模型的错，是**工具只认完整 URL**。
+//
+// 判据顺序（都是**通用**规则，不含站点专属判断题）：
+//   ① 已是 http/https ⇒ 原样；
+//   ② 像域名（有点、无空格、无中文）⇒ 补 `https://`；
+//   ③ 命中**常见站点名字典**（数据表，非判断逻辑）⇒ 用它的首页；
+//   ④ 其余 ⇒ 返回空，由调用方给出**可执行**的错误（列出可用的名字示例）。
+// ⚠ 这张表是"便利映射"，不是"引擎替用户决定"：解析不到时**如实说不知道**，
+//   绝不猜一个相近的站点打开（打开错的网站比不打开更糟）。
+std::wstring ResolveOpenWebpageTargetUrl(const std::wstring& raw) {
+    std::wstring t = Trim(raw);
+    if (t.empty()) return {};
+    // 去掉模型常带的包裹字符：`"url"`、`<url>`、`（url）`
+    while (!t.empty() && (t.front() == L'"' || t.front() == L'\'' || t.front() == L'<'
+            || t.front() == L'（' || t.front() == L'(' || t.front() == L'“')) {
+        t.erase(t.begin());
+    }
+    while (!t.empty() && (t.back() == L'"' || t.back() == L'\'' || t.back() == L'>'
+            || t.back() == L'）' || t.back() == L')' || t.back() == L'”'
+            || t.back() == L'。' || t.back() == L'.')) {
+        // ⚠ 句点只在**结尾且后面没有域名成分**时剥掉（`www.bilibili.com` 的 m 结尾不受影响）
+        t.pop_back();
+    }
+    t = Trim(t);
+    if (t.empty()) return {};
+    const std::wstring lower = [&] {
+        std::wstring o = t;
+        for (auto& c : o) {
+            if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+        }
+        return o;
+    }();
+    // ① 已有协议
+    if (lower.rfind(L"http://", 0) == 0 || lower.rfind(L"https://", 0) == 0) return t;
+    // 已知的浏览器内置页原样返回（由调用方按内置页路径处理）
+    if (lower.rfind(L"edge://", 0) == 0 || lower.rfind(L"chrome://", 0) == 0
+        || lower.rfind(L"about:", 0) == 0) {
+        return t;
+    }
+    // ② 像域名：含点、无空格、无中文 ⇒ 补协议
+    {
+        bool hasDot = lower.find(L'.') != std::wstring::npos;
+        bool hasSpace = lower.find(L' ') != std::wstring::npos
+            || lower.find(L'　') != std::wstring::npos;
+        bool hasCjk = false;
+        for (wchar_t c : lower) {
+            if (c >= 0x2E80) { hasCjk = true; break; }
+        }
+        if (hasDot && !hasSpace && !hasCjk) return L"https://" + t;
+    }
+    // ③ 常见站点名字典（小写子串匹配；**数据**，不是判断逻辑）
+    struct SiteNameRow { const wchar_t* key; const wchar_t* home; };
+    static const SiteNameRow kSites[] = {
+        { L"哔哩哔哩", L"https://www.bilibili.com/" },
+        { L"bilibili", L"https://www.bilibili.com/" },
+        { L"b站", L"https://www.bilibili.com/" },
+        { L"百度", L"https://www.baidu.com/" },
+        { L"baidu", L"https://www.baidu.com/" },
+        { L"知乎", L"https://www.zhihu.com/" },
+        { L"zhihu", L"https://www.zhihu.com/" },
+        { L"淘宝", L"https://www.taobao.com/" },
+        { L"天猫", L"https://www.tmall.com/" },
+        { L"京东", L"https://www.jd.com/" },
+        { L"微博", L"https://weibo.com/" },
+        { L"抖音", L"https://www.douyin.com/" },
+        { L"小红书", L"https://www.xiaohongshu.com/" },
+        { L"豆瓣", L"https://www.douban.com/" },
+        { L"网易", L"https://www.163.com/" },
+        { L"腾讯", L"https://www.qq.com/" },
+        { L"优酷", L"https://www.youku.com/" },
+        { L"爱奇艺", L"https://www.iqiyi.com/" },
+        { L"youtube", L"https://www.youtube.com/" },
+        { L"github", L"https://github.com/" },
+        { L"必应", L"https://www.bing.com/" },
+        { L"bing", L"https://www.bing.com/" },
+        { L"谷歌", L"https://www.google.com/" },
+        { L"google", L"https://www.google.com/" },
+        { L"搜狗", L"https://www.sogou.com/" },
+    };
+    for (const auto& row : kSites) {
+        if (lower.find(row.key) != std::wstring::npos) return row.home;
+    }
+    return {};
+}
+
+/// 解析失败时的**可执行**错误（列出可用写法；模型看得到，就能自己纠正）
+std::wstring OpenWebpageTargetHint() {
+    return L"。请给**完整网址**（如 https://www.bilibili.com/），或**常见站点名**"
+           L"（哔哩哔哩/B站、百度、知乎、淘宝、京东、微博、抖音、小红书、豆瓣、"
+           L"YouTube、GitHub、必应、谷歌…），或浏览器内置页（edge://history 等）。";
+}
+
+
 bool AiActionPromptLikelyNeedsScreenCapture(const std::wstring& prompt) {
     const std::wstring p = Trim(prompt);
     if (p.empty()) return false;
@@ -163,6 +261,22 @@ bool AiActionPromptLikelyNeedsScreenCapture(const std::wstring& prompt) {
         return true;
     if (HasAny(p, {L"按钮", L"图标", L"搜索框", L"搜索按钮"})
         && HasAny(p, {L"找", L"定位", L"点", L"在哪", L"哪里"})) {
+        return true;
+    }
+    // ★★ **交互类动词**（2026-09-28 补）：这些在语义上就是"在界面上点某个东西"，
+    //   但字面上不含「点击」二字，旧判据会漏 ⇒ 未勾选带截图时首轮无图，模型**盲着干**。
+    //   用户实测报障：「帮我打开哔哩哔哩，给up主"有山先生"主页的第一个视频**点赞**」
+    //   —— 判成"无需看屏"，模型看不到屏幕只能猜（点到了帮助中心那种莫名其妙的地方）。
+    //
+    //   ⚠ 取舍：这个判据只决定**要不要多截一帧**（约 0.2~0.4s + 一份图 token），
+    //     判"需要"的代价很小，判"不需要"的代价是整轮瞎猜 ⇒ **交互动词一律算需要**。
+    //     而纯数据任务（读文件 / 跑命令 / 分析文本 / 算数）**仍然判不需要**，别放水成恒 true。
+    if (HasAny(p, {L"点赞", L"点踩", L"投币", L"收藏", L"关注", L"取消关注", L"转发", L"分享",
+            L"评论", L"发弹幕", L"订阅", L"加入购物车", L"下单", L"购买", L"支付", L"付款",
+            L"提交", L"确认提交", L"登录", L"注册", L"退出登录", L"切换账号",
+            L"发送消息", L"发布", L"上传", L"下载", L"安装", L"勾选", L"取消勾选",
+            L"翻页", L"下一页", L"上一页", L"播放", L"暂停", L"全屏", L"退出全屏",
+            L"下拉菜单", L"右键菜单", L"扫码"})) {
         return true;
     }
     return false;
@@ -265,6 +379,63 @@ bool TryParseBoundingBox(const std::wstring& text, int& outX1, int& outY1, int& 
 
     // 兜底：全文前 4 个整数
     return parseFourAt(0);
+}
+
+AiVisionAnswerKind ParseVisionLocateAnswer(
+    const std::wstring& text, int& outX1, int& outY1, int& outX2, int& outY2) {
+    outX1 = outY1 = outX2 = outY2 = 0;
+    const std::wstring s = Trim(text);
+    if (s.empty()) return AiVisionAnswerKind::NoAnswer;
+
+    // ① 先看括号分组里有几个数：4 个是「框」，2~3 个是「点」。
+    //    这一步是**空框闸**的落点 —— 见头文件注释里的 `[0,0,0,0]` 实测。
+    for (const wchar_t openCh : {L'[', L'('}) {
+        const wchar_t closeCh = (openCh == L'[') ? L']' : L')';
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] != openCh || i + 1 >= s.size()) continue;
+            size_t j = i + 1;
+            while (j < s.size() && s[j] != closeCh) ++j;
+            if (j >= s.size()) continue;
+            int vals[4] = {};
+            int n = 0;
+            size_t p = i + 1;
+            while (p < j && n < 4) {
+                double v = 0;
+                if (!ReadNumberAt(s, p, &v)) break;
+                vals[n++] = RoundToInt(v);
+            }
+            if (n >= 4) {
+                const int x1 = (std::min)(vals[0], vals[2]);
+                const int y1 = (std::min)(vals[1], vals[3]);
+                const int x2 = (std::max)(vals[0], vals[2]);
+                const int y2 = (std::max)(vals[1], vals[3]);
+                if (x2 <= x1 || y2 <= y1) return AiVisionAnswerKind::NoAnswer;  // 空框 = 没回答
+                outX1 = x1; outY1 = y1; outX2 = x2; outY2 = y2;
+                return AiVisionAnswerKind::Box;
+            }
+            if (n == 2 || n == 3) {
+                // 只在这个分组内部取点：保证「数出来的」和「解析出的」是同一组数字。
+                if (!TryParseCoordinatePair(s.substr(i, j - i + 1), outX1, outY1)) break;
+                outX2 = outX1;
+                outY2 = outY1;
+                return AiVisionAnswerKind::Point;
+            }
+            break;  // 分组里只有 1 个数：不是位置
+        }
+    }
+
+    // ② 没有括号分组：沿用既有的「全文前 4 个数」兜底，再退到 2 个数。
+    int bx1 = 0, by1 = 0, bx2 = 0, by2 = 0;
+    if (TryParseBoundingBox(s, bx1, by1, bx2, by2)) {
+        outX1 = bx1; outY1 = by1; outX2 = bx2; outY2 = by2;
+        return AiVisionAnswerKind::Box;
+    }
+    if (TryParseCoordinatePair(s, outX1, outY1)) {
+        outX2 = outX1;
+        outY2 = outY1;
+        return AiVisionAnswerKind::Point;
+    }
+    return AiVisionAnswerKind::NoAnswer;
 }
 
 std::wstring ExtractClickTargetPhrase(const std::wstring& prompt) {
@@ -454,6 +625,22 @@ void MapApiPointToScreen(const AiCaptureMapping& map, int apiX, int apiY, int& s
     screenY = map.capY1 + static_cast<int>(static_cast<double>(apiY) * regionH / apiH);
 }
 
+void MapScreenPointToApi(const AiCaptureMapping& map, int screenX, int screenY, int& apiX, int& apiY) {
+    const int regionW = std::max(1, map.capX2 - map.capX1);
+    const int regionH = std::max(1, map.capY2 - map.capY1);
+    const int apiW = std::max(1, map.apiWidth > 0 ? map.apiWidth : map.srcWidth);
+    const int apiH = std::max(1, map.apiHeight > 0 ? map.apiHeight : map.srcHeight);
+    // 与 MapApiPointToScreen 同一套比例（互为逆运算）：api = (screen - cap) * api尺寸 / 区域尺寸。
+    // 钳到图内：屏幕点可能落在捕获区域之外（窗口挪了/多屏），钳出来的是"最近边界"，
+    // 调用方拿到的是「这张图里它在哪」，钳过的值不会指向图外的幻影坐标。
+    const int rawX = static_cast<int>(
+        static_cast<double>(screenX - map.capX1) * apiW / regionW);
+    const int rawY = static_cast<int>(
+        static_cast<double>(screenY - map.capY1) * apiH / regionH);
+    apiX = std::clamp(rawX, 0, apiW - 1);
+    apiY = std::clamp(rawY, 0, apiH - 1);
+}
+
 bool IsApiPointClearlyOutsideImage(int apiX, int apiY, int apiW, int apiH) {
     if (apiW <= 0 || apiH <= 0) return true;
     // 允许 2px 边缘误差；大幅越界视为幻觉（如 720 宽图却给 984）
@@ -487,6 +674,26 @@ bool VisionCoordsInUnit1000(int a, int b, int c, int d) {
     return lo >= 0 && hi <= 1000;
 }
 
+/// ★★两种读法**在本帧无法区分**时的说明（docs §61）。
+///
+/// 事情本身：prompt 要的是 `0~1000` 归一化，而整图帧恰好是 **960×540** ⇒
+/// 模型若违规回答**像素**（`672,72` 这种），判据「四个数都 ≤1000」**同样成立**。
+/// 两套读法都合法，而解析器只能选一套 —— 这不是 bug，是**信息不足**。
+///
+/// 纪律：**不许挑一种当成结论**（那只是把猜换个方向，而假阳性代价是假阴性的 4 倍），
+/// 也不许沉默（沉默等于假装没有歧义）。做法是**如实留痕**：
+/// 把另一种读法的数值一起写进诊断，让真实日志去回答「模型到底按哪套回答」——
+/// 先测量，再决定要不要动判据。
+std::wstring DescribeVisionCoordAmbiguity(int o1, int o2, int o3, int o4,
+    int apiW, int apiH) {
+    // 「按像素读」要成立，这四个数得落进图内（含 ±2 容差，与 VisionCoordsFitImage 同尺）
+    if (!(o1 >= -2 && o2 >= -2 && o3 < apiW + 2 && o4 < apiH + 2)) return std::wstring();
+    return L" ⚠本帧 " + std::to_wstring(apiW) + L"×" + std::to_wstring(apiH)
+        + L" ≤1000 ⇒ 与「按像素读」**无法区分**（那种读法会得到 "
+        + std::to_wstring(o1) + L"," + std::to_wstring(o2) + L","
+        + std::to_wstring(o3) + L"," + std::to_wstring(o4) + L"）";
+}
+
 void ScaleVisionRect(int& x1, int& y1, int& x2, int& y2,
     int fromW, int fromH, int toW, int toH) {
     fromW = std::max(1, fromW);
@@ -512,11 +719,14 @@ bool ResolveVisionPointToApiImage(
     // 否则会把 [677,134,…] 当成 1024×576 像素点到错误位置（搜索钮→快捷方式栏）。
     if (VisionCoordsInUnit1000(x, y, x, y)
         && (apiW != 1000 || apiH != 1000)) {
+        const int ox = x, oy = y;   // 原始数：另一种读法（像素）要照原样报出来
         x = static_cast<int>(static_cast<long long>(x) * apiW / 1000);
         y = static_cast<int>(static_cast<long long>(y) * apiH / 1000);
         x = std::clamp(x, 0, apiW - 1);
         y = std::clamp(y, 0, apiH - 1);
-        if (outNote) *outNote = L"0~1000归一化";
+        // ⚠ 两套读法都成立时**如实留痕**（见 DescribeVisionCoordAmbiguity）
+        if (outNote) *outNote = L"0~1000归一化"
+            + DescribeVisionCoordAmbiguity(ox, oy, ox, oy, apiW, apiH);
         return true;
     }
 
@@ -553,13 +763,16 @@ bool ResolveVisionRectToApiImage(
     // 与 Point 相同：0~1000 优先于「恰好落在上传图内」的像素解释
     if (VisionCoordsInUnit1000(x1, y1, x2, y2)
         && (apiW != 1000 || apiH != 1000)) {
+        const int o1 = x1, o2 = y1, o3 = x2, o4 = y2;   // 原始数（像素读法要照原样报）
         ScaleVisionRect(x1, y1, x2, y2, 1000, 1000, apiW, apiH);
         x1 = std::clamp(x1, 0, apiW - 1);
         y1 = std::clamp(y1, 0, apiH - 1);
         x2 = std::clamp(x2, 0, apiW - 1);
         y2 = std::clamp(y2, 0, apiH - 1);
         if (x2 <= x1 || y2 <= y1) return false;
-        if (outNote) *outNote = L"0~1000归一化";
+        // ⚠ 两套读法都成立时**如实留痕**（见 DescribeVisionCoordAmbiguity）
+        if (outNote) *outNote = L"0~1000归一化"
+            + DescribeVisionCoordAmbiguity(o1, o2, o3, o4, apiW, apiH);
         return true;
     }
 
@@ -802,9 +1015,11 @@ locateAndClick(短标签)：整图 VLM→紧凑/归一化点可跳过 Zoom。ref
 ★target 写法决定命中率：最准是 2~10 字、屏幕上真实存在的文字/控件名（「历史记录」「保存」「更多」）。
 方位/颜色/形状只作最短限定（「右上角更多」）；堆成长句（「历史记录面板右上角的三个点更多选项按钮」）
 会让 VLM 被带偏、UIA 名称匹配变歧义——**长描述不是更准，是更不准**。
-双击打开图标 doubleClick=true；右键 button=right。NOT_FOUND→换更短的描述/滚动，勿盲键。
-换措辞反复点同一处是常见误区：同一动作里定位到第 4 次宿主会提示换路线，
-先 observePage/看截图确认状态，再走 clickRef / invokeUiControl / runCommand。
+双击打开图标 doubleClick=true；右键 button=right。NOT_FOUND→可换更短的描述 / 滚动，不建议盲按键。
+换个说法反复点同一处通常是空转：建议先 observePage / 看截图确认状态，
+再考虑 clickRef / invokeUiControl / runCommand。
+⚠ 引擎**不做**任何「第 N 次就换路线」的限制（批 A 已撤销那些闸）：定位每次都真的执行、
+每次都真识图 —— 所以「再试一次会不会被拦」不是要考虑的事，值不值得重试才是。
 findImage/findColor 有模板时优先。多步见 section=agent。
 )";
 }
@@ -823,10 +1038,17 @@ std::wstring MacroActionUsageSkill() {
 ★命令要读结果就自己重定向到文件，再 readAgentFile 读；runCommand 不回显 stdout。
 
 ── 打开 / 导航 ──
+★查资料（玩法/用法/报错/名词）＝ **webSearch(query) → fetchWebPage(选中的 URL)**：
+  两步都是宿主 HTTP，**不开浏览器、不抢前台**；webSearch 还能 readTop=1~3 同一轮把正文读回来。
+  ⚠ 中文查询别用空格堆多个词（实测会把结果带偏），把关键短语连写。
+  openWebpage + observePage 只用于**需要点击/登录/翻页**的交互网页（⚠ 它会抢走当前前台，
+  用完记得 activateWindow 切回来）——一次性读资料不要走这条路。
+★★「统计浏览记录/书签、最近访问了什么」= **readBrowserHistory**（1 轮；**完整**标题+URL+精确时间）。
+  ⚠⚠ **别去 edge://history 观察/截图抄**：内置页**禁扩展注入** ⇒ observePage **必失败**；列表截图**必被省略号截断**
+  （zoom 只是放大省略号）⇒ 抄必错（实测那条路 8+ 轮、23.6 秒）。返回已完整，**别再 zoom 核对**。
 openWebpage → 只开给人看的 https 首页（禁 api.*/JSON）。同站搜人用 searchOnPage(query)。白屏只 wait。
-网页：优先 searchOnPage(query) 后 clickRef 列表第1项（同类卡片最上最左，点元素不跟推荐 href 偷跳）。有第1项则禁止滚动、禁止点其它视频卡。播放页工具栏按钮优先 clickRef。树上没有或未装扩展则 locateAndClick。开关看 checked；小范围已变勿再点（会取消）。扩展导航会固化为打开网页/找图（逻辑转化可回放）。登录框/表单填写用 typeByLabel(label)：一次调用即可，不必先 observePage。禁 space 空根。canvas 用 locateAndClick。
-浏览器内置页：locateAndClick 点菜单逐级找入口，勿猜应用专属快捷键。
-不确定某界面的快捷键/操作时：fetchWebPage 只查官方文档（禁站点 API）。
+网页：优先 searchOnPage(query) 后 clickRef（点树上那个名字最贴近目标的项；点元素不跟推荐 href 偷跳）。树上没有或未装扩展则 locateAndClick。开关看 checked；小范围已变勿再点（会取消）。扩展导航会固化为打开网页/找图（逻辑转化可回放）。登录框/表单填写用 typeByLabel(label)：一次调用即可，不必先 observePage。canvas 用 locateAndClick。
+不确定某界面的快捷键/操作时：webSearch 找官方文档 → fetchWebPage 读正文（只禁**站点内部 API**，搜索页能抓）。
 
 ── 窗口 / 启动 ──
 listWindows → activateWindow(match=标题关键词) 复用已开窗口。
@@ -867,9 +1089,11 @@ openFile(路径) 或 locateAndClick(doubleClick=true)。单击只选中打不开
 
 ── 定位 / 点击 ──
 locateAndClick(短标签)：最准 2~10 字，写屏幕上的文字/控件名；方位只作最短限定，
-别堆成长句（长描述让 VLM 跑偏、UIA 匹配歧义）。表格起点 Ctrl+Home。未找到换描述最多1次。
-★同一动作里反复「换个说法再定位」同一个目标是空转：定位到第 4 次宿主会要求换路线，
-先 observePage/看截图确认状态，再 clickRef / invokeUiControl / runCommand。
+别堆成长句（长描述让 VLM 跑偏、UIA 匹配歧义）。表格起点 Ctrl+Home。未找到可换更短的描述再试。
+★换个说法反复定位同一目标通常是空转：建议先 observePage / 看截图确认状态，
+再考虑 clickRef / invokeUiControl / runCommand。
+⚠ 引擎不限制定位次数、也不因为「同一目标重复」而拦你（批 A 已撤销那些闸）——
+不要为「会不会被拦」而放弃一条本来走得通的路。
 灰按钮=前置未满足，改输入别连点。目标不在当前树/可视区才 scrollWheel；对话框侧栏用 mouseDrag。
 ★点击输入框成功后：下一步直接 quickInput 输入，不要先滚动/切窗/按 Tab——
   滚轮常作用在鼠标所在窗口而非目标窗口，输入框也不需要滚动就能输入。
@@ -877,9 +1101,9 @@ locateAndClick(短标签)：最准 2~10 字，写屏幕上的文字/控件名；
 ── 回复 / 发送 ──
 quickInput 后 keyClick(Enter) 或 locateAndClick(发送按钮)。
 
-工具：runCommand、openWebpage、searchOnPage、observePage、clickRef、typeByLabel、typeRef、listUiControls、invokeUiControl、runProgram、openFile、scrollWheel、mouseDrag、quickInput、keyClick、
+工具：runCommand、**webSearch、fetchWebPage**、openWebpage、searchOnPage、observePage、clickRef、typeByLabel、typeRef、listUiControls、invokeUiControl、runProgram、openFile、scrollWheel、mouseDrag、quickInput、keyClick、
 locateAndClick、resolveSystemPath、activateWindow、runActionRecipe、saveTaskData、
-readTaskData、switchIme、completeTask；少用 mouseClick/aiActionExecute。
+readTaskData、switchIme、completeTask、readDocument、**readBrowserHistory**；少用 mouseClick/aiActionExecute。
 )";
 }
 
@@ -888,21 +1112,21 @@ std::wstring MacroActionAgentSkill() {
 看清→同轮多工具→验收→completeTask。
 
 · updateTaskMemo(goal|todos)
-· 网页优先 searchOnPage/observePage/clickRef/typeByLabel/typeRef；列表第1项在树则只能点该项、禁止滚动；播放页按钮优先 clickRef；树上没有或未装扩展则 locateAndClick；登录框/表单直接 typeByLabel(label)；开关小范围已变勿再点（会取消）；屏上已有则点，勿先滚；勿拼搜索框/Enter；禁space空根
+· 查资料先 webSearch（不开浏览器、不抢前台；中文别用空格堆词）→ fetchWebPage 读选中的 URL
+· 交互网页（要点击/登录/翻页）才用 searchOnPage/observePage/clickRef/typeByLabel/typeRef（⚠ 抢前台）；点树上名字最贴近目标的项；树上没有或未装扩展则 locateAndClick；登录框/表单直接 typeByLabel(label)；开关小范围已变勿再点（会取消）；屏上已有则点，勿先滚；勿拼搜索框/Enter
 · 先选路线：文件/数据/批量类用 runCommand(powershell) 一步做完；只有必须看界面才定位点击
-· 办公文件（xlsx/docx/pptx/pdf/csv）：先 readDocument 直接读；写用 runCommand 的 COM/CSV 配方
-  （见 section=office），不要开软件逐格输入
+· 办公文件（xlsx/docx/pptx/pdf/csv）：先 readDocument 直接读；写用 runCommand 的 COM/CSV 配方，别开软件逐格输入
+· 浏览器历史/书签：readBrowserHistory（1 轮拿完整标题+URL+时间）；**别开 edge://history 截图抄**
 · 桌面控件：listUiControls 看编号台账 → invokeUiControl(name) 精确触发；枚举不到（游戏/自绘）才 locateAndClick
+  ★列表型内容（历史/书签/文件/消息）优先用它，可加 typeFilter/nameFilter；**别 zoom 读截图**（标题被省略号截断，UIA 名字才完整）
 · 桌面框 quickInput(clearFirst)；scrollWheel/mouseDrag；滚后没变=滚错窗
 · 切窗 activateWindow；启动 runProgram/openAppViaSearch；路径 resolveSystemPath
 · 对话先确认截图有输入框；没有先 listWindows
 · 另存为：路径写入文件名框，禁空转滚轮
 · 对话框看图；勿盲猜快捷键；灰钮改前置
 · 未知键：fetchWebPage 查官方文档，禁编造
-· 表格：写数据优先 runCommand 一次做完（见 section=command）；必须点界面才 Ctrl+Home→runActionRecipe。
-  配方模板是**每组执行一遍**的，所以要想清「组间怎么前进」：逐行追加数据 → 模板里只用
-  Enter(下行)+Home(回 A 列)，起点 Ctrl+Home 单独发一次；每组都回到同一区域覆盖填写（同一张表
-  反复填新值）→ 模板里放 Ctrl+Home 才是对的。拿不准就看截图确认表头有没有被覆盖。
+· 表格：优先 runCommand 一次做完（见 section=command）；必须点界面才 Ctrl+Home→runActionRecipe。
+  配方模板**每组执行一遍** ⇒ 想清「组间怎么前进」：逐行追加用 Enter(下行)+Home(回 A 列)，起点 Ctrl+Home 单独发。
   已写入若干行后不要 Ctrl+A 清表重来（会丢已写内容）；失败禁连 Tab
 · 宿主已 settle，勿空 wait
 )";
@@ -936,9 +1160,28 @@ std::wstring MacroActionOfficeSkill() {
 读：readDocument(path, maxChars=6000, pages=3)
 · 支持 xlsx/xlsm/xls/xlsb、csv/tsv、docx/doc、pptx/ppt、pdf、txt/md/json/log/xml
 · 表格返回「制表符分隔、一行一记录」（首行常是表头）；文档返回段落文本
-· 引擎：excel-com/word-com（装了 Office，值最准）/ ooxml（没装，直读 zip+XML）/
+· 引擎：excel-com/word-com（装了 Office，值最准）/ **ooxml-native**（我们自己的引擎直读 zip+XML：
+  **不起外部进程、不需要 Office**，xlsx 默认走它）/ ooxml（老的脚本回退路线）/
   pdftotext / pdf-render（PDF 无文本层→渲染成图片发给你看）/ text
+· ★日期已能正确读：Excel 存的是序列号（2024-01-01=45292），原生引擎按数字格式还原成
+  `2024-01-01` / `12:00:00` / `2024-01-01 18:00:00`（ISO）。
+  ⚠ 百分比等其它格式给**原始数值**（0.12 就是 12%）—— 那是真值，算数用它对。
+  ⚠ 公式：有缓存值给值，没有就写 `=公式原文`（告诉你这里有公式，而不是给你空格子）。
 · 读不到内容：openFile 后用视觉读，或先 runCommand 转文本；别死磕
+
+★★浏览器历史/书签：**readBrowserHistory(limit)**（kind=history|bookmarks|browsers）。1 轮拿**完整**标题+URL+精确时间，制表符分隔直接进表。
+  ⚠ 别开 edge://history 观察/截图抄：内置页**禁扩展注入**（observePage 必失败），列表截图**必被省略号截断**。
+
+写：
+★首选 **writeSpreadsheet**（**不需要装 Office**，我们自己的引擎直接读写 OOXML）：
+· 新建：mode="create" + tsv（制表符分隔，首行常是表头）。数字自动识别，
+  但**带前导 0 的（007）保持文本**。⚠ 目标已存在时**默认拒绝覆盖**（要覆盖传 overwrite=true）。
+· 改已有文件：mode="setCells" + cells[{ref,text|number|bool|formula,cached?}]
+  —— **只动你点名的格子**，文件里的图表/公式/条件格式/样式/别的表**一字不动**
+  （这正是 COM「另存一份」做不到的）。⚠ 改前会自动备份，返回里给备份路径。
+· 公式**不会被计算**：`cached` 是直读用的缓存值，不传就等 Excel 打开时重算（直读拿不到值）。
+· 写完会把该表读回来给你核对。
+· 不支持老格式 .xls；需要 Excel 的**格式化显示值**（日期显示成 2024-01-01、千分位）时才走 COM。
 
 写（runCommand，路径先 resolveSystemPath）：
 · xlsx（装 Office）：$xl=New-Object -ComObject Excel.Application; $xl.Visible=$false;
@@ -965,6 +1208,21 @@ std::wstring MacroActionOfficeSkill() {
 · 读的引擎与局限：pdf-ifilter（Windows 自带，无版式/扫描件抽不到字）、pdf-render（渲染成图给你看）、
   ooxml（快、无 Office 依赖、公式只有缓存值）、excel-com/word-com（值最准）
 · 全部落到既有「运行程序」动作（runProgram + inputText），可回放、可在编辑器改
+
+★关于第三方办公引擎（**我们不依赖**，详见 skills/agent/office.md §2.5）：
+· 这里原来有一节「GenOffice 路线」（推荐优先用它的 CLI/MCP 工具读写 xlsx/docx/pptx），**已删除**。
+  理由：本产品**不依赖任何别人的软件运行** —— 把「写 Office 文件」外包给第三方 CLI，
+  对方没装就能力缺失、版本不同就行为不同、它的子命令清单还得跟着对方发版维护。
+· 所以：**不要**去探测、启动或推荐任何第三方办公软件，也**不要**指望 runAgentCommand 放行它们
+  （白名单里没有任何第三方程序特例）。
+· 值得借鉴的是**做法与思路**（与具体项目无关，我们自己在 src/ooxml/ 里实现）：
+  ① 工具层不调模型（文档读写是确定性的，模型只负责编排）；
+  ② **字节保留式编辑**（只重写改动的那部分，其余原样搬运 ⇒ 公式/图表/透视表/样式原样存活，
+     这正好补上上面「COM 另存会丢」那条的缺口）；
+  ③ 产物可验收（读回单元格做**确定性**验证；必要时渲染成图给你看）。
+· 自研层可用之前，写文件就走上面的 COM / CSV 配方。
+· 若用户**自己**配了外部 MCP server（mcp_servers.json），工具表里会出现 mcp__<server>__* ——
+  那是用户显式配置的、厂商中立的扩展点，可以用；但别去猜/推荐具体装哪个软件。
 )";
 }
 
@@ -975,49 +1233,83 @@ std::wstring MacroActionGameSkill() {
   没有哪个「VLM 每步都问」的方案能实时跑游戏（grounding 0.7~6.9s，游戏回路 ~15Hz）。
   正确姿势 = ①VLM 找一次 → ②之后用**本地**手段跟住 → ③本地判失败才再叫 VLM。
 
-★先搞懂机制再动手（抽象目标的必经一步）：「通关这关 / 打过这一波」这类目标，先用一轮把
+★建议先搞懂机制再动手（抽象目标时最省轮次的一步）：「通关这关 / 打过这一波」这类目标，建议先用一轮把
   ①胜负条件 ②资源规则（**冷却/费用是全局共享还是每个单位各自一份**）③操作机制（先选再点目标？
   能一次放几个？）④节奏（多久一波）搞清楚：lookupMacroAction(section=game) + 看画面 +
-  需要时 fetchWebPage 搜「游戏名+模式 玩法」，把一句可执行结论写进 updateTaskMemo。
-  操作明确（点这个按钮/按这个键）就直接做，别为省事而查。
+  需要时用 **webSearch**（零 API key、宿主直连、**不开浏览器不抢前台**）搜「游戏名+模式」，
+  再用 fetchWebPage 读选中那条的正文，结论写进 updateTaskMemo。
+  ⚠ 实测：中文查询**别用空格堆多个词**（「植物大战僵尸融合版 我是僵尸 攻略」被带偏成「植物」；
+  「植物大战僵尸融合版」第一条就是对的中文 Wiki）⇒ 关键短语连写，多概念分几次搜。
+  ⚠ 别用 runCommand 开浏览器搜（它**不回显输出**，结果读不到）；也别为此开 openWebpage
+  ——那会抢走游戏前台（实测还额外花 3 轮切来切去，拿到的是别的游戏的摘要）。
+  操作明确（点这个按钮/按这个键）就直接做，不必为省事而查。
   真实踩坑：PvZ「我是僵尸」里 AI 以为冷却只能放一个，于是一次只放一个僵尸送死；
-  实际冷却按卡牌各自算、阳光共享 → 正确打法是选够卡后**批量/连续放多个**形成波次。
+  实际冷却按卡牌各自算、阳光共享 → 批量/连续放多个更容易形成波次。
 
-★省轮次的两条硬手法：
+★不确定就「用一次动作问一问」，**别在脑子里反复推**（实测：有一局为「我是僵尸怎么算赢」
+  和「阳光是 3000 还是 30000」推了 8 轮、写了几千字，一个动作都没落）：
+  ① 每轮引擎都会**如实回执**「这一击之后界面有没有变化」—— 那是唯一可靠的现实校验，比推演硬；
+  ② 规则/按钮/数值不确定 ⇒ 用一个**成本最低的动作**去问（点一次那张卡、点一次空地、
+     按一次快捷键、screenshot 看一帧），然后**看回执**，一轮就有答案；
+  ③ ⚠ 自查「是不是在绕圈」：如果这一轮的疑问和上一轮**几乎一样**，立刻改用一次动作验证，
+     或换个信息来源（fetchWebPage 查玩法 / screenshot 看清画面）；
+  ④ 已确认的结论写进 updateTaskMemo 标「已确认」，假设标「待验证」再去验一次；
+  ⑤ 读不清卡槽/价格/计数器时 **screenshot 比推演便宜**；小字看不清就 `zoom` 那一块
+     （整帧是降采样过的，卡片角标/价格只剩几十像素，靠它读数字必然读错），见下面的 ★zoom；
+  ⑥ 点一次没反应（回执说界面没变）就是答案：那东西很可能不可点，换目标，**别再点第二次**；
+  ⑦ 回执说「**无法确认**这一击是否生效」时**别为它单开一轮**：动态画面每帧都在重绘，
+     本地测不出「生效没有」是正常的（既不是成功也不是失败）；动作执行**每轮本来就回传
+     观察帧**，直接看下一帧或继续推进，不要为了验收去补 screenshot；
+  ⑧ 索引里标「文字」的条目只表示「屏幕上有这几个字」（模式标签/标题/计数器都会出现），
+     **不保证可点**。
+
+★zoom（放大镜，看不清时用它，别拿 1024 宽的整帧猜）：
+  · 坐标直接抄**索引里给的那一对**（upload 截图像素 = 元素索引/文字索引/mouseClick 同一套，
+    零换算）；也可 zoom(target="屏幕上的短标签") —— 它查**同一张元素索引**，
+    ⇒「放大的地方」与 locateAndClick「会点的地方」是同一处。
+  · 回执写清**区域、倍率 ×N、图内坐标 → upload 的公式**（upload_x = x1 + 图x/N）：
+    要点击就把算出来的 upload 值交给 mouseClick/locateAndClick，**别把图内像素直接当坐标**。
+  · 一次放大一块；同一轮可调多次（每张都是独立的图，回执里的 [附图 N] 与图前编号一一对应）。
+  · 画面刚变过（刚点完/刚过关）旧坐标就过期：先重新 screenshot 再 zoom。
+
+★省轮次的两条手法：
   1) 两步操作一次做完：locateAndClick(targets=["拿起的卡","要放的位置"])
      —— 一次调用里逐个识图定位并**立即连点**，中间不插观察/验收（省一整轮主模型
-     10~40s 思考 + 每次 1.5~2.6s 的界面稳定等待）。游戏画面一直在动，逐步确认没有价值。
+     10~40s 思考 + 每次 1.5~2.6s 的界面稳定等待）。游戏画面一直在动，逐步确认价值不大。
   2) 批量推进：多个单位同时进攻就把目标一次列进 targets（≤6），或连续多条
      locateAndClick(targets=[...])；开局选卡一次选够再进游戏。
 
-★不是每个位置都值得建「复用」：判断标准只有一个 —— 这个地方后面还会不会再点？
-  · 一次性按钮（自选僵尸卡牌 / 正常模式 / 主菜单 / 暂停 / 确定）：**直接点**。目标文字就是
-    屏幕上的标签，locateAndClick(target="自选僵尸卡牌") 会用宿主本地 OCR 文字索引直接命中坐标
-    （0 次识图，日志打「文字直点」）。别给它建网格，也别为它反复识图确认。
-  · 反复点的位置（草坪格子 / 卡槽 / 道具栏）：走布局记忆 + locateAndClick(grid={anchor,cells})，
-    锚点只识图一次，之后每格纯坐标计算。只为这些付识图成本。
-  宿主默认行为：同一目标本次运行**第二次**被点才写复用缓存/布局记忆（一次性目标不写）。
+★省识图成本最有效的办法：**把同一批的多个落点一次做完**。
+  · 屏幕上**有文字标签**的位置（自选僵尸卡牌 / 正常模式 / 主菜单 / 暂停 / 确定）：**直接点**。
+    locateAndClick(target="自选僵尸卡牌") 会用宿主本地 OCR 文字索引直接命中坐标
+    （0 次识图，日志打「文字直点」）。不必为它反复识图确认。
+  · 反复点的位置（草坪格子 / 卡槽 / 道具栏）：引擎**不**记「上次在哪」（跨帧坐标不作数，
+    宁可慢也不拿旧坐标）⇒ 每次都真识图 —— 所以把这一批要点的多个位置一次列进
+    locateAndClick(targets=[…])，或一次 submitMacroActions 提交整批。
 
 本地手段优先级：
 1) 颜色：findColor/getColor/colorMatch 判血条/蓝条/技能亮灭/小地图点位（毫秒级，最稳）
-2) 找图：findImage（多尺度+唯一性+像素终审）。模板必须**有纹理**：纯色模板会被归一化
+2) 找图：findImage（多尺度+唯一性+像素终审）。模板需要**有纹理**：纯色模板会被归一化
    相关算成「处处满分」，宿主已直接拒绝并给出原因 → 换 findColor 或换有纹理的区域
-3) 循环反复点同一目标：宿主定位缓存已加「迟滞 N/3 帧一致」，抖动时宁可回一次识图
-4) UIA 对 DirectX/自绘游戏无效，别试
+3) 循环反复点同一目标：每次都**真识图**（宁可慢，不许拿旧坐标）；
+   能合并就把多个落点一次列进 targets，比一个一个试省得多
+4) UIA 对 DirectX/自绘游戏无效
 
 locateAndClick：target 短（2~10 字）且写屏幕上真实存在的东西；小/糊目标传 refineLevels=2
-（宿主会把分辨率花在目标附近的小区域，比整屏缩小识别率高）。同目标不要重复识图。
+（宿主会把分辨率花在目标附近的小区域，比整屏缩小识别率高）。同一目标重复识图不划算。
 
-输入手法：持续按住用 keyDown/keyUp（不要 keyClick 连点）；转视角用 moveMouseRelative
+输入手法：持续按住用 keyDown/keyUp（比 keyClick 连点可靠）；转视角用 moveMouseRelative
 （注意系统指针加速会缩放相对位移，精确点 HUD 要用找图/颜色拿到屏幕坐标再 mouseClick）；
-节奏用动作的 duration（=重复间隔，不是执行前等待），不要用 wait 凑帧（Sleep 被量化到 ~15ms）。
+节奏用动作的 duration（=重复间隔，不是执行前等待），用 wait 凑帧不划算（Sleep 被量化到 ~15ms）。
 连续多步可用 submitMacroActions 一次提交（等价 speculative multi-action，省大量 API 轮次），
-但每步必须确定（时间/按键/坐标已知），不能把「还没定位的东西」写进去。
+但每步要确定（时间/按键/坐标已知），不能把「还没定位的东西」写进去。
 
-不要做的事：同坐标连点（有守卫）；动态画面上反复 locate 同一目标（第 4 次起被要求换路线）；
+⚠ **引擎在这些地方都不设限、也不拦你**（批 A/B/C 已撤销那些闸）：同坐标可以再点、
+同一目标可以再定位、工具表永远给全 —— 判断「值不值得」是你的活，不是引擎的活。
+常见误区（多半不划算）：同坐标反复连点；换个说法反复定位同一目标；
 猜绝对坐标点没定位过的东西；用 wait 拼节奏 / keyClick 实现长按；同一步骤失败 2 次还原地重试
-（换目标描述/换行/换单位）；在带反作弊的在线游戏里跑自动化（SendInput 必带 LLMHF_INJECTED
-标记，无法清除）——遇到这类先 completeTask 说明风险。
+（可换目标描述/换行/换单位）；在带反作弊的在线游戏里跑自动化（SendInput 必带 LLMHF_INJECTED
+标记，无法清除）——遇到这类可先 completeTask 说明风险。
 )";
 }
 
@@ -1064,24 +1356,6 @@ std::wstring BuildCompositeLocatePrompt(const std::wstring& userTask,
     s += L"输出 [x1,y1,x2,y2]（0~1000）。整图找；多个相似只框描述完全匹配的那一个；无则 NOT_FOUND。"
         L"坐标一律相对整图 0~1000 归一化，❌禁止输出像素坐标或图宽图高。只输出结果，勿解释。"
         L"若有多个可能位置：每行一个框，最多 3 行，最可能的放第一行。";
-    return s;
-}
-
-std::wstring BuildMissSelfCorrectPrompt(const std::wstring& userTask,
-    int imageWidth, int imageHeight, int failedX, int failedY) {
-    // 备用项的 prompt：错点已经**点过了、并且没有反应**——这是已知事实，直接告诉模型，
-    // 让它对准红叉校正（PrecisionCUA）。★最后仍然要绝对坐标，绝不要 dx/dy。
-    std::wstring p = Trim(userTask);
-    if (p.empty()) p = L"目标";
-    std::wstring s = L"刚才点了「" + p + L"」，点了**没有任何反应**（说明没点中）。\n";
-    if (imageWidth > 0 && imageHeight > 0) {
-        s += L"本图 " + std::to_wstring(imageWidth) + L"x" + std::to_wstring(imageHeight)
-            + L"，是屏幕" + std::to_wstring(failedX) + L"," + std::to_wstring(failedY)
-            + L"附近区域的放大图。\n";
-    }
-    s += L"图中**红色十字**=刚才点的位置（没点中的那个点）。请对照红叉重新找"
-        L"「" + p + L"」到底在哪：输出它的中心 (x,y) 0~1000（相对本图归一化，绝对坐标）。"
-        L"❌不要输出偏移量/方向（如「向左 30px」）；真找不到就只输出 NOT_FOUND。只输出结果，勿解释。";
     return s;
 }
 

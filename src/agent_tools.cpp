@@ -5,6 +5,7 @@
 // ──────────────────────────────────────────────────────────────────
 
 #include "agent_tools.h"
+#include "window_mode/window_mode_log.h"   // 桌面任务诊断日志
 
 #include "action_utils.h"
 #include "ai_logic_convert.h"
@@ -15,10 +16,15 @@
 #include "agent_script_ops.h"
 #include "agent_reference.h"
 #include "agent_ai_actions.h"
+#include "agent_desktop_task.h"
+#include "agent_mcp.h"
 #include "agent_ui_notify.h"
 #include "agent_undo.h"
 #include "agent_shell.h"
 #include "agent_web.h"
+#include "engine/engine_ui_hooks.h"
+#include "engine/qst_engine.h"
+#include "macro_execute_tools.h"
 #include "recorder_timeline.h"
 #include "script_action_builder.h"
 #include "script_io.h"
@@ -26,6 +32,7 @@
 #include "window_mode/window_mode_json.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <sstream>
@@ -138,6 +145,11 @@ void ListScriptsInDir(const std::wstring& dir, const std::wstring& label,
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         std::wstring fileName(fd.cFileName);
         if (fileName.size() < 5 || fileName.substr(fileName.size() - 5) != L".json") continue;
+        // 助手「动手」层（runDesktopTask）的临时任务脚本**不是用户脚本**，别列给模型看
+        // （模型会以为那是可复用的资产，甚至去「打开」它）。详见 utils.h 的说明。
+        // ⚠ A/B 验证过：摘掉这一行 ⇒ AgentAssistantSelfTest 的
+        //   `list_scripts_hides_desktop_task_temp` 转红（hidesTemp=0）⇒ 用例非空断言。
+        if (IsAgentTaskTempFileName(fileName)) continue;
         std::wstring fullPath = dir + L"\\" + fileName;
         Entry e;
         e.fileName = fileName;
@@ -158,7 +170,7 @@ void ListScriptsInDir(const std::wstring& dir, const std::wstring& label,
             if (!e.windowEnabled && j.contains("breakoutTimeSeconds") && j["breakoutTimeSeconds"].is_number())
                 e.breakoutSec = static_cast<int>(j["breakoutTimeSeconds"].get<double>());
             // 轻量摘要：避免再 LoadScriptFileData；模式文案用 enabled 即可
-            e.modeSummary = e.windowEnabled ? L"窗口模式" : L"默认模式";
+            e.modeSummary = e.windowEnabled ? L"窗口/后台窗口模式" : L"默认模式";
         } catch (...) {
             // 坏文件仍列出，动作数未知
             e.displayName = fileName;
@@ -561,53 +573,14 @@ json ParseToolParams(const std::wstring& paramsJson, std::wstring& error) {
 
 }  // namespace
 
-// ── submitMacroActions（AI 动作执行运行时）────────────────────────
-AgentTool MakeSubmitMacroActionsTool() {
-    AgentTool tool;
-    tool.name = L"submitMacroActions";
-    tool.description =
-        L"【AI 动作执行必用】提交本批次要立刻执行的宏动作。禁止在文字回复中手写 JSON。"
-        L"传入 actions 数组，每项含 type 及该类型参数，与编辑器手动添加动作完全一致。"
-        L"返回经校验的动作 JSON 数组，程序将立即执行。"
-        L"必填参数：keyClick/keyDown/keyUp→keyText；quickInput→inputText；wait→duration；"
-        L"findImage→imagePath；if→conditionExpr；goto→gotoStepExpr；runMacro→targetPath；"
-        L"openFile/runProgram/openWebpage→targetPath；AI 动作→aiPrompt。缺必填会被拒绝。"
-        L"不确定参数时先 showSchema=true 查看字段说明。";
-
-    tool.parameters_json = LR"({
-        "type": "object",
-        "properties": {
-            "actions": {
-                "type": "array",
-                "description": "动作参数对象数组，每项至少含 type 字段",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": { "type": "string" }
-                    },
-                    "required": ["type"]
-                }
-            },
-            "showSchema": {
-                "type": "boolean",
-                "description": "为 true 时返回各 type 参数字段说明，不构建动作"
-            }
-        },
-        "required": []
-    })";
-
-    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
-        json params;
-        try {
-            params = json::parse(ToUtf8(paramsJson));
-        } catch (const json::parse_error&) {
-            return L"[错误] 参数 JSON 解析失败。";
-        }
-        return ExecuteBuildScriptActionsParams(params, true);
-    };
-
-    return tool;
-}
+// ── submitMacroActions ────────────────────────────────────────────
+// ⚠ 这里原来有一个 `MakeSubmitMacroActionsTool()`（描述写「【AI 动作执行必用】」），
+//   **全仓无任何调用点** ⇒ 已删除（2026-10-02，LESSONS §80）。
+//   保留它会**误导**：同名工具的**真身**在
+//     `macro_execute_tools.cpp` 的 `MakeSubmitMacroActionsToolLocal()`（需要 hooks），
+//     描述是「【批量/冷门】…常用请优先调用规范工具 quickInput/keyClick/…」——
+//   两份描述**语义相反**，谁读到这个死函数就会写出错误的提示词。
+//   （顺带：`tools/verify/probe_tool_desc_budget.py --dup` 也会把同名两份当"重复定义"报。）
 
 // ── buildScriptActions ────────────────────────────────────────────
 AgentTool MakeBuildScriptActionsTool() {
@@ -932,7 +905,7 @@ AgentTool MakeCreateMacroScriptTool() {
             "scriptMode": {
                 "type": "string",
                 "enum": ["default", "window", "backgroundWindow"],
-                "description": "脚本运行模式：default=默认, window=窗口模式, backgroundWindow=后台窗口模式"
+                "description": "脚本运行模式：default=默认, window=独立桌面模式, backgroundWindow=后台窗口模式"
             },
             "breakoutTimeSeconds": {
                 "type": "number",
@@ -955,6 +928,32 @@ AgentTool MakeCreateMacroScriptTool() {
         json params;
         try { params = json::parse(ToUtf8(paramsJson)); }
         catch (const json::parse_error&) { return L"[错误] 参数 JSON 解析失败。"; }
+
+        // ★★★ 参数容错（2026-10-02 用户要求）：**能自动补的就不报错**
+        //
+        //   ⚠⚠ 真机实证：模型为下面这几个参数**来回试了 4~5 轮**，一次任务 8 轮没出结果
+        //     （用户原话："半天不能正确操作"）：
+        //       · `actions` 传成**对象** ⇒ 回"actions 数组为空"（它不知道要数组）
+        //       · `fileName` 没带 `.json` ⇒ 回"文件名必须以 .json 结尾"
+        //       · 缺 `scriptName` ⇒ 回"缺少 scriptName 参数"
+        //   ⇒ 三条都**自动补齐**，别让模型为了格式再来一轮。
+        if (params.contains("actions") && params["actions"].is_object()) {
+            json arr = json::array();
+            arr.push_back(params["actions"]);
+            params["actions"] = arr;
+        }
+        {
+            std::string fn = params.value("fileName", "");
+            if (!fn.empty() && (fn.size() < 5 || fn.compare(fn.size() - 5, 5, ".json") != 0)) {
+                fn += ".json";
+                params["fileName"] = fn;
+            }
+            if (params.value("scriptName", "").empty() && !fn.empty()) {
+                std::string sn = fn;
+                if (sn.size() >= 5) sn.resize(sn.size() - 5);
+                params["scriptName"] = sn;
+            }
+        }
 
         const std::wstring fileName = FromUtf8(params.value("fileName", ""));
         const std::wstring scriptName = FromUtf8(params.value("scriptName", ""));
@@ -1496,6 +1495,9 @@ AgentTool MakeListSettingsTool() {
                            ? L"已勾选但被低性能模式压制（低性能模式优先）"
                            : L"启用（≥500k 像素的找图走 OpenCL）")
                    : L"禁用")
+           << L"\n";
+        ss << L"  细分位移铺满窗口: "
+           << (settings.playback.spreadRelativeMovePackets ? L"启用" : L"禁用")
            << L"\n\n";
 
         ss << L"【其他设置】\n";
@@ -1611,12 +1613,13 @@ AgentTool MakeUpdateSettingsTool() {
             "scheduledTaskAutoResume": { "type": "boolean", "description": "脚本中断后自动恢复。false=跳过或打断不恢复；true=结束后再跑或插入后从原步骤继续" },
             "lowPerformanceMode": { "type": "boolean", "description": "低性能模式（省 CPU/降温）：找图限 1 个 OpenCV 线程、输入时间轴大幅减少自旋、回放不再提优先级/不抬全系统定时器分辨率、找图监视轮询下限 50→200ms。代价是注入节奏可有 ~1ms 抖动、单帧找图变慢。用户抱怨「跑脚本时电脑很烫/风扇很响」时建议开启" },
             "findImageGpuAccel": { "type": "boolean", "description": "找图 GPU 加速（OpenCL）：大区域全屏找图走显卡（实测约快 3 倍），面积小于 500k 像素的区域找图自动仍用 CPU；机器无 OpenCL 设备时自动忽略。与 lowPerformanceMode 同时开启时本项不生效（低性能模式优先）" },
+            "spreadRelativeMovePackets": { "type": "boolean", "description": "【实验项·实测会变差，不建议开启】把每个相对位移按窗口细分成多份铺满窗口。2026-09-21 实测（15s 宏、790 包）：开启后包数 790->2107、waits 849->3168，但 late>1ms 从 11 涨到 110、p95 从 0us 涨到 581us —— 因为每拍预算从 8ms 缩到 2ms，同样的绝对抖动占比放大 4 倍；而游戏本来就按帧求和，拆细不改变每帧总量，只增加出错机会。默认关闭，保留仅供对照实验。" },
             "autoHideMainWindow": { "type": "boolean", "description": "宏执行后自动隐藏主窗口" },
             "playSoundOnStart": { "type": "boolean", "description": "脚本启动时播放提示音" },
             "playSoundOnEnd": { "type": "boolean", "description": "脚本结束时播放提示音" },
             "hideBottomRightTip": { "type": "boolean", "description": "隐藏右下角弹窗提示" },
             "closeToTray": { "type": "boolean", "description": "关闭按钮最小化到托盘" },
-            "showFloatBall": { "type": "boolean", "description": "显示桌面悬浮球（可贴边半露，也可拖到屏幕中间自由悬浮；悬停展开启停）" },
+            "showFloatBall": { "type": "boolean", "description": "显示桌面悬浮球（可贴边半露，也可拖到屏幕中间自由悬浮；悬停展开显示脚本名与当前状态，点圆头图标启停、点面板显示主界面）" },
             "autoStartOnBoot": { "type": "boolean", "description": "开机自动启动" },
             "resolveImeConflict": { "type": "boolean", "description": "中文输入法处于中文模式时不触发热键；Shift 英文或关闭输入法后仍可触发" },
             "editorDefaultView": { "type": "string", "enum": ["code", "visual"], "description": "鼠标宏编辑界面默认视图：code=代码化 visual=可视化" },
@@ -1714,6 +1717,7 @@ AgentTool MakeUpdateSettingsTool() {
             setBool("scheduledTaskAutoResume", settings.playback.scheduledTaskAutoResume);
             setBool("lowPerformanceMode", settings.playback.lowPerformanceMode);
             setBool("findImageGpuAccel", settings.playback.findImageGpuAccel);
+            setBool("spreadRelativeMovePackets", settings.playback.spreadRelativeMovePackets);
         } else if (category == L"other") {
             setBool("autoHideMainWindow", settings.other.autoHideMainWindow);
             setBool("playSoundOnStart", settings.other.playSoundOnStart);
@@ -2048,6 +2052,195 @@ AgentTool MakeRevertAgentChangeTool() {
     return tool;
 }
 
+// ── 桌面执行：让助手能「自己去做事」────────────────────────────────
+//
+// 为什么走「临时脚本 + 引擎正常回放」而不是直接调 ExecuteAiActionExecute：
+//   agentHooks（截图 / 执行动作 / 观察比对 / 定位点击 / 前视）是在
+//   engine_script_run.cpp 里按回放上下文组装出来的。从助手侧直接调等于把它重抄一遍，
+//   两份必然漂移。走回放链路顺带白拿：中断 / 脱离暂停、窗口/后台窗口模式、超时、
+//   AI 调试日志、嵌套熔断 —— 这些都已经调过了。
+//
+// 三个必须守住的点（对齐 docs/agent-capability-expansion.md §2.2）：
+//   ① 引擎的 ResolveLibraryScriptPath **只认 scripts/ 与 recordings/ 目录内的文件**
+//      ⇒ 临时脚本必须落在 ScriptsDir()，放 %TEMP% 根本跑不起来（跑完即删）。
+//   ② 只轮询 IsRunning() 会在「已投递、还没开始」的空档里误判「已经跑完」
+//      ⇒ 用 IsBusy()，并先等它**变 true** 再等它变 false。
+//   ③ 结果从宏变量读回来（引擎把 AI 的最终文本写进 aiOutputVarName）。
+//      没有这一条，助手就只能说「跑完了」而说不出跑成了什么。
+AgentTool MakeRunDesktopTaskTool() {
+    AgentTool tool;
+    tool.name = L"runDesktopTask";
+    tool.description =
+        L"直接在用户电脑上**把一件事做完**（不是生成脚本，是真的去操作）。"
+        L"助手会把目标交给桌面执行闭环：它自己截图观察、定位控件、点击输入，"
+        L"每步都看结果再决定下一步，最后把结论回给你。\n"
+        L"适用：打开某个软件做几步操作、在界面上填写/查找/导出、照着界面把数据抄下来。\n"
+        L"不适用：只是写文件/读文档/建脚本（那些用 runCommand / readDocument / "
+        L"buildScriptActions 更快更准，不用开界面）。\n"
+        L"包含删除/发送/提交/付款等**不可逆或对外**动作时，本工具会拒绝执行并要求你先问用户，"
+        L"用户明确同意后带 confirmed=true 再调一次。";
+    tool.parameters_json = LR"({
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "要做什么，一句话说清（会作为任务目标交给执行闭环）。例：打开记事本写一份今日待办并保存到桌面"
+            },
+            "withImage": {
+                "type": "boolean",
+                "description": "是否让执行过程带截图（默认 true）。纯键盘/命令类任务可设 false 省 token"
+            },
+            "maxSteps": {
+                "type": "integer",
+                "description": "最多执行几步，默认 12；-1 表示不封顶（仅留防死循环的安全上限）"
+            },
+            "timeoutSec": {
+                "type": "integer",
+                "description": "单次 API 调用超时秒数，默认 120，范围 10~600"
+            },
+            "confirmed": {
+                "type": "boolean",
+                "description": "用户已在上一轮明确同意执行这个不可逆/对外动作时置 true。**不要**自己替用户决定"
+            }
+        },
+        "required": ["goal"]
+    })";
+    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
+        qst::agent::DesktopTaskOptions opts;
+        std::wstring perr;
+        if (!qst::agent::ParseDesktopTaskOptions(paramsJson, opts, perr)) {
+            return L"[错误] " + perr;
+        }
+
+        // 安全联锁（S1）：不可逆/对外的动作，拿不到用户同意就不做。
+        // 与宏侧 runProgram 的「抓过网页要确认」是同一个道理（docs §47.7）。
+        if (qst::agent::DesktopTaskNeedsConfirm(opts.goal) && !opts.confirmed) {
+            return qst::agent::DesktopTaskConfirmPrompt(opts.goal);
+        }
+
+        if (qst::engine::IsBusy()) {
+            return L"[错误] 引擎正忙（已有脚本或桌面任务在跑）。"
+                L"请等它结束后再试，或先让用户停止当前运行。";
+        }
+
+        const std::wstring tempPath = qst::agent::DesktopTaskTempScriptPath();
+        const ScriptFileData data = qst::agent::BuildDesktopTaskScript(opts);
+        if (!SaveScriptFileData(tempPath, data)) {
+            return L"[错误] 无法写入临时任务脚本（目录不可写？）：" + tempPath;
+        }
+        // ★★★ 诊断日志（2026-10-02）：`runDesktopTask` 返回"没留下结论"时，
+        //   唯一能区分「脚本是空的」与「引擎没跑」的办法就是**把脚本本身记下来** ✓
+        //   ⚠ 不再猜（见 LESSONS §76：我今天已因猜错两次）。
+        {
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(tempPath, ec);
+            std::string body;
+            {
+                std::ifstream in(tempPath, std::ios::binary);
+                if (in) body.assign(std::istreambuf_iterator<char>(in),
+                                    std::istreambuf_iterator<char>());
+            }
+            const bool hasAi = body.find("aiActionExecute") != std::string::npos;
+            windowmode::WindowModeLogEventf(
+                L"[桌面任务] 临时脚本已写：%s（%llu 字节，含 aiActionExecute=%d）",
+                tempPath.c_str(),
+                static_cast<unsigned long long>(ec ? 0 : sz),
+                hasAi ? 1 : 0);
+        }
+
+        auto cleanup = [&tempPath]() {
+            std::error_code ec;
+            std::filesystem::remove(tempPath, ec);
+        };
+
+        // ★★★ 把**助手侧的会话 key** 交给引擎（2026-10-02 用户要求）：
+        //   "调用 AI 动作执行**不要再开新对话**，**在原来的那个对话里面**就行" ✓
+        //   ⚠ 引擎是另一个线程 ⇒ thread_local 传不过去 ⇒ 用全局 override（见 agent_core.h）
+        SetEngineSessionKeyOverride(AgentSessionKeyForThisThread());
+        windowmode::WindowModeLogEventf(L"[桌面任务] 沿用调用方会话 key：%s",
+            FromUtf8(AgentSessionKeyForThisThread()).c_str());
+
+        qst::agent::ClearDesktopTaskCancel();
+        std::string rerr;
+        if (!qst::engine::RequestRunScriptAsync(tempPath, rerr)) {
+            windowmode::WindowModeLogEventf(L"[桌面任务] 启动失败：%s", FromUtf8(rerr).c_str());
+            cleanup();
+            return L"[错误] 无法启动桌面任务：" + FromUtf8(rerr);
+        }
+
+        // 先等它**真的跑起来**（投递到窗口线程有延迟，直接判 IsBusy() 会误判「已结束」）
+        windowmode::WindowModeLogEventf(L"[桌面任务] 已启动，等引擎执行…");
+        const ULONGLONG startDeadline = GetTickCount64() + 8000;
+        bool started = false;
+        while (GetTickCount64() < startDeadline) {
+            if (qst::engine::IsBusy()) { started = true; break; }
+            if (qst::agent::DesktopTaskCancelRequested()) break;
+            Sleep(50);
+        }
+        if (!started) {
+            cleanup();
+            return L"[错误] 桌面任务未能启动（引擎拒绝了运行请求，脚本可能无有效动作）。";
+        }
+
+        // 整体上限：单次 API 超时 × 6，夹到 [3 分钟, 30 分钟]。
+        // 一个多步任务要跑好几轮 API，不能只按单轮超时算。
+        ULONGLONG budgetMs = static_cast<ULONGLONG>(opts.timeoutSec) * 6 * 1000ULL;
+        if (budgetMs < 180000ULL) budgetMs = 180000ULL;
+        if (budgetMs > 1800000ULL) budgetMs = 1800000ULL;
+        const ULONGLONG startTick = GetTickCount64();
+        const ULONGLONG runDeadline = startTick + budgetMs;
+
+        enum class Stop { Done, Cancelled, TimedOut };
+        Stop how = Stop::Done;
+        ULONGLONG lastStatusTick = startTick;
+        while (qst::engine::IsBusy()) {
+            if (qst::agent::DesktopTaskCancelRequested()) { how = Stop::Cancelled; break; }
+            const ULONGLONG now = GetTickCount64();
+            if (now > runDeadline) { how = Stop::TimedOut; break; }
+            // S2：执行期间在助手面板上留一条实时状态（JS 按 live-status 原地更新一行）
+            if (now - lastStatusTick >= 2000) {
+                lastStatusTick = now;
+                qst::webview::PostToWebUi(std::string("{\"type\":\"sendAgentMessage.status\",")
+                    + "\"ok\":true,\"status\":\"桌面任务执行中… 已 "
+                    + std::to_string((now - startTick) / 1000ULL) + " 秒\"}");
+            }
+            Sleep(200);
+        }
+        if (how != Stop::Done) {
+            // 停止是**异步**的：StopScript 只是投递 WM_APP_EXT_STOP_SCRIPT，
+            // 必须等引擎真的落地再取结果，否则会读到上一次回放的残留值。
+            qst::engine::StopScript();
+            const ULONGLONG stopDeadline = GetTickCount64() + 15000;
+            while (qst::engine::IsBusy() && GetTickCount64() < stopDeadline) Sleep(100);
+        }
+
+        std::wstring result;
+        const bool haveResult =
+            qst::engine::GetMacroVariable(qst::agent::DesktopTaskResultVar(), result);
+        cleanup();
+
+        if (how == Stop::Cancelled) {
+            return L"[已取消] 桌面任务被用户中断。当前界面上可能留下了做了一半的状态，"
+                L"如需收尾请先观察界面再决定下一步。";
+        }
+        if (how == Stop::TimedOut) {
+            return L"[超时] 桌面任务超过 " + std::to_wstring(budgetMs / 1000ULL)
+                + L" 秒仍未结束，已强制停止。任务可能只做了一部分 —— "
+                  L"请先观察界面确认实际状态，**不要**直接重跑一遍。";
+        }
+        if (!haveResult) {
+            windowmode::WindowModeLogEventf(
+                L"[桌面任务] 引擎已结束但**没产出结果**（看上面「临时脚本已写」那行："
+                L"若它不含 aiActionExecute ⇒ 脚本本身的问题；否则是执行链路的问题）");
+            return L"[结果] 桌面任务已结束，但执行闭环没有留下结论"
+                L"（可能是路由判成了识图问答，或中途失败）。"
+                L"如需确认界面实际状态，请再让我看一次当前屏幕。";
+        }
+        return L"[结果] " + qst::agent::SummarizeDesktopTaskResult(result);
+    };
+    return tool;
+}
+
 std::vector<AgentTool> BuildDefaultAgentTools() {
     std::vector<AgentTool> tools;
     tools.push_back(MakeListScriptsTool());
@@ -2056,11 +2249,14 @@ std::vector<AgentTool> BuildDefaultAgentTools() {
     tools.push_back(MakeReadScriptReferenceTool());
     tools.push_back(MakeReadAgentSkillTool());
     tools.push_back(MakeFetchWebPageTool());
+    tools.push_back(MakeWebSearchTool());
     tools.push_back(MakeRunAgentCommandTool());
     tools.push_back(MakeListAgentDirectoryTool());
     tools.push_back(MakeReadAgentFileTool());
+    tools.push_back(MakeAgentReadDocumentTool());
     tools.push_back(MakeSearchAgentFilesTool());
     tools.push_back(MakeWriteAgentFileTool());
+    tools.push_back(MakeWriteSpreadsheetTool());   // 写 .xlsx（自研 OOXML 层，不需要 Office）
     tools.push_back(MakeCopyAgentTextToClipboardTool());
     tools.push_back(MakePasteAgentClipboardTextTool());
     tools.push_back(MakeListAgentChangesTool());
@@ -2083,5 +2279,12 @@ std::vector<AgentTool> BuildDefaultAgentTools() {
     tools.push_back(MakeDeleteScheduledTaskTool());
     tools.push_back(MakeListSettingsTool());
     tools.push_back(MakeUpdateSettingsTool());
+    tools.push_back(MakeRunDesktopTaskTool());
+    // 外部 MCP server 的工具（Phase 2）。没有任何配置时返回空 —— 绝大多数用户
+    // 这条路径是零开销的；配了（或机器上装了 GenOffice）就自动并进来。
+    // ⚠ 这些工具的名字带 `mcp__<server>__` 前缀，模型一眼能看出是外部工具。
+    for (auto& t : qst::agent::CollectMcpAgentTools()) {
+        tools.push_back(std::move(t));
+    }
     return tools;
 }

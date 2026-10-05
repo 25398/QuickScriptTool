@@ -1,0 +1,3 @@
+pause.wav — 本项目生成（脚本合成，非第三方素材）
+用途：脚本暂停提示音。两音下行短促提示，mono/16bit/44100Hz/0.25s。
+要替换成别的音效，直接覆盖 resources/pause.wav 即可（保持 RIFF/WAVE 头）。

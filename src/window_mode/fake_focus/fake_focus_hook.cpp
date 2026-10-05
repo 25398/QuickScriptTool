@@ -1,75 +1,61 @@
 #include "fake_focus_hook.h"
 
-#include <cstring>
+#include "MinHook.h"
 
 namespace fakefocus {
 namespace {
 
-#if defined(_M_X64) || defined(__x86_64__)
-constexpr size_t kAbsJmpSize = 12;  // mov rax, imm64; jmp rax
-#else
-constexpr size_t kAbsJmpSize = 5;   // jmp rel32
-#endif
-
-void WriteAbsoluteJump(BYTE* dst, const void* to) {
-#if defined(_M_X64) || defined(__x86_64__)
-    dst[0] = 0x48;
-    dst[1] = 0xB8;
-    const UINT64 addr = reinterpret_cast<UINT64>(to);
-    std::memcpy(dst + 2, &addr, sizeof(addr));
-    dst[10] = 0xFF;
-    dst[11] = 0xE0;
-#else
-    dst[0] = 0xE9;
-    const INT32 rel = static_cast<INT32>(
-        reinterpret_cast<BYTE*>(const_cast<void*>(to)) - (dst + 5));
-    std::memcpy(dst + 1, &rel, sizeof(rel));
-#endif
-}
-
-bool PatchTarget(void* target, const void* bytes, size_t size) {
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(target, size, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
-    std::memcpy(target, bytes, size);
-    FlushInstructionCache(GetCurrentProcess(), target, size);
-    VirtualProtect(target, size, oldProtect, &oldProtect);
-    return true;
+/// MinHook 的 `MH_Initialize` 是幂等的：已初始化时返回 MH_ERROR_ALREADY_INITIALIZED。
+bool EnsureEngine() {
+    const MH_STATUS st = MH_Initialize();
+    return st == MH_OK || st == MH_ERROR_ALREADY_INITIALIZED;
 }
 
 }  // namespace
 
+bool InitInlineHooks() { return EnsureEngine(); }
+
 bool InstallInlineHook(InlineHook& hook, void* target, void* detour) {
-    if (hook.installed || !target || !detour) return false;
+    if (!target || !detour) return false;
+    if (hook.installed) return hook.target == target;
+    if (!EnsureEngine()) return false;
+
+    // trampoline = 原函数前 N 字节的副本 + 跳回 target+N。
+    // 有了它，调用原函数不再需要碰目标函数头 —— 这是本次修复的核心。
+    void* trampoline = nullptr;
+    if (MH_CreateHook(target, detour, &trampoline) != MH_OK) return false;
+
+    // MH_EnableHook 会**先挂起其他线程**再落补丁（消除安装瞬间的撕裂窗口）。
+    const MH_STATUS enabled = MH_EnableHook(target);
+    if (enabled != MH_OK && enabled != MH_ERROR_ENABLED) {
+        MH_RemoveHook(target);
+        return false;
+    }
 
     hook.target = target;
     hook.detour = detour;
-    hook.patchSize = kAbsJmpSize;
-    hook.trampoline = nullptr;  // originals use temporary unpatch (safe vs relative CALL)
-
-    std::memcpy(hook.original, target, hook.patchSize);
-
-    BYTE jump[16]{};
-    WriteAbsoluteJump(jump, detour);
-    if (!PatchTarget(target, jump, hook.patchSize)) return false;
-
+    hook.trampoline = trampoline;
     hook.installed = true;
     return true;
 }
 
 bool RemoveInlineHook(InlineHook& hook) {
     if (!hook.installed || !hook.target) return true;
-    if (!PatchTarget(hook.target, hook.original, hook.patchSize)) return false;
+    void* target = hook.target;
+    // 先摘掉「已安装」标记：卸载期间并发进入 detour 的线程会走调用方的兜底分支，
+    // 而不是拿着即将失效的 trampoline 去跳。
+    hook.target = nullptr;
+    hook.detour = nullptr;
+    hook.trampoline = nullptr;
     hook.installed = false;
+    MH_DisableHook(target);   // 恢复目标函数头
+    MH_RemoveHook(target);    // 释放 trampoline
     return true;
 }
 
-bool CallThroughOriginal(InlineHook& hook, void* (*fn)(void*), void* ctx, void** outResult) {
-    if (!hook.installed || !hook.target || !fn) return false;
-    if (!PatchTarget(hook.target, hook.original, hook.patchSize)) return false;
-    void* result = fn(ctx);
-    BYTE jump[16]{};
-    WriteAbsoluteJump(jump, hook.detour);
-    PatchTarget(hook.target, jump, hook.patchSize);
+bool CallThroughOriginal(InlineHook& hook, OriginalInvoker fn, void* ctx, void** outResult) {
+    if (!hook.installed || !hook.trampoline || !fn) return false;
+    void* result = fn(hook.trampoline, ctx);
     if (outResult) *outResult = result;
     return true;
 }

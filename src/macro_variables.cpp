@@ -1,5 +1,6 @@
 #include "macro_variables.h"
 #include "var_compute.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -485,6 +486,12 @@ void AddOcrSearchVarItems(const std::wstring& varName, std::vector<QuickInputVar
         varName
     });
     items.push_back({
+        varName + L".matchData",
+        L"{" + varName + L".matchData}",
+        L"文字查找匹配度(0~100)",
+        varName + L".matchData"
+    });
+    items.push_back({
         varName + L".x",
         L"{" + varName + L".x}",
         L"文字查找左上角X",
@@ -519,15 +526,54 @@ void AddOcrTextVarItems(const std::wstring& varName, std::vector<QuickInputVarIt
     });
 }
 
+/// 颜色动作（获取颜色/找色/颜色匹配）产出的变量。
+/// ⚠ 三个动作的语义**不一样**，别用一句话糊过去：
+///   · 获取颜色：{变量}=读到的颜色（取点失败为空）
+///   · 找色：{变量}=命中点实际颜色（未命中为空）、.matchData=匹配度 0~100（未命中 0）
+///   · 颜色匹配：{变量}=该点实际颜色（取点失败为空）、.matchData=匹配度 0~100（未匹配 0）
+void AddColorVarItems(const std::wstring& varName, std::vector<QuickInputVarItem>& items,
+    const wchar_t* colorTip, const wchar_t* scoreTip) {
+    items.push_back({
+        varName,
+        L"{" + varName + L"}",
+        colorTip,
+        varName
+    });
+    if (scoreTip) {
+        items.push_back({
+            varName + L".matchData",
+            L"{" + varName + L".matchData}",
+            scoreTip,
+            varName + L".matchData"
+        });
+    }
+    items.push_back({
+        varName + L".x",
+        L"{" + varName + L".x}",
+        L"颜色位置X",
+        varName + L".x"
+    });
+    items.push_back({
+        varName + L".y",
+        L"{" + varName + L".y}",
+        L"颜色位置Y",
+        varName + L".y"
+    });
+}
+
 std::wstring LookupOcrVarValue(const OcrVarResult& ocr, const std::wstring& prop) {
     if (ocr.mode == OcrVarMode::Text) {
         return prop.empty() ? ocr.text : L"";
     }
     if (prop.empty()) return std::to_wstring(ocr.found);
     if (!ocr.found) {
-        if (prop == L"x" || prop == L"y" || prop == L"x1" || prop == L"y1") return L"0";
+        // 数值型属性在「未找到」时给 0（不是空串）：否则 `if(a.matchData >= 65)` 会拿到空值。
+        if (prop == L"matchData" || prop == L"x" || prop == L"y" || prop == L"x1" || prop == L"y1") {
+            return L"0";
+        }
         return L"";
     }
+    if (prop == L"matchData") return std::to_wstring(ocr.matchData);
     if (prop == L"x") return std::to_wstring(ocr.topLeftX);
     if (prop == L"y") return std::to_wstring(ocr.topLeftY);
     if (prop == L"x1") return std::to_wstring(ocr.bottomRightX);
@@ -953,7 +999,31 @@ std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptA
         });
     }
     for (const auto& a : actions) {
-        if ((a.type != ActionType::AiTextAnalysis && a.type != ActionType::AiImageAnalysis) || a.aiOutputVarName.empty()) continue;
+        if (a.type != ActionType::GetColor || a.matchVarName.empty()) continue;
+        if (!seen.insert(a.matchVarName).second) continue;
+        AddColorVarItems(a.matchVarName, items,
+            L"获取颜色：读到的颜色(#RRGGBB；取点失败为空)", nullptr);
+    }
+    for (const auto& a : actions) {
+        if (a.type != ActionType::FindColor || a.matchVarName.empty()) continue;
+        if (!seen.insert(a.matchVarName).second) continue;
+        AddColorVarItems(a.matchVarName, items,
+            L"找色：命中点实际颜色(#RRGGBB；未命中为空)",
+            L"找色匹配度(0~100；未命中 0)");
+    }
+    for (const auto& a : actions) {
+        if (a.type != ActionType::ColorMatch || a.matchVarName.empty()) continue;
+        if (!seen.insert(a.matchVarName).second) continue;
+        AddColorVarItems(a.matchVarName, items,
+            L"颜色匹配：该点实际颜色(#RRGGBB；取点失败为空)",
+            L"颜色匹配度(0~100；未匹配 0)");
+    }
+    for (const auto& a : actions) {
+        // aiActionExecute 也会写 aiOutputVarName（引擎两条落点都在）—— 与另两个 AI 动作对齐，
+        // 否则 Web 面板里选中它时变量下拉看不到输出变量（旧 JS 那份反而有，属两份漂移）。
+        if ((a.type != ActionType::AiTextAnalysis && a.type != ActionType::AiImageAnalysis
+                && a.type != ActionType::AiActionExecute)
+            || a.aiOutputVarName.empty()) continue;
         if (!seen.insert(a.aiOutputVarName).second) continue;
         items.push_back({
             a.aiOutputVarName,
@@ -976,6 +1046,26 @@ std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptA
     }
     AppendFixedVarItems(items);
     return items;
+}
+
+std::wstring QuickInputVarItemsJson(const std::vector<ScriptAction>& actions) {
+    const std::vector<QuickInputVarItem> items = BuildQuickInputVarItems(actions);
+    // ⚠ EscapeJson 只做转义、**不加引号**（script_io.cpp 也是自己补引号）——
+    //   这里漏了引号就会输出 `{"code":a.matchData}` 这种非法 JSON，
+    //   前端 JSON.parse 直接失败（自检 quick_input_var_items_json 就是钉这个的）。
+    auto q = [](const std::wstring& v) { return L"\"" + EscapeJson(v) + L"\""; };
+    std::wstring out = L"[";
+    bool first = true;
+    for (const auto& it : items) {
+        if (!first) out += L",";
+        first = false;
+        // code=display：Web 侧下拉的「代码」列与插入文本分开（insert 已带花括号）
+        out += L"{\"code\":" + q(it.display)
+            + L",\"insert\":" + q(it.insertText)
+            + L",\"tip\":" + q(it.tooltip) + L"}";
+    }
+    out += L"]";
+    return out;
 }
 
 namespace {

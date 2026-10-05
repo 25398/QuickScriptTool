@@ -696,6 +696,216 @@ bool IsBrowserLaunchTarget(const std::wstring& nameOrPath) {
         || lower == L"edge" || lower == L"chrome" || lower == L"firefox";
 }
 
+// ── 按显示名解析启动目标（详见头文件注释：为什么不能用 Win+S 搜索）──────
+namespace {
+
+/// 去掉快捷方式/可执行文件的扩展名，得到「显示名」形态
+std::wstring StripLaunchExtension(const std::wstring& fileName) {
+    const std::wstring lower = ToLowerCopy(fileName);
+    for (const wchar_t* ext : { L".lnk", L".exe", L".url", L".bat", L".cmd" }) {
+        const size_t n = wcslen(ext);
+        if (lower.size() > n && lower.compare(lower.size() - n, n, ext) == 0) {
+            return fileName.substr(0, fileName.size() - n);
+        }
+    }
+    return fileName;
+}
+
+/// 只去首尾空白（不用全局 Trim：这里只需要这一件事，避免依赖 utils 的具体语义）
+std::wstring TrimAsciiSpace(const std::wstring& s) {
+    size_t b = 0, e = s.size();
+    auto isSpace = [](wchar_t c) {
+        return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == L'\u3000';
+    };
+    while (b < e && isSpace(s[b])) ++b;
+    while (e > b && isSpace(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+/// 去掉常见的「说明性后缀」：模型常写「植物大战僵尸融合版快捷方式/图标/游戏」，
+/// 而桌面快捷方式叫「植物大战僵尸融合版」。只剥**尾部**的这类词，不动本体。
+/// ⚠ 每剥一次都要再 Trim：模型写的多半是「notepad 程序」这种带空格的形态，
+///   不 Trim 就永远对不上（实测：`notepad` 能解析、`notepad 程序` 解析不出来）。
+std::wstring StripDecorativeSuffix(const std::wstring& s) {
+    static const wchar_t* kSuffixes[] = {
+        L"快捷方式", L"图标", L"按钮", L"的程序", L"程序", L"应用", L"游戏", L"软件",
+    };
+    std::wstring out = TrimAsciiSpace(s);
+    bool changed = true;
+    while (changed && out.size() > 2) {
+        changed = false;
+        for (const wchar_t* suf : kSuffixes) {
+            const size_t n = wcslen(suf);
+            if (out.size() > n && out.compare(out.size() - n, n, suf) == 0) {
+                out.erase(out.size() - n);
+                out = TrimAsciiSpace(out);
+                changed = true;
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+/// 显示名匹配打分（0 = 不匹配）。越高越可信：
+///   4 完全同名  3 一方包含另一方（「植物大战僵尸融合版」↔「植物大战僵尸融合版 v2.1」）
+///   2 互为前缀且长度接近
+int ScoreLaunchNameMatch(const std::wstring& candidateNameRaw, const std::wstring& queryRaw) {
+    const std::wstring cand = ToLowerCopy(Trim(candidateNameRaw));
+    const std::wstring query = ToLowerCopy(Trim(queryRaw));
+    if (cand.empty() || query.empty()) return 0;
+    if (cand == query) return 4;
+    const std::wstring stripped = StripDecorativeSuffix(cand);
+    if (!stripped.empty() && stripped == query) return 4;
+    // 包含关系：要求较短一方至少 2 个字符，避免「e」匹配一片
+    const std::wstring& shorter = cand.size() <= query.size() ? cand : query;
+    const std::wstring& longer = cand.size() <= query.size() ? query : cand;
+    if (shorter.size() >= 2 && longer.find(shorter) != std::wstring::npos) {
+        // 名字长度差太大时降级（「记事本」不该匹配「记事本++插件合集」）
+        if (longer.size() <= shorter.size() * 2 + 4) return 3;
+        return 1;
+    }
+    // 前缀且长度接近（处理「Visual Studio Code」↔「Visual Studio」这类）
+    size_t common = 0;
+    while (common < shorter.size() && cand[common] == query[common]) ++common;
+    if (common >= 4 && common * 2 >= shorter.size()) return 2;
+    return 0;
+}
+
+struct LaunchCandidate {
+    std::wstring path;
+    std::wstring name;      // 显示名（无扩展名）
+    std::wstring source;
+    int score = 0;
+    /// 同分时优先桌面（用户自己放的快捷方式最贴合「我要启动的那个」）
+    int priority = 0;
+};
+
+void CollectLaunchDir(const std::wstring& dir, int maxDepth, const std::wstring& source,
+    int priority, std::vector<LaunchCandidate>& out) {
+    if (dir.empty() || maxDepth < 0) return;
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = dir + L"\\*";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        const std::wstring full = dir + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (maxDepth > 0) CollectLaunchDir(full, maxDepth - 1, source, priority, out);
+            continue;
+        }
+        const std::wstring lower = ToLowerCopy(fd.cFileName);
+        const bool isLnk = lower.size() > 4 && lower.compare(lower.size() - 4, 4, L".lnk") == 0;
+        const bool isExe = lower.size() > 4 && lower.compare(lower.size() - 4, 4, L".exe") == 0;
+        if (!isLnk && !isExe) continue;
+        // 卸载/帮助/更新器这类不是「应用入口」
+        if (lower.find(L"uninstall") != std::wstring::npos
+            || lower.find(L"卸载") != std::wstring::npos
+            || lower.find(L"readme") != std::wstring::npos
+            || lower.find(L"help") != std::wstring::npos
+            || lower.find(L"update") != std::wstring::npos
+            || lower.find(L"website") != std::wstring::npos) {
+            continue;
+        }
+        LaunchCandidate c;
+        c.path = full;
+        c.name = StripLaunchExtension(fd.cFileName);
+        c.source = isLnk ? source + L"-lnk" : source + L"-exe";
+        c.priority = priority;
+        out.push_back(std::move(c));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+std::wstring KnownFolderPath(REFKNOWNFOLDERID id) {
+    PWSTR raw = nullptr;
+    if (FAILED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw)) || !raw) return {};
+    std::wstring out = raw;
+    CoTaskMemFree(raw);
+    return out;
+}
+
+}  // namespace
+
+bool LooksLikeShellLaunchTarget(const std::wstring& path) {
+    const std::wstring lower = ToLowerCopy(Trim(path));
+    if (lower.empty()) return false;
+    for (const wchar_t* ext : { L".lnk", L".url", L".bat", L".cmd" }) {
+        const size_t n = wcslen(ext);
+        if (lower.size() > n && lower.compare(lower.size() - n, n, ext) == 0) return true;
+    }
+    return false;
+}
+
+AppLaunchTarget ResolveAppLaunchTarget(const std::wstring& displayName) {
+    AppLaunchTarget result;
+    const std::wstring raw = Trim(displayName);
+    if (raw.empty()) return result;
+
+    // ① 本来就是个存在的路径 / 快捷方式 → 直接用它（模型有时会直接给 .lnk 路径）
+    if (raw.find(L'\\') != std::wstring::npos || raw.find(L'/') != std::wstring::npos) {
+        if (GetFileAttributesW(raw.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            result.path = raw;
+            result.source = L"path";
+            result.matchedName = FileNameFromPath(raw);
+            return result;
+        }
+    }
+
+    std::wstring query = StripDecorativeSuffix(raw);
+    if (query.empty()) query = raw;
+
+    // ② 扫快捷方式/启动夹（纯文件系统，不碰键盘、不碰 COM 自动化）
+    std::vector<LaunchCandidate> cands;
+    const std::wstring desktop = KnownFolderPath(FOLDERID_Desktop);
+    const std::wstring publicDesktop = KnownFolderPath(FOLDERID_PublicDesktop);
+    const std::wstring startMenu = KnownFolderPath(FOLDERID_Programs);
+    const std::wstring commonStartMenu = KnownFolderPath(FOLDERID_CommonPrograms);
+    // 桌面深度 0（只要顶层），开始菜单深度 2（「厂商\应用\xxx.lnk」很常见）
+    CollectLaunchDir(desktop, 0, L"desktop", 3, cands);
+    CollectLaunchDir(publicDesktop, 0, L"public-desktop", 2, cands);
+    CollectLaunchDir(startMenu, 2, L"startmenu", 1, cands);
+    CollectLaunchDir(commonStartMenu, 2, L"common-startmenu", 1, cands);
+
+    int bestScore = 0;
+    int bestPriority = -1;
+    for (const LaunchCandidate& c : cands) {
+        const int s = ScoreLaunchNameMatch(c.name, query);
+        if (s == 0) continue;
+        if (s > bestScore || (s == bestScore && c.priority > bestPriority)) {
+            bestScore = s;
+            bestPriority = c.priority;
+            result.path = c.path;
+            result.source = c.source;
+            result.matchedName = c.name;
+        }
+    }
+    if (result.ok()) return result;
+
+    // ③ App Paths / PATH（只对 exe 名有意义）
+    const std::wstring lower = ToLowerCopy(query);
+    std::wstring exe = CanonicalExeAlias(lower);
+    if (exe.empty()) {
+        exe = query;
+        if (exe.size() < 4 || ToLowerCopy(exe.substr(exe.size() - 4)) != L".exe") exe += L".exe";
+    }
+    if (std::wstring hit = QueryAppPathsExe(exe); !hit.empty()
+        && GetFileAttributesW(hit.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        result.path = hit;
+        result.source = L"app-paths";
+        result.matchedName = exe;
+        return result;
+    }
+    if (std::wstring hit = SearchPathExe(exe); !hit.empty()) {
+        result.path = hit;
+        result.source = L"where";
+        result.matchedName = exe;
+        return result;
+    }
+    return result;
+}
+
 namespace {
 std::wstring g_lastLaunchProgramError;
 }  // namespace
@@ -746,7 +956,8 @@ bool LaunchProgram(const std::wstring& path, const std::wstring& args) {
     if (resolved.find(L"://") == std::wstring::npos
         && GetFileAttributesW(resolved.c_str()) == INVALID_FILE_ATTRIBUTES) {
         g_lastLaunchProgramError = L"找不到文件「" + resolved
-            + L"」。请改用 openAppViaSearch(query=应用显示名) 走开始菜单搜索兜底。";
+            + L"」。请改用 openAppViaSearch(query=应用显示名) 按显示名解析"
+              L"（桌面/开始菜单快捷方式 / App Paths；不走搜索）。";
         return false;
     }
     SHELLEXECUTEINFOW info{};
@@ -760,7 +971,7 @@ bool LaunchProgram(const std::wstring& path, const std::wstring& args) {
         const DWORD err = GetLastError();
         g_lastLaunchProgramError = L"ShellExecute 失败（" + resolved + L"，err="
             + std::to_wstring(err)
-            + L"）。请改用 openAppViaSearch(query=应用显示名) 走开始菜单搜索兜底。";
+            + L"）。请改用 openAppViaSearch(query=应用显示名) 按显示名解析后再试。";
         return false;
     }
     if (info.hProcess) CloseHandle(info.hProcess);

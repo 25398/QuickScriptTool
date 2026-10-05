@@ -1,6 +1,7 @@
 #include "drag_pick_overlay.h"
 
 #include "image_match.h"
+#include "overlay_input_guard.h"
 #include "ui_scale.h"
 
 #include <algorithm>
@@ -157,10 +158,20 @@ private:
         ShowWindow(hwnd_, SW_SHOW);
         SetFocus(hwnd_);
         SetCapture(hwnd_);
+        // ★★ 兜底（overlay_input_guard.h）：本窗口是全屏 WS_EX_TOPMOST + SetCapture，
+        //   只在「抬起 / Esc」时才退出。那个终止事件一旦丢了（远控 SendInput 注入丢事件
+        //   是最常见来源），裸 GetMessage 会永久阻塞 ⇒ 叠层永远扣着用户的鼠标捕获 ⇒
+        //   「看得见屏幕、点不动」。本地还能按 Esc，**远控下几乎没有别的入口**。
         MSG msg{};
-        BOOL bRet;
-        while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0) {
-            if (bRet == -1) break;
+        for (;;) {
+            if (!overlay_guard::WaitMessageWithTimeout(msg, overlay_guard::kGuardTickMs)) {
+                if (overlay_guard::ShouldAbortStuckCaptureNow(hwnd_)) {
+                    Finish(false);
+                    break;
+                }
+                continue;
+            }
+            if (msg.message == WM_QUIT) break;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }

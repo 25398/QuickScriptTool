@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(QuickScriptTool LANGUAGES CXX)
+project(QuickScriptTool LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,8 @@ set(WINDOW_MODE_CORE_SOURCES
     src/window_mode/window_list.cpp
     src/window_mode/window_mode_permission.cpp
     src/window_mode/fake_focus/fake_focus_injector.cpp
+    # 注入副本（安装目录那份 DLL 永不被映射 ⇒ 覆盖安装/卸载不必重启电脑）
+    src/window_mode/fake_focus/fake_focus_stage.cpp
     src/window_mode/fake_focus/fake_focus_soft_input_host.cpp
     src/window_mode/cdp/cdp_input.cpp
     src/window_mode/ext_bridge/ext_bridge_server.cpp
@@ -114,6 +116,30 @@ if(MSVC)
     target_compile_options(window_mode_core PRIVATE /W4 /permissive- /utf-8)
 endif()
 
+# ── MinHook（BSD-2-Clause；third_party/minhook/）────────────────────────────
+# FakeFocus 的内联钩用它拿 **trampoline**：目标函数头**只在安装时写一次**，之后原函数
+# 经 trampoline 调用 —— 消除「临时还原 + 重写跳转」的多线程写入竞态
+# （旧实现让 Unity/UE 这类多线程目标 0xC0000005 闪退；复现见 build/_tmp/hookrace/）。
+set(MINHOOK_SOURCES
+    third_party/minhook/src/buffer.c
+    third_party/minhook/src/hook.c
+    third_party/minhook/src/trampoline.c
+    third_party/minhook/src/hde/hde32.c
+    third_party/minhook/src/hde/hde64.c
+)
+add_library(qst_minhook STATIC ${MINHOOK_SOURCES})
+target_include_directories(qst_minhook PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook/src/hde
+)
+if(MSVC)
+    # MinHook 是 C 代码：不要套 /permissive-（C++ 专用）。
+    target_compile_options(qst_minhook PRIVATE /W3 /utf-8)
+    # 运行时库必须与 FakeFocus 一致（/MT），否则 DLL 里会同时存在两套 CRT 堆。
+    set_property(TARGET qst_minhook PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ── FakeFocus DLL（目标进程内 hook；按当前架构输出 FakeFocus64/32）──
 set(FAKEFOCUS_DLL_SOURCES
     src/window_mode/fake_focus/fake_focus_dll.cpp
@@ -125,7 +151,7 @@ target_include_directories(FakeFocus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/window_mode/fake_focus
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(FakeFocus PRIVATE user32 dwmapi)
+target_link_libraries(FakeFocus PRIVATE user32 dwmapi qst_minhook)
 set(_FAKEFOCUS_DEF "${CMAKE_CURRENT_SOURCE_DIR}/src/window_mode/fake_focus/fake_focus.def")
 if(MSVC)
     target_link_options(FakeFocus PRIVATE "/DEF:${_FAKEFOCUS_DEF}")
@@ -160,7 +186,7 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(_FAKEFOCUS32_SCRIPT "${CMAKE_SOURCE_DIR}/src/window_mode/fake_focus/build_fakefocus32.cmd")
     add_custom_target(FakeFocus32 ALL
         COMMAND "${_FAKEFOCUS32_SCRIPT}" "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/$<CONFIG>"
-        DEPENDS ${FAKEFOCUS_DLL_SOURCES} ${_FAKEFOCUS32_SCRIPT} ${_FAKEFOCUS_DEF}
+        DEPENDS ${FAKEFOCUS_DLL_SOURCES} ${MINHOOK_SOURCES} ${_FAKEFOCUS32_SCRIPT} ${_FAKEFOCUS_DEF}
         COMMENT "Building FakeFocus32.dll (x86)"
         VERBATIM
     )
@@ -176,7 +202,11 @@ endif()
 # 所以 QstWebViewShell 才要逐个列出）。STATIC 库可正常传递。
 # utils.cpp 无全局注册对象（纯函数），不担心静态库裁剪掉初始化。
 # app_instance.cpp：g_instance 的定义（原在壳里 → 引擎/桌面工具链接不到）。
-add_library(qst_utils STATIC src/utils.cpp src/app_instance.cpp)
+add_library(qst_utils STATIC
+    src/utils.cpp
+    src/app_instance.cpp
+    src/script_package.cpp
+    src/player/player_runtime.cpp)
 target_compile_definitions(qst_utils PUBLIC UNICODE _UNICODE NOMINMAX)
 target_include_directories(qst_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qst_utils PUBLIC user32 shell32 shlwapi winmm advapi32 crypt32 gdi32)
@@ -186,7 +216,6 @@ endif()
 
 set(SCRIPT_CORE_COMMON_SOURCES
     src/action_utils.cpp
-    src/ai_ui_layout.cpp
     src/ai_plan_util.cpp
     src/input/mouse_input_backend.cpp
     src/input/hid_interception.cpp
@@ -201,6 +230,7 @@ set(SCRIPT_CORE_COMMON_SOURCES
     src/image_var_util.cpp
     src/color_match.cpp
     src/ocr_engine.cpp
+    src/ocr_winrt.cpp
     src/opencv_runtime.cpp
 )
 
@@ -211,7 +241,9 @@ target_include_directories(script_core_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/qst_vhid
     ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS} setupapi qst_utils)
+# windowsapp：ocr_winrt.cpp 用 C++/WinRT 调 Windows.Media.Ocr（系统自带 OCR）。
+# 必须 PUBLIC —— 任何链 script_core_common 的目标（含各 SelfTest）都会带进 ocr_winrt.obj。
+target_link_libraries(script_core_common PUBLIC ${OpenCV_LIBS} setupapi qst_utils windowsapp)
 if(MSVC)
     target_compile_options(script_core_common PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -290,7 +322,9 @@ target_include_directories(macro_variables_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(macro_variables_core PUBLIC user32 gdi32 shell32 advapi32)
+# ★ qst_utils：QuickInputVarItemsJson（给 Web 编辑器的变量清单）用 utils 的 EscapeJson、
+#   而变量清单的数字格式化也共用 utils —— 别去掉，否则 MacroVariablesSelfTest LNK2019。
+target_link_libraries(macro_variables_core PUBLIC user32 gdi32 shell32 advapi32 qst_utils)
 if(MSVC)
     target_compile_options(macro_variables_core PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -299,11 +333,20 @@ add_library(script_action_builder_core OBJECT
     src/script_action_builder.cpp
     src/agent_ai_actions.cpp
     src/ai_action_router.cpp
+    # ai_decide.cpp 也编进这里：agent_ai_actions.cpp（本库成员）会调它的判断表 +
+    # 诊断日志，而本库的消费者（ScriptActionBuilderSelfTest / ScriptIoSelfTest /
+    # ScriptSerializationSelfTest）都**不链 qst_engine**（见下方 458 行注释：
+    # 链 qst_engine 就不能再链本库）。新库只依赖它会让这 3 个目标链接失败（实测 LNK2019）。
+    src/ai_decide.cpp
     src/app_settings_store.cpp
     src/app_theme.cpp
     src/script_io.cpp
     src/recorder_timeline.cpp
 )
+# ⚠ 本库还引 webai::Enabled/ModelNameW/IsWebAiModelName/EnsureProfileInSettings
+#   （agent_ai_actions.cpp），真身在 src/web_ai/web_ai_config.cpp —— 那个文件会拉进
+#   window_mode/ext_bridge（浏览器桥 + HTTP），逻辑档不该背 ⇒ 三个消费者各自链
+#   `tools/web_ai_link_stubs.cpp`（恒 false 的桩，理由见该文件头）。加新消费者时别忘了它。
 target_compile_definitions(script_action_builder_core PUBLIC UNICODE _UNICODE NOMINMAX)
 target_include_directories(script_action_builder_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -347,6 +390,7 @@ qst_add_selftest(MacroVariablesSelfTest
 qst_add_selftest(ScriptActionBuilderSelfTest
     tools/script_action_builder_selftest.cpp
     tools/window_mode_link_stubs.cpp
+    tools/web_ai_link_stubs.cpp
     LIBS
         script_action_builder_core
         script_core_common
@@ -380,6 +424,7 @@ qst_add_selftest(CoordSpaceSelfTest
 qst_add_selftest(ScriptIoSelfTest
     tools/script_io_selftest.cpp
     tools/window_mode_link_stubs.cpp
+    tools/web_ai_link_stubs.cpp
     LIBS
         script_action_builder_core
         script_core_common
@@ -387,11 +432,21 @@ qst_add_selftest(ScriptIoSelfTest
         user32 gdi32 shell32 shlwapi
 )
 
+# 脚本包依赖收集（导出/导入）：只链 qst_utils，不需要 OpenCV / 引擎。
+# 锁住「递归收集嵌套脚本 + 图片」「多个 runMacro 都要改写」「循环引用安全」。
+qst_add_selftest(ScriptPackageSelfTest
+    tools/script_package_selftest.cpp
+    LIBS
+        qst_utils
+        user32 shell32 shlwapi
+)
+
 # D 段（#4 统一序列化）的安全网：脚本 读→写→再读 往返。
 # 默认跑内置合成用例（CI 安全）；--corpus <dir> 跑真实历史脚本库（D1 基线）。
 qst_add_selftest(ScriptSerializationSelfTest
     tools/script_serialization_selftest.cpp
     tools/window_mode_link_stubs.cpp
+    tools/web_ai_link_stubs.cpp
     LIBS
         script_action_builder_core
         script_core_common
@@ -469,7 +524,106 @@ add_custom_command(TARGET AgentAssistantSelfTest POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/.cursor/skills/agent-optimize/SKILL.md"
         "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/optimize.md"
+    # 产品自有 section（skills/agent/*.md）—— 缺了就会静默回落到内嵌文本，
+    # 于是「改了 md 却没生效」这类问题在自检里看不出来。
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/skills/agent/desktop.md"
+        "$<TARGET_FILE_DIR:AgentAssistantSelfTest>/skills/agent/desktop.md"
     COMMENT "Copy Agent skills for AgentAssistantSelfTest")
+
+# AI 助手「动手」层（runDesktopTask）：参数解析 / 安全闸 / 动作构造 / 结果清洗。
+# 只链 qst_utils —— 被测逻辑是纯函数，不碰引擎、不碰 OpenCV，
+# 所以它能在无桌面会话、无网、无驱动的机器上跑（进逻辑档）。
+qst_add_selftest(AgentDesktopTaskSelfTest
+    tools/agent_desktop_task_selftest.cpp
+    src/agent_desktop_task.cpp
+    LIBS
+        qst_utils
+        user32 shell32 shlwapi winmm
+)
+
+# AI 助手 MCP 客户端（agent_mcp.*）：协议纯函数 + stdio 客户端端到端。
+# 只链 qst_utils —— agent_mcp.cpp 的外部依赖只有 nlohmann/json 与 Win32，
+# 所以能在无桌面会话的机器上跑（进逻辑档）。
+# ⚠ 该 exe 自带 `--fake-mcp-server` 模式：用例把自己的路径当 command 起子进程，
+#   从而用**真管道 + 真进程**验证握手/列工具/调用/错误/超时（不依赖任何外部 MCP server）。
+qst_add_selftest(AgentMcpSelfTest
+    tools/agent_mcp_selftest.cpp
+    src/agent_mcp.cpp
+    LIBS
+        qst_utils
+        user32 shell32 shlwapi winmm
+)
+
+# OOXML 层（src/ooxml/）：自研 inflate（RFC 1951）+ zip 读写（支持「未改动条目
+# 原样搬运」）+ xlsx 读写（**只对该单元格做外科手术式替换**，其余 part 一字不动）。
+# 这是「不装 Office 也能读写 xlsx/docx/pptx」的地基，**不依赖任何第三方库**。
+# 只链 qst_utils —— 纯逻辑，能在无桌面会话、无网、无 Office 的机器上跑（进逻辑档）。
+# ⚠ zip 夹具是**硬编码的真 deflate 流 + 真 zip**（用 Python zlib/zipfile 生成后内联）；
+#   xlsx 夹具由用例自己用 ZipArchive 拼出来（可读性优先，deflate 路径已由 zip 用例覆盖）。
+qst_add_selftest(OoxmlSelfTest
+    tools/ooxml_selftest.cpp
+    src/ooxml/inflate.cpp
+    src/ooxml/zip_archive.cpp
+    src/ooxml/xlsx_doc.cpp
+    LIBS
+        qst_utils
+        user32 shell32 shlwapi
+)
+
+# SQLite 只读层（src/sqlite/）：手写的 SQLite 3 文件解析器，只做「读一张表」。
+# 用它读**浏览器历史库**（Edge/Chrome 的 History）—— 对照实测的 UI 路线
+# （observePage 在内置页必失败 → listUiControls 只给进视口的几十条、标题还被省略号截断
+#  → 反复 zoom 读像素 → Excel COM 收尾 23.6 秒），读库是**一条命令、全量、标题完整**。
+# **不依赖 sqlite3.c / Python**（产品不依赖别人的软件，见 AGENTS.md）。
+# ⚠ 夹具是**真的 SQLite 库字节**（用 Python 官方 sqlite3 造好后内联），
+#   期望值同样由官方模块查出 —— 不是照本实现反推的。
+# ⚠ 只链纯逻辑那部分：`sqlite_read.cpp`（不碰 Win32）。
+#   `sqlite_file.cpp` 带 FILE_SHARE_* 打开（浏览器运行时库被占用）⇒ 需要 windows.h，
+#   留给真正读文件的宿主（AgentAssistantSelfTest）覆盖。
+qst_add_selftest(SqliteSelfTest
+    tools/sqlite_selftest.cpp
+    src/sqlite/sqlite_read.cpp
+    LIBS
+        qst_utils
+        user32
+)
+
+# 网页版 AI 后端（C 方案，docs/web-ai-backend-design.md）：**纯逻辑**部分。
+# 只链 web_ai_prompt.cpp（消息→提示词、tool_calls 反解析、OpenAI/SSE 响应构造）
+# 与 web_ai_config_parse.cpp（开关文件解析）—— 不链驱动/桥/HTTP，因此无
+# 浏览器、无网、无桌面会话也能跑（进逻辑档）。
+# ⚠ 真机部分（豆包能不能写进去/读回来）**不在本套**：那必须由产品进程内的
+#   `POST /qst/web-ai/probe` 跑 —— 外部进程的 WS 探针进不了桥的业务链路
+#   （`ext_bridge_server.cpp` 的 HandleClient 只把入站消息当 result/ready 回执）。
+qst_add_selftest(WebAiSelfTest
+    tools/web_ai_selftest.cpp
+    src/web_ai/web_ai_prompt.cpp
+    src/web_ai/web_ai_image.cpp
+    src/web_ai/web_ai_config_parse.cpp
+    # web_ai_prompt.cpp 会写窗口模式日志 ⇒ 补 windowmode::WindowModeLogEventf 的桩
+    # （真身 window_mode_log.cpp 在 window_mode_core 里，逻辑档不背；见该文件头注释）。
+    tools/window_mode_link_stubs.cpp
+    LIBS
+        qst_utils
+        user32
+)
+
+# 窗口反代（B 类·界面反代，docs/ai-proxy-roadmap.md §3）：**纯逻辑**部分。
+# 只链 window_ai_profile.cpp（档案合并 / 窗口匹配 / 输入框打分 / 回复提取 / 稳定判据）
+# —— 它只 include UIAutomation.h 取**常量**，不调任何 UIA 函数 ⇒ 不需要
+#   uiautomationcore、不需要窗口、不需要键鼠（进逻辑档）。
+# ⚠ 真机部分（到底能不能写进豆包客户端 / Cursor）**不在本套**：
+#   必须由产品进程内的 `POST /qst/window-ai/probe` 跑（要 UIA + 前台 + 真控件树）。
+qst_add_selftest(WindowAiSelfTest
+    tools/window_ai_selftest.cpp
+    src/web_ai/window_ai_profile.cpp
+    LIBS
+        qst_utils
+        user32
+)
+
+
 
 # 办公文档提取脚本：自检必须测**当前**脚本（否则会测到 build 目录里的旧副本）
 add_custom_command(TARGET AiActionRouterSelfTest POST_BUILD
@@ -477,6 +631,8 @@ add_custom_command(TARGET AiActionRouterSelfTest POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/tools/office/read_doc.ps1"
         "$<TARGET_FILE_DIR:AiActionRouterSelfTest>/office/read_doc.ps1"
+    # （批 B 已删）这里原先还拷 TrackerVit 的 vit.onnx 给 locate_track 用例 —— 那条
+    # 「本地跟住」链路（连同用例）批 B 已整体撤销，模型因此**没有任何读者**，拷贝已成孤儿。
     COMMENT "Copy office read_doc.ps1 for AiActionRouterSelfTest")
 
 qst_add_selftest(AppSettingsStoreSelfTest
@@ -502,6 +658,13 @@ qst_add_selftest(ThemeUiSelfTest
 
 qst_add_selftest(BreakoutCooldownSelfTest
     tools/breakout_cooldown_selftest.cpp
+)
+
+# 窗口变速（变速齿轮）时钟换算：被测逻辑是纯 header
+# （src/window_mode/time_scale_clock.h），不链任何库 —— 目标进程内的 IAT 补丁
+# 那一半由 WindowModeSelfTest 的交互档经 FakeFocus_TimeScaleDiag 验。
+qst_add_selftest(TimeScaleSelfTest
+    tools/time_scale_selftest.cpp
 )
 
 # 桥接 JSON 边界契约（架构评估验收 A1）：锁住 saveSettings「提示成功但全部回滚」
@@ -534,6 +697,30 @@ qst_add_selftest(ScriptRunnerSelfTest
 
 qst_add_selftest(HotkeyStopSelfTest
     tools/hotkey_stop_selftest.cpp
+)
+
+# 悬浮球全屏隐藏判据（纯几何）：钉死「非全屏页面不得隐藏悬浮球」。
+qst_add_selftest(FloatBallGeomSelfTest
+    tools/float_ball_geom_selftest.cpp
+)
+
+# 叠层扣住鼠标捕获的兜底判据（纯逻辑 + 真消息队列）：
+# 钉死「终止事件丢了必须自己收尾，绝不把用户的鼠标控制权留在我们手里」。
+qst_add_selftest(OverlayInputGuardSelfTest
+    tools/overlay_input_guard_selftest.cpp
+    LIBS
+        user32
+)
+
+# 专属热键作用域判据（纯逻辑）：钉死「作用域外不注册、不吞键」。
+qst_add_selftest(HotkeyScopeSelfTest
+    tools/hotkey_scope_selftest.cpp
+)
+
+# 悬浮球全屏判据「实机探针」：与产品共用同一份判据，需真实桌面会话，
+# 输出给人看 —— **不进 $LogicSuites / $InteractiveSuites / CI 清单**。
+qst_add_selftest(FloatBallProbe
+    tools/float_ball_probe.cpp
 )
 
 qst_add_selftest(ClickerTimingSelfTest
@@ -633,6 +820,10 @@ function(qst_copy_product_runtime target)
 
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/tools"
+        # （批 D 已删）这里原先还拷 TrackerVit 的 vit.onnx（698KB）：「定位之后的本地跟住」
+        # 那条快路径批 B 已整体撤销 ⇒ **src/ 里没有任何读者**，把没人加载的模型打进产物
+        # 只会给下一个人留一条重建跟踪器的线索。模型本体 + 实测文档 + 复现工具都留在仓里
+        # （resources/models/、docs/local-detection-feasibility.md、tools/local_detection_bench/）。
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/resources/breakout_pause.ico"
             "$<TARGET_FILE_DIR:${target}>/breakout_pause.ico"
@@ -648,6 +839,9 @@ function(qst_copy_product_runtime target)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/resources/finish.wav"
             "$<TARGET_FILE_DIR:${target}>/finish.wav"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/resources/pause.wav"
+            "$<TARGET_FILE_DIR:${target}>/pause.wav"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/paddle_ocr_helper.py"
             "$<TARGET_FILE_DIR:${target}>/tools/paddle_ocr_helper.py"
@@ -690,6 +884,9 @@ function(qst_copy_product_runtime target)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/skills/agent/game.md"
             "$<TARGET_FILE_DIR:${target}>/skills/agent/game.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/skills/agent/desktop.md"
+            "$<TARGET_FILE_DIR:${target}>/skills/agent/desktop.md"
         COMMENT "Copying icons, OCR helpers, Edge extension, and Agent skills for ${target}")
 
     foreach(_vda_dll IN ITEMS
@@ -848,6 +1045,58 @@ if(QST_BUILD_WEBVIEW_SHELL)
     qst_copy_webview_ui(QstWebViewShell)
     qst_copy_product_runtime(QstWebViewShell)
     qst_bundle_webview2_fixed(QstWebViewShell)
+endif()
+
+# ── QstScriptPlayer（导出 EXE 的运行时模板 → QstPlayer.exe）──────
+# 导出时把「脚本包」追加到本 exe 尾部即得产物（见 src/script_package.h 的 payload 说明）。
+# 刻意不依赖 WebView2 / ui/ / WebView2Fixed（558MB）—— 那些只有主程序用。
+# DELAYLOAD opencv：没带找图组件的产物必须能正常启动（只是禁用找图 + 给出可读提示），
+# 否则"回退 + 提示"根本无从谈起。
+if(QST_BUILD_WEBVIEW_SHELL)
+    add_executable(QstScriptPlayer WIN32
+        resources/QstScriptPlayer.rc
+        src/player/player_main.cpp
+    )
+    # 产物名 QstPlayer.exe：与主程序 QuickScriptTool.exe 明确区分，
+    # 避免用户/杀软把导出的脚本误当主程序。
+    set_target_properties(QstScriptPlayer PROPERTIES OUTPUT_NAME QstPlayer)
+    target_compile_definitions(QstScriptPlayer PRIVATE
+        UNICODE _UNICODE NOMINMAX
+        QST_WEBVIEW_WITH_ENGINE=1
+        QST_GDI_LEGACY=0
+    )
+    target_include_directories(QstScriptPlayer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/resources
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party
+        ${CMAKE_CURRENT_SOURCE_DIR}/driver/qst_vhid
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(QstScriptPlayer PRIVATE
+        qst_engine
+        qst_desktop_tools
+        qst_engine_ui_stubs
+        ${QST_COMMON_LINK_LIBS}
+    )
+    if(MSVC)
+        target_compile_options(QstScriptPlayer PRIVATE /W4 /permissive- /utf-8)
+        target_sources(QstScriptPlayer PRIVATE resources/qst_uac.manifest)
+        target_link_libraries(QstScriptPlayer PRIVATE delayimp)
+        target_link_options(QstScriptPlayer PRIVATE
+            "/DELAYLOAD:opencv_world4100.dll"
+            "/MANIFESTUAC:NO"
+        )
+    endif()
+
+    # 把模板放到 tools/player/，随产品分发。导出时只做「复制 + 追加数据」，
+    # 所以 player 版本永远与主程序一致，也不会因网络/工具链问题失败。
+    add_custom_command(TARGET QstScriptPlayer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:QstScriptPlayer>/tools/player"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:QstScriptPlayer>"
+            "$<TARGET_FILE_DIR:QstScriptPlayer>/tools/player/QstPlayer.exe"
+        COMMENT "Copy QstPlayer.exe template into tools/player")
 endif()
 
 # ── 安装目录 Uninstall.exe（启动 Inno 卸载器并走 UAC）──────────

@@ -40,42 +40,20 @@
     );
 
   /* ---------- 假数据 ---------- */
+  // ⚠ 脚本的 `name` 是**不带 .json 的显示名**，`path` 才带扩展名。
+  //   这是产品定的口径：后端列表入口用 `data.scriptName`（存盘时已 StripJsonExtension），
+  //   兜底才用 `path.stem()`（同样没有扩展名）—— 见 webview_bridge_backend.cpp:3796。
+  //   Demo 早期给 name 加了 .json，于是编辑器的「宏名称」显示成「表格录入.json」，
+  //   比软件里多一个后缀（用户 2026-09-28 指出）。
   var macros = [
     {
       id: "demo-macro-1",
-      path: "示例宏/自动签到.json",
-      name: "自动签到.json",
-      folder: "示例宏",
-      hotkey: "F9",
-      actionCount: 12,
-      meta: "12 动作 · 08-05",
-    },
-    {
-      id: "demo-macro-2",
-      path: "游戏辅助/循环刷图.json",
-      name: "循环刷图.json",
-      folder: "游戏辅助",
-      hotkey: "",
-      actionCount: 38,
-      meta: "38 动作 · 08-03",
-    },
-    {
-      id: "demo-macro-3",
-      path: "办公自动化/表格录入.json",
-      name: "表格录入.json",
-      folder: "办公自动化",
-      hotkey: "Ctrl+F9",
-      actionCount: 26,
-      meta: "26 动作 · 08-01",
-    },
-    {
-      id: "demo-macro-4",
-      path: "新手入门/示例宏.json",
-      name: "示例宏.json",
+      path: "示例宏.json",
+      name: "示例宏",
       folder: "",
-      hotkey: "F8",
-      actionCount: 8,
-      meta: "8 动作 · 07-30",
+      hotkey: "F9",
+      actionCount: 11,
+      meta: "11 动作 · 鼠标 / 按键 / 循环 / 条件",
     },
   ];
 
@@ -83,22 +61,12 @@
     {
       id: "demo-rec-1",
       path: "录制/登录流程录制.json",
-      name: "登录流程录制.json",
+      name: "登录流程录制",
       folder: "录制",
       hotkey: "",
-      actionCount: 86,
-      recordTime: "1分24秒",
-      meta: "86 动作 · 1分24秒",
-    },
-    {
-      id: "demo-rec-2",
-      path: "录制/表单填写.json",
-      name: "表单填写.json",
-      folder: "",
-      hotkey: "",
-      actionCount: 42,
-      recordTime: "38秒",
-      meta: "42 动作 · 38秒",
+      actionCount: 12,
+      recordTime: "3秒",
+      meta: "12 动作 · 3秒",
     },
   ];
 
@@ -108,12 +76,6 @@
       name: "示例：帮我写一个自动签到脚本",
       folder: "",
       meta: "3 条消息 · 昨天",
-    },
-    {
-      id: "demo-chat-2",
-      name: "新手入门：什么是窗口模式",
-      folder: "",
-      meta: "2 条消息 · 08-02",
     },
   ];
 
@@ -133,7 +95,7 @@
       clickCountLimit: 1000,
     },
     playback: {
-      enablePlaybackCount: false,
+      enablePlaybackCount: true,
       playbackCount: 1,
       enablePlaybackInterval: false,
       playbackIntervalMinSeconds: 0.5,
@@ -229,10 +191,10 @@
   var tasks = [
     {
       id: "st-1",
-      name: "每日签到",
+      name: "每天早上跑一次示例宏",
       kind: 1,
-      filePath: "示例宏/自动签到.json",
-      fileDisplayName: "自动签到.json",
+      filePath: "示例宏.json",
+      fileDisplayName: "示例宏",
       frequency: 1,
       timeLabel: "08:00:00",
       status: 0,
@@ -243,10 +205,10 @@
     },
     {
       id: "st-2",
-      name: "每周报表截图",
+      name: "每周跑一次示例录制",
       kind: 0,
       filePath: "录制/登录流程录制.json",
-      fileDisplayName: "登录流程录制.json",
+      fileDisplayName: "登录流程录制",
       frequency: 2,
       timeLabel: "09:30:00",
       status: 1,
@@ -301,6 +263,21 @@
 
   function toast(text) {
     emit({ type: "engine.toast", text: text }, 10);
+  }
+
+  /**
+   * 网页 Demo 里"用户的屏幕分辨率"。
+   * `screen.width` 是 CSS 像素、随页面缩放变化，乘 devicePixelRatio 才是物理像素 ——
+   * 与产品用 `GetSystemMetrics(SM_CXVIRTUALSCREEN)` 拿到的量纲一致。
+   * （换算关系的说明见 website/export/qst-web-export.js 文件头"坐标"那一条。）
+   */
+  function demoScreenSize() {
+    var dpr = window.devicePixelRatio || 1;
+    var w = Math.round((window.screen && window.screen.width ? window.screen.width : 1920) * dpr);
+    var h = Math.round((window.screen && window.screen.height ? window.screen.height : 1080) * dpr);
+    if (!(w > 0)) w = 1920;
+    if (!(h > 0)) h = 1080;
+    return { w: w, h: h };
   }
 
   function notifyParent(msg) {
@@ -361,23 +338,37 @@
   }
 
   /* ---------- 示例宏动作（编辑器假数据） ---------- */
+  /**
+   * 官网 Demo 的**唯一**示例脚本。
+   *
+   * 设计意图（2026-09-28 按用户要求重写）：
+   *   旧版 13 条动作、场景是"登录/弹窗/输入 done"，用户看完不知道这软件到底怎么用；
+   *   而且示例太多太杂，没人有耐心看。
+   *   现在只留一条**能一眼读完**的脚本，把该露的能力各露一次：
+   *     基本动作（移动鼠标 / 鼠标点击 / 等待 / 按键点击）
+   *     + 循环（带循环变量 i）
+   *     + 如果 / 否则
+   *     + 结束宏运行
+   *   `loopVarName: "i"` 与后面的 `{i} >= 2` 是**成对**的 —— 顺手把"循环变量能拿到条件里用"
+   *   这件事演示清楚（不是随手写个不存在的变量）。
+   */
   function sampleActions() {
     return [
       {
         type: "moveMouse",
         name: "移动鼠标到",
-        remark: "移动到「登录」按钮",
-        x: 640,
-        y: 480,
-        duration: 0.2,
-        indent: 0,
+        remark: "把鼠标移到屏幕中间",
+        x: 960,
+        y: 540,
         randomX: 0,
         randomY: 0,
+        duration: 0,
+        indent: 0,
       },
       {
         type: "mouseClick",
         name: "鼠标点击",
-        remark: "左键点击登录",
+        remark: "左键点一下",
         button: "left",
         clickCount: 1,
         duration: 0.01,
@@ -386,52 +377,40 @@
       {
         type: "wait",
         name: "等待",
-        remark: "等待页面加载",
-        duration: 1.2,
+        remark: "等界面响应",
+        duration: 1,
         indent: 0,
       },
       {
         type: "loop",
         name: "循环",
-        remark: "重复 3 次收尾动作",
+        remark: "下面两步重复 3 次，循环次数存进变量 i",
         loopCount: 3,
+        loopVarName: "i",
         indent: 0,
       },
       {
-        type: "moveMouse",
-        name: "移动鼠标到",
-        remark: "确认弹窗",
-        x: 520,
-        y: 400,
-        duration: 0.15,
-        indent: 1,
-      },
-      {
-        type: "mouseClick",
-        name: "鼠标点击",
-        remark: "点确定",
-        button: "left",
+        type: "keyClick",
+        name: "按键点击",
+        remark: "按一下 A",
+        keyText: "A",
+        keyVk: 65,
+        clickCount: 1,
         duration: 0.01,
         indent: 1,
       },
       {
         type: "wait",
         name: "等待",
-        remark: "弹窗关闭",
-        duration: 0.8,
+        remark: "间隔 0.5 秒",
+        duration: 0.5,
         indent: 1,
-      },
-      {
-        type: "endLoop",
-        name: "跳出循环",
-        remark: "",
-        indent: 1, // 与循环体同级，位于 loop 容器内
       },
       {
         type: "if",
         name: "条件-如果",
-        remark: "如果变量 {done} == 1",
-        conditionExpr: "{done} == 1",
+        remark: "如果已经循环了 2 次以上",
+        conditionExpr: "{i} >= 2",
         indent: 0,
       },
       {
@@ -440,27 +419,30 @@
         remark: "回车确认",
         keyText: "Enter",
         keyVk: 13,
+        clickCount: 1,
         duration: 0.01,
         indent: 1,
       },
       {
         type: "else",
         name: "条件-否则",
-        remark: "",
+        remark: "还没到次数就取消",
         indent: 0,
       },
       {
-        type: "quickInput",
-        name: "快捷输入",
-        remark: "输入完成标记",
-        inputText: "done",
-        charInterval: 0.01,
+        type: "keyClick",
+        name: "按键点击",
+        remark: "按 Esc 取消",
+        keyText: "Esc",
+        keyVk: 27,
+        clickCount: 1,
+        duration: 0.01,
         indent: 1,
       },
       {
         type: "stopMacro",
         name: "结束宏运行",
-        remark: "",
+        remark: "整个脚本到此结束",
         indent: 0,
       },
     ];
@@ -513,44 +495,17 @@
     }
     var m = findMacro(path);
     if (m) {
-      var mode = m.mode;
-      if (mode == null) {
-        if (/循环刷图/.test(p)) mode = 1;
-        else if (/表格录入/.test(p)) mode = 2;
-        else mode = 0;
-      }
-      var wm = m.windowMode;
-      if (!wm) {
-        if (mode === 1) {
-          wm = {
-            enabled: 1,
-            executionKind: "hiddenDesktop",
-            selectMethod: "useEditorWindowClass",
-            targetExePath: "C:\\Game\\game.exe",
-            windowName: "游戏窗口",
-            windowClassName: "UnityWndClass",
-            fakeFocusEnabled: 0,
-          };
-        } else if (mode === 2) {
-          wm = {
-            enabled: 1,
-            executionKind: "backgroundWindow",
-            selectMethod: "useEditorWindowClass",
-            targetExePath: "C:\\Office\\EXCEL.EXE",
-            windowName: "工作簿",
-            windowClassName: "XLMAIN",
-            fakeFocusEnabled: 1,
-          };
-        } else {
-          wm = {
-            enabled: 0,
-            executionKind: "hiddenDesktop",
-            selectMethod: "selectOnStartup",
-            targetExePath: "",
-            fakeFocusEnabled: 0,
-          };
-        }
-      }
+      // 示例脚本一律「默认模式」（前台、屏幕绝对坐标）—— 与 sampleActions() 的意图一致。
+      // 旧版按脚本名硬编码 循环刷图→独立桌面 / 表格录入→后台窗口，
+      // 那套需要三条不同场景的假脚本；现在只留一条最简示例，这里也就不再分叉。
+      var mode = m.mode != null ? m.mode : 0;
+      var wm = m.windowMode || {
+        enabled: 0,
+        executionKind: "hiddenDesktop",
+        selectMethod: "selectOnStartup",
+        targetExePath: "",
+        fakeFocusEnabled: 0,
+      };
       return {
         path: m.path,
         name: m.name,
@@ -579,10 +534,13 @@
 
   function upsertMacro(payload) {
     var p = String(payload.path || "");
-    var name = String(payload.name || "").replace(/\.json$/i, "") + ".json";
-    var existing = findMacro(p);
+    // ⚠ name 是**不带 .json 的显示名**（产品口径见 macros 定义处的说明）。
+    //   用户可能自己在输入框里敲了 .json，这里按产品后端一样 StripJsonExtension。
+    var name = String(payload.name || "").replace(/\.json$/i, "");
+    var existing = findMacro(p) || macros.find(function (m) { return m.name === name; });
     if (existing) {
       existing.name = name;
+      existing.path = (existing.folder ? existing.folder + "/" : "") + name + ".json";
       existing.actionCount = Array.isArray(payload.actions) ? payload.actions.length : 0;
       existing.meta =
         existing.actionCount + " 动作 · " + new Date().toLocaleDateString("zh-CN");
@@ -598,7 +556,7 @@
     if (idx > 0) folder = p.slice(0, idx);
     var item = {
       id: "demo-macro-new-" + fakeState.newMacroSeq++,
-      path: p || ("新建宏/" + name),
+      path: (folder ? folder + "/" : "") + name + ".json",
       name: name,
       folder: folder,
       hotkey: "",
@@ -742,6 +700,94 @@
         ok("openEditor", { script: scriptForPath(msg.path) });
         return;
 
+      // 专业模式右侧的「动作预览」。旧实现没这个 case ⇒ 调用发出去没有任何 .result 回来，
+      // 预览区**永远空着**（界面不报错、也不显示，最难查的一类缺口）。
+      case "previewScriptActions":
+        {
+          var pvScript = scriptForPath(msg.path);
+          var pvActs = Array.isArray(pvScript.actions) ? pvScript.actions : [];
+          var pvMax = Math.max(1, Number(msg.max) || 16);
+          ok("previewScriptActions", {
+            reqId: msg.reqId || "",
+            actionCount: pvActs.length,
+            names: pvActs.slice(0, pvMax).map(actionPreviewName),
+          });
+        }
+        return;
+
+      // 窗口 Agents（把客户端窗口登记成模型）：网页版给一份示例档案 + 窗口列表，
+      // 让设置页那套「准星拾取 / 绑定」UI 能完整走一遍，只是数据是假的。
+      case "windowAgentList":
+        ok("windowAgentList", { payload: windowAgentPayload() });
+        return;
+
+      case "windowAgentBind":
+        {
+          var bindId = String(msg.client || "");
+          var bound = !msg.unbind;
+          if (bound && !bindId) {
+            // 按进程名新建骨架档案（与产品一致：仍需要探针校准）
+            bindId = "wa-demo-" + Date.now();
+            waClients.push({
+              id: bindId,
+              label: String(msg.process || "新窗口应用"),
+              processNames: [String(msg.process || "")],
+              bound: true,
+              calibrated: false,
+            });
+          } else if (bindId) {
+            waClients = waClients.map(function (c) {
+              if (String(c.id) === bindId) c.bound = bound;
+              return c;
+            });
+          }
+          setTimeout(function () {
+            ok("windowAgentBind", { payload: { ok: true, bound: bound, client: bindId } });
+          }, 120);
+        }
+        return;
+
+      // 虚拟 HID 驱动状态：网页版永远"未安装"（浏览器里本来就没有内核驱动），
+      // 让设置页显示成真实客户端「没装驱动」时的样子。
+      case "queryVhidStatus":
+        ok("queryVhidStatus", {
+          ok: true, driverReady: false, driverNeedsUpdate: false,
+          rebootPending: false, packagePresent: false, hvciEnabled: false,
+          lastExitCode: 0, demo: true,
+        });
+        return;
+
+      case "setRecorderMode":
+        fakeState.recWindowMode = msg.mode != null ? msg.mode | 0 : fakeState.recWindowMode;
+        ok("setRecorderMode", { mode: fakeState.recWindowMode });
+        return;
+
+      case "window.setHomeSize":
+        // 网页版的"窗口"就是 iframe；按请求的尺寸回一次 clientSize，
+        // 让外层的等比缩放跟着变（不然模式切换后窗口尺寸对不上）。
+        emit({
+          type: "window.clientSize",
+          clientW: Number(msg.w) || DESIGN.home.w,
+          clientH: Number(msg.h) || DESIGN.home.h,
+          dpi: 96,
+        });
+        ok("window.setHomeSize", {});
+        return;
+
+      // ── 浏览器里**做不到**的：明确说清楚，别让用户以为是坏了 ──────
+      case "pickScreenDrag":
+        fail(type, "拖动框选屏幕区域需要原生截图能力；网页体验版请下载 Windows 客户端。");
+        return;
+
+      case "pickTemplateDrag":
+        fail(type, "拖动框选模板图需要原生截图能力；网页体验版请下载 Windows 客户端。");
+        return;
+
+      case "systemReboot":
+        // 绝不真的重启用户的电脑 —— 这条无论如何都不能"演示"。
+        fail(type, "网页体验版不会重启你的电脑；需要重启请自行操作。");
+        return;
+
       case "peekScriptActions":
         {
           var peek = scriptForPath(msg.path);
@@ -752,6 +798,74 @@
             breakoutTimeSeconds: peek.breakoutTimeSeconds || 0,
             windowMode: peek.windowMode || {},
           });
+        }
+        return;
+
+      case "editorVarItems":
+        {
+          // 网页体验版**近似**回一份变量清单。
+          //
+          // ⚠ 客户端里这条命令由引擎算（C++ `QuickInputVarItemsJson`，与「构建/运行宏」
+          //   同一份实现）—— 网页版没有引擎，这里只做演示，**不是**第二份事实来源：
+          //   产品路径永远走 C++，这里漏了什么也只会影响 Demo 的下拉显示。
+          var demoItems = [];
+          var demoSeen = {};
+          var pushVar = function (code, tip) {
+            if (!code || demoSeen[code]) return;
+            demoSeen[code] = 1;
+            demoItems.push({ code: code, insert: "{" + code + "}", tip: tip });
+          };
+          var demoActs = Array.isArray(msg.actions) ? msg.actions : [];
+          demoActs.forEach(function (a) {
+            if (!a || a._preview) return;
+            var t = a.type || "";
+            var n = String(a.matchVarName || "").trim();
+            if (t === "findImage" && n) {
+              if ((a.findImageFollowUp | 0) === 3) {
+                pushVar(n, "图片变量");
+              } else {
+                [".matchData", ".x", ".y", ".x1", ".y1", ".cx", ".cy"].forEach(function (p) {
+                  pushVar(n + p, "找图" + p);
+                });
+              }
+            } else if (t === "multiMatch" && n) {
+              pushVar(n + ".count", "多图匹配命中个数");
+              pushVar(n + "[n]", "多图匹配第 n 处");
+              [".matchData", ".x", ".y", ".x1", ".y1", ".cx", ".cy", ".hit", ".hitName"].forEach(
+                function (p) {
+                  pushVar(n + "[0]" + p, "第一处" + p);
+                }
+              );
+            } else if (t === "textRecognition" && n) {
+              if ((a.ocrResultMode | 0) === 1) {
+                pushVar(n, "文字查找是否找到(0/1)");
+                pushVar(n + ".matchData", "文字查找匹配度(0~100)");
+                [".x", ".y", ".x1", ".y1"].forEach(function (p) {
+                  pushVar(n + p, "命中文字框" + p);
+                });
+              } else {
+                pushVar(n, "文字识别结果(字符串)");
+              }
+            } else if (t === "getCursorPos" && n) {
+              pushVar(n + ".x", "光标横坐标");
+              pushVar(n + ".y", "光标纵坐标");
+            } else if ((t === "getColor" || t === "findColor" || t === "colorMatch") && n) {
+              pushVar(n, "颜色(#RRGGBB)");
+              pushVar(n + ".matchData", "匹配度(0~100)");
+              pushVar(n + ".x", "颜色位置X");
+              pushVar(n + ".y", "颜色位置Y");
+            } else if (t === "loop" && a.loopVarName) {
+              pushVar(String(a.loopVarName).trim(), "循环变量");
+            } else if (t === "timerRecordTime" && (a.loopVarName || a.matchVarName)) {
+              pushVar(String(a.loopVarName || a.matchVarName).trim(), "计时器变量");
+            } else if (
+              (t === "aiTextAnalysis" || t === "aiImageAnalysis" || t === "aiActionExecute") &&
+              a.aiOutputVarName
+            ) {
+              pushVar(String(a.aiOutputVarName).trim(), "AI输出变量");
+            }
+          });
+          ok("editorVarItems", { reqId: msg.reqId || "", items: demoItems });
         }
         return;
 
@@ -776,11 +890,14 @@
       case "renameScript":
         {
           var rp = String(msg.path || "");
-          var rn = String(msg.name || "").replace(/\.json$/i, "") + ".json";
+          // 与产品 RenameScriptFile 同口径：传进来的是**裸名**，用户可能自己带 .json；
+          // 存进 name 的是裸名，path 才补 .json（webview_bridge_backend.cpp:1776-1786）。
+          var rn = String(msg.name || "").replace(/\.json$/i, "").replace(/[<>:"/\\|?*]/g, "_");
+          if (!rn) { fail("renameScript", "名称不能为空"); return; }
           macros = macros.map(function (m) {
             if (String(m.path) === rp || String(m.id) === rp) {
               m.name = rn;
-              m.path = (m.folder ? m.folder + "/" : "") + rn;
+              m.path = (m.folder ? m.folder + "/" : "") + rn + ".json";
             }
             return m;
           });
@@ -804,8 +921,119 @@
         return;
 
       case "importScript":
-      case "exportScript":
         fail(type, DEMO_HINT);
+        return;
+
+      // ── 导出为独立 EXE：网页版是**真做**的 ───────────────────────
+      // 原理与产品的 `--export-exe` 完全同一套格式：
+      //     [QstPlayer.exe][脚本包 zip][32 字节尾标]
+      // 差别只在"谁来拼"：产品在本地拼，网页在**浏览器里**拼 ——
+      // 服务器只发一个静态的播放器模板，脚本与图片一个字节都不上传。
+      // 实现见 website/export/qst-web-export.js（与「在线脚本工坊」共用同一份代码）。
+      case "scanScriptForExport":
+        {
+          var sx = window.QstWebExport;
+          if (!sx) { fail(type, "网页导出模块没加载（export/qst-web-export.js）"); return; }
+          var sScript = scriptForPath(msg.path);
+          var sScreen = demoScreenSize();
+          var sConv = sx.convertEditorActions(sScript.actions || [], {
+            screenW: sScreen.w, screenH: sScreen.h,
+          });
+          var sScan = sx.scanCapabilities(sConv.actions, []);
+          ok("scanScriptForExport", {
+            scriptName: sScript.name || "",
+            totalActions: sScan.totalActions,
+            imageActions: sScan.imageActions,
+            ocrActions: sScan.ocrActions,
+            aiActions: sScan.aiActions,
+            externalActions: sScan.externalActions,
+            windowMode: 0,
+            hasHotkey: 0,
+            nestedScripts: 0,
+            selfContainedOnly: sScan.selfContainedOnly ? 1 : 0,
+            templateAvailable: 1,
+            templateBytes: 5768192,          // 网页模板实际大小，导出前会按 fetch 到的字节复核
+            openCvBytes: 0,
+            fakeFocusBytes: 0,
+            missingRefs: [],
+            // 网页版特有：白名单之外的动作不是"没找到"，而是"这个版本不导出"
+            rejectedActions: sConv.rejected,
+            rejectedCount: sConv.rejected.length,
+          });
+        }
+        return;
+
+      case "exportScriptAsExe":
+        {
+          var ex = window.QstWebExport;
+          if (!ex) { fail(type, "网页导出模块没加载（export/qst-web-export.js）"); return; }
+          // file:// 下浏览器禁止 fetch 本地文件 ⇒ 导出必定失败。
+          // 早点给出**能照着做**的话，别让用户对着 `Failed to fetch` 猜。
+          if (ex.isFileProtocol && ex.isFileProtocol()) {
+            fail("exportScriptAsExe",
+              "这个页面是直接双击打开的（file://），浏览器不允许读取播放器模板。"
+              + "请在仓库根目录运行 tools\\serve_website.ps1，用 http://127.0.0.1:8090/demo.html 打开后再试。");
+            return;
+          }
+          var eScript = scriptForPath(msg.path);
+          var eScreen = demoScreenSize();
+          // ── 进度 + 可中止 ───────────────────────────────────────
+          // 取模板要下 5.5 MB，慢网络上好几秒；旧实现只弹一句 toast 然后干等，
+          // 用户既看不到进展也没法取消（用户 2026-09-28 反馈"不如客户端迅速"）。
+          // 组装本身是毫秒级 —— 慢的**只有**这一段下载，所以进度条要盯的就是它。
+          var expAbort = (typeof AbortController === "function") ? new AbortController() : null;
+          exportAbortController = expAbort;
+          showExportProgress(true);
+          setExportProgress(0, "正在下载播放器模板…");
+          ex.buildExeFromEditor({
+            name: (eScript.name || "在线脚本").replace(/\.json$/i, ""),
+            editorActions: eScript.actions || [],
+            screenW: eScreen.w, screenH: eScreen.h,
+            // ★ 设置继承：把用户当前在「设置」里改的那一份原样打进 exe 的 rt\app_settings.json，
+            //   与客户端导出 `SerializeAppSettings(...)` 的行为一致。
+            settings: settings,
+            signal: expAbort ? expAbort.signal : null,
+            onProgress: function (p) { onExportProgress(p); },
+          }).then(function (r) {
+            setExportProgress(1, "正在交给浏览器下载…");
+            ex.downloadBytes(r.bytes, r.filename,
+              "application/vnd.microsoft.portable-executable");
+            ok("exportScriptAsExe", {
+              bytes: r.stats.exeBytes,
+              payloadBytes: r.stats.payloadBytes,
+              skipped: 0,
+              usedOpenCv: 0,
+              usedFakeFocus: 0,
+              settingsEmbedded: 1,
+              aiKeyEmbedded: 0,
+              needsAi: 0,
+              missingRefs: [],
+              rejected: r.rejected,
+            });
+            setTimeout(function () { showExportProgress(false); }, 600);
+            if (r.rejected && r.rejected.length) {
+              setTimeout(function () {
+                toast("已导出；有 " + r.rejected.length + " 个动作网页版不支持，已跳过："
+                  + r.rejected.map(function (x) { return x.type; }).join("、"));
+              }, 400);
+            }
+          }).catch(function (e) {
+            setTimeout(function () { showExportProgress(false); }, 400);
+            if (ex.isAbort && ex.isAbort(e)) {
+              // 用户自己点的取消 —— 不是错误，别用红色语气报
+              fail("exportScriptAsExe", "cancelled");
+              setTimeout(function () { toast("已取消导出"); }, 60);
+              return;
+            }
+            fail("exportScriptAsExe", (e && e.message) ? e.message : "网页版导出失败");
+          });
+        }
+        return;
+
+      case "exportScript":
+        // 产品里这个是「导出 zip 脚本包」（设置里勾了"导出默认为 zip"才走）。
+        // 网页版不提供 zip 包，直接引导到我们真正做得成的 EXE 导出。
+        fail(type, "网页版不导出 zip 脚本包；请用「导出为独立 EXE」，或下载 Windows 客户端。");
         return;
 
       case "openRecordingOptimize":
@@ -900,7 +1128,7 @@
           var newRec = {
             id: "demo-rec-new-" + Date.now(),
             path: "录制/网页体验录制.json",
-            name: "网页体验录制.json",
+            name: "网页体验录制",
             folder: "录制",
             hotkey: "",
             actionCount: 42,
@@ -1036,12 +1264,98 @@
         });
         return;
 
+      // ── 目录管理：网页版**真做**（内存态）────────────────────────
+      // 旧实现一律 fail(DEMO_HINT) ⇒ 专业模式里"新建目录/改名/删除/移动脚本"全是死的，
+      // 用户感觉"网页版缺一半功能"。这些是纯数据操作，浏览器完全做得成。
       case "createLibraryFolder":
+        {
+          var ck = normKind(msg.kind);
+          var cf = normFolderPath(msg.folder);
+          if (!cf) { fail(type, "目录名不能为空"); return; }
+          if (folderExists(ck, cf)) { fail(type, "目录已存在：" + cf); return; }
+          (extraFolders[ck] || (extraFolders[ck] = [])).push(cf);
+          ok(type, { kind: msg.kind, folders: libraryFoldersFor(ck) });
+        }
+        return;
+
       case "renameLibraryFolder":
+        {
+          var rk = normKind(msg.kind);
+          var rfrom = normFolderPath(msg.folder);
+          var rto = normFolderPath(msg.name);
+          if (!rfrom || !rto) { fail(type, "目录名不能为空"); return; }
+          if (!folderExists(rk, rfrom)) { fail(type, "目录不存在：" + rfrom); return; }
+          if (folderExists(rk, rto)) { fail(type, "目标目录已存在：" + rto); return; }
+          rewriteItemFolders(rk, rfrom, rto);
+          // 子目录也要跟着改名（先长后短，避免父目录改名把子目录路径改花）
+          var subs = libraryFoldersFor(rk)
+            .filter(function (f) { return f.indexOf(rfrom + "/") === 0; })
+            .sort(function (a, b) { return b.length - a.length; });
+          subs.forEach(function (f) {
+            (extraFolders[rk] || (extraFolders[rk] = [])).push(rto + f.slice(rfrom.length));
+          });
+          extraFolders[rk] = (extraFolders[rk] || [])
+            .map(function (f) { return f === rfrom ? rto : (f.indexOf(rfrom + "/") === 0 ? rto + f.slice(rfrom.length) : f); })
+            .filter(function (f, i, arr) { return arr.indexOf(f) === i; });
+          ok(type, {
+            kind: msg.kind, folders: libraryFoldersFor(rk),
+            scripts: macros, recordings: recordings,
+          });
+        }
+        return;
+
       case "deleteLibraryFolder":
+        {
+          var dk = normKind(msg.kind);
+          var df = normFolderPath(msg.folder);
+          if (!df) { fail(type, "目录名不能为空"); return; }
+          // 目录里的条目**移到根**而不是删掉（与产品一致：删目录不该销毁脚本）
+          var moved = rewriteItemFolders(dk, df, "");
+          extraFolders[dk] = (extraFolders[dk] || []).filter(function (f) {
+            return f !== df && f.indexOf(df + "/") !== 0;
+          });
+          ok(type, {
+            kind: msg.kind, folders: libraryFoldersFor(dk), moved: moved,
+            scripts: macros, recordings: recordings,
+          });
+          if (moved > 0) setTimeout(function () { toast("已删除目录，其中 " + moved + " 个条目已移到根目录"); }, 200);
+        }
+        return;
+
       case "moveScriptToFolder":
+        {
+          var mpath = String(msg.path || "");
+          var mfolder = normFolderPath(msg.folder);
+          var target = findMacro(mpath) ||
+            recordings.find(function (r) { return String(r.path) === mpath || String(r.id) === mpath; });
+          if (!target) { fail(type, "找不到条目：" + mpath); return; }
+          target.folder = mfolder;
+          if (mfolder && !folderExists(normKind(target.id && /^demo-rec/.test(target.id) ? "rec" : "macro"), mfolder)) {
+            var mk = /^demo-rec/.test(String(target.id)) ? "rec" : "macro";
+            (extraFolders[mk] || (extraFolders[mk] = [])).push(mfolder);
+          }
+          ok(type, { folders: libraryFoldersFor("macro"), scripts: macros, recordings: recordings });
+        }
+        return;
+
       case "setItemLibraryFolder":
-        fail(type, DEMO_HINT);
+        {
+          var sk = normKind(msg.kind);
+          var sid = String(msg.id || "");
+          var sfolder = normFolderPath(msg.folder);
+          var hit = itemsOfKind(sk).find(function (it) {
+            return String(it.id) === sid || String(it.path) === sid;
+          });
+          if (!hit) { fail(type, "找不到条目：" + sid); return; }
+          hit.folder = sfolder;
+          if (sfolder && !folderExists(sk, sfolder)) {
+            (extraFolders[sk] || (extraFolders[sk] = [])).push(sfolder);
+          }
+          ok(type, {
+            kind: msg.kind, folders: libraryFoldersFor(sk),
+            scripts: macros, recordings: recordings,
+          });
+        }
         return;
 
       case "openAgentWindow":
@@ -1144,7 +1458,134 @@
     return task;
   }
 
+  /**
+   * 扁平设置键 → `[段, 字段]` 路由表。
+   *
+   * ⚠⚠ 这张表**必须与产品后端一一对应**（2026-09-28 用户反馈「导出还是没走设置」）：
+   *   `ui/app.js` 的 `collectSettings()` 发出去的是**扁平**键（`playbackCount`、
+   *   `enablePlaybackCount`、`lowPerformanceMode`…），而 `fillSettings()` 读的是**嵌套**
+   *   （`s.playback.playbackCount`）—— 也就是后端的契约是「**收扁平、回嵌套**」。
+   *   旧实现只认嵌套 + 一份手写的 `otherFlat` 白名单 ⇒ 播放次数/间隔/低性能模式…
+   *   这些扁平键**全被静默丢掉**：设置在界面上改了，`settings` 对象没变，
+   *   于是导出的 exe 用的是**旧值**（用户看到的就是"导出没走设置"）。
+   *
+   *   表是从 `src/webview/webview_bridge_backend.cpp` 的 SaveSettings 里**逐条抽出来的**
+   *   （86 条 + `savedModelsClear` 单独处理），并由
+   *   `tools/verify/demo_settings_parity.js` 反向校验 —— C++ 加了新设置而这里没跟，
+   *   守卫会直接报红，不会静默漂移。**别手写白名单**，那个教训已经吃过一次。
+   */
+  var FLAT_FIELD_SECTION = {
+    activeTab:                          ["home", "activeTab"],
+    aiEnabled:                          ["ai", "enabled"],
+    aiFastPaths:                        ["playback", "aiFastPaths"],
+    allowForegroundInputFallback:       ["windowMode", "allowForegroundInputFallback"],
+    autoHideMainWindow:                 ["other", "autoHideMainWindow"],
+    autoOutputKeyFunctionDebug:         ["playback", "autoOutputKeyFunctionDebug"],
+    autoStartOnBoot:                    ["other", "autoStartOnBoot"],
+    blockRunWhenUnhealthy:              ["windowMode", "blockRunWhenUnhealthy"],
+    clickCountLimit:                    ["click", "clickCountLimit"],
+    clickerButton:                      ["home", "clickerButton"],
+    clickerCustomInterval:              ["home", "clickerCustomInterval"],
+    clickerIntervalMode:                ["home", "clickerIntervalMode"],
+    clickerScrollOffset:                ["home", "clickerScrollOffset"],
+    closeToTray:                        ["other", "closeToTray"],
+    customAccentColor:                  ["other", "customAccentColor"],
+    customMainColor:                    ["other", "customMainColor"],
+    editorAutoSaveOnExit:               ["other", "editorAutoSaveOnExit"],
+    editorDisableModifyButton:          ["other", "editorDisableModifyButton"],
+    editorEnableBatchInsert:            ["other", "editorEnableBatchInsert"],
+    editorHideCoordVars:                ["other", "editorHideCoordVars"],
+    editorHideFixedVars:                ["other", "editorHideFixedVars"],
+    editorMultiResultPlaceholderOnly:   ["other", "editorMultiResultPlaceholderOnly"],
+    editorSearchAllActions:             ["other", "editorSearchAllActions"],
+    enableClickCountLimit:              ["click", "enableClickCountLimit"],
+    enableCoordinateJitter:             ["click", "enableCoordinateJitter"],
+    enableDebugOutputWindow:            ["playback", "enableDebugOutputWindow"],
+    enableFakeFocusInjection:           ["windowMode", "enableFakeFocusInjection"],
+    enableFixedCoordinates:             ["click", "enableFixedCoordinates"],
+    enableHidDriverSimulation:          ["playback", "enableHidDriverSimulation"],
+    enablePlaybackCount:                ["playback", "enablePlaybackCount"],
+    enablePlaybackInterval:             ["playback", "enablePlaybackInterval"],
+    enablePlaybackSpeed:                ["playback", "enablePlaybackSpeed"],
+    enablePressReleaseInterval:         ["click", "enablePressReleaseInterval"],
+    enableRandomInterval:               ["click", "enableRandomInterval"],
+    findImageGpuAccel:                  ["playback", "findImageGpuAccel"],
+    fixedX:                             ["click", "fixedX"],
+    fixedY:                             ["click", "fixedY"],
+    floatBallDocked:                    ["other", "floatBallDocked"],
+    floatBallEdge:                      ["other", "floatBallEdge"],
+    floatBallXRatio:                    ["other", "floatBallXRatio"],
+    floatBallYRatio:                    ["other", "floatBallYRatio"],
+    foregroundInputBackend:             ["playback", "foregroundInputBackend"],
+    hideBottomRightTip:                 ["other", "hideBottomRightTip"],
+    hideInjectedModule:                 ["windowMode", "hideInjectedModule"],
+    holdThresholdSeconds:               ["other", "holdThresholdSeconds"],
+    injectionTechnique:                 ["windowMode", "injectionTechnique"],
+    jitterX:                            ["click", "jitterX"],
+    jitterY:                            ["click", "jitterY"],
+    lowPerformanceMode:                 ["playback", "lowPerformanceMode"],
+    macroScrollOffset:                  ["home", "macroScrollOffset"],
+    maxTokens:                          ["ai", "maxTokens"],
+    playSoundOnEnd:                     ["other", "playSoundOnEnd"],
+    playSoundOnStart:                   ["other", "playSoundOnStart"],
+    playbackCount:                      ["playback", "playbackCount"],
+    playbackIntervalMaxSeconds:         ["playback", "playbackIntervalMaxSeconds"],
+    playbackIntervalMinSeconds:         ["playback", "playbackIntervalMinSeconds"],
+    playbackSpeed:                      ["playback", "playbackSpeed"],
+    preferDirect2D:                     ["other", "preferDirect2D"],
+    pressReleaseIntervalSeconds:        ["click", "pressReleaseIntervalSeconds"],
+    previewRefreshMs:                   ["windowMode", "previewRefreshMs"],
+    randomIntervalMaxSeconds:           ["click", "randomIntervalMaxSeconds"],
+    recorderCaptureScope:               ["home", "recorderCaptureScope"],
+    recorderInputMode:                  ["home", "recorderInputMode"],
+    recorderScrollOffset:               ["home", "recorderScrollOffset"],
+    recorderWindowMode:                 ["home", "recorderWindowMode"],
+    recordingClickCaptureEnabled:       ["playback", "recordingClickCaptureEnabled"],
+    recordingClickCaptureHalfSize:      ["playback", "recordingClickCaptureHalfSize"],
+    resolveImeConflict:                 ["other", "resolveImeConflict"],
+    scheduledTaskAutoResume:            ["playback", "scheduledTaskAutoResume"],
+    scheduledTaskConflictPolicy:        ["playback", "scheduledTaskConflictPolicy"],
+    scriptCustomScrollOffset:           ["home", "scriptCustomScrollOffset"],
+    showFloatBall:                      ["other", "showFloatBall"],
+    showPreviewThumbnail:               ["windowMode", "showPreviewThumbnail"],
+    spreadRelativeMovePackets:          ["playback", "spreadRelativeMovePackets"],
+    temperature:                        ["ai", "temperature"],
+    themeId:                            ["other", "themeId"],
+    uiScaleFactor:                      ["other", "uiScaleFactor"],
+    useCustomTheme:                     ["other", "useCustomTheme"],
+    visualBlockCallWires:               ["other", "visualBlockCallWires"],
+    visualBlockWrap:                    ["other", "visualBlockWrap"],
+    visualIfWrap:                       ["other", "visualIfWrap"],
+    visualJumpWires:                    ["other", "visualJumpWires"],
+    visualLoopWrap:                     ["other", "visualLoopWrap"],
+    visualShowCardId:                   ["other", "visualShowCardId"],
+    visualShowGrid:                     ["other", "visualShowGrid"],
+    visualWatchWrap:                    ["other", "visualWatchWrap"],
+
+    // ── 后端用**另外的路径**处理、不在上面那张 Get* 表里的扁平原键 ──────────
+    // 这几条不能省：`collectSettings()` 一样会把它们发过来，桩不接住就会丢
+    // （AI 配置一丢，设置页再打开时模型/密钥就"变回默认"了）。
+    // tools/verify/demo_settings_parity.js 的 STUB_ONLY 记着它们为什么不在 C++ 表里。
+    //
+    // ⚠ 其中 enableWindowTimeScale / exportScriptAsZip 原本**连产品后端都漏了映射**
+    //   （界面发了、没人接、保存后静默失效）—— 是这条判据把它们揪出来并已在
+    //   `webview_bridge_backend.cpp` 的 SaveSettings 里补上的。所以它们现在**也在** C++ 表里。
+    enableWindowTimeScale:              ["windowMode", "enableWindowTimeScale"],
+    exportScriptAsZip:                  ["other", "exportScriptAsZip"],
+    editorActionOrder:                  ["other", "editorActionOrder"],
+    editorHiddenActions:                ["other", "editorHiddenActions"],
+    editorCustomActionOrder:            ["other", "editorCustomActionOrder"],
+    editorCustomHiddenActions:          ["other", "editorCustomHiddenActions"],
+    editorCatalogPreset:                ["other", "editorCatalogPreset"],
+    uiMode:                             ["home", "uiMode"],
+    apiUrl:                             ["ai", "apiUrl"],
+    apiKey:                             ["ai", "apiKey"],
+    modelName:                          ["ai", "modelName"],
+    savedModels:                        ["ai", "savedModels"],
+  };
+
   function mergeSettings(next) {
+    // ① 嵌套形态（openSettingsData / 主题弹窗那类调用会回传整段）
     ["click", "playback", "other", "windowMode", "home", "ai"].forEach(function (sec) {
       if (next[sec] && typeof next[sec] === "object") {
         if (!settings[sec]) settings[sec] = {};
@@ -1153,37 +1594,22 @@
         });
       }
     });
-    // 产品 saveSettings / 编辑器设置保存是扁平字段，需写回 other（否则再 openSettingsData 会冲掉）
-    var otherFlat = [
-      "themeId",
-      "useCustomTheme",
-      "customMainColor",
-      "customAccentColor",
-      "preferDirect2D",
-      "holdThresholdSeconds",
-      "autoHideMainWindow",
-      "playSoundOnStart",
-      "playSoundOnEnd",
-      "hideBottomRightTip",
-      "closeToTray",
-      "showFloatBall",
-      "autoStartOnBoot",
-      "resolveImeConflict",
-      "editorDefaultView",
-      "visualLoopWrap",
-      "visualBlockCallWires",
-      "visualIfWrap",
-      "visualBlockWrap",
-      "visualJumpWires",
-      "visualShowGrid",
-      "visualShowCardId",
-      "editorActionOrder",
-      "editorHiddenActions",
-    ];
-    if (!settings.other) settings.other = {};
-    otherFlat.forEach(function (k) {
-      if (Object.prototype.hasOwnProperty.call(next, k)) settings.other[k] = next[k];
+    // ② 扁平形态（collectSettings 发过来的就是这一种）—— 按 C++ 抽出的表路由
+    Object.keys(next).forEach(function (k) {
+      var t = FLAT_FIELD_SECTION[k];
+      if (!t) return;
+      if (!settings[t[0]]) settings[t[0]] = {};
+      settings[t[0]][t[1]] = next[k];
     });
+    // ③ 语义特殊的两条：它们不是普通赋值
+    if (next.savedModelsClear) settings.ai && (settings.ai.savedModels = []);
+    if (Array.isArray(next.savedModels) && settings.ai) settings.ai.savedModels = next.savedModels;
+    // ④ 编辑器设置的兜底字段（C++ 侧走的是另一条持久化路径，这里保底不丢）
+    if (!settings.other) settings.other = {};
+    ["editorDefaultView", "editorActionOrder", "editorHiddenActions", "editorCatalogPreset"]
+      .forEach(function (k) {
+        if (Object.prototype.hasOwnProperty.call(next, k)) settings.other[k] = next[k];
+      });
   }
 
   function applyThemeMsg(msg) {
@@ -1200,12 +1626,212 @@
     }
   }
 
-  function libraryFoldersFor(kind) {
-    if (kind === "macro") return ["示例宏", "游戏辅助", "办公自动化"];
-    if (kind === "rec") return ["录制"];
-    if (kind === "sched") return ["每日任务"];
-    if (kind === "ai") return ["新手入门"];
+  /**
+   * 专业模式的**目录树数据源**。
+   *
+   * ⚠⚠ 只能从**真实条目**推导，绝不能写死（2026-09-28 用户反馈「极简模式和专业模式的脚本库
+   *   没有统一」就是这个）：
+   *   旧实现返回写死的 `["示例宏","游戏辅助","办公自动化"]`，而 `macros` 里只有一条
+   *   **无目录**的「示例宏」⇒ 专业模式显示 3 个空目录、脚本一条都不在里面；
+   *   极简模式却正常列出 1 条脚本 —— 同一份数据两种视图对不上，用户看到的就是"库不一样"。
+   *   这正是 AGENTS.md §43 那条：「静态清单 × 动态数据必须同一份事实」——
+   *   目录列表要从 items 的 folder 字段**算出来**，用户新建的目录另存一份。
+   */
+  var extraFolders = { macro: [], rec: [], sched: [], ai: [] };
+
+  /** 目录路径归一化（与 pro-mode.js 的 normFolder 同一把尺：反斜杠→斜杠、去首尾斜杠）。 */
+  function normFolderPath(f) {
+    return String(f == null ? "" : f).replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  }
+
+  /** 动作的显示名（预览列表用）。示例动作自带 name；没有就按类型给个中文名。 */
+  function actionPreviewName(a) {
+    if (!a) return "";
+    if (a.name) return String(a.name);
+    var t = String(a.type || "");
+    var labels = {
+      moveMouse: "移动鼠标到", mouseClick: "鼠标点击", mouseDown: "鼠标按下",
+      mouseUp: "鼠标松开", scrollWheel: "滚动滚轮", keyClick: "按键点击",
+      keyDown: "键盘按下", keyUp: "键盘松开", quickInput: "快捷输入",
+      wait: "等待", loop: "循环", endLoop: "跳出循环", if: "条件-如果",
+      else: "条件-否则", stopMacro: "结束宏运行", findImage: "找图点击",
+      runMacro: "运行鼠标宏", mousePlayback: "运行录制回放",
+    };
+    return labels[t] || t || "动作";
+  }
+
+  /**
+   * 窗口 Agents 的假档案 / 窗口列表（只为了让设置页那套 UI 能走通）。
+   */
+  var waClients = [
+    {
+      id: "wa-demo-doubao", label: "豆包客户端",
+      processNames: ["Doubao.exe"], bound: true, calibrated: true,
+    },
+  ];
+  function windowAgentPayload() {
+    return {
+      clients: waClients,
+      windows: [
+        { process: "Doubao.exe", title: "豆包" },
+        { process: "Cursor.exe", title: "Cursor" },
+        { process: "WindowsTerminal.exe", title: "终端" },
+      ],
+      demo: true,
+    };
+  }
+
+  // ── 导出进度 UI ────────────────────────────────────────────────
+  // 为什么由**桩**注入而不是改 ui\index.html：那是产品前端，动它就会跟着发版进客户端；
+  // 而客户端导出是本机 IO（毫秒级），根本不需要进度条。这是**网页独有**的补充件。
+  // 注入点选在 #expScan 之后、#expSize 之前 —— 不打断原有布局顺序。
+  var exportAbortController = null;
+  var lastExportPct = -1;
+
+  function ensureExportProgressUI() {
+    if (document.getElementById("qstExpProgress")) return true;
+    var body = document.querySelector("#ov-export-exe .dlg-body");
+    if (!body) return false;
+    if (!document.getElementById("qstExpProgressCss")) {
+      var st = document.createElement("style");
+      st.id = "qstExpProgressCss";
+      st.textContent =
+        "#qstExpProgress{margin:10px 0 2px;display:none}"
+        + "#qstExpProgress.on{display:block}"
+        + "#qstExpProgress .bar{height:8px;border-radius:999px;background:rgba(26,166,214,.14);"
+        + "border:1px solid var(--line,#c9d7e6);overflow:hidden}"
+        + "#qstExpProgress .bar i{display:block;height:100%;width:0;border-radius:999px;"
+        + "background:linear-gradient(90deg,var(--ice-400,#38bdf8),var(--mint-400,#2dd4bf));"
+        + "transition:width .18s ease}"
+        + "#qstExpProgress .txt{margin-top:6px;font-size:calc(12px * var(--qst-u,1.5));"
+        + "color:var(--text-3,#7e95ab)}"
+        + "#qstExpProgress .txt b{color:var(--text-2,#4a6178)}";
+      document.head.appendChild(st);
+    }
+    var box = document.createElement("div");
+    box.id = "qstExpProgress";
+    box.innerHTML = '<div class="bar"><i></i></div><div class="txt"></div>';
+    var anchor = document.getElementById("expSize");
+    if (anchor && anchor.parentNode === body) body.insertBefore(box, anchor);
+    else body.appendChild(box);
+    return true;
+  }
+
+  function showExportProgress(on) {
+    if (!ensureExportProgressUI()) return;
+    var box = document.getElementById("qstExpProgress");
+    if (box) box.className = on ? "on" : "";
+    var okBtn = document.getElementById("btnExportExeOk");
+    if (okBtn) {
+      okBtn.disabled = !!on;
+      okBtn.textContent = on ? "导出中…" : "导出";
+    }
+    // 「取消」按钮平时只是关弹窗（data-close）；导出中让它先**中止**再关。
+    var cancelBtn = document.querySelector("#ov-export-exe .dlg-foot .btn.cancel");
+    if (cancelBtn && !cancelBtn._qstAbortWired) {
+      cancelBtn._qstAbortWired = true;
+      cancelBtn.addEventListener("click", function () {
+        if (exportAbortController && !exportAbortController.signal.aborted) {
+          try { exportAbortController.abort(); } catch (e) {}
+          toast("已中止导出");
+        }
+      }, true);   // 捕获阶段：先中止，再让原有 data-close 关弹窗
+    }
+    if (!on) { lastExportPct = -1; exportAbortController = null; }
+  }
+
+  function setExportProgress(pct, text) {
+    if (!ensureExportProgressUI()) return;
+    var box = document.getElementById("qstExpProgress");
+    if (!box) return;
+    var fill = box.querySelector(".bar i");
+    var txt = box.querySelector(".txt");
+    if (fill) fill.style.width = Math.max(0, Math.min(100, Math.round(pct * 100))) + "%";
+    if (txt && text) txt.innerHTML = text;
+  }
+
+  /** 把 qst-web-export 的进度事件翻译成人话（阶段 + 百分比 + 已下载体积）。 */
+  function onExportProgress(p) {
+    if (!p) return;
+    if (p.phase === "player") {
+      var pct = p.ratio || 0;
+      // 下载阶段占整体进度的 0~90%（后面打包/组装是毫秒级，留 10% 给它们）
+      setExportProgress(pct * 0.9, p.cached || p.local
+        ? "播放器模板已在本地缓存"
+        : "正在下载播放器模板 <b>" + fmtMB(p.loaded) + " / "
+          + (p.total ? fmtMB(p.total) : "?") + "</b>（" + Math.round(pct * 100) + "%）");
+    } else if (p.phase === "pack") {
+      if (p.ratio >= 1) {
+        setExportProgress(0.96, "脚本包已生成 <b>" + fmtMB(p.payloadBytes) + "</b>");
+      } else {
+        setExportProgress(0.9, "正在打包脚本与设置…");
+      }
+    } else if (p.phase === "assemble") {
+      setExportProgress(0.98, "正在把脚本追加到播放器上…");
+    } else if (p.phase === "done") {
+      setExportProgress(1, "完成 <b>" + fmtMB(p.exeBytes) + "</b>");
+    }
+  }
+
+  function fmtMB(n) {
+    var v = Number(n) || 0;
+    if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(2) + " MB";
+    if (v >= 1024) return Math.round(v / 1024) + " KB";
+    return v + " B";
+  }
+
+  /** kind 别名归一（前端有的地方传 scripts/recordings）。 */
+  function normKind(kind) {
+    var k = String(kind || "macro");
+    if (k === "scripts" || k === "script") return "macro";
+    if (k === "recordings" || k === "recording") return "rec";
+    if (k === "tasks") return "sched";
+    if (k === "chats" || k === "conversations") return "ai";
+    return k;
+  }
+
+  function itemsOfKind(kind) {
+    var k = normKind(kind);
+    if (k === "macro") return macros;
+    if (k === "rec") return recordings;
+    if (k === "sched") return tasks;
+    if (k === "ai") return chats;
     return [];
+  }
+
+  function libraryFoldersFor(kind) {
+    var k = normKind(kind);
+    var set = {};
+    itemsOfKind(k).forEach(function (it) {
+      var f = normFolderPath(it.folder);
+      if (f) set[f] = 1;
+    });
+    (extraFolders[k] || []).forEach(function (f) {
+      var n = normFolderPath(f);
+      if (n) set[n] = 1;
+    });
+    return Object.keys(set).sort();
+  }
+
+  /** 目录是否存在（含"仅由条目隐式存在"的情况）。 */
+  function folderExists(kind, folder) {
+    return libraryFoldersFor(kind).indexOf(normFolderPath(folder)) >= 0;
+  }
+
+  /** 把目录路径（含其子孙）整体改名 / 删除时同步所有条目的 folder 字段。 */
+  function rewriteItemFolders(kind, from, to) {
+    var src = normFolderPath(from);
+    var dst = normFolderPath(to);
+    if (!src) return 0;
+    var n = 0;
+    itemsOfKind(kind).forEach(function (it) {
+      var f = normFolderPath(it.folder);
+      if (f === src || f.indexOf(src + "/") === 0) {
+        it.folder = dst ? (dst + f.slice(src.length)) : f.slice(src.length + 1);
+        n++;
+      }
+    });
+    return n;
   }
 
   function defaultSettings() {
@@ -1226,7 +1852,7 @@
           clickCountLimit: 500,
         },
         playback: {
-          enablePlaybackCount: false,
+          enablePlaybackCount: true,
           playbackCount: 1,
           enablePlaybackInterval: false,
           playbackIntervalMinSeconds: 0.5,
@@ -1344,5 +1970,14 @@
   setTimeout(function () {
     sendClientSize(fakeState.mode);
     notifyParent({ type: "ready", mode: fakeState.mode, w: DESIGN[fakeState.mode].w, h: DESIGN[fakeState.mode].h });
+    // ⚠ file:// 下"导出为独立 EXE"必定失败（浏览器禁止 fetch 本地文件）。
+    //   与其让用户点完导出再对着 `Failed to fetch` 猜，不如一进来就说清楚。
+    if (window.QstWebExport && window.QstWebExport.isFileProtocol
+        && window.QstWebExport.isFileProtocol()) {
+      setTimeout(function () {
+        toast("本地直接双击打开（file://）：界面可以看，但「导出为独立 EXE」用不了。"
+          + "请用 tools\\serve_website.ps1 起本地服务器后从 http://127.0.0.1:8090/demo.html 打开。");
+      }, 1200);
+    }
   }, 60);
 })();

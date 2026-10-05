@@ -5,6 +5,7 @@
 
 #include "screenshot_overlay.h"
 #include "image_match.h"
+#include "overlay_input_guard.h"
 #include "ui_scale.h"
 
 #include <algorithm>
@@ -65,11 +66,23 @@ void ScreenshotOverlay::Show(std::function<void(RECT)> onConfirm) {
     SetFocus(hwnd_);
     SetCapture(hwnd_);
 
-    // ── Blocking modal message loop (same pattern as Flameshot / all screenshot tools) ──
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0) {
-        if (bRet == -1) break;  // GetMessage error
+    // ── 模态消息循环（同 Flameshot 等所有截图工具）──
+    // ★★ 兜底（overlay_input_guard.h）：本窗口是**全屏 WS_EX_TOPMOST + SetCapture**，
+    //   右/中键取消还会把自己挪到 (-10000,-10000) 等抬起。那个「抬起」一旦丢了
+    //   （远控 SendInput 注入丢事件是最常见来源），裸 GetMessage 会永久阻塞 ⇒
+    //   一个看不见的顶置窗口永远扣着用户的鼠标捕获 ⇒「看得见屏幕、点不动」。
+    //   本地还能按 Esc 自救，**远控下几乎没有别的入口** ⇒ 必须能超时醒来并自己收尾。
+    MSG msg{};
+    for (;;) {
+        if (!overlay_guard::WaitMessageWithTimeout(msg, overlay_guard::kGuardTickMs)) {
+            if (overlay_guard::ShouldAbortStuckCaptureNow(hwnd_)) {
+                resultCancelled_ = true;
+                ReleaseCapture();
+                break;
+            }
+            continue;
+        }
+        if (msg.message == WM_QUIT) break;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }

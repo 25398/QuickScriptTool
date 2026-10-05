@@ -321,7 +321,7 @@ bool VirtualDesktopAccessor::EnsureLoaded(std::wstring& err) {
     if (module_ && getDesktopCount_ && SehCallInt0(getDesktopCount_) >= 0) return true;
 
     const DWORD build = OsBuildNumber();
-    WindowModeLogEventf(L"[窗口模式] 虚拟桌面探测 OS build=%lu",
+    WindowModeLogEventf(L"[窗口/后台窗口模式] 虚拟桌面探测 OS build=%lu",
         static_cast<unsigned long>(build));
     std::wstring lastErr;
 
@@ -330,10 +330,10 @@ bool VirtualDesktopAccessor::EnsureLoaded(std::wstring& err) {
         const std::wstring path = BuildCandidatePath(cand.fileName);
         std::wstring oneErr;
         if (TryLoadDll(path, oneErr)) {
-            WindowModeLogEventf(L"[窗口模式] 虚拟桌面 DLL 已加载 %s", cand.fileName);
+            WindowModeLogEventf(L"[窗口/后台窗口模式] 虚拟桌面 DLL 已加载 %s", cand.fileName);
             return true;
         }
-        WindowModeLogEventf(L"[窗口模式] 虚拟桌面 DLL 不可用 %s: %s",
+        WindowModeLogEventf(L"[窗口/后台窗口模式] 虚拟桌面 DLL 不可用 %s: %s",
             cand.fileName, oneErr.c_str());
         if (lastErr.empty()) lastErr = oneErr;
     }

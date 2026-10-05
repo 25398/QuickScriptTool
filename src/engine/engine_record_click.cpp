@@ -1,6 +1,7 @@
 // engine_record_click.cpp — F2 slice extracted from engine_host_window.h
 #include "engine/engine_host_window.h"
 #include "clicker_timing.h"
+#include "recorder_report_interval.h"
 #include "window_mode/window_target.h"
 
 // was engine_host_window.h:14652-14654
@@ -22,7 +23,7 @@ bool IsOwnPointWindow(int x, int y) {
     return false;
 }
 
-// 窗口模式录制：解析录制开始时鼠标位置的最上层目标窗口及其输入子窗口。
+// 后台窗口模式录制：解析录制开始时鼠标位置的最上层目标窗口及其输入子窗口。
 RecordingWindowTarget ResolveRecordingWindowTarget() {
     RecordingWindowTarget out;
     POINT pt{};
@@ -100,7 +101,7 @@ void EngineHost::StartRecording() {
         } else {
             SetRecordingIgnoreHotkey(0, 0, false);
         }
-        // 勿用编辑器残留的 scriptWindowMode_ 弹「窗口模式无法录制」（易误导）。
+        // 勿用编辑器残留的 scriptWindowMode_ 弹「后台窗口模式无法录制」（易误导）。
         // 窗口相对录制由 recorderWindowMode_ + SetRecordingWindowTarget 决定；
         // 保存时 SaveScriptFileData 仅对「非窗口相对」录制强制关 windowMode。
         recorderWindowMode_ = appSettings_.home.recorderWindowMode != 0;
@@ -119,12 +120,12 @@ void EngineHost::StartRecording() {
             imageLocate ? true : appSettings_.playback.recordingClickCaptureEnabled,
             appSettings_.playback.recordingClickCaptureHalfSize);
         SetRecordingClickCaptureSkipRelative(imageLocate);
-        // 窗口模式录制：解析目标窗口；坐标按客户区记录（跟随窗口回放）。
+        // 后台窗口模式录制：解析目标窗口；坐标按客户区记录（跟随窗口回放）。
         // 可与图片定位同时开：模板在点击送达目标前截取（悬停缓存 / 钩子内同步截）。
         if (recorderWindowMode_) {
             const auto wmTarget = ResolveRecordingWindowTarget();
             if (!wmTarget.enabled) {
-                lastRecordingError_ = L"窗口模式录制：未找到目标窗口，请将鼠标移到目标窗口上再开始录制。";
+                lastRecordingError_ = L"后台窗口模式录制：未找到目标窗口，请将鼠标移到目标窗口上再开始录制。";
                 ShowPromptInfo(lastRecordingError_);
                 return;
             }
@@ -244,15 +245,23 @@ void EngineHost::StopRecording() {
                     + L" 跳过=" + std::to_wstring(conv.skipped));
             }
         }
-        if (appSettings_.playback.enableDebugOutputWindow
-            && appSettings_.playback.autoOutputKeyFunctionDebug
-            && qst::desktop_tools::MacroDebug().IsCreated()) {
+        // 这三行是判定「偏差在输入层还是目标侧」的唯一依据，因此**落盘不受调试窗口影响**：
+        // 调试浮窗没有复制/导出按钮，只写窗口的话用户根本拿不出来（排查无法闭环）。
+        // 原先这里还额外要求 enableDebugOutputWindow，与回放侧 [回放保真] 的判据不一致 ——
+        // 会出现「录制侧三行全无、回放侧却有」，让人误以为录制没问题。现统一为只看
+        // autoOutputKeyFunctionDebug（默认开）。
+        if (appSettings_.playback.autoOutputKeyFunctionDebug) {
+            const bool showInWindow = qst::desktop_tools::MacroDebug().IsCreated();
+            auto emitDiag = [showInWindow](const std::wstring& line) {
+                qst::desktop_tools::AppendRecorderDiagLog(line);
+                if (showInWindow) qst::desktop_tools::MacroDebug().AppendLog(line);
+            };
             const auto st = GetRecordingDebugStats();
-            wchar_t summary[320]{};
+            wchar_t summary[400]{};
             swprintf_s(summary,
                 L"[录制结束] 时长=%.3fs 动作=%zu | "
                 L"键↓%llu ↑%llu 跳过重复%llu | 鼠↓%llu ↑%llu 滚轮%llu | "
-                L"绝对移动%llu 相对移动%llu",
+                L"绝对移动%llu 相对移动%llu | 通道切换 绝对↔相对 %llu/%llu",
                 saveDurationSeconds_,
                 actions_.size(),
                 static_cast<unsigned long long>(st.keyDown),
@@ -262,15 +271,43 @@ void EngineHost::StopRecording() {
                 static_cast<unsigned long long>(st.mouseUp),
                 static_cast<unsigned long long>(st.wheel),
                 static_cast<unsigned long long>(st.absMove),
-                static_cast<unsigned long long>(st.relMove));
-            qst::desktop_tools::MacroDebug().AppendLog(summary);
-            std::vector<std::wstring> lines;
-            lines.reserve(actions_.size());
-            for (size_t i = 0; i < actions_.size(); ++i) {
-                actions_[i].originalNo = static_cast<int>(i + 1);
-                lines.push_back(FormatGenericActionDebug(actions_[i]));
+                static_cast<unsigned long long>(st.relMove),
+                static_cast<unsigned long long>(st.captureSwitchToAbs),
+                static_cast<unsigned long long>(st.captureSwitchToRel));
+            emitDiag(summary);
+            if (st.captureSwitchToAbs + st.captureSwitchToRel > 0) {
+                emitDiag(
+                    L"[采集通道] 录制期间在「绝对坐标」与「相对位移」之间切换过 —— "
+                    L"切换处前后各 ~60ms 内的移动可能被记成幻影相对位移（镜头会多转一点）。"
+                    L"若脚本里同时有走位与开背包/切物品栏，优先用「后台窗口模式 + 强制相对」录制。");
             }
-            if (!lines.empty()) qst::desktop_tools::MacroDebug().AppendLogBatch(lines);
+            if (st.relMove > 0) {
+                // 回放「和录制不一样」先看这一行：报告周期决定相对位移时间轴的刻度。
+                // 估计周期明显大于鼠标标称周期（如 1000Hz 却报 8000µs）说明后台 Raw Input
+                // 被系统限流/合并，录制时间轴本身就是粗的；重建时间戳数 >0 说明有积压。
+                const uint64_t hz = qst_recorder::ReportIntervalModel::NearestPollingHz(
+                    st.relReportIntervalUs);
+                wchar_t relSummary[320]{};
+                swprintf_s(relSummary,
+                    L"[鼠标报告] 估计周期=%lluµs(≈%lluHz) 重建时间戳=%llu 过短间隔=%llu"
+                    L"（周期偏大=后台Raw Input被限流；重建>0=队列积压）",
+                    static_cast<unsigned long long>(st.relReportIntervalUs),
+                    static_cast<unsigned long long>(hz),
+                    static_cast<unsigned long long>(st.relStampRebuilt),
+                    static_cast<unsigned long long>(st.relGapDropped));
+                emitDiag(relSummary);
+            }
+            // 逐步动作日志量太大，只进调试窗口，不写文件。
+            // ⚠ 这里必须用 if 包住，**不能 return** —— 后面还有 SaveRecording()。
+            if (showInWindow) {
+                std::vector<std::wstring> lines;
+                lines.reserve(actions_.size());
+                for (size_t i = 0; i < actions_.size(); ++i) {
+                    actions_[i].originalNo = static_cast<int>(i + 1);
+                    lines.push_back(FormatGenericActionDebug(actions_[i]));
+                }
+                if (!lines.empty()) qst::desktop_tools::MacroDebug().AppendLogBatch(lines);
+            }
         }
         if (!actions_.empty()) {
             SaveRecording();

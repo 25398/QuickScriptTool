@@ -42,6 +42,8 @@
 #include "drawing.h"
 #include "hotkey_dialog.h"
 #include "image_match.h"
+#include "web_ai/web_ai_backend.h"
+#include "web_ai/web_ai_config.h"
 #include "input/foreground_input_router.h"
 #include "input/mouse_input_backend.h"
 #include "input/synthetic_input_filter.h"
@@ -56,6 +58,7 @@
 #include "prompt_modal.h"
 #include "crosshair_drag.h"
 #include "ocr_engine.h"
+#include "overlay_input_guard.h"
 #include "process_utils.h"
 #include "recorder.h"
 #include "recorder_timeline.h"
@@ -202,6 +205,11 @@ inline std::atomic<HANDLE> ghStopPollerThread{nullptr};
 constexpr UINT_PTR kHotkeyLatchSyncTimerId = 0x48534B31u; // 'HSK1'
 constexpr UINT_PTR kHotkeyHookWatchdogTimerId = 0x48534B32u; // 'HSK2'
 constexpr UINT_PTR kImeHotkeyPassTimerId = 0x48534B33u; // 'HSK3'
+/// 拖动准星（crosshairDrag_）期间的自检节拍。见 overlay_input_guard.h：
+/// Begin() 会把**主窗口挪到屏外**并 SetCapture —— 终止事件丢了就永久扣住用户鼠标。
+constexpr UINT_PTR kCrosshairCaptureGuardTimerId = 0x48534B39u; // 'HSK9'
+/// 主窗自身拖拽（动作列表排序 / 三种滚动条）的捕获自检节拍，理由同上。
+constexpr UINT_PTR kHostCaptureGuardTimerId = 0x48534B35u; // 'HSK5'
 /// UI 线程远程查询的中文模式缓存。LL 钩子禁止 SendMessage，只读这个标志。
 inline std::atomic<bool> ghImeHotkeyPassCache{false};
 /// LL 钩子最后一次收到事件的时间戳（GetTickCount）；配套 Raw 输入 tick 作为
@@ -239,7 +247,9 @@ inline void RemoveRegFailId(int id) {
 }
 inline void ClearRegFailIds() { ghRegFailCount = 0; }
 /// 主页选中变更后延迟写入 app_settings.json，避免连点时同步盘 I/O 卡死 UI/整机
-constexpr UINT_PTR kHomeStatePersistTimerId = 0x48534B33u; // 'HSK3'
+/// ⚠ 原值与 kImeHotkeyPassTimerId 撞号（都是 0x48534B33）⇒ WM_TIMER 永远先命中 IME 分支
+///   并 return，主页选中持久化**从来没跑过**。改成未占用值。
+constexpr UINT_PTR kHomeStatePersistTimerId = 0x48534B34u; // 'HSK4'
 /// 仅左键 / holdMode：按住超过阈值后开始，松开停止；右键等仍为单击切换
 /// 阈值由「其他设置 → 长按判定」写入 ghHoldThresholdMs（默认 200ms）
 inline std::atomic<DWORD> ghHoldThresholdMs{200};
@@ -490,6 +500,11 @@ struct PlaybackScriptHook {
     UINT mods = 0;
     int hotkeyId = 0;
     bool holdMode = false;
+    /// 专属热键作用域：当前页是否列出了该条目（见 DedicatedHotkeyInScope）。
+    /// false ⇒ 本键必须**原样放行**：不吞键、不投递启动，也不注册 RegisterHotKey
+    /// （注册了系统会吞掉该字母，用户就会「按 P 打不出 P」）。
+    /// 停止路径不受此限制（见 hotkey_stop::ShouldStopOnToggleKeyDown 分支）。
+    bool inScope = true;
     bool holdArmed = false;
     bool holdActive = false;
     bool holdExtended = false;
@@ -1448,6 +1463,9 @@ inline LRESULT HotkeyKbProcBody(int code, WPARAM wp, LPARAM lp) {
                         SetPhysicalHoldDownVk(h.vk);
                         return 1;
                     }
+                    // 专属热键作用域外：不武装、不吞键，原样落到前台程序。
+                    // （已激活的会话在上面已放行，保证切页后仍能松手停止）
+                    if (!h.inScope) continue;
                     if (!CheckHotkeyModifiers(h.mods, !busy)) continue;
                     // 忙碌 / 再武装冷却期间不再吞键：原样放行，避免长按脚本结束后
                     // 打字（尤其同键）被吞成「bian→ban/bani」、输入变迟缓。
@@ -1573,6 +1591,9 @@ inline LRESULT HotkeyKbProcBody(int code, WPARAM wp, LPARAM lp) {
                         // 忙碌停已在 MatchesKey 外处理；此处不再投递 WM_HOTKEY，避免停完又开。
                         continue;
                     }
+                    // 专属热键作用域外：不吞键、不投递 —— 否则用户按 P 既不起脚本
+                    // 又打不出 P（键被钩子吃掉）。只放行，让前台程序照常收到该键。
+                    if (!h.inScope) continue;
                     h.toggleNeedKeyUp = true;
                     PostMessageW(ghHotkeyHwnd, WM_HOTKEY, static_cast<WPARAM>(h.hotkeyId), 0);
                     if (passMode || ghPlaybackHotkeySuspended || IsRegFailId(h.hotkeyId)) return 1;
@@ -1855,6 +1876,12 @@ public:
     bool EngineIsBreakoutPaused() const {
         return breakoutPaused_.load(std::memory_order_relaxed);
     }
+    void EngineSetPlaybackPaused(bool paused) {
+        playbackPaused_.store(paused, std::memory_order_relaxed);
+    }
+    bool EngineIsPlaybackPaused() const {
+        return playbackPaused_.load(std::memory_order_relaxed);
+    }
     /// 编辑器调试：从指定动作开始单次执行（不受宏执行次数设置影响）。
     bool EngineDebugRunActions(const std::vector<ScriptAction>& actions, int startIndex,
         bool stepMode, const std::vector<int>& breakpoints,
@@ -1878,7 +1905,7 @@ public:
         std::lock_guard<std::mutex> lock(extScriptStateMu_);
         return runningScriptName_;
     }
-    /// 正在运行脚本的模式：0=默认 / 1=窗口模式 / 2=后台窗口（非运行时为 0）。
+    /// 正在运行脚本的模式：0=默认 / 1=独立桌面模式 / 2=后台窗口模式（非运行时为 0）。
     int EngineRunningMode() const {
         std::lock_guard<std::mutex> lock(extScriptStateMu_);
         if (!running_.load(std::memory_order_relaxed) && !extRunPending_.load(std::memory_order_relaxed)) {
@@ -1965,17 +1992,70 @@ public:
         }
         windowmode::FinalizeWindowModeForPlayback(wmCfg, anyRel, IsRecordingScriptPath(resolved));
         if (!ResolveWindowModeSelectMethod(wmCfg)) {
-            err = L"窗口模式未就绪或已取消";
+            err = L"窗口/后台窗口模式未就绪或已取消";
             return false;
         }
         CoordMeta execMeta = ScriptCoordMetaForExecution(data.coordMeta);
         std::vector<ScriptAction> execActions =
             PrepareScriptActionsForExecution(data.actions, execMeta);
         if (IsRecordingScriptPath(resolved) || ScriptIsTimedInputSequence(execActions))
-            RepairCompressedRelativeGaps(execActions);
+            PreparePlaybackTimeline(execActions, appSettings_.playback.spreadRelativeMovePackets);
         const double breakoutTime = EffectiveBreakoutTimeSeconds(data);
         StartActionsWorker(execActions, resolved, wmCfg, execMeta, breakoutTime, data.hotkey);
         return running_;
+    }
+
+    /// 引擎是否「忙」—— 含**已投递但还没开始**的窗口期。
+    ///
+    /// 为什么不能只看 running_：助手投递一个任务后，从 PostMessage 到
+    /// RunActionsFromPath 真正置起 running_ 之间有一段空档。只轮询 running_ 的话，
+    /// 助手会在这一瞬间就判定「已经跑完了」，然后拿一个空结果去回话。
+    bool EngineIsBusy() const {
+        return running_.load() || extRunPending_.load();
+    }
+
+    /// **异步**请求运行脚本：投递到引擎窗口线程再跑，立刻返回。
+    ///
+    /// 为什么不能直接调 EngineRunFromPath：它内部会走
+    /// ResolveWindowModeSelectMethod / 窗口模式选择（两种窗口模式的统称），这些必须在本进程的窗口线程上执行
+    /// （既有扩展桥 handlers.runScript 就是同一个理由走 PostMessage）。
+    /// 而 AI 助手的工具跑在**助手工作线程**上，所以必须投递，不能同步调。
+    ///
+    /// 与扩展桥共用 WM_APP_EXT_RUN_SCRIPT：引擎本来就是「一次只跑一个脚本」，
+    /// 助手任务与扩展触发的任务理应互斥（第二个会拿到 busy，这是正确行为）。
+    bool EngineRequestRunFromPathAsync(const std::wstring& path, std::wstring& err) {
+        err.clear();
+        if (running_.load()) {
+            err = L"引擎正忙（已有脚本在运行）";
+            return false;
+        }
+        if (extRunPending_.exchange(true)) {
+            err = L"引擎正忙（已有一个运行请求在排队）";
+            return false;
+        }
+        auto* heap = new std::wstring(path);
+        if (!PostMessageW(hwnd_, WM_APP_EXT_RUN_SCRIPT, 0, reinterpret_cast<LPARAM>(heap))) {
+            delete heap;
+            extRunPending_ = false;
+            err = L"投递运行请求失败";
+            return false;
+        }
+        return true;
+    }
+
+    /// 取宏变量值（助手用它取回 runDesktopTask 写入的结果变量）。
+    ///
+    /// 调用约定：**只能在 EngineIsBusy() 为 false 时读**。
+    /// aiVars_ 由动作工作线程在回放过程中写；引擎空闲 ⇒ 没有写者 ⇒ 读到的是最后一次
+    /// 回放的终值。这一点是调用方的责任，本函数不做加锁（每个写入点都加锁的代价
+    /// 远大于收益，而 running_ 已经提供了必要的 happens-before 顺序）。
+    bool EngineGetMacroVariable(const std::wstring& name, std::wstring& out) const {
+        out.clear();
+        if (name.empty()) return false;
+        const auto it = aiVars_.find(name);
+        if (it == aiVars_.end()) return false;
+        out = it->second;
+        return true;
     }
 
     void EngineSetActiveHomeTab(int tab) {
@@ -2173,6 +2253,9 @@ public:
     void EngineReloadSettings() {
         quickscript::AppSettings loaded;
         if (TryLoadAppSettings(loaded)) appSettings_ = std::move(loaded);
+        // 设置页保存后走这条路重载 ⇒ 网页版 AI 的档案注入/清理必须跟着走一遍
+        // （否则用户在设置里改了 AI 配置，注入过的档案会被整份覆盖掉）。
+        quickscript::webai::EnsureProfileInSettings(appSettings_.ai);
         quickscript::ApplyThemeFromSettings(appSettings_);
         clickerSettings_.button = static_cast<quickscript::MouseButtonChoice>(
             std::clamp(appSettings_.home.clickerButton, 0, 2));
@@ -2228,6 +2311,26 @@ public:
     bool EngineHotkeyChordConflicts(UINT vk, UINT modifiers, const std::wstring& excludePath,
         bool excludeGlobal, std::wstring& errOut) const {
         return HotkeyChordConflicts(vk, modifiers, excludePath, excludeGlobal, errOut);
+    }
+
+    bool EngineGlobalHotkeyConflicts(UINT vk, UINT modifiers) const {
+        return GlobalHotkeyConflicts(vk, modifiers);
+    }
+
+    void EngineSetDedicatedHotkeyScopeAll(bool all) {
+        if (homeHotkeyScopeAll_ == all) return;
+        homeHotkeyScopeAll_ = all;
+        // 作用域变了：重新装配热键（LL 钩子路径依赖这张表）。
+        RegisterAllHotkeys();
+    }
+
+    bool EngineDedicatedHotkeyInScope(bool isRecording) const {
+        return DedicatedHotkeyInScope(isRecording);
+    }
+
+    void EngineCollectDedicatedHotkeyOwners(UINT vk, UINT modifiers,
+        const std::wstring& excludePath, std::vector<std::wstring>& out) const {
+        CollectDedicatedHotkeyOwners(vk, modifiers, excludePath, out);
     }
 
 
@@ -2292,12 +2395,22 @@ private:
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (crosshairDrag_.IsActive()) {
             if (msg == WM_HOTKEY) { OnHotkey(static_cast<int>(wp)); return 0; }
-            if (crosshairDrag_.HandleMessage(msg, wp, lp,
+            if (msg == WM_TIMER && wp == kCrosshairCaptureGuardTimerId) {
+                // ★★ 拖动准星期间主窗口被挪到屏外、且鼠标捕获在我们手上。终止事件（抬起）
+                //   一旦丢了（远控 SendInput 注入丢事件是最常见来源），拖拽永远不结束 ⇒
+                //   用户「看得见屏幕、点不动，连我们的窗口都找不到」。本地还能按 Esc，
+                //   远控下几乎没有别的入口 ⇒ 必须能自检收尾。见 overlay_input_guard.h。
+                if (overlay_guard::ShouldAbortStuckCaptureNow(hwnd_)) crosshairDrag_.End();
+                return 0;
+            }
+            const bool handled = crosshairDrag_.HandleMessage(msg, wp, lp,
                 [this](int x, int y) {
                     if (moveX_) SetText(moveX_, std::to_wstring(x));
                     if (moveY_) SetText(moveY_, std::to_wstring(y));
                 },
-                nullptr)) {
+                nullptr);
+            if (!crosshairDrag_.IsActive()) KillTimer(hwnd_, kCrosshairCaptureGuardTimerId);
+            if (handled) {
                 return 0;
             }
             return DefWindowProcW(hwnd_, msg, wp, lp);
@@ -2320,7 +2433,12 @@ private:
                 return TRUE;
             }
             return DefWindowProcW(hwnd_, msg, wp, lp);
-        case WM_LBUTTONDOWN: OnMouseDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+        case WM_LBUTTONDOWN:
+            // ★ 本次按下可能引发 SetCapture（列表排序 / 滚动条拖动）：挂自检节拍，
+            //   抬起丢了要能自己松手（见 overlay_input_guard.h）。
+            SetTimer(hwnd_, kHostCaptureGuardTimerId, overlay_guard::kGuardTickMs, nullptr);
+            OnMouseDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
         case WM_LBUTTONUP: OnMouseUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
         case WM_MOUSEWHEEL: OnWheel(GET_WHEEL_DELTA_WPARAM(wp)); return 0;
         // 顶层下拉弹层不会随 owner 自动位移，拖动/移动时必须按锚点重算屏幕坐标。
@@ -2388,7 +2506,10 @@ private:
                     CloseClickerDropPopup();
                     CancelQuickInputTip();
                     // 窗口失焦时取消拖拽状态，避免拖拽卡死
-                    if (crosshairDrag_.IsActive()) crosshairDrag_.End();
+                    if (crosshairDrag_.IsActive()) {
+                        crosshairDrag_.End();
+                        KillTimer(hwnd_, kCrosshairCaptureGuardTimerId);
+                    }
                     if (dragging_) {
                         dragging_ = false;
                         dragIndex_ = -1;
@@ -2426,6 +2547,12 @@ private:
         case WM_SETFOCUS:
             return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_TIMER:
+            if (wp == kHostCaptureGuardTimerId) {
+                // 没在扣着捕获 ⇒ 本次拖拽已正常结束，撤掉节拍
+                if (GetCapture() != hwnd_) { KillTimer(hwnd_, kHostCaptureGuardTimerId); return 0; }
+                if (overlay_guard::ShouldAbortStuckCaptureNow(hwnd_)) AbortStuckCaptureDrag();
+                return 0;
+            }
             if (wp == kHotkeyLatchSyncTimerId) {
                 SyncHotkeyLatches();
                 PollHoldHotkeys();
@@ -2889,6 +3016,10 @@ private:
         LoadRecordings();
         LoadAgentConversations();
         LoadAppSettings(appSettings_);
+        // 网页版 AI（`AppDir()\web_ai_config.json` enabled=true 才生效）：
+        //   AI 三个动作的硬闸看的是 `appSettings_.ai.enabled`（本文件 :13481/:13521/:13569）
+        //   ⇒ 不在这里注入，用户开了开关也会被回「AI 未启用或未配置模型」。
+        quickscript::webai::EnsureProfileInSettings(appSettings_.ai);
         recorderWindowMode_ = appSettings_.home.recorderWindowMode != 0;
         quickscript::ApplyThemeFromSettings(appSettings_);
         ApplyDebugWindowSetting();
@@ -2904,6 +3035,11 @@ private:
         RestoreHomeState();   // 恢复上次退出时的界面状态
         EngineApplyGlobalHotkeyFromSettings();
         InvalidateRect(hwnd_, nullptr, TRUE);
+        // ⚠ 顺序有硬约束：RegisterAllHotkeys 会按**当前 TAB** 计算专属热键作用域
+        //   （DedicatedHotkeyInScope，作用域外一律不注册 RegisterHotKey —— 否则系统
+        //   会吞掉那个物理键，用户「按 P 打不出 P」）。所以恢复 TAB 的 RestoreHomeState()
+        //   必须排在它之前；一旦对调，启动时 activeHomeTab_ 还是默认值 ⇒ 作用域全为假
+        //   ⇒ **一个专属热键都不会注册**（要切一次 TAB 才恢复）。
         HotkeyDiagLog("engine Init: RegisterAllHotkeys begin");
         RegisterAllHotkeys();
         HotkeyDiagLog("engine Init: InstallGlobalHotkeyHooks begin");
@@ -2933,9 +3069,15 @@ private:
         HotkeyDiagLog("engine Init: done");
     }
 
-    /// 进程启动后常开本机桥（扩展顶栏弹窗 / 窗口模式共用）。失败只打日志。
+    /// 进程启动后常开本机桥（扩展顶栏弹窗 / 窗口/后台窗口模式共用）。失败只打日志。
     void StartExtBridgeAlwaysOn() {
         using namespace windowmode;
+        // 独立播放器：整条扩展桥都不启动（它既不是主程序，也不该把自己注册成
+        // 浏览器扩展的原生宿主 —— 那会被浏览器反复拉起形成进程风暴）。
+        if (!ExtNativeHostAllowed()) {
+            HotkeyDiagLog("engine: ext bridge skipped (native host disabled)");
+            return;
+        }
         ExtScriptApiHandlers handlers;
         handlers.listScripts = [this]() {
             std::vector<ExtScriptInfo> out;
@@ -3003,6 +3145,33 @@ private:
             return st;
         };
         ExtBridgeServer::Instance().SetScriptApiHandlers(std::move(handlers));
+
+        // 网页版 AI 端点（`POST /v1/chat/completions` + `POST /qst/web-ai/probe`）：
+        // **必须**在桥这一层注册处理器，桥本身不依赖 src/web_ai/*（理由见
+        // ExtWebAiHandlers 的注释）。没注册时两个路由回 501 并说明原因。
+        {
+            ExtWebAiHandlers webAi;
+            webAi.chat = [](const std::string& body, std::string& resp, bool& isSse, int& status) {
+                return quickscript::webai::HandleChatCompletion(body, resp, isSse, status);
+            };
+            webAi.probe = [](const std::string& body) {
+                return quickscript::webai::RunLiveProbeReportJson(body);
+            };
+            // ★ 窗口反代探针（GUI 客户端：豆包客户端 / Cursor / 终端 TUI）
+            webAi.windowProbe = [](const std::string& body) {
+                return quickscript::webai::RunWindowAiProbeReportJson(body);
+            };
+            // ★ 窗口 Agents 诊断路由（设置页「准星绑定窗口」）：
+            //   与 `windowAgentList`/`windowAgentBind` 两条 bridge 命令**同一实现**。
+            webAi.windowAgentsList = []() {
+                return quickscript::webai::RunWindowAgentsListJson();
+            };
+            webAi.windowAgentBind = [](const std::string& body) {
+                return quickscript::webai::RunWindowAgentBindJson(body);
+            };
+            ExtBridgeServer::Instance().SetWebAiHandlers(std::move(webAi));
+        }
+
         std::wstring bridgeErr;
         HotkeyDiagLog("engine: ExtBridge Start begin");
         if (!ExtBridgeServer::Instance().Start(bridgeErr)) {
@@ -3014,7 +3183,7 @@ private:
                 ExtBridgeServer::Instance().Port());
             HotkeyDiagLog("engine: ExtBridge Start ok");
         }
-        // softMessage/假焦点/CDP 窗口模式都可能用到「鼠标宏」；预热只查找不创建。
+        // softMessage/假焦点/CDP 的窗口/后台窗口模式都可能用到「鼠标宏」；预热只查找不创建。
         HotkeyDiagLog("engine: VDA Warmup begin");
         windowmode::MacroVirtualDesktop::WarmupAtProcessStart();
         HotkeyDiagLog("engine: VDA Warmup end");
@@ -6832,7 +7001,7 @@ private:
         };
         clearMarked(paramViewport_);
         for (HWND h : editorControls_) {
-            // 窗口模式「聚焦」属于脚本级开关，勿随动作表单清空。
+            // 窗口/后台窗口模式「聚焦」属于脚本级开关，勿随动作表单清空。
             if (h == wmFakeFocusCheck_) continue;
             if (h && IsMarkedParamCheckbox(h)) SetChecked(h, false, false);
         }
@@ -6879,7 +7048,7 @@ private:
         ClearAllParamCheckboxStates();
     }
 
-    // resetScriptChrome：退出编辑/新建宏时清模式·脱离时间·窗口模式；
+    // resetScriptChrome：退出编辑/新建宏时清模式·脱离时间·窗口/后台窗口模式；
     // 打开已有宏时为 false（脚本头已由 LoadScriptFile 写入）。
     void ResetActionFormSession(bool resetScriptChrome = true) {
         actionFormDrafts_.clear();
@@ -8179,7 +8348,7 @@ private:
         SyncScriptWindowModeFromEditor();
         data.windowMode = scriptWindowMode_;
         if (IsRecordingScriptPath(path)) {
-            // 窗口模式录制：保存目标窗口身份 + 窗口相对坐标标记，回放跟随窗口。
+            // 后台窗口模式录制：保存目标窗口身份 + 窗口相对坐标标记，回放跟随窗口。
             RecordingWindowTarget wmTgt = recordingWmTarget_.enabled
                 ? recordingWmTarget_ : GetRecordingWindowTarget();
             bool anyRel = false;
@@ -8200,6 +8369,12 @@ private:
                 wm.windowName = wmTgt.windowTitle;
                 wm.windowClassName = wmTgt.windowClassName;
                 wm.childWindowClassName = wmTgt.childWindowClassName;
+                // ⚠⚠ 录制写进 windowName 的只是「录制那一刻的标题」，不是用户表达的检索意图；
+                // 标题易变（换文档/换标签页/游戏换场景/存档改名），当硬匹配门会让回放
+                // 枚举不到任何窗口 ⇒ 绑不到目标 ⇒ 用户看到「后台窗口模式不操作后台」。
+                // 身份判定交给 进程路径 + 顶层类名(+子窗类名)。实测复现见
+                // tools/verify/probe_record_playback_bind.py。
+                wm.windowNameIsHintOnly = true;
                 wm.autoLaunchTarget = !wmTgt.exePath.empty();
                 wm.recordClientWidth = wmTgt.clientW;
                 wm.recordClientHeight = wmTgt.clientH;
@@ -9270,6 +9445,9 @@ private:
             CrosshairDragBinding binding{};
             if (self->crosshairDrag_.TryGetBinding(hwnd, binding)) {
                 self->crosshairDrag_.Begin(binding);
+                // ★ 拖动准星把主窗口挪到屏外并 SetCapture：挂自检节拍，终止事件丢了要能自己收尾
+                SetTimer(self->hwnd_, kCrosshairCaptureGuardTimerId,
+                    overlay_guard::kGuardTickMs, nullptr);
                 return 0;
             }
         }
@@ -9886,6 +10064,26 @@ private:
         OnEditorClick(x, y);
     }
 
+    /// ★ 兜底收尾（overlay_input_guard.h）：抬起丢了 ⇒ 主窗会永久扣住用户的鼠标捕获。
+    /// 主窗拖拽（动作列表排序 + 三种滚动条）都是 `SetCapture(hwnd_)`，没有超时就永远松不开。
+    /// 只有「捕获在手 + 没有任何鼠标键按下 + 已停手 ≥1.2s」才会被调到 ⇒ 正常拖拽不可能误触发。
+    void AbortStuckCaptureDrag() {
+        homeScrollbarDragging_ = false;
+        editorScrollbarDragging_ = false;
+        paramScrollbarDragging_ = false;
+        dragging_ = false;
+        dragIndex_ = -1;
+        dragTargetIndex_ = -1;
+        dragTargetIndent_ = 0;
+        dragTargetNested_ = false;
+        dragMoved_ = false;
+        dragStartX_ = 0;
+        dragStartY_ = 0;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+        if (hwnd_) KillTimer(hwnd_, kHostCaptureGuardTimerId);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
     void OnMouseUp(int, int) {
         if (promptModal_.visible()) return;
         if (homeScrollbarDragging_) {
@@ -9933,6 +10131,10 @@ private:
         if (tab == quickscript::MainTab::Recorder) ClampRecordingScroll();
         if (tab == quickscript::MainTab::Macro) { homeScrollOffset_ = 0; ClampHomeScroll(); }
         if (tab == quickscript::MainTab::ScriptCustom) { homeScrollOffset_ = 0; ClampAgentConvScroll(); }
+        // 专属热键按 TAB 限定：切页后必须刷新作用域，否则
+        //   ① 作用域外仍注册着 RegisterHotKey ⇒ 系统吞键，用户打不出该字母
+        //   ② 切回本页却不补注册 ⇒ 热键没反应
+        RefreshDedicatedHotkeyScope();
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
@@ -10649,6 +10851,31 @@ private:
     bool HotkeyChordConflicts(UINT vk, UINT modifiers, const std::wstring& excludePath,
         bool excludeGlobal, std::wstring& errOut) const;
 
+    /// 专属热键是否在当前页面的作用域内。**只管「启动」** ——
+    /// 停止永远放行，否则切页后热键停不掉正在跑的宏。
+    ///   连点 / 脚本定制 TAB 不列脚本也不列录制 → 都不允许
+    ///   键鼠录制 TAB 只列录制；鼠标宏 TAB 只列脚本
+    ///   专业模式脚本库/定时/设置页列出全部 → 全允许
+    bool DedicatedHotkeyInScope(bool isRecording) const;
+
+    /// 专属热键作用域变化（切 TAB / 「全部页面生效」开关）后刷新：
+    ///   ① 更新 LL 钩子表里的 inScope 标记（钩子据此决定吞键还是放行）
+    ///   ② 同步 RegisterHotKey —— 作用域外一律注销，否则系统会吞掉该键，
+    ///      表现为「按 P 既不起脚本、又打不出 P」。
+    /// 运行中不注销（保留热键以停止正在跑的宏；回放挂起时本就走 LL 钩子）。
+    void RefreshDedicatedHotkeyScope();
+
+    /// 全局启停热键是否占了这个和弦。
+    /// 专属热键设置时用它区分「与全局冲突」和「与其它条目重复」——
+    /// 前者仍报错（静默把用户的启停键顶掉更糟），后者直接强行覆盖。
+    bool GlobalHotkeyConflicts(UINT vk, UINT modifiers) const;
+
+    /// 收集与给定和弦重复的**专属热键**持有者路径（脚本/录制，
+    /// 不含 excludePath、不含全局）。供「专属热键强行覆盖」用：
+    /// 拿到后逐个清空，再把新键设上去。
+    void CollectDedicatedHotkeyOwners(UINT vk, UINT modifiers,
+        const std::wstring& excludePath, std::vector<std::wstring>& out) const;
+
 #if (QST_GDI_LEGACY == 1)
     void ShowScheduledTaskDialog() {
         ScheduledTaskDialog dlg;
@@ -10668,6 +10895,8 @@ private:
             agentDialogs_.end());
 
         LoadAppSettings(appSettings_);
+        // 打开 AI 助手前也从磁盘重载 ⇒ 同样注入网页版 AI 档案（助手与三个 AI 动作共用这条路径）
+        quickscript::webai::EnsureProfileInSettings(appSettings_.ai);
 
         AgentDialog::RestoreData restore;
         const AgentDialog::RestoreData* restorePtr = nullptr;
@@ -10877,6 +11106,8 @@ private:
         settingsDialog_.reset();
         // 始终从磁盘加载最新设置后再打开，确保 AI 助手修改后立即可见
         LoadAppSettings(appSettings_);
+        // 设置对话框里也要能看到网页版 AI 档案（否则用户勾了开关却在模型列表里找不到它）
+        quickscript::webai::EnsureProfileInSettings(appSettings_.ai);
         settingsDialog_ = std::make_unique<SettingsDialog>();
         if (!settingsDialog_->Show(hwnd_, appSettings_, [this]() {
             ApplyThemeAndRefreshUi();
@@ -10920,7 +11151,7 @@ private:
         std::vector<ScriptAction> execActions =
             PrepareScriptActionsForExecution(data.actions, execMeta);
         if (IsRecordingScriptPath(resolved) || ScriptIsTimedInputSequence(execActions))
-            RepairCompressedRelativeGaps(execActions);
+            PreparePlaybackTimeline(execActions, appSettings_.playback.spreadRelativeMovePackets);
 
         const double breakoutTime = EffectiveBreakoutTimeSeconds(data);
         StartActionsWorker(execActions, resolved, wmCfg, execMeta, breakoutTime,
@@ -13178,7 +13409,10 @@ private:
             recs.swap(deferredDebugRecs_);
             texts.swap(deferredDebugTexts_);
         }
-        if (recs.empty() || !qst::desktop_tools::MacroDebug().IsCreated()) return;
+        // ⚠ 这里**不许**按 `IsCreated()` 提前 return（docs §61）：延后队列里的这些行
+        //   正是「长录制回放」的逐步现场，窗没建就更需要落盘那份。
+        //   队列已被 swap 出去，此时 return 等于把整批现场直接丢掉。
+        if (recs.empty()) return;
         std::vector<std::wstring> batch;
         batch.reserve(recs.size());
         for (const auto& r : recs) {
@@ -13300,13 +13534,14 @@ private:
         deferredDebugRecs_.push_back(rec);
     }
 
+    /// ⚠ 这两条**不许**再按 `IsCreated()` 提前 return（docs §61）：调试窗是视图，
+    ///   不是记录本身。原来窗没建就丢弃 ⇒ 用户报的现象没有任何可读的现场。
+    ///   现在 `MacroDebug().AppendLog` 自己会**先落盘**，窗口那边没建就自然什么都不做。
     void AppendBreakoutDebugLog(const std::wstring& text) {
-        if (!qst::desktop_tools::MacroDebug().IsCreated()) return;
         qst::desktop_tools::MacroDebug().AppendLog(text);
     }
 
     void AppendAiDebugLog(const std::wstring& text) {
-        if (!qst::desktop_tools::MacroDebug().IsCreated()) return;
         qst::desktop_tools::MacroDebug().AppendLog(text);
     }
 
@@ -13708,6 +13943,9 @@ private:
     bool editorLoadCoordsNormalized_ = false;
     CoordMeta editorLoadCoordMeta_{};
     Page page_ = Page::Home; quickscript::MainTab activeHomeTab_ = quickscript::MainTab::Clicker; Hotkey globalHotkey_{0, VK_F8, L"F8", true};
+    /// 专属热键作用域：专业模式的脚本库/定时/设置页列出全部内容，
+    /// 所以这些页面下所有专属热键都应响应；其余页面按 TAB 限定（见 DedicatedHotkeyInScope）。
+    bool homeHotkeyScopeAll_ = false;
     RECT homeRectBeforeEditor_{};
     int selectedScript_ = -1, selectedRecording_ = -1, currentScriptIndex_ = -1, homeHover_ = -1, recordingHover_ = -1, agentConvHover_ = -1, hoverIndex_ = -1, selectedIndex_ = -1, editingRemarkIndex_ = -1, copySource_ = -1, dragIndex_ = -1, dragTargetIndex_ = -1, dragTargetIndent_ = 0, dragStartX_ = 0, dragStartY_ = 0, scrollOffset_ = 0, homeScrollOffset_ = 0, homeScrollbarDragOffset_ = 0, editorScrollbarDragOffset_ = 0, pendingDeleteIndex_ = -1, pendingRecordingDeleteIndex_ = -1, pendingDeleteAgentConv_ = -1, paramScrollY_ = 0, paramScrollbarDragOffset_ = 0;
     HoverButton hoverButton_ = HoverButton::None;
@@ -13741,7 +13979,7 @@ private:
     quickscript::ClickerSettings clickerSettings_{};
     quickscript::RecorderSettings recorderSettings_{};
     quickscript::AppSettings appSettings_{};
-    /// 窗口模式录制开关（HomeState.recorderWindowMode；录制时以最上层窗口为目标）。
+    /// 后台窗口模式录制开关（HomeState.recorderWindowMode；录制时以最上层窗口为目标）。
     bool recorderWindowMode_ = false;
     RecordingWindowTarget recordingWmTarget_{};
     int currentRecordingCaptureMode_ = -1;
@@ -13814,9 +14052,26 @@ private:
     std::unordered_map<std::wstring, int> loopVars_;
     std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> timerStarts_;
     int curLoops_ = 0;
+    /// 本轮宏的起跑时刻（`GetTickCount64`），`0` = 没在跑。
+    ///
+    /// ⚠ 存在的唯一理由是**目标闪退时的取证**（2026-09-27 真机）：原先只报
+    ///   「目标窗口已消失」+ 一堆句柄/退出码，却**没有"跑了多久"** ——
+    ///   而「绑定后 40ms 就没了」和「跑了 3 秒才没」是两种完全不同的故障
+    ///   （前者指向注入/绑定本身，后者指向某个动作把游戏搞崩），日志里分不出来，
+    ///   只能靠猜。
+    ULONGLONG playbackRunStartTick_ = 0;
+    /// 回放**已经派发**的最后一条动作（`[3]找图，…` 这种，与调试窗同一份文案）。
+    ///
+    /// ⚠ 与 `playbackRunStartTick_` 配套：目标消失时"当时正打到第几条"是定位
+    ///   崩溃触发点的**唯一线索** —— 这个脚本只有 4 条动作，知道死在找图之后的
+    ///   那一步，和只知道"死在脚本里"是两回事。
+    std::wstring playbackLastActionText_;
     std::atomic<int> simulatingInputDepth_{0};
     std::atomic<bool> breakoutUserInput_{false};
     std::atomic<bool> breakoutPaused_{false};
+    /// 回放暂停（独立播放器用）。产品内恒为 false。
+    /// 与 breakoutPaused_ 的区别：那个是"用户动键鼠 → 等脱离时间"，这个是"用户按热键主动暂停"。
+    std::atomic<bool> playbackPaused_{false};
     bool breakoutTaskbarShown_ = false;
     bool breakoutUiVisibleOnScreen_ = false;
     bool breakoutTaskbarTransition_ = false;

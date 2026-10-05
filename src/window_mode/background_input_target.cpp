@@ -251,12 +251,14 @@ HWND FindAndroidEmulatorRenderChild(HWND top, const WindowModeScriptConfig* conf
     return nullptr;
 }
 
+/// 显式命中「渲染表面类名」的后代（Chrome_RenderWidgetHostHWND / SDL_app / TheRender /
+/// unitygfx / applicationframewindow …）。
+/// ⚠ **不含**「最大后代」启发式 —— 那条在 `FindBackgroundInputChild` 里与「包装层让位」
+///   一起处理：它需要 config（是否优先文本输入）才能判对。
 HWND FindKnownRenderSurfaceChild(HWND top) {
     RenderChildContext ctx{};
     EnumDescendantRenderChildren(top, &ctx);
-    if (ctx.bestKnown) return ctx.bestKnown;
-    if (ctx.largestArea >= 320 * 240) return ctx.largest;
-    return nullptr;
+    return ctx.bestKnown;
 }
 
 bool IsDesktopEmulatorTop(HWND top, const WindowModeScriptConfig* config) {
@@ -291,6 +293,28 @@ bool PreferTextInputBinding(HWND top, const WindowModeScriptConfig* config) {
     return true;
 }
 
+/// 「最大后代」若是**包装层**（真正的输入控件长在它里面），必须让位给真控件。
+///
+/// 为什么：`PostMessage` **不会**向子窗转发 ⇒ 把键投给一个只作容器的父窗等于**完全没投**。
+/// 实测树（Windows 11 商店版记事本 / WinUI3，2026-09-23 本机）：
+///     `Notepad`(top) └ `NotepadTextBox`(755x553) └ `RichEditD2DPT`(755x553)
+/// 父子客户区**一样大**，而 `EnumChildWindows` 是「父先于子」⇒「严格大于」的最大值启发式
+/// 取到包装层 `NotepadTextBox`。投 `WM_CHAR` 给它 → 文档**一个字都不进**；
+/// 投给 `RichEditD2DPT` → 正常进字。用户反馈原文：
+/// 「后台窗口模式按键点击不生效，按 A 打不到其他应用的后台里面」。
+///
+/// 判据用 `IsChild(surface, input)` 而不是「窗口里有没有输入框」：
+/// 只在「真文本控件确实长在这个最大子窗**里面**」时让位 —— 窗口别处的小搜索框
+/// 不该改变既有选择（那会把投递目标从主区域挪到搜索框）。
+HWND TextInputInsideSurface(HWND top, HWND surface, const WindowModeScriptConfig* config) {
+    if (!surface || !IsWindow(surface)) return nullptr;
+    if (!PreferTextInputBinding(top, config)) return nullptr;
+    HWND input = FindTextInputTarget(top);
+    if (!input || input == surface) return nullptr;
+    if (!IsChild(surface, input)) return nullptr;
+    return input;
+}
+
 }  // namespace
 
 const wchar_t* BackgroundInputTargetKindName(BackgroundInputTargetKind kind) {
@@ -310,18 +334,36 @@ HWND FindBackgroundInputChild(HWND top, const WindowModeScriptConfig* config,
     top = TopLevelTargetWindow(top);
     if (!top || !IsWindow(top)) return nullptr;
 
-    auto finish = [&](HWND hwnd, BackgroundInputTargetKind kind) -> HWND {
+    auto finish = [&](HWND hwnd, BackgroundInputTargetKind kind,
+                      const wchar_t* why = L"") -> HWND {
         if (outKind) *outKind = kind;
         if (hwnd && hwnd != top) {
-            static HWND s_lastLogged = nullptr;
+            // ⚠⚠ 原来这里有**两个各自独立的 static**（`s_lastLogged` / `s_lastKind`）——
+            //   而本函数是**每拍都调**的热路径（每个鼠标采样一次）。两个目标交替出现时
+            //   `hwnd != s_lastLogged` 与 `kind != s_lastKind` **总有一个成立** ⇒
+            //   两条日志无限对刷。实测（2026-09-30，Win11 记事本）一次 54 步的宏里
+            //   刷了 50+ 行「后台输入子窗」，把调试窗挤满、拖慢回放。
+            //   ⇒ 收成一份状态 + 时间节流：目标**变了**立刻报（那才是有用的事件），
+            //     没变就按间隔最多每 2 秒报一次。
+            static HWND s_lastHwnd = nullptr;
             static BackgroundInputTargetKind s_lastKind = BackgroundInputTargetKind::TopLevel;
-            if (hwnd != s_lastLogged || kind != s_lastKind) {
+            static DWORD s_lastLogTick = 0;
+            const DWORD nowTick = GetTickCount();
+            const bool changed = (hwnd != s_lastHwnd || kind != s_lastKind);
+            if (changed || nowTick - s_lastLogTick >= 2000) {
                 wchar_t cls[128]{};
                 GetClassNameW(hwnd, cls, 128);
-                WindowModeLogf(L"[窗口模式] 后台输入子窗 kind=%s class=%s hwnd=0x%p",
-                    BackgroundInputTargetKindName(kind), cls, hwnd);
-                s_lastLogged = hwnd;
+                // ★ 把**命中的判据**一起打出来（2026-09-30）：之前只有 kind+class，
+                //   于是"为什么选它"（走的是哪条分支）只能靠读代码猜 —— 而这一格
+                //   恰恰是"投给容器 ⇒ 键鼠/滚轮全部石沉大海"那类事故的定位点。
+                WindowModeLogf(L"[窗口/后台窗口模式] 后台输入子窗 kind=%s class=%s hwnd=0x%p"
+                    L" 判据=%s%s",
+                    BackgroundInputTargetKindName(kind), cls, hwnd,
+                    (why && *why) ? why : L"(未标注)",
+                    changed ? L"" : L"（同上，2s 节流）");
+                s_lastHwnd = hwnd;
                 s_lastKind = kind;
+                s_lastLogTick = nowTick;
             }
         }
         return hwnd ? hwnd : top;
@@ -337,47 +379,66 @@ HWND FindBackgroundInputChild(HWND top, const WindowModeScriptConfig* config,
                 return finish(qt.best, BackgroundInputTargetKind::AndroidEmulatorRender);
             }
         } else if (HWND child = FindChildWindowByClass(top, config->childWindowClassName)) {
-            return finish(child, BackgroundInputTargetKind::ConfigChildClass);
+            return finish(child, BackgroundInputTargetKind::ConfigChildClass, L"配置的子窗类名命中");
         }
     }
 
     if (HWND emu = FindAndroidEmulatorRenderChild(top, config)) {
-        return finish(emu, BackgroundInputTargetKind::AndroidEmulatorRender);
+        return finish(emu, BackgroundInputTargetKind::AndroidEmulatorRender, L"安卓模拟器渲染子窗");
     }
 
     // 微信 4.x：键鼠打到顶层 QWindow，不要落到最大子表面（与 AIR/冒险岛相同）。
     if (LooksLikeWeixinTarget(config ? *config : WindowModeScriptConfig{}, top)
         && !LooksLikeChromiumShellTarget(config ? *config : WindowModeScriptConfig{}, top)) {
-        return finish(top, BackgroundInputTargetKind::TopLevel);
+        return finish(top, BackgroundInputTargetKind::TopLevel, L"微信：投顶层 QWindow");
     }
 
     // DeSmuME/Dolphin 等：WM_LBUTTON / 假焦点绑顶层；勿误投到工具栏或最大子窗。
     if (IsDesktopEmulatorTop(top, config)) {
-        return finish(top, BackgroundInputTargetKind::TopLevel);
+        return finish(top, BackgroundInputTargetKind::TopLevel, L"桌面模拟器：投顶层");
     }
 
-    const bool fakeFocusTarget = config && UsesFakeFocus(*config);
+    const bool fakeFocusTarget = config && UsesFakeFocus(*config, top);
     const bool desktopEmu = config && LooksLikeEmulatorTarget(*config, top);
     if (!fakeFocusTarget && !desktopEmu) {
         if (HWND browser = FindBrowserRenderWidget(top)) {
-            return finish(browser, BackgroundInputTargetKind::BrowserRenderWidget);
+            return finish(browser, BackgroundInputTargetKind::BrowserRenderWidget,
+                L"浏览器渲染子窗");
         }
     }
 
     if (HWND surface = FindKnownRenderSurfaceChild(top)) {
-        return finish(surface, BackgroundInputTargetKind::KnownRenderSurface);
-    }
-
-    if (PreferTextInputBinding(top, config)) {
-        if (HWND input = FindTextInputTarget(top)) {
-            return finish(input, BackgroundInputTargetKind::TextInput);
+        // ⚠⚠ 「已知渲染面」同样可能是**包装层**，而 `PostMessage` 不向子窗转发
+        //   ⇒ 投给包装层等于完全没投。这条修正原先只加在下面 `ctx.largest` 那一段，
+        //   这一条早退漏了 —— 两处必须同一把尺（真控件长在里面的容器要让位）。
+        if (HWND input = TextInputInsideSurface(top, surface, config)) {
+            return finish(input, BackgroundInputTargetKind::TextInput, L"已知渲染面⊃真文本控件");
         }
+        return finish(surface, BackgroundInputTargetKind::KnownRenderSurface, L"已知渲染面");
     }
 
     RenderChildContext ctx{};
     EnumDescendantRenderChildren(top, &ctx);
+
+    if (ctx.largestArea >= 320 * 240) {
+        // ⚠ 「最大后代」可能是**包装层**：真控件长在它里面，而 PostMessage 不向子窗转发
+        //   ⇒ 投给包装层等于完全没投（现代记事本 NotepadTextBox ⊃ RichEditD2DPT，实测）。
+        if (HWND input = TextInputInsideSurface(top, ctx.largest, config)) {
+            return finish(input, BackgroundInputTargetKind::TextInput, L"最大后代⊃真文本控件");
+        }
+        return finish(ctx.largest, BackgroundInputTargetKind::KnownRenderSurface,
+            L"最大后代(≥320x240)");
+    }
+
+    if (PreferTextInputBinding(top, config)) {
+        if (HWND input = FindTextInputTarget(top)) {
+            return finish(input, BackgroundInputTargetKind::TextInput, L"直接找文本输入控件");
+        }
+    }
+
     if (ctx.largestArea >= 160 * 120) {
-        return finish(ctx.largest, BackgroundInputTargetKind::LargestSurface);
+        return finish(ctx.largest, BackgroundInputTargetKind::LargestSurface,
+            L"最大后代(≥160x120)");
     }
 
     if (outKind) *outKind = BackgroundInputTargetKind::TopLevel;

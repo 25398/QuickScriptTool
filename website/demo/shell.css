@@ -4,7 +4,7 @@
  * - 主界面客户区 1552×960；鼠标宏编辑界面 1800×1230
  * - 键鼠录制优化弹窗 1640×1140（壳 setMode opt 改客户区）
  * - 动作详情对齐原生窄栏 218 / 找图 120+90，按 --qst-u 等比，勿拉满
- * - 设置 / AI 助手组件与主界面同一倍率 --qst-u = 1.5（见 index.html）
+ * - 设置 / AI 助手组件与主界面同一基准倍率 --qst-u = 1.5，再乘布局缩放（分辨率自适应 × 用户倍率）
  * - #app 铺满 WebView；禁止再用 zoom 把界面缩成左上角小窗
  */
 html, body {
@@ -19,7 +19,7 @@ html, body {
   -webkit-user-select: none;
   user-select: none;
 }
-/* 允许选中：输入框、contenteditable、AI 气泡、宏调试日志 */
+/* 允许选中：输入框、contenteditable、AI 气泡、宏调试日志、关于页联系信息 */
 input,
 textarea,
 select,
@@ -30,7 +30,10 @@ select,
 .bubble,
 .bubble .think-body,
 .debug-log,
-#debugLog {
+#debugLog,
+.set-pane[data-pane="about"] .param-block,
+.set-pane[data-pane="about"] .about-link,
+.set-pane[data-pane="about"] .about-val {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -168,6 +171,12 @@ body::after {
 .app.visual-editor .add-bar {
   display: none !important;
 }
+body.editor-no-modify #btnEdRemark {
+  display: none !important;
+}
+body.editor-autosave #btnEdSave {
+  display: none !important;
+}
 .app.editor-mode .left-col.is-visual #visualCanvasHost,
 .app.editor-mode .editor-chrome.is-visual #visualCanvasHost,
 .app.visual-editor #visualCanvasHost {
@@ -183,6 +192,8 @@ body::after {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  scrollbar-gutter: stable;
+  overflow-anchor: none;
 }
 .app .editor-chrome .add-bar {
   flex-shrink: 0;
@@ -404,6 +415,30 @@ body::after {
   max-width: 100%;
   min-width: 0;
 }
+.param-block textarea.inp.ed-code,
+.param-block .fline textarea.inp.ed-code {
+  display: block !important;
+  align-items: unset !important;
+  justify-content: unset !important;
+  flex: 1 1 auto;
+  align-self: stretch;
+  width: 100%;
+  min-width: 0;
+  height: auto !important;
+  min-height: calc(13px * var(--qst-u, 1.5) * 1.45 * 8 + 16px * var(--qst-u, 1.5));
+  max-height: none !important;
+  line-height: 1.45 !important;
+  padding: calc(8px * var(--qst-u, 1.5)) calc(10px * var(--qst-u, 1.5)) !important;
+  font-family: var(--mono, Consolas, monospace);
+  font-size: calc(13px * var(--qst-u, 1.5));
+  font-weight: 500;
+  white-space: pre;
+  overflow: auto;
+  resize: vertical;
+  tab-size: 4;
+  cursor: text;
+  box-sizing: border-box;
+}
 .param-block .fline.nwm-btns {
   width: 100%;
   gap: calc(6px * var(--qst-u, 1.5));
@@ -430,4 +465,32 @@ body::after {
 .param-block .fline-stack.nwm-full .stack-lab.nwm-lab > .chk {
   flex: 0 0 auto;
   font-weight: 500;
+}
+/*
+ * 文字识别「查找文字」：「输入框 + 插入变量」单独占一整排（标签在上一排）。
+ * ⚠ 输入框是 `.stack-ctrl` 的**孙节点** ⇒ 不会被 `.fline-stack .stack-ctrl > .inp`
+ *    的黄金分割宽度（φ）命中，必须在这里显式拉满；否则又会被压窄。
+ * ⚠ 也别把两者塞回标签同一行（原先的 `.row` + flex:1 写法）：窄侧栏下输入框会被
+ *    压出面板、插入变量按钮被裁掉。
+ */
+.param-block .fline-stack .stack-ctrl > .ocr-search-row {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--qst-u, 1.5));
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+.param-block .fline-stack .stack-ctrl > .ocr-search-row > .inp {
+  flex: 1 1 0;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+.param-block .fline-stack .stack-ctrl > .ocr-search-row > button.btn {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  white-space: nowrap;
 }

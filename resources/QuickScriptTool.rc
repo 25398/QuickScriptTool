@@ -6,8 +6,8 @@
 #endif
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,3,3,0
- PRODUCTVERSION 1,3,3,0
+ FILEVERSION 1,4,1,0
+ PRODUCTVERSION 1,4,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -20,12 +20,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "QuickScriptTool"
             VALUE "FileDescription", "QuickScriptTool"
-            VALUE "FileVersion", "1.3.3.0"
+            VALUE "FileVersion", "1.4.1.0"
             VALUE "InternalName", "QuickScriptTool"
             VALUE "LegalCopyright", "Copyright (C) QuickScriptTool"
             VALUE "OriginalFilename", "QuickScriptTool.exe"
             VALUE "ProductName", "QuickScriptTool"
-            VALUE "ProductVersion", "1.3.3"
+            VALUE "ProductVersion", "1.4.1"
         END
     END
     BLOCK "VarFileInfo"

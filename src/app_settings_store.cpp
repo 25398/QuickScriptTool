@@ -290,6 +290,8 @@ void LoadPlaybackSettings(const std::wstring& obj, quickscript::PlaybackTabSetti
     out.scheduledTaskAutoResume = ParseBoolField(obj, L"scheduledTaskAutoResume",
         out.scheduledTaskAutoResume);
     out.lowPerformanceMode = ParseBoolField(obj, L"lowPerformanceMode", out.lowPerformanceMode);
+    out.spreadRelativeMovePackets = ParseBoolField(obj, L"spreadRelativeMovePackets",
+        out.spreadRelativeMovePackets);
     out.aiFastPaths = ParseBoolField(obj, L"aiFastPaths", out.aiFastPaths);
     out.findImageGpuAccel = ParseBoolField(obj, L"findImageGpuAccel", out.findImageGpuAccel);
 }
@@ -298,6 +300,7 @@ void LoadOtherSettings(const std::wstring& obj, quickscript::OtherTabSettings& o
     out.autoHideMainWindow = ParseBoolField(obj, L"autoHideMainWindow", out.autoHideMainWindow);
     out.playSoundOnStart = ParseBoolField(obj, L"playSoundOnStart", out.playSoundOnStart);
     out.playSoundOnEnd = ParseBoolField(obj, L"playSoundOnEnd", out.playSoundOnEnd);
+    out.exportScriptAsZip = ParseBoolField(obj, L"exportScriptAsZip", out.exportScriptAsZip);
     out.hideBottomRightTip = ParseBoolField(obj, L"hideBottomRightTip", out.hideBottomRightTip);
     out.closeToTray = ParseBoolField(obj, L"closeToTray", out.closeToTray);
     out.autoStartOnBoot = ParseBoolField(obj, L"autoStartOnBoot", out.autoStartOnBoot);
@@ -377,6 +380,8 @@ void LoadWindowModeSettings(const std::wstring& obj, quickscript::WindowModeSett
     out.injectionTechnique = ParseIntField(obj, L"injectionTechnique", out.injectionTechnique);
     out.injectionTechnique = std::clamp(out.injectionTechnique, 0, 10);
     out.hideInjectedModule = ParseBoolField(obj, L"hideInjectedModule", out.hideInjectedModule);
+    out.enableWindowTimeScale = ParseBoolField(obj, L"enableWindowTimeScale",
+        out.enableWindowTimeScale);
     out.previewRefreshMs = std::clamp(out.previewRefreshMs, 200, 5000);
 }
 
@@ -496,6 +501,8 @@ void WritePlaybackSettings(std::wostream& file, const quickscript::PlaybackTabSe
     file << L"    \"scheduledTaskConflictPolicy\": " << s.scheduledTaskConflictPolicy << L",\n";
     file << L"    \"scheduledTaskAutoResume\": " << (s.scheduledTaskAutoResume ? L"true" : L"false") << L",\n";
     file << L"    \"lowPerformanceMode\": " << (s.lowPerformanceMode ? L"true" : L"false") << L",\n";
+    file << L"    \"spreadRelativeMovePackets\": "
+         << (s.spreadRelativeMovePackets ? L"true" : L"false") << L",\n";
     file << L"    \"aiFastPaths\": " << (s.aiFastPaths ? L"true" : L"false") << L",\n";
     file << L"    \"findImageGpuAccel\": " << (s.findImageGpuAccel ? L"true" : L"false") << L"\n";
 }
@@ -504,6 +511,7 @@ void WriteOtherSettings(std::wostream& file, const quickscript::OtherTabSettings
     file << L"    \"autoHideMainWindow\": " << (s.autoHideMainWindow ? L"true" : L"false") << L",\n";
     file << L"    \"playSoundOnStart\": " << (s.playSoundOnStart ? L"true" : L"false") << L",\n";
     file << L"    \"playSoundOnEnd\": " << (s.playSoundOnEnd ? L"true" : L"false") << L",\n";
+    file << L"    \"exportScriptAsZip\": " << (s.exportScriptAsZip ? L"true" : L"false") << L",\n";
     file << L"    \"hideBottomRightTip\": " << (s.hideBottomRightTip ? L"true" : L"false") << L",\n";
     file << L"    \"closeToTray\": " << (s.closeToTray ? L"true" : L"false") << L",\n";
     file << L"    \"autoStartOnBoot\": " << (s.autoStartOnBoot ? L"true" : L"false") << L",\n";
@@ -563,13 +571,20 @@ void WriteWindowModeSettings(std::wostream& file, const quickscript::WindowModeS
         << (s.enableFakeFocusInjection ? L"true" : L"false") << L",\n";
     file << L"    \"injectionTechnique\": " << s.injectionTechnique << L",\n";
     file << L"    \"hideInjectedModule\": "
-        << (s.hideInjectedModule ? L"true" : L"false") << L"\n";
+        << (s.hideInjectedModule ? L"true" : L"false") << L",\n";
+    file << L"    \"enableWindowTimeScale\": "
+        << (s.enableWindowTimeScale ? L"true" : L"false") << L"\n";
 }
 
-void WriteAiApiSettings(std::wostream& file, const quickscript::AiApiSettings& s) {
+/// protectKey=false 时写**明文**密钥（便携导出用，见 SerializeAppSettings 的说明）。
+void WriteAiApiSettings(std::wostream& file, const quickscript::AiApiSettings& s,
+    bool protectKey) {
+    auto key = [protectKey](const std::wstring& k) -> std::wstring {
+        return protectKey ? ProtectSecret(k) : k;
+    };
     file << L"    \"enabled\": " << (s.enabled ? L"true" : L"false") << L",\n";
     file << L"    \"apiUrl\": \"" << EscapeJson(s.apiUrl) << L"\",\n";
-    file << L"    \"apiKey\": \"" << EscapeJson(ProtectSecret(s.apiKey)) << L"\",\n";
+    file << L"    \"apiKey\": \"" << EscapeJson(key(s.apiKey)) << L"\",\n";
     file << L"    \"modelName\": \"" << EscapeJson(s.modelName) << L"\",\n";
     file << L"    \"temperature\": " << s.temperature << L",\n";
     file << L"    \"maxTokens\": " << s.maxTokens << L",\n";
@@ -578,7 +593,7 @@ void WriteAiApiSettings(std::wostream& file, const quickscript::AiApiSettings& s
         const auto& m = s.savedModels[i];
         file << L"      {\n";
         file << L"        \"apiUrl\": \"" << EscapeJson(m.apiUrl) << L"\",\n";
-        file << L"        \"apiKey\": \"" << EscapeJson(ProtectSecret(m.apiKey)) << L"\",\n";
+        file << L"        \"apiKey\": \"" << EscapeJson(key(m.apiKey)) << L"\",\n";
         file << L"        \"modelName\": \"" << EscapeJson(m.modelName) << L"\",\n";
         file << L"        \"temperature\": " << m.temperature << L",\n";
         file << L"        \"maxTokens\": " << m.maxTokens << L"\n";
@@ -685,6 +700,32 @@ bool LoadAppSettings(quickscript::AppSettings& out) {
     return true;
 }
 
+std::wstring SerializeAppSettings(const quickscript::AppSettings& settings,
+    bool portableSecrets) {
+    std::wostringstream file;
+    file << L"{\n";
+    file << L"  \"click\": {\n";
+    WriteClickSettings(file, settings.click);
+    file << L"  },\n";
+    file << L"  \"playback\": {\n";
+    WritePlaybackSettings(file, settings.playback);
+    file << L"  },\n";
+    file << L"  \"other\": {\n";
+    WriteOtherSettings(file, settings.other);
+    file << L"  },\n";
+    file << L"  \"windowMode\": {\n";
+    WriteWindowModeSettings(file, settings.windowMode);
+    file << L"  },\n";
+    file << L"  \"ai\": {\n";
+    WriteAiApiSettings(file, settings.ai, !portableSecrets);
+    file << L"  },\n";
+    file << L"  \"home\": {\n";
+    WriteHomeState(file, settings.home);
+    file << L"  }\n";
+    file << L"}\n";
+    return file.str();
+}
+
 bool SaveAppSettings(const quickscript::AppSettings& settings) {
     const std::wstring path = AppSettingsFilePath();
     const std::wstring tmpPath = path + L".tmp";
@@ -694,28 +735,7 @@ bool SaveAppSettings(const quickscript::AppSettings& settings) {
     SetAiFastPaths(settings.playback.aiFastPaths);
 
     auto buildUtf8 = [&]() -> std::string {
-        std::wostringstream file;
-        file << L"{\n";
-        file << L"  \"click\": {\n";
-        WriteClickSettings(file, settings.click);
-        file << L"  },\n";
-        file << L"  \"playback\": {\n";
-        WritePlaybackSettings(file, settings.playback);
-        file << L"  },\n";
-        file << L"  \"other\": {\n";
-        WriteOtherSettings(file, settings.other);
-        file << L"  },\n";
-        file << L"  \"windowMode\": {\n";
-        WriteWindowModeSettings(file, settings.windowMode);
-        file << L"  },\n";
-        file << L"  \"ai\": {\n";
-        WriteAiApiSettings(file, settings.ai);
-        file << L"  },\n";
-        file << L"  \"home\": {\n";
-        WriteHomeState(file, settings.home);
-        file << L"  }\n";
-        file << L"}\n";
-        return ToUtf8(file.str());
+        return ToUtf8(SerializeAppSettings(settings, false));
     };
 
     // 必须写 UTF-8：wofstream 默认 locale 遇中文路径会截断，导致 app_settings.json 损坏、热键/选中全坏

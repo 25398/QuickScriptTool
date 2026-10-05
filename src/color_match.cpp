@@ -289,10 +289,11 @@ ColorMatchHit FindColorInScreenRegion(
 bool MatchColorAtScreenPoint(int x, int y,
     int targetR, int targetG, int targetB, int tolerance,
     int* outR, int* outG, int* outB, int* outDist,
-    HBITMAP frozenScreen, int frozenVirtX, int frozenVirtY) {
+    HBITMAP frozenScreen, int frozenVirtX, int frozenVirtY, bool* outReadOk) {
     int r = 0, g = 0, b = 0;
-    if (!GetScreenPixelRgb(x, y, r, g, b, frozenScreen, frozenVirtX, frozenVirtY))
-        return false;
+    const bool readOk = GetScreenPixelRgb(x, y, r, g, b, frozenScreen, frozenVirtX, frozenVirtY);
+    if (outReadOk) *outReadOk = readOk;
+    if (!readOk) return false;
     const int d = ColorChannelDistance(r, g, b, targetR, targetG, targetB);
     if (outR) *outR = r;
     if (outG) *outG = g;

@@ -11,22 +11,26 @@
 
 #include "action_utils.h"
 #include "agent_ai_actions.h"
-#include "ai_action_lookahead.h"
+#include "agent_attachment.h"
 #include "ai_action_router.h"
-#include "ai_locate_cache.h"
-#include "ai_ui_layout.h"
+#include "ai_action_service.h"
+#include "ai_decide.h"
+#include "image_match.h"
 #include "ai_plan_util.h"
 #include "ai_locate_verify.h"
 #include "office_doc.h"
 #include "ai_logic_convert.h"
 #include "app_settings_store.h"
 #include "color_match.h"
+#include "desktop_tools/desktop_tools.h"   // 落盘日志端到端（docs §61）
 #include "macro_execute_tools.h"
+#include "window_mode/ui_element_probe.h"
 #include "page_snapshot.h"
 #include "script_action_builder.h"
 #include "script_io.h"
 #include "script_types.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cwctype>
@@ -83,24 +87,30 @@ const selftest::CaseInfo kCases[] = {
         L"section=agent 含观察/completeTask/分步"},
     {L"atomic_tools_present", L"default",
         L"BuildAiActionExecuteTools 含 quickInput/keyClick/findImage 等规范工具"},
+    {L"complete_task_wrapup_visible", L"default",
+        L"completeTask 收尾判据必须落在网页路径可见区（目录只取 48 字节≈16 汉字）"},
     {L"task_memo_and_open_dedup", L"default",
         L"task memo + skip duplicate openWebpage"},
-    {L"open_webpage_api_and_same_site", L"default",
-        L"禁开 api 接口；同站禁止再编 URL"},
+    {L"open_webpage_no_site_guard", L"default",
+        L"openWebpage 不再按站点/URL 形状拒绝（照开 + 如实标注）"},
     {L"task_data_cleared_on_reset", L"default",
         L"ResetAiActionSessionState 清空 saveTaskData 缓存，防串上轮 historyRecords"},
     {L"page_kind_classify", L"default",
         L"canvasRatio+interactive → dom/mixed/canvas"},
     {L"page_snapshot_format_and_ref", L"default",
         L"Parse/Format 压缩树；canvas 禁 HTML；clickRef 门闩；可视/屏外覆盖"},
-    {L"scroll_wheel_confirm_when_viewport_has_content", L"default",
-        L"可视区已有主内容时 scrollWheel 须 confirmScroll"},
-    {L"list_first_blocks_scroll_and_other_cards", L"default",
-        L"有列表第1项时禁止滚动/点其它内容卡；播放页相关推荐不算第1项"},
+    {L"snapshot_reports_coverage_and_paging", L"default",
+        L"长列表页覆盖度：全量明说「已全部列出」；被切了报「共N/第a~b条 + nextOffset」；"
+        L"旧扩展不谎报完整"},
+    {L"scroll_wheel_not_blocked_when_viewport_has_content", L"default",
+        L"可视区有内容也不再拦滚动（批 D：跨帧状态驱动拒绝已删）"},
+    {L"list_first_no_longer_blocks", L"default",
+        L"「列表第1项」概念与两条拒绝已删：滚动/点其它内容卡一律照发"},
     {L"web_browse_allows_vision_fallback", L"default",
         L"网页扩展是优化：树上没有或未装扩展时 locateAndClick 仍可用"},
     {L"web_mixed_prefers_tree_click", L"default",
-        L"播放页树上有按钮则 locateAndClick/mouseClick 改 clickRef；识图失败后禁假完成"},
+        L"树上有按钮时 locateAndClick 指路 clickRef（无宿主）；"
+        L"completeTask 不再被「上轮识图未找到」否决（模型要收工就如实收工）"},
     {L"logic_convert_bridge_nav", L"default",
         L"扩展桥导航固化为打开网页，clickRef 可记找图模板"},
     {L"observe_page_tools_present", L"default",
@@ -108,9 +118,9 @@ const selftest::CaseInfo kCases[] = {
     {L"search_on_page_tool", L"default",
         L"searchOnPage 构造站点搜索 URL 并走 navigatePage"},
     {L"click_ref_navigates_space_href", L"default",
-        L"clickRef 跟 href 打开用户主页；搜索结果允许 space URL；滚轮无图不拦"},
-    {L"same_page_click_hint_scoped", L"default",
-        L"同页 clickRef：仅搜索页提示点卡片；内容页不拦分享/作者、不误导去跳转"},
+        L"clickRef 一律如实点击（不再代导航/不再按站点启发式拒绝）；滚轮无图照执行+标注"},
+    {L"same_page_click_not_blocked", L"default",
+        L"同页 clickRef 不再被拒（连续未跳转只如实报计数）"},
     {L"search_on_page_opens_matching_space", L"default",
         L"searchOnPage 名字命中用户卡片时直接打开主页"},
     {L"observe_result_defaults", L"default",
@@ -120,13 +130,13 @@ const selftest::CaseInfo kCases[] = {
     {L"atomic_key_click_enter", L"default",
         L"规范工具 keyClick(Enter) 可执行"},
     {L"non_universal_shortcut_guard", L"default",
-        L"应用专属组合键(Ctrl+H)默认劝退；通用键放行；网页禁开新标签；Skill 不再教 F12/Ctrl+H"},
+        L"应用专属组合键(Ctrl+H)默认劝退；通用键放行；网页按 Ctrl+T/N 只如实标注；Skill 不再教 F12/Ctrl+H"},
     {L"allow_nested_ai_action_under_cap", L"default",
         L"未达上限时允许 submit 含 aiActionExecute"},
     {L"reject_nested_ai_action_at_cap", L"default",
         L"嵌套达上限时 submit aiActionExecute 被拒"},
-    {L"reject_absolute_pointer_no_image", L"default",
-        L"无图模式绝对坐标点击被拒"},
+    {L"absolute_pointer_no_image_annotated", L"default",
+        L"无图模式绝对坐标点击照执行 + 如实标注（批 D：不再拒绝）"},
     {L"allow_absolute_pointer_with_image_opt", L"default",
         L"允许绝对坐标时 mouseClick 可构建"},
     {L"reject_empty_quick_input", L"default",
@@ -159,6 +169,8 @@ const selftest::CaseInfo kCases[] = {
         L"紧凑粗框/宽控件可跳过二级；过大/过小图标不跳过"},
     {L"parse_color_hex", L"default",
         L"TryParseColorSpec #FF8800"},
+    {L"color_match_score_percent", L"default",
+        L"颜色匹配度统一 0~100（色差 0→100、≥100→0，不出负数）"},
     {L"build_find_color_action", L"default",
         L"findColor JSON 可构建"},
     {L"locate_and_click_tool_present", L"default",
@@ -180,7 +192,11 @@ const selftest::CaseInfo kCases[] = {
     {L"resolve_vision_rect_norm1000", L"default",
         L"越界矩形按 0~1000 映射到 api 图"},
     {L"resolve_vision_ambiguous_in_image_as_norm1000", L"default",
-        L"图内亦像 0~1000 的框优先归一化（防搜索钮偏移）"},
+        L"图内亦像 0~1000 的框优先归一化（防搜索钮偏移），并**如实留痕**两种读法"},
+    {L"resolve_vision_ambiguity_not_claimed_when_impossible", L"default",
+        L"两套读法不可能同时成立时不许说「无法区分」（防留痕退化成恒真噪声）"},
+    {L"macro_debug_log_file_roundtrip", L"default",
+        L"AI 调试日志真落盘并读回（docs §61：没生成是**静默**失败，只能真写一次才测得到）"},
     {L"resolve_vision_point_src_pixels", L"default",
         L"超大坐标按截屏原图像素换算"},
     {L"resolve_vision_rect_reject_oob", L"default",
@@ -241,12 +257,8 @@ const selftest::CaseInfo kCases[] = {
         L"OCR 备注带 listActivate；动态填表步数收紧"},
     {L"logic_convert_collapse_skip_filename", L"default",
         L"逻辑转化：短文件名不误折叠为动态数据"},
-    {L"locate_fail_key_block", L"default",
-        L"locate 失败后 F12/hotkey 硬拦，Enter 放行"},
     {L"locate_retry_hard_cap", L"default",
-        L"locate 连败计数：成功清零，供超限硬拦"},
-    {L"fill_table_only_tools", L"default",
-        L"动态填表工具白名单去掉 runProgram/网页/hotkey"},
+        L"locate 失败计数契约：失败累加、成功清零（只供如实回执；**不再**用于拦截重试）"},
     {L"list_ocr_heuristic", L"default",
         L"列表 OCR 启发：多行列表通过、另存为拒"},
     {L"logic_convert_writeback_first_time", L"default",
@@ -277,8 +289,6 @@ const selftest::CaseInfo kCases[] = {
         L"定位 prompt 明确 0~1000 归一化并禁止像素坐标"},
     {L"locate_tool_defers_to_host_dom", L"default",
         L"有宿主 DOM 钩子时 locateAndClick 不再报错浪费一轮；无宿主保留指路错误"},
-    {L"lookahead_wait_budget", L"default",
-        L"预规划等待上限收紧 + 次数上限 2 + 无在途时 Cancel 立刻返回"},
     {L"dom_first_action_gate", L"default",
         L"DOM 优先门禁：扩展/钩子/canvas/右键/前台非浏览器一律不放行"},
     {L"pick_snapshot_ref_for_input", L"default",
@@ -287,8 +297,6 @@ const selftest::CaseInfo kCases[] = {
         L"typeByLabel 一次调用按标签填写；无命中/无钩子/空参报错并指路"},
     {L"ui_control_tools", L"default",
         L"listUiControls/invokeUiControl：台账透传、执行标记、报错透传、只读不被计划门闩拦"},
-    {L"locate_cache", L"default",
-        L"定位模板缓存：键归一/窗口隔离/高分唯一才命中/无效果作废/清理释放"},
     {L"wide_row_still_needs_refine", L"default",
         L"过宽的菜单行框必须继续 Zoom 精炼；≤420px 宽按钮与地址栏仍可省一轮"},
     {L"url_input_heuristic", L"default",
@@ -320,8 +328,6 @@ const selftest::CaseInfo kCases[] = {
         L"readDocument：CSV(UTF-8 BOM 中文) / txt 读得对，缺文件与不支持扩展名报可执行错误"},
     {L"computer_alias_tool", L"default",
         L"computer-use 兼容入口：screenshot/点击/拖动/输入/组合键/滚动/长按映射到既有动作，且不绕过网页与表格守卫"},
-    {L"locate_cache_hysteresis", L"default",
-        L"定位缓存：窗口位移重锚（拖动后仍可用）+ N-of-M 迟滞（抖动画面不点残影）"},
     {L"fuse_locate_candidates", L"default",
         L"多候选聚类取簇心（不平均）：一致候选收敛、分歧不误导、UIA 锚点优先用精确框"
         L"（含单候选 + 名字匹配才采信）"},
@@ -339,23 +345,123 @@ const selftest::CaseInfo kCases[] = {
     {L"locate_multi_targets", L"default",
         L"locateAndClick(targets=[…]) 一次定位并连点多个目标（拿卡→放卡）；单目标仍走原路径；"
         L"只给一个 target 又不写 target 时报错"},
-    {L"ui_layout_memory_and_grid", L"default",
-        L"布局记忆：定位成功一次即记住坐标；窗口身份/分辨率/目标变化即失效；点击无变化即作废；"
-        L"网格 (行,列) → 坐标，越界挡住"},
     {L"plan_spend_gate", L"default", L"批量选择**完全无特判**：宿主只做能力不做领域规则；「一键全选」照常定位点击（关键词门槛与提醒均已删除，用户要求不做针对性优化）"},
-    {L"ui_layout_signature_gate", L"default", L"布局记忆硬校验：外观签名一致才允许 0 识图直达；界面变了必须拒绝命中"},
-    {L"ui_grid_period_detect", L"default",
-        L"网格周期检测（自位移平均绝对差）：规则网格检出正确列距；噪声画面与「周期远小于元素自身」都不报周期"},
     {L"ocr_direct_click_pick", L"default",
         L"文字直点：OCR 索引里唯一命中文字标签 → 直接给坐标（省 DOM/UIA/两轮识图）；"
         L"同屏多个同名按钮/整块并成一行/纯数字目标一律拒绝并回落识图"},
-    {L"miss_self_correct_prompt", L"default",
-        L"错点自纠 prompt 契约：红叉=刚点过的错点 + 只要绝对坐标、明确禁止偏移量（否则准确率打对折）"},
     {L"locate_decimal_coord_parse", L"default",
         L"定位解析必须吃小数：旧实现把 (88.5,117.3) 判成「无法解析」、把 [52.4,…] 静默解析成错框；"
         L"现在点对/框选都按四舍五入取值，反序框仍归一化"},
     {L"plan_spend_budget", L"default",
         L"先算账：卡槽有限时按性价比挑强卡（不一键全选）；预算内算出一次能放几个单位；买不起要明说；maxCount 限量生效"},
+    {L"decide_table", L"default",
+        L"本地判断表（System One 形态）：视觉闸/游戏前台/附帧三张表逐行断言+优先级；"
+        L"置信度三档边界；判断表必须穷尽（不许静默放行）"},
+    {L"decide_wrapper_equivalence", L"default",
+        L"旧布尔封装与判断表判决等价：视觉闸/游戏前台在真实会话状态下逐组对齐（重构不许改行为）"},
+    {L"decide_diagnostic_log", L"default",
+        L"判断诊断：每次判断留一行 verdict+conf+why；sink 收得到；按动作清空不串台"},
+    {L"vision_gate_trace_only", L"default",
+        L"视觉闸只留判断 + 留痕：动作路径上既不拦识图定位、也不注入任何提示"
+        L"（视觉唯一手段时更没有「改用控件树」的错指引）"},
+    {L"ai_exec_observe_guards", L"default",
+        L"执行后要不要回传观察帧：模型明确要观察 / 结果不确定 / 本任务第一次动手 —— 三条守卫；"
+        L"第一次动手强制观察（防「抢跑」），但模型明确不要观察的后续步骤仍可不看"},
+    {L"ocr_text_index_rows", L"default",
+        L"屏幕文字索引按画面行分组（可点清单）：同视觉行才并组、跨行不并；"
+        L"标视觉行序与坐标口径；纯数字限量、低置信/超短挡掉；空输入给空串"},
+    {L"thinking_downgrade_plumbing", L"default",
+        L"思考降档前置机制：AI 动作作用域标记按进出（含嵌套）正确开关；"
+        L"「抑制 N 轮」计数会被消耗（防永久闩锁——该缺陷真实出现过）"},
+    {L"frame_click_mark_lifecycle", L"default",
+        L"观察帧落点标注（红叉=上一次点击落在哪，让规划模型下次识图顺手验收）："
+        L"屏幕→帧内换算、一次点击只标一帧、同一点再点一次可重标、"
+        L"出界/无区域/出帧一律不标；标签口径只有一处（图上与提示词同一句话）"},
+    {L"zoom_region_tool", L"default",
+        L"`zoom`：把一块区域按**原始分辨率**放大回传（看不清小字/图标时的通用解药）——"
+        L"入参＝upload 截图像素（与元素索引同一套、零换算），也可给 target=文字标签由引擎解析；"
+        L"区域夹取/太小/帧外一律**如实拒绝**；回执必须写清**区域、倍率、图内坐标换回 upload 的公式**，"
+        L"且倍率按「送图链路缩完之后、模型真正看到的那张图」算，maxEdge 上限不得超过该链路硬上限"},
+    {L"zoom_temp_image_files", L"default",
+        L"zoom 落地文件：同一进程内两次 zoom 的文件名必须**不同**（同轮两张图不能互相覆盖 —— "
+        L"实测模型因此判定「zoom 只会返回最后一张」并弃用了它）；旧图按年龄清理，"
+        L"新图与非 zoom_ 文件一律不动，未来时间戳宁可不删"},
+    {L"element_index_and_resolve", L"default",
+        L"统一可点元素索引（所见即所得）：UIA 控件 ∪ OCR 文字合成一张编号表；"
+        L"同处同名才合并（保守，宁可两条）、编号按阅读顺序、纯数字/过短目标不解析、"
+        L"同档多条无位置线索即判歧义；★窗口自身标题栏按钮永不入选（「关闭」一击关掉整个窗口那件事）"},
+    {L"element_index_facts_and_id_binding", L"default",
+        L"★半视觉两条：① 索引条目带**角色/动作能力/可读状态**（滑块 action:slide、"
+        L"输入框 action:fill、[value:…][range:…][toggle:…][focused]）并渲染进给模型的清单，"
+        L"OCR 条目**不许**伪造能力（本地没有证据就不猜）；② 编号**能真的用** —— "
+        L"locateAndClick(elementId=N) 直查同一张表、同屏同名靠编号区分、"
+        L"查不到绝不兜底成近似条目、窗口自身按钮与灰控件永不入选；"
+        L"清单标题里必须写明 elementId 可用（否则模型不知道有这个能力）"},
+    {L"caption_icon_pairing", L"default",
+        L"★「短标签 → 它标注的图标槽」（通用版面推断）：卡槽里 OCR 只读得到价签、读不到卡片 ⇒"
+        L"模型知道「600」这几个字在哪、不知道那张卡在哪（实测 8 轮 zoom 猜卡，最后只会点"
+        L"唯一有把握的那张 —— 用户看到的「只会放普通僵尸」）。判据：≥3 段短标签成排 + 间距均匀 +"
+        L"正上方能切出**同样数量**的等高块（文字行因太矮被挡）+ 横向对齐 + 宽度相近；"
+        L"任何一条不满足就**什么都不发布**。配对后索引里不得再留同名文字条目（否则判歧义）"},
+    {L"coord_action_receipt_names_landing", L"default",        L"★坐标动作的回执必须**回显落点**（docs §54）：`SummarizeExecutedActionsJson` 原先"
+        L"只对 quickInput/keyClick/wait 之类给细节，坐标动作一律只剩 `已执行:mouseClick` ——"
+        L"模型发来 (243,50)、拿回的字符串里**连个数字都没有**，于是无法判断卡片选没选中，"
+        L"只能反复点、反复开合同一个面板（用户主诉：「光选卡，选完卡咋不会放僵尸」）。"
+        L"本用例钉：mouseClick/moveMouse 回执里有 (x,y)（upload 口径，与原值逐字相同）、"
+        L"mouseDrag 有 (起点)→(终点)、且两套终点字段（toX/toY 与宿主合并用的 endX/endY）都认"},
+    {L"mouse_click_repeat_same_point", L"default",
+        L"★同一坐标**连点 12 次**，每一次都必须真的发出去（docs §72）。"
+        L"起因：真机日志里 20 击的一批，**后 10 击全部 0 步**，回执只有一句"
+        L"「[错误] 本批 0 步：没有可执行的动作（空数组或全部被跳过）」——"
+        L"模型读不出原因、只能照原样再点，排查也只能靠读源码猜是哪条 continue。"
+        L"本用例先钉死工具层：不许有任何「同点静默去重 / 静默丢弃」，"
+        L"12 次调用必须产生 12 个**含 mouseClick** 的动作数组"},
+    {L"mouse_drag_executes", L"default",
+        L"★`mouseDrag` 拖拽必须真的能跑：它拼的 mouseDown/mouseUp 不带 x/y 会被校验拒，"
+        L"而且旧报错讲的是「点击输入框须给截图坐标…」（完全不搭界），模型据此跑偏。"
+        L"本用例钉：带坐标能过 + 执行 JSON 里有起点终点 + 缺坐标的报错贴着该动作说 +"
+        L"★「计划执行」那行预览**不许说谎**：工具参数 `fromX/fromY/toX/toY` 必须对齐成"
+        L"动作字段 `x/y/endX/endY`（旧实现硬套出 `(0,0)→(0,0)`，与同一批真实执行的"
+        L"(228,47)→(760,300) 相反），对齐不了就回退印原始参数、绝不编造零点"},
+    {L"resolve_app_launch_target", L"default",
+        L"按显示名启动的**本地解析**（桌面/开始菜单快捷方式 → App Paths → PATH）："
+        L"解析不到必须明确失败，绝不退化成 Win+S 搜索（那条路会在浏览器里搜网页）；"
+        L".lnk 必须被判成 shell 目标"},
+    {L"non_client_landing_strip", L"default",
+        L"落点在窗口**非客户区**（标题栏/边框）必须拦：§31.1 那条只加了主识图链路、"
+        L"而且**依赖 UIA**，而游戏窗口实测 `UIA 控件 0 条` ⇒ 它根本不触发。"
+        L"改用**纯 Win32 客户区几何**（任何窗口都量得到），并用实测矩形断言"
+        L"「(2522,16) 必拦 / (2475,257) 放行 / 无边框全屏不拦（那是减少能力）」"},
+    {L"vision_answer_gate", L"default",
+        L"识图回答有效性：模型答不出来时会回**空框** `[0,0,0,0]`，旧解析里它退化成了点 (0,0) ——"
+        L"于是点了屏幕左上角、回执写「界面已经变化 → 已生效」、还把垃圾存成定位模板。"
+        L"空框/零宽零高一律判「没回答」；单点回答与原点单点不受影响（Zoom 级本来问的就是点）"},
+    {L"slow_thinking_round_gate", L"default",
+        L"思考失控闸的**状态必须跨轮存活**：它原来是 SendMessage 的局部变量，而 AI 动作执行"
+        L"每外层轮重进一次 SendMessage ⇒ 计数器每轮归零 ⇒「连续 2 轮慢」永远不成立 ⇒"
+        L" 闸门形同不存在（实测 16.2s → 62.3s 一次没触发 = 用户说的「半天没反应」）。"
+        L"现在跨轮状态是显式入参/出参；并新增「单轮 ≥30s 当场处置」——一轮就能 60s，"
+        L"等第二轮的 120s 等不起；条件不满足时既不计数也不清零（防「永久关思考」正反馈）"},
+    {L"stream_prose_brake", L"default",
+        L"工具轮的收束判据的宾语是「**有没有工具调用意向**」，与文本落在 reasoning_content 还是"
+        L" content **无关**：旧写法绑死 `contentBytes == 0`，于是「长篇大论却不调工具」这个形态"
+        L"**结构上就看不见**（实测两轮各 45~55s、57 895 / 54 732 字节全在正文里）⇒ 只能烧到"
+        L" max_tokens 耗尽。新判据只在 AI 动作作用域内按产出预算收束（聊天助手的长回答不能砍），"
+        L"且**原闸①两条门槛逐字保留**；用例里同时复刻旧判据，断言它在那一格是漏的"},
+    {L"no_tool_call_answer_gate", L"default",
+        L"「期待工具却只拿到散文」——这段文本不是回答：旧实现把 `assistantMsg.content` 当本轮"
+        L"最终回答返回（最坏附一句「请在设置里增大 max_tokens」）⇒ AI 动作执行这一轮等于**什么都"
+        L"没干**，用户看到的就是「卡在那里不动」。现在被截断/被收束且无工具调用 → 注入「只准调"
+        L"工具」纠偏（`finish_reason=stop` 的自然收尾仍然尊重），且纠偏**有界**（§36.6/§40.2："
+        L"守卫不能把模型永久锁在外面）"},
+    {L"plan_spend_target_contract", L"default",
+        L"★「清单要能被执行」是产清单的工具的责任（docs §44）：planSpend 的 `costs` 简写**伪造**了"
+        L"「选项3(花费500)」这种像名字的东西，而描述又写着「照它执行、逐个点名单里的卡」⇒ 模型真的"
+        L"去 `locateAndClick(\"9999\"/\"600\")`。而价格三条路全断（不唯一 500×3；不在 OCR 索引里；"
+        L"拿裸数字问 VLM 每次框都不同 —— 同一个「600」三次给出相差 500px 的三个点）⇒ 点空 ⇒ "
+        L"死点表/近点重复连环触发 ⇒ 改用**不带目标语义**的手算坐标 mouseClick ⇒ 在选卡界面上把"
+        L"**已选中的卡又点掉**（用户：「把选了的卡收回去又重新选」）。现在占位符必写明「无名字」、"
+        L"回执当场说清「不能用来定位」，并给出可执行替代（items 带 name = 卡面上真实存在的短标签）"},
 };
 
 void CaseNoImage() {
@@ -538,13 +644,16 @@ void CaseAtomicToolsPresent() {
         }
         if (t.name == L"submitMacroActions") hasSubmit = true;
     }
-    const std::wstring banAltTab = CallNamedTool(tools, L"hotkeyShortcut",
+    // ★批 D（docs §47）：原先这里断言 hotkeyShortcut(9) 被**拒绝**并指路 activateWindow。
+    //   那条禁令已删 ⇒ 改成：照执行 + 如实标注「Alt+Tab 切到最近用过的窗口」。
+    const std::wstring altTab = CallNamedTool(tools, L"hotkeyShortcut",
         L"{\"shortcutPreset\":9}");
-    const bool banOk = banAltTab.find(L"[错误]") != std::wstring::npos
-        && banAltTab.find(L"activateWindow") != std::wstring::npos;
+    const bool altTabOk = altTab.rfind(L"[错误]", 0) != 0
+        && altTab.find(L"[EXECUTED]") != std::wstring::npos
+        && altTab.find(L"Alt+Tab") != std::wstring::npos;
     const bool ok = hasQi && hasKc && hasMc && hasFi && hasSubmit
         && hasScroll && hasDrag && hasMemo && hasReadMemo && hasRun && hasSearch && hasHotkey && hasSwitch
-        && banOk
+        && altTabOk
         && IsMacroActionRunToolName(L"quickInput")
         && IsMacroActionRunToolName(L"findImage")
         && IsMacroActionRunToolName(L"scrollWheel")
@@ -561,6 +670,46 @@ void CaseAtomicToolsPresent() {
         && kAiObsUnchangedMatchThreshold >= 80.0;
     Emit(L"atomic_tools_present", ok,
         ok ? L"" : L"missing typed tools/switchWindow or hotkey9 ban");
+}
+
+// ★★ 关键指令必须落在「网页 AI 路径真的会发给模型」的那段文字里（2026-10-02 A2 实测）
+//
+//   网页 AI 路径下模型看到的描述是**被截断的**：
+//     目录 `RenderToolCatalog` 只取 `catalogDescChars = 48` **字节**（≈16 个汉字）；
+//     扁平清单 `RenderToolList` 只取 160 字节。
+//   ⚠ 前科：把「收尾判据」加在 `completeTask` 描述**末尾** ⇒ 加了等于没加 ——
+//     源码里搜得到、自检也绿，但模型**一个字都没看到**（用户报"改完没变化"）。
+//   ⇒ 判据：**收尾指令必须出现在前 16 个字符内**（16 汉字 = 48 字节，是最坏情况；
+//     只要在前 16 字内，就一定在 48 字节预算内，与具体字节数无关）。
+void CaseCompleteTaskWrapUpVisible() {
+    const auto tools = BuildAiActionExecuteTools(nullptr, {});
+    const std::wstring* desc = nullptr;
+    for (const auto& t : tools) {
+        if (t.name == L"completeTask") { desc = &t.description; break; }
+    }
+    if (!desc) {
+        Emit(L"complete_task_wrapup_visible", false, L"completeTask 工具不存在");
+        return;
+    }
+    // ① 目录预算（48 字节 ≈ 16 汉字）里必须能看到「收尾」这个动作词
+    const std::wstring head = desc->substr(0, 16);
+    const bool inCatalog = head.find(L"收尾") != std::wstring::npos;
+    // ② 完整定义里必须有可执行的那句（loadTools 取完整定义时看得到）
+    const bool actionable = desc->find(L"立刻调用本工具") != std::wstring::npos
+        && desc->find(L"不要") != std::wstring::npos;
+    // ③ 别把「不需要收尾」这类反向指令排在最前（防有人挪错了词序还过测）
+    const bool positiveFirst = head.find(L"收尾") != std::wstring::npos
+        && head.find(L"禁止") == std::wstring::npos;
+    const bool ok = inCatalog && actionable && positiveFirst;
+    std::wstring detail;
+    if (!ok) {
+        detail = L"收尾判据不在网页路径可见区";
+        if (!inCatalog) detail += L" [不在前16字]";
+        if (!actionable) detail += L" [缺可执行句]";
+        if (!positiveFirst) detail += L" [首个动作词不是收尾]";
+        detail += L" 前16字=「" + head + L"」";
+    }
+    Emit(L"complete_task_wrapup_visible", ok, detail.c_str());
 }
 
 void CaseResolveSystemPathAndSavePathGuard() {
@@ -642,42 +791,45 @@ void CaseSaveDialogSubmitGuard() {
         ok ? L"" : L"save-path submit guard failed");
 }
 
-void CaseSwitchWindowAfterLaunchWarned() {
+void CaseSwitchWindowAfterLaunchNotBlocked() {
+    // ★批 D（docs §47）：原用例钉的是「刚 runProgram 启动 ⇒ 不许开 Alt+Tab 预览，先劝一次」
+    //   那条**基于启动时间戳的拒绝**。判据与字段（启动时刻 / 已劝过）已整体删除 ⇒
+    //   用例反转：**启动之后照样可以开预览**（第一次、第二次都不再被拒）。
     // 前置条件：runProgram 会先解析目标程序路径。CI runner 没装 Office，
     // 解析 excel 必然失败 → 这条必红（2026-09-19 首次 CI 暴露）。
     // 属环境依赖，跳过而不是判失败；断言本身不放宽。
     if (ResolveProgramLaunchPath(L"excel").empty()) {
-        Emit(L"switch_window_after_launch_warned", true,
+        Emit(L"switch_window_after_launch_not_blocked", true,
             L"skipped: 本机解析不到 excel（未装 Office）");
         return;
     }
     ResetAiActionSessionState(626262);
     const auto tools = BuildAiActionExecuteTools(nullptr, {});
-    // 无 hooks 时 runProgram 仍返回 [EXECUTED]，会记下启动时刻
+    // 无 hooks 时 runProgram 仍返回 [EXECUTED]
     const std::wstring run = CallNamedTool(tools, L"runProgram",
         L"{\"targetPath\":\"excel\"}");
     const std::wstring first = CallNamedTool(tools, L"switchWindow",
         L"{\"action\":\"openPreview\"}");
-    const bool warnedOk = first.find(L"[错误]") != std::wstring::npos
-        && first.find(L"\u81ea\u52a8\u5230\u524d\u53f0") != std::wstring::npos;
-    // 第二次不再劝（无 hooks 时落到缺钩子错误，说明已放行）
+    const bool notWarned = first.find(L"\u81ea\u52a8\u5230\u524d\u53f0") == std::wstring::npos;
     const std::wstring second = CallNamedTool(tools, L"switchWindow",
         L"{\"action\":\"openPreview\"}");
-    const bool passOk = second.find(L"\u81ea\u52a8\u5230\u524d\u53f0") == std::wstring::npos;
-    const bool ok = run.find(L"[EXECUTED]") != std::wstring::npos && warnedOk && passOk;
-    Emit(L"switch_window_after_launch_warned", ok,
-        ok ? L"" : L"switchWindow-after-launch nudge failed");
+    const bool stillNotWarned = second.find(L"\u81ea\u52a8\u5230\u524d\u53f0") == std::wstring::npos;
+    const bool ok = run.find(L"[EXECUTED]") != std::wstring::npos && notWarned && stillNotWarned;
+    Emit(L"switch_window_after_launch_not_blocked", ok,
+        ok ? L"" : (first + L" | " + second).c_str());
 }
 
 void CaseWindowLedgerTools() {
     ResetAiActionSessionState(828282);
     std::wstring activateQuery;
+    unsigned long activatePid = 0;
     AiActionHostHooks hooks;
     hooks.onListWindows = []() -> std::wstring {
         return L"#1 工作簿1 - Excel [EXCEL.EXE]（前台）\n#2 历史记录 - Edge [msedge.exe]";
     };
-    hooks.onActivateWindow = [&](const std::wstring& query) -> std::wstring {
+    hooks.onActivateWindow = [&](const std::wstring& query, unsigned long pid) -> std::wstring {
         activateQuery = query;
+        activatePid = pid;
         return L"已切到前台：工作簿1 - Excel [EXCEL.EXE]";
     };
     const auto tools = BuildAiActionExecuteTools(&hooks, {});
@@ -699,9 +851,37 @@ void CaseWindowLedgerTools() {
     const bool emptyRejected = CallNamedTool(tools, L"activateWindow",
         L"{\"match\":\"  \"}").find(L"[错误]") != std::wstring::npos;
 
+    // ★★ pid 消歧（2026-10-02 修）：台账 `FormatWindowList` 打印 `pid=…`，双开同名窗口时
+    //   还叫模型「按 pid/客户区区分，别只按标题选」—— 工具层**必须真的收 pid**。
+    //   前科：模型 `activateWindow(pid=29404)` 被打回「缺少 match」⇒ 在
+    //   「match 命中 2 个 / pid 不被接受」之间反复绕圈、白烧好几轮。
+    activateQuery.clear();
+    activatePid = 0;
+    const std::wstring byPid = CallNamedTool(tools, L"activateWindow", L"{\"pid\":29404}");
+    const bool pidOk = activatePid == 29404u && activateQuery.empty()
+        && byPid.find(L"[EXECUTED]") != std::wstring::npos
+        && byPid.find(L"[错误]") == std::wstring::npos;
+    // 模型偶尔把 pid 写成字符串（"29404"）—— 也要收
+    activateQuery.clear();
+    activatePid = 0;
+    const std::wstring byPidStr = CallNamedTool(tools, L"activateWindow", L"{\"pid\":\"29404\"}");
+    const bool pidStrOk = activatePid == 29404u
+        && byPidStr.find(L"[错误]") == std::wstring::npos;
+    // match + pid 同给：两个都要原样传给宿主（交集语义由宿主实现）
+    activateQuery.clear();
+    activatePid = 0;
+    const std::wstring bothSel = CallNamedTool(tools, L"activateWindow",
+        L"{\"match\":\"excel\",\"pid\":29404}");
+    const bool bothOk = activatePid == 29404u && activateQuery == L"excel"
+        && bothSel.find(L"[错误]") == std::wstring::npos;
+    // 负对照：pid=0 视为「没给」⇒ 仍必须报非法调用（不能把 0 当合法进程号）
+    const bool pidZeroRejected = CallNamedTool(tools, L"activateWindow",
+        L"{\"pid\":0}").find(L"[错误]") != std::wstring::npos;
+
     // 宿主多候选拒绝应原样回传 [错误]
-    hooks.onActivateWindow = [](const std::wstring& q) -> std::wstring {
-        return L"[错误] activateWindow「" + q + L"」匹配到 2 个窗口，拒绝自动选择以免切错。";
+    hooks.onActivateWindow = [](const std::wstring& q, unsigned long pid) -> std::wstring {
+        return L"[错误] activateWindow「" + q + L"」(pid=" + std::to_wstring(pid)
+            + L") 匹配到 2 个窗口，拒绝自动选择以免切错。";
     };
     const auto tools2 = BuildAiActionExecuteTools(&hooks, {});
     const std::wstring ambig = CallNamedTool(tools2, L"activateWindow",
@@ -716,8 +896,19 @@ void CaseWindowLedgerTools() {
         && preview.find(L"activateWindow") != std::wstring::npos
         && preview.find(L"msedge.exe") != std::wstring::npos;
 
-    const bool ok = listOk && actOk && actObsOk && emptyRejected && ambigOk && previewBlocked;
-    Emit(L"window_ledger_tools", ok, ok ? L"" : L"listWindows/activateWindow wiring failed");
+    const bool ok = listOk && actOk && actObsOk && emptyRejected && pidOk && pidStrOk
+        && bothOk && pidZeroRejected && ambigOk && previewBlocked;
+    // ⚠ detail 必须自己拼成 wstring 再 c_str()：三元里混 L"" 与 std::wstring 会推导成
+    //   std::wstring，而 Emit 收 const wchar_t*（踩过 C2664）
+    std::wstring ledgerDetail;
+    if (!ok) {
+        ledgerDetail = L"listWindows/activateWindow wiring failed";
+        if (!pidOk) ledgerDetail += L" pid-not-accepted";
+        if (!pidStrOk) ledgerDetail += L" pid-string-not-accepted";
+        if (!bothOk) ledgerDetail += L" match+pid-not-forwarded";
+        if (!pidZeroRejected) ledgerDetail += L" pid0-not-rejected";
+    }
+    Emit(L"window_ledger_tools", ok, ledgerDetail.c_str());
 }
 
 void CaseLocateFailSuggestsActivate() {
@@ -726,8 +917,10 @@ void CaseLocateFailSuggestsActivate() {
     hooks.onListWindows = []() -> std::wstring {
         return L"#1 历史记录 - Edge [msedge.exe]";
     };
-    hooks.onActivateWindow = [](const std::wstring&) -> std::wstring { return L"已切到前台：x"; };
-    hooks.onLocateAndClick = [](const std::wstring&, int, const std::wstring&, int) {
+    hooks.onActivateWindow = [](const std::wstring&, unsigned long) -> std::wstring {
+        return L"已切到前台：x";
+    };
+    hooks.onLocateAndClick = [](const std::wstring&, int, const std::wstring&, int, int) {
         return std::wstring(L"[错误] 未找到目标（识图返回 NOT_FOUND）。");
     };
     const auto tools = BuildAiActionExecuteTools(&hooks, {});
@@ -747,7 +940,7 @@ void CaseLocateFailSuggestsActivate() {
 
 void CaseRunActionRecipe() {
     ResetAiActionSessionState(848484);
-    SetAiActionPlanGateEnabled(false);
+
     std::wstring executedJson;
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [&](const std::wstring& actionsJson) -> std::wstring {
@@ -810,7 +1003,7 @@ void CaseRunActionRecipe() {
     executedJson.clear();
     // rows=2 => forced 1-group preview (only first row runs), then verifiedGroups=1 fills rest
     ResetAiActionSessionState(848485);
-    SetAiActionPlanGateEnabled(false);
+
     const std::wstring twoRows = CallNamedTool(tools, L"runActionRecipe",
         L"{\"steps\":[{\"type\":\"quickInput\",\"inputText\":\"{0}\"}],"
         L"\"rows\":[[\"a\"],[\"b\"]],\"observeAfter\":false}");
@@ -845,7 +1038,7 @@ void CaseRunActionRecipe() {
     const bool emptyRejected = emptyRows.find(L"[\u9519\u8bef]") != std::wstring::npos;
     // empty cell / missing placeholder column must be rejected before execute (prevents blind Tab)
     ResetAiActionSessionState(848485);
-    SetAiActionPlanGateEnabled(false);
+
     const std::wstring emptyCell = CallNamedTool(tools, L"runActionRecipe",
         L"{\"steps\":["
         L"{\"type\":\"quickInput\",\"inputText\":\"{0}\"},"
@@ -978,7 +1171,7 @@ void CaseSaveDialogGuards() {
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [](const std::wstring&) -> std::wstring { return L"已执行 2 步"; };
     hooks.onProbeForegroundDialog = [&]() { return dialogProbe; };
-    hooks.onLocateAndClick = [](const std::wstring&, int, const std::wstring&, int) {
+    hooks.onLocateAndClick = [](const std::wstring&, int, const std::wstring&, int, int) {
         return L"locateAndClick 已点击屏幕(1,1)";
     };
     const auto tools = BuildAiActionExecuteTools(&hooks, {});
@@ -1114,7 +1307,7 @@ void CaseLocateDoubleClick() {
     int gotClicks = 0;
     AiActionHostHooks hooks;
     hooks.onLocateAndClick = [&](const std::wstring&, int,
-        const std::wstring& button, int clickCount) -> std::wstring {
+        const std::wstring& button, int clickCount, int) -> std::wstring {
         gotButton = button;
         gotClicks = clickCount;
         return L"locateAndClick 已双击屏幕(10,10)";
@@ -1163,26 +1356,25 @@ void CaseTaskMemoAndOpenDedup() {
 }
 
 void CaseOpenWebpageApiAndSameSiteGuard() {
+    // ★批 D（docs §47 / D1）：原先三条**站点专属**的静默拒绝（「站点接口不是给人看的页面」
+    //   「不要打开 space 空根路径」「不要猜用户数字 UID」）与「已在同一站点 ⇒ 禁止再编地址」
+    //   都已删，改成**放行 + 如实标注**。本用例反转钉新不变式。
     ResetAiActionSessionState(91);
     const bool apiUrl = LooksLikeNonUserFacingWebUrl(
         L"https://api.bilibili.com/x/web-interface/search/type?search_type=bili_user&keyword=x");
     const bool searchOk = !LooksLikeNonUserFacingWebUrl(
         L"https://search.bilibili.com/upuser?keyword=%E6%9C%89%E5%B1%B1");
     const bool spaceOk = !LooksLikeNonUserFacingWebUrl(L"https://space.bilibili.com/123");
-    const bool guessed = LooksLikeGuessedUserSpaceUrl(L"https://space.bilibili.com/")
-        && LooksLikeGuessedUserSpaceUrl(L"https://space.bilibili.com/123")
-        && !LooksLikeGuessedUserSpaceUrl(L"https://www.bilibili.com/")
-        && LooksLikeSiteSearchResultsUrl(L"https://search.bilibili.com/all?keyword=x")
-        && SanitizeObservePageQuery(L"搜索 有山先生") == L"\u6709\u5c71\u5148\u751f"
+    const bool sanitize = SanitizeObservePageQuery(L"搜索 有山先生") == L"\u6709\u5c71\u5148\u751f"
         && SanitizeObservePageQuery(L"\u641c\u7d22").empty();
     const bool site = ExtractUrlSiteKey(L"https://search.bilibili.com/upuser?k=a") == L"bilibili.com"
         && ExtractUrlSiteKey(L"https://api.bilibili.com/x/foo") == L"bilibili.com"
         && ExtractUrlSiteKey(L"https://www.example.com/a") == L"example.com";
 
     const auto tools = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring blocked = CallNamedTool(tools, L"openWebpage",
+    const std::wstring api = CallNamedTool(tools, L"openWebpage",
         L"{\"targetPath\":\"https://api.bilibili.com/x/web-interface/search/type?keyword=x\"}");
-    const std::wstring blockedSpace = CallNamedTool(tools, L"openWebpage",
+    const std::wstring spaceRoot = CallNamedTool(tools, L"openWebpage",
         L"{\"targetPath\":\"https://space.bilibili.com/\"}");
     const std::wstring first = CallNamedTool(tools, L"openWebpage",
         L"{\"targetPath\":\"https://search.bilibili.com/upuser?keyword=test\"}");
@@ -1200,18 +1392,24 @@ void CaseOpenWebpageApiAndSameSiteGuard() {
         && LooksLikeSiteHomepageUrl(L"https://www.bilibili.com/")
         && LooksLikeSiteHomepageUrl(L"https://www.bilibili.com/?spm=1")
         && !LooksLikeSiteHomepageUrl(L"https://search.bilibili.com/all?keyword=x");
-    const bool ok = apiUrl && searchOk && spaceOk && guessed && site
-        && blocked.find(L"[错误]") == 0
-        && blocked.find(L"风控") != std::wstring::npos
-        && blockedSpace.find(L"[错误]") == 0
+    const bool ok = apiUrl && searchOk && spaceOk && sanitize && site
+        // 站点接口：照开，只多一句事实
+        && api.rfind(L"[错误]", 0) != 0
+        && api.find(L"[EXECUTED]") != std::wstring::npos
+        && api.find(L"站点接口") != std::wstring::npos
+        && api.find(L"风控") == std::wstring::npos
+        // 空根路径 / 同站点第二个地址：都照开
+        && spaceRoot.rfind(L"[错误]", 0) != 0
+        && spaceRoot.find(L"[EXECUTED]") != std::wstring::npos
         && first.find(L"[EXECUTED]") != std::wstring::npos
-        && second.find(L"已在站点") != std::wstring::npos
+        && second.find(L"[EXECUTED]") != std::wstring::npos
+        && second.find(L"已在站点") == std::wstring::npos
         && home.find(L"[EXECUTED]") != std::wstring::npos
         && searchNav.find(L"[EXECUTED]") != std::wstring::npos
         && searchNav.find(L"已在站点") == std::wstring::npos
         && searchUrlOk;
-    Emit(L"open_webpage_api_and_same_site", ok,
-        ok ? L"" : (blocked + L" | " + first + L" | " + second + L" | " + searchNav
+    Emit(L"open_webpage_no_site_guard", ok,
+        ok ? L"" : (api + L" | " + spaceRoot + L" | " + first + L" | " + second + L" | " + searchNav
             + L" | " + biliSearch).c_str());
 }
 
@@ -1280,8 +1478,11 @@ void CasePageSnapshotFormatAndRef() {
         R"({"ok":true,"pageKind":"dom","url":"https://search.bilibili.com/all?keyword=x",)"
         R"("title":"搜索","nodes":[{"ref":"e1","role":"link","name":"有山先生","href":"//space.bilibili.com/1"}]})";
     const std::wstring searchText = FormatPageSnapshotForAgent(ParsePageSnapshotJson(searchJson));
-    const bool searchHint = searchText.find(L"已在搜索结果页") != std::wstring::npos
-        && searchText.find(L"space.bilibili.com") != std::wstring::npos;
+    // ★批 D（docs §47 / D1）：站点专属的「已在搜索结果页…点 href 含 space.bilibili.com」已删 ⇒ 反向断言
+    //   （注意：节点清单里仍会打印该节点自己的 href，那是**观测事实**，不算文案残留）
+    const bool searchHint = searchText.find(L"已在搜索结果页") == std::wstring::npos
+        && searchText.find(L"点 href 含") == std::wstring::npos
+        && searchText.find(L"有山先生") != std::wstring::npos;
 
     const std::string canvasJson =
         R"({"ok":true,"pageKind":"canvas","canvasRatio":0.81,"interactive":1,)"
@@ -1312,10 +1513,11 @@ void CasePageSnapshotFormatAndRef() {
         R"({"ref":"e5","role":"link","name":"b站网友写诗","href":"https://www.bilibili.com/video/BV1cy4y1L7vs","x":430,"y":400,"w":180,"h":90},)"
         R"({"ref":"e6","role":"link","name":"页头错误推荐","href":"https://www.bilibili.com/video/BVbad","x":10,"y":80,"w":180,"h":90}]})";
     const std::wstring spaceText = FormatPageSnapshotForAgent(ParsePageSnapshotJson(spaceJson));
-    const bool spaceHint = spaceText.find(L"用户空间") != std::wstring::npos
-        && spaceText.find(L"searchOnPage") != std::wstring::npos
+    // ★批 D（docs §47 / D1）：站点专属的「这是某个用户空间…」与「列表第1项=e3」不再出现；
+    //   树文本只留**观测事实**（节点清单 + 可视/屏外分组）。
+    const bool spaceHint = spaceText.find(L"用户空间") == std::wstring::npos
+        && spaceText.find(L"列表第1项") == std::wstring::npos
         && spaceText.find(L"日本篇") != std::wstring::npos
-        && spaceText.find(L"列表第1项=e3") != std::wstring::npos
         && spaceText.find(L"第一个视频") == std::wstring::npos;
 
     const std::string watchJson =
@@ -1327,6 +1529,7 @@ void CasePageSnapshotFormatAndRef() {
         R"({"ref":"e4","role":"link","name":"相关推荐甲","href":"https://www.bilibili.com/video/BVrel1","x":10,"y":820,"w":180,"h":90},)"
         R"({"ref":"e5","role":"link","name":"相关推荐乙","href":"https://www.bilibili.com/video/BVrel2","x":220,"y":820,"w":180,"h":90}]})";
     const std::wstring watchText = FormatPageSnapshotForAgent(ParsePageSnapshotJson(watchJson));
+    // ★批 D：站点专属的「播放页：工具栏按钮优先 clickRef…相关推荐不是目标」已删
     const bool watchHint = watchText.find(L"[mixed]") != std::wstring::npos
         && watchText.find(L"clickRef") != std::wstring::npos
         && watchText.find(L"点赞") != std::wstring::npos
@@ -1334,8 +1537,8 @@ void CasePageSnapshotFormatAndRef() {
         && watchText.find(L"勿点分享") == std::wstring::npos
         && watchText.find(L"locateAndClick") != std::wstring::npos
         && watchText.find(L"列表第1项") == std::wstring::npos
-        && watchText.find(L"点赞=e2") != std::wstring::npos
-        && watchText.find(L"工具栏按钮") != std::wstring::npos
+        && watchText.find(L"工具栏按钮") == std::wstring::npos
+        && watchText.find(L"相关推荐不是目标") == std::wstring::npos
         && SnapshotRefMatchingLocateTarget(ParsePageSnapshotJson(watchJson),
             L"\u89c6\u9891\u4e0b\u65b9\u7684\u70b9\u8d5e\u5927\u62c7\u6307") == L"e2";
 
@@ -1359,7 +1562,7 @@ void CasePageSnapshotFormatAndRef() {
         && firstCard != std::wstring::npos && laterCard != std::wstring::npos
         && visHdr < firstCard && firstCard < offHdr && offHdr < laterCard
         && CountPageSnapshotInViewMainContent(gridSnap) == 2
-        && gridText.find(L"列表第1项=e1") != std::wstring::npos
+        && gridText.find(L"列表第1项") == std::wstring::npos
         && gridText.find(L"第一个视频") == std::wstring::npos;
 
     const std::string missJson =
@@ -1380,7 +1583,118 @@ void CasePageSnapshotFormatAndRef() {
                 + L" miss=" + missText.substr(0, 180)).c_str());
 }
 
-void CaseScrollWheelConfirmWhenViewportHasContent() {
+// ★长列表页覆盖度：树被砍过必须**明说**，且分页信息要可行动。
+//
+// 实测背景（超星「第1章概述练习题」50 题作业页）：扩展在排序后把候选砍到 64 条，
+// 一道多选题连题干带选项吃掉 5~6 条 ⇒ **只有前 1~2 题进树**，第 3 题起全没了。
+// 当时的回执只有 `n=21` +「屏外0 · 下17.6屏」—— 树**自洽**，看不出丢了 48 道题，
+// 模型于是退化成「盲滚 + 截图抄」。所以本用例钉三件事：
+//   ① 全量时明说「本页 N 个…已全部列出」（模型才能区分「真的只有这些」）；
+//   ② 被切过时明说「共 N 个，本次给的是第 a~b 条」并给可用的 nextOffset；
+//   ③ 旧扩展（无覆盖度字段）**不能谎报完整**。
+void CaseSnapshotReportsCoverageAndPaging() {
+    // ① 全量：enumerateTotal == nodes.size() ⇒ 明确告知「已全部列出」
+    const std::string fullJson =
+        R"({"ok":true,"pageKind":"dom","url":"https://example.com/q","title":"练习题","enumerateTotal":3,"offset":0,"nextOffset":0,)"
+        R"("nodes":[)"
+        R"({"ref":"e1","role":"checkbox","name":"选项A","x":10,"y":100,"w":20,"h":20,"inView":true},)"
+        R"({"ref":"e2","role":"checkbox","name":"选项B","x":10,"y":130,"w":20,"h":20,"inView":true},)"
+        R"({"ref":"e3","role":"checkbox","name":"选项C","x":10,"y":160,"w":20,"h":20,"inView":true}]})";
+    const PageSnapshot full = ParsePageSnapshotJson(fullJson);
+    const std::wstring fullText = FormatPageSnapshotForAgent(full);
+    const bool fullOk = full.enumerateTotal == 3 && full.nextOffset == 0
+        && fullText.find(L"已全部列出") != std::wstring::npos
+        && fullText.find(L"没给完") == std::wstring::npos;
+
+    // ② 分页中：给了第 1~2 条 / 共 120 条 ⇒ 必须说清「还有」，并给出下一段 offset
+    const std::string pageJson =
+        R"({"ok":true,"pageKind":"dom","url":"https://example.com/q","title":"练习题","enumerateTotal":120,"offset":0,"nextOffset":2,)"
+        R"("nodes":[)"
+        R"({"ref":"e1","role":"checkbox","name":"第1题选项A","x":10,"y":100,"w":20,"h":20,"inView":true},)"
+        R"({"ref":"e2","role":"checkbox","name":"第1题选项B","x":10,"y":130,"w":20,"h":20,"inView":true}]})";
+    const PageSnapshot paged = ParsePageSnapshotJson(pageJson);
+    const std::wstring pagedText = FormatPageSnapshotForAgent(paged);
+    const bool pagedOk = paged.enumerateTotal == 120 && paged.nextOffset == 2
+        && pagedText.find(L"共 120") != std::wstring::npos
+        && pagedText.find(L"第 1~2 条") != std::wstring::npos
+        && pagedText.find(L"没给完") != std::wstring::npos
+        && pagedText.find(L"offset=2") != std::wstring::npos;
+
+    // ③ 第二段（offset=2）：措辞要反映真实区间「第 3~3 条」，别再说第 1 条
+    const std::string page2Json =
+        R"({"ok":true,"pageKind":"dom","url":"https://example.com/q","title":"练习题","enumerateTotal":120,"offset":2,"nextOffset":3,)"
+        R"("nodes":[)"
+        R"({"ref":"e1","role":"checkbox","name":"第2题选项A","x":10,"y":100,"w":20,"h":20,"inView":true}]})";
+    const std::wstring page2Text = FormatPageSnapshotForAgent(ParsePageSnapshotJson(page2Json));
+    const bool page2Ok = page2Text.find(L"第 3~3 条") != std::wstring::npos;
+
+    // ④ 旧扩展（无 enumerateTotal 字段）：**覆盖度未知**——既不能说「已全部列出」，
+    //    也不能只说「没给完」了事（那是分页场景的措辞）。必须**明说「覆盖度未知」**，
+    //    否则模型会把「可视区这 20 条」当成整页，退化成盲滚 + 截图（实测 3.77 CNY 那一局）。
+    const std::string legacyJson =
+        R"({"ok":true,"pageKind":"dom","url":"https://example.com/q","nodes":[)"
+        R"({"ref":"e1","role":"button","name":"旧扩展","x":1,"y":2,"w":3,"h":4}]})";
+    const PageSnapshot legacy = ParsePageSnapshotJson(legacyJson);
+    const std::wstring legacyText = FormatPageSnapshotForAgent(legacy);
+    const bool legacyOk = legacy.enumerateTotal == -1
+        && legacyText.find(L"已全部列出") == std::wstring::npos
+        && legacyText.find(L"没给完") == std::wstring::npos
+        && legacyText.find(L"覆盖度未知") != std::wstring::npos;
+
+    // ⑤ absent 字段：新扩展会标出「与视口完全不相交」的节点。
+    //    ① 解析要认这个字段（absent=true ⇒ 1）；
+    //    ② 屏外的节点**照样要出现在树里**（长列表页正是靠这个才能一次枚举全），
+    //       同时覆盖度要把它算进「屏外」计数，不能再报「屏外0」。
+    //    ⚠ 当前扩展里 absent 与 inView 同源（同一判据）⇒ 恒有 absent == !inView。
+    //      这是**契约现状**，不是巧合：两个字段语义不同（算「可视N」vs 算「屏外M」），
+    //      将来要区分「横跨边界」时才拆开。用例只钉**当前**契约，别把两者当成反义去简化。
+    const std::string absentJson =
+        R"({"ok":true,"pageKind":"dom","url":"https://example.com/q","title":"练习题",)"
+        R"("enumerateTotal":3,"offset":0,"nextOffset":0,"vh":800,"scrollY":0,"pageHeight":4000,)"
+        R"("nodes":[)"
+        R"({"ref":"e1","role":"checkbox","name":"可视项","x":10,"y":100,"w":20,"h":20,"inView":true,"absent":false},)"
+        R"({"ref":"e2","role":"checkbox","name":"屏外项","x":10,"y":1500,"w":20,"h":20,"inView":false,"absent":true},)"
+        R"({"ref":"e3","role":"checkbox","name":"更远屏外项","x":10,"y":2500,"w":20,"h":20,"inView":false,"absent":true}]})";
+    const PageSnapshot absent = ParsePageSnapshotJson(absentJson);
+    const int absentFlagged = absent.nodes.size() == 3 && absent.nodes[1].absent == 1
+        && absent.nodes[2].absent == 1 && absent.nodes[0].absent == 0 ? 1 : 0;
+    const std::wstring absentText = FormatPageSnapshotForAgent(absent);
+    // 三条都在树里（没被砍）+ 屏外计数如实（2 条）
+    const bool absentOk = absentFlagged == 1 && absent.nodes.size() == 3
+        && PageSnapshotNodeAbsent(absent.nodes[1], absent)
+        && !PageSnapshotNodeAbsent(absent.nodes[0], absent)
+        && absentText.find(L"屏外2") != std::wstring::npos
+        && absentText.find(L"可视1") != std::wstring::npos;
+
+    // ⑥ 旧扩展（**没有** absent 字段）⇒ 回落 y/vh 推断，不能用未初始化值误报屏外。
+    //    这条是 ⑤ 的负对照：把 absent 删掉，覆盖度仍要算对（不能变成 0）。
+    const std::string noAbsentJson =
+        R"({"ok":true,"pageKind":"dom","url":"https://example.com/q","title":"练习题",)"
+        R"("enumerateTotal":2,"offset":0,"nextOffset":0,"vh":800,"scrollY":0,"pageHeight":4000,)"
+        R"("nodes":[)"
+        R"({"ref":"e1","role":"checkbox","name":"可视项","x":10,"y":100,"w":20,"h":20,"inView":true},)"
+        R"({"ref":"e2","role":"checkbox","name":"屏外项","x":10,"y":1500,"w":20,"h":20,"inView":false}]})";
+    const PageSnapshot noAbsent = ParsePageSnapshotJson(noAbsentJson);
+    const std::wstring noAbsentText = FormatPageSnapshotForAgent(noAbsent);
+    const bool noAbsentOk = noAbsent.nodes.size() == 2
+        && noAbsent.nodes[1].absent == -1            // 未提供 ⇒ 保持 -1
+        && PageSnapshotNodeAbsent(noAbsent.nodes[1], noAbsent)   // y=1500 ≥ vh=800 ⇒ 屏外
+        && !PageSnapshotNodeAbsent(noAbsent.nodes[0], noAbsent)
+        && noAbsentText.find(L"屏外1") != std::wstring::npos;
+
+    const bool ok = fullOk && pagedOk && page2Ok && legacyOk && absentOk && noAbsentOk;
+    Emit(L"snapshot_reports_coverage_and_paging", ok,
+        ok ? L"" : (L"full=" + std::to_wstring(fullOk) + L" paged=" + std::to_wstring(pagedOk)
+            + L" page2=" + std::to_wstring(page2Ok) + L" legacy=" + std::to_wstring(legacyOk)
+            + L" absent=" + std::to_wstring(absentOk) + L" noAbsent=" + std::to_wstring(noAbsentOk)
+            + L" | fullText=" + fullText.substr(0, 160)
+            + L" | pagedText=" + pagedText.substr(0, 200)).c_str());
+}
+
+void CaseScrollWheelNotBlockedWhenViewportHasContent() {
+    // ★批 D（docs §47）：原先「可视区已有主内容 ⇒ 必须 confirmScroll 才准滚」的静默拒绝
+    //   已删（拿跨帧的「上一次」状态替模型决定该不该滚）。本用例反转钉新不变式：
+    //   **照滚**，`confirmScroll` 入参也不复存在。
     ResetAiActionSessionState(814);
     const std::string json =
         R"({"ok":true,"pageKind":"dom","vw":1699,"vh":780,)"
@@ -1391,14 +1705,11 @@ void CaseScrollWheelConfirmWhenViewportHasContent() {
         R"({"ref":"e3","role":"link","name":"卡片丙标题","href":"/c","inView":true,"x":390,"y":240,"w":180,"h":90}]})";
     AiNotePageSnapshot(ParsePageSnapshotJson(json));
     const auto tools = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring blocked = CallNamedTool(tools, L"scrollWheel",
+    const std::wstring scrolled = CallNamedTool(tools, L"scrollWheel",
         L"{\"scrollDirection\":1,\"scrollSteps\":5}");
-    const bool blockedOk = blocked.rfind(L"[错误]", 0) == 0
-        && blocked.find(L"confirmScroll") != std::wstring::npos
-        && blocked.find(L"clickRef") != std::wstring::npos;
-    const std::wstring allowed = CallNamedTool(tools, L"scrollWheel",
-        L"{\"scrollDirection\":1,\"scrollSteps\":5,\"confirmScroll\":true}");
-    const bool confirmOk = allowed.find(L"[错误]") == std::wstring::npos;
+    const bool scrolledOk = scrolled.rfind(L"[错误]", 0) != 0
+        && scrolled.find(L"[EXECUTED]") != std::wstring::npos
+        && scrolled.find(L"confirmScroll") == std::wstring::npos;
 
     ResetAiActionSessionState(815);
     AiNotePageKind(L"dom");
@@ -1407,13 +1718,15 @@ void CaseScrollWheelConfirmWhenViewportHasContent() {
         L"{\"scrollDirection\":1,\"scrollSteps\":3}");
     const bool emptyOk = empty.find(L"[错误]") == std::wstring::npos;
 
-    const bool ok = blockedOk && confirmOk && emptyOk;
-    Emit(L"scroll_wheel_confirm_when_viewport_has_content", ok,
-        ok ? L"" : (L"blocked=" + blocked.substr(0, 160) + L" | allowed=" + allowed.substr(0, 80)
-            + L" | empty=" + empty.substr(0, 80)).c_str());
+    const bool ok = scrolledOk && emptyOk;
+    Emit(L"scroll_wheel_not_blocked_when_viewport_has_content", ok,
+        ok ? L"" : (L"scrolled=" + scrolled.substr(0, 160) + L" | empty=" + empty.substr(0, 80)).c_str());
 }
 
-void CaseListFirstBlocksScrollAndOtherCards() {
+void CaseListFirstNoLongerBlocks() {
+    // ★批 D（docs §47）：原先「有列表第1项 ⇒ 禁止滚动 / 禁止点其它内容卡」两条静默拒绝
+    //   已删（判据是「重复卡片网格的第 1 项」+ 按 URL 形状判播放页）。反转钉新不变式：
+    //   滚动与点击**一律照发**，快照文本里也不再出现「列表第1项」这个已消失的概念。
     ResetAiActionSessionState(818);
     const std::string gridJson =
         R"({"ok":true,"pageKind":"dom","vw":1699,"vh":780,)"
@@ -1423,16 +1736,19 @@ void CaseListFirstBlocksScrollAndOtherCards() {
         R"({"ref":"e5","role":"link","name":"后面一张投稿","href":"/video/BV1ee","inView":true,"x":220,"y":240,"w":180,"h":90},)"
         R"({"ref":"e7","role":"link","name":"投稿","href":"/upload/video","inView":true,"x":80,"y":80,"w":48,"h":24}]})";
     AiNotePageSnapshot(ParsePageSnapshotJson(gridJson));
-    const auto tools = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring confirmBlocked = CallNamedTool(tools, L"scrollWheel",
-        L"{\"scrollDirection\":1,\"scrollSteps\":6,\"confirmScroll\":true}");
-    const bool noMindlessScroll = confirmBlocked.rfind(L"[错误]", 0) == 0
-        && confirmBlocked.find(L"列表第1项") != std::wstring::npos
-        && confirmBlocked.find(L"e1") != std::wstring::npos;
+    // clickRef 现在会真的走到扩展钩子（原先这些断言在「站点/列表」拒绝处就提前返回了）
+    AiActionHostHooks hooks;
+    hooks.onExecuteActions = [](const std::wstring&) -> std::wstring { return L"ok"; };
+    hooks.onClickRef = [](const std::wstring& ref, bool) -> std::wstring {
+        return L"clicked " + ref;
+    };
+    const auto tools = BuildAiActionExecuteTools(&hooks, {});
+    const std::wstring scroll = CallNamedTool(tools, L"scrollWheel",
+        L"{\"scrollDirection\":1,\"scrollSteps\":6}");
+    const bool scrollOk = scroll.rfind(L"[错误]", 0) != 0
+        && scroll.find(L"列表第1项") == std::wstring::npos;
     const std::wstring otherCard = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e5\"}");
-    const bool otherBlocked = otherCard.rfind(L"[错误]", 0) == 0
-        && otherCard.find(L"e1") != std::wstring::npos
-        && otherCard.find(L"e5") != std::wstring::npos;
+    const bool otherNotBlocked = otherCard.rfind(L"[错误]", 0) != 0;
     const std::wstring firstCard = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e1\"}");
     const bool firstNotListBan = firstCard.find(L"不要点") == std::wstring::npos
         && firstCard.find(L"另一张卡") == std::wstring::npos;
@@ -1447,29 +1763,31 @@ void CaseListFirstBlocksScrollAndOtherCards() {
         R"({"ref":"e3","role":"button","name":"点赞","x":40,"y":700,"w":48,"h":32}]})";
     AiNotePageSnapshot(ParsePageSnapshotJson(watchJson));
     const std::wstring watchFmt = FormatPageSnapshotForAgent(ParsePageSnapshotJson(watchJson));
-    const bool watchNoListFirst = watchFmt.find(L"列表第1项") == std::wstring::npos;
+    const bool watchNoListFirst = watchFmt.find(L"列表第1项") == std::wstring::npos
+        && watchFmt.find(L"播放页") == std::wstring::npos;   // 站点专属「播放页」建议也已删
     const std::wstring like = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e3\"}");
     const bool likeNotListBan = like.find(L"另一张卡") == std::wstring::npos;
     const std::wstring watchScroll = CallNamedTool(tools, L"scrollWheel",
-        L"{\"scrollDirection\":1,\"scrollSteps\":3,\"confirmScroll\":true}");
+        L"{\"scrollDirection\":1,\"scrollSteps\":3}");
     const bool watchScrollOk = watchScroll.find(L"列表第1项") == std::wstring::npos;
 
-    const bool ok = noMindlessScroll && otherBlocked && firstNotListBan && tabNotListBan
+    const bool ok = scrollOk && otherNotBlocked && firstNotListBan && tabNotListBan
         && watchNoListFirst && likeNotListBan && watchScrollOk;
-    Emit(L"list_first_blocks_scroll_and_other_cards", ok,
-        ok ? L"" : (L"scroll=" + confirmBlocked.substr(0, 140)
+    Emit(L"list_first_no_longer_blocks", ok,
+        ok ? L"" : (L"scroll=" + scroll.substr(0, 140)
             + L" | e5=" + otherCard.substr(0, 120)
             + L" | e1=" + firstCard.substr(0, 80)
             + L" | e7=" + tab.substr(0, 80)
             + L" | like=" + like.substr(0, 80)
+            + L" | wfmt=" + watchFmt.substr(0, 80)
             + L" | wscroll=" + watchScroll.substr(0, 80)).c_str());
 }
 
 void CaseWebBrowseAllowsVisionFallback() {
     ResetAiActionSessionState(816);
     AiNoteWebBrowseSession(true);
-    SetAiActionPlanGateEnabled(false);
-    // 「前台是浏览器」必须固定：本用例断言网页守卫生效，而该守卫读真实前台窗口，
+
+    // 「前台是浏览器」必须固定：本用例断言网页上下文的判断生效，而它读真实前台窗口，
     // 不固定就会随测试机当前前台而随机红/绿
     SetAiForegroundBrowserOverrideForTest(1);
     const auto tools = BuildAiActionExecuteTools(nullptr, {});
@@ -1482,10 +1800,14 @@ void CaseWebBrowseAllowsVisionFallback() {
 
     AiNotePageKind(L"dom");
     const std::wstring enter2 = CallNamedTool(tools, L"keyClick", L"{\"keyText\":\"Enter\"}");
-    const bool enterWithTree = enter2.find(L"searchOnPage") != std::wstring::npos;
+    // ★批 D（docs §47）：原先这里断言「有控件树 ⇒ 拦 Enter 并要求 searchOnPage」。
+    //   那条静默拒绝已删 → 反转成新不变式：**Enter 照发**，只多一句如实标注。
+    const bool enterWithTree = enter2.rfind(L"[错误]", 0) != 0
+        && enter2.find(L"searchOnPage") == std::wstring::npos
+        && enter2.find(L"[事实]") != std::wstring::npos;
 
     ResetAiActionSessionState(817);
-    SetAiActionPlanGateEnabled(false);
+
     const auto tools2 = BuildAiActionExecuteTools(nullptr, {});
     const std::wstring desk = CallNamedTool(tools2, L"locateAndClick",
         L"{\"target\":\"\u684c\u9762\u56fe\u6807\"}");
@@ -1499,7 +1821,7 @@ void CaseWebBrowseAllowsVisionFallback() {
 
 void CaseWebMixedPrefersTreeClick() {
     ResetAiActionSessionState(819);
-    SetAiActionPlanGateEnabled(false);
+
     SetAiForegroundBrowserOverrideForTest(1);   // 断言网页守卫（mouseClick 拒绝等）生效
     const std::string watchJson =
         R"({"ok":true,"pageKind":"mixed","canvasRatio":0.35,)"
@@ -1517,16 +1839,17 @@ void CaseWebMixedPrefersTreeClick() {
     const bool noGuess = click.rfind(L"[错误]", 0) == 0
         && click.find(L"clickRef") != std::wstring::npos;
 
-    AiNoteLocateFailed();
+    // ★引擎**不**拿「上一轮识图没找到目标」否决 completeTask（那条内联否决闸已删）：
+    //   模型要收工就如实收工 —— 刚记过一次定位失败也必须放行，否则它被锁死在任务里。
+    AiNoteLocateMiss();
     const std::wstring fakeDone = CallNamedTool(tools, L"completeTask",
         L"{\"reason\":\"\u5df2\u70b9\u8d5e\"}");
-    const bool rejectFake = fakeDone.rfind(L"[错误]", 0) == 0
-        && fakeDone.find(L"\u8bc6\u56fe\u672a\u627e\u5230") != std::wstring::npos;
+    const bool allowAfterMiss = fakeDone.find(L"[TASK_COMPLETE]") != std::wstring::npos;
     const std::wstring honest = CallNamedTool(tools, L"completeTask",
         L"{\"reason\":\"\u672a\u627e\u5230\u76ee\u6807\"}");
     const bool allowFail = honest.find(L"[TASK_COMPLETE]") != std::wstring::npos;
 
-    const bool ok = locToRef && noGuess && rejectFake && allowFail;
+    const bool ok = locToRef && noGuess && allowAfterMiss && allowFail;
     Emit(L"web_mixed_prefers_tree_click", ok,
         ok ? L"" : (L"loc=" + loc.substr(0, 120) + L" | click=" + click.substr(0, 80)
             + L" | fake=" + fakeDone.substr(0, 80) + L" | honest=" + honest.substr(0, 80)).c_str());
@@ -1562,7 +1885,8 @@ void CaseObservePageToolsPresent() {
     ResetAiActionSessionState(78);
     SetAiForegroundBrowserOverrideForTest(1);   // 断言网页守卫（mouseClick/Enter 拒绝）生效
     AiActionHostHooks hooks;
-    hooks.onObservePage = [](bool, const std::wstring&, const std::wstring&) -> std::wstring {
+    hooks.onObservePage = [](bool, const std::wstring&, const std::wstring&,
+                                int) -> std::wstring {
         AiNotePageKind(L"dom");
         return L"[dom] 登录 | https://example.com | 800x600 canvas=0.01 n=1\n"
             L"优先 clickRef / typeRef；失败再用 locateAndClick。旧 ref 已作废。\n"
@@ -1604,8 +1928,13 @@ void CaseObservePageToolsPresent() {
     const bool visionBlocked = mcDom.rfind(L"[错误]", 0) == 0
         && mcDom.find(L"clickRef") != std::wstring::npos
         && locDom.find(L"\u6b63\u5728\u6d4f\u89c8\u7f51\u9875") == std::wstring::npos
-        && typeAgain.find(L"\u641c\u7d22\u7ed3\u679c") != std::wstring::npos
-        && enterDom.find(L"typeRef") != std::wstring::npos;
+        // ★批 D（docs §47）：原先这两条断言钉的是「已在搜索结果页 ⇒ 拦 typeRef」
+        //   与「有控件树 ⇒ 拦 Enter」——两条静默拒绝都已删，反转成「照常执行」。
+        && typeAgain.rfind(L"[错误]", 0) != 0
+        && typeAgain.find(L"\u641c\u7d22\u7ed3\u679c") == std::wstring::npos
+        && typeAgain.find(L"typeRef") != std::wstring::npos
+        && enterDom.rfind(L"[错误]", 0) != 0
+        && enterDom.find(L"typeRef") == std::wstring::npos;
     AiNotePageKind(L"canvas");
     const std::wstring skipHtml = CallNamedTool(tools, L"observePage", L"{}");
     const std::wstring canvasClick = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e1\"}");
@@ -1613,8 +1942,12 @@ void CaseObservePageToolsPresent() {
         L"{\"ref\":\"e1\",\"text\":\"x\"}");
     const std::wstring force = CallNamedTool(tools, L"observePage", L"{\"force\":true}");
     const bool canvasGate = skipHtml.find(L"禁止再抓 HTML") != std::wstring::npos
-        && canvasClick.find(L"禁止 clickRef") != std::wstring::npos
-        && canvasType.find(L"禁止 typeRef") != std::wstring::npos
+        // ★批 D：画布页的拒绝文案改成**事实句**（「没有控件树 ⇒ 解析不了」），
+        //   不再是「禁止 clickRef/typeRef」（引擎不该用「禁止」掩盖能力缺失）。
+        && canvasClick.find(L"canvas") != std::wstring::npos
+        && canvasClick.find(L"没有可解析的 ref") != std::wstring::npos
+        && canvasType.find(L"canvas") != std::wstring::npos
+        && canvasType.find(L"没有可解析的 ref") != std::wstring::npos
         && force.find(L"[dom]") != std::wstring::npos;
     const bool runFlags = IsMacroActionRunToolName(L"clickRef")
         && IsMacroActionRunToolName(L"typeRef")
@@ -1662,21 +1995,36 @@ void CaseSearchOnPageTool() {
         && navQuery.find(L"\u6709\u5c71") != std::wstring::npos;
     const std::wstring again = CallNamedTool(tools, L"searchOnPage",
         L"{\"query\":\"\u6709\u5c71\u5148\u751f\"}");
-    const bool dupOk = again.find(L"搜索结果") != std::wstring::npos;
-    AiActionToolOptions fillOpts;
-    fillOpts.fillTableOnly = true;
-    const auto fillTools = BuildAiActionExecuteTools(nullptr, fillOpts);
-    bool fillHasSearch = false;
-    for (const auto& t : fillTools) {
-        if (t.name == L"searchOnPage") fillHasSearch = true;
+    // ★批 D（docs §47 / D1）：原先「已在「X」的搜索结果页 ⇒ 拒绝再搜」那条站点专属
+    //   静默拒绝已删 ⇒ 同一个词再搜一次也**照执行**（要不要再搜由模型判断）。
+    const bool dupOk = again.rfind(L"[错误]", 0) != 0
+        && again.find(L"[EXECUTED]") != std::wstring::npos
+        && again.find(L"搜索结果") == std::wstring::npos;
+    // ★批 E（docs §48）反转：原先这里还断言「动态填表场景下 searchOnPage 被裁掉」
+    //   （按提示词子串裁工具表）。裁表整族已撤销 ⇒ 该断言连同构造一起删，
+    //   改为断言**工具表永远给全**：同一份工具表里 openWebpage / searchOnPage / runProgram
+    //   必须都在（被裁掉的就是它们，包括那条「游戏里查玩法的唯一出口」fetchWebPage）。
+    const auto fullTools = BuildAiActionExecuteTools(nullptr, {});
+    bool hasSearch = false, hasOpenWeb = false, hasRunProg = false, hasFetchWeb = false;
+    for (const auto& t : fullTools) {
+        if (t.name == L"searchOnPage") hasSearch = true;
+        if (t.name == L"openWebpage") hasOpenWeb = true;
+        if (t.name == L"runProgram") hasRunProg = true;
+        if (t.name == L"fetchWebPage") hasFetchWeb = true;
     }
-    const bool ok = needSiteOk && navOk && dupOk && !fillHasSearch;
+    const bool toolTableComplete = hasSearch && hasOpenWeb && hasRunProg && hasFetchWeb;
+    const bool ok = needSiteOk && navOk && dupOk && toolTableComplete;
     Emit(L"search_on_page_tool", ok,
         ok ? L"" : (needSite + L" | " + searched + L" | " + navUrl + L" | " + again).c_str());
     ResetAiActionSessionState(79);
 }
 
 void CaseClickRefNavigatesSpaceHref() {
+    // ★批 D（docs §47）反转：clickRef 现在**只如实点击**——
+    //   ① 不再按站点启发式「直接导航」（原来命中某站空间 URL 就跳过点击自己 onNavigatePage）；
+    //   ② 不再有「列表第1项」拦点别的卡；
+    //   ③ 连续两次未跳转时不再**自己从快照挑一个链接导航过去**。
+    //   相对路径解析也改成与站点无关（`/space/28626598` 不再被魔改成 space.* 域名）。
     ResetAiActionSessionState(810);
     const std::wstring searchUrl = L"https://search.bilibili.com/all?keyword=x";
     const std::wstring spaceUrl = L"https://space.bilibili.com/28626598";
@@ -1687,15 +2035,11 @@ void CaseClickRefNavigatesSpaceHref() {
     const std::wstring rSlashSpace = ResolvePageNavigationUrl(L"/space/28626598", searchUrl);
     const bool resolveOk =
         rSpace == spaceUrl
-        && rAll.empty()
-        && rBare.empty()
-        && rSlashSpace == spaceUrl
+        && rAll.empty()                                  // 同路径筛选项（/all?vt=1）不算导航
+        && rBare == L"https://search.bilibili.com/28626598"  // 相对路径按当前站点解析
+        && rSlashSpace == L"https://search.bilibili.com/space/28626598"
         && PageUrlsSameDocument(searchUrl, L"https://search.bilibili.com/all?vt=9&keyword=x")
-        && !PageUrlsSameDocument(searchUrl, spaceUrl)
-        && LooksLikeEmptyUserSpaceUrl(L"https://space.bilibili.com/")
-        && LooksLikeGuessedUserSpaceUrl(spaceUrl)
-        && ShouldDirectNavigateSnapshotHref(spaceUrl)
-        && !ShouldDirectNavigateSnapshotHref(L"https://www.bilibili.com/video/BV1aa");
+        && !PageUrlsSameDocument(searchUrl, spaceUrl);
 
     std::wstring navUrl;
     int clickCount = 0;
@@ -1732,9 +2076,10 @@ void CaseClickRefNavigatesSpaceHref() {
 
     navUrl.clear();
     const std::wstring clicked = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e1\"}");
-    const bool navClick = clickCount == 0
-        && navUrl.find(L"space.bilibili.com/28626598") != std::wstring::npos
-        && clicked.find(L"打开") != std::wstring::npos;
+    // 空间链接也走**点击**（不再由引擎直接导航）
+    const bool navClick = clickCount == 1
+        && navUrl.empty()
+        && clicked.find(L"clicked e1") != std::wstring::npos;
 
     ResetAiActionSessionState(811);
     navUrl.clear();
@@ -1743,10 +2088,13 @@ void CaseClickRefNavigatesSpaceHref() {
     AiNotePageKind(L"dom");
     const std::wstring tab1 = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e2\"}");
     const std::wstring tab2 = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e3\"}");
-    const bool streakNav = clickCount == 2
-        && tab1.find(L"页面未跳转") != std::wstring::npos
-        && tab2.find(L"打开") != std::wstring::npos
-        && navUrl.find(L"space.bilibili.com/28626598") != std::wstring::npos;
+    // 连续两次未跳转：只如实报计数，**不再**替模型挑链接导航
+    const bool streakHonest = clickCount == 2
+        && navUrl.empty()
+        && tab1.find(L"[事实]") != std::wstring::npos
+        && tab2.find(L"[事实]") != std::wstring::npos
+        && tab2.find(L"2 次") != std::wstring::npos
+        && tab2.find(L"space.bilibili.com") == std::wstring::npos;
 
     ResetAiActionSessionState(813);
     navUrl.clear();
@@ -1763,37 +2111,50 @@ void CaseClickRefNavigatesSpaceHref() {
     ResetAiActionSessionState(812);
     AiNotePageUrl(L"https://www.bilibili.com/");
     const auto tools2 = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring guessed = CallNamedTool(tools2, L"openWebpage",
+    const std::wstring spaceGuess = CallNamedTool(tools2, L"openWebpage",
         L"{\"targetPath\":\"https://space.bilibili.com/28626598\"}");
-    const bool stillBlockGuess = guessed.find(L"[错误]") == 0;
+    // 「不要猜用户数字 UID」那条站点专属拒绝已删 ⇒ 照开
+    const bool guessAllowed = spaceGuess.rfind(L"[错误]", 0) != 0
+        && spaceGuess.find(L"猜") == std::wstring::npos;
 
     AiActionToolOptions opts;
     opts.allowAbsolutePointer = false;
-    const auto wheelTools = BuildAiActionExecuteTools(nullptr, opts);
-    const std::wstring wheel = CallNamedTool(wheelTools, L"scrollWheel",
+    const auto noImgTools = BuildAiActionExecuteTools(nullptr, opts);
+    // 无图：mouseClick 照执行 + 如实标注（批 D 由「拒绝」改成「执行 + 标注」）
+    const std::wstring noImgClick = CallNamedTool(noImgTools, L"mouseClick",
+        L"{\"x\":10,\"y\":20}");
+    const bool noImgOk = noImgClick.rfind(L"[错误]", 0) != 0
+        && noImgClick.find(L"[EXECUTED]") != std::wstring::npos
+        && noImgClick.find(L"本轮没有把截图回传给模型") != std::wstring::npos;
+    // scrollWheel 的 x/y 在无图时被工具自己忽略（本来就没有可映射的基准），照滚
+    const std::wstring wheel = CallNamedTool(noImgTools, L"scrollWheel",
         L"{\"scrollDirection\":0,\"x\":10,\"y\":20}");
-    const bool wheelOk = wheel.find(L"[EXECUTED]") != std::wstring::npos
-        && wheel.find(L"绝对坐标") == std::wstring::npos;
+    const bool wheelOk = wheel.rfind(L"[错误]", 0) != 0
+        && wheel.find(L"[EXECUTED]") != std::wstring::npos
+        && wheel.find(L"禁止") == std::wstring::npos;
 
-    const bool ok = resolveOk && spaceFromSearch && navClick && streakNav
-        && videoClicksElement && stillBlockGuess && wheelOk;
+    const bool ok = resolveOk && spaceFromSearch && navClick && streakHonest
+        && videoClicksElement && guessAllowed && noImgOk && wheelOk;
     std::wstring flags = L" f=";
     flags.push_back(resolveOk ? L'1' : L'0');
     flags.push_back(spaceFromSearch ? L'1' : L'0');
     flags.push_back(navClick ? L'1' : L'0');
-    flags.push_back(streakNav ? L'1' : L'0');
+    flags.push_back(streakHonest ? L'1' : L'0');
     flags.push_back(videoClicksElement ? L'1' : L'0');
-    flags.push_back(stillBlockGuess ? L'1' : L'0');
+    flags.push_back(guessAllowed ? L'1' : L'0');
+    flags.push_back(noImgOk ? L'1' : L'0');
     flags.push_back(wheelOk ? L'1' : L'0');
     Emit(L"click_ref_navigates_space_href", ok,
         ok ? L"" : (flags + L" rSpace=" + rSpace + L" rAll=[" + rAll + L"] rBare=[" + rBare
             + L"] rSlash=" + rSlashSpace
             + L" | " + spaceOpen + L" | " + clicked + L" | " + tab1 + L" | " + tab2
-            + L" | " + videoClick + L" | " + guessed + L" | " + wheel).c_str());
+            + L" | " + videoClick + L" | " + spaceGuess + L" | " + noImgClick + L" | " + wheel).c_str());
     ResetAiActionSessionState(810);
 }
 
-void CaseSamePageClickHintScoped() {
+void CaseSamePageClickNotBlocked() {
+    // ★批 D（docs §47）反转：同页点击不再被任何闸拦（原「连续两次未跳转 ⇒ 拒绝 +
+    //   引擎自己挑一个链接导航过去」整块删除）。新不变式：**照点**，只如实报计数。
     ResetAiActionSessionState(811);
     int clickCount = 0;
     std::wstring navUrl;
@@ -1823,8 +2184,11 @@ void CaseSamePageClickHintScoped() {
         && like.find(L"请点 href 含 space.bilibili.com") == std::wstring::npos
         && like.find(L"页内按钮") != std::wstring::npos;
     const std::wstring up = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e3\"}");
-    const bool upNav = up.find(L"[错误]") != 0
-        && navUrl.find(L"space.bilibili.com") != std::wstring::npos;
+    // ★批 D：作者链接也走**点击**（引擎不再自己挑链接导航）
+    const bool upClicksElement = up.find(L"[错误]") != 0
+        && clickCount == 2
+        && navUrl.empty()
+        && up.find(L"clicked e3") != std::wstring::npos;
 
     ResetAiActionSessionState(812);
     clickCount = 0;
@@ -1836,10 +2200,12 @@ void CaseSamePageClickHintScoped() {
         R"({"ref":"e2","role":"link","name":"有山先生","href":"//space.bilibili.com/28626598"}]})";
     AiNotePageSnapshot(ParsePageSnapshotJson(searchJson));
     const std::wstring tab = CallNamedTool(tools, L"clickRef", L"{\"ref\":\"e1\"}");
-    const bool searchHint = tab.find(L"请点 href 含 space.bilibili.com") != std::wstring::npos;
+    // ★批 D：那条站点专属药方（「请点 href 含 space.bilibili.com 的卡片」）已删 ⇒ 反向断言
+    const bool hintGone = tab.find(L"请点 href 含 space.bilibili.com") == std::wstring::npos
+        && tab.find(L"[事实]") != std::wstring::npos;
 
-    const bool ok = likeOk && upNav && searchHint;
-    Emit(L"same_page_click_hint_scoped", ok,
+    const bool ok = likeOk && upClicksElement && hintGone;
+    Emit(L"same_page_click_not_blocked", ok,
         ok ? L"" : (like + L" | " + up + L" | " + tab).c_str());
     ResetAiActionSessionState(811);
 }
@@ -1953,12 +2319,14 @@ void CaseNonUniversalShortcutGuard() {
     const std::wstring ctrlA = CallNamedTool(tools, L"keyClick",
         L"{\"keyText\":\"a\",\"holdLeftCtrl\":true}");
     const bool universal = ctrlA.find(L"[EXECUTED]") != std::wstring::npos;
+    // ★批 D（docs §47）：原先「网页标签内 ⇒ 拦 Ctrl+T/N」的静默拒绝已删。
+    //   反转钉新不变式：**照按**，回执里补一句「会新开一个标签页」的事实。
     AiNotePageKind(L"mixed");
     const std::wstring ctrlT = CallNamedTool(tools, L"keyClick",
         L"{\"keyText\":\"t\",\"holdLeftCtrl\":true,\"confirmShortcut\":true,\"observeAfter\":false}");
-    const bool noNewTab = ctrlT.find(L"[错误]") != std::wstring::npos
-        && ctrlT.find(L"新标签") != std::wstring::npos
-        && ctrlT.find(L"[EXECUTED]") == std::wstring::npos;
+    const bool newTabAnnotated = ctrlT.rfind(L"[错误]", 0) != 0
+        && ctrlT.find(L"[EXECUTED]") != std::wstring::npos
+        && ctrlT.find(L"新开一个标签页") != std::wstring::npos;
     // Skill 不再教 F12 / 裸 Ctrl+H（应用专属）；允许出现 Ctrl+Home（表格回 A1，通用）
     auto hasBareCtrlH = [](const std::wstring& s) {
         for (size_t p = 0; (p = s.find(L"Ctrl+H", p)) != std::wstring::npos; ) {
@@ -1974,9 +2342,15 @@ void CaseNonUniversalShortcutGuard() {
         && !hasBareCtrlH(MacroActionUsageSkill())
         && MacroActionAgentSkill().find(L"F12") == std::wstring::npos
         && !hasBareCtrlH(MacroActionAgentSkill());
-    const bool ok = blocked && confirmed && universal && skillClean && noNewTab;
+    const bool ok = blocked && confirmed && universal && skillClean && newTabAnnotated;
+    std::wstring flags = L" f=";
+    flags.push_back(blocked ? L'1' : L'0');
+    flags.push_back(confirmed ? L'1' : L'0');
+    flags.push_back(universal ? L'1' : L'0');
+    flags.push_back(skillClean ? L'1' : L'0');
+    flags.push_back(newTabAnnotated ? L'1' : L'0');
     Emit(L"non_universal_shortcut_guard", ok,
-        ok ? L"" : L"shortcut guard / skill F12 Ctrl+H cleanup failed");
+        ok ? L"" : (flags + L" ctrlH=" + ctrlH.substr(0, 120) + L" ctrlT=" + ctrlT.substr(0, 120)).c_str());
 }
 
 void CaseAllowNestedUnderCap() {
@@ -2004,42 +2378,31 @@ void CaseRejectNestedAtCap() {
     Emit(L"reject_nested_ai_action_at_cap", ok, r.c_str());
 }
 
-void CasePlanGateRequiresMemo() {
+void CasePlanGateRemoved() {
+    // ★批 D（docs §47）：「先写 goal/todos 才准动手」的计划门闩**整族已删**。
+    //   本用例由旧 `plan_gate_requires_memo` **反转**而来（旧断言是 blocked=[错误]+
+    //   updateTaskMemo —— 那正是「守卫把模型锁在门外」）。新不变式：
+    //   **没写任何备忘时执行类工具也照常执行**，备忘工具本身保留。
     ResetAiActionSessionState(424242);
-    SetAiActionPlanGateEnabled(true);
     const auto tools = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring blocked = CallNamedTool(tools, L"quickInput",
+    const std::wstring first = CallNamedTool(tools, L"quickInput",
         L"{\"inputText\":\"hello\",\"observeAfter\":false}");
-    const bool blockedOk = blocked.find(L"[错误]") != std::wstring::npos
-        && blocked.find(L"updateTaskMemo") != std::wstring::npos;
+    const bool noLock = first.rfind(L"[错误]", 0) != 0
+        && first.find(L"[EXECUTED]") != std::wstring::npos
+        && first.find(L"updateTaskMemo") == std::wstring::npos;
     const std::wstring memo = CallNamedTool(tools, L"updateTaskMemo",
         L"{\"section\":\"goal\",\"note\":\"\u6d4b\u8bd5\u76ee\u6807\"}");
-    const bool memoOk = memo.find(L"[错误]") == std::wstring::npos
-        && AiActionPlanGateIsOpen();
-    const std::wstring allowed = CallNamedTool(tools, L"quickInput",
-        L"{\"inputText\":\"hello\",\"observeAfter\":false}");
-    const bool allowedOk = allowed.find(L"[EXECUTED]") != std::wstring::npos;
-    // listWindows 只读，无计划也应放行
-    ResetAiActionSessionState(424243);
-    SetAiActionPlanGateEnabled(true);
-    const auto tools2 = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring list = CallNamedTool(tools2, L"listWindows", L"{}");
-    const bool listOk = list.find(L"updateTaskMemo") == std::wstring::npos;
-    // note 里写 goal: 且不带 section，也应解锁
-    ResetAiActionSessionState(424244);
-    SetAiActionPlanGateEnabled(true);
-    const auto tools3 = BuildAiActionExecuteTools(nullptr, {});
-    const std::wstring prefixMemo = CallNamedTool(tools3, L"updateTaskMemo",
+    const bool memoOk = memo.find(L"[错误]") == std::wstring::npos;
+    const std::wstring prefixMemo = CallNamedTool(tools, L"updateTaskMemo",
         L"{\"note\":\"goal: \u6253\u5f00B\u7ad9\\ntodos:\\n1) searchOnPage\"}");
-    const bool prefixOk = prefixMemo.find(L"[错误]") == std::wstring::npos
-        && AiActionPlanGateIsOpen();
-    SetAiActionPlanGateEnabled(false);
-    const bool ok = blockedOk && memoOk && allowedOk && listOk && prefixOk;
-    Emit(L"plan_gate_requires_memo", ok,
-        ok ? L"" : L"plan gate blocked/unlock failed");
+    const bool prefixOk = prefixMemo.find(L"[错误]") == std::wstring::npos;
+
+    const bool ok = noLock && memoOk && prefixOk;
+    Emit(L"plan_gate_removed", ok,
+        ok ? L"" : (first + L" | " + memo + L" | " + prefixMemo).c_str());
 }
 
-void CaseLocateTargetLengthAndOutsourceReject() {
+void CaseLocateTargetLengthGuard() {
     ResetAiActionSessionState(434343);
     const auto tools = BuildAiActionExecuteTools(nullptr, {});
     std::wstring longTarget(kMaxLocateAndClickTargetChars + 5, L'x');
@@ -2052,16 +2415,17 @@ void CaseLocateTargetLengthAndOutsourceReject() {
     const bool longOk = longR.find(L"[错误]") != std::wstring::npos
         && longR.find(L"过长") != std::wstring::npos;
 
-    const bool looksLocate = LooksLikeLocateOnlyOutsourcePrompt(L"点击确定按钮");
-    const bool looksMulti = !LooksLikeLocateOnlyOutsourcePrompt(
-        L"点击确定然后输入姓名并保存");
+    // ★批 D（docs §47）：原先这里钉着「禁止用 aiActionExecute 外包定位」那条
+    //   **对提示词做文本匹配**的判据（要求 nested 回执里出现 locateAndClick）。
+    //   判据已删 ⇒ 断言反过来：回执里**不再**出现那条外包禁令文案
+    //   （不再断言它必然成功：嵌套动作还要过「AI 模型已配置」这道真实的参数校验）。
     const std::wstring nested = CallSubmitTool(tools,
         L"{\"actions\":[{\"type\":\"aiActionExecute\",\"aiPrompt\":\"\u70b9\u51fb\u786e\u5b9a\u6309\u94ae\"}]}");
-    const bool nestedOk = nested.find(L"[错误]") != std::wstring::npos
-        && nested.find(L"locateAndClick") != std::wstring::npos;
-    const bool ok = longOk && looksLocate && looksMulti && nestedOk;
-    Emit(L"locate_target_and_outsource_reject", ok,
-        ok ? L"" : L"locate harden failed");
+    const bool nestedOk = nested.find(L"外包") == std::wstring::npos
+        && nested.find(L"禁止用 aiActionExecute") == std::wstring::npos;
+    const bool ok = longOk && nestedOk;
+    Emit(L"locate_target_length_guard", ok,
+        ok ? L"" : (longR + L" | " + nested).c_str());
 }
 
 void CaseHistorySidebarAndBusyGuards() {
@@ -2082,26 +2446,24 @@ void CaseHistorySidebarAndBusyGuards() {
     }
 
     ResetAiActionSessionState(454546);
-    // ★这条闸只针对「网页内容在动」：必须显式声明前台是浏览器窗口，
-    //   否则（桌面游戏/自绘应用）没有控件树可退，视觉是唯一手段，绝不能拦。
+    // ★批 D（docs §47 / D6④）：视觉闸只保留**判断 + 留痕**，不再拦 locateAndClick。
+    //   本用例由旧 `history_sidebar_and_busy_guards` 的「高频动态 ⇒ 拦识图」**反转**：
+    //   同样一份宿主信号下，定位请求**必须照发**（回执里不允许再出现「动态干扰过大」）。
     SetAiForegroundBrowserOverrideForTest(1);
     NoteAiActionUiBusy(0.20, true);
-    const bool busy = AiActionUiTooBusyForVisionLocate();
-    const bool skipLa = AiActionShouldSkipLookahead();
+    const bool busy = AiActionUiTooBusyForVisionLocate();   // 判断照做（只留痕）
     const auto tools2 = BuildAiActionExecuteTools(nullptr, {});
-    // 计划门闩关：直接测 busy locate
-    SetAiActionPlanGateEnabled(false);
+
     const std::wstring loc = CallNamedTool(tools2, L"locateAndClick",
         L"{\"target\":\"\u67e5\u770b\u66f4\u591a\"}");
-    const bool locBlocked = loc.find(L"[错误]") != std::wstring::npos
-        && loc.find(L"动态") != std::wstring::npos
+    const bool locNotBlocked = loc.find(L"动态") == std::wstring::npos
         && loc.find(L"Ctrl+T") == std::wstring::npos
         && loc.find(L"Ctrl+t") == std::wstring::npos;
 
     ResetAiActionSessionState(454547);
     AiNotePageKind(L"mixed");
     NoteAiActionUiBusy(0.20, true);
-    SetAiActionPlanGateEnabled(false);
+
     const auto tools3 = BuildAiActionExecuteTools(nullptr, {});
     const std::wstring like = CallNamedTool(tools3, L"locateAndClick",
         L"{\"target\":\"\u89c6\u9891\u4e0b\u65b9\u5de6\u4fa7\u5927\u62c7\u6307\u5411\u4e0a\u7684\u70b9\u8d5e\u6309\u94ae\"}");
@@ -2109,9 +2471,9 @@ void CaseHistorySidebarAndBusyGuards() {
         && like.find(L"\u6b63\u5728\u6d4f\u89c8\u7f51\u9875") == std::wstring::npos
         && like.find(L"Ctrl+T") == std::wstring::npos;
 
-    const bool ok = histRejected && descClean && busy && skipLa && locBlocked && likeFallback;
+    const bool ok = histRejected && descClean && busy && locNotBlocked && likeFallback;
     Emit(L"history_sidebar_and_busy_guards", ok,
-        ok ? L"" : L"history/busy host guards failed");
+        ok ? L"" : (L"loc=" + loc.substr(0, 120) + L" | like=" + like.substr(0, 120)).c_str());
 }
 
 void CaseLocateMultiTargets() {
@@ -2122,7 +2484,7 @@ void CaseLocateMultiTargets() {
     ResetAiActionSessionState(484848);
     SetAiForegroundBrowserOverrideForTest(-1);
     SetAiSpreadsheetForegroundOverrideForTest(0);
-    SetAiActionPlanGateEnabled(false);
+
 
     AiActionHostHooks hooks;
     std::vector<std::wstring> got;
@@ -2136,7 +2498,7 @@ void CaseLocateMultiTargets() {
         return L"[1/2] 已点击卡片\n[2/2] 已点击草坪";
     };
     int singleCalls = 0;
-    hooks.onLocateAndClick = [&](const std::wstring&, int, const std::wstring&, int) -> std::wstring {
+    hooks.onLocateAndClick = [&](const std::wstring&, int, const std::wstring&, int, int) -> std::wstring {
         ++singleCalls;
         return L"locateAndClick 已点击屏幕(10,20)";
     };
@@ -2167,177 +2529,6 @@ void CaseLocateMultiTargets() {
     Emit(L"locate_multi_targets", ok, detail.c_str());
 }
 
-void CaseUiLayoutMemoryAndGrid() {
-    // 布局记忆 + 相对网格（通用能力）：定位成功一次就记住坐标；窗口身份/分辨率变化即失效；
-    // 点下去没变化即作废；网格按 (行,列) 直接算坐标。
-    AiUiLayoutClear();
-    bool ok = true;
-    std::wstring detail;
-
-    AiUiLayoutKey key;
-    key.target = L"\u8349\u576a";
-    key.windowIdentity = L"PvZ|Class|PvZ.exe|1920x1080";
-    key.screenW = 2560;
-    key.screenH = 1440;
-
-    const AiUiLayoutRect r{100, 200, 160, 260};
-    AiUiLayoutRect got{};
-    ok = ok && !AiUiLayoutRecall(key, got);            // 记忆前取不到
-    AiUiLayoutRemember(key, r);
-    ok = ok && AiUiLayoutRecall(key, got) && got.cx() == 130 && got.cy() == 230;
-
-    AiUiLayoutKey other = key;                          // 换窗/改客户区 → 新界面
-    other.windowIdentity = L"PvZ|Class|PvZ.exe|1280x720";
-    ok = ok && !AiUiLayoutRecall(other, got);
-    AiUiLayoutKey res = key;                            // 改分辨率 → 失效
-    res.screenW = 1920;
-    ok = ok && !AiUiLayoutRecall(res, got);
-    AiUiLayoutKey otherTarget = key;                    // 不同目标 → 不同条目
-    otherTarget.target = L"\u50f5\u5c38\u5361";
-    ok = ok && !AiUiLayoutRecall(otherTarget, got);
-
-    const AiUiGridSpec grid{130, 230, 120, 100, 7, 4};
-    AiUiLayoutRememberGrid(key, grid);
-    AiUiGridSpec gotGrid{};
-    ok = ok && AiUiLayoutRecallGrid(key, gotGrid)
-        && gotGrid.stepX == 120 && gotGrid.stepY == 100;
-    // ★单次「点下去没变化」**不删**条目（实测每次点击都误报）：仍能取回；
-    //   连续两次才判过期 → 回退真识图（条目仍在，下次 Remember 刷新它）
-    AiUiLayoutNoteClickNoEffect(key);
-    ok = ok && AiUiLayoutRecall(key, got) && AiUiLayoutStaleCount() == 0;
-    AiUiLayoutNoteClickNoEffect(key);
-    ok = ok && !AiUiLayoutRecall(key, got) && AiUiLayoutStaleCount() == 1;
-    ok = ok && AiUiLayoutCount() == 1;              // 条目没被删
-    AiUiLayoutRemember(key, r);                     // 重新识图成功 → 恢复可用
-    ok = ok && AiUiLayoutRecall(key, got) && AiUiLayoutStaleCount() == 0;
-    // 多次定位取平均：偏 6px 的第二次会把坐标往中间拉（越用越准；具体权重看样本数）
-    AiUiLayoutRect r2{106, 206, 166, 266};
-    AiUiLayoutRemember(key, r2);
-    AiUiLayoutRect avg{};
-    ok = ok && AiUiLayoutRecall(key, avg) && avg.cx() > 130 && avg.cx() <= 136;
-    // 偏得太多（>24px）→ 直接换新值，不拉平均
-    AiUiLayoutRect r3{500, 600, 560, 660};
-    AiUiLayoutRemember(key, r3);
-    ok = ok && AiUiLayoutRecall(key, avg) && avg.cx() == 530;
-    AiUiLayoutForget(key);
-    ok = ok && !AiUiLayoutRecall(key, got) && !AiUiLayoutRecallGrid(key, gotGrid);
-    ok = ok && AiUiLayoutCount() == 0;
-
-    int x = 0, y = 0;
-    const bool c00 = AiUiGridCellCenter(grid, 0, 0, x, y) && x == 130 && y == 230;
-    const bool c01 = AiUiGridCellCenter(grid, 0, 1, x, y) && x == 250 && y == 230;
-    const bool c10 = AiUiGridCellCenter(grid, 1, 0, x, y) && x == 130 && y == 330;
-    const bool cNeg = AiUiGridCellCenter(grid, -1, -1, x, y) && x == 10 && y == 130;
-    const bool cOob = !AiUiGridCellCenter(grid, 999, 0, x, y);
-    ok = ok && c00 && c01 && c10 && cNeg && cOob;
-    if (!(c00 && c01 && c10 && cNeg && cOob)) detail += L" cell";
-    AiUiLayoutClear();
-    Emit(L"ui_layout_memory_and_grid", ok, detail.c_str());
-}
-
-void CaseUiLayoutSignatureGate() {
-    // 「点错按钮」的闸：记住坐标时留外观签名；命中前用当前画面重算，
-    // 签名不一致（界面变了）→ 必须拒绝命中，回退真识图。
-    AiUiLayoutClear();
-    bool ok = true;
-    std::wstring detail;
-    AiUiLayoutKey key;
-    key.target = L"确认";
-    key.windowIdentity = L"Game|Class|g.exe|1280x720";
-    key.screenW = 1920;
-    key.screenH = 1080;
-    const AiUiLayoutRect r{100, 100, 140, 140};
-    AiUiLayoutRemember(key, r);
-
-    // 造一帧：目标区亮块
-    const int w = 400, h = 300;
-    std::vector<uint8_t> frame(static_cast<size_t>(w) * h, 30);
-    for (int y = 95; y < 145; ++y)
-        for (int x = 95; x < 145; ++x) frame[static_cast<size_t>(y) * w + x] = 220;
-    uint8_t sig[kAiUiSigN * kAiUiSigN]{};
-    const bool gotSig = AiUiLayoutSignature(frame.data(), w, h, w, r, sig);
-    AiUiLayoutRememberSignature(key, sig);
-    // 同一帧 → 必须通过
-    uint8_t sig2[kAiUiSigN * kAiUiSigN]{};
-    AiUiLayoutSignature(frame.data(), w, h, w, r, sig2);
-    const bool sameOk = gotSig && AiUiLayoutSignatureMatches(key, sig2);
-
-    // 目标区被换掉（面板关了/换页）→ 必须拒绝
-    std::vector<uint8_t> frame2(static_cast<size_t>(w) * h, 30);
-    for (int y = 95; y < 145; ++y)
-        for (int x = 95; x < 145; ++x) frame2[static_cast<size_t>(y) * w + x] = 40;
-    uint8_t sig3[kAiUiSigN * kAiUiSigN]{};
-    AiUiLayoutSignature(frame2.data(), w, h, w, r, sig3);
-    const bool changedRejected = !AiUiLayoutSignatureMatches(key, sig3);
-    ok = ok && sameOk && changedRejected;
-    if (!(sameOk && changedRejected)) detail += L" sig(same=" + std::to_wstring(sameOk ? 1 : 0)
-        + L",changed=" + std::to_wstring(changedRejected ? 1 : 0) + L")";
-    AiUiLayoutClear();
-    Emit(L"ui_layout_signature_gate", ok, detail.c_str());
-}
-
-void CaseUiGridPeriodDetect() {
-    bool ok = true;
-    std::wstring detail;
-    auto makeGrid = [](int w, int h, int ox, int oy, int stepX, int stepY,
-                       int cols, int rows, int cw, int ch) {
-        std::vector<uint8_t> img(static_cast<size_t>(w) * h, 40);
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                const int cx = ox + c * stepX;
-                const int cy = oy + r * stepY;
-                for (int yy = cy - ch / 2; yy <= cy + ch / 2; ++yy) {
-                    if (yy < 0 || yy >= h) continue;
-                    for (int xx = cx - cw / 2; xx <= cx + cw / 2; ++xx) {
-                        if (xx < 0 || xx >= w) continue;
-                        img[static_cast<size_t>(yy) * w + xx] =
-                            static_cast<uint8_t>(170 + ((xx * 7 + yy * 13) % 60));
-                    }
-                }
-            }
-        }
-        return img;
-    };
-    // ① 规则网格（一行 9 格、列距 120、行距 100）：锚点给一格，应检出列距 120
-    {
-        const int w = 1200, h = 400;
-        const auto img = makeGrid(w, h, 100, 200, 120, 100, 9, 3, 70, 60);
-        const AiUiLayoutRect anchor{70, 170, 130, 230};
-        int px = 0, py = 0;
-        const bool got = AiUiDetectGridPeriod(img.data(), w, h, w, anchor, 16, 420, px, py);
-        const bool okX = got && std::abs(px - 120) <= 4;
-        const bool okY = !got || py == 0 || std::abs(py - 100) <= 4;
-        ok = ok && okX && okY;
-        if (!(okX && okY))
-            detail += L" grid(px=" + std::to_wstring(px) + L",py=" + std::to_wstring(py) + L")";
-    }
-    // ② 不规则画面（噪声）：不许报出周期，否则会把不相干的地方当格子点
-    {
-        const int w = 900, h = 300;
-        std::vector<uint8_t> noise(static_cast<size_t>(w) * h);
-        unsigned int s = 0x12345678u;
-        for (auto& v : noise) {
-            s = s * 1664525u + 1013904223u;
-            v = static_cast<uint8_t>((s >> 19) & 0xFF);
-        }
-        const AiUiLayoutRect anchor{200, 120, 260, 180};
-        int px = 0, py = 0;
-        const bool got = AiUiDetectGridPeriod(noise.data(), w, h, w, anchor, 16, 420, px, py);
-        ok = ok && !got;
-        if (got) detail += L" noise(px=" + std::to_wstring(px) + L",py=" + std::to_wstring(py) + L")";
-    }
-    // ③ 周期远小于元素自身 → 判为假周期（实测：暂停菜单上误报 16×16px，会去点 79 列）
-    {
-        const int w = 1200, h = 400;
-        const auto img = makeGrid(w, h, 100, 200, 8, 8, 120, 40, 6, 6);
-        const AiUiLayoutRect anchor{70, 170, 130, 230};   // 60×60 的锚点，周期只有 8px
-        int px = 0, py = 0;
-        const bool got = AiUiDetectGridPeriod(img.data(), w, h, w, anchor, 16, 420, px, py);
-        ok = ok && !got;
-        if (got) detail += L" tiny(px=" + std::to_wstring(px) + L",py=" + std::to_wstring(py) + L")";
-    }
-    Emit(L"ui_grid_period_detect", ok, detail.c_str());
-}
 
 void CaseLocateDecimalCoordParse() {
     // 模型回小数坐标是常态（带 grounding 训练/长推理链的尤其多）。旧实现用 wcstol 逐个抓整数：
@@ -2373,35 +2564,6 @@ void CaseLocateDecimalCoordParse() {
         }
     }
     Emit(L"locate_decimal_coord_parse", ok, detail.c_str());
-}
-
-void CaseMissSelfCorrectPrompt() {
-    // 「错点自纠」的 prompt 契约（备用项）：必须 ① 说清红叉=刚点过的错点、
-    // ② 给出放大图与错点的坐标上下文、③ 只要**绝对坐标**、④ 明确禁止偏移量。
-    // 依据：PrecisionCUA（arXiv 2604.13019）——红叉+绝对坐标让 GPT-5.4-Pro 13.5%→41.0%，
-    // 而「用锚点估算相对位置」的提示词把它打到 18.5%。
-    bool ok = true;
-    std::wstring detail;
-    const std::wstring p = BuildMissSelfCorrectPrompt(L"自选僵尸卡牌", 768, 768, 226, 169);
-    const bool hasCross = p.find(L"红色十字") != std::wstring::npos
-        || p.find(L"红叉") != std::wstring::npos;
-    const bool hasFailed = p.find(L"226") != std::wstring::npos
-        && p.find(L"169") != std::wstring::npos;
-    const bool hasTarget = p.find(L"自选僵尸卡牌") != std::wstring::npos;
-    const bool noOffsetAsk = p.find(L"不要输出偏移量") != std::wstring::npos
-        || p.find(L"❌不要输出偏移量") != std::wstring::npos;
-    const bool absAsk = p.find(L"绝对坐标") != std::wstring::npos;
-    const bool notFound = p.find(L"NOT_FOUND") != std::wstring::npos;
-    ok = ok && hasCross && hasFailed && hasTarget && noOffsetAsk && absAsk && notFound;
-    if (!ok) {
-        detail += L" cross=" + std::to_wstring(hasCross ? 1 : 0)
-            + L" failed=" + std::to_wstring(hasFailed ? 1 : 0)
-            + L" target=" + std::to_wstring(hasTarget ? 1 : 0)
-            + L" noOffset=" + std::to_wstring(noOffsetAsk ? 1 : 0)
-            + L" abs=" + std::to_wstring(absAsk ? 1 : 0)
-            + L" notFound=" + std::to_wstring(notFound ? 1 : 0);
-    }
-    Emit(L"miss_self_correct_prompt", ok, detail.c_str());
 }
 
 void CaseOcrDirectClickPick() {
@@ -2549,11 +2711,11 @@ void CaseNoBatchSelectSpecialCase() {
     ResetAiActionSessionState(494949);          // 复位标记
     SetAiForegroundBrowserOverrideForTest(-1);
     SetAiSpreadsheetForegroundOverrideForTest(0);
-    SetAiActionPlanGateEnabled(false);
+
 
     int hostCalls = 0;
     AiActionHostHooks hooks;
-    hooks.onLocateAndClick = [&](const std::wstring&, int, const std::wstring&, int) -> std::wstring {
+    hooks.onLocateAndClick = [&](const std::wstring&, int, const std::wstring&, int, int) -> std::wstring {
         ++hostCalls;
         return L"locateAndClick 已点击屏幕(10,20)";
     };
@@ -2580,7 +2742,7 @@ void CaseNoBatchSelectSpecialCase() {
     ResetAiActionSessionState(494950);
     int hostCalls2 = 0;
     AiActionHostHooks hooks2;
-    hooks2.onLocateAndClick = [&](const std::wstring&, int, const std::wstring&, int) -> std::wstring {
+    hooks2.onLocateAndClick = [&](const std::wstring&, int, const std::wstring&, int, int) -> std::wstring {
         ++hostCalls2;
         return L"ok";
     };
@@ -2606,7 +2768,7 @@ void CaseGameForegroundVisionAllowed() {
     NoteAiActionUiBusy(0.42, true);
     const bool gameAllowed = !AiActionUiTooBusyForVisionLocate();
     const bool gameRecognized = AiActionGameForegroundLikely();
-    SetAiActionPlanGateEnabled(false);
+
     const auto toolsGame = BuildAiActionExecuteTools(nullptr, {});
     const std::wstring gameLoc = CallNamedTool(toolsGame, L"locateAndClick", L"{\"target\":\"僵尸\"}");
     const bool gameNotBusyBlocked = gameLoc.find(L"动态干扰过大") == std::wstring::npos;
@@ -3107,76 +3269,19 @@ void CaseLogicConvertCollapseInstanceData() {
         saveAsOk ? L"" : L"短文件名被误折叠或未保留");
 }
 
-void CaseLocateFailKeyBlock() {
-    ResetAiActionSessionState(42);
-    AiNoteLocateFailed();
-    const auto tools = BuildAiActionExecuteTools(nullptr, {});
-    const AgentTool* key = nullptr;
-    const AgentTool* hot = nullptr;
-    for (const auto& t : tools) {
-        if (t.name == L"keyClick") key = &t;
-        if (t.name == L"hotkeyShortcut") hot = &t;
-    }
-    bool ok = key && hot && key->execute && hot->execute;
-    std::wstring detail;
-    if (ok) {
-        const std::wstring f12 = key->execute(L"{\"keyText\":\"F12\"}");
-        if (f12.find(L"上轮 locate") == std::wstring::npos) {
-            ok = false;
-            detail = L"F12未硬拦";
-        }
-        const std::wstring ent = key->execute(L"{\"keyText\":\"Enter\"}");
-        if (ent.find(L"上轮 locate") != std::wstring::npos) {
-            ok = false;
-            detail = L"Enter被误拦";
-        }
-        const std::wstring sav = hot->execute(L"{\"name\":\"save\"}");
-        if (sav.find(L"上轮 locate") == std::wstring::npos) {
-            ok = false;
-            detail = L"hotkey未硬拦";
-        }
-    } else {
-        detail = L"缺工具";
-    }
-    AiClearLocateFailKeyBlock();
-    Emit(L"locate_fail_key_block", ok, detail.c_str());
-}
-
 void CaseLocateRetryHardCap() {
     ResetAiActionSessionState(42);
     const int initial = AiLocateRetryCount();
-    AiNoteLocateFailed();
+    AiNoteLocateMiss();
     const int afterOne = AiLocateRetryCount();
-    AiNoteLocateFailed();
+    AiNoteLocateMiss();
     const int afterTwo = AiLocateRetryCount();
-    AiClearLocateFailKeyBlock();
+    AiResetLocateMiss();
     const int afterClear = AiLocateRetryCount();
     const bool ok = initial == 0 && afterOne == 1 && afterTwo == 2 && afterClear == 0;
     Emit(L"locate_retry_hard_cap", ok,
         (ok ? L"" : (L"count=" + std::to_wstring(initial) + L"," + std::to_wstring(afterOne)
             + L"," + std::to_wstring(afterTwo) + L"," + std::to_wstring(afterClear)).c_str()));
-}
-
-void CaseFillTableOnlyTools() {
-    AiActionToolOptions opts;
-    opts.fillTableOnly = true;
-    const auto tools = BuildAiActionExecuteTools(nullptr, opts);
-    bool hasQi = false, hasLocate = false, hasRun = false, hasHot = false, hasWeb = false;
-    bool hasObs = false, hasClickRef = false, hasTypeRef = false;
-    for (const auto& t : tools) {
-        if (t.name == L"quickInput") hasQi = true;
-        if (t.name == L"locateAndClick") hasLocate = true;
-        if (t.name == L"runProgram") hasRun = true;
-        if (t.name == L"hotkeyShortcut") hasHot = true;
-        if (t.name == L"openWebpage") hasWeb = true;
-        if (t.name == L"observePage") hasObs = true;
-        if (t.name == L"clickRef") hasClickRef = true;
-        if (t.name == L"typeRef") hasTypeRef = true;
-    }
-    const bool ok = hasQi && hasLocate && hasObs && hasClickRef && hasTypeRef
-        && !hasRun && !hasHot && !hasWeb;
-    Emit(L"fill_table_only_tools", ok,
-        ok ? L"" : L"白名单过滤不符合预期");
 }
 
 void CaseListOcrHeuristic() {
@@ -3423,63 +3528,25 @@ void CaseLogicConvertWritebackPromote() {
     Emit(L"logic_convert_writeback_promote", ok, detail.c_str());
 }
 
-void CaseLookaheadAcceptReject() {
-    // 纯逻辑：界面未变丢弃；变化则给出 hint
-    const bool discardUnchanged = ShouldDiscardAiLookahead(true, false, false);
-    const bool keepDynamicOnly = !ShouldDiscardAiLookahead(true, true, false);
-    const bool discardDialog = ShouldDiscardAiLookahead(false, false, true);
-
-    AiActionLookahead la;
-    std::atomic_bool stop{false};
-    la.SetFetchOverrideForTest([&](const std::wstring&, const std::atomic_bool&) {
-        ToolCallRecord tc;
-        tc.id = L"1";
-        tc.name = L"keyClick";
-        tc.arguments = L"{\"keyText\":\"Enter\"}";
-        return std::vector<ToolCallRecord>{tc};
-    });
-    AgentConfig cfg;
-    cfg.model = L"test";
-    cfg.apiUrl = L"http://127.0.0.1";
-    la.BeginAfterTools(cfg, L"[goal] t", L"quickInput -> ok", stop, nullptr);
-    const std::wstring hintOk = la.TakeHintAfterObserve(false, false, false, 2000);
-    const bool hintReady = hintOk.find(L"keyClick") != std::wstring::npos
-        || hintOk.find(L"预规划") != std::wstring::npos;
-
-    AiActionLookahead la2;
-    la2.SetFetchOverrideForTest([&](const std::wstring&, const std::atomic_bool&) {
-        ToolCallRecord tc;
-        tc.name = L"wait";
-        return std::vector<ToolCallRecord>{tc};
-    });
-    la2.BeginAfterTools(cfg, L"[goal] t", L"click", stop, nullptr);
-    const std::wstring hintDrop = la2.TakeHintAfterObserve(true, false, false, 2000);
-    const bool dropped = hintDrop.empty();
-
-    AiLookaheadCachedPlan plan;
-    plan.ready = true;
-    ToolCallRecord t2;
-    t2.name = L"locateAndClick";
-    t2.arguments = L"{\"target\":\"OK\"}";
-    plan.toolCalls = {t2};
-    const std::wstring fmt = FormatAiLookaheadHint(plan);
-    const bool fmtOk = fmt.find(L"locateAndClick") != std::wstring::npos;
-
-    const bool ok = discardUnchanged && keepDynamicOnly && discardDialog
-        && hintReady && dropped && fmtOk;
-    Emit(L"lookahead_accept_reject", ok,
-        ok ? L"" : L"lookahead unit logic failed");
-}
+// ★批 D（docs §47）：宿主预规划（引擎每轮工具批之后自己再发一次 API 猜下一步）
+//   整条链路连同它的两个用例（预规划接受/丢弃、预规划等待预算）已整体删除 ——
+//   引擎替模型先想一步 = 引擎在决策。用例层面不再有可钉的不变式：
+//   它不是一个「闸」，而是一整块被删掉的引擎行为。
 
 void CaseRejectAbsoluteNoImage() {
+    // ★批 D（docs §47）反转：原先「无截图 ⇒ 拒绝绝对坐标点击」改成**执行 + 如实标注**
+    //   （宿主本来就有截图映射，模型可能知道得比守卫多）。用例名保留旧名以便对照 git 历史，
+    //   断言换成新不变式：**照点**，回执里带那句事实。
     AiActionToolOptions opts;
     opts.allowAbsolutePointer = false;
     const auto tools = BuildAiActionExecuteTools(nullptr, opts);
     const std::wstring r = CallSubmitTool(tools,
         L"{\"actions\":[{\"type\":\"mouseClick\",\"x\":100,\"y\":200}]}");
-    const bool ok = r.rfind(L"[错误]", 0) == 0
-        && r.find(L"绝对坐标") != std::wstring::npos;
-    Emit(L"reject_absolute_pointer_no_image", ok, r.c_str());
+    const bool ok = r.rfind(L"[错误]", 0) != 0
+        && r.find(L"[EXECUTED]") != std::wstring::npos
+        && r.find(L"本轮没有把截图回传给模型") != std::wstring::npos
+        && r.find(L"禁止") == std::wstring::npos;
+    Emit(L"absolute_pointer_no_image_annotated", ok, r.c_str());
 }
 
 void CaseAllowAbsoluteWithOpt() {
@@ -3794,6 +3861,25 @@ void CaseParseColorHex() {
     Emit(L"parse_color_hex", ok, FormatColorHex(r, g, b).c_str());
 }
 
+/// 颜色的「匹配度」必须统一在 0~100（找色/颜色匹配过去写 `100 - 色差`，
+/// 而色差是单通道最大差 0~255 ⇒ 会出负数）。钉住四档：
+/// 同色=100、容差内、超过 100 的色差=0（不是负）、极端值仍钳在 0~100。
+void CaseColorMatchScorePercent() {
+    bool ok = ColorMatchScorePercent(0) == 100
+        && ColorMatchScorePercent(4) == 96
+        && ColorMatchScorePercent(16) == 84
+        && ColorMatchScorePercent(100) == 0      // 过去这里是 0，再大就是负数
+        && ColorMatchScorePercent(255) == 0;
+    std::wstring detail;
+    if (!ok) {
+        detail = L"0→" + std::to_wstring(ColorMatchScorePercent(0))
+            + L" 16→" + std::to_wstring(ColorMatchScorePercent(16))
+            + L" 100→" + std::to_wstring(ColorMatchScorePercent(100))
+            + L" 255→" + std::to_wstring(ColorMatchScorePercent(255));
+    }
+    Emit(L"color_match_score_percent", ok, ok ? L"" : detail.c_str());
+}
+
 void CaseBuildFindColor() {
     nlohmann::json j = {
         {"type", "findColor"},
@@ -3944,11 +4030,60 @@ void CaseResolveVisionAmbiguousInImageAsNorm1000() {
     const bool mappedOk = ok && note.find(L"1000") != std::wstring::npos
         && y1 >= 70 && y1 <= 90 && y2 >= 100 && y2 <= 120
         && screenY >= 180 && screenY <= 280;
-    Emit(L"resolve_vision_ambiguous_in_image_as_norm1000", mappedOk,
+    // ★★歧义必须**留痕**（docs §61）：本帧 1024×576 ≤1000 ⇒ 「按像素读」同样成立，
+    //   判据（四个数都 ≤1000）**认不出**这两套。纪律是不挑一种当结论、也不沉默，
+    //   而是把另一种读法的原值一起写进诊断 —— 让真实日志去回答模型按哪套回答。
+    const bool notedAmbiguity = ok
+        && note.find(L"无法区分") != std::wstring::npos
+        && note.find(L"677,134,717,186") != std::wstring::npos;
+    Emit(L"resolve_vision_ambiguous_in_image_as_norm1000", mappedOk && notedAmbiguity,
         (L"api=[" + std::to_wstring(x1) + L"," + std::to_wstring(y1) + L","
             + std::to_wstring(x2) + L"," + std::to_wstring(y2) + L"] c=("
             + std::to_wstring(cx) + L"," + std::to_wstring(cy)
             + L") screenY≈" + std::to_wstring(screenY) + L" " + note).c_str());
+}
+
+/// 反过来钉：**两套读法不可能同时成立时，不许说「无法区分」**
+/// （否则「有歧义」这句话会退化成恒真的噪声，等于没有留痕）。
+void CaseResolveVisionAmbiguityNotClaimedWhenImpossible() {
+    int x1 = 356, y1 = 963, x2 = 375, y2 = 993;   // 993 > 720+2 ⇒ 「按像素读」不成立
+    std::wstring note;
+    const bool ok = ResolveVisionRectToApiImage(x1, y1, x2, y2, 1280, 720, 2560, 1440, &note);
+    Emit(L"resolve_vision_ambiguity_not_claimed_when_impossible",
+        ok && note.find(L"无法区分") == std::wstring::npos,
+        (L"note=" + note).c_str());
+}
+
+/// ★落盘**端到端**（docs §61）：这条链路的失败形态是**静默**的 —— 日志根本不生成，
+/// 而"没生成"只有在**真写一次、真读回来**时才发现得了（纯逻辑自检测不到路径解析、
+/// 目录可写性、编码、裁剪这几段）。本 exe 就链着 `qst_desktop_tools`，所以能真做。
+/// ⚠ 只**追加**、绝不清理：它跑在产品目录里，清理会删掉用户真实的日志。
+void CaseMacroDebugLogFileRoundTrip() {
+    const std::wstring marker = L"[自检] macro_debug_log_file_roundtrip pid="
+        + std::to_wstring(GetCurrentProcessId());
+    qst::desktop_tools::AppendMacroDebugLogFile(marker);
+    const std::wstring path = qst::desktop_tools::MacroDebugLogFilePath();
+
+    // 读**尾部**（文件上限 4MB，标记刚追加在末尾 ⇒ 从头读固定长度会读不到）
+    std::wstring content;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") == 0 && fp) {
+        _fseeki64(fp, 0, SEEK_END);
+        const long long size = _ftelli64(fp);
+        const long long keepBytes = 64 * 1024;
+        const long long from = size > keepBytes ? size - keepBytes : 0;
+        // 对齐到 wchar 边界，否则读出来是错位的乱码（UTF-16LE）
+        _fseeki64(fp, from - (from % 2), SEEK_SET);
+        std::vector<wchar_t> buf(static_cast<size_t>(keepBytes / 2) + 1);
+        const size_t got = fread(buf.data(), sizeof(wchar_t), buf.size(), fp);
+        fclose(fp);
+        content.assign(buf.data(), got);
+    }
+    const bool ok = !content.empty()
+        && content.find(marker) != std::wstring::npos
+        && content.find(L"[自检]") != std::wstring::npos;
+    Emit(L"macro_debug_log_file_roundtrip", ok,
+        (L"path=" + path + L" readChars=" + std::to_wstring(content.size())).c_str());
 }
 
 void CaseResolveVisionSrcPixels() {
@@ -4016,6 +4151,42 @@ void CaseActionVerbExpansion() {
     // 「移动端设备」里的「移动」不是鼠标动作词；无其它动作词 → 默认 ToolExecute（非识图）
     Emit(L"route_mobile_device_not_move",
         ClassifyAiActionRoute(L"移动端设备的配置", true) == AiActionRouteKind::ToolExecute, L"");
+}
+
+// ★ openWebpage 的「打开目标」解析（2026-09-28）：用户任务写「打开哔哩哔哩」，
+//   而旧实现只认完整 URL ⇒ 模型两次空调用、两轮白烧（实测报障，见 docs §4.16）。
+//   这里测**纯函数**（不会真开浏览器）：站点名/裸域名/内置页/不认识四种。
+void CaseResolveOpenWebpageTarget() {
+    const bool ok = ResolveOpenWebpageTargetUrl(L"哔哩哔哩") == L"https://www.bilibili.com/"
+        && ResolveOpenWebpageTargetUrl(L"B站") == L"https://www.bilibili.com/"
+        && ResolveOpenWebpageTargetUrl(L"bilibili") == L"https://www.bilibili.com/"
+        && ResolveOpenWebpageTargetUrl(L"www.bilibili.com") == L"https://www.bilibili.com"
+        && ResolveOpenWebpageTargetUrl(L"https://example.com/a?b=1") == L"https://example.com/a?b=1"
+        && ResolveOpenWebpageTargetUrl(L"edge://history") == L"edge://history"
+        && ResolveOpenWebpageTargetUrl(L"随便什么不认识的东西").empty();
+    // 提示文案必须**可执行**（列出可用写法）——它是给模型看的纠错信息
+    const std::wstring hint = OpenWebpageTargetHint();
+    const bool hintOk = hint.find(L"完整网址") != std::wstring::npos
+        && hint.find(L"站点名") != std::wstring::npos
+        && hint.find(L"哔哩哔哩") != std::wstring::npos;
+    Emit(L"resolve_open_webpage_target", ok && hintOk, hint.c_str());
+}
+void CaseNeedScreenCaptureForInteractionVerbs() {
+    // ★ 用户实测报障（2026-09-28）：「帮我打开哔哩哔哩，给up主"有山先生"主页的第一个视频点赞。」
+    //   —— 旧判据只认「点击」这类**字面词**，而「点赞」语义上就是点屏幕 ⇒ 判成"无需看屏"
+    //   ⇒ 未勾选带截图时首轮无图，模型盲着干（点到了帮助中心那种地方）。
+    const bool yes =
+        AiActionPromptLikelyNeedsScreenCapture(
+            L"帮我打开哔哩哔哩，给up主\"有山先生\"主页的第一个视频点赞。")
+        && AiActionPromptLikelyNeedsScreenCapture(L"把第一个商品加入购物车并下单")
+        && AiActionPromptLikelyNeedsScreenCapture(L"关注这个up主并收藏视频")
+        && AiActionPromptLikelyNeedsScreenCapture(L"登录后提交表单")
+        && AiActionPromptLikelyNeedsScreenCapture(L"翻到下一页继续找");
+    // ⚠ 纯数据任务**仍不许**判成"要看屏"（否则每次都白截一帧、白花 token）
+    const bool no = !AiActionPromptLikelyNeedsScreenCapture(L"读取 D:\\a.xlsx 第三列求和")
+        && !AiActionPromptLikelyNeedsScreenCapture(L"分析变量 count，若大于0则按 Enter")
+        && !AiActionPromptLikelyNeedsScreenCapture(L"把这段文字翻译成英文");
+    Emit(L"need_screen_capture_interaction_verbs", yes && no, L"");
 }
 
 void CaseNeedScreenScrollCapture() {
@@ -4203,6 +4374,11 @@ void CaseModelSupportsVision() {
         && ModelSupportsVision(L"deepseek-v4-flash")
         && ModelSupportsVision(L"deepseek v4.1 flash")
         && ModelSupportsVision(L"deepseek-v4.1-flash-vision")
+        // ★★ 网页 AI 桥接（`web` / `doubao-web` …）**能传图**：网页通道经扩展把图上传进对话
+        //   （`AttachImagesToPage` → `UploadImages`），PlanTurn 也真收到 imagesAttached。
+        //   ⚠ 曾经漏判 ⇒ 观察截图一律不上传，模型看不到屏幕（用户实测报障）。
+        && ModelSupportsVision(L"web")
+        && ModelSupportsVision(L"doubao-web")
         && !ModelSupportsVision(L"deepseek-chat")
         && !ModelSupportsVision(L"deepseek-r1")
         && !ModelSupportsVision(L"deepseek-reasoner")
@@ -4358,13 +4534,13 @@ void CaseVisionPromptNormalizedContract() {
 // ── 宿主有 DOM 钩子时 locateAndClick 不再「报错让模型再调一次」──────────
 void CaseLocateToolDefersToHostDom() {
     ResetAiActionSessionState(941);
-    SetAiActionPlanGateEnabled(false);
+
     const std::string watchJson =
         R"({"ok":true,"pageKind":"dom","url":"https://example.com/","nodes":[)"
         R"({"ref":"e1","role":"button","name":"登录","x":10,"y":200,"w":120,"h":36,"inView":true}]})";
     AiNotePageSnapshot(ParsePageSnapshotJson(watchJson));
     AiActionHostHooks hooks;
-    hooks.onLocateAndClick = [](const std::wstring& target, int, const std::wstring&, int) {
+    hooks.onLocateAndClick = [](const std::wstring& target, int, const std::wstring&, int, int) {
         return L"locateAndClick 已按控件树点击「" + target
             + L"」(e1，DOM 精确点击，未截屏/未识图)";
     };
@@ -4385,24 +4561,8 @@ void CaseLocateToolDefersToHostDom() {
     ResetAiActionSessionState(941);
 }
 
-// ── 预规划（lookahead）预算：不许把主链路拖住 ─────────────────────────
-void CaseLookaheadWaitBudget() {
-    const bool budgetOk = kAiLookaheadAfterObserveWaitMs <= 500
-        && kAiLookaheadSkipObserveWaitMs <= 300
-        && kAiLookaheadMaxStartsPerAction == 2;
-    ResetAiActionSessionState(942);
-    NoteAiActionUiBusy(-1.0, false);
-    const bool firstOk = !AiActionShouldSkipLookahead();
-    NoteAiActionLookaheadStarted();
-    NoteAiActionLookaheadStarted();
-    const bool cappedOk = AiActionShouldSkipLookahead();
-    AiActionLookahead la;
-    la.Cancel();  // 无在途预取时 Cancel 必须立刻返回（旧实现在此 join 到 API 超时）
-    la.Reset();
-    Emit(L"lookahead_wait_budget", budgetOk && firstOk && cappedOk,
-        budgetOk ? L"" : L"budget constants drifted");
-    ResetAiActionSessionState(942);
-}
+// ★批 D（docs §47）：宿主预规划整条链路已删（连它的等待预算常量与次数上限一起），
+//   原「预规划等待预算」用例随之删除 —— 没有「闸」可反转，只有一整块行为被移除。
 
 // ── 浏览器 DOM 优先门禁（判错会点到别的窗口 → 必须可自检）────────────
 void CaseDomFirstActionGate() {
@@ -4482,9 +4642,9 @@ void CasePickSnapshotRefForInput() {
 // ── typeByLabel：一次调用完成「按标签填写」────────────────────────────
 void CaseTypeByLabelTool() {
     ResetAiActionSessionState(951);
-    SetAiActionPlanGateEnabled(false);
+
     AiActionHostHooks hooks;
-    hooks.onObservePage = [](bool, const std::wstring&, const std::wstring& query) {
+    hooks.onObservePage = [](bool, const std::wstring&, const std::wstring& query, int) {
         AiNotePageKind(L"dom");
         const std::string json =
             R"({"ok":true,"pageKind":"dom","url":"https://example.com/login","nodes":[)"
@@ -4540,11 +4700,18 @@ void CaseTypeByLabelTool() {
 // ── UIA 台账 / 按编号触发：工具层（宿主钩子契约）──────────────────────
 void CaseUiControlTools() {
     ResetAiActionSessionState(952);
-    SetAiActionPlanGateEnabled(false);
+
     AiActionHostHooks hooks;
     int listedMax = 0;
-    hooks.onListUiControls = [&listedMax](int maxCount) -> std::wstring {
+    // ⚠ 签名与 `AiActionHostHooks::onListUiControls` **必须一致**（三参）。
+    //   加了 typeFilter/nameFilter 之后，过滤在**宿主侧**做 —— 这里如实记下来，
+    //   下面 `filterOk` 会核对「过滤真的传到宿主了」。
+    std::wstring listedTypeFilter, listedNameFilter;
+    hooks.onListUiControls = [&](int maxCount, const std::wstring& typeFilter,
+                                     const std::wstring& nameFilter) -> std::wstring {
         listedMax = maxCount;
+        listedTypeFilter = typeFilter;
+        listedNameFilter = nameFilter;
         return L"前台窗口：记事本\n[1] 按钮 \"保存\" @100,200\n[2] 输入框 \"文件名\" @300,400\n";
     };
     int invokedId = 0;
@@ -4599,14 +4766,23 @@ void CaseUiControlTools() {
         L"{\"id\":1,\"name\":\"\u4fdd\u5b58\"}");
     const bool badOk = nameOnlyOk && badName.rfind(L"[错误]", 0) == 0
         && noHookList.rfind(L"[错误]", 0) == 0 && noHookInvoke.rfind(L"[错误]", 0) == 0;
-    // 台账是只读工具：不能被「先写 goal/todos」门闩拦住（否则第一步就没法看界面）
-    const bool readExempt = CheckAiActionPlanGate(L"listUiControls").empty();
+    // ★批 D（docs §47）：原先这里断言「台账是只读工具，不该被计划门闩拦住」——
+    //   门闩整族已删，只读/执行工具都不再有任何「先写 goal/todos」的前置条件。
+    //   （只读工具确实照常可用，见上面 noHookList 的钩子缺失报错口径。）
+    const bool readExempt = true;
+    // ★过滤参数必须**原样透传到宿主**（过滤在宿主侧做 ⇒ 省 token；这里钉住"没被吞掉"）。
+    //   同时钉住 maxCount 的**独立**透传（过滤不该影响它）。
+    const std::wstring filtered = CallNamedTool(tools, L"listUiControls",
+        L"{\"maxCount\":30,\"typeFilter\":\"ListItem\",\"nameFilter\":\"计算机\"}");
+    const bool filterOk = listedTypeFilter == L"ListItem"
+        && listedNameFilter == L"计算机" && listedMax == 30
+        && filtered.find(L"[1]") != std::wstring::npos;
     // invokeUiControl 属于会改界面的执行类工具
     const bool listed = IsMacroActionRunToolName(L"invokeUiControl")
         && IsMacroExecutionToolName(L"invokeUiControl")
         && IsMacroExecutionToolName(L"listUiControls");
     const bool ok = hasList && hasInvoke && ledgerOk && invOk && skipOk && errOk && badOk
-        && readExempt && listed;
+        && readExempt && listed && filterOk;
     Emit(L"ui_control_tools", ok,
         ok ? L"" : (L"ledger=" + ledger.substr(0, 60) + L" | inv=" + inv.substr(0, 60)
             + L" | skip=" + invSkip.substr(0, 40) + L" | err=" + invErr.substr(0, 40)
@@ -4614,78 +4790,74 @@ void CaseUiControlTools() {
     ResetAiActionSessionState(952);
 }
 
-// ── 定位模板缓存：键归一 / 命中门槛 / 存取作废 ────────────────────────
-void CaseLocateCache() {
-    // 键归一：剥通用后缀、折叠空白、统一小写
-    const bool normOk = AiLocateNormalizeTarget(L"保存按钮") == L"保存"
-        && AiLocateNormalizeTarget(L"  Save  ") == L"save"
-        && AiLocateNormalizeTarget(L"下一题") == L"下一题";
-    // 命中门槛：高分且唯一才接受
-    AiLocateCacheAcceptInput ok1;
-    ok1.bestScore = 95.0;
-    const bool accept1 = ShouldAcceptAiLocateCacheHit(ok1);
-    AiLocateCacheAcceptInput low;
-    low.bestScore = 80.0;
-    const bool rejectLow = !ShouldAcceptAiLocateCacheHit(low);
-    AiLocateCacheAcceptInput twin;
-    twin.bestScore = 95.0;
-    twin.secondScore = 93.0;
-    twin.bestDistToCached = 3;
-    twin.secondDistToCached = 5;
-    const bool rejectTwin = !ShouldAcceptAiLocateCacheHit(twin);   // 同屏两个都像 → 回识图
-    AiLocateCacheAcceptInput farAway;   // 注意：不能叫 far（MSVC 保留字）
-    farAway.bestScore = 95.0;
-    farAway.secondScore = 93.0;
-    farAway.bestDistToCached = 3;
-    farAway.secondDistToCached = 220;
-    const bool acceptFar = ShouldAcceptAiLocateCacheHit(farAway);  // 次佳离得远 → 仍可信
-    AiLocateCacheAcceptInput weak2;
-    weak2.bestScore = 95.0;
-    weak2.secondScore = 85.0;
-    weak2.bestDistToCached = 3;
-    weak2.secondDistToCached = 5;
-    const bool acceptWeak2 = ShouldAcceptAiLocateCacheHit(weak2);  // 次佳明显低 → 可信
 
-    // 存取 / 作废 / 清理（用 2×2 位图当模板，只验证生命周期不验证匹配）
-    AiLocateCacheClear();
-    AiLocateCacheKey key;
-    key.target = L"保存";
-    key.windowTitle = L"记事本";
-    key.windowClass = L"Notepad";
-    key.captureW = 1280;
-    key.captureH = 720;
-    HBITMAP tmpl = CreateBitmap(2, 2, 1, 32, nullptr);
-    AiLocateCacheStore(key, tmpl, 100, 200, 80, 80);
-    AiLocateCacheEntry got;
-    const bool stored = AiLocateCacheSize() == 1
-        && AiLocateCacheLookup(key, &got) && got.screenX == 100 && got.screenY == 200
-        && got.tmpl != nullptr;
-    // 窗口变了 → 键不同 → 查不到（不许跨窗口复用坐标）
-    AiLocateCacheKey other = key;
-    other.windowTitle = L"另一个窗口";
-    AiLocateCacheEntry miss;
-    const bool windowScoped = !AiLocateCacheLookup(other, &miss);
-    // 点击无效果 → 作废
-    AiLocateCacheInvalidate(key);
-    const bool invalidated = AiLocateCacheSize() == 0 && !AiLocateCacheLookup(key, &got);
-    // 再存一条，Clear 必须释放干净
-    AiLocateCacheStore(key, CreateBitmap(2, 2, 1, 32, nullptr), 10, 20, 40, 40);
-    AiLocateCacheClear();
-    const bool cleared = AiLocateCacheSize() == 0;
-
-    const bool ok = normOk && accept1 && rejectLow && rejectTwin && acceptFar
-        && acceptWeak2 && stored && windowScoped && invalidated && cleared;
-    Emit(L"locate_cache", ok,
-        ok ? L"" : (L"norm=" + std::to_wstring(normOk ? 1 : 0) + L" acc="
-            + std::to_wstring(accept1 ? 1 : 0) + L"/" + std::to_wstring(rejectLow ? 1 : 0)
-            + L"/" + std::to_wstring(rejectTwin ? 1 : 0) + L"/"
-            + std::to_wstring(acceptFar ? 1 : 0) + L"/" + std::to_wstring(acceptWeak2 ? 1 : 0)
-            + L" store=" + std::to_wstring(stored ? 1 : 0) + L" scope="
-            + std::to_wstring(windowScoped ? 1 : 0) + L" inv="
-            + std::to_wstring(invalidated ? 1 : 0) + L" clr="
-            + std::to_wstring(cleared ? 1 : 0)).c_str());
-    AiLocateCacheClear();
+HBITMAP CreateDibSection32(int w, int h) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // 自上而下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = GetDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        return nullptr;
+    }
+    return bmp;
 }
+
+// 从 src 的 (sx,sy) 起裁一块 w×h 出来（自检专用）
+HBITMAP BlitSubRect32(HBITMAP src, int sx, int sy, int w, int h) {
+    if (!src || w <= 0 || h <= 0) return nullptr;
+    HBITMAP dst = CreateDibSection32(w, h);
+    if (!dst) return nullptr;
+    HDC dc = GetDC(nullptr);
+    HDC sd = CreateCompatibleDC(dc);
+    HDC dd = CreateCompatibleDC(dc);
+    BOOL ok = FALSE;
+    if (sd && dd) {
+        HGDIOBJ o1 = SelectObject(sd, src);
+        HGDIOBJ o2 = SelectObject(dd, dst);
+        ok = BitBlt(dd, 0, 0, w, h, sd, sx, sy, SRCCOPY);
+        SelectObject(dd, o2);
+        SelectObject(sd, o1);
+    }
+    if (sd) DeleteDC(sd);
+    if (dd) DeleteDC(dd);
+    ReleaseDC(nullptr, dc);
+    if (!ok) {
+        DeleteObject(dst);
+        return nullptr;
+    }
+    return dst;
+}
+
+// 冻结帧：一张已拍好的屏幕区域 + 它的屏幕矩形；帧源按请求裁它的子区。
+// `outOfRange` 是**坐标口径**的直接判据 —— 搜索区是按 `s->box` 算的，
+// 若 box 被存成**帧内**坐标，搜索区会整块落到冻结区外面（真 bug 时 3/3 全越界）。
+struct FrozenFrame {
+    HBITMAP bmp = nullptr;
+    int x1 = 0;
+    int y1 = 0;
+    int x2 = 0;
+    int y2 = 0;
+    int outOfRange = 0;
+};
+
+HBITMAP FrozenFrameSource(int x1, int y1, int x2, int y2, void* user) {
+    auto* ff = static_cast<FrozenFrame*>(user);
+    if (!ff || !ff->bmp || x2 <= x1 || y2 <= y1) return nullptr;
+    if (x1 < ff->x1 || y1 < ff->y1 || x2 > ff->x2 || y2 > ff->y2) {
+        ++ff->outOfRange;
+        return nullptr;
+    }
+    return BlitSubRect32(ff->bmp, x1 - ff->x1, y1 - ff->y1, x2 - x1, y2 - y1);
+}
+
 
 // ── 非浏览器链路：宽框/地址栏 Enter/URL 判定（本轮日志回归）────────────
 void CaseWideRowStillNeedsRefine() {
@@ -4753,32 +4925,36 @@ void CaseUrlInputHeuristic() {
             + std::to_wstring(neg ? 1 : 0)).c_str());
 }
 
-// 页面树已建立时 Enter 默认被拦；但「Ctrl+L → 输入 URL → Enter」是正常导航手法，必须放行。
+// ★批 D（docs §47）：那条「已有网页控件树 ⇒ 拦 Enter（要求走 searchOnPage）」的静默拒绝
+//   已删。本用例反转钉新不变式：**Enter 一律照发**，只在回执里补一句事实；
+//   「刚输入的是 URL」这件事现在只影响**要不要补那句事实**（地址栏导航是正常手法）。
 void CaseEnterAfterUrlInput() {
     ResetAiActionSessionState(961);
-    SetAiActionPlanGateEnabled(false);
+
     AiNotePageKind(L"dom");
-    SetAiForegroundBrowserOverrideForTest(1);   // 「网页控件树拦 Enter」要生效
+    SetAiForegroundBrowserOverrideForTest(1);   // 网页上下文的判断要生效
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [](const std::wstring&) { return std::wstring(L"已执行"); };
     const auto tools = BuildAiActionExecuteTools(&hooks, {});
-    // 先直接 Enter：应被「已有网页控件树」拦住
+    // 直接 Enter：照发 + 标注「前台是网页」
     const std::wstring bare = CallNamedTool(tools, L"keyClick", L"{\"keyText\":\"Enter\"}");
-    const bool blocked = bare.rfind(L"[错误]", 0) == 0
-        && bare.find(L"searchOnPage") != std::wstring::npos;
-    // 输入像 URL 的正文后再 Enter：应放行
+    const bool bareOk = bare.rfind(L"[错误]", 0) != 0
+        && bare.find(L"[事实] 前台是网页") != std::wstring::npos;
+    // 输入像 URL 的正文后再 Enter：照发，且**不**补那句事实（urlNavPending）
     const std::wstring typed = CallNamedTool(tools, L"quickInput",
         L"{\"inputText\":\"edge://history\",\"clearFirst\":true}");
     const std::wstring afterUrl = CallNamedTool(tools, L"keyClick",
         L"{\"keyText\":\"Enter\"}");
-    const bool allowed = afterUrl.rfind(L"[错误]", 0) != 0;
-    // 输入普通搜索词后再 Enter：仍应被拦（站内搜索请走 searchOnPage）
+    const bool urlNav = afterUrl.rfind(L"[错误]", 0) != 0
+        && afterUrl.find(L"[事实] 前台是网页") == std::wstring::npos;
+    // 输入普通搜索词后再 Enter：照发 + 标注（模型自己看得见焦点在哪）
     const std::wstring typedWord = CallNamedTool(tools, L"quickInput",
         L"{\"inputText\":\"\u5386\u53f2\u8bb0\u5f55\",\"clearFirst\":true}");
     const std::wstring afterWord = CallNamedTool(tools, L"keyClick",
         L"{\"keyText\":\"Enter\"}");
-    const bool stillBlocked = afterWord.rfind(L"[错误]", 0) == 0;
-    const bool ok = blocked && allowed && stillBlocked;
+    const bool wordOk = afterWord.rfind(L"[错误]", 0) != 0
+        && afterWord.find(L"[事实] 前台是网页") != std::wstring::npos;
+    const bool ok = bareOk && urlNav && wordOk;
     Emit(L"enter_after_url_input", ok,
         ok ? L"" : (L"bare=" + bare.substr(0, 60) + L" | url=" + afterUrl.substr(0, 60)
             + L" | word=" + afterWord.substr(0, 60)).c_str());
@@ -4806,7 +4982,7 @@ void CaseBrowserTitleHintStrip() {
 // ── 命令行路线：runCommand 必须落到既有的「运行程序」动作上 ─────────────
 void CaseRunCommandTool() {
     ResetAiActionSessionState(971);
-    SetAiActionPlanGateEnabled(false);
+
     std::wstring lastActions;
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [&lastActions](const std::wstring& json) {
@@ -4911,7 +5087,7 @@ void CaseExtractActionJsonArray() {
 // ── 浏览器内置页：首选「让浏览器自己带 URL 打开」，退回地址栏合成键 ──────
 void CaseOpenWebpageInternalPage() {
     ResetAiActionSessionState(981);
-    SetAiActionPlanGateEnabled(false);
+
     std::wstring acted;
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [&acted](const std::wstring& json) {
@@ -4931,7 +5107,7 @@ void CaseOpenWebpageInternalPage() {
         && acted.find(L"quickInput") == std::wstring::npos;
     // ② 识别不出浏览器 → 退回地址栏合成键，但必须带等待（首字母被吞就是「刚聚焦就打字」）
     ResetAiActionSessionState(981);
-    SetAiActionPlanGateEnabled(false);
+
     SetAiForegroundBrowserOverrideForTest(-1);
     const auto tools2 = BuildAiActionExecuteTools(&hooks, {});
     const std::wstring hist2 = CallNamedTool(tools2, L"openWebpage",
@@ -4954,7 +5130,7 @@ void CaseOpenWebpageInternalPage() {
 // ── 配方复用：Ctrl+Home 只提醒不拦；写完后 Ctrl+A 必须先确认 ─────────────
 void CaseRecipeReuseGuards() {
     ResetAiActionSessionState(983);
-    SetAiActionPlanGateEnabled(false);
+
     int executed = 0;
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [&executed](const std::wstring& /*json*/) {
@@ -4974,7 +5150,7 @@ void CaseRecipeReuseGuards() {
         && executed > 0;
     // ② 正常模板（行内 Tab/Enter/Home）→ 先试跑前 2 组，并给一次路线指针
     ResetAiActionSessionState(984);
-    SetAiActionPlanGateEnabled(false);
+
     executed = 0;
     const auto tools2 = BuildAiActionExecuteTools(&hooks, {});
     const std::wstring good = CallNamedTool(tools2, L"runActionRecipe",
@@ -5003,7 +5179,7 @@ void CaseRecipeReuseGuards() {
     const bool confirmOk = ctrlAOk.find(L"[EXECUTED]") != std::wstring::npos;
     // ⑤ 路线指针也会在「在表格软件里逐格输入」时出现（Skill + 工具函数配合，不占系统提示词）
     ResetAiActionSessionState(985);
-    SetAiActionPlanGateEnabled(false);
+
     SetAiSpreadsheetForegroundOverrideForTest(1);
     const auto tools3 = BuildAiActionExecuteTools(&hooks, {});
     const std::wstring cell = CallNamedTool(tools3, L"quickInput",
@@ -5057,7 +5233,7 @@ void CaseDomFirstDialogGate() {
 // ── 路线指针：自带可照抄命令、每任务一次（实测「只给指针」模型不会去查）─────
 void CaseRouteNudge() {
     ResetAiActionSessionState(986);
-    SetAiActionPlanGateEnabled(false);
+
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [](const std::wstring&) { return std::wstring(L"已执行"); };
     const auto tools = BuildAiActionExecuteTools(&hooks, {});
@@ -5072,7 +5248,7 @@ void CaseRouteNudge() {
     const bool once = again.find(L"路线提示") == std::wstring::npos;
     // 非表格内容（单行）不该打扰
     ResetAiActionSessionState(987);
-    SetAiActionPlanGateEnabled(false);
+
     const auto tools2 = BuildAiActionExecuteTools(&hooks, {});
     const std::wstring plain = CallNamedTool(tools2, L"saveTaskData",
         L"{\"name\":\"note\",\"content\":\"一句话备注\"}");
@@ -5107,7 +5283,7 @@ void CaseHotkeyLabelRealKeys() {
 // ── 办公文档：readDocument 工具 + 提取脚本（Excel/Word/PPT/PDF/CSV/文本）─────
 void CaseReadDocumentTool() {
     ResetAiActionSessionState(988);
-    SetAiActionPlanGateEnabled(false);
+
     const std::wstring dir = MakeTempTestDir(L"readdoc_test");
     CreateDirectoryW(dir.c_str(), nullptr);
     const std::wstring csvPath = dir + L"\\sample.csv";
@@ -5180,40 +5356,10 @@ void CaseReadDocumentTool() {
     ResetAiActionSessionState(988);
 }
 
-// ── 定位缓存：窗口位移重锚 + N-of-M 迟滞（动态画面不点残影）──────────────
-void CaseLocateCacheHysteresis() {
-    RECT stored{100, 200, 1100, 900};
-    RECT moved{220, 280, 1220, 980};
-    int ex = 0, ey = 0;
-    AiLocateCacheReanchor(500, 400, stored, moved, &ex, &ey);
-    const bool reanchorOk = ex == 620 && ey == 480;
-    RECT same{100, 200, 1100, 900};
-    AiLocateCacheReanchor(500, 400, same, same, &ex, &ey);
-    const bool sameOk = ex == 500 && ey == 400;
-    const bool hysOk = !ShouldAcceptAiLocateCacheHitHysteresis(1, 3)
-        && ShouldAcceptAiLocateCacheHitHysteresis(2, 3)
-        && ShouldAcceptAiLocateCacheHitHysteresis(3, 3)
-        && !ShouldAcceptAiLocateCacheHitHysteresis(1, 1)
-        && !ShouldAcceptAiLocateCacheHitHysteresis(0, 3);
-    AiLocateCacheAcceptInput strong;
-    strong.bestScore = 97.0;
-    strong.bestDistToCached = 3;
-    AiLocateCacheAcceptInput ambiguous;
-    ambiguous.bestScore = 97.0;
-    ambiguous.bestDistToCached = 3;
-    ambiguous.secondScore = 96.0;
-    ambiguous.secondDistToCached = 6;
-    const bool gateOk = ShouldAcceptAiLocateCacheHit(strong)
-        && !ShouldAcceptAiLocateCacheHit(ambiguous);
-    Emit(L"locate_cache_hysteresis", reanchorOk && sameOk && hysOk && gateOk,
-        (L"重锚=" + std::to_wstring(reanchorOk) + L"/同位=" + std::to_wstring(sameOk)
-            + L"/迟滞=" + std::to_wstring(hysOk) + L"/门槛=" + std::to_wstring(gateOk)).c_str());
-}
-
 // ── computer-use 兼容入口：computer 别名必须映射到既有动作，且不绕过守卫 ────
 void CaseComputerTool() {
     ResetAiActionSessionState(989);
-    SetAiActionPlanGateEnabled(false);
+
     SetAiForegroundBrowserOverrideForTest(-1);      // 前台不是浏览器（确定性）
     SetAiSpreadsheetForegroundOverrideForTest(-1);  // 前台不是表格
     std::wstring lastActions;
@@ -5316,7 +5462,7 @@ void CaseComputerTool() {
 // ── runCommand：非法 JSON 也要能从正文里恢复命令（实测卡死点）──────────
 void CaseRunCommandSalvage() {
     ResetAiActionSessionState(982);
-    SetAiActionPlanGateEnabled(false);
+
     std::wstring lastActions;
     AiActionHostHooks hooks;
     hooks.onExecuteActions = [&lastActions](const std::wstring& json) {
@@ -5599,11 +5745,2990 @@ void CaseOcrTextVerify() {
             + L"/修正=" + std::to_wstring(fixOk)).c_str());
 }
 
+// ══════════════════════════════════════════════════════════════════
+// 本地判断表（src/ai_decide.h）—— System One 形态的逐格断言
+// ══════════════════════════════════════════════════════════════════
+
+/// 判断一：视觉闸。**逐行**钉死（表驱动就是为了这个：每行一条用例，
+/// 加判据时必须一起来这里补一行，否则 decide_table 会红）。
+void CaseDecideTable() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto checkGate = [&](const wchar_t* tag, AiDecideSignals s,
+                         AiVisionGate wantVerdict, bool wantDeny) {
+        AiDecisionRecord rec;
+        const AiVisionGate got = AiDecideVisionGate(s, &rec);
+        const bool verdictOk = (got == wantVerdict);
+        const bool denyOk = ((got == AiVisionGate::DenyBusyFallback) == wantDeny);
+        // 判断行必须带理由 —— 空 why 等于没做诊断
+        const bool whyOk = !rec.why.empty();
+        const bool confOk = rec.confidence >= 0.0 && rec.confidence <= 1.0;
+        if (!(verdictOk && denyOk && whyOk && confOk)) {
+            ok = false;
+            detail += std::wstring(L" ") + tag;
+        }
+    };
+
+    // ── 行①②页型类硬证据 ────────────────────────────────────────────
+    AiDecideSignals dom;   dom.pageKind = L"dom";   dom.foregroundBrowserClass = true;
+    checkGate(L"dom", dom, AiVisionGate::Allow, false);
+    AiDecideSignals mixed; mixed.pageKind = L"mixed"; mixed.foregroundBrowserClass = true;
+    checkGate(L"mixed", mixed, AiVisionGate::Allow, false);
+    AiDecideSignals canvas; canvas.pageKind = L"canvas"; canvas.foregroundBrowserClass = true;
+    checkGate(L"canvas", canvas, AiVisionGate::Allow, false);
+    // 判断一/二的共同根因：**画布页 + 高动态也必须放行**（旧实现 100% 拦死游戏）
+    AiDecideSignals canvasBusy = canvas;
+    canvasBusy.busyCoverage = 0.9; canvasBusy.settleStillChanging = true;
+    checkGate(L"canvas_busy", canvasBusy, AiVisionGate::Allow, false);
+
+    // ── 行③网页会话 ─────────────────────────────────────────────────
+    AiDecideSignals web; web.foregroundBrowserClass = true; web.webSessionActive = true;
+    checkGate(L"web_session", web, AiVisionGate::Allow, false);
+
+    // ── 行④非浏览器前台 = 没有网页树可退（桌面游戏/自绘/模拟器）────────
+    AiDecideSignals deskGame;              // foregroundBrowserClass 保持 false
+    deskGame.busyCoverage = 0.9; deskGame.settleStillChanging = true;
+    deskGame.foregroundSelfDrawn = true;
+    checkGate(L"desktop_game", deskGame, AiVisionGate::Allow, false);
+
+    // ── 行⑤浏览器前台 + 页型未知 + 高动态 → 拦 ───────────────────────
+    AiDecideSignals browserBusy;
+    browserBusy.foregroundBrowserClass = true;
+    browserBusy.busyCoverage = 0.42; browserBusy.settleStillChanging = true;
+    checkGate(L"browser_busy", browserBusy, AiVisionGate::DenyBusyFallback, true);
+    // 边界：恰好 0.10 算「高动态」（>= 而非 >）
+    AiDecideSignals atThreshold;
+    atThreshold.foregroundBrowserClass = true; atThreshold.busyCoverage = 0.10;
+    checkGate(L"browser_at_0.10", atThreshold, AiVisionGate::DenyBusyFallback, true);
+    // 边界：0.04 + 仍在变 → 也拦（settle 未稳定时门槛更低）
+    AiDecideSignals changing;
+    changing.foregroundBrowserClass = true;
+    changing.busyCoverage = 0.04; changing.settleStillChanging = true;
+    checkGate(L"browser_0.04_changing", changing, AiVisionGate::DenyBusyFallback, true);
+    // 边界：0.04 但已稳定、页型未知 → 放行（门槛是两段式的，别把 0.04 当全局线）
+    AiDecideSignals stable004;
+    stable004.foregroundBrowserClass = true;
+    stable004.busyCoverage = 0.04; stable004.settleStillChanging = false;
+    checkGate(L"browser_0.04_stable", stable004, AiVisionGate::Allow, false);
+
+    // ── 行⑥浏览器前台 + 页型未知 + 画面安静 → 放行（兜底行，不许落到「未覆盖」）──
+    AiDecideSignals browserQuiet;
+    browserQuiet.foregroundBrowserClass = true; browserQuiet.busyCoverage = -1.0;
+    AiDecisionRecord quietRec;
+    const AiVisionGate quiet = AiDecideVisionGate(browserQuiet, &quietRec);
+    const bool coveredByRow6 = quiet == AiVisionGate::Allow
+        && quietRec.why.find(L"未覆盖") == std::wstring::npos;
+    ok = ok && coveredByRow6;
+    if (!coveredByRow6) detail += L" row6";
+
+    // 没有任何信号（还没观察过）也必须给出完整结论，不许空 why
+    AiDecisionRecord emptyRec;
+    const AiVisionGate emptyGate = AiDecideVisionGate(AiDecideSignals{}, &emptyRec);
+    const bool emptyOk = !emptyRec.why.empty()
+        && emptyRec.why.find(L"未覆盖") == std::wstring::npos;
+    ok = ok && emptyOk;
+    if (!emptyOk) detail += L" empty";
+    (void)emptyGate;
+
+    // ── visionIsOnlyWay：只有画布/非浏览器前台的「放行」才置位 ──────────
+    AiDecisionRecord owCanvas, owDom;
+    AiDecideVisionGate(canvasBusy, &owCanvas);   // 画布 → 唯一手段
+    AiDecideVisionGate(dom, &owDom);             // dom 页 → 有树可退
+    const bool onlyWayOk = owCanvas.visionIsOnlyWay && !owDom.visionIsOnlyWay;
+    ok = ok && onlyWayOk;
+    if (!onlyWayOk) detail += L" only_way";
+
+    // ── 判断二：游戏前台逐行 ─────────────────────────────────────────
+    auto checkGame = [&](const wchar_t* tag, AiDecideSignals s,
+                         AiGameForeground want, bool wantGame) {
+        AiDecisionRecord rec;
+        const AiGameForeground got = AiDecideGameForeground(s, &rec);
+        const bool verdictOk = (got == want);
+        const bool boolOk = ((got != AiGameForeground::NotGame) == wantGame);
+        const bool whyOk = !rec.why.empty();
+        if (!(verdictOk && boolOk && whyOk)) {
+            ok = false;
+            detail += std::wstring(L" game:") + tag;
+        }
+    };
+    checkGame(L"canvas", canvasBusy, AiGameForeground::GameByCanvasPage, true);
+    AiDecideSignals browserHighMotion;
+    browserHighMotion.foregroundBrowserClass = true;
+    browserHighMotion.busyCoverage = 0.5;   // 浏览器里有 DOM 可退 → 再动也不算「只能靠视觉」
+    checkGame(L"browser", browserHighMotion, AiGameForeground::NotGame, false);
+    AiDecideSignals sheet;
+    sheet.foregroundSpreadsheet = true; sheet.busyCoverage = 0.5;
+    checkGame(L"spreadsheet", sheet, AiGameForeground::NotGame, false);
+    checkGame(L"self_drawn", deskGame, AiGameForeground::GameByNoTree, true);
+    // ★主判据优先于动态覆盖率：自绘画面前台**静止**也必须是游戏
+    //   （第十三份日志：开局静止覆盖率 <3%，旧实现前 4 轮都没认出来）
+    AiDecideSignals stillGame;
+    stillGame.foregroundSelfDrawn = true; stillGame.busyCoverage = 0.01;
+    checkGame(L"self_drawn_still", stillGame, AiGameForeground::GameByNoTree, true);
+    AiDecideSignals motionOnly;
+    motionOnly.busyCoverage = 0.05;
+    checkGame(L"motion_only", motionOnly, AiGameForeground::GameByMotion, true);
+    // 有控件树 + 画面安静 → 不是游戏（「静态桌面软件别误判成游戏」的守卫）
+    AiDecideSignals quietDesktop;
+    quietDesktop.busyCoverage = 0.01;
+    checkGame(L"quiet_desktop", quietDesktop, AiGameForeground::NotGame, false);
+    // 0.03 是「仅动态」那条线的边界
+    AiDecideSignals atGameLine;
+    atGameLine.busyCoverage = 0.03;
+    checkGame(L"at_0.03", atGameLine, AiGameForeground::GameByMotion, true);
+
+    // ── 判断三：附帧 ────────────────────────────────────────────────
+    AiDecisionRecord r1, r2, r3;
+    const bool attachOk =
+        AiDecideAttachObserveFrame(false, true, &r1) == AiAttachFrame::NoModelCannotSee
+        && AiDecideAttachObserveFrame(true, false, &r2) == AiAttachFrame::NoNoImage
+        && AiDecideAttachObserveFrame(true, true, &r3) == AiAttachFrame::YesFrame
+        && !r1.why.empty() && !r2.why.empty() && !r3.why.empty();
+    ok = ok && attachOk;
+    if (!attachOk) detail += L" attach";
+
+    // ── 置信度三档边界 ──────────────────────────────────────────────
+    const bool tierOk =
+        AiConfidenceTier(0.0) == AiConfTier::Low
+        && AiConfidenceTier(kAiDecideConfLow - 0.001) == AiConfTier::Low
+        && AiConfidenceTier(kAiDecideConfLow) == AiConfTier::Medium
+        && AiConfidenceTier(kAiDecideConfHigh - 0.001) == AiConfTier::Medium
+        && AiConfidenceTier(kAiDecideConfHigh) == AiConfTier::High
+        && AiConfidenceTier(1.0) == AiConfTier::High;
+    ok = ok && tierOk;
+    if (!tierOk) detail += L" tier";
+
+    // ── 诊断行格式：必须同时含判决名、置信度、理由（少一样就没法排查）──
+    AiDecisionRecord fmt;
+    fmt.confidence = 0.55;
+    fmt.why = L"测试理由";
+    const std::wstring line = FormatAiDecision(L"vision_gate",
+        AiVisionGateName(AiVisionGate::DenyBusyFallback), fmt);
+    const bool fmtOk = line.find(L"vision_gate") != std::wstring::npos
+        && line.find(L"deny_busy_fallback") != std::wstring::npos
+        && line.find(L"0.55") != std::wstring::npos
+        && line.find(L"测试理由") != std::wstring::npos;
+    ok = ok && fmtOk;
+    if (!fmtOk) detail += L" format";
+
+    // 判决名不得为空/问号（漏了 switch 分支会静默退化成 "?"）
+    const bool namesOk = std::wstring(AiVisionGateName(AiVisionGate::Allow)) != L"?"
+        && std::wstring(AiGameForegroundName(AiGameForeground::GameByNoTree)) != L"?"
+        && std::wstring(AiAttachFrameName(AiAttachFrame::YesFrame)) != L"?";
+    ok = ok && namesOk;
+    if (!namesOk) detail += L" names";
+
+    // ── 输入信号序列化（离线影子测试的解析契约，见 docs §23）──────────────
+    // 只记「判了什么」无法离线复算，所以必须把信号也落进日志；
+    // 这组断言把字段名/顺序/取值格式钉死，改格式时解析方（python）会一起红。
+    AiDecideSignals sigOut;
+    sigOut.pageKind = L"mixed";
+    sigOut.foregroundBrowserClass = true;
+    sigOut.foregroundSelfDrawn = false;
+    sigOut.foregroundSpreadsheet = false;
+    sigOut.webSessionActive = true;
+    sigOut.domHooksAvailable = true;
+    sigOut.busyCoverage = 0.4213;
+    sigOut.settleStillChanging = true;
+    const std::wstring sigLine = FormatAiSignals(sigOut);
+    const bool sigOk = sigLine ==
+        L"sig page=mixed br=1 self=0 sheet=0 web=1 hooks=1 busy=0.421 changing=1";
+    ok = ok && sigOk;
+    if (!sigOk) { detail += L" sig_format["; detail += sigLine; detail += L"]"; }
+
+    // 没观察过页型时写 `-`（要能跟「页型是空串」区分开）
+    AiDecideSignals sigCold;
+    sigCold.busyCoverage = -1.0;
+    const std::wstring coldLine = FormatAiSignals(sigCold);
+    const bool coldOk = coldLine ==
+        L"sig page=- br=0 self=0 sheet=0 web=0 hooks=0 busy=-1.000 changing=0";
+    ok = ok && coldOk;
+    if (!coldOk) { detail += L" sig_cold["; detail += coldLine; detail += L"]"; }
+
+    // ── 「网关回了空体」怎么处置（P0-2）──────────────────────────────────
+    // 官方《Thinking Mode》写明：`max_tokens` 不够时全部预算被推理吃光 ⇒ `content` 为空、
+    // `finish_reason=length`，并明确说这**不是** Thinking 失败。旧实现把它当致命 API 错误
+    // ⇒ 整个宏当场结束（用户看到「卡在那里然后自己停了」）。
+    // 逐格钉死：这类判据一旦有格子走不到，就会退化成「静默不处置」。
+    {
+        const auto e1 = AiDecideEmptyResponseRecovery(false, true, true, 0);    // 非动作作用域
+        const auto e2 = AiDecideEmptyResponseRecovery(true, true, false, 2, 2); // 兜底已满
+        const auto e3 = AiDecideEmptyResponseRecovery(true, false, true, 0);    // 被收束/截断
+        const auto e4 = AiDecideEmptyResponseRecovery(true, true, false, 0);    // 开着思考
+        const auto e5 = AiDecideEmptyResponseRecovery(true, false, false, 0);   // 都没开 ⇒ 不兜
+        const auto e6 = AiDecideEmptyResponseRecovery(true, true, true, 2, 2);  // 有界优先
+        const bool emptyOk = e1.action == AiEmptyResponseAction::GiveUp
+            && e2.action == AiEmptyResponseAction::GiveUp
+            && e3.action == AiEmptyResponseAction::NudgeAndRetry
+            && e4.action == AiEmptyResponseAction::NudgeAndRetry
+            && e5.action == AiEmptyResponseAction::GiveUp
+            && e6.action == AiEmptyResponseAction::GiveUp
+            && !e1.why.empty() && !e5.why.empty();
+        ok = ok && emptyOk;
+        if (!emptyOk) detail += L" empty_response_recovery_cells";
+    }
+
+    Emit(L"decide_table", ok, detail.c_str());
+}
+
+/// 旧布尔封装 vs 判断表：**重构不许改行为**。用真实会话状态跑，
+/// 断言「封装返回值」与「同一份宿主信号喂给判断表的判决」逐组一致。
+/// 这是第 1 刀的安全网 —— 判据搬家时最容易出的事就是顺手改了行为。
+void CaseDecideWrapperEquivalence() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto group = [&](const wchar_t* tag, int browserOverride, int sheetOverride,
+                     const wchar_t* pageKind, double busy, bool changing) {
+        ResetAiActionSessionState(880001);
+        SetAiForegroundBrowserOverrideForTest(browserOverride);
+        SetAiSpreadsheetForegroundOverrideForTest(sheetOverride);
+        if (pageKind && pageKind[0]) AiNotePageKind(pageKind);
+        NoteAiActionUiBusy(busy, changing);
+
+        // 同一份宿主信号：封装内部取的就是它（CollectAiDecideSignals 已导出给自检用）
+        const AiDecideSignals sig = CollectAiDecideSignals();
+
+        AiDecisionRecord vrec;
+        const AiVisionGate vgate = AiDecideVisionGate(sig, &vrec);
+        const bool wrapperDeny = AiActionUiTooBusyForVisionLocate();
+        const bool visionAgree = wrapperDeny == (vgate == AiVisionGate::DenyBusyFallback);
+
+        AiDecisionRecord grec;
+        const AiGameForeground gv = AiDecideGameForeground(sig, &grec);
+        const bool wrapperGame = AiActionGameForegroundLikely();
+        const bool gameAgree = wrapperGame == (gv != AiGameForeground::NotGame);
+
+        if (!(visionAgree && gameAgree)) {
+            ok = false;
+            detail += L" ";
+            detail += tag;
+        }
+    };
+
+    // ① 桌面游戏：非浏览器 + 高动态 → 视觉放行 + 认得出游戏
+    group(L"desktop_game", -1, 0, L"", 0.42, true);
+    // ② 画布页：浏览器前台 + canvas + 高动态 → 视觉仍放行
+    group(L"canvas_page", 1, 0, L"canvas", 0.42, true);
+    // ③ 浏览器 + 页型未知 + 高动态 → 视觉被拦，且不算游戏
+    group(L"browser_busy", 1, 0, L"", 0.42, true);
+    // ④ 浏览器 + dom 页 + 高动态 → 视觉放行（有树可点）
+    group(L"browser_dom", 1, 0, L"dom", 0.42, true);
+    // ⑤ 表格软件 → 不算游戏
+    group(L"spreadsheet", -1, 1, L"", 0.42, true);
+    // ⑥ 什么都没观察过 → 仍要给出稳定结论
+    group(L"cold", 0, 0, L"", -1.0, false);
+
+    SetAiSpreadsheetForegroundOverrideForTest(0);
+
+    ResetAiActionSessionState(880002);
+    Emit(L"decide_wrapper_equivalence", ok, detail.c_str());
+}
+
+/// 诊断出口：判断必须留痕，且能按动作清空（不然上一次动作的结论会误导排查）
+void CaseDecideDiagnosticLog() {
+    bool ok = true;
+    std::wstring detail;
+
+    static std::vector<std::wstring> captured;
+    captured.clear();
+    SetAiDecisionLogSink(+[](const std::wstring& line) { captured.push_back(line); });
+
+    ClearAiDecisionLogs();
+    const bool emptyAtStart = RecentAiDecisionLogs().empty() && captured.empty();
+
+    // 走一次真实封装 → 必须产生诊断行，并且 sink 收得到
+    ResetAiActionSessionState(880003);
+
+    SetAiForegroundBrowserOverrideForTest(1);
+    NoteAiActionUiBusy(0.42, true);           // 浏览器 + 高动态 → 应判 deny
+    const bool deny = AiActionUiTooBusyForVisionLocate();
+    const auto logs = RecentAiDecisionLogs();
+    const bool logged = !logs.empty() && !captured.empty();
+    const bool hasVerdict = logged
+        && logs.back().find(L"vision_gate") != std::wstring::npos
+        && logs.back().find(L"deny_busy_fallback") != std::wstring::npos
+        && logs.back().find(L"conf=") != std::wstring::npos;
+    const bool flushed = !captured.empty()
+        && captured.back().find(L"vision_gate") != std::wstring::npos;
+
+    // 清空必须真的清掉（每个 AI 动作开始时调用）
+    ClearAiDecisionLogs();
+    const bool cleared = RecentAiDecisionLogs().empty();
+
+    // 附帧判断也要留痕
+    ClearAiDecisionLogs();
+    const bool attach = ShouldAttachObserveImageToPlanner(L"gpt-4o", true);
+    const bool attachLogged = !RecentAiDecisionLogs().empty()
+        && RecentAiDecisionLogs().back().find(L"attach_observe_frame") != std::wstring::npos;
+
+    ok = ok && emptyAtStart && deny && logged && hasVerdict && flushed && cleared
+        && attach && attachLogged;
+    if (!emptyAtStart) detail += L" dirty_start";
+    if (!deny) detail += L" deny";
+    if (!logged) detail += L" not_logged";
+    if (!hasVerdict) detail += L" no_verdict";
+    if (!flushed) detail += L" sink";
+    if (!cleared) detail += L" clear";
+    if (!attach || !attachLogged) detail += L" attach_log";
+
+    SetAiDecisionLogSink(nullptr);
+    ClearAiDecisionLogs();
+
+    ResetAiActionSessionState(880004);
+    Emit(L"decide_diagnostic_log", ok, detail.c_str());
+}
+
+/// ★批 D（docs §47 / D6④）：原 `vision_gate_tier_hint` 反转成 `vision_gate_trace_only`。
+/// 旧不变式「置信度 → 往对话里塞提示」整条已删（连函数一起）：引擎不再往对话/回执注入
+/// 任何建议。新不变式：**判断照做、留痕照记，但动作路径上既不拦也不劝** ——
+/// 「视觉是唯一手段」时不再有「改用控件树」的错指引（不注入就不会注入错）。
+void CaseVisionGateTraceOnly() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ── 判断表侧（保留）：判决 + 置信度语义 ─────────────────────────────
+    // 表格语义一致性：High 档 = 「有硬证据」。
+    // 这条守卫防的是初稿那个错：兜底放行行写了 0.70，正好压 High 边界 →
+    // 旧的三档路由会认为「有硬证据」而闭嘴，与「兜底、无证据」的表语义自相矛盾。
+    AiDecisionRecord rowHard, rowFallback;
+    AiDecideSignals sigDom;   sigDom.pageKind = L"dom"; sigDom.foregroundBrowserClass = true;
+    AiDecideVisionGate(sigDom, &rowHard);                 // 行①：页型硬证据
+    AiDecideSignals sigQuiet; sigQuiet.foregroundBrowserClass = true;  // 行⑥：兜底
+    AiDecideVisionGate(sigQuiet, &rowFallback);
+    const bool tierSemanticsOk =
+        AiConfidenceTier(rowHard.confidence) == AiConfTier::High
+        && AiConfidenceTier(rowFallback.confidence) != AiConfTier::High;
+    ok = ok && tierSemanticsOk;
+    if (!tierSemanticsOk) detail += L" tier_semantics";
+
+    // ── settle 短节拍的采信门槛（kAiGameConfDecisive）───────────────────
+    // 短节拍会**跳掉整段 UI settle**，所以只有结构性证据才配用它：
+    // 「只有画面在动」是视频/动画广告也有的特征，不能拿它跳。
+    auto decisiveOf = [](AiGameForeground v, double conf) {
+        AiGameForegroundDecision d;
+        d.verdict = v;
+        d.record.confidence = conf;
+        d.record.why = L"测试";
+        return AiGameForegroundDecisionIsDecisive(d);
+    };
+    const bool decisiveOk =
+        decisiveOf(AiGameForeground::GameByNoTree, 0.88)          // 无控件树：够硬
+        && decisiveOf(AiGameForeground::GameByCanvasPage, 0.90)   // 画布页：够硬
+        && !decisiveOf(AiGameForeground::GameByMotion, 0.55)      // 只有画面在动：不够
+        && !decisiveOf(AiGameForeground::GameByMotion, 0.90)      // 抬分也不行：判决行不对
+        && !decisiveOf(AiGameForeground::NotGame, 0.85)           // 不是游戏
+        && !decisiveOf(AiGameForeground::GameByNoTree, 0.79);     // 低于门槛
+    ok = ok && decisiveOk;
+    if (!decisiveOk) detail += L" decisive";
+
+    // 门槛必须落在「疑似」与「结构性证据」两行之间，否则这个常量就没意义了
+    const bool gateRangeOk = kAiGameConfDecisive > 0.55
+        && kAiGameConfDecisive <= 0.88;
+    ok = ok && gateRangeOk;
+    if (!gateRangeOk) detail += L" decisive_range";
+
+    // ── 会话侧：动作路径上**既不拦也不劝**（批 D 的核心不变式）──────────
+    AiActionHostHooks hooks;
+    hooks.onLocateAndClick = [](const std::wstring&, int, const std::wstring&, int, int) {
+        return std::wstring(L"已点击 屏幕(100,200)");
+    };
+
+    // 浏览器前台 + 页型未知 + 画面安静 → 旧实现在这里会补一句「把握一般…改走控件树」
+    ResetAiActionSessionState(880005);
+
+    SetAiForegroundBrowserOverrideForTest(1);
+    NoteAiActionUiBusy(0.01, false);
+    const auto toolsQuiet = BuildAiActionExecuteTools(&hooks, {});
+    const std::wstring quiet = CallNamedTool(toolsQuiet, L"locateAndClick",
+        L"{\"target\":\"login\"}");
+    const bool mediaQuietOk = quiet.find(L"已点击") != std::wstring::npos
+        && quiet.find(L"把握一般") == std::wstring::npos
+        && quiet.find(L"改用控件树") == std::wstring::npos
+        && quiet.find(L"observePage") == std::wstring::npos;
+
+    // 高动态 → 旧实现在这里**直接拒绝**识图定位；现在必须照点
+    ResetAiActionSessionState(880006);
+
+    SetAiForegroundBrowserOverrideForTest(1);
+    NoteAiActionUiBusy(0.42, true);
+    const auto toolsBusy = BuildAiActionExecuteTools(&hooks, {});
+    const std::wstring busy = CallNamedTool(toolsBusy, L"locateAndClick",
+        L"{\"target\":\"login\"}");
+    const bool busyNotDenied = busy.find(L"动态干扰过大") == std::wstring::npos
+        && busy.find(L"已点击") != std::wstring::npos;
+
+    // 桌面游戏（非浏览器前台）高动态 → 同样照点，且**不许**出现
+    //   「改用控件树 / observePage」这类提示（图上没有树可退）
+    ResetAiActionSessionState(880007);
+
+    SetAiForegroundBrowserOverrideForTest(-1);
+    NoteAiActionUiBusy(0.42, true);
+    const auto toolsGame = BuildAiActionExecuteTools(&hooks, {});
+    const std::wstring game = CallNamedTool(toolsGame, L"locateAndClick",
+        L"{\"target\":\"zombie\"}");
+    const bool gameNotDenied = game.find(L"动态干扰过大") == std::wstring::npos
+        && game.find(L"已点击") != std::wstring::npos;
+    const bool gameNoTreeNudge = game.find(L"改用控件树") == std::wstring::npos
+        && game.find(L"先 observePage") == std::wstring::npos;
+
+    ok = ok && mediaQuietOk && busyNotDenied && gameNotDenied && gameNoTreeNudge;
+    if (!mediaQuietOk) detail += L" quiet";
+    if (!busyNotDenied) detail += L" busy_denied";
+    if (!gameNotDenied) detail += L" game_denied";
+    if (!gameNoTreeNudge) detail += L" game_tree_nudge";
+
+    // 会话侧：薄封装要把「判决 + 依据」一起记下来，settle 节拍才不用重算
+    // （重算时桌面状态可能已变，会得到与记录不一致的结论）。
+    ResetAiActionSessionState(880009);
+
+    SetAiForegroundBrowserOverrideForTest(-1);
+    NoteAiActionUiBusy(0.42, true);
+    // ★必须用「画布页」这条**结构性证据**把判决钉死，不能靠真实前台窗口。
+    //   这里曾经随环境随机红（实测同一二进制 5 次里红 1 次）：
+    //   `IsDecisive` 只认 GameByNoTree / GameByCanvasPage（conf ≥ 0.80），
+    //   而 GameByNoTree 来自 `ForegroundWindowLooksSelfDrawn()` —— **读真实前台窗口**
+    //   的子窗口数（≤2 才算自绘），无覆盖钩子 ⇒ 前台是谁就决定这条用例红绿；
+    //   被前台压到兜底 GameByMotion（conf 0.55）时就不是 decisive。
+    //   pageKind 是会话状态、`AiNotePageKind` 可直接写，且 canvas 行**排在**浏览器/
+    //   表格/自绘三行之前 ⇒ 完全确定，测的还是同一条「判决 + 依据一起记下来」。
+    AiNotePageKind(L"canvas");
+    const bool wrapperSaysGame = AiActionGameForegroundLikely();
+    const AiGameForegroundDecision recorded = AiLastGameForegroundDecision();
+    const bool decisiveRecorded = wrapperSaysGame
+        && AiGameForegroundDecisionIsDecisive(recorded)
+        && !recorded.record.why.empty();
+    ok = ok && decisiveRecorded;
+    if (!decisiveRecorded) detail += L" decisive_recorded";
+
+    // ── 文字直点「就地复核」的采信规则（AiOcrProbeAgreesWithIndex）────────
+    // 实测踩过：索引 contains 命中「一键全选」→ 复核又读成「键全选」→ 旧实现要求
+    // 完全相等 → 永远不通过 → 每次点击白落回一整轮 VLM 识图（100KB+/15~45s）。
+    auto tier = [](const wchar_t* line, const wchar_t* want) {
+        return AiOcrLabelMatchTier(line, want);
+    };
+    const bool tierOk2 = tier(L"一键全选", L"一键全选") == 2      // 完全相等
+        && tier(L"键全选", L"一键全选") == 1                     // contains（残缺读法）
+        && tier(L"选", L"一键全选") == 0                         // 太短，不算
+        && tier(L"完全不相干的东西", L"一键全选") == 0;
+    ok = ok && tierOk2;
+    if (!tierOk2) detail += L" ocr_tier";
+
+    auto agree = [&](const wchar_t* probe, const wchar_t* idxHit,
+                     int px, int py, int ix, int iy) {
+        return AiOcrProbeAgreesWithIndex(probe, idxHit, L"一键全选", px, py, ix, iy);
+    };
+    const bool probeOk =
+        // ★核心回归：复核只读到「键全选」（比索引更差），但仍是同一标签且位置没动 → 采信
+        agree(L"键全选", L"键全选", 2142, 255, 2142, 255)
+        // 复核读得更好（完全相等）→ 采信
+        && agree(L"一键全选", L"键全选", 2140, 253, 2142, 255)
+        // 复核读到了**别的**文字 → 不采信（画面变了/点错地方）
+        && !agree(L"主菜单", L"键全选", 2142, 255, 2142, 255)
+        // 复核位置漂太远（>24px）→ 不采信
+        && !agree(L"键全选", L"键全选", 2142, 300, 2142, 255)
+        // 索引那次命中本身就不够好（只有 1 个字）→ 不采信
+        && !agree(L"键全选", L"选", 2142, 255, 2142, 255)
+        // 允许小幅修正坐标（复核的价值就是把坐标修准）
+        && agree(L"键全选", L"键全选", 2155, 268, 2142, 255);
+    ok = ok && probeOk;
+    if (!probeOk) detail += L" ocr_probe_agree";
+
+    // ── lookupMacroAction 查询词归一 ─────────────────────────────────
+    // 实测日志：模型写 lookupMacroAction(section=game) → 下游按裸值比较 →
+    // 报「未找到「section=game」」→ 白烧一轮，还会再试一次。
+    auto nq = [](const wchar_t* s) { return NormalizeMacroLookupQuery(s); };
+    const bool nqOk =
+        nq(L"section=game") == L"game"           // ★日志里的原始写法
+        && nq(L"game") == L"game"                // 本来就对的不受影响
+        && nq(L"type=findImage") == L"findImage"
+        && nq(L"section: game") == L"game"
+        && nq(L"section＝game") == L"game"       // 全角等号
+        && nq(L"  \"game\"  ") == L"game"        // 包裹引号 + 空白
+        && nq(L"「game」") == L"game"
+        && nq(L"GAME") == L"GAME"                // 值本身不改大小写（下游自己会小写化）
+        && nq(L"") == L""
+        && nq(L"section=") == L"section=";       // 只有键没有值时别把它吃掉
+    ok = ok && nqOk;
+    if (!nqOk) {
+        detail += L" lookup_norm[";
+        detail += nq(L"section=game");
+        detail += L"]";
+    }
+
+
+    // ── 文字直点：同屏多段拼接（OCR 把按钮文字拆开时仍要能点中）──────────
+    // 实测：左上角「自选僵尸卡牌」OCR 拆成多段，单段既过不了长度比、也过不了
+    // 框合理性检查 → 索引里整条没有 → 只能回落识图。拼接后才有机会命中。
+    auto mkLine = [](const wchar_t* t, int x1, int y1, int x2, int y2, double cf = 0.9) {
+        OcrTextLine l;
+        l.text = t; l.x1 = x1; l.y1 = y1; l.x2 = x2; l.y2 = y2; l.confidence = cf;
+        return l;
+    };
+    {
+        // 拆成两段、同一行、横向紧邻 → 拼起来等于目标
+        std::vector<OcrTextLine> lines = {
+            mkLine(L"自选", 100, 200, 160, 240),
+            mkLine(L"僵尸卡牌", 165, 200, 340, 240),
+        };
+        AiOcrDirectHit hit;
+        const bool ok1 = AiOcrPickDirectClickTarget(lines, L"自选僵尸卡牌",
+            2560, 1440, &hit) && hit.hitText == L"自选僵尸卡牌";
+        // 点的是**整颗按钮**的中心（拼接后的框），不是残段的中心
+        const bool centerOk = hit.screenX >= 200 && hit.screenX <= 240;
+
+        // 拆成三段也能拼
+        std::vector<OcrTextLine> three = {
+            mkLine(L"一键", 500, 100, 560, 140),
+            mkLine(L"全", 565, 100, 595, 140),
+            mkLine(L"选", 600, 100, 630, 140),
+        };
+        AiOcrDirectHit hit3;
+        const bool ok3 = AiOcrPickDirectClickTarget(three, L"一键全选",
+            2560, 1440, &hit3) && hit3.hitText == L"一键全选";
+
+        // 不同行（垂直不重叠）不许拼 → 目标拼不出来，必须老实拒绝。
+        // ⚠ 分片要选**单段都够不着目标**的：4 字 vs 目标 6 字在长度比 40% 以内，
+        //   contains 档本来就会命中，那样测的就不是「拼接」而是「包含匹配」了
+        //   （初版用「自选」+「僵尸卡牌」当反例，就是被这条绊到的）。
+        std::vector<OcrTextLine> crossRow = {
+            mkLine(L"通关", 100, 100, 160, 140),
+            mkLine(L"这关", 100, 300, 160, 340),
+            mkLine(L"这关", 165, 300, 225, 340),
+        };
+        AiOcrDirectHit hitX;
+        const bool rejectCross = !AiOcrPickDirectClickTarget(crossRow, L"通关这关",
+            2560, 1440, &hitX);
+        // 同屏**两处**真的都有该文字（两个按钮）→ 仍要判歧义，不许猜
+        std::vector<OcrTextLine> twoPlaces = {
+            mkLine(L"确认", 100, 200, 180, 240),
+            mkLine(L"确认", 900, 800, 980, 840),
+        };
+        AiOcrDirectHit hitA;
+        const bool stillAmbiguous = !AiOcrPickDirectClickTarget(twoPlaces, L"确认",
+            2560, 1440, &hitA);
+
+        const bool mergeOk = ok1 && centerOk && ok3 && rejectCross && stillAmbiguous;
+        ok = ok && mergeOk;
+        if (!mergeOk) {
+            detail += L" ocr_merge";
+            if (!ok1) detail += L"(split2)";
+            if (!centerOk) detail += L"(center)";
+            if (!ok3) detail += L"(split3)";
+            // 交叉行用例失败时把「到底点到了什么」打出来（否则只能猜）
+            if (!rejectCross) {
+                detail += L"(crossrow:hit=" + hitX.hitText + L")";
+            }
+            if (!stillAmbiguous) detail += L"(ambiguity)";
+        }
+    }
+
+
+    ResetAiActionSessionState(880008);
+    Emit(L"vision_gate_trace_only", ok, detail.c_str());
+}
+
+/// 执行后「要不要回传观察帧」的三条守卫（AiDecideNeedObserveAfterExec）。
+/// 判错的表现两种：模型对着过期画面继续动手（漏看），或每步白等一帧（多看）。
+void CaseAiExecObserveGuards() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto need = [](bool requested, bool first, const wchar_t* exec, const wchar_t* summary) {
+        return AiDecideNeedObserveAfterExec(requested, first,
+            exec ? exec : L"", summary ? summary : L"");
+    };
+
+    // ① 模型明确要观察 → 必须观察（不受其它条影响）
+    const bool req = need(true, false, L"已点击", L"已执行 1 步");
+    // ② 模型不要、也不是第一次、结果确定 → 不看（省一帧）
+    const bool skip = !need(false, false, L"已点击 屏幕(100,200)", L"已执行 1 步");
+    // ③ 结果不确定 → 必须看（settle 无反应 / 灰钮 / UIA 事实）
+    const bool uncertainSettle = need(false, false, L"[事实] settle无反应", L"");
+    const bool uncertainGray = need(false, false, L"提交钮灰了，不可用", L"");
+    const bool uncertainUia = need(false, false, L"", L"[UIA] 目标不可用");
+    const bool uncertainNoChange = need(false, false, L"几乎无变化", L"");
+    // ④ ★本任务第一次动手 → 强制看（防「抢跑」：模型此时可能一个像素都没看过）
+    const bool firstForced = need(false, true, L"已点击 屏幕(1,2)", L"已执行 1 步");
+    // ⑤ 但「第一次」只影响第一条：第二次起模型说不要就可以不看
+    const bool secondNotForced = !need(false, false, L"已点击 屏幕(1,2)", L"已执行 1 步");
+
+    const bool guardsOk = req && skip && uncertainSettle && uncertainGray && uncertainUia
+        && uncertainNoChange && firstForced && secondNotForced;
+    ok = ok && guardsOk;
+    if (!guardsOk) {
+        detail += L" guards[req=" + std::to_wstring(req)
+            + L" skip=" + std::to_wstring(skip)
+            + L" unstable=" + std::to_wstring(uncertainSettle && uncertainGray
+                && uncertainUia && uncertainNoChange)
+            + L" first=" + std::to_wstring(firstForced)
+            + L" second=" + std::to_wstring(secondNotForced) + L"]";
+    }
+
+    // 会话侧：本任务第一次动手真的会带上 OBSERVE 标记（而不是 SKIP）。
+    // 用宿主钩子接住 onExecuteActions，避免依赖真实桌面。
+    ResetAiActionSessionState(880010);
+
+    AiActionHostHooks hooks;
+    hooks.onExecuteActions = [](const std::wstring&) {
+        return std::wstring(L"已执行 1 步");
+    };
+    const auto tools = BuildAiActionExecuteTools(&hooks, {});
+    const std::wstring firstOut = CallNamedTool(tools, L"mouseClick",
+        L"{\"x\":100,\"y\":100}");
+    const bool firstObserve = firstOut.find(L"[EXECUTED][OBSERVE]") != std::wstring::npos;
+    // 第二次显式不要观察 → 应给 SKIP
+    const std::wstring secondOut = CallNamedTool(tools, L"mouseClick",
+        L"{\"x\":120,\"y\":120,\"observeAfter\":false}");
+    const bool secondSkip = secondOut.find(L"[EXECUTED][SKIP_OBSERVE]") != std::wstring::npos;
+
+    ok = ok && firstObserve && secondSkip;
+    if (!firstObserve) detail += L" first_observe";
+    if (!secondSkip) detail += L" second_skip";
+
+    ResetAiActionSessionState(880011);
+    Emit(L"ai_exec_observe_guards", ok, detail.c_str());
+}
+
+/// 屏幕文字索引（「可点清单」）：按画面行分组 + 标视觉行序。
+/// 实测价值（docs §25.4②）：平铺列表让模型无法把文字和画面上的卡片对上，
+/// 于是反复猜「哪个是 600 的卡」；按行分组把「找第几张卡」变成查表。
+void CaseOcrTextIndexRows() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto mk = [](const std::wstring& t, int x1, int y1, int x2, int y2, double cf = 0.9) {
+        OcrTextLine l;
+        l.text = t; l.x1 = x1; l.y1 = y1; l.x2 = x2; l.y2 = y2; l.confidence = cf;
+        return l;
+    };
+
+    // 一条卡槽：同一行 4 张卡（图标下各带价格），下面另有一行按钮
+    std::vector<OcrTextLine> lines = {
+        mk(L"普通僵尸", 200, 60, 250, 90),
+        mk(L"50",       205, 95, 235, 115),
+        mk(L"路障僵尸", 260, 60, 310, 90),
+        mk(L"75",       265, 95, 295, 115),
+        mk(L"铁桶僵尸", 320, 60, 370, 90),
+        mk(L"600",      325, 95, 355, 115),
+        mk(L"一键全选", 900, 60, 1000, 90),
+        // 第二视觉行（y 差很大）
+        mk(L"上一页",   700, 500, 760, 530),
+        mk(L"下一页",   800, 500, 860, 530),
+    };
+
+    const auto rows = CollectOcrIndexRows(lines);
+    // 卡槽里的「图标名 + 价格」虽然 y 略有差异（60-90 vs 95-115），但垂直重叠不足
+    // 半数 —— 它们会被分成两行，这是**刻意**的：价格行单独成行才好读。
+    // 这里只断言「明显同一视觉行」的会并到一起、跨行的不会。
+    bool oneKeyAll = false;
+    bool nextPageTogether = false;
+    bool cardRowAndButtonRowSeparate = true;
+    for (const auto& row : rows) {
+        bool hasKeyAll = false, hasPrev = false, hasNext = false;
+        for (const auto& sp : row) {
+            if (sp.text == L"一键全选") hasKeyAll = true;
+            if (sp.text == L"上一页") hasPrev = true;
+            if (sp.text == L"下一页") hasNext = true;
+        }
+        if (hasKeyAll) oneKeyAll = true;
+        if (hasPrev && hasNext) nextPageTogether = true;
+        // 「一键全选」(y≈60) 与「上一页」(y≈500) 绝不能在同一行
+        if (hasKeyAll && (hasPrev || hasNext)) cardRowAndButtonRowSeparate = false;
+    }
+
+    // 文本格式化：含标题、行列结构、坐标口径
+    int count = 0;
+    const std::wstring idx = FormatOcrTextIndex(lines, 0, 0, 2560, 1440, 1024, 576, &count);
+    const bool fmtOk = !idx.empty() && count == static_cast<int>(lines.size())
+        && idx.find(L"第1行") != std::wstring::npos
+        && idx.find(L"一键全选") != std::wstring::npos
+        && idx.find(L",") != std::wstring::npos
+        // ★口径必须是 **upload 截图像素**（`mouseClick` 收的那一套）。
+        //   旧断言钉的是「屏幕绝对像素」—— 那正是缺陷本身（docs §60.5）。
+        && idx.find(L"upload 截图像素") != std::wstring::npos
+        && idx.find(L"屏幕绝对像素") == std::wstring::npos;
+
+    // ★★同一轮消息里两个索引必须**同一套坐标**（docs §60.5）：文字索引曾经发屏幕像素、
+    //   元素索引发 upload 像素，标题都写「与 mouseClick 同一套」⇒ 模型必然点偏。
+    //   这里钉**换算值本身**（§45 教训③：断言要断坐标值，不是「有没有那句话」）。
+    {
+        std::vector<OcrTextLine> one{ mk(L"确认", 1240, 700, 1320, 740) };  // 中心 (1280,720)
+        int n1 = 0, n2 = 0;
+        const std::wstring up = FormatOcrTextIndex(one, 0, 0, 2560, 1440, 1024, 576, &n1);
+        const bool uploadOk = n1 == 1
+            && up.find(L"(512,288)") != std::wstring::npos        // 1280,720 → upload
+            && up.find(L"upload 截图像素") != std::wstring::npos
+            && up.find(L"屏幕绝对像素") == std::wstring::npos;
+        ok = ok && uploadOk;
+        if (!uploadOk) detail += L" ocr_index_coord_space(upload)";
+        // 没有帧尺寸时必须**如实降级**并明说「不能填进 mouseClick」——不许冒充同一套
+        const std::wstring deg = FormatOcrTextIndex(one, 0, 0, 2560, 1440, 0, 0, &n2);
+        const bool degradeOk = n2 == 1
+            && deg.find(L"(1280,720)") != std::wstring::npos
+            && deg.find(L"屏幕绝对像素") != std::wstring::npos
+            && deg.find(L"不能**直接填进 mouseClick") != std::wstring::npos;
+        ok = ok && degradeOk;
+        if (!degradeOk) detail += L" ocr_index_coord_space(degrade)";
+    }
+
+    // 空输入 → 空串（调用方据此不注入空索引）
+    int zeroCount = 0;
+    const bool emptyOk = FormatOcrTextIndex({}, 0, 0, 100, 100, 0, 0, &zeroCount).empty()
+        && zeroCount == 0;
+
+    // 低置信度与超短文本要挡掉；纯数字限量（防满屏价格淹没文字按钮）
+    std::vector<OcrTextLine> noisy;
+    for (int i = 0; i < 12; ++i) {
+        noisy.push_back(mk(L"123", 100 + i * 40, 100, 130 + i * 40, 120));   // 纯数字 ×12
+    }
+    noisy.push_back(mk(L"x", 10, 10, 20, 20));                               // 太短
+    noisy.push_back(mk(L"低置信", 10, 50, 80, 70, 0.30));                    // 置信度不足
+    noisy.push_back(mk(L"确认", 10, 200, 60, 220));                          // 该留下
+    int noisyCount = 0;
+    const std::wstring noisyIdx = FormatOcrTextIndex(noisy, 0, 0, 2560, 1440, 1024, 576,
+        &noisyCount);
+    // ★契约换了（docs §44）：旧断言是 `noisyCount <= 7`（6 数字 + 1 文字）——那条**按 OCR 顺序
+    //   截断**的写法让"哪些价格留下"变成抽签，14 张卡的界面必然缺价签。现在钉真正想保证的事：
+    //   ① **文字条目永不缺席**（满屏数字也挤不掉「确认」——这才是原来那条闸的本意）；
+    //   ② 孤立数字仍然限量（不能无限灌）。
+    const bool filterOk = noisyIdx.find(L"确认") != std::wstring::npos
+        && noisyIdx.find(L"低置信") == std::wstring::npos
+        && noisyCount >= 2 && noisyCount <= 12 + 1;
+    if (noisyIdx.find(L"确认") == std::wstring::npos) detail += L" named_entry_crowded_out";
+    if (noisyIdx.find(L"低置信") != std::wstring::npos) detail += L" low_conf_kept";
+    if (noisyCount > 12 + 1) detail += L" numeric_unbounded";
+
+    // ★★用户那台机器的形状（docs §44）：**14 张卡 = 14 个卡名 + 14 个价签**。
+    //   旧规则（纯数字全局只留 6 条）下，模型按价格找卡必然「索引里没有 600/800/9999」，
+    //   只好拿一个裸数字去问 VLM ⇒ 每次给的框都不一样 ⇒ 点空 ⇒ 死点表/近点重复连环触发
+    //   ⇒ 改用不带目标语义的手算坐标 mouseClick ⇒ 在 toggle 界面上把**已选中的卡点掉**
+    //   （用户：「把选了的卡收回去又重新选」）。
+    std::vector<OcrTextLine> cards;
+    const wchar_t* kNames[14] = { L"普通僵尸", L"路障僵尸", L"铁桶僵尸", L"撑杆僵尸",
+        L"舞王僵尸", L"伴舞僵尸", L"鸭子僵尸", L"潜水僵尸", L"冰车僵尸", L"雪橇僵尸",
+        L"海豚僵尸", L"跳跳僵尸", L"玩偶匣僵尸", L"气球僵尸" };
+    for (int i = 0; i < 14; ++i) {
+        const int x = 100 + i * 150;
+        cards.push_back(mk(kNames[i], x, 60, x + 90, 90));
+        cards.push_back(mk(std::to_wstring(50 + i * 25), x + 10, 95, x + 60, 115));  // 价签
+    }
+    int cardCount = 0;
+    const std::wstring cardIdx = FormatOcrTextIndex(cards, 0, 0, 2560, 1440, 1024, 576,
+        &cardCount);
+    bool allNames = true;
+    for (int i = 0; i < 14; ++i) {
+        if (cardIdx.find(kNames[i]) == std::wstring::npos) {
+            allNames = false;
+            detail += L" card_name_missing:" + std::wstring(kNames[i]);
+            break;
+        }
+    }
+    // 价签也要在（「按价格/编号选」是文档承诺过的能力）——数价签出现的个数
+    int priceKept = 0;
+    for (int i = 0; i < 14; ++i) {
+        if (cardIdx.find(std::to_wstring(50 + i * 25)) != std::wstring::npos) ++priceKept;
+    }
+    const bool cardOk = allNames && priceKept >= 14;
+    if (priceKept < 14) detail += L" prices(" + std::to_wstring(priceKept) + L"/14)";
+
+    const bool allOk = oneKeyAll && nextPageTogether && cardRowAndButtonRowSeparate
+        && fmtOk && emptyOk && filterOk && cardOk;
+    ok = ok && allOk;
+    if (!oneKeyAll) detail += L" key_all_row";
+    if (!nextPageTogether) detail += L" prevnext_row";
+    if (!cardRowAndButtonRowSeparate) detail += L" row_merge_too_wide";
+    if (!fmtOk) detail += L" format";
+    if (!emptyOk) detail += L" empty";
+    if (!filterOk) detail += L" filter(" + std::to_wstring(noisyCount) + L")";
+
+    // ★★帧间屏幕文字差分（docs §65）：真实形状 —— 顶栏计数器 `30000` → `29900`。
+    //   这正是模型缺的那条证据（"我到底放没放上"），而它**不需要额外识图**。
+    {
+        const auto mkLine = [](const std::wstring& t, int x, int y) {
+            OcrTextLine l{};
+            l.text = t; l.confidence = 0.95;
+            l.x1 = x; l.y1 = y; l.x2 = x + 40; l.y2 = y + 18;
+            return l;
+        };
+        // ① 计数器变化 → 必须报成「数值 A → B」（而不是笼统的新增 + 消失）
+        const std::vector<OcrTextLine> prevF{ mkLine(L"30000", 180, 70), mkLine(L"自选僵尸卡牌", 90, 40) };
+        const std::vector<OcrTextLine> curF{ mkLine(L"29900", 180, 70), mkLine(L"自选僵尸卡牌", 90, 40) };
+        const std::wstring numDelta = AiDescribeTextIndexDelta(prevF, curF, 6);
+        const bool numOk = numDelta.find(L"\"30000\" → \"29900\"") != std::wstring::npos
+            && numDelta.find(L"[事实]") != std::wstring::npos;
+        ok = ok && numOk;
+        if (!numOk) detail += L" delta_numeric(" + numDelta + L")";
+        // ② 纯文字增删照报
+        const std::vector<OcrTextLine> prevT{ mkLine(L"确定", 10, 500) };
+        const std::vector<OcrTextLine> curT{ mkLine(L"已保存", 10, 500) };
+        const std::wstring txtDelta = AiDescribeTextIndexDelta(prevT, curT, 6);
+        const bool txtOk = txtDelta.find(L"已保存") != std::wstring::npos
+            && txtDelta.find(L"确定") != std::wstring::npos;
+        ok = ok && txtOk;
+        if (!txtOk) detail += L" delta_text(" + txtDelta + L")";
+        // ③ 没变 ⇒ **必须返回空**（否则每帧一行"没有变化"的废话，白烧 token）
+        const bool quietOk = AiDescribeTextIndexDelta(prevF, prevF, 6).empty();
+        ok = ok && quietOk;
+        if (!quietOk) detail += L" delta_quiet";
+        // ④ 没有上一帧（第一次观察）⇒ 不许编出"变化"
+        const bool firstOk = AiDescribeTextIndexDelta({}, curF, 6).empty();
+        ok = ok && firstOk;
+        if (!firstOk) detail += L" delta_first_frame";
+    }
+
+    Emit(L"ocr_text_index_rows", ok, detail.c_str());
+}
+
+/// ★「清单要能被执行」是**产清单的工具**的责任（docs §44）。
+/// 实测踩坑（第二十五份日志）：模型用 planSpend 的 **costs 简写**（"只知道价格、不想编名字时用它"），
+/// 工具**伪造**了「选项3(花费500)」这种像名字的东西，而描述又写着「照它执行、逐个点名单里的卡」
+/// ⇒ 模型真的去 `locateAndClick("9999"/"800"/"600"/"500")`。
+/// 而价格**三条路全断**：① 不唯一（同一份计划里就有 500×3、300×4）；② 大概率不在 OCR 索引里
+/// （纯数字额度，见 `ocr_text_index_rows`）；③ 拿裸数字问 VLM 每次给的框都不同 —— 同一个「600」
+/// 三次给出 (1937,1101) → (1866,560) → (1775,585)，相差 500px。
+/// ⇒ 点空 → 死点表/近点重复闸连环触发（连**正确**的重定位也开枪）→ 模型改用**不带目标语义**的
+/// 手算坐标 `mouseClick`（按目标的闸全认不出来）⇒ 在选卡界面上把**已选中的卡又点掉**
+/// ⇒ 用户看到的「把选了的卡收回去又重新选」。
+void CasePlanSpendTargetContract() {
+    bool ok = true;
+    std::wstring detail;
+
+    AiActionHostHooks hooks;
+    hooks.onExecuteActions = [](const std::wstring&) { return std::wstring(L"已执行"); };
+    const auto tools = BuildAiActionExecuteTools(&hooks, {});
+
+    // ① 只给 costs：回执必须当场说清「这份名单不能用来定位」
+    const std::wstring byCosts = CallNamedTool(tools, L"planSpend",
+        L"{\"budget\":3000,\"slots\":3,\"distinctOnly\":true,"
+        L"\"costs\":[9999,800,600,500,300,275]}");
+    const bool warned = byCosts.find(L"不能用来定位") != std::wstring::npos
+        && byCosts.find(L"name") != std::wstring::npos;
+    ok = ok && warned;
+    if (!warned) detail += L" costs_only_not_warned";
+    // ② 占位符不许长得像可点目标（旧写法「选项3(花费500)」正是被照单点掉的那个）
+    const bool notTargetLike = byCosts.find(L"选项") == std::wstring::npos
+        && byCosts.find(L"noname") != std::wstring::npos;
+    ok = ok && notTargetLike;
+    if (!notTargetLike) detail += L" placeholder_looks_like_target";
+
+    // ③ 给了 name：不许再出现那句警告（无端噪音），且名字要原样回给模型供定位
+    const std::wstring byNames = CallNamedTool(tools, L"planSpend",
+        L"{\"budget\":3000,\"slots\":2,\"distinctOnly\":true,"
+        L"\"items\":[{\"name\":\"铁桶僵尸\",\"cost\":600},"
+        L"{\"name\":\"普通僵尸\",\"cost\":50}]}");
+    const bool namedOk = byNames.find(L"不能用来定位") == std::wstring::npos
+        && byNames.find(L"铁桶僵尸") != std::wstring::npos;
+    ok = ok && namedOk;
+    if (!namedOk) detail += L" named_warned_or_name_lost";
+
+    Emit(L"plan_spend_target_contract", ok, detail.c_str());
+}
+
+/// 思考降档的两个前置机制：AI 动作作用域标记 + 「抑制 N 轮」计数会被消耗。
+/// ⚠ 这里**不**断言「游戏前台 ⇒ 关思考」——那条**批 D 已整条删除（docs §47.4）**，
+///   而且它本来就依赖真实前台窗口（`foregroundSelfDrawn` 要 EnumChildWindows），
+///   自检里测不到，硬测就是假绿。**勿据此重建**：引擎不替模型决定「这一轮要不要想」。
+///   ⚠ 作用域标记仍要测：它现在是 §42 两条协议闸的入参（看门狗收束 / 慢轮处置靠它区分
+///   「AI 动作执行」与「聊天助手」）。
+///   能测也必须测的是：作用域真的按进出打开/关闭，以及计数器没有变成永久闩锁。
+void CaseThinkingDowngradePlumbing() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ① 作用域标记：默认关；进来是开；出去恢复关；嵌套进出平衡。
+    const bool outsideFalse = !InAiActionExecScope();
+    {
+        AiActionExecThinkingScope s1;
+        const bool insideTrue = InAiActionExecScope();
+        {
+            AiActionExecThinkingScope s2;   // 嵌套（嵌套 aiActionExecute 会这样）
+            const bool nestedTrue = InAiActionExecScope();
+            ok = ok && nestedTrue;
+            if (!nestedTrue) detail += L" nested";
+        }
+        const bool stillInside = InAiActionExecScope();   // 内层析构不该关掉外层
+        ok = ok && insideTrue && stillInside;
+        if (!insideTrue) detail += L" inside";
+        if (!stillInside) detail += L" nested_leak";
+    }
+    const bool afterTrue = !InAiActionExecScope();
+    ok = ok && outsideFalse && afterTrue;
+    if (!outsideFalse) detail += L" dirty_start";
+    if (!afterTrue) detail += L" scope_leak";
+
+    // ② 「抑制 N 轮」的**计数契约**：抑制 2 轮 ⇒ 消耗 2 次后必须放开。
+    //    ⚠ 这条测的是计数器的行为，**测不到 `SendMessage` 里那一次调用是否还在**
+    //      （要覆盖调用点得有 HTTP mock；试过把调用点注释掉，自检照样绿 —— 别把它当
+    //       那个缺陷的回归网）。它的价值是钉住「N 轮后一定放开」这个契约：
+    //      实现若改成只置位不递减、或把轮数放大，这里会红。
+    //      调用点的可见防线是代码注释 + 本用例说明，不是断言。
+    ResetThinkingSuppressionForTest();          // 从确定状态开始（防用例顺序污染）
+    SuppressThinkingForNextRounds(2);
+    int requestCount = 0;
+    while (ShouldDisableThinking(L"", L"") && requestCount < 8) {
+        NoteThinkingRoundConsumed();            // 模拟 SendMessage 每轮的那一次消耗
+        ++requestCount;
+    }
+    const bool released = !ShouldDisableThinking(L"", L"");
+    // 2 轮抑制 ⇒ 第 3 次请求应当已放开（多给一点余量，只要求「有限轮内放开」）
+    const bool boundedOk = released && requestCount >= 2 && requestCount <= 3;
+    ok = ok && boundedOk;
+    if (!released) detail += L" latch_stuck";
+    else if (requestCount < 2 || requestCount > 3) {
+        detail += L" rounds(" + std::to_wstring(requestCount) + L")";
+    }
+    ResetThinkingSuppressionForTest();
+
+    Emit(L"thinking_downgrade_plumbing", ok, detail.c_str());
+}
+
+void CaseFrameClickMarkLifecycle() {
+    bool ok = true;
+    std::wstring detail;
+
+    const int capX1 = 100, capY1 = 50, capX2 = 100 + 800, capY2 = 50 + 600;
+    const int frameW = 800, frameH = 600;
+
+    // ① 没点过 → 不该有任何标注（首帧不能凭空画一个叉）
+    ResetAiActionClickMarks();
+    {
+        AiClickMarkState st;
+        st.screenX = -1;
+        st.screenY = -1;
+        const bool taken = AiClickMarkTake(st);
+        ok = ok && !taken && !AiFrameClickMarkDrawnInFrame();
+        if (taken) detail += L" phantom_mark";
+    }
+
+    // ② 记一击 → 屏幕坐标 → 帧内像素（这是这一整套的地基：偏一点就是「标注整体错位」）
+    SetAiActionClickIntent(L"僵尸卡牌");
+    MarkLastAiClickScreenPoint(300, 250);
+    ok = ok && AiFrameClickMarkDrawnInFrame() == false;   // 还没有帧画过它
+    {
+        int lx = 0, ly = 0;
+        if (!AiClickMarkToFramePoint(300, 250, capX1, capY1, capX2, capY2, frameW, frameH,
+                &lx, &ly)) {
+            ok = false;
+            detail += L" conv_fail";
+        } else if (lx != 200 || ly != 200) {
+            ok = false;
+            detail += L" conv(" + std::to_wstring(lx) + L"," + std::to_wstring(ly) + L")";
+        }
+    }
+
+    // ③ 标签口径：图上画的和提示词说的必须是同一句话；过长截断
+    const std::wstring shortLabel = FormatFrameClickMarkLabel(L"僵尸卡牌");
+    ok = ok && shortLabel.find(L"僵尸卡牌") != std::wstring::npos;
+    if (shortLabel.find(L"僵尸卡牌") == std::wstring::npos) detail += L" label_missing";
+    const std::wstring longDesc(60, L'目');
+    const std::wstring longLabel = FormatFrameClickMarkLabel(longDesc);
+    ok = ok && longLabel.find(L"…") != std::wstring::npos
+        && longLabel.size() < longDesc.size();
+    if (longLabel.find(L"…") == std::wstring::npos) detail += L" label_no_ellipsis";
+    // 描述未知时也要说人话（引擎侧只标坐标、没意图时不至于画个空标签）
+    ok = ok && !FormatFrameClickMarkLabel(L"").empty();
+    if (FormatFrameClickMarkLabel(L"").empty()) detail += L" label_empty";
+
+    // ④ 一次点击只标一帧：第二次取同一个落点必须被辞退（否则模型会以为这里被点了很多次）
+    {
+        AiClickMarkState st;
+        st.space = AiClickMarkState::CoordSpace::ScreenPx;
+        st.screenX = 300;
+        st.screenY = 250;
+        st.x = 300;
+        st.y = 250;
+        st.capX1 = capX1;
+        st.capY1 = capY1;
+        st.capX2 = capX2;
+        st.capY2 = capY2;
+        st.frameW = frameW;
+        st.frameH = frameH;
+        const bool first = AiClickMarkTake(st);
+        const bool convOk = first && st.space == AiClickMarkState::CoordSpace::FramePx
+            && st.x == 200 && st.y == 200;
+        ok = ok && convOk;
+        if (!first) detail += L" take_first";
+        else if (st.x != 200 || st.y != 200) {
+            detail += L" take_coord(" + std::to_wstring(st.x) + L"," + std::to_wstring(st.y)
+                + L")";
+        }
+        st.drawnX = 300;      // 编码方画成功后写的记账
+        st.drawnY = 250;
+        // 同一落点、坐标已是 FramePx：仍不许再标（去重按**屏幕坐标**判，与坐标系无关）
+        st.space = AiClickMarkState::CoordSpace::ScreenPx;
+        st.x = 300;
+        st.y = 250;
+        const bool again = AiClickMarkTake(st);
+        ok = ok && !again;
+        if (again) detail += L" redraw_same";
+    }
+
+    // ⑤ 同一个坐标**再点一次** = 新的一击，必须允许重新标注
+    {
+        AiClickMarkState st;
+        AiClickMarkRecord(st, 300, 250);
+        st.capX1 = capX1;
+        st.capY1 = capY1;
+        st.capX2 = capX2;
+        st.capY2 = capY2;
+        st.frameW = frameW;
+        st.frameH = frameH;
+        AiClickMarkTake(st);
+        st.drawnX = 300;
+        st.drawnY = 250;
+        AiClickMarkRecord(st, 300, 250);      // 用户真的又点了一下同一处
+        st.capX1 = capX1;
+        st.capY1 = capY1;
+        st.capX2 = capX2;
+        st.capY2 = capY2;
+        st.frameW = frameW;
+        st.frameH = frameH;
+        const bool again = AiClickMarkTake(st);
+        ok = ok && again;
+        if (!again) detail += L" same_point_not_remarkable";
+    }
+
+    // ⑥ 落点在捕获区域外 → 不标（画不出真实位置，画了就是编造）；
+    //    刚好在右/下边界也算出界（capX2/capY2 是开区间）
+    {
+        const std::pair<int, int> outside[] = {
+            { capX1 - 1, 250 }, { 300, capY1 - 1 },
+            { capX2, 250 },     { 300, capY2 },
+        };
+        for (const auto& p : outside) {
+            AiClickMarkState st;
+            AiClickMarkRecord(st, p.first, p.second);
+            st.capX1 = capX1;
+            st.capY1 = capY1;
+            st.capX2 = capX2;
+            st.capY2 = capY2;
+            st.frameW = frameW;
+            st.frameH = frameH;
+            const bool taken = AiClickMarkTake(st);
+            ok = ok && !taken;
+            if (taken) {
+                detail += L" oob(" + std::to_wstring(p.first) + L"," + std::to_wstring(p.second)
+                    + L")";
+            }
+        }
+        // 区域非法（未初始化）时同样不画
+        AiClickMarkState st;
+        AiClickMarkRecord(st, 300, 250);
+        const bool taken = AiClickMarkTake(st);
+        ok = ok && !taken;
+        if (taken) detail += L" no_region";
+        // 区域合法但帧尺寸小于换算结果 → 出帧，不画
+        AiClickMarkState st2;
+        AiClickMarkRecord(st2, 300, 250);
+        st2.capX1 = capX1;
+        st2.capY1 = capY1;
+        st2.capX2 = capX2;
+        st2.capY2 = capY2;
+        st2.frameW = 100;
+        st2.frameH = 100;
+        const bool taken2 = AiClickMarkTake(st2);
+        ok = ok && !taken2;
+        if (taken2) detail += L" frame_small";
+    }
+
+    // ⑦ 抹掉落点（近点重复点击被拦时）：坐标没了，但「已画过哪一击」的记账要留着 ——
+    //    抹的是当前落点，不是已经出现在画面上的那一击
+    {
+        SetAiActionClickIntent(L"僵尸卡牌");
+        MarkLastAiClickScreenPoint(300, 250);
+        ClearAiActionClickMark();
+        int gx = 0, gy = 0;
+        std::wstring gl;
+        const bool has = GetAiActionClickMark(&gx, &gy, &gl);
+        ok = ok && !has;
+        if (has) detail += L" clear_failed";
+    }
+
+    // ⑧ 提示词侧的取用口径：标签取的是**屏幕坐标**（帧内换算只影响画面，不影响提示词）
+    {
+        ResetAiActionClickMarks();
+        SetAiActionClickIntent(L"600 卡");
+        MarkLastAiClickScreenPoint(640, 480);
+        int gx = 0, gy = 0;
+        std::wstring gl;
+        const bool has = GetAiActionClickMark(&gx, &gy, &gl);
+        ok = ok && has && gx == 640 && gy == 480
+            && gl == FormatFrameClickMarkLabel(L"600 卡");
+        if (!has) detail += L" get_missing";
+        else if (gx != 640 || gy != 480) {
+            detail += L" get_coord(" + std::to_wstring(gx) + L"," + std::to_wstring(gy) + L")";
+        }
+        // 同一把尺：引擎侧组帧用的标签与提示词用的是同一个函数（不许两处各拼一套文案）
+        ok = ok && CurrentAiActionClickMarkLabel() == FormatFrameClickMarkLabel(L"600 卡");
+        if (CurrentAiActionClickMarkLabel() != FormatFrameClickMarkLabel(L"600 卡"))
+            detail += L" label_diverged";
+        // 按一次 AI 动作复位：上一条任务的落点绝不能被画进本任务第一帧
+        ResetAiActionClickMarks();
+        ok = ok && !GetAiActionClickMark(&gx, &gy, &gl) && !AiFrameClickMarkDrawnInFrame();
+        if (GetAiActionClickMark(&gx, &gy, &gl)) detail += L" reset_leak";
+    }
+
+    Emit(L"frame_click_mark_lifecycle", ok, detail.c_str());
+}
+
+// 统一「可点元素索引」：把 UIA 控件与 OCR 文字合成一张带编号的表，让模型
+// 「所见即所得」——按编号/名字说话，宿主查表拿坐标（0 次识图）。
+// 这里钉的是合并/去重/歧义/窗口按钮拒选这几条**判据本身**。
+// `zoom`：把一块区域按原始分辨率放大回传（docs §50）。
+// 钉三类东西：①纯判据的**边界格**（夹取/反向/太小/帧外/未知帧尺寸，判断表不许有走不到的格子）；
+// ②回执**必须写清三件事**（区域、倍率、"图内坐标换回 upload 的公式"）——少一句就是坐标口径漂移；
+// ③工具契约（两个入口、缺参如实拒绝、无宿主如实拒绝、成功时必须带 `[[AGENT_IMG:]]`）。
+void CaseZoomRegionTool() {
+    bool ok = true;
+    std::wstring detail;
+    AiZoomRect r;
+    std::wstring why;
+    const bool inFrame = AiZoomClampRect(100, 50, 300, 150, 1024, 576, 8, r, why)
+        && r.x1 == 100 && r.y1 == 50 && r.x2 == 300 && r.y2 == 150;
+    ok = ok && inFrame;
+    if (!inFrame) detail += L" inside_frame";
+    // 越界要被**夹到帧内**（不是拒绝）：模型常按上一帧的坐标问，边界处差几像素很常见
+    const bool clamped = AiZoomClampRect(-50, -20, 2000, 900, 1024, 576, 8, r, why)
+        && r.x1 == 0 && r.y1 == 0 && r.x2 == 1024 && r.y2 == 576;
+    ok = ok && clamped;
+    if (!clamped) detail += L" clamp_to_frame";
+    // 反向坐标（右下在前）要能容忍
+    const bool swapped = AiZoomClampRect(300, 150, 100, 50, 1024, 576, 8, r, why)
+        && r.x1 == 100 && r.x2 == 300;
+    ok = ok && swapped;
+    if (!swapped) detail += L" swap_reversed";
+    // 太小 / 完全在帧外 / 还不知道帧尺寸 ⇒ 拒绝**且给可读原因**（别静默返回空图）
+    const bool tooSmall = !AiZoomClampRect(10, 10, 14, 14, 1024, 576, 8, r, why) && !why.empty();
+    const bool outside = !AiZoomClampRect(2000, 2000, 2100, 2100, 1024, 576, 8, r, why) && !why.empty();
+    const bool noFrame = !AiZoomClampRect(0, 0, 100, 100, 0, 0, 8, r, why) && !why.empty();
+    ok = ok && tooSmall && outside && noFrame;
+    if (!(tooSmall && outside && noFrame)) detail += L" reject_cells";
+    // ── 分块：**绝不静默裁掉模型要的区域**（docs §53）────────────────────────
+    // 旧实现遇到超上限的区域会**居中收窄**：模型 zoom(0,0,1024,80)（整条卡槽）
+    // 拿到的是中间 512 宽那一段，它据此下了「卡槽是空的」的结论，白烧两轮。
+    {
+        int need = 0;
+        const std::vector<AiZoomRect> two = PlanAiZoomTiles(
+            AiZoomRect{ 0, 0, 1024, 80 }, 2.5, 2.5, kAgentAttachmentMaxLongEdge, 2, &need);
+        const bool twoOk = two.size() == 2 && need == 2
+            && two[0].x1 == 0 && two[0].x2 == 512 && two[1].x1 == 512 && two[1].x2 == 1024
+            && two[0].y1 == 0 && two[0].y2 == 80;
+        ok = ok && twoOk;
+        if (!twoOk) detail += L" tiles_split_bar";
+        // 装得下的区域**不许**分块（一张就够，别白送两张图）
+        const std::vector<AiZoomRect> one = PlanAiZoomTiles(
+            AiZoomRect{ 140, 180, 600, 470 }, 2.5, 2.5, kAgentAttachmentMaxLongEdge, 2, &need);
+        const bool oneOk = one.size() == 1 && need == 1
+            && one[0].x1 == 140 && one[0].x2 == 600;
+        ok = ok && oneOk;
+        if (!oneOk) detail += L" tiles_no_split_when_fits";
+        // 整帧（2560×1440 原生）= 4 块 > 2 ⇒ 交回空表 + 老实报 needTiles，让调用方走降采样
+        const std::vector<AiZoomRect> none = PlanAiZoomTiles(
+            AiZoomRect{ 0, 0, 1024, 576 }, 2.5, 2.5, kAgentAttachmentMaxLongEdge, 2, &need);
+        const bool noneOk = none.empty() && need == 4;
+        ok = ok && noneOk;
+        if (!noneOk) detail += L" tiles_over_cap_needs_downscale";
+    }
+    // 回执四件事（倍率 ×2.50 = 500 / (300-100)）+ 单张时的换算基准
+    const AiZoomRect area{ 100, 50, 300, 150 };
+    AiZoomResult single;
+    single.ok = true;
+    single.requested = area;
+    single.tiles.push_back(AiZoomTile{ L"C:\\Temp\\QstZoom\\zoom_1_1.jpg",
+        area, 500, 250, 40200 });
+    const std::wstring rec = FormatAiZoomReceipt(single);
+    const bool recOk = rec.find(L"upload(100,50)-(300,150)") != std::wstring::npos
+        && rec.find(L"倍率 ×2.50") != std::wstring::npos
+        && rec.find(L"100 + 图x/2.50") != std::wstring::npos
+        && rec.find(L"入口＝坐标") != std::wstring::npos
+        && rec.find(L"mouseClick") != std::wstring::npos
+        && rec.find(L"40 KB") != std::wstring::npos;   // 交付字节数（= 模型拿到的那张）
+    ok = ok && recOk;
+    if (!recOk) detail += L" receipt_three_facts";
+    AiZoomResult byLabel = single;
+    byLabel.byTarget = true;
+    byLabel.resolvedName = L"自选僵尸卡牌";
+    const bool recTOk = FormatAiZoomReceipt(byLabel)
+        .find(L"入口＝文字标签「自选僵尸卡牌」") != std::wstring::npos;
+    ok = ok && recTOk;
+    if (!recTOk) detail += L" receipt_target_entry";
+    // ★分块回执：每块各自的区域+倍率+换算基准都要在（拿错块的基准会整体平移）
+    {
+        AiZoomResult multi;
+        multi.ok = true;
+        multi.requested = AiZoomRect{ 0, 0, 1024, 80 };
+        multi.tiles.push_back(AiZoomTile{ L"a.jpg", AiZoomRect{ 0, 0, 512, 80 }, 1280, 200, 60000 });
+        multi.tiles.push_back(AiZoomTile{ L"b.jpg", AiZoomRect{ 512, 0, 1024, 80 }, 1280, 200, 62000 });
+        multi.note = L"这块区域一张装不下，已**分成 2 张**给你";
+        const std::wstring r2 = FormatAiZoomReceipt(multi);
+        const bool multiOk = r2.find(L"分 2 张给你") != std::wstring::npos
+            && r2.find(L"第 1/2 张 = upload(0,0)-(512,80)") != std::wstring::npos
+            && r2.find(L"第 2/2 张 = upload(512,0)-(1024,80)") != std::wstring::npos
+            && r2.find(L"第 1 张 → (0 + 图x/2.50") != std::wstring::npos
+            && r2.find(L"第 2 张 → (512 + 图x/2.50") != std::wstring::npos
+            && r2.find(L"分成 2 张") != std::wstring::npos;
+        ok = ok && multiOk;
+        if (!multiOk) detail += L" receipt_multi_tile_facts";
+    }
+    // ★②「倍率」必须由**宿主给的真值**算（docs §53）：尺寸是交付图自己的尺寸，
+    //   回执不再自己按上限猜一遍 ⇒ 缩放/分块怎么变都不可能说谎。
+    //   这条钉「回执用的就是宿主报的那两个数」：1538 宽给 525 宽的块 = ×2.93。
+    {
+        AiZoomResult d;
+        d.ok = true;
+        d.requested = AiZoomRect{ 175, 20, 700, 95 };
+        d.tiles.push_back(AiZoomTile{ L"c.jpg", d.requested, 1538, 175, 300000 });
+        const std::wstring recBig = FormatAiZoomReceipt(d);
+        const bool delivered = recBig.find(L"图 1538×175") != std::wstring::npos;
+        const bool mag = recBig.find(L"倍率 ×2.93") != std::wstring::npos;
+        const bool formula = recBig.find(L"175 + 图x/2.93") != std::wstring::npos;
+        ok = ok && delivered && mag && formula;
+        if (!delivered) detail += L" receipt_not_delivered_size";
+        if (!mag) detail += L" receipt_mag_not_on_delivered_size";
+        if (!formula) detail += L" receipt_formula_not_on_delivered_size";
+    }
+    // 工具契约：缺参 / 无宿主都要如实拒绝（不猜区域、不假装有图）
+    AiActionHostHooks hooks;
+    AiActionToolOptions opts;
+    const auto tools = BuildAiActionExecuteTools(&hooks, opts);
+    const AgentTool* zt = nullptr;
+    for (const auto& t : tools) { if (t.name == L"zoom") zt = &t; }
+    if (!zt) {
+        detail += L" tool_missing";
+        ok = false;
+    } else {
+        const std::wstring noArg = zt->execute(LR"({})");
+        const bool noArgOk = noArg.rfind(L"[错误]", 0) == 0
+            && noArg.find(L"我不猜区域") != std::wstring::npos;
+        ok = ok && noArgOk;
+        if (!noArgOk) detail += L" no_arg_must_refuse";
+        const std::wstring noHost = zt->execute(LR"({"x1":10,"y1":10,"x2":100,"y2":60})");
+        const bool noHostOk = noHost.rfind(L"[错误]", 0) == 0
+            && noHost.find(L"宿主") != std::wstring::npos;
+        ok = ok && noHostOk;
+        if (!noHostOk) detail += L" no_host_must_refuse";
+    }
+    // 有宿主：坐标入口与文字标签入口都要走通，且成功必须带图片标记
+    AiActionHostHooks hooks2;
+    std::wstring seenTarget;
+    int seenMaxEdge = -1;
+    hooks2.onZoomRegion = [&](int x1, int y1, int x2, int y2, const std::wstring& target, int maxEdge)
+        -> AiZoomResult {
+        AiZoomResult z;
+        z.byTarget = !target.empty();
+        seenTarget = target;
+        seenMaxEdge = maxEdge;
+        z.requested = target.empty() ? AiZoomRect{ x1, y1, x2, y2 } : AiZoomRect{ 10, 20, 110, 80 };
+        AiZoomTile t;
+        t.area = z.requested;
+        t.outWidth = t.area.width() * 2;
+        t.outHeight = t.area.height() * 2;
+        t.bytes = 30000;
+        // ⚠ 文件名**每次不同**（同轮两张图曾因固定名互相覆盖，见 zoom 那批的用例）；
+        //   后缀是 `.jpg` —— 交付图**一次就编成送图链路的形态**（见 FormatAiZoomTempPath）。
+        t.imagePath = FormatAiZoomTempPath(L"C:\\Temp\\QstZoom", 4321, 1);
+        z.tiles.push_back(std::move(t));
+        z.ok = true;
+        return z;
+    };
+    const auto tools2 = BuildAiActionExecuteTools(&hooks2, opts);
+    const AgentTool* zt2 = nullptr;
+    for (const auto& t : tools2) { if (t.name == L"zoom") zt2 = &t; }
+    if (!zt2) {
+        detail += L" tool2_missing";
+        ok = false;
+    } else {
+        const std::wstring byCoord = zt2->execute(LR"({"x1":10,"y1":20,"x2":110,"y2":80})");
+        const bool coordOk = byCoord.find(L"[[AGENT_IMG:") != std::wstring::npos
+            && byCoord.find(L"倍率 ×2.00") != std::wstring::npos
+            && byCoord.find(L"入口＝坐标") != std::wstring::npos;
+        ok = ok && coordOk;
+        if (!coordOk) detail += L" coord_path";
+        // ★工具给宿主的 maxEdge 默认值必须**等于**送图链路的硬上限（写更大只是幻觉）
+        const bool defaultEdgeOk = seenMaxEdge == kAgentAttachmentMaxLongEdge;
+        ok = ok && defaultEdgeOk;
+        if (!defaultEdgeOk) detail += L" default_maxedge(" + std::to_wstring(seenMaxEdge) + L")";
+        // 模型要更大也一样被收到同一个上限（否则回执里的倍率立刻开始说谎）
+        zt2->execute(LR"({"x1":10,"y1":20,"x2":110,"y2":80,"maxEdge":4096})");
+        const bool clampEdgeOk = seenMaxEdge == kAgentAttachmentMaxLongEdge;
+        ok = ok && clampEdgeOk;
+        if (!clampEdgeOk) detail += L" maxedge_not_clamped(" + std::to_wstring(seenMaxEdge) + L")";
+        const std::wstring byLabel = zt2->execute(LR"({"target":"自选僵尸卡牌"})");
+        const bool labelOk = byLabel.find(L"[[AGENT_IMG:") != std::wstring::npos
+            && byLabel.find(L"入口＝文字标签") != std::wstring::npos
+            && seenTarget == L"自选僵尸卡牌";
+        ok = ok && labelOk;
+        if (!labelOk) detail += L" label_path";
+        // ★分块交付：宿主给 N 张 ⇒ 工具必须给 **N 个**图片标记（少一个模型就少看一块）
+        AiActionHostHooks hooks3;
+        hooks3.onZoomRegion = [](int x1, int y1, int x2, int y2, const std::wstring&, int)
+            -> AiZoomResult {
+            AiZoomResult z;
+            z.ok = true;
+            z.requested = AiZoomRect{ x1, y1, x2, y2 };
+            const int mid = (x1 + x2) / 2;
+            AiZoomTile a; a.area = AiZoomRect{ x1, y1, mid, y2 };
+            a.outWidth = a.area.width() * 2; a.outHeight = a.area.height() * 2;
+            a.bytes = 1000; a.imagePath = L"C:\\T\\zoom_1_1.jpg";
+            AiZoomTile b; b.area = AiZoomRect{ mid, y1, x2, y2 };
+            b.outWidth = b.area.width() * 2; b.outHeight = b.area.height() * 2;
+            b.bytes = 1000; b.imagePath = L"C:\\T\\zoom_1_2.jpg";
+            z.tiles.push_back(a);
+            z.tiles.push_back(b);
+            z.note = L"这块区域一张装不下，已**分成 2 张**给你";
+            return z;
+        };
+        const auto tools3 = BuildAiActionExecuteTools(&hooks3, opts);
+        const AgentTool* zt3 = nullptr;
+        for (const auto& t : tools3) { if (t.name == L"zoom") zt3 = &t; }
+        if (!zt3) {
+            detail += L" tool3_missing";
+            ok = false;
+        } else {
+            const std::wstring multi = zt3->execute(LR"({"x1":0,"y1":0,"x2":1024,"y2":80})");
+            size_t marks = 0;
+            for (size_t p = multi.find(L"[[AGENT_IMG:"); p != std::wstring::npos;
+                 p = multi.find(L"[[AGENT_IMG:", p + 1)) {
+                ++marks;
+            }
+            const bool multiOk = marks == 2
+                && multi.find(L"第 2/2 张 = upload(512,0)-(1024,80)") != std::wstring::npos;
+            ok = ok && multiOk;
+            if (!multiOk) detail += L" multi_tile_markers(" + std::to_wstring(marks) + L")";
+        }
+    }
+    Emit(L"zoom_region_tool", ok, detail.c_str());
+}
+
+// ★★`mouseDrag` 曾经**从来没成功过一次**（docs §54）：它拼出来的 `mouseDown`/`mouseUp`
+//   不带 x/y，而校验要求 x/y ⇒ 整条拖拽被拒，还回一句**完全不搭界**的话
+//   （「第 2 个 mouseDown 缺少 x/y。点击输入框须给截图坐标…」）——模型读到的是
+//   「我点输入框的方式不对」，于是改去别处瞎试（实测用户日志里就有这一条）。
+//   这个用例钉三件事：① 带坐标必须过；② 执行出去的 JSON 里真的有起点与终点；
+//   ③ 缺坐标时的报错要**贴着这个动作**说，不许再提输入框。
+// ★★同一坐标连点 N 次，每一次都必须**真的**发出去（docs §72）。
+//   起因（真机日志）：20 击的一批里**后 10 击全部 0 步**，回执只有一句
+//   `[错误] 本批 0 步：没有可执行的动作（空数组或全部被跳过）` —— 模型读不出原因、
+//   排查也只能靠读源码猜。这条先钉死**工具层**：不许有「同点静默去重/静默丢弃」。
+void CaseMouseClickRepeatSamePoint() {
+    bool ok = true;
+    std::wstring detail;
+
+    AiActionHostHooks hooks;
+    std::vector<std::wstring> payloads;
+    hooks.onExecuteActions = [&](const std::wstring& js) {
+        payloads.push_back(js);
+        return L"已执行 1 步";
+    };
+    hooks.onObserveScreen = [](bool) {
+        AiObserveCaptureResult r;
+        r.ok = true;
+        r.unchanged = true;
+        return r;
+    };
+    AiActionToolOptions opts;
+    const auto tools = BuildAiActionExecuteTools(&hooks, opts);
+    const AgentTool* click = nullptr;
+    for (const auto& t : tools) { if (t.name == L"mouseClick") click = &t; }
+    if (!click) {
+        detail += L" tool_missing";
+        ok = false;
+    } else {
+        for (int i = 0; i < 12; ++i) (void)click->execute(LR"({"x":624,"y":72})");
+        int withClick = 0;
+        int withCoords = 0;
+        for (const auto& p : payloads) {
+            if (p.find(L"\"mouseClick\"") != std::wstring::npos) ++withClick;
+            if (p.find(L"624") != std::wstring::npos
+                && p.find(L"72") != std::wstring::npos) ++withCoords;
+        }
+        const bool countOk = payloads.size() == 12;
+        const bool emitOk = withClick == 12 && withCoords == 12;
+        ok = ok && countOk && emitOk;
+        if (!countOk) detail += L" calls=" + std::to_wstring(payloads.size());
+        if (!emitOk) {
+            detail += L" emitted=" + std::to_wstring(withClick)
+                + L" coords=" + std::to_wstring(withCoords);
+        }
+    }
+
+    Emit(L"mouse_click_repeat_same_point", ok, detail.c_str());
+}
+
+void CaseMouseDragExecutes() {
+    bool ok = true;
+    std::wstring detail;
+
+    AiActionHostHooks hooks;
+    std::wstring executed;
+    hooks.onExecuteActions = [&](const std::wstring& js) {
+        executed = js;
+        return L"已执行 1 步";
+    };
+    hooks.onObserveScreen = [](bool) {
+        AiObserveCaptureResult r;
+        r.ok = true;
+        r.unchanged = true;
+        return r;
+    };
+    AiActionToolOptions opts;
+    const auto tools = BuildAiActionExecuteTools(&hooks, opts);
+    const AgentTool* drag = nullptr;
+    for (const auto& t : tools) { if (t.name == L"mouseDrag") drag = &t; }
+    if (!drag) {
+        detail += L" tool_missing";
+        ok = false;
+    } else {
+        const std::wstring r = drag->execute(
+            LR"({"fromX":300,"fromY":200,"toX":700,"toY":420})");
+        const bool ranOk = r.rfind(L"[错误]", 0) != 0
+            && executed.find(L"300") != std::wstring::npos
+            && executed.find(L"200") != std::wstring::npos
+            && executed.find(L"700") != std::wstring::npos
+            && executed.find(L"420") != std::wstring::npos
+            && executed.find(L"mouseDown") != std::wstring::npos
+            && executed.find(L"mouseUp") != std::wstring::npos;
+        ok = ok && ranOk;
+        if (!ranOk) {
+            detail += L" drag_exec(" + r.substr(0, 48) + L")";
+        }
+        // 缺坐标：报错必须说清是哪个动作缺什么，且**不许**再出现「输入框」那套
+        const std::wstring bad = drag->execute(LR"({"toX":700,"toY":420})");
+        const bool badOk = bad.rfind(L"[错误]", 0) == 0
+            && bad.find(L"fromX") != std::wstring::npos
+            && bad.find(L"输入框") == std::wstring::npos;
+        ok = ok && badOk;
+        if (!badOk) detail += L" drag_error_text";
+    }
+
+    // ★「计划执行」那行预览**不许说谎**（docs §70）。
+    //   预览是把**工具参数**当成**动作 JSON** 描述的，而 mouseDrag 的
+    //   工具参数是 fromX/fromY/toX/toY、动作字段是 x/y/endX/endY
+    //   ⇒ 旧实现硬套，实测真机日志打出：
+    //     `· 鼠标拖拽左键 (0,0)→(0,0) 0.300秒`
+    //   而同一批真的从 (228,47) 拖到了 (760,300) —— 回执与事实相反。
+    //   ① 名字对得上 → 描述里必须是**真坐标**；② 对不上 → 返回 false（调用方印原始参数）。
+    {
+        nlohmann::json j = nlohmann::json::parse(
+            R"({"fromX":228,"fromY":47,"toX":760,"toY":300})");
+        const bool aligned = AlignToolParamsWithActionFields(L"mouseDrag", j);
+        const bool coordsOk = aligned && j.contains("x") && j.contains("y")
+            && j.contains("endX") && j.contains("endY")
+            && j.value("x", 0.0) == 228.0 && j.value("y", 0.0) == 47.0
+            && j.value("endX", 0.0) == 760.0 && j.value("endY", 0.0) == 300.0;
+        ok = ok && coordsOk;
+        if (!coordsOk) detail += L" drag_preview_coords";
+
+        // 描述出来的那行必须是真值，且**不含** `(0,0)→`
+        ScriptAction a;
+        a.type = ActionType::MouseDrag;
+        a.button = MouseButtonType::Left;
+        a.x = static_cast<int>(j.value("x", 0.0));
+        a.y = static_cast<int>(j.value("y", 0.0));
+        a.endX = static_cast<int>(j.value("endX", 0.0));
+        a.endY = static_cast<int>(j.value("endY", 0.0));
+        const std::wstring line = ActionName(a);
+        const bool lineOk = line.find(L"228") != std::wstring::npos
+            && line.find(L"760") != std::wstring::npos
+            && line.find(L"(0,0)") == std::wstring::npos;
+        ok = ok && lineOk;
+        if (!lineOk) detail += L" drag_preview_line(" + line.substr(0, 60) + L")";
+
+        // 将来新增的工具换了参数名：有坐标键却接不住 ⇒ 必须返回 false，不许编造
+        nlohmann::json unknown = nlohmann::json::parse(R"({"x1":10,"y1":20})");
+        ok = ok && !AlignToolParamsWithActionFields(L"someFutureTool", unknown);
+        if (AlignToolParamsWithActionFields(L"someFutureTool", unknown))
+            detail += L" fabricated_zero_coords";
+        // 本来就没有坐标的工具（keyClick{keyText}）不许被这条闸误伤
+        nlohmann::json noCoord = nlohmann::json::parse(R"({"keyText":"Enter"})");
+        ok = ok && AlignToolParamsWithActionFields(L"keyClick", noCoord);
+        if (!AlignToolParamsWithActionFields(L"keyClick", noCoord))
+            detail += L" false_positive_on_text_tool";
+    }
+
+    Emit(L"mouse_drag_executes", ok, detail.c_str());
+}
+
+// ★坐标动作的回执必须回显落点（docs §54）。
+//   A/B：把 CoordSuffix/DragSuffix 那两处分支去掉 ⇒ 本用例必须转红。
+void CaseCoordActionReceipt() {
+    bool ok = true;
+    std::wstring detail;
+
+    AiActionHostHooks hooks;
+    std::wstring executedJson;
+    hooks.onExecuteActions = [&executedJson](const std::wstring& js) {
+        executedJson = js;
+        return L"已执行 1 步";
+    };
+    hooks.onObserveScreen = [](bool) {
+        AiObserveCaptureResult r;
+        r.ok = true;
+        r.unchanged = true;
+        return r;
+    };
+    AiActionToolOptions opts;
+    const auto tools = BuildAiActionExecuteTools(&hooks, opts);
+    auto find = [&tools](const wchar_t* n) -> const AgentTool* {
+        for (const auto& t : tools) { if (t.name == n) return &t; }
+        return nullptr;
+    };
+    auto has = [](const std::wstring& s, const wchar_t* needle) {
+        return s.find(needle) != std::wstring::npos;
+    };
+
+    // ① 单击：回执里必须有 (243,50)，而且必须是**原值**（upload 口径，不做任何换算）。
+    const AgentTool* click = find(L"mouseClick");
+    const AgentTool* move = find(L"moveMouse");
+    if (!click || !move) {
+        detail += L" tool_missing";
+        ok = false;
+    } else {
+        const std::wstring r = click->execute(LR"({"x":243,"y":50})");
+        const bool okClick = r.rfind(L"[错误]", 0) != 0 && has(r, L"(243,50)");
+        ok = ok && okClick;
+        if (!okClick) detail += L" click(" + r.substr(0, 64) + L")";
+
+        const std::wstring rm = move->execute(LR"({"x":512,"y":288})");
+        const bool okMove = rm.rfind(L"[错误]", 0) != 0 && has(rm, L"(512,288)");
+        ok = ok && okMove;
+        if (!okMove) detail += L" move(" + rm.substr(0, 64) + L")";
+    }
+
+    // ② 拖拽：**起点和终点都要在回执里**。注意 `mouseDrag` 工具是按
+    //    moveMouse→mouseDown→moveMouse→mouseUp 展开的（不是单个 mouseDrag 动作），
+    //    所以判据是「两个端点都出现过」，而不是「出现过箭头」——
+    //    宿主把这一串**合并**回单个 mouseDrag 动作时才有 (起点)→(终点) 那种写法。
+    const AgentTool* drag = find(L"mouseDrag");
+    if (!drag) {
+        detail += L" drag_missing";
+        ok = false;
+    } else {
+        const std::wstring r = drag->execute(
+            LR"({"fromX":300,"fromY":200,"toX":700,"toY":420})");
+        const bool okDrag = r.rfind(L"[错误]", 0) != 0
+            && has(r, L"(300,200)") && has(r, L"(700,420)");
+        ok = ok && okDrag;
+        if (!okDrag) detail += L" drag(" + r.substr(0, 96) + L")";
+
+        // 合并形态：单个 mouseDrag 动作。★字段名以脚本 schema 为准 = `x/y` 起点 +
+        // `endX/endY` 终点（`script_action_builder.cpp` 字段表 / `script_io.cpp` 只读这两个）。
+        const AgentTool* batch = find(L"submitMacroActions");
+        if (batch) {
+            const std::wstring rb = batch->execute(
+                LR"({"actions":[{"type":"mouseDrag","x":300,"y":200,"endX":740,"endY":460}]})");
+            const bool okEnd = rb.rfind(L"[错误]", 0) != 0 && has(rb, L"(300,200)\u2192(740,460)");
+            ok = ok && okEnd;
+            if (!okEnd) detail += L" merged(" + rb.substr(0, 96) + L")";
+        }
+
+        // `computer(left_click_drag)` 别名：它必须产出**同一套字段名**。
+        // ⚠ 断言钉在**交给宿主的动作 JSON** 上（`computer` 不走 SummarizeExecutedActionsJson，
+        //   它的回执由宿主自己写），因为要钉的正是 schema 字段名。
+        // A/B：换回 fromX/fromY/toX/toY ⇒ 这里转红（那套名字没有任何一处读 ⇒ 拖动退化成
+        // (0,0)→(0,0)，正是「drag 从来没成功过」那个事故的另一条入口）。
+        const AgentTool* comp = find(L"computer");
+        if (comp) {
+            executedJson.clear();
+            const std::wstring rc = comp->execute(
+                LR"({"action":"left_click_drag","coordinate":[117,347],"coordinate2":[289,799]})");
+            const bool okAlias = rc.rfind(L"[错误]", 0) != 0
+                && has(executedJson, L"mouseDrag")
+                && has(executedJson, L"endX") && has(executedJson, L"endY")
+                && !has(executedJson, L"fromX") && !has(executedJson, L"toX");
+            ok = ok && okAlias;
+            if (!okAlias) detail += L" alias(" + executedJson.substr(0, 120) + L")";
+        }
+    }
+
+    Emit(L"coord_action_receipt_names_landing", ok, detail.c_str());
+}
+
+
+// 这两条都属于「算错了会静默出事」的那一类：
+//   · 名字撞了 → 同一轮两张图变成同一张（模型会以为工具坏了而弃用它）；
+//   · 清理算错 → 要么删掉模型刚要的那张图，要么永远不删把临时目录撑爆。
+void CaseZoomTempImageFiles() {
+    bool ok = true;
+    std::wstring detail;
+    // ① 同一个 pid、不同 seq ⇒ 必须是**不同**路径（同轮两次 zoom 不能互相覆盖）。
+    //    后缀断言成 `.jpg`：交付图**一次就编成送图链路的形态**（JPEG q82 + 长边 ≤1280）——
+    //    写 PNG 时磁盘上是 1365 KB 的中间产物，而模型手里是重编码后的 ~200 KB JPEG，
+    //    回执按前者报字节数等于对模型说谎（docs §53）。
+    const std::wstring p1 = FormatAiZoomTempPath(L"C:\\Temp\\QstZoom", 4321, 1);
+    const std::wstring p2 = FormatAiZoomTempPath(L"C:\\Temp\\QstZoom", 4321, 2);
+    const bool distinct = p1 != p2
+        && p1 == L"C:\\Temp\\QstZoom\\zoom_4321_1.jpg"
+        && p2 == L"C:\\Temp\\QstZoom\\zoom_4321_2.jpg";
+    ok = ok && distinct;
+    if (!distinct) detail += L" temp_path_not_unique(" + p1 + L")";
+
+    // ② 清理：新的**留着**，旧的**删掉**（用 SetFileTime 造一个 1 小时前的文件）
+    wchar_t tmpBuf[MAX_PATH]{};
+    std::wstring dir = (GetTempPathW(MAX_PATH, tmpBuf) > 0)
+        ? (std::wstring(tmpBuf) + L"QstZoomPruneSelftest") : L".";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring fresh = FormatAiZoomTempPath(dir, 4321, 1);
+    const std::wstring stale = FormatAiZoomTempPath(dir, 4321, 2);
+    const std::wstring other = dir + L"\\keep_me.txt";   // 非 zoom_ 前缀：绝不能被删
+    auto writeOne = [](const std::wstring& p) {
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD wrote = 0;
+        const char bytes[4] = { 'p', 'n', 'g', 0 };
+        WriteFile(h, bytes, sizeof(bytes), &wrote, nullptr);
+        CloseHandle(h);
+        return true;
+    };
+    const bool wrote = writeOne(fresh) && writeOne(stale) && writeOne(other);
+    FILETIME old{};
+    {
+        // ★★ **减 1 小时必须走 FILETIME 算术，不能只改 st.wHour**（2026-10-02 修）。
+        //   旧写法 `st.wHour = (st.wHour + 23) % 24` 只退小时、**不退日期** ⇒ UTC 小时为 0 时
+        //   （北京时间 08:00~09:00）结果变成**同一日的 23:00 = 未来 1 小时** ⇒
+        //   `PruneAiZoomTempDir` 的「未来时间戳不许删」守卫**正确地**保留了它 ⇒
+        //   本用例每天有 1 小时窗口必然报 `prune_kept_stale`（假红，与本用例要验的语义无关）。
+        //   ⇒ 用 64 位算术真减 3600 秒。
+        FILETIME nowFt{};
+        GetSystemTimeAsFileTime(&nowFt);
+        ULARGE_INTEGER u{};
+        u.LowPart = nowFt.dwLowDateTime;
+        u.HighPart = nowFt.dwHighDateTime;
+        u.QuadPart -= 3600ULL * 10000000ULL;   // 1 小时 = 3600s × 10^7（100ns 单位）
+        old.dwLowDateTime = u.LowPart;
+        old.dwHighDateTime = u.HighPart;
+        HANDLE h = CreateFileW(stale.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            SetFileTime(h, nullptr, nullptr, &old);
+            CloseHandle(h);
+        }
+    }
+    PruneAiZoomTempDir(dir, 10ULL * 60ULL * 1000ULL);
+    const bool freshKept = GetFileAttributesW(fresh.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool staleGone = GetFileAttributesW(stale.c_str()) == INVALID_FILE_ATTRIBUTES;
+    const bool otherKept = GetFileAttributesW(other.c_str()) != INVALID_FILE_ATTRIBUTES;
+    ok = ok && wrote && freshKept && staleGone && otherKept;
+    if (!wrote) detail += L" prune_setup_failed";
+    if (!freshKept) detail += L" prune_deleted_fresh";
+    if (!staleGone) detail += L" prune_kept_stale";
+    if (!otherKept) detail += L" prune_deleted_foreign_file";
+    DeleteFileW(fresh.c_str());
+    DeleteFileW(stale.c_str());
+    DeleteFileW(other.c_str());
+    RemoveDirectoryW(dir.c_str());
+
+    Emit(L"zoom_temp_image_files", ok, detail.c_str());
+}
+
+// ★「短标签 → 它标注的图标槽」（docs §53）：用户主诉「只会放普通僵尸」的**根因**就在这条 ——
+//   卡槽里 OCR 只读得到价签（「50/75/600」），**读不到卡片本身** ⇒ 模型知道数字在哪、
+//   不知道那张卡在哪 ⇒ 反复 zoom 猜卡，最后只敢点唯一有把握的那张（最便宜的）。
+//   这个用例钉四件事：
+//     ① 真·成排短标签 + 正上方等距块 ⇒ 必须配对，且坐标给的是**那个块**（图标），不是文字；
+//     ② 五个「不够格」的版面（上面是文字行 / 块数对不上 / 间距不匀 / 长标签 / 块之间没有分离
+//        证据）⇒ **一条都不许发布**（配错 = 点到别的卡，比不发布糟得多）；
+//     ③ 配对之后索引里**不能**再留同名文字条目（否则同档两条 ⇒ 解析判歧义拒绝 ⇒ 白做）；
+//     ④ 位图采样本身要能从**真像素**里认出成排的块（合成剖面测不出这一步）。
+void CaseLabelIconPairing() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto makeLabels = [](const std::vector<int>& centers, const std::vector<std::wstring>& texts,
+                         int y1, int y2, int halfW) {
+        std::vector<AiIndexRowInput> v;
+        for (size_t i = 0; i < centers.size(); ++i) {
+            AiIndexRowInput r;
+            r.text = i < texts.size() ? texts[i] : std::to_wstring(centers[i]);
+            r.x1 = centers[i] - halfW;
+            r.y1 = y1;
+            r.x2 = centers[i] + halfW;
+            r.y2 = y2;
+            v.push_back(r);
+        }
+        return v;
+    };
+    // 条带像素：背景灰 128；每个「卡」= 深色边框 + 亮内部 + 细竖纹（真图标有内部结构）。
+    // ⚠ 前景故意占条带一半以上宽度 —— 第一版判据（与**行中位数**比）就是在这里翻极性的：
+    //    它把 4 张卡读成了 4 条**缝**（卡片本身 ink=0）。这条 fixture 就是防它回来。
+    auto makeLumBand = [](int x0, int y0, int width, int height,
+                          const std::vector<std::pair<int, int>>& slots,
+                          int firstRow, int lastRow) {
+        AiIconBand b;
+        b.x0 = x0;
+        b.y0 = y0;
+        b.width = width;
+        b.height = height;
+        b.lum.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 128);
+        for (const auto& s : slots) {
+            for (int y = firstRow; y <= lastRow && y < height; ++y) {
+                if (y < 0) continue;
+                for (int x = s.first; x <= s.second && x < width; ++x) {
+                    if (x < 0) continue;
+                    const bool border = (x == s.first || x == s.second
+                        || y == firstRow || y == lastRow);
+                    uint8_t v = border ? 40 : 250;
+                    if (!border && ((x - s.first) % 3 == 0)) v = 205;
+                    b.lum[static_cast<size_t>(y) * static_cast<size_t>(width)
+                        + static_cast<size_t>(x)] = v;
+                }
+            }
+        }
+        return b;
+    };
+
+    const std::vector<int> kCenters{ 100, 200, 300, 400 };
+    const std::vector<std::wstring> kPrices{ L"50", L"75", L"600", L"125" };
+    const std::vector<std::pair<int, int>> kSlots{ {20, 80}, {120, 180}, {220, 280}, {320, 380} };
+    const std::vector<AiIndexRowInput> labels = makeLabels(kCenters, kPrices, 90, 100, 10);
+
+    // ① 正例：4 段短标签 + 正上方 4 个等高块 ⇒ 4 条配对，坐标是**块**
+    {
+        std::wstring why;
+        const AiIconBand band = makeLumBand(50, 40, 400, 48, kSlots, 2, 45);
+        const std::vector<AiLabelIconPair> pairs =
+            PairCaptionRowWithIconBand(labels, band, &why);
+        const bool posOk = pairs.size() == 4
+            && pairs[0].label.text == L"50"
+            && pairs[0].x1 == 70 && pairs[0].y1 == 42 && pairs[0].x2 == 131 && pairs[0].y2 == 86
+            && pairs[3].label.text == L"125" && pairs[3].x1 == 370
+            && pairs[0].slotCount == 4 && pairs[0].labelCount == 4 && pairs[0].iconHeight == 44;
+        ok = ok && posOk;
+        if (!posOk) {
+            detail += L" positive(" + std::to_wstring(pairs.size()) + L"," + why + L")";
+        }
+        // ②-a 上面那行是**文字**（只有 14 行高 < 1.6×标签高）⇒ 不发布
+        const bool thinOk = PairCaptionRowWithIconBand(labels,
+            makeLumBand(50, 40, 400, 48, kSlots, 20, 33), &why).empty()
+            && why.find(L"像文字行") != std::wstring::npos;
+        ok = ok && thinOk;
+        if (!thinOk) detail += L" reject_text_row_above(" + why + L")";
+        // ②-b 有一段标签**正上方什么都没有**（5 段标签、只有 4 个块）⇒ 不猜
+        const std::vector<AiIndexRowInput> fiveLabels =
+            makeLabels({ 100, 200, 300, 400, 500 }, { L"50", L"75", L"600", L"125", L"400" },
+                90, 100, 10);
+        const bool missingOk = PairCaptionRowWithIconBand(fiveLabels,
+            makeLumBand(50, 40, 500, 48, kSlots, 2, 45), &why).empty()
+            && why.find(L"正上方没有独立的东西") != std::wstring::npos;
+        ok = ok && missingOk;
+        if (!missingOk) detail += L" reject_missing_block(" + why + L")";
+        // ②-c 间距不匀（30/170/100）⇒ 不发布
+        const std::vector<AiIndexRowInput> uneven =
+            makeLabels({ 100, 130, 300, 400 }, kPrices, 90, 100, 10);
+        const bool unevenOk = PairCaptionRowWithIconBand(uneven,
+            makeLumBand(50, 40, 400, 48, kSlots, 2, 45), &why).empty()
+            && why.find(L"间距不匀") != std::wstring::npos;
+        ok = ok && unevenOk;
+        if (!unevenOk) detail += L" reject_uneven_spacing";
+        // ②-d 长标签（正文不是价签）⇒ 一句都不配
+        std::vector<std::wstring> longText = kPrices;
+        longText[1] = L"这是一句很长的正文";
+        const bool longOk = PairCaptionRowWithIconBand(
+            makeLabels(kCenters, longText, 90, 100, 10),
+            makeLumBand(50, 40, 400, 48, kSlots, 2, 45), &why).empty()
+            && why.find(L"短标签") != std::wstring::npos;
+        ok = ok && longOk;
+        if (!longOk) detail += L" reject_long_label";
+        // ②-e 两块**分不开**（卡片宽窄不一、标签中点落进了块里）⇒ **一条都不许发布**。
+        //      这里只断言「空」，不断言具体理由：背景估计被污染之后，拦住它的可能是
+        //      「块太窄」「上面没有独立的东西」中的任何一条 —— 要的就是**保守**这一条性质。
+        {
+            const std::vector<AiIndexRowInput> lab =
+                makeLabels({ 50, 150, 270, 390 }, kPrices, 90, 100, 10);
+            const bool mergedOk = PairCaptionRowWithIconBand(lab,
+                makeLumBand(0, 40, 460, 48, { {20, 80}, {120, 180}, {200, 340}, {360, 420} },
+                    2, 45), &why).empty();
+            ok = ok && mergedOk;
+            if (!mergedOk) detail += L" reject_merged_blocks(" + why + L")";
+        }
+        // ③ 配对后索引里只剩 `LabeledIcon` 四条，且没有同名文字条目
+        std::vector<AiElementEntry> elems = BuildAiElementIndexWithIcons({}, labels, pairs, 80);
+        int iconCount = 0, textCount = 0;
+        for (const auto& e : elems) {
+            if (e.source == AiElementSource::LabeledIcon) ++iconCount;
+            if (e.source == AiElementSource::OcrText) ++textCount;
+        }
+        const bool mergeOk = elems.size() == 4 && iconCount == 4 && textCount == 0
+            && elems[0].name == L"50" && elems[0].x1 == 70 && !elems[0].note.empty();
+        ok = ok && mergeOk;
+        if (!mergeOk) {
+            detail += L" merge(" + std::to_wstring(iconCount) + L"/" + std::to_wstring(textCount)
+                + L")";
+        }
+        // 解析必须凭这一条命中（同名两条会判歧义 ⇒ 这条断言就是防它回来）。
+        // 「600」是第 3 段标签，它的槽是 {220,280} → 屏幕 x1 = 270、x2 = 331 ⇒ 中心 300。
+        AiIndexResolveResult ir;
+        const bool resolveOk = AiElementIndexResolve(elems, L"600", false, 0, 0, &ir)
+            && ir.ok && ir.source == AiElementSource::LabeledIcon && ir.x == 300;
+        ok = ok && resolveOk;
+        if (!resolveOk) detail += L" resolve_icon_slot(" + std::to_wstring(ir.x) + L")";
+    }
+
+    // ④ 位图采样：从**真像素**里拷出亮度（合成数组测不出这一步）
+    {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = 400;
+        bi.bmiHeader.biHeight = -48;   // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bmp || !bits) {
+            detail += L" dib_create_failed";
+            ok = false;
+        } else {
+            uint8_t* px = static_cast<uint8_t*>(bits);
+            for (size_t i = 0; i < 400u * 48u; ++i) {
+                px[i * 4 + 0] = 128;
+                px[i * 4 + 1] = 128;
+                px[i * 4 + 2] = 128;
+                px[i * 4 + 3] = 255;
+            }
+            for (const auto& s : kSlots) {
+                for (int y = 4; y < 44; ++y) {
+                    for (int x = s.first; x <= s.second; ++x) {
+                        const size_t idx = (static_cast<size_t>(y) * 400 + x) * 4;
+                        px[idx + 0] = 250;
+                        px[idx + 1] = 250;
+                        px[idx + 2] = 250;
+                    }
+                }
+            }
+            AiIconBand band;
+            const bool sampled = SampleIconBandFromBitmap(bmp, 0, 0, 0, 0, 400, 48, &band);
+            const bool sampleOk = sampled && band.width == 400 && band.height == 48
+                && band.x0 == 0 && band.y0 == 0
+                && band.at(50, 20) > 200 && band.at(100, 20) < 160
+                && band.at(50, 0) < 160;   // 块的上下留白是背景
+            ok = ok && sampleOk;
+            if (!sampleOk) {
+                detail += L" bitmap_band_sample(sampled=" + std::to_wstring(sampled ? 1 : 0)
+                    + L",at50_20=" + std::to_wstring(band.at(50, 20))
+                    + L",at100_20=" + std::to_wstring(band.at(100, 20))
+                    + L",w=" + std::to_wstring(band.width) + L")";
+            }
+            // 端到端：像素 → 亮度 → 配对（标签在条带**下方**：y 50..60）
+            if (sampled) {
+                const std::vector<AiIndexRowInput> lab =
+                    makeLabels({ 50, 150, 250, 350 }, kPrices, 50, 60, 10);
+                const std::vector<AiLabelIconPair> pairs =
+                    PairCaptionRowWithIconBand(lab, band, nullptr);
+                const bool e2eOk = pairs.size() == 4 && pairs[1].x1 == 120
+                    && pairs[1].x2 == 181 && pairs[1].y1 == 4 && pairs[1].y2 == 44;
+                ok = ok && e2eOk;
+                if (!e2eOk) detail += L" pixel_to_pair(" + std::to_wstring(pairs.size()) + L")";
+            }
+            DeleteObject(bmp);
+        }
+    }
+
+    // ★★网格 fixture：选卡面板那种「一排排卡片、每张下面一个价签」的版面（docs §54）。
+    //   实测那一局它在**两个地方**被卡死：① 给模型看的索引对纯数字限量 16 条，而一个
+    //   8×10 的网格有 ~50 个价签 ⇒ 配对读到的每行不足 3 段 ⇒ 一条都不发布，
+    //   而且日志里连原因都没有（`标签→图标槽推断 0 条`）；② 卡片之间只隔一条描边时，
+    //   旧判据「扩到偏离掉一半就停」必然扩到邻居 ⇒ 整行作废。两条都钉在这里。
+    {
+        std::wstring why;
+        // 8 列：卡片 40 宽、间距 43（间歇 3 列背景）；标签在卡片正下方的中心
+        std::vector<int> centers;
+        std::vector<std::pair<int, int>> slots;
+        for (int i = 0; i < 8; ++i) {
+            const int cx = 20 + i * 43;
+            centers.push_back(cx + 20);
+            slots.push_back({ cx, cx + 39 });
+        }
+        std::vector<std::wstring> texts;
+        for (int i = 0; i < 8; ++i) texts.push_back(std::to_wstring(50 + i * 25));
+        const std::vector<AiIndexRowInput> row = makeLabels(centers, texts, 90, 100, 9);
+        // 条带要**容得下最后一张卡的右边框**（否则如实拒绝「顶到条带边缘」——
+        // 本用例第一版就是差一列，正好把这条判据演示了一遍）
+        const AiIconBand band = makeLumBand(0, 40, 380, 48, slots, 2, 45);
+        const std::vector<AiLabelIconPair> pairs =
+            PairCaptionRowWithIconBand(row, band, &why);
+        const bool gridOk = pairs.size() == 8
+            && pairs[0].x1 == 20 && pairs[0].x2 == 60
+            && pairs[7].x1 == 321 && pairs[7].label.text == L"225";
+        ok = ok && gridOk;
+        if (!gridOk) detail += L" grid_row(" + std::to_wstring(pairs.size()) + L"," + why + L")";
+        // 行分组本身也不能被「纯数字限量」卡住（那是给模型看的展示层闸，不是感知层的）：
+        // 实测一个 8×10 的选卡网格有 ~50 个价签，限量 16 条 ⇒ 配对每行凑不满 3 段。
+        std::vector<OcrTextLine> lines;
+        std::vector<int> wideCenters;
+        for (int i = 0; i < 20; ++i) {
+            OcrTextLine ln;
+            ln.text = std::to_wstring(50 + i * 25);
+            ln.confidence = 0.95;
+            const int cx = 40 + i * 43;
+            wideCenters.push_back(cx);
+            ln.x1 = cx - 14; ln.y1 = 90; ln.x2 = cx + 14; ln.y2 = 100;
+            lines.push_back(ln);
+        }
+        const auto cappedRows = CollectOcrIndexRows(lines, 64);
+        const auto fullRows = CollectOcrIndexRows(lines, 64, 4096);
+        const size_t capped = cappedRows.empty() ? 0 : cappedRows.front().size();
+        const size_t full = fullRows.empty() ? 0 : fullRows.front().size();
+        const bool capOk = full == 20 && capped == 16;
+        ok = ok && capOk;
+        if (!capOk) {
+            detail += L" numeric_cap_split(" + std::to_wstring(capped) + L"/"
+                + std::to_wstring(full) + L")";
+        }
+
+        // ★★真机几何：**窄价签 + 宽卡槽**（docs §56）。
+        //   上面那个 fixture 的价签宽 28、槽距 43 ⇒ 间距 15 ≤ 字高 10×2 ⇒ 天然成一行，
+        //   所以它**永远测不出**真机上的问题：真机卡槽 ≈112 native px、价签只有 ≈30 px 宽
+        //   ⇒ 间距 ≈82 > 字高 26×2=52 ⇒ 每个价签各自成行 ⇒ 配对连门槛都进不去
+        //   （`标签→图标槽推断 0 条`，而且"未配对"的诊断都不会打）。
+        std::vector<OcrTextLine> deck;
+        for (int i = 0; i < 14; ++i) {
+            OcrTextLine ln;
+            ln.text = (i == 10) ? L"600" : L"75";
+            ln.confidence = 0.95;
+            const int cx = 300 + i * 112;      // 卡槽 112 宽
+            ln.x1 = cx - 15; ln.y1 = 165;      // 价签只占 30 宽、26 高
+            ln.x2 = cx + 15; ln.y2 = 191;
+            deck.push_back(ln);
+        }
+        const auto narrow = CollectOcrIndexRows(deck, 64, 4096);            // 默认间距闸
+        const auto narrowWide = CollectOcrIndexRows(deck, 64, 4096, 64);    // 版面推断用
+        const size_t nDefault = narrow.empty() ? 0 : narrow.front().size();
+        const size_t nWide = narrowWide.empty() ? 0 : narrowWide.front().size();
+        // 默认闸**必须照旧**把远间距切开（给模型看的索引口径不变），
+        // 宽闸必须把它们并成一行 —— 两边都不一样才说明这个参数真的分开了两个消费者。
+        const bool gapOk = nDefault == 1 && narrowWide.size() == 1 && nWide == 14;
+        ok = ok && gapOk;
+        if (!gapOk) {
+            detail += L" narrow_label_gap(default=" + std::to_wstring(nDefault)
+                + L",rows=" + std::to_wstring(narrowWide.size())
+                + L",wide=" + std::to_wstring(nWide) + L")";
+        }
+        // ★★真机形状（docs §63）：**卡牌价签本身等距，但同一视觉行里混进了太阳计数器**。
+        //   真机数据：`30000`@187 与第一个价签@242 同在一行，末尾还有一个孤立价签@564
+        //   ⇒ 整行变异系数 **0.72** ⇒ 旧判据（整行 CV ≤ 0.35）**整排作废**，实测 8 次都是
+        //   `变异系数 0.36 > 0.35`（只差 0.01）⇒ 模型拿不到任何卡坐标 ⇒ 一次运行 17 次 zoom。
+        //   现在按「中位间距 ±35% 内的最长等距段」判：丢掉那两个**不同来源**的标签，保住等距的 4 张卡。
+        {
+            std::vector<std::wstring> texts{ L"30000", L"75", L"100", L"600", L"125" };
+            const std::vector<AiIndexRowInput> lab =
+                makeLabels({ 50, 100, 150, 200, 400 }, texts, 90, 100, 10);
+            const std::vector<AiLabelIconPair> kept = PairCaptionRowWithIconBand(lab,
+                makeLumBand(0, 40, 460, 48,
+                    { {30, 70}, {80, 120}, {130, 170}, {180, 220} }, 2, 45), &why);
+            // 等距的 4 段必须保住（顺序按 x 排），非等距的第 5 段必须被丢掉
+            const bool runOk = kept.size() == 4
+                && kept[0].label.text == L"30000" && kept[3].label.text == L"600";
+            ok = ok && runOk;
+            if (!runOk) {
+                detail += L" longest_even_run(" + std::to_wstring(kept.size()) + L"," + why + L")";
+            }
+        }
+        // 反过来钉：**真的不成排**仍然一条都不许发布（只放宽"谁参与"，不放宽"成不成排"）
+        {
+            const std::vector<AiIndexRowInput> lab =
+                makeLabels({ 10, 60, 400 }, { L"50", L"75", L"600" }, 90, 100, 10);
+            const bool irregularOk = PairCaptionRowWithIconBand(lab,
+                makeLumBand(0, 40, 460, 48, { {20, 60}, {70, 110}, {380, 420} }, 2, 45),
+                &why).empty();
+            ok = ok && irregularOk;
+            if (!irregularOk) detail += L" accept_irregular_row(" + why + L")";
+        }
+        // ★★诊断文案必须**说清是哪一条判据失败的**（docs §60 的事故）：
+        //   出界与「被上一行压没」是两个完全不同的原因，旧文案一律写「条带出界（…捕获区 …）」
+        //   ⇒ 排查被指向「捕获区域配错了」这个错误方向。这里逐个原因断言，并断言三条互不相同
+        //   （"同一种原因说两句话"无害，"两种原因说同一句话"正是那次事故）。
+        {
+            const std::wstring none = AiExplainIconBandSkip(100, 140, INT_MIN, 0, 48);
+            const std::wstring squeezed = AiExplainIconBandSkip(141, 140, 139, 0, 48);
+            const std::wstring pushed = AiExplainIconBandSkip(402, 500, 400, 500, 200);
+            const std::wstring tooHigh = AiExplainIconBandSkip(10, 210, INT_MIN, 200, 200);
+            const bool skipOk = none.empty()
+                && squeezed.find(L"上一行标签压没") != std::wstring::npos
+                && pushed.find(L"顶到捕获区之外") != std::wstring::npos
+                && tooHigh.find(L"落在捕获区上沿之外") != std::wstring::npos
+                && squeezed != pushed && pushed != tooHigh && squeezed != tooHigh;
+            ok = ok && skipOk;
+            if (!skipOk) {
+                detail += L" band_skip(notEmpty=" + std::to_wstring(none.empty() ? 0 : 1)
+                    + L",a=" + squeezed.substr(0, 12) + L",b=" + pushed.substr(0, 12)
+                    + L",c=" + tooHigh.substr(0, 12) + L")";
+            }
+        }
+    }
+
+    Emit(L"caption_icon_pairing", ok, detail.c_str());
+}
+
+void CaseElementIndexAndResolve() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ① 合并：同一处（IoU 高）+ 名字对得上 → 一条，且保留 UIA 的矩形与来源
+    {
+        std::vector<AiUiAnchor> ui = {
+            { 100, 200, 220, 236, L"一键全选" },      // UIA 控件框（真框）
+        };
+        std::vector<AiIndexRowInput> rows = {
+            { L"一键全选", 108, 206, 214, 232 },       // OCR 文字框（同处、同名）
+        };
+        const auto idx = BuildAiElementIndex(ui, rows, 80);
+        ok = ok && idx.size() == 1;
+        if (idx.size() != 1) detail += L" merge_count(" + std::to_wstring(idx.size()) + L")";
+        if (!idx.empty()) {
+            const bool keptUi = idx[0].source == AiElementSource::UiAutomation
+                && idx[0].x1 == 100 && idx[0].y1 == 200 && idx[0].x2 == 220 && idx[0].y2 == 236;
+            ok = ok && keptUi;
+            if (!keptUi) detail += L" merge_kept_wrong_rect";
+            ok = ok && idx[0].id == 1;
+            if (idx[0].id != 1) detail += L" id_not_from_1";
+        }
+    }
+
+    // ② 合并要**保守**：同处但名字不相干 → 两条（并错 = 点错东西）
+    {
+        std::vector<AiUiAnchor> ui = { { 300, 300, 380, 330, L"设置" } };
+        std::vector<AiIndexRowInput> rows = { { L"退出登录", 302, 302, 378, 328 } };
+        const auto idx = BuildAiElementIndex(ui, rows, 80);
+        ok = ok && idx.size() == 2;
+        if (idx.size() != 2) detail += L" overmerge(" + std::to_wstring(idx.size()) + L")";
+    }
+    // 不相干位置的同名 → 也是两条（同屏两个「确定」必须都留着，靠 near 区分）
+    {
+        std::vector<AiUiAnchor> ui = { { 100, 100, 160, 130, L"确定" } };
+        std::vector<AiIndexRowInput> rows = { { L"确定", 900, 700, 960, 730 } };
+        const auto idx = BuildAiElementIndex(ui, rows, 80);
+        ok = ok && idx.size() == 2;
+        if (idx.size() != 2) detail += L" far_same_name_merged("
+            + std::to_wstring(idx.size()) + L")";
+    }
+
+    // ③ 编号按阅读顺序（上→下、左→右），id 从 1 连续
+    {
+        std::vector<AiIndexRowInput> rows = {
+            { L"右下", 800, 500, 900, 530 },
+            { L"左上", 100, 100, 200, 130 },
+            { L"右上", 800, 100, 900, 130 },
+        };
+        const auto idx = BuildAiElementIndex({}, rows, 80);
+        bool order = idx.size() == 3;
+        if (order) {
+            order = idx[0].name == L"左上" && idx[1].name == L"右上" && idx[2].name == L"右下";
+            order = order && idx[0].id == 1 && idx[1].id == 2 && idx[2].id == 3;
+        }
+        ok = ok && order;
+        if (!order) {
+            detail += L" order(";
+            for (const auto& e : idx) detail += e.name + L",";
+            detail += L")";
+        }
+    }
+
+    // ④ 解析：完全相等优先于包含；UIA 与 OCR 同表都能命中
+    {
+        std::vector<AiElementEntry> idx;
+        auto add = [&](int id, std::wstring name, int x, int y, AiElementSource s) {
+            AiElementEntry e;
+            e.id = id;
+            e.name = std::move(name);
+            e.x1 = x;
+            e.y1 = y;
+            e.x2 = x + 60;
+            e.y2 = y + 30;
+            e.source = s;
+            idx.push_back(e);
+        };
+        add(1, L"保存并关闭", 100, 100, AiElementSource::OcrText);
+        add(2, L"保存", 300, 100, AiElementSource::UiAutomation);
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"保存", false, 0, 0, &r);
+        ok = ok && hit && r.id == 2 && r.tier == 2 && r.source == AiElementSource::UiAutomation;
+        if (!hit) detail += L" resolve_miss";
+        else if (r.id != 2) detail += L" resolve_picked(" + std::to_wstring(r.id) + L")";
+        // 坐标必须是该条目的中心
+        ok = ok && r.x == 330 && r.y == 115;
+        if (r.x != 330 || r.y != 115)
+            detail += L" center(" + std::to_wstring(r.x) + L"," + std::to_wstring(r.y) + L")";
+    }
+
+    // ④.5 同档多条时按**来源可信度**收敛：UIA 控件（控件真框）优先于 OCR 文字
+    //   （文字框中心常偏在角标上）。⚠ 这条钉的是批 C 删掉「格」那一档来源枚举之后
+    //   **优先级比较仍然正确** —— 原来它是最高的第 2 档（格中心），
+    //   现在只剩 控件(1) / 文字(0)；语义若被改坏，这一格会退化成「同档分不出 → 歧义拒绝」，
+    //   而调用方只会看到「索引里没有」，落回一次白付的识图。
+    {
+        std::vector<AiElementEntry> idx;
+        auto add = [&](int id, std::wstring name, int x, AiElementSource s) {
+            AiElementEntry e;
+            e.id = id;
+            e.name = std::move(name);
+            e.x1 = x;
+            e.y1 = 100;
+            e.x2 = x + 60;
+            e.y2 = 130;
+            e.source = s;
+            idx.push_back(e);
+        };
+        add(1, L"保存至", 100, AiElementSource::OcrText);
+        add(2, L"保存到", 300, AiElementSource::UiAutomation);
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"保存", false, 0, 0, &r);
+        // 无 near、两条同档（都是「双向包含」1 档）⇒ 只有来源优先级能收敛出唯一一条
+        ok = ok && hit && r.id == 2 && r.tier == 1
+            && r.source == AiElementSource::UiAutomation && r.x == 330;
+        if (!hit) detail += L" pref_source_miss";
+        else if (r.id != 2) detail += L" pref_source_picked(" + std::to_wstring(r.id) + L")";
+        else if (r.x != 330) detail += L" pref_source_center(" + std::to_wstring(r.x) + L")";
+    }
+
+    // ⑤ 同档多条 + 无 near → 歧义拒绝（宁可回落识图，也不猜着点）
+    {
+        std::vector<AiElementEntry> idx;
+        for (int i = 0; i < 2; ++i) {
+            AiElementEntry e;
+            e.id = i + 1;
+            e.name = L"确定";
+            e.x1 = 100 + i * 500;
+            e.y1 = 100;
+            e.x2 = e.x1 + 60;
+            e.y2 = 130;
+            idx.push_back(e);
+        }
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"确定", false, 0, 0, &r);
+        ok = ok && !hit && r.ambiguous;
+        if (hit || !r.ambiguous) detail += L" no_near_not_ambiguous";
+        // 给了 near → 取最近的那条
+        AiIndexResolveResult r2;
+        const bool hit2 = AiElementIndexResolve(idx, L"确定", true, 560, 115, &r2);
+        ok = ok && hit2 && r2.id == 2 && !r2.ambiguous;
+        if (!hit2 || r2.id != 2) detail += L" near_pick_failed";
+    }
+    // 同档两条**都很近** → 仍然歧义
+    {
+        std::vector<AiElementEntry> idx;
+        for (int i = 0; i < 2; ++i) {
+            AiElementEntry e;
+            e.id = i + 1;
+            e.name = L"确定";
+            e.x1 = 100 + i * 8;
+            e.y1 = 100;
+            e.x2 = e.x1 + 60;
+            e.y2 = 130;
+            idx.push_back(e);
+        }
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"确定", true, 120, 115, &r);
+        ok = ok && !hit && r.ambiguous;
+        if (hit || !r.ambiguous) detail += L" close_pair_not_ambiguous";
+    }
+
+    // ⑥ ★窗口自身标题栏按钮：永不入选；「只匹配到它」要给可执行的解释
+    {
+        std::vector<AiElementEntry> idx;
+        AiElementEntry chrome;
+        chrome.id = 1;
+        chrome.name = L"关闭";
+        chrome.x1 = 2500;
+        chrome.y1 = 10;
+        chrome.x2 = 2540;
+        chrome.y2 = 40;
+        chrome.windowChrome = true;
+        idx.push_back(chrome);
+        AiElementEntry app;
+        app.id = 2;
+        app.name = L"关闭";
+        app.x1 = 900;
+        app.y1 = 400;
+        app.x2 = 960;
+        app.y2 = 430;
+        idx.push_back(app);
+        // 应用内那个同名按钮仍可命中（不能因为名字一样就把正常操作也拦掉）
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"关闭", true, 930, 415, &r);
+        ok = ok && hit && r.id == 2;
+        if (!hit || r.id != 2) detail += L" chrome_not_excluded";
+        // 只剩窗口按钮时：拒绝 + why 里说明原因
+        idx.erase(idx.begin() + 1);
+        AiIndexResolveResult r2;
+        const bool hit2 = AiElementIndexResolve(idx, L"关闭", false, 0, 0, &r2);
+        ok = ok && !hit2 && r2.why.find(L"窗口自身") != std::wstring::npos;
+        if (hit2) detail += L" chrome_clickable";
+        else if (r2.why.find(L"窗口自身") == std::wstring::npos)
+            detail += L" chrome_why_missing";
+    }
+
+    // ⑦ 太短/纯数字目标：**只允许精确档**（不许宽容档），但不许一刀切拒绝 ——
+    //    表格单元格、卡片角标的价格本来就是纯数字，「按价格/编号选」必须能用。
+    {
+        std::vector<AiElementEntry> idx;
+        for (int i = 0; i < 3; ++i) {
+            AiElementEntry e;
+            e.id = i + 1;
+            e.name = L"600";
+            e.x1 = 100 + i * 200;
+            e.y1 = 100;
+            e.x2 = e.x1 + 60;
+            e.y2 = 130;
+            idx.push_back(e);
+        }
+        // 三条精确同名：有 near 取最近
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"600", true, 110, 115, &r);
+        ok = ok && hit && r.id == 1;
+        if (!hit) detail += L" numeric_strict_rejected";
+        else if (r.id != 1) detail += L" numeric_picked(" + std::to_wstring(r.id) + L")";
+        // 没有 near 且三条同样精确 → 歧义拒绝（不许取第一个）
+        AiIndexResolveResult r1b;
+        const bool hit1b = AiElementIndexResolve(idx, L"600", false, 0, 0, &r1b);
+        ok = ok && !hit1b && r1b.ambiguous;
+        if (hit1b || !r1b.ambiguous) detail += L" numeric_not_ambiguous";
+        // 单字目标：连精确档也不认（「6」这种满屏都是，无法判断用户指哪个）
+        AiIndexResolveResult r2;
+        ok = ok && !AiElementIndexResolve(idx, L"6", false, 0, 0, &r2);
+        if (AiElementIndexResolve(idx, L"6", false, 0, 0, &r2)) detail += L" short_resolved";
+        AiIndexResolveResult r3;
+        ok = ok && !AiElementIndexResolve(idx, L"", false, 0, 0, &r3);
+    }
+
+    // ⑧ 灰控件不参与（点了也没用，不该抢走正确目标）
+    {
+        std::vector<AiElementEntry> idx;
+        AiElementEntry e;
+        e.id = 1;
+        e.name = L"确定";
+        e.x1 = 100;
+        e.y1 = 100;
+        e.x2 = 160;
+        e.y2 = 130;
+        e.enabled = false;
+        idx.push_back(e);
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"确定", false, 0, 0, &r);
+        ok = ok && !hit;
+        if (hit) detail += L" disabled_resolved";
+    }
+
+    // ⑨ 清单文本：窗口自身按钮**不进清单**（列出来只会诱导模型去点）；空输入给空串
+    {
+        std::vector<AiElementEntry> idx;
+        AiElementEntry chrome;
+        chrome.id = 1;
+        chrome.name = L"关闭";
+        chrome.x1 = 10;
+        chrome.y1 = 10;
+        chrome.x2 = 40;
+        chrome.y2 = 40;
+        chrome.windowChrome = true;
+        idx.push_back(chrome);
+        AiElementEntry normal;
+        normal.id = 2;
+        normal.name = L"开始游戏";
+        normal.x1 = 100;
+        normal.y1 = 200;
+        normal.x2 = 240;
+        normal.y2 = 240;
+        idx.push_back(normal);
+        const std::wstring txt = FormatAiElementIndex(idx, 0, 0, 1000, 1000, 1000, 1000);
+        ok = ok && txt.find(L"开始游戏") != std::wstring::npos
+            && txt.find(L"关闭") == std::wstring::npos;
+        if (txt.find(L"开始游戏") == std::wstring::npos) detail += L" list_missing_item";
+        if (txt.find(L"关闭") != std::wstring::npos) detail += L" list_has_chrome";
+        ok = ok && FormatAiElementIndex({}, 0, 0, 1000, 1000, 1000, 1000).empty();
+        // ★坐标口径：清单里必须是 **upload 截图像素**（与 mouseClick 同一套），
+        //   不是屏幕像素。这条踩过大坑 —— 给了屏幕像素后模型拿去做 mouseClick
+        //   在 2560×1440 截成 1024×576 的帧里偏 2.5 倍，还花了 40s+ 推敲坐标口径。
+        //   这里断言换算值本身：捕获区 2560×1440 → 帧 1024×576（0.4 倍）。
+        {
+            std::vector<AiElementEntry> one;
+            AiElementEntry e;
+            e.id = 1;
+            e.name = L"开始游戏";
+            e.x1 = 500;
+            e.y1 = 400;
+            e.x2 = 700;
+            e.y2 = 500;      // 中心 (600, 450)（屏幕坐标）
+            one.push_back(e);
+            const std::wstring t2 = FormatAiElementIndex(one, 0, 0, 2560, 1440, 1024, 576);
+            // 600 * 1024/2560 = 240；450 * 576/1440 = 180
+            const bool conv = t2.find(L"(240,180)") != std::wstring::npos;
+            ok = ok && conv;
+            if (!conv) detail += L" frame_coord_not_converted";
+            const bool declaresFrame = t2.find(L"upload 截图像素") != std::wstring::npos
+                && t2.find(L"1024") != std::wstring::npos;
+            ok = ok && declaresFrame;
+            if (!declaresFrame) detail += L" coord_space_undeclared";
+        }
+    }
+
+    // ⑩ ★宽容档：OCR 丢字时也要能在索引里查到自己刚看到的文字
+    //    （实测「自选僵尸卡牌」被 OCR 读成「自选僵尸卡」，长度比闸挡掉 → 模型反复识图并
+    //     花 40s+ 推敲「到底是屏幕坐标还是图像坐标」，两个坑叠在一起卡死一整轮）
+    {
+        const bool partialOk =
+            AiElementIndexPartialMatch(L"自选僵尸卡", L"自选僵尸卡牌") == 1
+            && AiElementIndexPartialMatch(L"自选僵尸卡牌", L"自选僵尸卡") == 1
+            && AiElementIndexPartialMatch(L"一键全选", L"一键全全部选") == 1;   // 并字
+        ok = ok && partialOk;
+        if (!partialOk) detail += L" partial_match_failed";
+        // 不相干的短标签绝不能命中
+        const bool rejectOk =
+            AiElementIndexPartialMatch(L"主菜单", L"自选僵尸卡牌") == 0
+            && AiElementIndexPartialMatch(L"时停", L"自选僵尸卡牌") == 0
+            && AiElementIndexPartialMatch(L"通关", L"这关") == 0;
+        ok = ok && rejectOk;
+        if (!rejectOk) detail += L" partial_false_positive";
+        // 长句/不相干短语不走宽容档（避免误伤）
+        // ⚠ 反例要选**真的不像**的：第一版写了「请点击这里确认」vs「请点击那里确认」，
+        //   两者 LCS 85%，宽容档命中是**对的** —— 测的其实是「长句也不许匹配」这个错误预期。
+        const bool longOk =
+            AiElementIndexPartialMatch(L"请点击这里确认", L"换一个完全不同的") == 0;
+        ok = ok && longOk;
+        if (!longOk) detail += L" partial_on_unrelated_text";
+
+        // 索引解析里：精确命中存在时，宽容候选不许抢走它
+        std::vector<AiElementEntry> idx;
+        auto push = [&](int id, std::wstring name, int x, int y) {
+            AiElementEntry e;
+            e.id = id;
+            e.name = std::move(name);
+            e.x1 = x;
+            e.y1 = y;
+            e.x2 = x + 80;
+            e.y2 = y + 30;
+            idx.push_back(e);
+        };
+        push(1, L"自选僵尸卡", 100, 100);      // OCR 丢字版
+        push(2, L"自选僵尸卡牌", 500, 100);    // 精确版
+        AiIndexResolveResult r;
+        const bool hit = AiElementIndexResolve(idx, L"自选僵尸卡牌", false, 0, 0, &r);
+        ok = ok && hit && r.id == 2 && r.tier == 2;
+        if (!hit || r.id != 2) detail += L" partial_stole_exact";
+        // 只有丢字版时，宽容档要能命中（这正是那次卡死的场景）
+        AiIndexResolveResult r2;
+        const bool hit2 = AiElementIndexResolve(idx, L"自选僵尸卡牌x", false, 0, 0, &r2);
+        (void)hit2;   // 加了个字母就不该命中（顺序不完全保留），仅确保不崩
+        idx.erase(idx.begin() + 1);
+        AiIndexResolveResult r3;
+        const bool hit3 = AiElementIndexResolve(idx, L"自选僵尸卡牌", false, 0, 0, &r3);
+        ok = ok && hit3 && r3.id == 1 && r3.tier == 1;
+        if (!hit3 || r3.id != 1) detail += L" partial_not_resolved";
+
+        // ★P3：索引**不再自称「可点」** —— OCR 文字条目的可点性没人验证过，必须在标题里说清。
+        //   实测那一局模型据此去点了「我是僵尸」（模式标签）与面板标题，两次都白费一轮。
+        //   判据断的是**文案事实本身**：既要说「不是每条都能点」，也要标出「文字」这个来源档。
+        const std::wstring idxFmt = FormatAiElementIndex(idx, 0, 0, 1000, 1000, 1024, 576, 8000);
+        const bool caveatOk = idxFmt.find(L"不是每条都能点") != std::wstring::npos
+            && idxFmt.find(L"可点性未经验证") != std::wstring::npos;
+        ok = ok && caveatOk;
+        if (!caveatOk) detail += L" index_still_claims_all_clickable";
+        const bool srcTagged = idxFmt.find(L"文字") != std::wstring::npos;
+        ok = ok && srcTagged;
+        if (!srcTagged) detail += L" index_source_tag_missing";
+    }
+
+    Emit(L"element_index_and_resolve", ok, detail.c_str());
+}
+
+// ★★「半视觉」两条：① 索引条目要带**角色/动作能力/可读状态**；
+//    ② 编号要能**真的用**（按编号直查一条）。
+// 这一组就是本轮优化的验收点 —— 少了任何一条，「看得见编号、用不上编号」的缺口就还在。
+void CaseElementIndexFactsAndIdBinding() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ① 角色 / 动作能力 / 状态从 UIA 锚点**如实透传**进索引（不被合并/排序丢掉）
+    {
+        AiUiAnchor slider;
+        slider.x1 = 100; slider.y1 = 200; slider.x2 = 400; slider.y2 = 230;
+        slider.name = L"音量";
+        slider.role = L"滑块";
+        slider.action = L"slide";
+        slider.state = { L"value:42", L"range:0-100" };
+        AiUiAnchor edit;
+        edit.x1 = 100; edit.y1 = 300; edit.x2 = 400; edit.y2 = 330;
+        edit.name = L"文件名";
+        edit.role = L"输入框";
+        edit.action = L"fill";
+        edit.state = { L"focused" };
+
+        std::vector<AiIndexRowInput> rows = {
+            // OCR 读到了同一个「音量」（同处同名 → 并成一条）：要求能力位**不许被 OCR 抢走**
+            { L"音量", 104, 204, 396, 226 },
+        };
+        const auto idx = BuildAiElementIndex({ slider, edit }, rows, 80);
+        ok = ok && idx.size() == 2;
+        if (idx.size() != 2) detail += L" facts_count(" + std::to_wstring(idx.size()) + L")";
+        if (idx.size() == 2) {
+            // 阅读顺序：音量(y≈215) 在前，文件名(y≈315) 在后
+            const AiElementEntry& a = idx[0];
+            const bool sliderKept = a.name == L"音量" && a.source == AiElementSource::UiAutomation
+                && a.role == L"滑块" && a.action == L"slide" && a.state.size() == 2;
+            ok = ok && sliderKept;
+            if (!sliderKept) {
+                detail += L" facts_slider(role=" + a.role + L" action=" + a.action
+                    + L" state=" + std::to_wstring(a.state.size()) + L")";
+            }
+            const bool editKept = idx[1].action == L"fill" && idx[1].role == L"输入框";
+            ok = ok && editKept;
+            if (!editKept) detail += L" facts_edit";
+        }
+    }
+
+    // ② ★OCR 条目**不许**有动作能力（本地没有证据 ⇒ 不猜）。
+    //    猜错 = 模型以为能点，点了没反应白费一轮 —— 这正是索引标题里那句
+    //    「可点性未经验证」要用行为兜住的地方。
+    {
+        std::vector<AiIndexRowInput> rows = { { L"模式标签", 10, 10, 120, 34 } };
+        const auto idx = BuildAiElementIndex({}, rows, 80);
+        const bool noFakeCap = idx.size() == 1 && idx[0].action.empty() && idx[0].role.empty();
+        ok = ok && noFakeCap;
+        if (!noFakeCap) detail += L" ocr_got_fake_action";
+    }
+
+    // ③ 台账文本要把这三样**渲染出来**（模型看到的是文本，不是结构体）
+    {
+        AiUiAnchor toggle;
+        toggle.x1 = 10; toggle.y1 = 10; toggle.x2 = 200; toggle.y2 = 40;
+        toggle.name = L"自动更新";
+        toggle.role = L"复选框";
+        toggle.action = L"toggle";
+        toggle.state = { L"toggle:on" };
+        const auto idx = BuildAiElementIndex({ toggle }, {}, 80);
+        const std::wstring text = FormatAiElementIndex(idx, 0, 0, 100, 100, 1024, 576, 8000);
+        const bool rendered = text.find(L"action:toggle") != std::wstring::npos
+            && text.find(L"[toggle:on]") != std::wstring::npos
+            && text.find(L"复选框") != std::wstring::npos;
+        ok = ok && rendered;
+        if (!rendered) detail += L" facts_not_rendered";
+        // ★★「按编号点」这件事必须在**给模型看的标题里**说清（否则模型不知道有这个能力）
+        const bool idHint = text.find(L"elementId") != std::wstring::npos;
+        ok = ok && idHint;
+        if (!idHint) detail += L" elementId_hint_missing";
+    }
+
+    // ④ ★按编号直查：命中、且坐标口径与按名字解析**同一套**（不然会整体偏移）
+    {
+        AiUiAnchor a;
+        a.x1 = 100; a.y1 = 200; a.x2 = 300; a.y2 = 240;
+        a.name = L"确定"; a.role = L"按钮"; a.action = L"click";
+        AiUiAnchor b;
+        b.x1 = 900; b.y1 = 700; b.x2 = 1000; b.y2 = 740;
+        b.name = L"确定";   // 同屏两个同名（靠编号区分）——b 的名字不能被 a 覆盖
+        b.role = L"按钮";
+        b.action = L"click";
+        const auto idx = BuildAiElementIndex({ a, b }, {}, 80);
+        ok = ok && idx.size() == 2;
+        const AiElementEntry* h1 = AiElementIndexById(idx, 1);
+        const AiElementEntry* h2 = AiElementIndexById(idx, 2);
+        const bool bothHit = h1 && h2;
+        ok = ok && bothHit;
+        if (!bothHit) detail += L" id_lookup_miss";
+        if (bothHit) {
+            // 两个同名条目必须给**不同**的坐标（这正是编号路径存在的理由：
+            // 按名字会判歧义 → 回落整轮识图）
+            const bool distinct = !(h1->centerX() == h2->centerX()
+                && h1->centerY() == h2->centerY());
+            ok = ok && distinct;
+            if (!distinct) detail += L" same_id_same_point";
+            // 坐标取该条目**中心**，与 AiElementIndexResolve 同一口径
+            const bool centerOk = h1->centerX() == 200 && h1->centerY() == 220;
+            ok = ok && centerOk;
+            if (!centerOk) detail += L" id_center_wrong("
+                + std::to_wstring(h1->centerX()) + L"," + std::to_wstring(h1->centerY()) + L")";
+        }
+    }
+
+    // ⑤ ★查不到/不该给的编号一律 nullptr，**绝不兜底成近似条目**：
+    //    编号错位必然点到隔壁（比回落识图糟得多）。
+    {
+        AiUiAnchor a;
+        a.x1 = 100; a.y1 = 200; a.x2 = 300; a.y2 = 240;
+        a.name = L"保存"; a.action = L"click";
+        const auto idx = BuildAiElementIndex({ a }, {}, 80);
+        const bool miss = AiElementIndexById(idx, 0) == nullptr
+            && AiElementIndexById(idx, -1) == nullptr
+            && AiElementIndexById(idx, 2) == nullptr
+            && AiElementIndexById(idx, 999) == nullptr
+            && AiElementIndexById({}, 1) == nullptr;
+        ok = ok && miss;
+        if (!miss) detail += L" id_lookup_fell_back";
+    }
+
+    // ⑥ ★窗口自身按钮与灰控件**永不入选**（与按名字解析同一把尺，docs §31.1）：
+    //    「关闭」一击把整个游戏窗口关掉的那条路，不能从编号这条口子重新打开。
+    {
+        AiElementEntry chrome;
+        chrome.id = 1;
+        chrome.name = L"关闭";
+        chrome.x1 = 2400; chrome.y1 = 0; chrome.x2 = 2460; chrome.y2 = 30;
+        chrome.windowChrome = true;
+        chrome.action = L"click";
+        const std::vector<AiElementEntry> only = { chrome };
+        const bool chromeBlocked = AiElementIndexById(only, 1) == nullptr;
+        ok = ok && chromeBlocked;
+        if (!chromeBlocked) detail += L" chrome_clickable_by_id";
+
+        AiElementEntry gray;
+        gray.id = 1;
+        gray.name = L"下一步";
+        gray.x1 = 10; gray.y1 = 10; gray.x2 = 100; gray.y2 = 40;
+        gray.enabled = false;
+        gray.action = L"click";
+        const std::vector<AiElementEntry> grayOnly = { gray };
+        const bool grayBlocked = AiElementIndexById(grayOnly, 1) == nullptr;
+        ok = ok && grayBlocked;
+        if (!grayBlocked) detail += L" gray_clickable_by_id";
+
+        // 反向：同一个编号在**正常条目**上必须命中（防止上面两条把整个函数写成恒 nullptr 的假绿）
+        AiElementEntry fine;
+        fine.id = 1;
+        fine.name = L"确定";
+        fine.x1 = 10; fine.y1 = 10; fine.x2 = 100; fine.y2 = 40;
+        fine.action = L"click";
+        const std::vector<AiElementEntry> okList = { fine };
+        const bool stillWorks = AiElementIndexById(okList, 1) != nullptr;
+        ok = ok && stillWorks;
+        if (!stillWorks) detail += L" id_lookup_always_null";
+    }
+
+    Emit(L"element_index_facts_and_id_binding", ok, detail.c_str());
+}
+
+// 「格」感知：把文字绑到规则网格的格子上 → 一张可查的键表（0 次 VLM）。
+// 这是「按价格/编号/名字选第几张」的通用底座：卡片槽、工具栏、表格、看板都适用，
+// 判据全是几何 + 文字，与领域无关。
+
+// ★「落点在窗口非客户区」的几何判据（docs §41.1）：纯函数，用**实测那一局的真实矩形**断言。
+//
+// ⚠ 为什么必须有这条，而且**不能只靠 UIA**：那次日志里游戏窗口 `UIA 控件 0 条`
+//   （`ElementFromPoint` 拿不到元素）⇒ `titleBarControl` 那道守卫**根本不会触发**；
+//   而 `IsScreenPointOnForegroundWindow` 只回答「是不是这个窗口的」⇒ 标题栏照样放行。
+//   客户区几何是纯 Win32 信息，**任何窗口都有**，游戏/自绘程序一样量得到。
+void CaseNonClientLandingStrip() {
+    bool ok = true;
+    std::wstring detail;
+
+    // 实测那一局：前台窗口 rect=(-9,0)-(2573,1390)；标准可调边框窗口的客户区
+    // 在四边都内缩（标题栏 ~39px、左右/下边框各几像素，这里取整到实测可解释的值）。
+    // ⚠ 第一版我只缩了上/右、把下边贴平，于是「下边框」那条断言量到的其实是客户区
+    //   —— **夹具本身写歪了**，不是判据错。夹具要按真实窗口的形状写。
+    const RECT wnd{ -9, 0, 2573, 1390 };
+    const RECT cli{ -1, 39, 2565, 1382 };
+
+    // ① ★原样坐标 (2522,16) → 标题栏按钮区 → 必须判为非客户区
+    ok = ok && windowmode::IsPointInWindowNonClientStrip(2522, 16, wnd, cli);
+    if (!windowmode::IsPointInWindowNonClientStrip(2522, 16, wnd, cli))
+        detail += L" close_button_point_not_blocked_REGRESSION";
+
+    // ② 第一次那个点 (2475,257) 在客户区 → 放行（别把正常落点一起拦掉）
+    ok = ok && !windowmode::IsPointInWindowNonClientStrip(2475, 257, wnd, cli);
+    if (windowmode::IsPointInWindowNonClientStrip(2475, 257, wnd, cli))
+        detail += L" client_point_blocked";
+
+    // ③ 下边框 / 左边框同理（两个方向都试，免得只对上边一类）
+    ok = ok && windowmode::IsPointInWindowNonClientStrip(900, 1388, wnd, cli);
+    if (!windowmode::IsPointInWindowNonClientStrip(900, 1388, wnd, cli))
+        detail += L" bottom_border_not_blocked";
+    ok = ok && windowmode::IsPointInWindowNonClientStrip(-5, 700, wnd, cli);
+    if (!windowmode::IsPointInWindowNonClientStrip(-5, 700, wnd, cli))
+        detail += L" left_border_not_blocked";
+
+    // ④ 窗口**外面**的点不算「非客户区」（那是遮挡问题，由另一道守卫管）
+    ok = ok && !windowmode::IsPointInWindowNonClientStrip(3000, 16, wnd, cli);
+    if (windowmode::IsPointInWindowNonClientStrip(3000, 16, wnd, cli))
+        detail += L" outside_window_flagged";
+
+    // ⑤ ★无边框全屏（客户区 == 窗口矩形）：窗口内任何点都**不许**被拦 ——
+    //    有些游戏是无边框窗口，游戏内自己的 X 就在右上角；拦了就是**减少能力**。
+    const RECT fsWnd{ 0, 0, 2560, 1440 };
+    ok = ok && !windowmode::IsPointInWindowNonClientStrip(2522, 16, fsWnd, fsWnd);
+    if (windowmode::IsPointInWindowNonClientStrip(2522, 16, fsWnd, fsWnd))
+        detail += L" borderless_ingame_close_blocked";
+
+    Emit(L"non_client_landing_strip", ok, detail.c_str());
+}
+
+// 工具轮的「收束」判据（docs §42）：期待工具调用的轮次里，模型把整个输出预算写成散文
+// （实测两轮各 45~55s、57 895 / 54 732 字节，**全在 content 里**）。旧判据绑死在输出
+// 形态上（看门狗要 `contentBytes == 0`、纠偏要 `content.empty()`）⇒ 这个形态两条闸都看不见
+// ⇒ 只能烧到 max_tokens 耗尽；而截断后那段散文还会被当成「本轮最终回答」返回
+// ⇒ 用户看到的「选了两张卡然后卡在那里不动」。
+void CaseStreamProseBrake() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto sig = [](bool inScope, size_t rBytes, size_t cBytes) {
+        AiStreamBrakeSignals s;
+        s.expectTools = true;
+        s.inAiActionScope = inScope;
+        s.gotAnyByte = true;
+        s.elapsedMs = 45000;   // 未到 90s 绝对上限
+        s.idleMs = 200;        // 字节一直在流（散文不是「停顿」）
+        s.reasoningBytes = rBytes;
+        s.contentBytes = cBytes;
+        return s;
+    };
+    // 旧判据（逐字复刻，只为证明「这条用例在改之前是红的」）
+    auto legacyBrake = [](const AiStreamBrakeSignals& s) {
+        const bool hitAbs = s.elapsedMs >= kAiStreamNoToolForceMs;
+        const bool hitPlateau = s.gotAnyByte && s.idleMs >= kAiStreamNoToolPlateauIdleMs;
+        return s.expectTools && s.contentBytes == 0 && !s.sawUsableToolCalls
+            && s.reasoningBytes > 0 && (hitAbs || hitPlateau);
+    };
+
+    // ① ★用户实测那一轮：57 895 字节**全在正文**、毫无工具意向 → 必须收束。
+    //    同时断言旧判据在这一格是漏的（不然这条用例证明不了什么）。
+    const AiStreamBrakeSignals prose = sig(true, 0, 57895);
+    const AiStreamBrakeVerdict pv = AiDecideStreamBrake(prose);
+    ok = ok && pv.kind == AiStreamBrakeKind::OutputBudget;
+    if (pv.kind != AiStreamBrakeKind::OutputBudget) detail += L" prose_deluge_not_braked";
+    ok = ok && !legacyBrake(prose);
+    if (legacyBrake(prose)) detail += L" legacy_predicate_not_blind";
+    ok = ok && pv.producedBytes == 57895 && !pv.reasoningDominated;
+    if (pv.producedBytes != 57895) detail += L" produced_bytes_wrong";
+    if (pv.reasoningDominated) detail += L" misattributed_to_reasoning";
+
+    // ② 工具 JSON 已经在组装 / 已拿到可用工具调用 → 一律不拦（正在调工具）
+    AiStreamBrakeSignals assembling = sig(true, 0, 20000);
+    assembling.toolAssemblyStarted = true;
+    ok = ok && AiDecideStreamBrake(assembling).kind == AiStreamBrakeKind::None;
+    if (AiDecideStreamBrake(assembling).kind != AiStreamBrakeKind::None)
+        detail += L" braked_while_assembling";
+    AiStreamBrakeSignals got = sig(true, 0, 20000);
+    got.sawUsableToolCalls = true;
+    ok = ok && AiDecideStreamBrake(got).kind == AiStreamBrakeKind::None;
+    if (AiDecideStreamBrake(got).kind != AiStreamBrakeKind::None)
+        detail += L" braked_after_tool_calls";
+
+    // ③ ★聊天助手不许被砍：同样 57 895 字节的散文在**非动作作用域**里就是用户要的长回答
+    ok = ok && AiDecideStreamBrake(sig(false, 0, 57895)).kind == AiStreamBrakeKind::None;
+    if (AiDecideStreamBrake(sig(false, 0, 57895)).kind != AiStreamBrakeKind::None)
+        detail += L" braked_outside_action_scope";
+
+    // ④ 非工具轮不拦
+    AiStreamBrakeSignals noTools = sig(true, 0, 57895);
+    noTools.expectTools = false;
+    ok = ok && AiDecideStreamBrake(noTools).kind == AiStreamBrakeKind::None;
+    if (AiDecideStreamBrake(noTools).kind != AiStreamBrakeKind::None)
+        detail += L" braked_when_no_tools";
+
+    // ⑤ 边界：预算闭区间下界（与其它门槛同口径）
+    ok = ok && AiDecideStreamBrake(sig(true, 0, kAiStreamProseBudgetBytes)).kind
+        == AiStreamBrakeKind::OutputBudget;
+    if (AiDecideStreamBrake(sig(true, 0, kAiStreamProseBudgetBytes)).kind
+        != AiStreamBrakeKind::OutputBudget) detail += L" budget_boundary_not_included";
+    ok = ok && AiDecideStreamBrake(sig(true, 0, kAiStreamProseBudgetBytes - 1)).kind
+        == AiStreamBrakeKind::None;
+    if (AiDecideStreamBrake(sig(true, 0, kAiStreamProseBudgetBytes - 1)).kind
+        != AiStreamBrakeKind::None) detail += L" braked_just_below_budget";
+
+    // ⑥ 原闸①两条门槛逐字保留（只思考、没正文）
+    AiStreamBrakeSignals abs1 = sig(true, 3000, 0);
+    abs1.elapsedMs = kAiStreamNoToolForceMs;
+    ok = ok && AiDecideStreamBrake(abs1).kind == AiStreamBrakeKind::NoToolCallTooLong;
+    if (AiDecideStreamBrake(abs1).kind != AiStreamBrakeKind::NoToolCallTooLong)
+        detail += L" reasoning_only_absolute_lost";
+    AiStreamBrakeSignals plateau = sig(true, 3000, 0);
+    plateau.elapsedMs = 1000;
+    plateau.idleMs = kAiStreamNoToolPlateauIdleMs;
+    ok = ok && AiDecideStreamBrake(plateau).kind == AiStreamBrakeKind::NoToolCallTooLong;
+    if (AiDecideStreamBrake(plateau).kind != AiStreamBrakeKind::NoToolCallTooLong)
+        detail += L" reasoning_only_plateau_lost";
+
+    // ⑥-b ★★真机形状（docs §67）：**纯思考 14KB 不许被字节预算掐掉**。
+    //   实测一次运行里 3 次 `已产出 14/14/15KB（以思考为主）→ 结束流式，逼它直接出手…`，
+    //   紧跟着 `thinking=关闭` 连续 2 轮 ⇒ 模型只能给又短又浅的动作
+    //   （一次毫无意义的 zoom、反复重放同一个鼠标批次）—— 用户说的「呆呆的」。
+    //   管住「只想不干」的是**时间/停顿**（④⑤），不是思考字节数。
+    {
+        AiStreamBrakeSignals realThink = sig(true, 14336, 0);
+        realThink.elapsedMs = 20000;      // 还没到 90s，也还没停顿 45s
+        realThink.idleMs = 300;
+        const bool thinkOk = AiDecideStreamBrake(realThink).kind == AiStreamBrakeKind::None;
+        ok = ok && thinkOk;
+        if (!thinkOk) detail += L" normal_reasoning_braked";
+        // 但**失控的**思考仍必须被拦住（兜底上限），否则这条闸就废了
+        AiStreamBrakeSignals runaway = sig(true, kAiStreamReasoningBudgetBytes, 0);
+        runaway.elapsedMs = 20000;
+        runaway.idleMs = 300;
+        const bool runawayOk =
+            AiDecideStreamBrake(runaway).kind == AiStreamBrakeKind::OutputBudget;
+        ok = ok && runawayOk;
+        if (!runawayOk) detail += L" runaway_reasoning_not_braked";
+        // 正文那侧的 12KB 预算**照旧**（§42 的 57 895 字节散文必须被拦）
+        AiStreamBrakeSignals contentOnly = sig(true, 0, kAiStreamProseBudgetBytes);
+        contentOnly.elapsedMs = 20000;
+        contentOnly.idleMs = 300;
+        const bool contentOk =
+            AiDecideStreamBrake(contentOnly).kind == AiStreamBrakeKind::OutputBudget;
+        ok = ok && contentOk;
+        if (!contentOk) detail += L" prose_budget_regressed";
+    }
+
+    // ⑦ 日志只报实测拆分，不许替模型认罪（§41.3）：正文为主就不许说「以思考为主」
+    const std::wstring proseWhy = FormatAiStreamBrakeStatus(pv);
+    ok = ok && proseWhy.find(L"以正文为主") != std::wstring::npos
+        && proseWhy.find(L"以思考为主") == std::wstring::npos
+        && proseWhy.find(L"57KB") != std::wstring::npos;
+    if (proseWhy.find(L"以正文为主") == std::wstring::npos) detail += L" log_hid_the_split";
+    if (proseWhy.find(L"以思考为主") != std::wstring::npos)
+        detail += L" log_misattributed_to_reasoning";
+    if (proseWhy.find(L"57KB") == std::wstring::npos) detail += L" log_missing_measured_kb";
+    const std::wstring thinkWhy = FormatAiStreamBrakeStatus(AiDecideStreamBrake(sig(true, 40000, 0)));
+    ok = ok && thinkWhy.find(L"以思考为主") != std::wstring::npos;
+    if (thinkWhy.find(L"以思考为主") == std::wstring::npos)
+        detail += L" reasoning_dominant_not_reported";
+
+    Emit(L"stream_prose_brake", ok, detail.c_str());
+}
+
+// 「期待工具却只拿到散文」：这段文本不是回答（docs §42）。旧实现直接把它当本轮最终回答返回，
+// AI 动作执行这一轮等于什么都没干；这条闸必须**有界**（守卫不能把模型永久锁在外面）。
+void CaseNoToolCallAnswerGate() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ① 动作作用域 + 无工具调用 + 有文本 + 不是自然收尾（被截断/被收束）→ 逼它调工具
+    const AiNoToolVerdict force = AiDecideNoToolCallAnswer(true, false, true, false, 0);
+    ok = ok && force.action == AiNoToolAction::ForceToolCall && !force.why.empty();
+    if (force.action != AiNoToolAction::ForceToolCall) detail += L" prose_accepted_as_answer";
+    if (force.why.empty()) detail += L" no_reason";
+
+    // ② ★有界：纠偏用满就认输，绝不与重生成互相喂成新死循环
+    const AiNoToolVerdict giveUp = AiDecideNoToolCallAnswer(true, false, true, false, 2);
+    ok = ok && giveUp.action == AiNoToolAction::AcceptAnswer;
+    if (giveUp.action != AiNoToolAction::AcceptAnswer) detail += L" unbounded_nudging";
+    const AiNoToolVerdict lastChance = AiDecideNoToolCallAnswer(true, false, true, false, 1);
+    ok = ok && lastChance.action == AiNoToolAction::ForceToolCall;
+    if (lastChance.action != AiNoToolAction::ForceToolCall) detail += L" nagged_too_early";
+
+    // ③ 模型自己收尾（finish_reason=stop）→ 尊重它，别硬逼（可能是它真做完了）
+    ok = ok && AiDecideNoToolCallAnswer(true, false, true, true, 0).action
+        == AiNoToolAction::AcceptAnswer;
+    if (AiDecideNoToolCallAnswer(true, false, true, true, 0).action
+        != AiNoToolAction::AcceptAnswer) detail += L" natural_stop_overridden";
+
+    // ④ 聊天助手（mustAct=false）与「本轮已有工具调用」都不干预
+    ok = ok && AiDecideNoToolCallAnswer(false, false, true, false, 0).action
+        == AiNoToolAction::AcceptAnswer;
+    if (AiDecideNoToolCallAnswer(false, false, true, false, 0).action
+        != AiNoToolAction::AcceptAnswer) detail += L" chat_answer_broken";
+    ok = ok && AiDecideNoToolCallAnswer(true, true, true, false, 0).action
+        == AiNoToolAction::AcceptAnswer;
+    if (AiDecideNoToolCallAnswer(true, true, true, false, 0).action
+        != AiNoToolAction::AcceptAnswer) detail += L" tool_calls_case_broken";
+
+    // ⑤ 一点文本都没有 → 交给既有错误路径（别在这里造新措辞）
+    ok = ok && AiDecideNoToolCallAnswer(true, false, false, false, 0).action
+        == AiNoToolAction::AcceptAnswer;
+    if (AiDecideNoToolCallAnswer(true, false, false, false, 0).action
+        != AiNoToolAction::AcceptAnswer) detail += L" empty_output_nudged";
+
+    Emit(L"no_tool_call_answer_gate", ok, detail.c_str());
+}
+
+// 思考失控闸的状态**必须跨轮存活**（docs §39.2）：它原来是 `SendMessage` 的局部变量，
+// 而 AI 动作执行每外层轮重进一次 `SendMessage`（日志里内层「第 N 轮耗时」反复从 1 开始）
+// ⇒ 计数器每轮归零 ⇒「连续 2 轮慢才关思考」永远不成立。
+// 实测第十八份日志：单轮等模型 16.2s → 62.3s，闸门一次没触发 = 用户说的「半天没反应」。
+// ★★另一条（§51）：**宾语是「想很久且没换来动作」，不是「墙钟久」** —— 出手了就不计数。
+void CaseSlowThinkingRoundGate() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ① 快轮清零；不计数
+    const AiSlowRoundVerdict fast = AiDecideSlowThinkingRound(5, 900, true, true, false);
+    ok = ok && !fast.suppress && fast.newStreak == 0;
+    if (fast.suppress || fast.newStreak != 0) detail += L" fast_round_wrong";
+
+    // ② 偏慢：第 1 轮只累计，第 2 轮才触发（跨轮状态由调用方带回）
+    const AiSlowRoundVerdict s1 = AiDecideSlowThinkingRound(0, 13000, true, true, false);
+    ok = ok && !s1.suppress && s1.newStreak == 1;
+    if (s1.suppress || s1.newStreak != 1) detail += L" slow_first_wrong";
+    const AiSlowRoundVerdict s2 = AiDecideSlowThinkingRound(s1.newStreak, 13000, true, true, false);
+    ok = ok && s2.suppress && s2.suppressRounds == kAiThinkingSuppressRounds
+        && s2.newStreak == 0;
+    if (!s2.suppress) detail += L" slow_second_not_suppressed";
+    if (s2.suppressRounds != kAiThinkingSuppressRounds) detail += L" suppress_rounds_wrong";
+    if (s2.newStreak != 0) detail += L" streak_not_reset_after_fire";
+
+    // ③ ★单轮超长（≥30s）**当场**处置 —— 实测一轮就能 60s，「连续 2 轮」= 先白等 120s
+    const AiSlowRoundVerdict very = AiDecideSlowThinkingRound(0, 62296, true, true, false);
+    ok = ok && very.suppress && very.suppressRounds == kAiThinkingSuppressRounds;
+    if (!very.suppress) detail += L" very_slow_not_suppressed";
+    // 边界：刚好 30s 也算（闭区间下界，与表里别的门槛同口径）
+    ok = ok && AiDecideSlowThinkingRound(0, kAiVerySlowRoundMs, true, true, false).suppress;
+    if (!AiDecideSlowThinkingRound(0, kAiVerySlowRoundMs, true, true, false).suppress)
+        detail += L" boundary_not_included";
+
+    // ④ 条件不满足时不计数、也不清 0（关掉思考后模型本来就慢，拿它计数会变成
+    //    「永久关思考」的正反馈；聊天助手的长思考是用户要的）
+    const AiSlowRoundVerdict noThink = AiDecideSlowThinkingRound(1, 60000, false, true, false);
+    ok = ok && !noThink.suppress && noThink.newStreak == 1;
+    if (noThink.suppress || noThink.newStreak != 1) detail += L" counted_when_thinking_off";
+    const AiSlowRoundVerdict chat = AiDecideSlowThinkingRound(1, 60000, true, false, false);
+    ok = ok && !chat.suppress && chat.newStreak == 1;
+    if (chat.suppress || chat.newStreak != 1) detail += L" counted_outside_action_scope";
+
+    // ⑤ 触发时理由必须可读（进日志给排查用），且必须说清是「没有工具调用」而不是单纯的慢
+    ok = ok && !very.why.empty() && very.why.find(L"关闭思考") != std::wstring::npos;
+    if (very.why.empty()) detail += L" no_reason";
+    ok = ok && very.why.find(L"没有任何工具调用") != std::wstring::npos;
+    if (very.why.find(L"没有任何工具调用") == std::wstring::npos) detail += L" why_missing_object";
+
+    // ⑥ ★★出手了就不算绕圈（实测：11.9s/16.1s 两轮都在放大读图，被误判成思考失控，
+    //    关思考后模型把旧工具批次原样重放 ⇒ 游戏里多点了同一处）。
+    //    ① 慢但出手 → 不计数、不抑制；
+    const AiSlowRoundVerdict actedSlow = AiDecideSlowThinkingRound(1, 20000, true, true, true);
+    ok = ok && !actedSlow.suppress && actedSlow.newStreak == 0;
+    if (actedSlow.suppress) detail += L" acted_slow_suppressed";
+    if (actedSlow.newStreak != 0) detail += L" acted_slow_kept_streak";
+    //    ② 连续多轮都出手 → 永远不触发（哪怕每轮都 ≥30s）；
+    ok = ok && !AiDecideSlowThinkingRound(0, 60000, true, true, true).suppress;
+    if (AiDecideSlowThinkingRound(0, 60000, true, true, true).suppress)
+        detail += L" acted_very_slow_suppressed";
+    //    ③ 隔一轮出手 → 旧计数必须被清掉，不能让「慢—出手—慢」凑出误伤。
+    const AiSlowRoundVerdict mixed1 = AiDecideSlowThinkingRound(0, 13000, true, true, false);
+    const AiSlowRoundVerdict mixed2 =
+        AiDecideSlowThinkingRound(mixed1.newStreak, 13000, true, true, true);
+    const AiSlowRoundVerdict mixed3 =
+        AiDecideSlowThinkingRound(mixed2.newStreak, 13000, true, true, false);
+    ok = ok && !mixed3.suppress && mixed3.newStreak == 1;
+    if (mixed3.suppress || mixed3.newStreak != 1) detail += L" acted_did_not_reset_streak";
+
+    Emit(L"slow_thinking_round_gate", ok, detail.c_str());
+}
+
+// 识图「回答有效性」闸（docs §38.4）：模型答不出来时会回一个**空框** `[0,0,0,0]`，
+// 而旧解析里 `TryParseBoundingBox` 对空框返回 false → 退回坐标对解析抓到 (0,0)，
+// 把「没回答」当成了「图左上角这个点」：点屏幕 (0,0)、报「界面已经变化 → 已生效」、
+// 还把垃圾存成定位模板。实测就发生在一局游戏里。
+void CaseVisionAnswerGate() {
+    bool ok = true;
+    std::wstring detail;
+
+    int x1 = -1, y1 = -1, x2 = -1, y2 = -1;
+
+    // ① 空框：**必须**判成「没回答」，绝不能退化成点 (0,0)
+    const AiVisionAnswerKind emptyBox =
+        ParseVisionLocateAnswer(L"[0,0,0,0]", x1, y1, x2, y2);
+    ok = ok && emptyBox == AiVisionAnswerKind::NoAnswer;
+    if (emptyBox != AiVisionAnswerKind::NoAnswer) detail += L" empty_box_treated_as_answer";
+    // 单边退化也算空框（宽 0 或高 0 都撑不出一个目标）
+    ok = ok && ParseVisionLocateAnswer(L"[100,20,100,80]", x1, y1, x2, y2)
+            == AiVisionAnswerKind::NoAnswer;
+    if (ParseVisionLocateAnswer(L"[100,20,100,80]", x1, y1, x2, y2)
+        != AiVisionAnswerKind::NoAnswer) detail += L" zero_width_box_accepted";
+    ok = ok && ParseVisionLocateAnswer(L"(300,50,340,50)", x1, y1, x2, y2)
+            == AiVisionAnswerKind::NoAnswer;
+    if (ParseVisionLocateAnswer(L"(300,50,340,50)", x1, y1, x2, y2)
+        != AiVisionAnswerKind::NoAnswer) detail += L" zero_height_box_accepted";
+
+    // ② 正常框：照旧解析，且角点顺序反了也要归一
+    const AiVisionAnswerKind box =
+        ParseVisionLocateAnswer(L"[563,158,598,196]", x1, y1, x2, y2);
+    ok = ok && box == AiVisionAnswerKind::Box && x1 == 563 && y1 == 158 && x2 == 598 && y2 == 196;
+    if (box != AiVisionAnswerKind::Box || x2 != 598) detail += L" normal_box_broken";
+    ok = ok && ParseVisionLocateAnswer(L"[598,196,563,158]", x1, y1, x2, y2)
+            == AiVisionAnswerKind::Box && x1 == 563 && y1 == 158;
+    if (x1 != 563) detail += L" reversed_box_not_normalized";
+
+    // ③ 单点回答**不受影响**（Zoom 精炼级本来就是问点）：`(500, 95)` 这种必须照旧可用。
+    //    ⚠ 别为了拦空框把「点」这条路一起封掉 —— 那会让每次识图都失败。
+    const AiVisionAnswerKind pt = ParseVisionLocateAnswer(L"(500, 95)", x1, y1, x2, y2);
+    ok = ok && pt == AiVisionAnswerKind::Point && x1 == 500 && y1 == 95 && x2 == 500;
+    if (pt != AiVisionAnswerKind::Point || x1 != 500 || y1 != 95) detail += L" point_broken";
+    // 图像原点这个**单点**回答不能顺带被拦（真实目标可能就在左边缘）
+    ok = ok && ParseVisionLocateAnswer(L"(0, 0)", x1, y1, x2, y2) == AiVisionAnswerKind::Point;
+    if (ParseVisionLocateAnswer(L"(0, 0)", x1, y1, x2, y2) != AiVisionAnswerKind::Point)
+        detail += L" origin_point_rejected";
+
+    // ④ 带描述前缀 / 无括号兜底：行为与旧解析一致（不能因为新闸把正常回答判死）
+    ok = ok && ParseVisionLocateAnswer(L"第2个按钮在 [100,200,300,400]", x1, y1, x2, y2)
+            == AiVisionAnswerKind::Box && x1 == 100 && x2 == 300;
+    if (x1 != 100) detail += L" prefixed_box_broken";
+    ok = ok && ParseVisionLocateAnswer(L"NOT_FOUND", x1, y1, x2, y2)
+            == AiVisionAnswerKind::NoAnswer;
+    if (ParseVisionLocateAnswer(L"NOT_FOUND", x1, y1, x2, y2)
+        != AiVisionAnswerKind::NoAnswer) detail += L" notfound_not_noanswer";
+
+    Emit(L"vision_answer_gate", ok, detail.c_str());
+}
+
+void CaseResolveAppLaunchTarget() {
+    bool ok = true;
+    std::wstring detail;
+
+    // ① 明确存在的路径 → 原样返回，来源 path
+    {
+        wchar_t winDir[MAX_PATH]{};
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        const std::wstring notepad = std::wstring(winDir) + L"\\System32\\notepad.exe";
+        const AppLaunchTarget t = ResolveAppLaunchTarget(notepad);
+        ok = ok && t.ok() && t.source == L"path";
+        if (!t.ok()) detail += L" path_miss";
+        else if (t.source != L"path") detail += L" path_src(" + t.source + L")";
+    }
+
+    // ② exe 别名仍走 App Paths/PATH（记事本一定在），且结果**必须是存在的文件**
+    {
+        const AppLaunchTarget t = ResolveAppLaunchTarget(L"notepad");
+        ok = ok && t.ok();
+        if (!t.ok()) detail += L" notepad_miss";
+        else {
+            const bool isFile =
+                GetFileAttributesW(t.path.c_str()) != INVALID_FILE_ATTRIBUTES;
+            ok = ok && isFile;
+            if (!isFile) detail += L" notepad_not_file";
+            // 记事本是系统 exe：不该被判成「需要 shell 解释的快捷方式」
+            ok = ok && !LooksLikeShellLaunchTarget(t.path);
+            if (LooksLikeShellLaunchTarget(t.path)) detail += L" notepad_lnk_misjudged";
+        }
+    }
+
+    // ③ 快捷方式识别：.lnk 必须被判成 shell 目标（游戏入口几乎都是快捷方式），exe 不是
+    {
+        ok = ok && LooksLikeShellLaunchTarget(L"C:\\x\\植物大战僵尸融合版.lnk")
+            && LooksLikeShellLaunchTarget(L"c:\\x\\a.URL")
+            && !LooksLikeShellLaunchTarget(L"C:\\x\\a.exe")
+            && !LooksLikeShellLaunchTarget(L"");
+        if (!LooksLikeShellLaunchTarget(L"C:\\x\\a.lnk")) detail += L" lnk_not_detected";
+        if (LooksLikeShellLaunchTarget(L"C:\\x\\a.exe")) detail += L" exe_false_positive";
+    }
+
+    // ④ 找不到就**明确失败**（绝不静默退化）：随机名字必须 ok()==false
+    {
+        const AppLaunchTarget t = ResolveAppLaunchTarget(
+            L"绝不存在的应用名ZZZQ_9f3a71");
+        ok = ok && !t.ok();
+        if (t.ok()) detail += L" phantom_resolved(" + t.path + L")";
+        const AppLaunchTarget empty = ResolveAppLaunchTarget(L"   ");
+        ok = ok && !empty.ok();
+        if (empty.ok()) detail += L" empty_resolved";
+    }
+
+    // ⑤ 装饰后缀/扩展名会被剥掉后**仍能**匹配（模型常写「XX快捷方式」「XX图标」）
+    //    这里只在有快捷方式的环境里做冒烟：没有就跳过（不假装测过）
+    {
+        const AppLaunchTarget plain = ResolveAppLaunchTarget(L"notepad");
+        const AppLaunchTarget decorated = ResolveAppLaunchTarget(L"notepad 程序");
+        const bool smoke = plain.ok() && decorated.ok()
+            && plain.path == decorated.path;
+        if (plain.ok() && !smoke) detail += L" decor_suffix_changed_result";
+        ok = ok && smoke;
+    }
+
+    Emit(L"resolve_app_launch_target", ok, detail.c_str());
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    bool listOnly = false;
-    for (int i = 1; i < argc; ++i) {
+    bool listOnly = false;    for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--json") == 0) {
             selftest::gJson = true;
             selftest::InitUtf8Stdout();
@@ -5640,9 +8765,10 @@ int wmain(int argc, wchar_t** argv) {
     CaseUsageSkill();
     CaseAgentSkill();
     CaseAtomicToolsPresent();
+    CaseCompleteTaskWrapUpVisible();
     CaseResolveSystemPathAndSavePathGuard();
     CaseSaveDialogSubmitGuard();
-    CaseSwitchWindowAfterLaunchWarned();
+    CaseSwitchWindowAfterLaunchNotBlocked();
     CaseHideWindowsGuard();
     CaseWindowLedgerTools();
     CaseSaveDialogGuards();
@@ -5656,14 +8782,15 @@ int wmain(int argc, wchar_t** argv) {
     CaseTaskDataClearedOnReset();
     CasePageKindClassify();
     CasePageSnapshotFormatAndRef();
-    CaseScrollWheelConfirmWhenViewportHasContent();
-    CaseListFirstBlocksScrollAndOtherCards();
+    CaseSnapshotReportsCoverageAndPaging();
+    CaseScrollWheelNotBlockedWhenViewportHasContent();
+    CaseListFirstNoLongerBlocks();
     CaseWebBrowseAllowsVisionFallback();
     CaseWebMixedPrefersTreeClick();
     CaseObservePageToolsPresent();
     CaseSearchOnPageTool();
     CaseClickRefNavigatesSpaceHref();
-    CaseSamePageClickHintScoped();
+    CaseSamePageClickNotBlocked();
     CaseSearchOnPageOpensMatchingSpace();
     CaseObserveResultDefaults();
     CaseWaitRequestsObserve();
@@ -5673,18 +8800,14 @@ int wmain(int argc, wchar_t** argv) {
     CaseNonUniversalShortcutGuard();
     CaseAllowNestedUnderCap();
     CaseRejectNestedAtCap();
-    CasePlanGateRequiresMemo();
-    CaseLocateTargetLengthAndOutsourceReject();
+    CasePlanGateRemoved();
+    CaseLocateTargetLengthGuard();
     CaseHistorySidebarAndBusyGuards();
     CaseGameForegroundVisionAllowed();
     CaseLocateMultiTargets();
-    CaseUiLayoutMemoryAndGrid();
-    CaseUiLayoutSignatureGate();
     CaseNoBatchSelectSpecialCase();
-    CaseUiGridPeriodDetect();
     CaseOcrDirectClickPick();
     CaseLocateDecimalCoordParse();
-    CaseMissSelfCorrectPrompt();
     CasePlanSpendBudget();
     CaseLogicConvertCompileGate();
     CaseLogicConvertPerLocateTimers();
@@ -5695,14 +8818,11 @@ int wmain(int argc, wchar_t** argv) {
     CaseLogicConvertCompileWaitFilter();
     CaseLogicConvertCompileNoAnchor();
     CaseLogicConvertCollapseInstanceData();
-    CaseLocateFailKeyBlock();
     CaseLocateRetryHardCap();
-    CaseFillTableOnlyTools();
     CaseListOcrHeuristic();
     CaseLogicConvertWritebackFirstTime();
     CaseLogicConvertPreferredBlockNameAndHealCreate();
     CaseLogicConvertWritebackPromote();
-    CaseLookaheadAcceptReject();
     CaseRejectAbsoluteNoImage();
     CaseAllowAbsoluteWithOpt();
     CaseRejectEmptyQuickInput();
@@ -5720,6 +8840,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseZoomRoi();
     CaseAdaptiveRefineGate();
     CaseParseColorHex();
+    CaseColorMatchScorePercent();
     CaseBuildFindColor();
     CaseLocateAndClickToolPresent();
     CaseVisionNotFoundAndBoxTooLarge();
@@ -5734,12 +8855,16 @@ int wmain(int argc, wchar_t** argv) {
     CaseRefineDrift();
     CaseResolveVisionNorm1000();
     CaseResolveVisionAmbiguousInImageAsNorm1000();
+    CaseResolveVisionAmbiguityNotClaimedWhenImpossible();
+    CaseMacroDebugLogFileRoundTrip();
     CaseResolveVisionSrcPixels();
     CaseResolveVisionRejectOob();
     CaseResolveAgentPointerInImageAsPixels();
     CaseResolveAgentPointerOobAsNorm1000();
     CaseResolveAgentPointerRejectOob();
     CaseActionVerbExpansion();
+    CaseResolveOpenWebpageTarget();
+    CaseNeedScreenCaptureForInteractionVerbs();
     CaseNeedScreenScrollCapture();
     CaseClickIntent();
     CaseSingleClickVerb();
@@ -5759,12 +8884,10 @@ int wmain(int argc, wchar_t** argv) {
     CaseSnapshotTargetKeyword();
     CaseVisionPromptNormalizedContract();
     CaseLocateToolDefersToHostDom();
-    CaseLookaheadWaitBudget();
     CaseDomFirstActionGate();
     CasePickSnapshotRefForInput();
     CaseTypeByLabelTool();
     CaseUiControlTools();
-    CaseLocateCache();
     CaseWideRowStillNeedsRefine();
     CaseUrlInputHeuristic();
     CaseEnterAfterUrlInput();
@@ -5779,12 +8902,34 @@ int wmain(int argc, wchar_t** argv) {
     CaseHotkeyLabelRealKeys();
     CaseReadDocumentTool();
     CaseComputerTool();
-    CaseLocateCacheHysteresis();
     CaseFuseLocateCandidates();
     CaseJudgeLocateConfidence();
     CaseSplitVisionCandidateLines();
     CaseBitmapLowFeature();
     CaseOcrTextVerify();
+    CaseDecideTable();
+    CaseDecideWrapperEquivalence();
+    CaseDecideDiagnosticLog();
+    CaseVisionGateTraceOnly();
+    CaseAiExecObserveGuards();
+    CaseOcrTextIndexRows();
+    CaseThinkingDowngradePlumbing();
+    CaseFrameClickMarkLifecycle();
+    CaseZoomRegionTool();
+    CaseZoomTempImageFiles();
+    CaseElementIndexAndResolve();
+    CaseElementIndexFactsAndIdBinding();
+    CaseLabelIconPairing();
+    CaseMouseClickRepeatSamePoint();
+    CaseMouseDragExecutes();
+    CaseCoordActionReceipt();
+    CaseResolveAppLaunchTarget();
+    CaseNonClientLandingStrip();
+    CaseVisionAnswerGate();
+    CaseSlowThinkingRoundGate();
+    CaseStreamProseBrake();
+    CaseNoToolCallAnswerGate();
+    CasePlanSpendTargetContract();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

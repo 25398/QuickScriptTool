@@ -81,6 +81,22 @@ html,body{height:100%;width:100%;margin:0;overflow:hidden;background:var(--sky-1
 .field-grid{padding:0 calc(24px * var(--qst-u)) calc(18px * var(--qst-u));display:flex;flex-direction:column;gap:calc(16px * var(--qst-u))}
 .field label{display:flex;align-items:center;font-size:calc(12.5px * var(--qst-u));color:var(--text-2);margin:0}
 .radios{display:flex;gap:calc(10px * var(--qst-u));flex-wrap:wrap}
+/* ── 导出脚本（脚本包 / 独立 EXE）──────────────────────────────
+   刻意只用项目既有的主题变量（--text/--text-2/--line/--frost/--ice-*/--mint-*），
+   这样用户换主题时这个弹窗自动跟着变，不需要任何额外适配。 */
+.exp-body{display:flex;flex-direction:column;gap:calc(10px * var(--qst-u));padding:calc(14px * var(--qst-u)) calc(18px * var(--qst-u)) calc(6px * var(--qst-u))}
+.exp-name{font-size:calc(13px * var(--qst-u));color:var(--text-3)}
+.exp-opt{border:1px solid var(--line);border-radius:calc(10px * var(--qst-u));padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u));background:var(--frost);cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.exp-opt:hover{border-color:var(--ice-400);box-shadow:0 calc(4px * var(--qst-u)) calc(14px * var(--qst-u)) var(--glow-ice)}
+.exp-opt-h{display:flex;align-items:center;gap:calc(8px * var(--qst-u));font-size:calc(14px * var(--qst-u));font-weight:700;color:var(--text)}
+.exp-opt-tag{font-size:calc(11px * var(--qst-u));font-weight:500;color:var(--mint-400);border:1px solid var(--mint-400);border-radius:calc(6px * var(--qst-u));padding:calc(1px * var(--qst-u)) calc(6px * var(--qst-u))}
+.exp-opt-d{margin-top:calc(6px * var(--qst-u));font-size:calc(12.5px * var(--qst-u));color:var(--text-2);line-height:1.5}
+.exp-scan{border:1px solid var(--line);border-radius:calc(10px * var(--qst-u));background:var(--frost);padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u));font-size:calc(12.5px * var(--qst-u));color:var(--text-2);line-height:1.75}
+.exp-scan b{color:var(--text)}
+.exp-scan .warn{color:var(--rose);font-weight:700}
+.exp-sec-h{font-size:calc(13px * var(--qst-u));font-weight:700;color:var(--text);margin-bottom:calc(6px * var(--qst-u))}
+.exp-size{font-size:calc(13px * var(--qst-u));color:var(--text);font-weight:700}
+.exp-tip{font-size:calc(12px * var(--qst-u));color:var(--text-3);line-height:1.5}
 .radio{display:flex;align-items:center;gap:calc(8px * var(--qst-u));font-size:calc(13px * var(--qst-u));color:var(--text-2)}
 .radio.on{color:var(--text)}
 .radio i{width:calc(16px * var(--qst-u));height:calc(16px * var(--qst-u));border-radius:50%;border:1.5px solid var(--line-strong,#9eb4cb);display:inline-block}
@@ -152,7 +168,7 @@ html, body {
   -webkit-user-select: none;
   user-select: none;
 }
-/* 输入与可读输出区可选中（AI 对话 / 调试日志 / 表单输入） */
+/* 输入与可读输出区可选中（AI 对话 / 调试日志 / 表单输入 / 关于页联系信息） */
 input,
 textarea,
 select,
@@ -163,7 +179,10 @@ select,
 .bubble,
 .bubble .think-body,
 .debug-log,
-#debugLog {
+#debugLog,
+.set-pane[data-pane="about"] .param-block,
+.set-pane[data-pane="about"] .about-link,
+.set-pane[data-pane="about"] .about-val {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -196,11 +215,12 @@ body::before, body::after { display: none !important; content: none !important; 
    *    设计稿 .dlg.opt-size ≈ 1100×760 → --qst-opt-u = 1640/1100 ≈ 1.491
    * 4. 设置窗 / AI 脚本助手：组件与主界面同一倍率，勿再单独缩小
    * 5. HTML 设计稿 docs/ui-redesign-mockup.html 的组件尺寸原按画布 920×720 编写；
-   *    要保持「组件相对窗口」的占比，主界面倍率：
-   *      --qst-u = 1.5
+   *    要保持「组件相对窗口」的占比，主界面基准倍率：
+   *      --qst-u = 1.5 × 布局缩放
+   *    布局缩放 = 分辨率自适应 × 用户「界面缩放倍率」（设置-其他，默认 1.0）。
    * 6. 组件宽高/字号/间距一律用 calc(原px * var(--qst-u)) 写死在本文件；
    *    禁止再用 JS 对 #app 做 zoom/transform「比例缩放」缩成小窗。
-   * 7. HWND 客户区由 qst_webview_shell.cpp 的 kHomeClientW/H、kEditorClientW/H 保证。
+   * 7. HWND 客户区 = 设计像素 × 布局缩放；由 qst_webview_shell.cpp 保证。
    * 8. 动作列表：容器及其子树叠 10% 淡色（可多层重叠）；箭头按层级拉开距离。
    * 9. 动作详情：对齐原生窄栏 kEditorRightColWDesign=218 / 找图块 120+8+90；
    *    用 --qst-u 等比放大，禁止把控件横向拉满右栏。
@@ -310,18 +330,18 @@ html,body{height:100%}
   100%{transform:translate3d(2%,3%,0) scale(1.06)}
 }
 
-/* 主题预设卡片（设置 / 主题弹窗） */
-.theme-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;width:100%;padding:4px 0 8px}
+/* 主题预设卡片（设置 / 主题弹窗）——一律跟 --qst-u，禁止裸 px */
+.theme-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(calc(140px * var(--qst-u)),1fr));gap:calc(10px * var(--qst-u));width:100%;padding:calc(4px * var(--qst-u)) 0 calc(8px * var(--qst-u))}
 .theme-card{
-  border:1.5px solid var(--line);border-radius:10px;padding:10px;cursor:pointer;background:var(--frost);
+  border:1.5px solid var(--line);border-radius:calc(10px * var(--qst-u));padding:calc(10px * var(--qst-u));cursor:pointer;background:var(--frost);
   transition:border-color .2s,box-shadow .2s,transform .15s;text-align:left;
 }
-.theme-card:hover{border-color:var(--ice-400);transform:translateY(-1px);box-shadow:0 6px 18px var(--glow-ice)}
-.theme-card.on{border-color:var(--ice-500);box-shadow:0 0 0 2px var(--focus-ring, color-mix(in srgb, var(--ice-500) 25%, transparent))}
-.theme-card .tc-name{font-size:12.5px;font-weight:700;color:var(--text);margin-bottom:8px}
-.theme-card .tc-swatches{display:flex;gap:4px;height:18px}
-.theme-card .tc-swatches i{flex:1;border-radius:4px;display:block}
-.theme-card .tc-map{margin-top:6px;font-size:10px;color:var(--text-3);line-height:1.35}
+.theme-card:hover{border-color:var(--ice-400);transform:translateY(-1px);box-shadow:0 calc(6px * var(--qst-u)) calc(18px * var(--qst-u)) var(--glow-ice)}
+.theme-card.on{border-color:var(--ice-500);box-shadow:0 0 0 calc(2px * var(--qst-u)) var(--focus-ring, color-mix(in srgb, var(--ice-500) 25%, transparent))}
+.theme-card .tc-name{font-size:calc(12.5px * var(--qst-u));font-weight:700;color:var(--text);margin-bottom:calc(8px * var(--qst-u));line-height:1.3}
+.theme-card .tc-swatches{display:flex;gap:calc(4px * var(--qst-u));height:calc(18px * var(--qst-u))}
+.theme-card .tc-swatches i{flex:1;border-radius:calc(4px * var(--qst-u));display:block}
+.theme-card .tc-map{margin-top:calc(6px * var(--qst-u));font-size:calc(10px * var(--qst-u));color:var(--text-3);line-height:1.35}
 
 .app{
   width:100%;height:100%;
@@ -355,6 +375,14 @@ html.pro-ui .app::after{
 .app .titlebar,.app .home-nav,.app .editor-chrome,.app .views{position:relative;z-index:1}
 .app.editor-mode{width:100%;height:100%;min-height:100%;max-width:none;max-height:none}
 body.editor-open{padding:0}
+/* 编辑器 1800×1230：关掉整窗极光动画/行 hover 过渡，避免鼠标移动时整表重绘卡顿 */
+body.editor-open .app::before,
+body.editor-open .app::after{animation:none !important}
+body.editor-open .arow,
+body.editor-open .btn,
+body.editor-open .card,
+body.editor-open .combo,
+body.editor-open .arow .op .op-a{transition:none !important}
 
 html[data-theme-mood="soft"] .app::before{opacity:.95}
 html[data-theme-mood="soft"] .app::after{opacity:.65}
@@ -537,6 +565,33 @@ html[data-theme-mood="soft"] .app::after{opacity:.65}
   flex-shrink:0;
   margin-left:calc(6px * var(--qst-u));
 }
+.combo.combo-search{
+  cursor:text;
+  padding-right:0;
+  gap:0;
+}
+.combo.combo-search::after{content:none;display:none}
+.combo.combo-search:focus-within{
+  border-color:var(--ice-500);
+  box-shadow:0 0 0 3px var(--focus-ring, color-mix(in srgb, var(--ice-500) 20%, transparent));
+  outline:none;
+}
+.combo-search-in{
+  flex:1;min-width:0;align-self:stretch;border:0;background:transparent;
+  height:100%;padding:0;margin:0;outline:none;box-shadow:none;
+  font:inherit;font-weight:500;color:inherit;cursor:text;
+  appearance:none;-webkit-appearance:none;
+}
+.combo-caret{
+  flex-shrink:0;align-self:stretch;width:calc(32px * var(--qst-u));
+  border:0;background:transparent;cursor:pointer;padding:0;
+  color:var(--ice-500);font-size:calc(11px * var(--qst-u));font-weight:700;
+  line-height:1;display:grid;place-items:center;
+  transition:transform .15s,color .15s;
+}
+.combo.open .combo-caret{transform:rotate(180deg)}
+.combo-caret:hover{color:var(--ice-400)}
+.popup-menu .mi.disabled{opacity:.45;pointer-events:none;cursor:default}
 
 .chk{display:inline-flex;align-items:center;gap:calc(8px * var(--qst-u));cursor:pointer;font-size:calc(13.5px * var(--qst-u));font-weight:500}
 .chk i{width:calc(15px * var(--qst-u));height:calc(15px * var(--qst-u));border-radius:calc(4px * var(--qst-u));border:1.5px solid var(--line-strong);background:var(--frost);
@@ -769,7 +824,15 @@ body:not(.opt-open) .app{
   padding:calc(12px * var(--qst-opt-u));
 }
 .opt-layout .panel{min-height:0;display:flex;flex-direction:column;padding:calc(12px * var(--qst-opt-u)) !important}
-.opt-list{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:calc(8px * var(--qst-opt-u));background:var(--frost)}
+.opt-list{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:calc(8px * var(--qst-opt-u));background:var(--frost);position:relative;overflow-anchor:none}
+/* 虚拟滚动（窗口化）：.opt-vspace 用 height 撑起总高（超长列表时是**压缩后**的高度），
+   .opt-vwin 绝对定位、只装窗口内的那几十行，每帧用 transform 贴住视口。
+   DOM 恒定 ⇒ 几万条动作也和几十条一样流畅（分批追加做不到这点：
+   它只优化首屏，DOM 仍随滚动无限累积）。
+   ⚠ overflow-anchor:none：窗口内容每帧重建，禁掉浏览器的滚动锚定，
+   否则它会在内容变化时"帮"我们调 scrollTop，造成滚动跳动。 */
+.opt-vspace{position:relative;width:100%;overflow:hidden}
+.opt-vwin{position:absolute;left:0;right:0;top:0;will-change:transform}
 /* 优化列表独立栅格，勿套用编辑器 .arow 的序号/操作列 */
 .opt-headers,
 .opt-list .arow{
@@ -927,6 +990,10 @@ body:not(.opt-open) .app{
 .left-col{border-right:1px solid var(--line);padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u)) calc(8px * var(--qst-u));display:flex;flex-direction:column;background:var(--sky-50);min-width:0;min-height:0;overflow:hidden}
 .right-col{padding:calc(10px * var(--qst-u));background:var(--sky-100);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;
   background-image:radial-gradient(280px 160px at 80% 0%,rgba(26,166,214,.1),transparent)}
+.right-col > #paramPanel{
+  flex:1 1 auto;min-height:0;overflow-x:hidden;overflow-y:auto;scrollbar-gutter:stable;
+  padding-bottom:calc(16px * var(--qst-u));
+}
 .form-line{display:flex;align-items:center;gap:calc(8px * var(--qst-u));margin-bottom:calc(8px * var(--qst-u));flex-wrap:wrap}
 .lbl{font-size:calc(12.5px * var(--qst-u));color:var(--text-2);font-weight:500;white-space:nowrap}
 .section-head{display:flex;align-items:center;gap:calc(8px * var(--qst-u));margin:calc(4px * var(--qst-u)) 0 calc(8px * var(--qst-u));flex-wrap:wrap}
@@ -947,7 +1014,16 @@ body:not(.opt-open) .app{
 }
 .col-headers > span:first-child{text-align:left;padding-left:calc(2px * var(--qst-u))}
 .col-headers > span:last-child{text-align:center}
-.action-list{flex:1;min-height:0;overflow:auto;border:none;border-radius:0;background:transparent;scrollbar-gutter:stable;outline:none}
+.action-list{flex:1;min-height:0;overflow:auto;border:none;border-radius:0;background:transparent;scrollbar-gutter:stable;overflow-anchor:none;outline:none}
+/* 批量编辑用 CSS 显隐勾选框，避免 innerHTML 整表重绘把滚动条拆掉重建 */
+.action-list:not(.is-batch) .arow .chk[data-act="batch-toggle"]{display:none}
+.action-list:not(.is-batch) .op-batch{display:none}
+.action-list.is-batch .op-normal{display:none}
+.action-list.is-batch .op{color:var(--text-3)}
+.action-list .op-batch{pointer-events:none;user-select:none}
+.action-list .arow .chk[data-act="batch-toggle"]{flex-shrink:0;gap:0}
+.section-head.editor-list-head{flex-wrap:nowrap}
+.editor-list-head .batch-bar,.editor-list-head #normalBar{flex-wrap:nowrap;min-width:0;overflow-x:auto}
 .arow{
   height:calc(38px * var(--qst-u));
   display:grid;
@@ -963,9 +1039,15 @@ body:not(.opt-open) .app{
   background-repeat:no-repeat;
   background-size:100% 100%;
 }
-.arow:nth-child(even):not(.sel):not(.nest-tint){background:var(--sky-50)}
-.arow:nth-child(even):not(.sel).nest-tint{background-color:var(--sky-50)}
-.arow:nth-child(odd):not(.sel).nest-tint{background-color:var(--frost)}
+/* ⚠⚠ 必须限定在 .action-list（宏编辑器）内：这三条是**全局** `.arow` 规则，
+   特异性 (0,4,0) > 优化列表的 `.opt-list .arow.tone-a` (0,3,0) ⇒ 一旦泄漏到
+   优化列表，行底色就由**它在窗口 DOM 里的位置**（:nth-child 奇偶）决定；
+   而虚拟滚动的窗口起点随滚动变化 ⇒ 奇偶翻转 ⇒ **同一行滚动时不断换色**。
+   （探针 `probe_opt_list_virtual_scroll.py` 场景 D 钉死这条：滚动一行后
+    同一动作序号的底色必须不变。） */
+.action-list .arow:nth-child(even):not(.sel):not(.nest-tint){background:var(--sky-50)}
+.action-list .arow:nth-child(even):not(.sel).nest-tint{background-color:var(--sky-50)}
+.action-list .arow:nth-child(odd):not(.sel).nest-tint{background-color:var(--frost)}
 .arow .ano{
   display:flex;align-items:center;min-width:0;overflow:visible;
 }
@@ -1029,6 +1111,8 @@ body:not(.opt-open) .app{
 .arow.sel .op{color:var(--mint-300)}
 .arow.sel .op .op-drag{cursor:grabbing;pointer-events:none;opacity:1}
 .add-bar{margin-top:calc(8px * var(--qst-u));display:flex;align-items:center;gap:calc(8px * var(--qst-u));flex-shrink:0}
+body.editor-no-modify #btnEdRemark{display:none !important}
+body.editor-autosave #btnEdSave{display:none !important}
 .app.editor-mode .left-col.is-visual .action-table,
 .app.editor-mode .left-col.is-visual .add-bar,
 .app.editor-mode .editor-chrome.is-visual .action-table,
@@ -1073,6 +1157,7 @@ body:not(.opt-open) .app{
 .vwrap.if{border-color:rgba(34,197,94,.65);background:rgba(34,197,94,.07)}
 .vwrap.else{border-color:rgba(245,158,11,.7);background:rgba(245,158,11,.07)}
 .vwrap.defineBlock{border-color:rgba(139,92,246,.65);background:rgba(139,92,246,.07)}
+.vwrap.watchImage{border-color:rgba(14,165,233,.7);background:rgba(14,165,233,.08)}
 .visual-edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:auto;z-index:3}
 .visual-cards{position:absolute;left:0;top:0;right:0;bottom:0;z-index:4;pointer-events:none}
 .vcard{
@@ -1106,6 +1191,7 @@ body:not(.opt-open) .app{
 .vcard.container.if{border-color:#22c55e}
 .vcard.container.else{border-color:#f59e0b}
 .vcard.container.defineBlock{border-color:#8b5cf6}
+.vcard.container.watchImage{border-color:#0ea5e9}
 .vcard.sel{
   border-color:#38bdf8;background:#f0f9ff;
   box-shadow:0 0 0 2px rgba(56,189,248,.28),0 4px 14px rgba(14,116,144,.12);
@@ -1188,12 +1274,6 @@ body:not(.opt-open) .app{
 .param-title{font-size:calc(15px * var(--qst-u));font-weight:700;margin-bottom:calc(10px * var(--qst-u));display:flex;align-items:center;gap:calc(8px * var(--qst-u));flex-shrink:0}
 .param-title span{font-size:calc(11px * var(--qst-u));font-weight:600;color:#0369a1;background:var(--ice-200);padding:calc(2px * var(--qst-u)) calc(8px * var(--qst-u));border-radius:calc(4px * var(--qst-u))}
 /* 勿用 flex 列：子块会被压扁导致找图预览与匹配区重叠 */
-.param-block{
-  background:var(--frost);border:1px solid var(--line);border-radius:calc(8px * var(--qst-u));
-  padding:calc(12px * var(--qst-u)) calc(12px * var(--qst-u)) calc(14px * var(--qst-u));flex:1;min-height:0;overflow-x:hidden;overflow-y:auto;
-  display:block;width:100%;box-sizing:border-box;
-  scrollbar-gutter:auto;
-}
 .right-col .panel-empty{color:var(--text-3);font-size:calc(13px * var(--qst-u));text-align:center;padding:calc(40px * var(--qst-u)) calc(12px * var(--qst-u))}
 
 /* 参数流：占满动作详情可用宽度 */
@@ -1203,6 +1283,9 @@ body:not(.opt-open) .app{
   flex-wrap:nowrap;width:100%;max-width:100%;box-sizing:border-box;
 }
 .fline.wrap{flex-wrap:wrap}
+.param-block .radios{align-items:center;gap:calc(12px * var(--qst-u))}
+.param-block .radio{font-size:calc(13px * var(--qst-u));font-weight:500}
+.param-block [hidden]{display:none !important}
 .fline.xy{
   display:grid;
   grid-template-columns:var(--qst-xy-cols);
@@ -1314,6 +1397,8 @@ body:not(.opt-open) .app{
 .ocr-progress{height:calc(14px * var(--qst-u));border-radius:999px;background:#e6e6e6;border:1px solid #d2d2d2;overflow:hidden}
 .ocr-progress > i{display:block;height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,var(--ice-500),var(--mint-400));transition:width .2s}
 .fline .tl{flex:0 0 auto;font-size:calc(13px * var(--qst-u));font-weight:600;color:var(--text-2);white-space:nowrap;line-height:calc(32px * var(--qst-u))}
+.fline .tl + .chk{flex:0 0 auto;align-items:center;margin-left:calc(4px * var(--qst-u))}
+.fline .tl + .chk .chk-lab{flex:0 0 auto;white-space:nowrap}
 .fline .tl.n{min-width:1.5em;width:auto}
 .fline .tl.grow-lab{flex:0 1 auto;min-width:0;max-width:none}
 .fline .sp{width:calc(10px * var(--qst-u));flex:0 0 calc(10px * var(--qst-u))}
@@ -1411,6 +1496,29 @@ body:not(.opt-open) .app{
 }
 .fline > .combo{width:auto;flex:1 1 auto;min-width:0}
 .param-block .combo,.param-block .inp{--qst-inp-h:calc(32px * var(--qst-u));height:var(--qst-inp-h);font-size:calc(13px * var(--qst-u))}
+.param-block textarea.inp.ed-code{
+  display:block !important;
+  align-items:unset !important;
+  justify-content:unset !important;
+  flex:1 1 auto;
+  align-self:stretch;
+  width:100%;
+  min-width:0;
+  height:auto !important;
+  min-height:calc(13px * var(--qst-u) * 1.45 * 8 + 16px * var(--qst-u));
+  max-height:none !important;
+  line-height:1.45 !important;
+  padding:calc(8px * var(--qst-u)) calc(10px * var(--qst-u)) !important;
+  font-family:var(--mono);
+  font-size:calc(13px * var(--qst-u));
+  font-weight:500;
+  white-space:pre;
+  overflow:auto;
+  resize:vertical;
+  tab-size:4;
+  cursor:text;
+  box-sizing:border-box;
+}
 .param-block .inp.ed-area.fixed-3row{
   height:calc(13px * var(--qst-u) * 1.35 * 3 + 16px * var(--qst-u));
   min-height:calc(13px * var(--qst-u) * 1.35 * 3 + 16px * var(--qst-u));
@@ -1459,6 +1567,11 @@ body:not(.opt-open) .app{
 .find-mod-top .chk > i{margin-top:0 !important;flex:0 0 auto}
 .find-mod-top .chk .chk-lab{flex:0 0 auto;line-height:1;white-space:nowrap}
 .find-mod-var{display:inline-flex;align-items:center;height:var(--qst-find-btn-h)}
+.find-mod-top-main .find-mod-count{
+  flex:0 0 auto;min-width:calc(36px * var(--qst-u));width:calc(44px * var(--qst-u));
+  height:var(--qst-find-btn-h);padding:0 calc(4px * var(--qst-u));
+  font-size:calc(12px * var(--qst-u));justify-content:center;
+}
 /* 有「测试」：主行宽=预览宽，「变量」右对齐预览右缘；测试独占第4列 */
 .find-mod-top--with-test .find-mod-top-main{
   grid-column:1 / 3;justify-self:start;align-self:center;
@@ -1568,9 +1681,9 @@ body:not(.opt-open) .app{
 }
 .find-mod-head{display:none}
 .find-mod-body,.find-side,.find-tpl{display:none !important}
-.preview{height:84px;border:1px dashed var(--line-strong);border-radius:6px;
-  background:repeating-conic-gradient(var(--sky-100) 0% 25%,var(--frost) 0% 50%) 50%/12px 12px;
-  display:grid;place-items:center;color:var(--text-3);font-size:12px}
+.preview{height:calc(84px * var(--qst-u));border:1px dashed var(--line-strong);border-radius:calc(6px * var(--qst-u));
+  background:repeating-conic-gradient(var(--sky-100) 0% 25%,var(--frost) 0% 50%) 50%/calc(12px * var(--qst-u)) calc(12px * var(--qst-u));
+  display:grid;place-items:center;color:var(--text-3);font-size:calc(12px * var(--qst-u))}
 
 .ed-chrome{display:flex;flex-direction:column;gap:6px;margin-bottom:4px;padding-bottom:8px;border-bottom:1px solid var(--line)}
 .ed-chrome .form-line{margin-bottom:0}
@@ -1592,38 +1705,38 @@ body:not(.opt-open) .app{
   background:rgba(45,212,191,.06);
 }
 .wm-preview .label{
-  position:absolute;left:50%;top:calc(50% - 34px);transform:translate(-50%,-100%);
-  background:var(--navy-900);color:#e8f4fc;font-size:12px;padding:5px 10px;border-radius:6px;
+  position:absolute;left:50%;top:calc(50% - calc(34px * var(--qst-u)));transform:translate(-50%,-100%);
+  background:var(--navy-900);color:#e8f4fc;font-size:calc(12px * var(--qst-u));padding:calc(5px * var(--qst-u)) calc(10px * var(--qst-u));border-radius:calc(6px * var(--qst-u));
   border:1px solid rgba(45,212,191,.5);
 }
 .run-hud{
-  position:fixed;right:24px;bottom:88px;z-index:90;display:none;
-  min-width:220px;padding:12px 14px;border-radius:12px;
+  position:fixed;right:calc(24px * var(--qst-u));bottom:calc(88px * var(--qst-u));z-index:90;display:none;
+  min-width:calc(220px * var(--qst-u));padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u));border-radius:calc(12px * var(--qst-u));
   background:linear-gradient(135deg,var(--navy-950),var(--navy-800));
   color:#e8f4fc;border:1px solid rgba(45,212,191,.4);
   box-shadow:0 12px 32px rgba(0,0,0,.35),0 0 20px var(--glow-mint);
 }
 .run-hud.show{display:block;animation:pillIn .35s var(--ease) both}
-.run-hud .rh-title{font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.run-hud .rh-title::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--mint-400);animation:blink 1s infinite}
-.run-hud .rh-meta{font-size:11.5px;color:#9eb0bd;line-height:1.45}
-.run-hud .rh-acts{display:flex;gap:8px;margin-top:10px}
+.run-hud .rh-title{font-size:calc(12px * var(--qst-u));font-weight:700;display:flex;align-items:center;gap:calc(8px * var(--qst-u));margin-bottom:calc(6px * var(--qst-u))}
+.run-hud .rh-title::before{content:"";width:calc(8px * var(--qst-u));height:calc(8px * var(--qst-u));border-radius:50%;background:var(--mint-400);animation:blink 1s infinite}
+.run-hud .rh-meta{font-size:calc(11.5px * var(--qst-u));color:#9eb0bd;line-height:1.45}
+.run-hud .rh-acts{display:flex;gap:calc(8px * var(--qst-u));margin-top:calc(10px * var(--qst-u))}
 .tray-float.running{box-shadow:0 8px 24px var(--glow-mint),0 0 0 2px rgba(45,212,191,.55)}
 .tray-float.running .mark{animation:markPulse 1.2s ease-in-out infinite}
 .tray-menu .ti.warn{color:#b45309}
 .tray-menu .ti.danger{color:#be123c}
-.driver-steps{display:flex;flex-direction:column;gap:10px;margin:12px 0}
+.driver-steps{display:flex;flex-direction:column;gap:calc(10px * var(--qst-u));margin:calc(12px * var(--qst-u)) 0}
 .driver-step{
-  display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;
-  padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--frost);
+  display:grid;grid-template-columns:calc(28px * var(--qst-u)) 1fr;gap:calc(10px * var(--qst-u));align-items:start;
+  padding:calc(10px * var(--qst-u)) calc(12px * var(--qst-u));border:1px solid var(--line);border-radius:calc(8px * var(--qst-u));background:var(--frost);
 }
 .driver-step .n{
-  width:28px;height:28px;border-radius:50%;display:grid;place-items:center;
-  background:var(--navy-800);color:#fff;font-size:12px;font-weight:700;
+  width:calc(28px * var(--qst-u));height:calc(28px * var(--qst-u));border-radius:50%;display:grid;place-items:center;
+  background:var(--navy-800);color:#fff;font-size:calc(12px * var(--qst-u));font-weight:700;
 }
 .driver-step.done .n{background:linear-gradient(135deg,var(--ice-400),var(--mint-400))}
-.driver-step .t{font-size:13px;font-weight:600}
-.driver-step .d{font-size:12px;color:var(--text-3);margin-top:2px;line-height:1.4}
+.driver-step .t{font-size:calc(13px * var(--qst-u));font-weight:600}
+.driver-step .d{font-size:calc(12px * var(--qst-u));color:var(--text-3);margin-top:calc(2px * var(--qst-u));line-height:1.4}
 .overlay-demo{
   position:fixed;inset:0;z-index:250;background:rgba(6,16,24,.55);
   display:none;align-items:center;justify-content:center;
@@ -1636,7 +1749,7 @@ body:not(.opt-open) .app{
 }
 .overlay.crop-ov.show{display:flex}
 .crop-stage{
-  width:min(720px,92vw);height:min(420px,70vh);background:#1a2430;border-radius:12px;
+  width:min(calc(720px * var(--qst-u)),92vw);height:min(calc(420px * var(--qst-u)),70vh);background:#1a2430;border-radius:calc(12px * var(--qst-u));
   position:relative;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.4);
   border:1px solid rgba(255,255,255,.12);
 }
@@ -1655,9 +1768,9 @@ body:not(.opt-open) .app{
   border-radius:2px;cursor:crosshair;box-sizing:border-box;
 }
 .crop-stage .hud{
-  position:absolute;left:0;right:0;bottom:0;padding:10px 14px;
+  position:absolute;left:0;right:0;bottom:0;padding:calc(10px * var(--qst-u)) calc(14px * var(--qst-u));
   background:linear-gradient(90deg,var(--navy-950),var(--navy-800));color:#e8f4fc;
-  display:flex;align-items:center;gap:10px;font-size:12.5px;z-index:2;
+  display:flex;align-items:center;gap:calc(10px * var(--qst-u));font-size:calc(12.5px * var(--qst-u));z-index:2;
 }
 .shot-stage{position:fixed;inset:0;z-index:250;display:none;cursor:crosshair}
 .shot-stage.show{display:block}
@@ -1668,12 +1781,12 @@ body:not(.opt-open) .app{
   box-shadow:0 0 0 9999px rgba(6,16,24,.4);
 }
 .shot-stage .tip{
-  position:absolute;top:12px;left:50%;transform:translateX(-50%);
-  background:var(--navy-900);color:#fff;padding:8px 14px;border-radius:999px;font-size:12.5px;
+  position:absolute;top:calc(12px * var(--qst-u));left:50%;transform:translateX(-50%);
+  background:var(--navy-900);color:#fff;padding:calc(8px * var(--qst-u)) calc(14px * var(--qst-u));border-radius:999px;font-size:calc(12.5px * var(--qst-u));
   border:1px solid rgba(56,189,248,.4);
 }
 .match-badge{
-  position:absolute;left:30%;top:30%;padding:4px 8px;border-radius:4px;font-size:11px;font-weight:700;
+  position:absolute;left:30%;top:30%;padding:calc(4px * var(--qst-u)) calc(8px * var(--qst-u));border-radius:calc(4px * var(--qst-u));font-size:calc(11px * var(--qst-u));font-weight:700;
   background:rgba(45,212,191,.9);color:var(--navy-950);border:2px solid #fff;
 }
 .bottom-bar{background:var(--sky-100);border-top:1px solid var(--line);display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:0 20px}
@@ -1683,24 +1796,24 @@ body:not(.opt-open) .app{
 /* Overlay / dialogs */
 .overlay{
   position:fixed;inset:0;z-index:200;background:rgba(6,16,24,.52);backdrop-filter:blur(4px);
-  display:flex;align-items:center;justify-content:center;padding:20px 16px;
+  display:flex;align-items:center;justify-content:center;padding:calc(20px * var(--qst-u)) calc(16px * var(--qst-u));
   opacity:0;pointer-events:none;transition:opacity .28s;
 }
 .app.editor-mode .overlay,.app.visual-editor .overlay{z-index:4000}
 .overlay.show{opacity:1;pointer-events:auto}
 .dlg{
-  background:var(--frost);border-radius:14px;overflow:hidden;width:min(640px,100%);
-  max-height:calc(100vh - 40px);display:flex;flex-direction:column;
+  background:var(--frost);border-radius:calc(14px * var(--qst-u));overflow:hidden;width:min(calc(427px * var(--qst-u)),100%);
+  max-height:calc(100vh - calc(27px * var(--qst-u)));display:flex;flex-direction:column;
   box-shadow:0 28px 64px rgba(6,16,24,.45), 0 0 0 1px rgba(255,255,255,.2) inset;
-  transform:translateY(14px) scale(.96);opacity:0;
+  transform:translateY(calc(14px * var(--qst-u))) scale(.96);opacity:0;
   transition:transform .35s var(--ease), opacity .3s;
 }
 .overlay.show .dlg{transform:none;opacity:1}
 .dlg.home-size{
   /* AI 脚本助手等大弹窗：约主界面 0.85 宽，高度充足 */
-  width:min(1170px, calc(1552px * 0.85), 96vw);
-  height:min(820px, calc(100vh - 36px));
-  max-height:calc(100vh - 36px);
+  width:min(calc(780px * var(--qst-u)), 96vw);
+  height:min(calc(547px * var(--qst-u)), calc(100vh - calc(24px * var(--qst-u))));
+  max-height:calc(100vh - calc(24px * var(--qst-u)));
 }
 /* 独立 AI 助手顶层窗：铺满客户区 */
 html.agent-shell,html.agent-shell body{
@@ -1782,17 +1895,12 @@ html.agent-shell .chat{
 html.agent-shell .bubble{
   font-size:calc(13px * var(--qst-u));
 }
-/* 设置窗：视觉约 1080×780（720×520 × 1.5）；组件沿用 --qst-u=1.5，与主界面一致 */
+/* 设置窗：视觉约 1080×780（720×520 × --qst-u）；与主界面同一倍率 */
 .dlg.settings-size{
-  width:min(1080px, 92vw);
-  height:min(780px, calc(100vh - 48px));
+  width:min(calc(720px * var(--qst-u)), 92vw);
+  height:min(calc(520px * var(--qst-u)), calc(100vh - calc(32px * var(--qst-u))));
   max-width:none;
   max-height:none;
-}
-.dlg.settings-size.editor-settings-size{
-  width:min(680px, 92vw);
-  height:min(640px, calc(100vh - 48px)) !important;
-  max-height:min(720px, calc(100vh - 48px));
 }
 .dlg.settings-size.editor-settings-size .dlg-body{
   display:flex;
@@ -1823,6 +1931,16 @@ html.agent-shell .bubble{
 .dlg.settings-size.editor-settings-size .ed-set-pane .row{
   margin-left:0;
   margin-right:0;
+}
+.ed-cat-presets.radios{
+  min-height:0;
+  gap:calc(14px * var(--qst-u));
+  margin:0 calc(10px * var(--qst-u)) calc(12px * var(--qst-u));
+}
+.dlg.settings-size.editor-settings-size .ed-set-pane[data-edpane="general"] .row,
+.dlg.settings-size.editor-settings-size .ed-set-pane[data-edpane="vars"] .row,
+.dlg.settings-size.editor-settings-size .ed-set-pane[data-edpane="common"] .row{
+  margin:0 calc(10px * var(--qst-u)) calc(10px * var(--qst-u));
 }
 .ed-action-catalog{
   display:flex;
@@ -1965,6 +2083,35 @@ html.agent-shell .bubble{
 }
 .dlg.settings-size .set-pane[data-pane="about"] .param-block .row{
   padding:calc(8px * var(--qst-u)) calc(12px * var(--qst-u));
+  cursor:text;
+  -webkit-user-select:text;
+  user-select:text;
+}
+.dlg.settings-size .set-pane[data-pane="about"] .about-lab{
+  flex:0 0 auto;
+  color:var(--text);
+}
+.dlg.settings-size .set-pane[data-pane="about"] .about-val{
+  flex:1 1 auto;
+  min-width:0;
+  color:var(--text);
+  cursor:text;
+  -webkit-user-select:text;
+  user-select:text;
+}
+.dlg.settings-size .set-pane[data-pane="about"] .about-link{
+  flex:1 1 auto;
+  min-width:0;
+  color:#0369a1;
+  font-weight:600;
+  text-decoration:underline;
+  text-underline-offset:2px;
+  cursor:pointer;
+  -webkit-user-select:text;
+  user-select:text;
+}
+.dlg.settings-size .set-pane[data-pane="about"] .about-link:hover{
+  color:var(--ice-500);
 }
 .dlg.settings-size .set-pane[data-pane="about"] .brand-ver{
   color:var(--ice-500);
@@ -2019,11 +2166,11 @@ html.agent-shell .bubble{
 }
 .dlg.settings-size .row.ui-mode-row .radios{
   flex:1;
-  min-width:220px;
+  min-width:calc(220px * var(--qst-u));
   display:flex;
   align-items:center;
   flex-wrap:wrap;
-  gap:16px;
+  gap:calc(16px * var(--qst-u));
   padding-top:0;
   margin:0;
 }
@@ -2032,7 +2179,7 @@ html.agent-shell .bubble{
   align-items:center;
 }
 .dlg.settings-size .row.sched-prio-row .radios{
-  min-width:200px;
+  min-width:calc(200px * var(--qst-u));
   gap:calc(12px * var(--qst-u));
 }
 .dlg.settings-size .row.sched-prio-row .sched-resume-pair{
@@ -2075,6 +2222,11 @@ html.pro-ui .dlg.settings-size .row.sched-prio-row .sched-resume-pair{
   cursor:pointer;
   user-select:none;
   -webkit-user-select:none;
+}
+.speed-slider:focus-visible{
+  outline:2px solid var(--ice-400);
+  outline-offset:2px;
+  border-radius:calc(8px * var(--qst-u));
 }
 .speed-slider-track{
   position:relative;
@@ -2203,10 +2355,49 @@ html.pro-ui body:not(.editor-open) #btnSettings{display:none !important}
 }
 .dlg.settings-size .theme-grid{grid-template-columns:repeat(auto-fill,minmax(calc(120px * var(--qst-u)),1fr));gap:calc(8px * var(--qst-u))}
 .dlg.settings-size .theme-card{padding:calc(8px * var(--qst-u))}
+.dlg.settings-size .theme-pick-row{
+  align-items:flex-start;
+  flex-wrap:wrap;
+  gap:calc(10px * var(--qst-u));
+}
+.dlg.settings-size .theme-pick-row .lbl-w{padding-top:calc(8px * var(--qst-u))}
+.dlg.settings-size .theme-pick-col{
+  flex:1;
+  min-width:min(100%, calc(220px * var(--qst-u)));
+}
+.dlg.settings-size .theme-pick-col .combo{width:100%;margin-bottom:calc(8px * var(--qst-u))}
+.dlg.settings-size #setWmInjectTech{
+  margin-left:auto;min-width:calc(150px * var(--qst-u));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.dlg.settings-size #aiModelCombo{
+  width:min(calc(280px * var(--qst-u)),42vw);min-width:calc(200px * var(--qst-u));margin-left:auto;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
 .dlg.settings-size .panel-head{padding:calc(8px * var(--qst-u)) calc(16px * var(--qst-u)) calc(4px * var(--qst-u));flex-shrink:0}
 .dlg.wide{width:min(calc(960px * var(--qst-u) * 0.85),96vw);height:min(calc(620px * var(--qst-u) * 0.85),calc(100vh - 40px));max-height:calc(100vh - 40px)}
 .dlg.sm{width:min(calc(400px * var(--qst-u)),94vw)}
-.dlg.med{width:min(calc(540px * var(--qst-u)),94vw);max-height:calc(100vh - 40px)}
+.dlg.med{width:min(calc(540px * var(--qst-u)),94vw);max-height:calc(100vh - calc(27px * var(--qst-u)))}
+.keycap-body{text-align:center;padding:calc(28px * var(--qst-u)) calc(16px * var(--qst-u))}
+.keycap-body p{font-size:calc(14px * var(--qst-u));margin-bottom:calc(14px * var(--qst-u));line-height:1.55}
+#ov-action-key .keycap-body p{color:var(--text-3)}
+#hotkeyHoldTip{font-size:calc(12px * var(--qst-u));color:var(--text-3)}
+#hotkeyVal,#actionKeyVal{
+  font-family:var(--mono);font-size:calc(26px * var(--qst-u));font-weight:700;color:#0369a1;
+  text-shadow:0 0 20px var(--glow-ice);
+}
+.interval-body{display:flex;align-items:center;justify-content:center;gap:calc(10px * var(--qst-u));padding:calc(32px * var(--qst-u))}
+.interval-inp{
+  width:calc(120px * var(--qst-u));--qst-inp-h:calc(40px * var(--qst-u));height:var(--qst-inp-h);
+  font-size:calc(18px * var(--qst-u));justify-content:center;text-align:center;font-family:var(--mono);
+}
+.interval-body .lbl{font-size:calc(15px * var(--qst-u))}
+.rename-body{display:flex;justify-content:center;padding:calc(28px * var(--qst-u))}
+#renameInput{max-width:calc(300px * var(--qst-u));--qst-inp-h:calc(40px * var(--qst-u));height:var(--qst-inp-h)}
+.theme-dlg-hint{font-size:calc(12px * var(--qst-u));color:var(--text-3);padding:0 calc(2px * var(--qst-u)) calc(10px * var(--qst-u));line-height:1.5}
+.theme-color-row{margin-top:calc(8px * var(--qst-u))}
+#ov-theme input[type=color]{
+  width:calc(48px * var(--qst-u));height:calc(32px * var(--qst-u));border:0;background:transparent;cursor:pointer;
+}
 .dlg-title{
   height:calc(40px * var(--qst-u));flex-shrink:0;display:flex;align-items:center;padding:0 0 0 calc(14px * var(--qst-u));
   background:linear-gradient(90deg,var(--navy-950),var(--navy-800));color:#e8f4fc;font-size:calc(13px * var(--qst-u));font-weight:700;
@@ -2251,7 +2442,9 @@ html.pro-ui body:not(.editor-open) #btnSettings{display:none !important}
 .table .th,.table .tr{display:grid;grid-template-columns:1.1fr .7fr 1fr .7fr .6fr .55fr .7fr;padding:calc(8px * var(--qst-u)) calc(10px * var(--qst-u));gap:calc(4px * var(--qst-u));align-items:center}
 .table .th{background:var(--sky-50);color:var(--text-3);font-weight:700;font-size:calc(11px * var(--qst-u));border-bottom:1px solid var(--line)}
 .table .tr{border-bottom:1px solid var(--sky-100)}
-.table .tr .act{color:#0369a1;cursor:pointer}
+.table .tr .act{color:#0369a1;cursor:pointer;user-select:none}
+.table .tr .act span{cursor:pointer}
+.table .tr .act span:hover,.table .tr .act[data-sched]:hover{text-decoration:underline}
 #ov-sched .sched-list-head{gap:calc(12px * var(--qst-u));margin-bottom:calc(12px * var(--qst-u));align-items:center}
 #ov-sched .sched-list-head h3{
   margin:0;font-size:calc(16px * var(--qst-u));font-weight:700;color:var(--text);line-height:1.2;
@@ -2476,8 +2669,8 @@ html.pro-ui body:not(.editor-open) #btnSettings{display:none !important}
   flex:0 0 auto;display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;
 }
 .aiv-toolbar button{
-  height:42px;min-width:42px;padding:0 16px;border-radius:10px;border:1px solid rgba(255,255,255,.2);
-  background:rgba(255,255,255,.12);color:#fff;font-size:15px;font-weight:600;cursor:pointer;
+  height:calc(42px * var(--qst-u));min-width:calc(42px * var(--qst-u));padding:0 calc(16px * var(--qst-u));border-radius:calc(10px * var(--qst-u));border:1px solid rgba(255,255,255,.2);
+  background:rgba(255,255,255,.12);color:#fff;font-size:calc(15px * var(--qst-u));font-weight:600;cursor:pointer;
 }
 .aiv-toolbar button:hover{background:rgba(255,255,255,.22)}
 .aiv-zoom-wrap{
@@ -2490,8 +2683,8 @@ html.pro-ui body:not(.editor-open) #btnSettings{display:none !important}
   width:48px;border:none;outline:none;background:transparent;color:#fff;font-size:15px;font-weight:600;
   text-align:center;font-family:inherit;-webkit-user-select:text;user-select:text;
 }
-.aiv-zoom-unit{color:rgba(255,255,255,.85);font-size:15px;font-weight:600;pointer-events:none}
-.aiv-counter{color:rgba(255,255,255,.78);font-size:14px;font-weight:600;letter-spacing:.02em;text-align:center;line-height:1.2;min-height:18px}
+.aiv-zoom-unit{color:rgba(255,255,255,.85);font-size:calc(15px * var(--qst-u));font-weight:600;pointer-events:none}
+.aiv-counter{color:rgba(255,255,255,.78);font-size:calc(14px * var(--qst-u));font-weight:600;letter-spacing:.02em;text-align:center;line-height:1.2;min-height:calc(18px * var(--qst-u))}
 .aiv-counter[hidden]{display:none !important}
 /* 独立助手窗：未绘完前 navy 底（非白）；chrome 绘出后轻量入场，与加载并行 */
 html.agent-shell.agent-booting #ov-agent .dlg{
@@ -2552,7 +2745,7 @@ html.agent-shell.agent-ready #ov-agent .dlg{
 
 /* toast 必须在 .app 外（与 overlay 同级），否则会被设置等遮罩盖住 */
 .toast{
-  position:fixed;left:50%;bottom:56px;z-index:500;transform:translateX(-50%) translateY(12px);
+  position:fixed;left:50%;bottom:calc(56px * var(--qst-u));z-index:500;transform:translateX(-50%) translateY(12px);
   background:var(--navy-900);color:#fff;
   padding:calc(10px * var(--qst-u)) calc(18px * var(--qst-u));border-radius:999px;
   font-size:calc(14px * var(--qst-u));font-weight:600;line-height:1.35;
@@ -2707,9 +2900,9 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
 }
 .agent-tabs:empty{display:none}
 .agent-tab{
-  flex:0 0 auto;max-width:160px;padding:6px 10px;border-radius:8px 8px 0 0;
-  font-size:12px;color:var(--text-3);cursor:pointer;border:1px solid transparent;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:6px;
+  flex:0 0 auto;max-width:calc(160px * var(--qst-u));padding:calc(6px * var(--qst-u)) calc(10px * var(--qst-u));border-radius:calc(8px * var(--qst-u)) calc(8px * var(--qst-u)) 0 0;
+  font-size:calc(12px * var(--qst-u));color:var(--text-3);cursor:pointer;border:1px solid transparent;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:calc(6px * var(--qst-u));
 }
 .agent-tab.active{background:var(--frost);color:var(--text);border-color:var(--line);border-bottom-color:var(--frost)}
 .agent-tab .tab-x{
@@ -2744,17 +2937,17 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
 }
 #ov-agent.agent-min .dlg{display:none}
 .agent-min-dock{
-  position:fixed;right:18px;bottom:18px;z-index:260;
-  padding:10px 16px;border-radius:999px;cursor:pointer;
+  position:fixed;right:calc(18px * var(--qst-u));bottom:calc(18px * var(--qst-u));z-index:260;
+  padding:calc(10px * var(--qst-u)) calc(16px * var(--qst-u));border-radius:999px;cursor:pointer;
   background:linear-gradient(135deg,var(--navy-800),var(--navy-700));
-  color:#e8f4fc;font-size:13px;font-weight:700;
+  color:#e8f4fc;font-size:calc(13px * var(--qst-u));font-weight:700;
   box-shadow:0 12px 28px rgba(6,16,24,.35),0 0 0 1px rgba(255,255,255,.15) inset;
   pointer-events:auto;
 }
 .agent-min-dock:hover{filter:brightness(1.08)}
 .agent-min-dock[hidden]{display:none !important}
 
-.sw{width:44px;height:28px;border-radius:6px;border:1px solid rgba(0,0,0,.12)}
+.sw{width:calc(44px * var(--qst-u));height:calc(28px * var(--qst-u));border-radius:calc(6px * var(--qst-u));border:1px solid rgba(0,0,0,.12)}
 .sv{height:140px;border-radius:8px;border:1px solid var(--line);
   background:linear-gradient(to bottom,#0000,#000),linear-gradient(to right,#fff,var(--ice-500))}
 .hue{height:12px;border-radius:4px;margin-top:8px;background:linear-gradient(90deg,red,#ff0,#0f0,#0ff,#00f,#f0f,red)}
@@ -2763,19 +2956,19 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
   border-radius:8px;padding:12px;height:180px;overflow:auto}
 
 .tray-float{
-  position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:14px;cursor:pointer;z-index:80;
+  position:fixed;right:calc(24px * var(--qst-u));bottom:calc(24px * var(--qst-u));width:calc(48px * var(--qst-u));height:calc(48px * var(--qst-u));border-radius:calc(14px * var(--qst-u));cursor:pointer;z-index:80;
   background:linear-gradient(135deg,var(--navy-900),var(--navy-700));
   box-shadow:0 10px 28px rgba(0,0,0,.35),0 0 0 2px rgba(56,189,248,.35);
   display:grid;place-items:center;
 }
-.tray-float .mark{width:18px;height:18px;border-radius:4px;background:linear-gradient(135deg,var(--ice-400),var(--mint-400))}
+.tray-float .mark{width:calc(18px * var(--qst-u));height:calc(18px * var(--qst-u));border-radius:calc(4px * var(--qst-u));background:linear-gradient(135deg,var(--ice-400),var(--mint-400))}
 .tray-menu{
-  position:fixed;right:24px;bottom:80px;width:150px;background:var(--frost);border-radius:10px;
+  position:fixed;right:calc(24px * var(--qst-u));bottom:calc(80px * var(--qst-u));width:calc(150px * var(--qst-u));background:var(--frost);border-radius:calc(10px * var(--qst-u));
   border:1px solid var(--line);box-shadow:0 12px 32px rgba(0,0,0,.25);overflow:hidden;z-index:81;
   display:none;animation:fadeUp .2s var(--ease-out);
 }
 .tray-menu.show{display:block}
-.tray-menu .ti{padding:11px 14px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--line)}
+.tray-menu .ti{padding:calc(11px * var(--qst-u)) calc(14px * var(--qst-u));font-size:calc(13px * var(--qst-u));cursor:pointer;border-bottom:1px solid var(--line)}
 .tray-menu .ti:last-child{border-bottom:0}
 .tray-menu .ti:hover{background:linear-gradient(90deg,rgba(26,166,214,.12),rgba(45,212,191,.1))}
 
@@ -2809,7 +3002,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
 
 <link rel="stylesheet" href="shell.css?v=20260912nwm6" />
 <link rel="stylesheet" href="vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="pro-mode.css?v=20260831a" />
+<link rel="stylesheet" href="pro-mode.css?v=20260904b" />
 </head>
 <body>
 <div class="app" id="app">
@@ -2965,7 +3158,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
           </div>
           <div class="cta-side">
             <div class="rec-mode-pills">
-              <div class="mode-pill" id="recWindowMode" title="窗口模式：以鼠标所在最上层窗口为目标录制，回放跟随窗口">全屏模式 ▾</div>
+              <div class="mode-pill" id="recWindowMode" title="后台窗口模式：以鼠标所在最上层窗口为目标录制，回放跟随该窗口、不抢前台焦点，目标被遮挡也能操作（脚本内的模式即“后台窗口模式”）。前台模式则按屏幕绝对坐标操作，回放时窗口必须在前台。">前台模式 ▾</div>
               <div class="mode-pill" id="recMode" title="图片定位：点击前截模板，自动转找图">自动识别 ▾</div>
             </div>
             <div class="cta-key" id="ctaRecKey">F8</div>
@@ -3053,7 +3246,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
               <button class="btn ghost" id="edBrowseBtn" type="button">浏览</button>
               <button class="btn ghost" id="edPickBtn" data-open="pick">准星找程序</button>
               <button class="btn ghost" id="edClassBtn">指定窗口类</button>
-              <span class="chk" id="edFocus"><i>✓</i>聚焦</span>
+              <span class="chk" id="edFocus" title="向目标进程注入假焦点（联机/反作弊游戏请勿使用，易被扫描）。远程桌面(mstsc)请勿开启——会搞挂客户端；mstsc 回放会自动改用前台本机键鼠"><i>✓</i>聚焦</span>
             </div>
             <div class="form-line" id="edTitleRow" style="display:none">
               <span class="lbl form-lab-wide">窗口标题</span>
@@ -3062,7 +3255,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
               <div class="inp grow" id="edTargetClass" contenteditable="true"></div>
             </div>
           </div>
-          <div class="section-head">
+          <div class="section-head editor-list-head">
             <h3>动作列表</h3><span class="count" id="edCount">7 项</span>
             <div class="batch-bar" id="batchBar">
               <button class="btn primary" id="btnExitBatch">退出批量编辑</button>
@@ -3100,8 +3293,11 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         </div>
         <div class="right-col">
           <div class="form-line ed-add-type" style="margin:0 0 8px;flex-shrink:0">
-            <span class="lbl">请选择要添加的宏</span>
-            <div class="combo grow" id="edActionType" style="min-width:0;flex:1">找图</div>
+            <span class="lbl" id="edActionTypeLbl">请选择要添加的宏</span>
+            <div class="combo combo-search grow" id="edActionTypeBox" style="min-width:0;flex:1">
+              <input class="combo-search-in" id="edActionType" type="text" autocomplete="off" spellcheck="false" value="找图">
+              <button type="button" class="combo-caret" id="edActionTypeCaret" tabindex="-1" title="展开或收起动作列表" aria-label="展开或收起动作列表">▼</button>
+            </div>
           </div>
           <div class="param-title">动作详情 <span id="paramTag">未选择</span></div>
           <div class="param-block" id="paramPanel"><div class="panel-empty">在左侧选中一条动作后，在此编辑参数</div></div>
@@ -3123,7 +3319,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         <div class="st-tab active" data-stab="click">点击设置</div>
         <div class="st-tab" data-stab="play">宏回放设置</div>
         <div class="st-tab" data-stab="other">其他设置</div>
-        <div class="st-tab" data-stab="window">窗口模式</div>
+        <div class="st-tab" data-stab="window">窗口/后台窗口模式</div>
         <div class="st-tab" data-stab="ai">AI助手</div>
         <div class="st-tab" data-stab="about">关于</div>
       </div>
@@ -3146,6 +3342,10 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
               <div class="row"><span class="chk" id="setPlayIntervalEn"><i>✓</i></span><span class="lbl-w">间隔</span><div class="inp sm" id="setPlayIntervalMin" contenteditable="true">0.5</div>~<div class="inp sm" id="setPlayIntervalMax" contenteditable="true">1</div>秒</div>
               <div class="row"><span class="chk" id="setDebugWin"><i>✓</i></span><span class="lbl-w">宏调试窗口</span></div>
               <div class="row"><span class="chk on" id="setAutoKeyDebug"><i>✓</i></span><span class="lbl-w">自动输出关键信息</span></div>
+              <div class="row"><span class="chk" id="setLowPerfMode"><i>✓</i></span><span class="lbl-w">低性能模式</span></div>
+              <div class="row"><span class="chk" id="setSpreadRelMoves"><i>✓</i></span><span class="lbl-w">细分位移铺满窗口（实验·实测变差）</span></div>
+              <div class="row"><span class="chk on" id="setAiFastPaths"><i>✓</i></span><span class="lbl-w">AI 高级加速</span></div>
+              <div class="row"><span class="chk" id="setFindGpuAccel"><i>✓</i></span><span class="lbl-w">找图 GPU 加速</span></div>
               <div class="row"><span class="chk on" id="setRecCaptureEn"><i>✓</i></span><span class="lbl-w">录制截模板半径</span><div class="inp sm" id="setRecCaptureHalf" contenteditable="true">40</div></div>
               <div class="row speed-row">
                 <span class="chk" id="setPlaySpeedEn"><i>✓</i></span>
@@ -3192,6 +3392,10 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
                 <span class="chk on" id="setPlaySoundEnd"><i>✓</i></span>
                 <span class="lbl-w">脚本结束时播放声音</span>
               </span>
+              <span class="sound-chk-pair">
+                <span class="chk" id="setExportAsZip"><i>✓</i></span>
+                <span class="lbl-w">导出脚本默认为 zip 格式</span>
+              </span>
             </div>
             <div class="row"><span class="chk on" id="setHideTip"><i>✓</i></span><span class="lbl-w">关闭右下角运行提示</span></div>
             <div class="row"><span class="chk on" id="setCloseTray"><i>✓</i></span><span class="lbl-w">关闭按钮隐藏到托盘</span></div>
@@ -3199,12 +3403,13 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
             <div class="row"><span class="chk" id="setAutoBoot"><i>✓</i></span><span class="lbl-w">开机自动启动</span></div>
             <div class="row"><span class="chk" id="setImeConflict"><i>✓</i></span><span class="lbl-w">中文输入法不触发热键</span></div>
             <div class="row"><span class="lbl-w">长按判定</span><div class="inp sm" id="setHoldSec" contenteditable="true">0.5</div><span class="lbl">秒</span></div>
-            <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
-              <span class="lbl-w" style="padding-top:8px">界面主题</span>
-              <div style="flex:1;min-width:220px">
-                <div class="combo ed-full" id="themeCombo" style="width:100%;margin-bottom:8px">极光 Arctic</div>
+            <div class="row"><span class="lbl-w">界面缩放倍率</span><div class="inp sm" id="setUiScale" contenteditable="true">1.0</div><span class="lbl">（相对分辨率自适应后的大小，默认 1.0）</span></div>
+            <div class="row theme-pick-row">
+              <span class="lbl-w">界面主题</span>
+              <div class="theme-pick-col">
+                <div class="combo ed-full" id="themeCombo">极光 Arctic</div>
                 <div class="theme-grid" id="themeGridHome"></div>
-                <button class="btn ghost" data-open="theme" style="margin-top:4px">自定义主色 / 点缀色…</button>
+                <button class="btn ghost" data-open="theme">自定义主色 / 点缀色…</button>
               </div>
             </div>
             <div class="row ui-mode-row">
@@ -3217,32 +3422,53 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
           </div>
         </div>
         <div class="set-pane" data-pane="window">
-          <div class="panel"><div class="panel-head"><div><h3>窗口模式</h3><p>预览 · 健康检查 · 输入回退</p></div></div>
+          <div class="panel"><div class="panel-head"><div><h3>窗口/后台窗口模式</h3><p>预览 · 健康检查 · 输入回退</p></div></div>
             <div class="row"><span class="chk on" id="setWmPreviewThumb"><i>✓</i></span><span class="lbl-w">运行时显示目标窗口预览缩略图</span></div>
             <div class="row"><span class="lbl-w">预览刷新间隔</span><div class="inp sm" id="setWmPreviewMs" contenteditable="true">500</div><span class="lbl">毫秒(200~5000)</span></div>
             <div class="row"><span class="chk on" id="setWmBlockUnhealthy"><i>✓</i></span><span class="lbl-w">目标窗口不健康时阻止运行</span></div>
             <div class="row"><span class="chk" id="setWmFgFallback"><i>✓</i></span><span class="lbl-w">后台输入失败时允许前台输入回退</span></div>
+            <div class="row"><span class="chk" id="setWmHideModule"><i>✓</i></span><span class="lbl-w">注入后隐藏模块（测试模块枚举检测）</span></div>
+            <div class="row"><span class="chk on" id="setWmEnableInject" title="关闭后窗口/后台窗口模式不向目标进程注入假焦点 DLL（联机/反作弊更安全）。冒险岛等后台游戏仍会强制注入，否则按键无效。"><i>✓</i></span><span class="lbl-w">启用假焦点注入</span>
+              <div class="combo" id="setWmInjectTech">经典远线程</div></div>
+            <div class="row"><span class="chk on" id="setWmTimeScale" title="回放倍速同时作用于目标窗口进程的时钟：脚本 2 倍速时游戏冷却/动画也 2 倍速，脚本才不会在冷却结束前就再次操作。仅在后台窗口模式生效；倍率 1.0 时不改变目标行为。与「启用假焦点注入」互相独立：即使关掉注入也照样生效（此时只注入时钟补丁，不改变键鼠路径）。"><i>✓</i></span><span class="lbl-w">启用窗口变速（回放倍速同步作用于目标窗口）</span></div>
           </div>
         </div>
         <div class="set-pane" data-pane="ai">
-          <div class="panel"><div class="panel-head"><div><h3>模型配置</h3><p>OpenAI 兼容</p></div>
-            <div style="display:flex;gap:8px"><button class="btn ghost">添加模型</button><button class="btn danger">删除</button></div></div>
+          <div class="panel"><div class="panel-head"><div><h3 id="aiPanelTitle">模型配置</h3><p id="aiPanelSub">OpenAI 兼容</p></div>
+            <div style="display:flex;gap:8px" id="aiModelBtns"><button class="btn ghost">添加模型</button><button class="btn danger">删除</button></div></div>
             <div class="row"><span class="chk on" id="aiEnabled"><i>✓</i></span><span class="lbl-w">启用 AI 脚本助手</span>
-              <div class="combo" id="aiModelCombo" style="width:min(280px,42vw);min-width:200px;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">未添加模型</div></div>
-            <div class="row"><span class="lbl form-lab">API 地址</span><div class="inp grow" id="aiApiUrl" contenteditable="true"></div></div>
-            <div class="row"><span class="lbl form-lab">API 密钥</span><div class="inp grow" id="aiApiKey" contenteditable="true"></div></div>
-            <div class="row"><span class="lbl form-lab">模型名称</span><div class="inp grow" id="aiModelName" contenteditable="true"></div></div>
-            <div class="row"><span class="lbl form-lab">温度</span><div class="inp sm" id="aiTemp" contenteditable="true">0.3</div>
-              <span class="lbl">Token</span><div class="inp sm" id="aiTokens" contenteditable="true">4096</div></div>
+              <div class="combo" id="aiModelCombo">未添加模型</div></div>
+            <!-- ① API 模型：只显示这一组（选窗口应用时整组隐藏） -->
+            <div id="aiApiFields">
+              <div class="row"><span class="lbl form-lab">API 地址</span><div class="inp grow" id="aiApiUrl" contenteditable="true"></div></div>
+              <div class="row"><span class="lbl form-lab">API 密钥</span><div class="inp grow" id="aiApiKey" contenteditable="true"></div></div>
+              <div class="row"><span class="lbl form-lab">模型名称</span><div class="inp grow" id="aiModelName" contenteditable="true"></div></div>
+              <div class="row"><span class="lbl form-lab">温度</span><div class="inp sm" id="aiTemp" contenteditable="true">0.3</div>
+                <span class="lbl">Token</span><div class="inp sm" id="aiTokens" contenteditable="true">4096</div></div>
+            </div>
+            <!-- ② 窗口应用（窗口 Agents）：选中的是客户端窗口时**只显示这一组** -->
+            <div id="aiWindowAgentFields" hidden>
+              <div class="row"><span class="lbl form-lab">窗口应用</span>
+                <div class="inp grow" id="waPanelApp" contenteditable="false"></div></div>
+              <div class="row"><span class="lbl form-lab">进程</span>
+                <div class="inp grow" id="waPanelProcess" contenteditable="false"></div></div>
+              <div class="row"><span class="lbl form-lab">状态</span>
+                <p class="hint" id="waPanelState"></p></div>
+              <div class="row" style="gap:8px">
+                <button type="button" class="btn primary" id="btnWindowAgentOpen">选择窗口应用…</button>
+                <button type="button" class="btn ghost" id="btnWaPanelUnbind">解除绑定</button>
+              </div>
+              <div class="row"><p class="hint" id="windowAgentSummary"></p></div>
+            </div>
           </div>
         </div>
         <div class="set-pane" data-pane="about">
           <div class="panel" style="text-align:center">
             <div class="brand" style="color:var(--text)"><span class="brand-mark"></span> 键鼠工坊</div>
             <div class="param-block">
-              <div class="row" data-about="website">官网地址：https://www.quickscripttool.cloud/</div>
-              <div class="row" data-about="contact">联系方式：24353623@qq.com</div>
-              <div class="row" data-about="qq">QQ 交流群：2163074732</div>
+              <div class="row" data-about="website"><span class="about-lab">官网地址：</span><a class="about-link" data-about-val="website" href="https://www.quickscripttool.cloud/" target="_blank" rel="noopener noreferrer">https://www.quickscripttool.cloud/</a></div>
+              <div class="row" data-about="contact"><span class="about-lab">联系方式：</span><span class="about-val" data-about-val="contact">24353623@qq.com</span></div>
+              <div class="row" data-about="qq"><span class="about-lab">QQ 交流群：</span><a class="about-link" data-about-val="qq" href="https://qm.qq.com/q/tB60fYgiAw" target="_blank" rel="noopener noreferrer">2163074732</a></div>
             </div>
           </div>
         </div>
@@ -3259,7 +3485,9 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
       <div class="dlg-title">键鼠工坊 — 鼠标宏编辑设置 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
       <div class="settings-tabs" id="editorSettingsTabs">
         <div class="st-tab active" data-edtab="visual">可视化</div>
-        <div class="st-tab" data-edtab="general">通用</div>
+        <div class="st-tab" data-edtab="general">动作列表</div>
+        <div class="st-tab" data-edtab="vars">变量</div>
+        <div class="st-tab" data-edtab="common">通用</div>
       </div>
       <div class="dlg-body settings-body">
         <div class="ed-set-pane active" data-edpane="visual">
@@ -3289,6 +3517,10 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
               <span class="chk on" id="edSetBlockWrap"><i>✓</i></span><span class="lbl-w">指令块包裹</span>
               <p class="hint">取消勾选后，定义宏指令块不再用大框包裹</p>
             </div>
+            <div class="row" title="取消后找图监视不再用大框包裹">
+              <span class="chk on" id="edSetWatchWrap"><i>✓</i></span><span class="lbl-w">找图监视包裹</span>
+              <p class="hint">取消勾选后，找图监视不再用大框包裹</p>
+            </div>
             <div class="row" title="取消后不显示跳转/goto 连线">
               <span class="chk on" id="edSetJumpWires"><i>✓</i></span><span class="lbl-w">跳转连线</span>
               <p class="hint">取消勾选后，不显示跳转 / goto 连线</p>
@@ -3305,9 +3537,55 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         </div>
         <div class="ed-set-pane" data-edpane="general">
           <div class="panel">
-            <div class="panel-head"><div><h3>动作隐藏 / 显示</h3><p>取消勾选后，该动作不再出现在「请选择要添加的宏」里。脚本中已有步骤不受影响。</p></div></div>
+            <div class="panel-head"><div><h3>动作目录预设</h3><p>必选其一。点「保存」后才写入设置。</p></div></div>
+            <div class="radios ed-cat-presets" id="edCatalogPresets">
+              <span class="radio" data-cat-preset="simple"><i></i>精简</span>
+              <span class="radio" data-cat-preset="office"><i></i>办公</span>
+              <span class="radio" data-cat-preset="game"><i></i>游戏图色</span>
+              <span class="radio on" data-cat-preset="all"><i></i>全部</span>
+              <span class="radio" data-cat-preset="custom"><i></i>自定义</span>
+            </div>
+            <div class="row" title="勾选后，添加列表搜索会匹配已隐藏的动作">
+              <span class="chk" id="edSetSearchAllActions"><i></i></span><span class="lbl-w">搜索动作从所有动作里搜索</span>
+              <p class="hint">勾选后，在「请选择要添加的宏」里搜索可找到已隐藏的动作并添加；未勾选只搜索当前目录显示的项。</p>
+            </div>
+            <div class="panel-head"><div><h3>动作隐藏 / 显示</h3><p>取消勾选后，该动作不再出现在添加菜单里。勾选上方「搜索动作从所有动作里搜索」后，仍可通过搜索找到并添加。脚本中已有步骤不受影响。</p></div></div>
             <div class="panel-head"><div><h3>排列顺序</h3><p>拖动手柄或点上下按钮，调整添加列表中的顺序。</p></div></div>
             <div class="ed-action-catalog" id="edActionCatalog"></div>
+          </div>
+        </div>
+        <div class="ed-set-pane" data-edpane="vars">
+          <div class="panel">
+            <div class="panel-head"><div><h3>插入变量列表</h3><p>只影响编辑器下拉，不影响脚本执行。点「保存」后才写入设置。</p></div></div>
+            <div class="row" title="勾选后，插入变量列表不再显示 ctrl:CurLoops 等固定变量">
+              <span class="chk" id="edSetHideFixedVars"><i></i></span><span class="lbl-w">隐藏固定变量</span>
+              <p class="hint">勾选后，不显示 ctrl:CurLoops()、ctrl:Random()、ctrl:Hour() 等固定变量。</p>
+            </div>
+            <div class="row" title="勾选后，不显示 .x/.y/.cx 以及 matchRet[0].x 这类坐标字段">
+              <span class="chk" id="edSetHideCoordVars"><i></i></span><span class="lbl-w">隐藏坐标变量</span>
+              <p class="hint">勾选后，不显示 matchRet.x、matchRet[0].x、光标 .x/.y 等坐标字段，列表更短。</p>
+            </div>
+            <div class="row" title="勾选后，多结果不列出 [0][1][2]，只保留 matchRet[n] 代指">
+              <span class="chk" id="edSetMultiResultPlaceholder"><i></i></span><span class="lbl-w">多结果仅显示代指变量</span>
+              <p class="hint">勾选后，不列出 matchRet[0]、matchRet[1]…，只显示一个 matchRet[n]（以及 count）。把 n 换成 0、1、2 即可引用第几处。</p>
+            </div>
+          </div>
+        </div>
+        <div class="ed-set-pane" data-edpane="common">
+          <div class="panel">
+            <div class="panel-head"><div><h3>编辑行为</h3><p>只影响鼠标宏编辑器操作方式，不影响脚本执行。点「保存」后才写入设置。</p></div></div>
+            <div class="row" title="勾选后隐藏「修改」按钮；选中动作后改参数/备注在失焦时立刻写回列表">
+              <span class="chk" id="edSetDisableModify"><i></i></span><span class="lbl-w">不启用修改按钮</span>
+              <p class="hint">勾选后隐藏「修改」；选中动作后，动作详情与备注在输入框失焦时立刻写回该条（不立刻存盘）。右键可插入到此项前/后。</p>
+            </div>
+            <div class="row" title="勾选后去掉「保存」；关闭编辑器或软件时保存，「取消」恢复到打开时">
+              <span class="chk" id="edSetAutoSaveOnExit"><i></i></span><span class="lbl-w">退出时自动保存</span>
+              <p class="hint">勾选后去掉「保存」按钮，「取消」移到原保存位置。点右上角 × 或关闭软件时保存整份脚本；「取消」恢复到本次打开时的状态。编辑中约每 10 秒定时保存一次。</p>
+            </div>
+            <div class="row" title="勾选后，批量勾选多条时可用添加按钮逐条插入非容器动作；循环/如果等仍并入">
+              <span class="chk" id="edSetEnableBatchInsert"><i></i></span><span class="lbl-w">启用批量插入</span>
+              <p class="hint">默认关闭，避免和「并入」抢添加栏。勾选后，批量选中多条时可在「请选择要添加的宏」里选等待、点击等不能带子节点的动作，点「添加」会在每条勾选项后插入一份；选循环/如果/否则/定义块/找图监视时仍走原来的并入。</p>
+            </div>
           </div>
         </div>
       </div>
@@ -3414,9 +3692,12 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
           <div class="row"><span class="lbl form-lab">文件</span><div class="combo" id="schedFile" style="flex:1">选择文件…</div></div>
           <div class="row" id="schedFreqRow"><span class="lbl form-lab">频率</span>
             <div class="radio" data-freq="0"><i></i>每小时</div><div class="radio on" data-freq="1"><i></i>每日</div>
-            <div class="radio" data-freq="2"><i></i>每周</div><div class="radio" data-freq="3"><i></i>自定义</div></div>
+            <div class="radio" data-freq="2"><i></i>每周</div><div class="radio" data-freq="3"><i></i>自定义</div>
+            <div class="radio" data-freq="4"><i></i>间隔</div></div>
           <div class="row"><span class="lbl form-lab">时间</span>
+            <div id="schedHourWrap" style="display:contents">
             <div class="inp sm" id="schedHour" contenteditable="true">8</div><span>:</span>
+            </div>
             <div class="inp sm" id="schedMinute" contenteditable="true">0</div><span>:</span>
             <div class="inp sm" id="schedSecond" contenteditable="true">0</div><span>.</span>
             <div class="inp sm" id="schedMs" contenteditable="true">0</div>
@@ -3438,9 +3719,9 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
   <div class="overlay" id="ov-hotkey">
     <div class="dlg sm">
       <div class="dlg-title"><span id="hotkeyDlgTitle">脚本热键</span> <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
-      <div class="dlg-body" style="text-align:center;padding:28px 16px">
-        <p style="font-size:14px;margin-bottom:14px">请按下要设置的热键<br><span style="font-size:12px;color:var(--text-3)" id="hotkeyHoldTip">（按住设为启停，按住 0.2 秒算按住）</span></p>
-        <div style="font-family:var(--mono);font-size:26px;font-weight:700;color:#0369a1;text-shadow:0 0 20px var(--glow-ice)" id="hotkeyVal">F8</div>
+      <div class="dlg-body keycap-body">
+        <p>请按下要设置的热键<br><span id="hotkeyHoldTip">（按住设为启停，按住 0.2 秒算按住）</span></p>
+        <div id="hotkeyVal">F8</div>
       </div>
       <div class="dlg-foot" style="justify-content:center">
         <button class="btn ghost" id="btnHotkeyReset">重置热键</button>
@@ -3469,9 +3750,9 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
   <div class="overlay" id="ov-action-key">
     <div class="dlg sm">
       <div class="dlg-title">动作按键 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
-      <div class="dlg-body" style="text-align:center;padding:28px 16px">
-        <p style="font-size:14px;margin-bottom:14px;color:var(--text-3);line-height:1.55">请按下要点击的键<br>（截屏键除外）</p>
-        <div style="font-family:var(--mono);font-size:26px;font-weight:700;color:#0369a1;text-shadow:0 0 20px var(--glow-ice)" id="actionKeyVal">无</div>
+      <div class="dlg-body keycap-body">
+        <p>请按下要点击的键<br>（截屏键除外）</p>
+        <div id="actionKeyVal">无</div>
       </div>
       <div class="dlg-foot">
         <button class="btn lg cancel" data-close>取消</button>
@@ -3483,9 +3764,9 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
   <div class="overlay" id="ov-interval">
     <div class="dlg sm">
       <div class="dlg-title">自定义连点间隔 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
-      <div class="dlg-body" style="display:flex;align-items:center;justify-content:center;gap:10px;padding:32px">
-        <div class="inp" style="width:120px;--qst-inp-h:40px;height:var(--qst-inp-h);font-size:18px;justify-content:center;text-align:center;font-family:var(--mono)" contenteditable="true">0.100</div>
-        <span class="lbl" style="font-size:15px">秒</span>
+      <div class="dlg-body interval-body">
+        <div class="inp interval-inp" contenteditable="true">0.100</div>
+        <span class="lbl">秒</span>
       </div>
       <div class="dlg-foot"><button class="btn lg cancel" data-close>取消</button><button class="btn lg primary" id="btnIntervalOk">确定</button></div>
     </div>
@@ -3494,8 +3775,8 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
   <div class="overlay" id="ov-rename">
     <div class="dlg sm">
       <div class="dlg-title">重命名 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
-      <div class="dlg-body" style="display:flex;justify-content:center;padding:28px">
-        <div class="inp grow" id="renameInput" style="max-width:300px;--qst-inp-h:40px;height:var(--qst-inp-h)" contenteditable="true">登录流程录制</div>
+      <div class="dlg-body rename-body">
+        <div class="inp grow" id="renameInput" contenteditable="true">登录流程录制</div>
       </div>
       <div class="dlg-foot"><button class="btn lg cancel" data-close>取消</button><button class="btn lg primary" id="btnRenameOk">确定</button></div>
     </div>
@@ -3509,6 +3790,30 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         <button class="btn lg primary" id="btnPromptOk">确定</button>
         <button class="btn lg cancel" data-close>取消</button>
       </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="ov-export-exe">
+    <div class="dlg">
+      <div class="dlg-title">导出为独立 EXE <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
+      <div class="dlg-body exp-body">
+        <div class="exp-scan" id="expScan">正在检查脚本…</div>
+        <div>
+          <div class="exp-sec-h">目标电脑装了「键鼠工坊」吗？</div>
+          <div class="radios" id="expTargetRadios">
+            <div class="radio on" data-v="none"><i></i>没装 / 不确定 —— 需要的能力全部自带（推荐）</div>
+            <div class="radio" data-v="installed"><i></i>装了 —— 复用软件里已有的组件（体积更小）</div>
+          </div>
+        </div>
+        <div id="expAdvanced" hidden>
+          <div class="exp-sec-h">分别指定</div>
+          <div class="row"><span class="chk on" id="expBundledOpenCv"><i>✓</i></span><span class="lbl-w">找图 / 找色：把图像识别组件打进 exe</span></div>
+          <div class="row"><span class="chk on" id="expBundledOcr"><i>✓</i></span><span class="lbl-w">文字识别：用目标电脑的系统 OCR</span></div>
+        </div>
+        <div class="exp-size" id="expSize">预计体积：—</div>
+        <div class="exp-tip">提示：导出的 exe 未做数字签名，对方首次运行可能看到 Windows 的安全提示，选择「仍要运行」即可。</div>
+      </div>
+      <div class="dlg-foot"><button class="btn lg cancel" data-close>取消</button><button class="btn lg primary" id="btnExportExeOk">导出</button></div>
     </div>
   </div>
 
@@ -3561,9 +3866,17 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
                 <button class="btn primary" id="optApplyMerge">开始合并</button>
               </div>
               <div class="opt-scheme-pane" data-scheme="鼠标移动压缩">
-                <div class="row"><span class="lbl">压缩后等待时间</span><div class="inp sm" id="optCompressWait" contenteditable="true">0.1</div><span class="lbl">秒</span></div>
                 <div class="row"><span class="lbl">压缩阈值</span><div class="inp sm" id="optCompressDist" contenteditable="true">1</div></div>
-                <p class="hint">已选中关键动作时按关键动作分段压缩连续移动点；未选中关键动作时仍须连续选择移动和等待。含相对位移的段会跳过。</p>
+                <div class="row"><span class="lbl-w">压缩后等待时间处理</span></div>
+                <div id="optCompressRadios">
+                  <div class="row"><div class="radio" data-merge="sum"><i></i>等待时间累加</div></div>
+                  <div class="row"><div class="radio" data-merge="average"><i></i>使用平均时间</div></div>
+                  <div class="row"><div class="radio on" data-merge="first"><i></i>使用已选的第一个</div></div>
+                  <div class="row"><div class="radio" data-merge="last"><i></i>使用已选的最后一个</div></div>
+                  <div class="row"><div class="radio" data-merge="fixed"><i></i>使用指定的时间</div></div>
+                </div>
+                <div class="row" id="optCompressCustom" style="display:none"><span class="lbl">调整等待时间为</span><div class="inp sm" id="optCompressWait" contenteditable="true">0.1</div><span class="lbl">秒</span></div>
+                <p class="hint">已选中关键动作时按关键动作分段压缩连续移动点；留下的移动点之间的等待按所选方式单独计算。未选中关键动作时仍须连续选择移动和等待。含相对位移的段会跳过。</p>
                 <button class="btn primary" id="optApplyCompress">开始压缩</button>
               </div>
             </div>
@@ -3580,13 +3893,12 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
       <div class="dlg-body">
         <div class="ocr-panel">
           <div class="ocr-lab">安装插件：</div>
-          <div class="ocr-name" id="ocrPluginName">文字识别(PaddleOCR)</div>
+          <div class="ocr-name" id="ocrPluginName">文字识别(RapidOCR)</div>
           <div class="ocr-lab">插件说明：</div>
-          <div class="ocr-desc" id="ocrDesc">此插件支持中文（简/繁）、英文等多种语言文字识别，识别速度快、准确度高。首次安装将自动安装 Python 3.12 并下载 OCR 依赖，请保持联网并耐心等待。</div>
-          <div class="ocr-status" id="ocrStatus">已就绪，点击安装开始下载安装…</div>
+          <div class="ocr-desc" id="ocrDesc">此插件用 ONNX 版 RapidOCR 识别中英文屏幕文字（旧版 PaddleOCR 仍可作回退）。首次安装会部署独立 Python 3.12，体积远小于旧方案，请保持联网。</div>
+          <div class="ocr-status" id="ocrStatus">已就绪，点击下方按钮开始安装或修复…</div>
           <div class="progress ocr-progress"><i id="ocrBar"></i></div>
-          <button class="btn lg primary" id="btnOcrInstall" style="align-self:center;min-width:180px;justify-content:center">安装插件</button>
-          <button class="btn ghost sm" id="btnOcrRepair" style="align-self:center;margin-top:4px">修复 / 更新</button>
+          <button class="btn lg primary" id="btnOcrInstall" style="align-self:center;min-width:180px;justify-content:center">安装 / 修复</button>
         </div>
       </div>
     </div>
@@ -3614,19 +3926,49 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
     </div>
   </div>
 
+  <div class="overlay" id="ov-window-agent">
+    <div class="dlg med">
+      <div class="dlg-title">选择窗口应用 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
+      <div class="dlg-body">
+        <div class="panel" style="padding:8px 4px">
+          <div class="row" style="justify-content:center;gap:10px;flex-wrap:wrap">
+            <span class="lbl-w">用准星指定一个窗口</span>
+            <button type="button" class="btn primary crosshair-btn" id="btnWaCrosshair"
+              title="按住不放，把准星拖到目标客户端窗口上松手">按住拖到目标窗口</button>
+          </div>
+          <div class="row"><span class="lbl form-lab">已选窗口</span>
+            <div class="inp grow" id="waPickedTitle" contenteditable="false" style="min-height:24px"></div></div>
+          <div class="row"><span class="lbl form-lab">进程</span>
+            <div class="inp grow" id="waPickedProcess" contenteditable="false"></div></div>
+          <div class="row"><span class="lbl form-lab">状态</span>
+            <p class="hint" id="waPickedState">还没有选择窗口</p></div>
+          <div class="row" style="gap:8px">
+            <button type="button" class="btn primary" id="btnWaBind" disabled>绑定为模型</button>
+            <button type="button" class="btn ghost" id="btnWaUnbind" disabled>解除绑定</button>
+          </div>
+        </div>
+        <div class="panel" style="padding:8px 4px;margin-top:8px">
+          <div class="panel-head"><div><h3>当前打开的窗口</h3><p>点一行即可选中（等价于准星拾取）</p></div></div>
+          <div id="waWindowList"></div>
+        </div>
+      </div>
+      <div class="dlg-foot"><button class="btn cancel" data-close>关闭</button></div>
+    </div>
+  </div>
+
   <div class="overlay" id="ov-theme">
     <div class="dlg med">
       <div class="dlg-title">界面主题 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
       <div class="dlg-body">
-        <p style="font-size:12px;color:var(--text-3);padding:0 2px 10px;line-height:1.5">
+        <p class="theme-dlg-hint">
           预设对齐软件 <code>AppTheme</code>。点预设即切换；或自定义主色/点缀色后确定。
         </p>
         <div class="theme-grid" id="themeGridDlg"></div>
-        <div class="row" style="margin-top:8px"><span class="lbl form-lab-wide">主色（Chrome）</span>
-          <input type="color" id="themeMainColor" value="#1aa6d6" style="width:48px;height:32px;border:0;background:transparent;cursor:pointer"/>
+        <div class="row theme-color-row"><span class="lbl form-lab-wide">主色（Chrome）</span>
+          <input type="color" id="themeMainColor" value="#1aa6d6"/>
           <div class="sw" id="swMain" style="background:var(--ice-500)"></div></div>
         <div class="row"><span class="lbl form-lab-wide">点缀色（强调）</span>
-          <input type="color" id="themeAccentColor" value="#2dd4bf" style="width:48px;height:32px;border:0;background:transparent;cursor:pointer"/>
+          <input type="color" id="themeAccentColor" value="#2dd4bf"/>
           <div class="sw" id="swAccent" style="background:var(--mint-400)"></div></div>
       </div>
       <div class="dlg-foot"><button class="btn ghost" id="btnThemeRand">随机</button><div style="flex:1"></div>
@@ -3653,7 +3995,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
     <div class="df-body"><pre class="debug-log" id="debugLog"></pre></div>
   </div>
 
-<!-- 阶段 C：运行 HUD / 窗口模式预览 / 驱动安装 -->
+<!-- 阶段 C：运行 HUD / 窗口模式预览 / 驱动安装（窗口模式=独立桌面模式，与后台窗口模式区分） -->
 <div class="run-hud" id="runHud">
   <div class="rh-title" id="runHudTitle">宏运行中</div>
   <div class="rh-meta" id="runHudMeta">日常挂机 · 主循环<br>模式：默认 · 已执行 12 步</div>
@@ -3665,14 +4007,14 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
 <div class="wm-preview" id="wmPreview">
   <div class="desk"></div>
   <div class="target"></div>
-  <div class="label">窗口模式目标 · 目标窗口</div>
+  <div class="label">后台窗口目标 · 目标窗口</div>
 </div>
 
 <div class="overlay" id="ov-driver-ic">
   <div class="dlg med">
     <div class="dlg-title">安装 Interception 驱动 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
     <div class="dlg-body">
-<p class="hint" style="padding:0 0 8px">用于底层键鼠注入。仅在当前 Windows 能加载该驱动时安装；<b>不会</b>关闭安全启动、开启测试签名或改内存完整性。加载失败会回滚，不注册键盘/鼠标过滤驱动。</p>
+<p class="hint" style="padding:0 0 8px">用于底层键鼠注入。默认安装包不含该驱动（降低杀软误报）。点安装会先从官网下载驱动包，再弹出管理员权限。无 EV 签名时当前 Windows 往往会拒载；失败会回滚。<b>不会</b>关闭安全启动、开启测试签名或改内存完整性。</p>
       <div class="driver-steps" id="icSteps">
         <div class="driver-step" data-s="0"><div class="n">1</div><div><div class="t">检查环境</div><div class="d">检测是否已安装；清除旧版危险残留</div></div></div>
         <div class="driver-step" data-s="1"><div class="n">2</div><div><div class="t">申请管理员权限</div><div class="d">UAC 提权后写入驱动文件</div></div></div>
@@ -3693,7 +4035,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
   <div class="dlg med">
     <div class="dlg-title">安装虚拟 HID 驱动 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
     <div class="dlg-body">
-<p class="hint" style="padding:0 0 8px">虚拟键鼠软件设备（不是键盘/鼠标类过滤驱动）。<b>不会</b>自动关闭安全启动、开启测试签名或关闭内存完整性。签名不被当前系统信任时会拒绝安装。</p>
+<p class="hint" style="padding:0 0 8px">虚拟键鼠软件设备（不是键盘/鼠标类过滤驱动）。默认安装包不含内核文件；点安装会先下载再 UAC。<b>不会</b>自动关闭安全启动、开启测试签名或关闭内存完整性。无 EV 时当前系统通常会拒绝安装。</p>
       <div class="driver-steps" id="vhidSteps">
         <div class="driver-step" data-s="0"><div class="n">1</div><div><div class="t">准备环境</div><div class="d">检查签名；清除旧版开机任务</div></div></div>
         <div class="driver-step" data-s="1"><div class="n">2</div><div><div class="t">安装驱动</div><div class="d">写入驱动库（软件设备）</div></div></div>
@@ -3774,11 +4116,12 @@ body.editor-open #qstDemoBadge{display:none}
 })();
 </script>
 <script src="vendor/katex/katex.min.js" defer></script>
+<script src="../export/qst-web-export.js" defer></script>
 <script src="bridge.stub.js?v=20260912nwm4" defer></script>
 <script src="bridge.js?v=20260912nwm4" defer></script>
 <script src="agent-inline.js?v=20260818" defer></script>
 <script src="app.js?v=20260913vis1" defer></script>
 <script src="visual_editor.js?v=20260913d" defer></script>
-<script src="pro-mode.js?v=20260831c" defer></script>
+<script src="pro-mode.js?v=20260904b" defer></script>
 </body>
 </html>

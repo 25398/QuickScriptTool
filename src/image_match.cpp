@@ -314,6 +314,14 @@ HBITMAP MatToHBitmap(const cv::Mat& img) {
 
 HBITMAP LoadBitmapFromFile(const std::wstring& path) {
     if (path.empty()) return nullptr;
+    // ⚠ 必须在**任何 cv::Mat 出现之前**早退：本函数只要构造/析构一个 cv::Mat，
+    //   就会引用 OpenCV 符号；而 exe 是用 /DELAYLOAD 链 OpenCV 的 ——
+    //   DLL 不在时 delay-load 桩会抛 0xC06D007E，**进程直接死**（连日志都没有）。
+    //   没有 OpenCV 时退回 GDI 的 LoadImageW：BMP 还能用，其它格式返回空。
+    if (!OpenCvAvailable()) {
+        return static_cast<HBITMAP>(LoadImageW(nullptr, path.c_str(), IMAGE_BITMAP, 0, 0,
+            LR_LOADFROMFILE | LR_CREATEDIBSECTION));
+    }
     const cv::Mat cached = TryGetCachedTemplateImage(path);
     if (!cached.empty()) return MatToHBitmap(cached);
     const cv::Mat img = ImReadW(path);
@@ -394,57 +402,6 @@ bool TryMatchTemplateOnGpu(const cv::Mat& src, const cv::Mat& tpl,
 }
 
 }  // namespace image_match_internal
-
-bool PlanFindImageFastPath(const FindImageFastPathParams& params,
-    int roiX1, int roiY1, int roiX2, int roiY2,
-    int prevTLX, int prevTLY, int tplW, int tplH,
-    double lastFullSearchMs, long long ageMs,
-    int& winX1, int& winY1, int& winX2, int& winY2) {
-    winX1 = winY1 = winX2 = winY2 = 0;
-    if (tplW <= 0 || tplH <= 0) return false;
-    if (roiX2 <= roiX1 || roiY2 <= roiY1) return false;
-    // 上帧本来很快（区域找图）→ 不值得再来一次小窗口调度
-    if (!(lastFullSearchMs >= params.minFullSearchMs)) return false;
-    if (ageMs < 0 || ageMs > params.maxAgeMs) return false;
-    if (params.maxDriftPx < 0) return false;
-    // 上一帧命中必须在搜索区内，且整块模板放得下
-    if (prevTLX < roiX1 || prevTLY < roiY1) return false;
-    if (prevTLX + tplW > roiX2 || prevTLY + tplH > roiY2) return false;
-
-    // 余量至少覆盖漂移带，否则「接受区间」会有一部分落在窗口外 →
-    // 那部分漂移找不到就会白回退（宁可现在就回退）
-    const int drift = params.maxDriftPx;
-    const int margin = (std::max)(drift, (std::min)(64, (std::max)(tplW, tplH) / 4));
-    const int cx1 = (std::max)(roiX1, prevTLX - margin);
-    const int cy1 = (std::max)(roiY1, prevTLY - margin);
-    const int cx2 = (std::min)(roiX2, prevTLX + tplW + margin);
-    const int cy2 = (std::min)(roiY2, prevTLY + tplH + margin);
-    if (cx2 - cx1 < tplW || cy2 - cy1 < tplH) return false;
-    // 覆盖检查：窗口内可放置的左上角范围必须完整包含 [prev-drift, prev+drift]
-    if (cx1 > prevTLX - drift) return false;
-    if (cy1 > prevTLY - drift) return false;
-    if (cx2 - tplW < prevTLX + drift) return false;
-    if (cy2 - tplH < prevTLY + drift) return false;
-    // 窗口几乎等于整个搜索区 → 没有收益，还不如直接全屏搜（避免「假快速路径」）
-    const long long winArea = static_cast<long long>(cx2 - cx1) * (cy2 - cy1);
-    const long long roiArea = static_cast<long long>(roiX2 - roiX1) * (roiY2 - roiY1);
-    if (winArea * 10 >= roiArea * 7) return false;
-
-    winX1 = cx1;
-    winY1 = cy1;
-    winX2 = cx2;
-    winY2 = cy2;
-    return true;
-}
-
-bool AcceptFindImageFastPathHit(const FindImageFastPathParams& params,
-    int prevTLX, int prevTLY, int newTLX, int newTLY,
-    double thresholdPercent, double newScore) {
-    if (params.maxDriftPx < 0) return false;
-    if (std::abs(newTLX - prevTLX) > params.maxDriftPx) return false;
-    if (std::abs(newTLY - prevTLY) > params.maxDriftPx) return false;
-    return newScore >= thresholdPercent + params.scoreMarginPct;
-}
 
 std::wstring FindImageGpuDeviceName() {
     try {
@@ -847,6 +804,8 @@ ScreenChangeDiffResult DiffBitmapsChangedRegions(
     const cv::Mat mb = BitmapToBgrMat(b);
     if (ma.empty() || mb.empty()) return out;
     out.ok = true;
+    out.width = ma.cols;
+    out.height = ma.rows;
     if (ma.cols != mb.cols || ma.rows != mb.rows) {
         out.sameSize = false;
         out.nearlyIdentical = false;
@@ -918,8 +877,100 @@ ScreenChangeDiffResult DiffBitmapsChangedRegions(
     return out;
 }
 
-UiVisualSettleResult WaitUiReactThenSettle(
-    HBITMAP baseline,
+bool AiRoiIsLocalMotion(const ScreenChangeRoi& r, int frameW, int frameH) {
+    const int rw = (std::max)(0, r.x2 - r.x1);
+    const int rh = (std::max)(0, r.y2 - r.y1);
+    if (rw <= 0 || rh <= 0) return true;   // 退化框不构成「整片在动」的证据
+    if (frameW <= 0 || frameH <= 0) {
+        // 拿不到画面尺寸 → 退回旧的绝对阈值（行为与 §39.4 那版逐字一致）
+        return rw <= kAiReactionMaxRoiW && rh <= kAiReactionMaxRoiH
+            && rw * rh <= kAiReactionMaxRoiArea;
+    }
+    // ★相对画面判「整片在动」（docs §40.1）：绝对阈值会把卡片高亮这种真反应误判掉。
+    const double frameArea = static_cast<double>(frameW) * static_cast<double>(frameH);
+    const double areaFrac = (static_cast<double>(rw) * static_cast<double>(rh)) / frameArea;
+    if (areaFrac >= kAiReactionLargeAreaFrac) return false;
+    if (rw >= frameW * kAiReactionLargeSpanFrac && rh >= frameH * kAiReactionLargeSpanFrac)
+        return false;
+    return true;
+}
+
+AiUiReactionVerdict AiJudgeUiReaction(const std::vector<ScreenChangeRoi>& rois,
+    const std::vector<POINT>& inputs, bool dynamicForeground,
+    int nearPx, int frameW, int frameH) {
+    AiUiReactionVerdict v;
+    if (rois.empty()) {
+        v.why = L"没有结构变化区";
+        // 一个变化区都没有 = 画面一动没动 ⇒ **确定**没反应（唯一能确定的「无反应」）
+        v.conclusive = true;
+        return v;
+    }
+    if (nearPx <= 0) nearPx = 48;
+
+    int compact = 0;
+    int large = 0;
+    bool compactNearInput = false;
+    bool compactAway = false;
+    for (const auto& r : rois) {
+        if (!AiRoiIsLocalMotion(r, frameW, frameH)) {
+            ++large;
+            continue;
+        }
+        ++compact;
+        bool nearAnyInput = false;
+        for (const POINT& p : inputs) {
+            // 点到矩形的最短距离（在框内为 0）
+            const int dx = (p.x < r.x1) ? (r.x1 - p.x) : ((p.x > r.x2) ? (p.x - r.x2) : 0);
+            const int dy = (p.y < r.y1) ? (r.y1 - p.y) : ((p.y > r.y2) ? (p.y - r.y2) : 0);
+            if (dx <= nearPx && dy <= nearPx) {
+                nearAnyInput = true;
+                break;
+            }
+        }
+        if (nearAnyInput) compactNearInput = true;
+        else compactAway = true;
+    }
+
+    const std::wstring counts = L"变化区 " + std::to_wstring(rois.size())
+        + L" 个（局部 " + std::to_wstring(compact)
+        + L" / 大面积 " + std::to_wstring(large) + L"）";
+
+    if (!dynamicForeground) {
+        // 静态界面：任何变化都算反应（与改动前逐字等价）。巨框在这里是**真重绘**。
+        v.kind = compactNearInput ? AiUiReactionKind::NearInput
+            : (compactAway ? AiUiReactionKind::AwayFromInput
+                : AiUiReactionKind::LargeMotionOnly);
+        v.reacted = true;
+        v.conclusive = true;
+        v.why = counts + L"；静态前台 → 任何变化都算反应";
+        return v;
+    }
+
+    if (compactNearInput) {
+        v.kind = AiUiReactionKind::NearInput;
+        v.reacted = true;
+        v.conclusive = true;
+        v.why = counts + L"；有局部变化落在落点附近 → 算反应";
+    } else if (compactAway) {
+        // ★★这一档**不算反应**（docs §40.1）：动态画面上实体/计时器每帧都在产生局部变化，
+        //   「别处有局部变化」实测**恒真** ⇒ 零信息量。但也不能反过来说「确定没反应」——
+        //   画面自己在动，无法归因，所以 conclusive=false（不许触发死点表）。
+        v.kind = AiUiReactionKind::AwayFromInput;
+        v.reacted = false;
+        v.conclusive = false;
+        v.why = counts + L"；局部变化全**不在**落点附近（动态画面上实体/计时器每帧都会产生"
+            L"局部变化，因此这不构成「这一击生效了」的证据）→ 无法确认是否生效";
+    } else {
+        v.kind = AiUiReactionKind::LargeMotionOnly;
+        v.reacted = false;
+        v.conclusive = false;
+        v.why = counts + L"；**没有任何局部变化** → 整片在动是背景动画，"
+            L"不构成「这一击生效了」的证据，也无法归因于这一击";
+    }
+    return v;
+}
+
+UiVisualSettleResult WaitUiReactThenSettle(    HBITMAP baseline,
     const std::function<HBITMAP()>& capture,
     const std::atomic_bool& stopFlag,
     const UiVisualSettleOptions& opts) {
@@ -973,6 +1024,8 @@ UiVisualSettleResult WaitUiReactThenSettle(
             + L" 差分" + std::to_wstring(static_cast<int>(out.lastChangedRatio * 10000.0 + 0.5))
             + L"bp";
         if (!roisTxt.empty()) out.logLine += L" 变化区[" + roisTxt + L"]";
+        // ★把判据说破（§39.4）：否则日志里会出现「差分0bp」与「仍在变化」并排的自相矛盾行
+        if (!out.reactionWhy.empty()) out.logLine += L"；" + out.reactionWhy;
         if (out.suggestRefresh) out.logLine += L" →建议刷新/重开";
 
         // 只报事实；策略见 lookupMacroAction(section=agent|usage)
@@ -1008,8 +1061,34 @@ UiVisualSettleResult WaitUiReactThenSettle(
                 baseline, cur, opts.channelTol);
             out.lastChangedRatio = d.changedRatio;
             out.lastChangeRois = d.rois;
-            const bool changed = d.ok && d.sameSize
+            const bool ratioChanged = d.ok && d.sameSize
                 && (!d.nearlyIdentical && d.changedRatio >= opts.reactedMinChangedRatio);
+            // ★★「有变化」之外还要过**反应判据**（docs §39.4）：动态画面上「整片背景在动」
+            //   不算「我这一击生效了」。不加这道闸，`reacted` 必真 ⇒ `NoReaction` 不可达
+            //   ⇒ 死点表 / 缓存作废 / 连败表 / 回执的「没有变化」全部变成死代码。
+            //   ⚠ 非动态前台**不受影响**（判据在那条分支里恒为 reacted=true），
+            //     所以 Web/Office 路径与改动前逐字等价。
+            const AiUiReactionVerdict rv = AiJudgeUiReaction(
+                d.rois, opts.inputPoints, opts.dynamicForeground, opts.inputNearPx,
+                d.width, d.height);
+            out.reactionConclusive = rv.conclusive;
+            const bool changed = ratioChanged && rv.reacted;
+            // ★★判据与结局**不能各说各话**（docs §41.3）：`rv.reacted` 只回答
+            //   「局部证据指向哪边」，最终还要 AND 上「整帧差分过阈」。
+            //   把两者写进同一句话，否则日志会出现自相矛盾的一行 —— 实测原样：
+            //     `UI settle：无反应 …；变化区 1 个（局部 1 / 大面积 0）；有局部变化落在落点附近 → 算反应`
+            //   （结局「无反应」与判据「算反应」并排。）**回执说谎比没有回执更糟**，
+            //   日志也一样 —— 判读的人会照着错的那半句去改代码。
+            if (!changed && rv.reacted) {
+                out.reactionWhy = rv.why + L"；但整帧结构差分 "
+                    + std::to_wstring(static_cast<int>(d.changedRatio * 10000.0 + 0.5))
+                    + L"bp 未过阈值 "
+                    + std::to_wstring(
+                        static_cast<int>(opts.reactedMinChangedRatio * 10000.0 + 0.5))
+                    + L"bp（画面近似静止）→ **不判为反应**";
+            } else {
+                out.reactionWhy = rv.why;
+            }
             if (changed) {
                 reacted = true;
                 stableSinceMs = -1;

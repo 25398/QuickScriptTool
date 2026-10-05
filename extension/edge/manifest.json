@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "键鼠工坊",
-  "version": "1.0.20",
+  "version": "1.0.43",
   "description": "配合键鼠工坊窗口模式，在已打开的 Edge/Chrome 标签页后台投递键鼠（无需 remote-debugging-port）。",
   "permissions": ["debugger", "tabs", "windows", "storage", "alarms", "scripting", "nativeMessaging"],
   "host_permissions": [

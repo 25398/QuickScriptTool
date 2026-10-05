@@ -430,7 +430,7 @@ Native → Web 推送；`ui/app.js` 调现有 `toast()`。无 Web 桥时回落 `
 
 设置 `openSettingsData` / `saveSettings` 的 `playback` 含：`enablePlaybackCount`、`playbackCount`、`enablePlaybackInterval`、间隔秒、`enablePlaybackSpeed`、`playbackSpeed`(0.25~4)。**全局倍速只作用于录制页直接播放**：极简模式无视勾选（视为已启用），专业模式看勾选；与极简录制工具栏共用 `playbackSpeed`，专业录制页不再另放滑条。鼠标宏顶层不缩放。嵌套「运行录制回放」(`mousePlayback`) 只用动作自身 `playbackSpeed`（缺省 1），不叠加全局。`enableDebugOutputWindow`、`autoOutputKeyFunctionDebug`、`recordingClickCaptureEnabled`、`recordingClickCaptureHalfSize`、`foregroundInputBackend`(0/1/2)、`scheduledTaskConflictPolicy`(0=执行脚本优先/跳过 1=定时脚本优先/打断)、`scheduledTaskAutoResume`（false=上述跳过/打断不恢复；true 时 0=结束后再跑、1=插入后从原步骤继续）。`other` 另含 `closeToTray`、`playSoundOnStart`、`playSoundOnEnd`、`hideBottomRightTip`、`resolveImeConflict`、`showFloatBall`（默认 true，桌面悬浮球显隐；可贴边半露或拖到工作区中间自由悬浮）等（**`preferDirect2D` 在 Web 壳设置页隐藏**，磁盘值保留）。`home` 含 `activeTab`、`uiMode`(`simple`/`pro`)、可选 `selectedScriptPath` / `selectedRecordingPath`。
 
-headless 下原生右下角 tip **禁用**（仅用 Web `#statusPill`，由 `hideBottomRightTip` 控制），避免双显。桌面悬浮球是独立 DesktopTools HWND，与 tip 无关。
+headless 下原生右下角 tip **禁用**（仅用 Web `#statusPill`，由 `hideBottomRightTip` 控制），避免双显。桌面悬浮球是独立 DesktopTools HWND，与 tip 无关：悬停展开的面板第一行是脚本名、第二行是**脚本当前状态**（`UpdateDesktopFloatBallModel()` 是状态文案的唯一来源）；**点击圆头图标 = 启停切换**，**点击面板 = 显示主窗口**（已无独立的启动/停止按钮）。
 
 ### 仍强制原生的窗口
 

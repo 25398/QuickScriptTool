@@ -4,6 +4,9 @@ A simple tool for defining keyboard and mouse scripts. Its UI draws inspiration 
 
 功能表与代码模块对照（维护入口）：[`docs/features-and-modules.md`](docs/features-and-modules.md)
 
+AI 脚本助手使用说明（**用户向**：能做什么 / 怎么开口 / 接自己的 MCP 工具 / 人工验收清单 / 排障）：
+[`docs/agent-assistant-user-guide.md`](docs/agent-assistant-user-guide.md)
+
 ## 声明
 
 本项目为独立开源实现，仅自主实现键鼠脚本录制编辑相关功能逻辑，未复制、逆向、抄袭任何商业软件源代码与原创界面设计；本项目免费开源仅供个人学习交流使用，不与任何第三方商业软件存在隶属、衍生关系。

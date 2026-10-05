@@ -103,6 +103,7 @@ ScheduledTask ParseTaskObject(const std::wstring& obj) {
     task.status = ParseIntField(obj, L"status", 0) == 1
         ? ScheduledTaskStatus::Disabled : ScheduledTaskStatus::Enabled;
     task.customFired = ParseBoolField(obj, L"customFired", false);
+    task.lastFireKey = ExtractString(obj, L"lastFireKey");
     task.time.year = ParseIntField(obj, L"year", 0);
     task.time.month = ParseIntField(obj, L"month", 0);
     task.time.day = ParseIntField(obj, L"day", 0);
@@ -137,6 +138,8 @@ void AppendTaskJson(std::wstring& out, const ScheduledTask& t) {
     out += L"      \"customFired\": ";
     out += (t.customFired ? L"true" : L"false");
     out += L",\n";
+    // 秒级去重键：必须落盘，否则强杀重开后同一时刻会重复触发（见 ScheduledTask 注释）。
+    out += L"      \"lastFireKey\": \"" + EscapeJson(t.lastFireKey) + L"\",\n";
     out += L"      \"year\": " + std::to_wstring(t.time.year) + L",\n";
     out += L"      \"month\": " + std::to_wstring(t.time.month) + L",\n";
     out += L"      \"day\": " + std::to_wstring(t.time.day) + L",\n";

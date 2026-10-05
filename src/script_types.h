@@ -206,7 +206,8 @@ struct ScriptAction {
     bool ocrDigitsOnly = false;              // 纯数字：小框整行识别；全图/大区域先定位再留数字
     int ocrResultMode = 0;                   // 0=获取文字, 1=文字查找
     std::wstring ocrSearchText;              // 文字查找目标（可含变量）
-    int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到, 2=保存到变量
+    int ocrFollowUp = 0;                     // 0=点击, 1=鼠标移动到,
+                                             // 2=保存结果（获取文字⇒识别文字；文字查找⇒匹配度{变量}.matchData）
     std::wstring conditionExpr;               // 条件表达式 (If 动作)
     std::wstring gotoStepExpr;                // 跳转目标序号（支持变量表达式）
     bool resumeAfterWatch = true;            // 找图监视：中断后从原处继续（无跳转时）

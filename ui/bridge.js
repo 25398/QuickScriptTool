@@ -40,6 +40,14 @@
         reqId: String(reqId || ""),
         max: Number(max) || 16,
       }),
+    // 编辑器变量下拉：把当前动作原样交给引擎算清单（**唯一实现**在 C++）。
+    // ⚠ actions 必须是**数组**（C++ 侧 ExtractJsonArray 找 "actions"），别传字符串。
+    editorVarItems: (actions, reqId) =>
+      post({
+        type: "editorVarItems",
+        actions: Array.isArray(actions) ? actions : [],
+        reqId: String(reqId || ""),
+      }),
     saveEditor: (payload) => post(Object.assign({ type: "saveEditor" }, payload || {})),
     debugScript: (payload) => post(Object.assign({ type: "debugScript" }, payload || {})),
     deleteScript: (path) => post({ type: "deleteScript", path: String(path || "") }),
@@ -47,6 +55,10 @@
       post({ type: "renameScript", path: String(path || ""), name: String(name || "") }),
     importScript: (kind) => post({ type: "importScript", kind: String(kind || "macro") }),
     exportScript: (path) => post({ type: "exportScript", path: String(path || "") }),
+    scanScriptForExport: (path) =>
+      post({ type: "scanScriptForExport", path: String(path || "") }),
+    exportScriptAsExe: (opts) =>
+      post(Object.assign({ type: "exportScriptAsExe" }, opts || {})),
     openRecordingOptimize: (path, name) =>
       post({
         type: "openRecordingOptimize",
@@ -127,8 +139,14 @@
       }),
     modeReady: () => post({ type: "window.modeReady" }),
     uncloak: () => post({ type: "window.uncloak" }),
-    setActiveHomeTab: (tab) =>
-      post({ type: "setActiveHomeTab", tab: Number(tab) || 0 }),
+    // scopeAll：本页是否列出「全部内容」（专业模式脚本库/定时/设置）。
+    // true 时专属热键不按 TAB 限定；缺省 false = 只响应当前 TAB 列出的那一类。
+    setActiveHomeTab: (tab, scopeAll) =>
+      post({
+        type: "setActiveHomeTab",
+        tab: Number(tab) || 0,
+        scopeAll: scopeAll ? 1 : 0,
+      }),
     setHomeSelection: (tab, path) =>
       post({
         type: "setHomeSelection",
@@ -158,7 +176,12 @@
     themeCatalog: () => post({ type: "themeCatalog" }),
     applyTheme: (opts) => post(Object.assign({ type: "applyTheme" }, opts || {})),
     openThemeCustom: (opts) => post(Object.assign({ type: "openThemeCustom" }, opts || {})),
-    crosshairPick: (mode) => post({ type: "crosshairPick", mode: String(mode || "coordinates") }),
+    crosshairPick: (mode, opts) => post(Object.assign(
+      { type: "crosshairPick", mode: String(mode || "coordinates") }, opts || {})),
+  // ★ 窗口 Agents：把客户端窗口（豆包客户端 / Cursor / 终端…）登记成模型。
+  //   绑定入口在设置页「AI 助手」→「窗口 Agents」，用**准星拖拽**指窗口（与窗口模式同一套准星）。
+  windowAgentList: () => post({ type: "windowAgentList" }),
+  windowAgentBind: (payload) => post(Object.assign({ type: "windowAgentBind" }, payload || {})),
     browsePath: (executableOnly) =>
       post({ type: "browsePath", executableOnly: executableOnly ? 1 : 0 }),
     installDriver: (kind, opts) =>

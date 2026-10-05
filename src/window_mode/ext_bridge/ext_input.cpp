@@ -258,7 +258,7 @@ bool ExtInputSession::RecoverAttach(std::wstring& err) {
         err = L"扩展 debugger 已脱落且无标题可重绑";
         return false;
     }
-    WindowModeLog(L"[窗口模式] 扩展 debugger 已脱落，正在重新 attach…");
+    WindowModeLog(L"[窗口/后台窗口模式] 扩展 debugger 已脱落，正在重新 attach…");
     return EnsureReady(titleHint_, boundTopHwnd_, err);
 }
 
@@ -282,7 +282,7 @@ bool ExtInputSession::CallCdp(const std::string& method, const std::string& para
             return CallCdp(method, paramsJson, err, false);
         }
         const std::wstring methodW(method.begin(), method.end());
-        WindowModeLogf(L"[窗口模式] 扩展 CDP 失败 %s: %s", methodW.c_str(), err.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展 CDP 失败 %s: %s", methodW.c_str(), err.c_str());
         return false;
     }
     if (!ResultLooksOk(result)) {
@@ -292,7 +292,7 @@ bool ExtInputSession::CallCdp(const std::string& method, const std::string& para
             return CallCdp(method, paramsJson, err, false);
         }
         const std::wstring methodW(method.begin(), method.end());
-        WindowModeLogf(L"[窗口模式] 扩展 CDP 失败 %s: %s", methodW.c_str(), err.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展 CDP 失败 %s: %s", methodW.c_str(), err.c_str());
         return false;
     }
     return true;
@@ -455,7 +455,7 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
         bool skipWin32Ref = true;
         // 脚本猫模型：永远禁止 Win32 PrintWindow 参考帧（会切屏）；只用标题戳记对页。
         WindowModeLog(
-            L"[窗口模式] 扩展 attach：跳过 Win32 PrintWindow 参考帧（宏桌面停放+扩展操作）");
+            L"[窗口/后台窗口模式] 扩展 attach：跳过 Win32 PrintWindow 参考帧（宏桌面停放+扩展操作）");
         (void)skipWin32Ref;
     }
 
@@ -473,7 +473,7 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
         }
         if (!bridge.IsExtensionConnected()) {
             if (round == 0) {
-                WindowModeLog(L"[窗口模式] 等待配套扩展连接本机桥…");
+                WindowModeLog(L"[窗口/后台窗口模式] 等待配套扩展连接本机桥…");
             }
             std::wstring waitErr;
             if (!bridge.WaitForExtension(2500, waitErr)) {
@@ -487,7 +487,7 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
             }
         }
 
-        WindowModeLogf(L"[窗口模式] 扩展桥 attach 标题提示: %s（已连接扩展 %d 路，第 %d 次）",
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展桥 attach 标题提示: %s（已连接扩展 %d 路，第 %d 次）",
             titleHint_.c_str(), bridge.ExtensionClientCount(), round + 1);
 
         std::vector<int> tabIds;
@@ -498,10 +498,10 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
             std::wstring listErr;
             if (bridge.Request("listPages", baseExtra, listResult, listErr, 4000)) {
                 tabIds = ParseJsonIntArray(listResult, "tabIds");
-                WindowModeLogf(L"[窗口模式] 扩展桥 listPages: %d 个标题候选",
+                WindowModeLogf(L"[窗口/后台窗口模式] 扩展桥 listPages: %d 个标题候选",
                     static_cast<int>(tabIds.size()));
             } else if (listErr.find(L"UNKNOWN") == std::wstring::npos) {
-                WindowModeLogf(L"[窗口模式] listPages 不可用: %s，回退标题 attach", listErr.c_str());
+                WindowModeLogf(L"[窗口/后台窗口模式] listPages 不可用: %s，回退标题 attach", listErr.c_str());
             }
         }
 
@@ -546,7 +546,7 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
                     err = L"已取消";
                     return false;
                 }
-                WindowModeLogf(L"[窗口模式] 扩展桥 attach 失败(tab=%d): %s", tabId, lastErr.c_str());
+                WindowModeLogf(L"[窗口/后台窗口模式] 扩展桥 attach 失败(tab=%d): %s", tabId, lastErr.c_str());
                 continue;
             }
 
@@ -613,16 +613,16 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
                     score = CorrelateWin32ToExtShot(refBmp, shot);
                     DeleteObject(shot);
                 } else {
-                    WindowModeLogf(L"[窗口模式] 候选 tab=%d 扩展截图失败: %s",
+                    WindowModeLogf(L"[窗口/后台窗口模式] 候选 tab=%d 扩展截图失败: %s",
                         tabId, shotErr.c_str());
                 }
             }
-            WindowModeLogf(L"[窗口模式] 候选 tab=%d 标题钉窗=%d stamped=%d 相似度=%.3f",
+            WindowModeLogf(L"[窗口/后台窗口模式] 候选 tab=%d 标题钉窗=%d stamped=%d 相似度=%.3f",
                 tabId, pinOk ? 1 : 0, stampedFlag ? 1 : 0, score);
 
             if (pinOk) {
                 if (refBmp) DeleteObject(refBmp);
-                WindowModeLogf(L"[窗口模式] 扩展桥选定 tab=%d（标题戳记命中绑定窗）", tabId);
+                WindowModeLogf(L"[窗口/后台窗口模式] 扩展桥选定 tab=%d（标题戳记命中绑定窗）", tabId);
                 return finishFromResult(result, tabId);
             }
 
@@ -642,9 +642,9 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
             if (refBmp) DeleteObject(refBmp);
             err = L"无法将扩展标签对应到绑定窗口（标题戳记未命中）。"
                   L"请确认目标游戏标签在绑定的 Edge 窗内，并关掉其它同名游戏窗后重试。";
-            WindowModeLog(L"[窗口模式] 扩展桥 attach 失败: 标题戳记未命中绑定 HWND");
+            WindowModeLog(L"[窗口/后台窗口模式] 扩展桥 attach 失败: 标题戳记未命中绑定 HWND");
             if (bestTabId > 0) {
-                WindowModeLogf(L"[窗口模式] 曾尝试最佳 tab=%d 相似度=%.3f（已拒绝）",
+                WindowModeLogf(L"[窗口/后台窗口模式] 曾尝试最佳 tab=%d 相似度=%.3f（已拒绝）",
                     bestTabId, bestScore);
             }
             return false;
@@ -662,7 +662,7 @@ bool ExtInputSession::EnsureReady(const std::wstring& titleHint, HWND boundTop,
 
     if (refBmp) DeleteObject(refBmp);
     err = lastErr.empty() ? L"NO_EXTENSION" : lastErr;
-    WindowModeLog(L"[窗口模式] 提示: 请重载扩展到 v1.1.4，打开选项页点「重新连接」。");
+    WindowModeLog(L"[窗口/后台窗口模式] 提示: 请重载扩展到 v1.1.4，打开选项页点「重新连接」。");
     return false;
 }
 
@@ -708,15 +708,15 @@ bool ExtInputSession::FinishAttachFromResult(const std::string& result, int tabI
     if (!attachedTitle.empty()) {
         const std::wstring titleW = Utf8SnippetToWide(attachedTitle);
         const std::wstring verW = ver.empty() ? L"?" : Utf8SnippetToWide(ver);
-        WindowModeLogf(L"[窗口模式] 扩展桥已 attach 标签: %s（扩展 v%s）",
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展桥已 attach 标签: %s（扩展 v%s）",
             titleW.c_str(), verW.c_str());
     } else {
-        WindowModeLog(L"[窗口模式] 扩展桥已连接（chrome.debugger）");
+        WindowModeLog(L"[窗口/后台窗口模式] 扩展桥已连接（chrome.debugger）");
     }
     {
         const std::string pickNote = extractStr("pickNote");
         if (!pickNote.empty()) {
-            WindowModeLogf(L"[窗口模式] 扩展桥选页: %s",
+            WindowModeLogf(L"[窗口/后台窗口模式] 扩展桥选页: %s",
                 Utf8SnippetToWide(pickNote).c_str());
         }
     }
@@ -730,12 +730,12 @@ bool ExtInputSession::FinishAttachFromResult(const std::string& result, int tabI
         const std::wstring viaW = Utf8SnippetToWide(via.empty() ? "?" : via);
         const std::wstring focusW = Utf8SnippetToWide(focus.empty() ? "?" : focus);
         const std::wstring urlW = Utf8SnippetToWide(url.substr(0, 160));
-        WindowModeLogf(L"[窗口模式] 扩展输入目标 via=%s focus=%s url=%s",
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展输入目标 via=%s focus=%s url=%s",
             viaW.c_str(), focusW.c_str(), urlW.c_str());
     }
     if (!note.empty()) {
         const std::wstring noteW = Utf8SnippetToWide(note.substr(0, 360));
-        WindowModeLogf(L"[窗口模式] 扩展 iframe 探测: %s", noteW.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展 iframe 探测: %s", noteW.c_str());
     }
     ApplyLayoutFields(
         extractNum("iframeCssX"), extractNum("iframeCssY"),
@@ -747,7 +747,7 @@ bool ExtInputSession::FinishAttachFromResult(const std::string& result, int tabI
         if (dpr > 0.1 && dpr < 8.0) dpr_ = dpr;
     }
     if (via == "tab") {
-        WindowModeLog(L"[窗口模式] 警告: 仍挂在壳页(tab)。跨域游戏 iframe 未挂上时角色通常无反应。"
+        WindowModeLog(L"[窗口/后台窗口模式] 警告: 仍挂在壳页(tab)。跨域游戏 iframe 未挂上时角色通常无反应。"
             L"请把上面「iframe 探测」整行发我。");
     }
     // 禁止 HoldPreferred：用户进「鼠标宏」不得被踢回。
@@ -791,7 +791,7 @@ bool ExtInputSession::RefreshLayout(std::wstring& err) {
         if (dpr > 0.1 && dpr < 8.0) dpr_ = dpr;
     }
     WindowModeLogf(
-        L"[窗口模式] 扩展布局 iframeCss=(%d,%d) %dx%d content=%dx%d pageCss=%dx%d surface=%dx%d scale≈%.3fx%.3f",
+        L"[窗口/后台窗口模式] 扩展布局 iframeCss=(%d,%d) %dx%d content=%dx%d pageCss=%dx%d surface=%dx%d scale≈%.3fx%.3f",
         iframeCssX_, iframeCssY_, iframeCssW_, iframeCssH_, contentW_, contentH_, pageCssW_, pageCssH_,
         surfaceW_, surfaceH_,
         (pageCssW_ > 0 && surfaceW_ > 0) ? (surfaceW_ / static_cast<double>(pageCssW_)) : 0.0,
@@ -877,7 +877,7 @@ bool ExtInputSession::CallMouse(const char* action, int cx, int cy, MouseButtonT
         if (allowReattach && IsDetachError(result, err) && RecoverAttach(err)) {
             return CallMouse(action, cx, cy, button, err, false);
         }
-        WindowModeLogf(L"[窗口模式] 扩展鼠标 %hs 失败 host=(%d,%d): %s",
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展鼠标 %hs 失败 host=(%d,%d): %s",
             action ? action : "?", cx, cy, err.c_str());
         return false;
     }
@@ -885,7 +885,7 @@ bool ExtInputSession::CallMouse(const char* action, int cx, int cy, MouseButtonT
     // 旧扩展无 mouse 命令时回退到逐条 CDP。
     const std::string errCode = ExtractJsonStringLocal(result, "error");
     if (errCode == "UNKNOWN") {
-        WindowModeLog(L"[窗口模式] 扩展无 mouse 命令，回退 CDP（请重载扩展到 v1.0.15）");
+        WindowModeLog(L"[窗口/后台窗口模式] 扩展无 mouse 命令，回退 CDP（请重载扩展到 v1.0.15）");
         if (std::strcmp(action, "move") == 0) {
             std::string params = "{\"type\":\"mouseMoved\",\"x\":";
             params += std::to_string(cx);
@@ -934,7 +934,7 @@ bool ExtInputSession::CallMouse(const char* action, int cx, int cy, MouseButtonT
         if (allowReattach && IsDetachError(result, err) && RecoverAttach(err)) {
             return CallMouse(action, cx, cy, button, err, false);
         }
-        WindowModeLogf(L"[窗口模式] 扩展鼠标 %hs 失败 host=(%d,%d): %s",
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展鼠标 %hs 失败 host=(%d,%d): %s",
             action ? action : "?", cx, cy, err.c_str());
         return false;
     }
@@ -971,7 +971,7 @@ bool ExtInputSession::CallMouse(const char* action, int cx, int cy, MouseButtonT
     const bool touchOk = result.find("\"touch\":true") != std::string::npos
         || result.find("\"touch\": true") != std::string::npos;
     WindowModeLogf(
-        L"[窗口模式] 扩展鼠标 %hs surface=(%d,%d) -> iframe=(%d,%d) scale=%.3fx%.3f touch=%d%s",
+        L"[窗口/后台窗口模式] 扩展鼠标 %hs surface=(%d,%d) -> iframe=(%d,%d) scale=%.3fx%.3f touch=%d%s",
         action ? action : "?", cx, cy, mappedX, mappedY, scaleX, scaleY,
         touchOk ? 1 : 0, domHint.c_str());
     err.clear();
@@ -1171,7 +1171,7 @@ bool ExtInputSession::CaptureScreenshot(HBITMAP* outBmp, int* outW, int* outH, s
                 err = L"已取消";
                 return false;
             }
-            WindowModeLogf(L"[窗口模式] 扩展视觉: 静帧/复用旧图 丢弃，重试截图 (%d/2)", attempt);
+            WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉: 静帧/复用旧图 丢弃，重试截图 (%d/2)", attempt);
             std::this_thread::sleep_for(std::chrono::milliseconds(80 * attempt));
             bridge.ClearLastShotJpeg();
             result.clear();
@@ -1200,29 +1200,29 @@ bool ExtInputSession::CaptureScreenshot(HBITMAP* outBmp, int* outW, int* outH, s
             const bool sameAsPrev = lastVisionJpegHash_ != 0 && hash == lastVisionJpegHash_;
             if ((isStatic || sameAsPrev) && attempt < 2) {
                 if (sameAsPrev && !isStatic) {
-                    WindowModeLog(L"[窗口模式] 扩展视觉: JPEG 与上次完全相同（假新帧）");
+                    WindowModeLog(L"[窗口/后台窗口模式] 扩展视觉: JPEG 与上次完全相同（假新帧）");
                 }
                 continue;
             }
             if (isStatic || sameAsPrev) {
-                WindowModeLog(L"[窗口模式] 扩展视觉: 仍为静帧/旧图（屏外可能冻 WebGL）；匹配可能不准");
+                WindowModeLog(L"[窗口/后台窗口模式] 扩展视觉: 仍为静帧/旧图（屏外可能冻 WebGL）；匹配可能不准");
             }
             if (!decodeJpegBytesToBmp(jpeg)) {
                 return false;
             }
             lastVisionJpegHash_ = hash;
-            WindowModeLogf(L"[窗口模式] 扩展视觉截图成功 via=%s (HTTP)",
+            WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉截图成功 via=%s (HTTP)",
                 via.empty() ? L"cdp:http" : std::wstring(via.begin(), via.end()).c_str());
             const std::string visionPath = ExtractJsonStringLocal(result, "visionPath");
             if (!visionPath.empty()) {
-                WindowModeLogf(L"[窗口模式] 扩展视觉路径=%s",
+                WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉路径=%s",
                     Utf8SnippetToWide(visionPath).c_str());
             }
             if (via.find("pageclip") != std::string::npos) {
                 const std::string mirrorErr = ExtractJsonStringLocal(result, "mirrorErr");
-                WindowModeLog(L"[窗口模式] ★回归：热路径出现 pageclip（1.1.33+ 应为 mirror-only）");
+                WindowModeLog(L"[窗口/后台窗口模式] ★回归：热路径出现 pageclip（1.1.33+ 应为 mirror-only）");
                 if (!mirrorErr.empty()) {
-                    WindowModeLogf(L"[窗口模式] 扩展视觉 mirror 未用（已回退 pageclip，可能闪白）: %s",
+                    WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉 mirror 未用（已回退 pageclip，可能闪白）: %s",
                         Utf8SnippetToWide(mirrorErr).c_str());
                 }
             }
@@ -1234,14 +1234,14 @@ bool ExtInputSession::CaptureScreenshot(HBITMAP* outBmp, int* outW, int* outH, s
             continue;
         }
         if (isStatic) {
-            WindowModeLog(L"[窗口模式] 扩展视觉: 仍为静帧（最小化冻 WebGL）；匹配可能不准");
+            WindowModeLog(L"[窗口/后台窗口模式] 扩展视觉: 仍为静帧（最小化冻 WebGL）；匹配可能不准");
         }
         if (decodeB64ToBmp(ExtractJsonStringLocal(result, "data"))) {
             if (!via.empty()) {
-                WindowModeLogf(L"[窗口模式] 扩展视觉截图成功 via=%s",
+                WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉截图成功 via=%s",
                     std::wstring(via.begin(), via.end()).c_str());
             } else {
-                WindowModeLog(L"[窗口模式] 扩展视觉截图成功");
+                WindowModeLog(L"[窗口/后台窗口模式] 扩展视觉截图成功");
             }
             return true;
         }
@@ -1254,11 +1254,11 @@ bool ExtInputSession::CaptureScreenshot(HBITMAP* outBmp, int* outW, int* outH, s
         err = detail.empty()
             ? L"扩展视觉截图不可用"
             : (L"扩展视觉截图不可用: " + Utf8SnippetToWide(detail));
-        WindowModeLogf(L"[窗口模式] %s", err.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] %s", err.c_str());
         return false;
     }
     if (!reqErr.empty()) {
-        WindowModeLogf(L"[窗口模式] 扩展视觉截图失败: %s", reqErr.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉截图失败: %s", reqErr.c_str());
     }
     err = reqErr.empty() ? L"扩展截图失败" : reqErr;
     return false;
@@ -1391,11 +1391,11 @@ int dx = 0, dy = 0, dw = clientW, dh = clientH;
             dy = 0;
         }
         WindowModeLogf(
-            L"[窗口模式] 扩展截图合成: canvas=%dx%d → client=%dx%d iframe@(%d,%d) %dx%d (pageCss=%dx%d s=%.3f)",
+            L"[窗口/后台窗口模式] 扩展截图合成: canvas=%dx%d → client=%dx%d iframe@(%d,%d) %dx%d (pageCss=%dx%d s=%.3f)",
             sw, sh, clientW, clientH, dx, dy, dw, dh, pageCssW_, pageCssH_, s);
     } else {
         WindowModeLogf(
-            L"[窗口模式] 扩展截图合成: 无 iframe 布局，canvas %dx%d 拉伸铺满客户区 %dx%d",
+            L"[窗口/后台窗口模式] 扩展截图合成: 无 iframe 布局，canvas %dx%d 拉伸铺满客户区 %dx%d",
             sw, sh, clientW, clientH);
     }
 
@@ -1450,7 +1450,7 @@ bool ExtInputSession::CaptureScreenshotForVisionMatch(int clientW, int clientH,
         if (outH) *outH = sh;
         if (outCanvasSpace) *outCanvasSpace = true;
         err.clear();
-        WindowModeLogf(L"[窗口模式] 扩展视觉: canvas/HTTP 空间 %dx%d via=%s",
+        WindowModeLogf(L"[窗口/后台窗口模式] 扩展视觉: canvas/HTTP 空间 %dx%d via=%s",
             sw, sh,
             lastShotVia_.empty() ? L"?" : std::wstring(lastShotVia_.begin(), lastShotVia_.end()).c_str());
         return true;

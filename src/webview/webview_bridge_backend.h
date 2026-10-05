@@ -77,6 +77,9 @@ std::string JsonLoadScriptEditor(const std::wstring& path, bool isNew);
 std::string JsonPeekScriptActions(const std::wstring& path);
 /// 脚本库详情「动作预览」：ActionName 列表（不含完整动作 JSON）。
 std::string JsonPreviewScriptActions(const std::wstring& path, int maxNames);
+/// 编辑器变量下拉的清单：从消息里的 `actions` 数组算（**规则只在 C++ 一份**，
+/// 见 macro_variables.h 的 QuickInputVarItemsJson）。返回 JSON 数组文本；失败返回空并填 err。
+std::string JsonEditorVarItems(const std::string& msgJson, std::string& err);
 bool SaveEditorFromJson(const std::string& msgJson, std::string& outPathUtf8, std::string& err);
 /// 解析编辑器调试请求：actions / startIndex / mode(step|run) / breakpoints / 调试热键
 bool ParseDebugScriptJson(const std::string& msgJson, std::vector<ScriptAction>& actions,
@@ -88,8 +91,24 @@ bool RenameScriptFile(const std::string& pathUtf8, const std::string& newNameUtf
     std::string& outNewPathUtf8, std::string& err);
 bool ImportScriptFile(bool toRecordings, std::wstring& outPath, std::string& err);
 /// ZIP 导出时 skipped 为跳过的缺失图片数；skippedFilesJson 为 UTF-8 路径 JSON 数组（可空）。
+/// missingRefsJson：解析不到的**嵌套脚本引用**（RunMacro/MousePlayback 的 targetPath /
+/// blockName）JSON 数组（可空）。这些引用会被打包跳过，必须提示用户，否则对方导入后
+/// 嵌套动作会静默失败。
 bool ExportScriptFile(const std::string& pathUtf8, std::string& err,
-    int* outSkipped = nullptr, std::string* outSkippedFilesJson = nullptr);
+    int* outSkipped = nullptr, std::string* outSkippedFilesJson = nullptr,
+    std::string* outMissingRefsJson = nullptr);
+/// 导出前体检：返回 JSON（动作数 / 找图 / OCR / AI / 窗口模式 / 子脚本 / 缺失引用 /
+/// 模板与各组件体积），供导出对话框展示与估算体积。失败返回空串并填 err。
+std::string ScanScriptForExportJson(const std::string& pathUtf8, std::string& err);
+
+/// 导出为**独立 EXE**：复制播放器模板 + 追加脚本包 payload（见 script_package.h）。
+/// outPathUtf8 为空时弹保存框。bundled* 由用户在导出对话框里选：
+///   true  = 组件打进 exe（目标电脑没装软件也能跑）
+///   false = 用目标电脑上已装软件的组件（体积小、行为完全一致）
+bool ExportScriptAsExe(const std::string& pathUtf8, const std::string& outPathUtf8,
+    bool bundledOpenCv, bool bundledOcr, bool bundledFakeFocus,
+    std::string& err, std::string* outInfoJson = nullptr);
+
 bool SetScriptHotkeyJson(const std::string& pathUtf8, const std::string& hotkeyTextUtf8,
     UINT vk, UINT modifiers, bool hold, std::string& err);
 bool SetRecorderInputMode(int mode, std::string& err);

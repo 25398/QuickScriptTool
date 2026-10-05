@@ -2,9 +2,21 @@
 #include "background_input_target.h"
 #include "window_target.h"
 #include "cdp/cdp_input.h"
+#include "mouse_wheel_events.h"
 
 #include <algorithm>
 #include <cctype>
+
+// ★ 滚轮单格增量：`mouse_wheel_events.h` 为了不依赖 windows.h 自带了一份常量，
+//   这里把它与系统真值钉在一起 —— 两边一旦不一致，滚轮会**静默**滚错格数。
+static_assert(windowmode::kWheelNotchDelta == WHEEL_DELTA,
+    "mouse_wheel_events.h 的 kWheelNotchDelta 必须等于系统的 WHEEL_DELTA");
+
+// ★ 单条滚轮事件的增量必须装得进 `wParam` 高位的 `SHORT`（±32767）。
+//   这条断言就是 2026-09-30 那次"滚动不能正常滚动"的根因防线：
+//   当年是 `WHEEL_DELTA * steps` 直接截断成 short，steps 稍大就回绕成反向。
+static_assert(windowmode::kMaxWheelNotchesPerEvent * windowmode::kWheelNotchDelta <= 32767,
+    "单条滚轮消息的增量溢出 SHORT：请下调 kMaxWheelNotchesPerEvent");
 
 namespace windowmode {
 
@@ -441,6 +453,33 @@ bool LooksLikeGameWindowClass(const std::wstring& className) {
     return false;
 }
 
+bool LooksLikeUwpShellWindowClass(const std::wstring& className) {
+    if (className.empty()) return false;
+    const std::wstring lower = ToLowerCopy(className);
+    // 顶层 UWP 壳窗口。
+    if (lower == L"applicationframewindow") return true;
+    // ⚠ UWP 的**内容窗**（CoreWindow）：用户也可能把目标绑到它
+    //   （日志里的 `后台输入子窗 kind=renderSurface class=Windows.UI.Core.CoreWindow`）
+    //   ⇒ 只判顶层类名会漏掉这条绑定方式，护栏就失效了。
+    if (lower == L"windows.ui.core.corewindow") return true;
+    // ⚠⚠ **与 `background_uia_input.cpp` 的 `ClassLooksLikeUiaHost` 是两套判据，
+    //    刻意不合并** —— 语义不同：
+    //      · `ClassLooksLikeUiaHost` 回答「**该不该走 UIA 输入**」⇒ 范围更宽
+    //        （还含 `WinUIDesktopWin32WindowClass` / `InputSite` /
+    //         `DesktopChildSiteBridge` / `Xaml_WindowedPopup`）；
+    //      · 本函数回答「**是不是 UWP 壳进程**」⇒ 只用于**禁止注入**（已知会崩）。
+    //    若拿前者当「禁止注入」判据会**过宽**（把 WinUI 也挡掉，而那些目标未必有问题）。
+    //    ⇒ 改任何一处前先想清楚改的是哪个语义。
+    return false;
+}
+
+bool LooksLikeUwpShellExecutable(const std::wstring& exePath) {
+    if (exePath.empty()) return false;
+    const size_t slash = exePath.find_last_of(L"\\/");
+    const std::wstring name = (slash == std::wstring::npos) ? exePath : exePath.substr(slash + 1);
+    return ToLowerCopy(name) == L"applicationframehost.exe";
+}
+
 bool LooksLikeKernelAntiCheatToken(const std::wstring& text) {
     if (text.empty()) return false;
     const std::wstring lower = ToLowerCopy(text);
@@ -708,7 +747,9 @@ bool UsesFakeFocusForTarget(const WindowModeScriptConfig& config, HWND hwnd) {
         GetClassNameW(hwnd, cls, 256);
         if (LooksLikeRemoteDesktopWindowClass(cls)) return false;
     }
-    if (UsesFakeFocus(config)) return true;
+    // ⚠ 传 hwnd：配置类名为空时（拖拽拾取）必须回头读已绑定窗口的类名，
+    // 否则 GLFW30 / SDL_APP 这类「只在窗口上」的游戏类会被漏掉（后台模式拿不到假焦点）。
+    if (UsesFakeFocus(config, hwnd)) return true;
     if (AndroidEmulatorPrefersFakeFocus(hwnd, &config)) return true;
     // 绑定时 config.exe 可能为空：按直播 HWND 识别 QQ/Discord 等 Chromium 壳，或微信 4.x。
     if (HwndLooksLikeChromiumShell(hwnd)) return true;
@@ -741,7 +782,6 @@ bool GameTargetNeedsHardwareWithoutFakeFocus(const WindowModeScriptConfig& confi
     }
     return UsesFakeFocusForTarget(config, hwnd);
 }
-
 bool UsesFakeFocusOrAndroidQt(const WindowModeScriptConfig& config, HWND hwnd) {
     if (UsesFakeFocus(config)) return true;
     if (hwnd && AndroidEmulatorPrefersFakeFocus(hwnd, &config)) return true;
@@ -802,7 +842,7 @@ const wchar_t* HealthToDisplayText(WindowModeHealth health) {
 
 const wchar_t* HealthToUserHint(WindowModeHealth health) {
     switch (health) {
-    case WindowModeHealth::Ok: return L"窗口模式就绪";
+    case WindowModeHealth::Ok: return L"窗口/后台窗口模式就绪";
     case WindowModeHealth::Unknown: return L"状态未知";
     case WindowModeHealth::DesktopNotReady: return L"无法创建或打开「鼠标宏」虚拟桌面";
     case WindowModeHealth::TargetNotFound: return L"请在「鼠标宏」虚拟桌面启动目标程序，或绑定当前窗口";

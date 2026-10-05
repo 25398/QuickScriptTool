@@ -24,7 +24,7 @@ const TechniqueInfo kTechniques[] = {
     { L"threadhijack", L"挂起线程 + SetThreadContext 执行 LoadLibraryW 桩，随后恢复原上下文" },
     { L"manualmap", L"手动映射 PE（不经 LoadLibrary，模块列表不可见；入口经远程线程调用）" },
     { L"manualmapxor", L"XOR 加密载荷文件，内存解密后手动映射（对抗静态文件扫描）" },
-    { L"setwindowshook", L"SetWindowsHookEx(WH_GETMESSAGE) 窗口消息钩子注入（窗口模式经典路径）" },
+    { L"setwindowshook", L"SetWindowsHookEx(WH_GETMESSAGE) 窗口消息钩子注入（窗口/后台窗口模式经典路径）" },
     { L"manualmaphijack", L"复合：手动映射 + 线程劫持入口（不新建线程，模块列表不可见）" },
     { L"manualmaphijackxor", L"复合：XOR 载荷 + 手动映射 + 线程劫持入口（最隐蔽组合）" },
     { L"imagemap", L"SEC_IMAGE 映像节映射（MEM_IMAGE，内存扫描看起来像正常加载的镜像）" },
@@ -56,6 +56,10 @@ const wchar_t* TechniqueDescription(Technique t) {
 
 int TechniqueCount() {
     return static_cast<int>(sizeof(kTechniques) / sizeof(kTechniques[0]));
+}
+
+bool IsLoadLibraryBasedTechnique(Technique t) {
+    return IsLoadLibraryBased(t);
 }
 
 bool ParseTechnique(const std::wstring& name, Technique& out) {
@@ -195,7 +199,8 @@ bool InjectDll(DWORD pid, const std::wstring& dllPath, Technique tech,
             break;
         case Technique::SetWindowsHook:
             ok = InjectSetWindowsHook(process, pid, dllPath, opts,
-                                      remoteModule, techErr);
+                                      remoteModule, out.hookModule, out.hookHandle,
+                                      techErr);
             break;
         default:
             techErr = L"未实现的技术";

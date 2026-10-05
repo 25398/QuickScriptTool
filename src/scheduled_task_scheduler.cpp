@@ -218,8 +218,15 @@ void ScheduledTaskScheduler::TickAt(const SYSTEMTIME& now) {
             if (!due) continue;
             if (task.frequency != ScheduledFrequency::Interval) {
                 const std::wstring key = FireKey(task, now);
-                if (lastFireKey_[task.id] == key) continue;
+                // 去重键**同时**比内存 map 与任务里的落盘副本。
+                // 落盘那份跨进程有效：强杀后重开不会再触发同一时刻
+                // （用户实测「卡死强杀后重开又自动开始回放」）。
+                if (lastFireKey_[task.id] == key || task.lastFireKey == key) continue;
                 lastFireKey_[task.id] = key;
+                if (task.lastFireKey != key) {
+                    task.lastFireKey = key;
+                    needSave = true;
+                }
             }
             if (!task.filePath.empty()) pathsToRun.push_back(task.filePath);
             if (task.frequency == ScheduledFrequency::Custom) {

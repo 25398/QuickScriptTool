@@ -4,6 +4,7 @@
 
 #include "match_overlay.h"
 #include "drawing.h"
+#include "overlay_input_guard.h"
 #include "ui_scale.h"
 
 #include <algorithm>
@@ -234,10 +235,21 @@ MatchOverlay::ActionResult MatchOverlay::Show(
     SetFocus(hwnd_);
     PostMessageW(hwnd_, WM_USER + 1, 0, 0);
 
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0) {
-        if (bRet == -1) break;
+    // ★★ 兜底（overlay_input_guard.h）：本窗口是**全屏 WS_EX_TOPMOST + SetCapture**，
+    //   取消时还会把自己挪到 (-10000,-10000) 等抬起。那个「抬起」一旦丢了（远控注入丢事件
+    //   是最常见来源），裸 GetMessage 会永久阻塞 ⇒ 一个看不见的顶置窗口永远扣着用户的
+    //   鼠标捕获 ⇒「看得见屏幕、点不动」。本地还能按 Esc，**远控下几乎没有别的入口**。
+    MSG msg{};
+    for (;;) {
+        if (!overlay_guard::WaitMessageWithTimeout(msg, overlay_guard::kGuardTickMs)) {
+            if (overlay_guard::ShouldAbortStuckCaptureNow(hwnd_)) {
+                cancelled_ = true;
+                ReleaseCapture();
+                break;
+            }
+            continue;
+        }
+        if (msg.message == WM_QUIT) break;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }

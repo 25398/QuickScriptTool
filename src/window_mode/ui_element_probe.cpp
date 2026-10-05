@@ -32,19 +32,12 @@ std::wstring BstrToWide(BSTR bstr) {
 }
 
 std::wstring ControlTypeLabel(CONTROLTYPEID id) {
-    switch (id) {
-        case UIA_ButtonControlTypeId: return L"按钮";
-        case UIA_EditControlTypeId: return L"输入框";
-        case UIA_ComboBoxControlTypeId: return L"下拉框";
-        case UIA_CheckBoxControlTypeId: return L"复选框";
-        case UIA_RadioButtonControlTypeId: return L"单选框";
-        case UIA_HyperlinkControlTypeId: return L"链接";
-        case UIA_ListItemControlTypeId: return L"列表项";
-        case UIA_MenuItemControlTypeId: return L"菜单项";
-        case UIA_TabItemControlTypeId: return L"标签页";
-        case UIA_TextControlTypeId: return L"文本";
-        default: return L"";
+    int n = 0;
+    const UiControlTypeRow* rows = UiControlTypeTable(&n);
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].controlTypeId == static_cast<int>(id)) return rows[i].label;
     }
+    return L"";
 }
 
 bool LooksLikeSubmitName(const std::wstring& name) {
@@ -205,6 +198,72 @@ std::wstring FormatForegroundDialogProbe() {
     return out;
 }
 
+/// 该元素是不是「窗口自身标题栏上的按钮」（关闭/最小化/最大化）。
+///
+/// 判据（不靠按钮名字，名字是本地化的、且和应用内按钮完全重名）：
+/// 沿父链上溯，只要祖先里出现 **TitleBar** 控件类型，或**直接**挂在一个
+/// ControlType=Window 的元素下（UIA 里窗口自己的按钮就是标题栏的直接子节点，
+/// 而应用自己画的「关闭」按钮在内容树里，父链上是 Pane/Group 之类）——
+/// 就认定为窗口自身按钮。
+///
+/// ⚠ 这条守卫是真实事故换来的：模型想关游戏内的卡牌面板，UIA 命中窗口自己的
+///   「关闭」按钮（`关闭 [按钮 id=3] InvokePattern`），一击把整个游戏窗口关掉。
+/// ★★ shell 图标宿主类名判据（纯函数；实现放在这里，声明在头文件，供自检逐格断言）。
+/// 只看结构不看名字：`SHELLDLL_DefView` 是 Windows 外壳视图的宿主 —— 桌面图标
+/// （Progman/WorkerW 下）与资源管理器文件列表（CabinetWClass 下）的项父链上都经过它，
+/// 而别的应用里的普通 ListView 不会经过。
+bool ClassNameIsShellIconHost(const wchar_t* className) {
+    if (!className || !*className) return false;
+    return _wcsicmp(className, L"SHELLDLL_DefView") == 0;
+}
+
+/// 元素（或祖先，≤8 层）落在 shell 视图里 ⇒ 该目标的"打开"= **双击**。
+/// ⚠ 为什么必须结构判据：UIA 对桌面图标/文件项给的是 ListItem + InvokePattern，
+///   而 shell 的 Invoke **只做选中**（实测：回执说"已触发"，浏览器却没起来，
+///   见 2026-09-29 用户日志与 `UiControlInfo::shellIconItem` 的说明）。
+bool IsShellIconItem(IUIAutomationElement* el) {
+    if (!el) return false;
+    ComPtr<IUIAutomation> uia = CreateAutomation();
+    if (!uia) return false;
+    ComPtr<IUIAutomationTreeWalker> walker;
+    if (FAILED(uia->get_ControlViewWalker(&walker)) || !walker) return false;
+    ComPtr<IUIAutomationElement> cur = el;
+    for (int depth = 0; depth < 8 && cur; ++depth) {
+        BSTR cls = nullptr;
+        if (SUCCEEDED(cur->get_CurrentClassName(&cls)) && cls) {
+            const bool hit = ClassNameIsShellIconHost(cls);
+            SysFreeString(cls);
+            if (hit) return true;
+        }
+        ComPtr<IUIAutomationElement> parent;
+        if (FAILED(walker->GetParentElement(cur.Get(), &parent)) || !parent) return false;
+        cur = parent;
+    }
+    return false;
+}
+
+bool IsWindowChromeButton(IUIAutomationElement* el) {
+    if (!el) return false;
+    ComPtr<IUIAutomation> uia = CreateAutomation();
+    if (!uia) return false;
+    ComPtr<IUIAutomationTreeWalker> walker;
+    // 用 ControlViewWalker：与枚举时的 IsControlElement 过滤口径一致
+    if (FAILED(uia->get_ControlViewWalker(&walker)) || !walker) return false;
+
+    ComPtr<IUIAutomationElement> cur = el;
+    for (int depth = 0; depth < 4 && cur; ++depth) {
+        ComPtr<IUIAutomationElement> parent;
+        if (FAILED(walker->GetParentElement(cur.Get(), &parent)) || !parent) return false;
+        CONTROLTYPEID ptype = 0;
+        if (FAILED(parent->get_CurrentControlType(&ptype))) return false;
+        if (ptype == UIA_TitleBarControlTypeId) return true;
+        // 直接挂在窗口元素下 = 非客户区按钮（有的窗口标题栏没有独立 TitleBar 元素）
+        if (ptype == UIA_WindowControlTypeId) return depth == 0;
+        cur = parent;
+    }
+    return false;
+}
+
 UiElementState ProbeUiElementAtPoint(int screenX, int screenY) {
     UiElementState state;
     ComPtr<IUIAutomation> uia = CreateAutomation();
@@ -229,6 +288,9 @@ UiElementState ProbeUiElementAtPoint(int screenX, int screenY) {
     state.offscreen = offscreen != FALSE;
     state.name = BstrToWide(nameBstr);
     state.controlType = ControlTypeLabel(ctype);
+    // 该点是否落在**窗口自身**的标题栏按钮上（名字和应用内按钮完全重名，必须靠父链判）
+    state.titleBarControl = IsWindowChromeButton(el.Get());
+    state.shellIconItem = IsShellIconItem(el.Get());
     return state;
 }
 
@@ -276,22 +338,31 @@ bool FindDisabledSubmitButtonInForeground(std::wstring& disabledName) {
 namespace {
 
 bool IsInteractiveControlType(CONTROLTYPEID id) {
-    switch (id) {
-        case UIA_ButtonControlTypeId:
-        case UIA_EditControlTypeId:
-        case UIA_ComboBoxControlTypeId:
-        case UIA_CheckBoxControlTypeId:
-        case UIA_RadioButtonControlTypeId:
-        case UIA_HyperlinkControlTypeId:
-        case UIA_ListItemControlTypeId:
-        case UIA_MenuItemControlTypeId:
-        case UIA_TabItemControlTypeId:
-        case UIA_TreeItemControlTypeId:
-        case UIA_SplitButtonControlTypeId:
-            return true;
-        default:
-            return false;
+    int n = 0;
+    const UiControlTypeRow* rows = UiControlTypeTable(&n);
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].controlTypeId == static_cast<int>(id)) return true;
     }
+    return false;
+}
+
+/// 这几类**必须**额外通过「可聚焦」闸才收（理由见 `UiControlTypeTable` 里那几行的注释）。
+bool NeedsFocusableGate(CONTROLTYPEID id) {
+    int n = 0;
+    const UiControlTypeRow* rows = UiControlTypeTable(&n);
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].controlTypeId == static_cast<int>(id)) return rows[i].needsFocusable;
+    }
+    return false;
+}
+
+/// 数值 → 简短可读串（%g 语义：去掉无意义的尾零，超出精度自动转科学计数）。
+/// 为什么要它：滑块/进度的量级跨得很远（音量 0~100、缩放 0~500、视频进度 0~1e7），
+/// 用固定小数位打印必然要么全是 `0.000000` 要么拖出一串长数字把模型带偏。
+std::wstring FormatNumShort(double v) {
+    wchar_t buf[40]{};
+    swprintf_s(buf, L"%.4g", v);
+    return buf;
 }
 
 std::wstring LowerCopyLocal(std::wstring s) {
@@ -312,9 +383,75 @@ std::wstring TrimCopy(const std::wstring& s) {
     return s.substr(b, e - b);
 }
 
+/// 窗口自身的控制按钮名字（各地语言都要覆盖：UIA 给的是本地化字符串）。
+/// ⚠ 只在**已经确认元素属于标题栏**时才用名字做二次判定，绝不单凭名字拦点击 ——
+///   应用里的「关闭」按钮同样叫这个名字，靠名字拦会误伤正常操作。
+bool LooksLikeWindowControlName(const std::wstring& nameLower) {
+    static const wchar_t* kNames[] = {
+        L"关闭", L"最小化", L"最大化", L"还原", L"close", L"minimize", L"maximize", L"restore",
+    };
+    for (const wchar_t* n : kNames) {
+        if (nameLower == n) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
-std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd, int maxCount) {
+// ── 在册控件类型表：**单一事实来源**（角色 / 动作能力 / 是否需可聚焦闸）────────
+// 为什么要一张表而不是三处 switch：类型清单、中文角色、动作动词、可聚焦闸
+// 是三份必须同步的事实，分散写必然漂移（加一类只改了两处 ⇒ 那一类静默半残）。
+// ⚠ 自检遍历的就是这张表本身（`UiControlTypeTable`），不另抄常量。
+const UiControlTypeRow* UiControlTypeTable(int* outCount) {
+    static const UiControlTypeRow kRows[] = {
+        // 触发类：动作是「点」。
+        { UIA_ButtonControlTypeId,      L"按钮",       L"click",  false },
+        { UIA_SplitButtonControlTypeId, L"拆分按钮",   L"click",  false },
+        { UIA_HyperlinkControlTypeId,   L"链接",       L"click",  false },
+        { UIA_HeaderItemControlTypeId,  L"列头",       L"click",  false },
+        { UIA_MenuBarControlTypeId,     L"菜单栏",     L"click",  false },
+        { UIA_TabControlTypeId,         L"标签栏",     L"click",  false },
+        // 文本类：能力是「填值」，点它只是为了聚焦。
+        { UIA_EditControlTypeId,        L"输入框",     L"fill",   false },
+        { UIA_DocumentControlTypeId,    L"文档区",     L"click",  true  },
+        // 开关类：能力是「切换」（点两次等于没做，而模型看不出来）。
+        { UIA_CheckBoxControlTypeId,    L"复选框",     L"toggle", false },
+        // 选择类：从一个集合里选一个。
+        { UIA_ComboBoxControlTypeId,    L"下拉框",     L"select", false },
+        { UIA_RadioButtonControlTypeId, L"单选框",     L"select", false },
+        { UIA_ListItemControlTypeId,    L"列表项",     L"select", false },
+        { UIA_TreeItemControlTypeId,    L"树节点",     L"select", false },
+        { UIA_DataItemControlTypeId,    L"数据项",     L"select", false },
+        { UIA_MenuItemControlTypeId,    L"菜单项",     L"select", false },
+        { UIA_TabItemControlTypeId,     L"标签页",     L"select", false },
+        // 连续量：给的是「值」不是「点」。
+        { UIA_SliderControlTypeId,      L"滑块",       L"slide",  false },
+        { UIA_SpinnerControlTypeId,     L"数值调节",   L"slide",  false },
+        { UIA_ScrollBarControlTypeId,   L"滚动条",     L"scroll", false },
+        // ⚠ 容器类：**只有可聚焦**才收。它们是「能打字的地方」（编辑器正文/画布），
+        //   但绝大多数同名同类的容器只是布局壳子 —— 全收进来会把条数预算挤满、
+        //   把真按钮挤出清单（这比漏收更糟）。needsFocusable=true 即这道闸。
+        { UIA_GroupControlTypeId,       L"分组",       L"focus",  true  },
+        { UIA_CustomControlTypeId,      L"自定义控件", L"focus",  true  },
+    };
+    if (outCount) *outCount = static_cast<int>(sizeof(kRows) / sizeof(kRows[0]));
+    return kRows;
+}
+
+// ── 控件类型 → 动作能力动词（纯函数，自检可直接逐格断言）──────────────────
+const wchar_t* UiActionVerbForControl(int controlTypeId) {
+    int n = 0;
+    const UiControlTypeRow* rows = UiControlTypeTable(&n);
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].controlTypeId == controlTypeId) return rows[i].action;
+    }
+    // ⚠ 不在册的类型**不返回 click**：点一个说不清是什么的东西会打错目标。
+    //   「可聚焦」是任何可交互控件的共同下限，不构成误导性的能力承诺。
+    return L"focus";
+}
+
+std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd, int maxCount,
+    int* offscreenSkipped) {
     std::vector<UiControlInfo> out;
     if (!hwnd) hwnd = GetForegroundWindow();
     if (!hwnd || !IsWindow(hwnd)) return out;
@@ -384,12 +521,32 @@ std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd, int maxCount) {
 
             BOOL offscreen = FALSE;
             el->get_CurrentIsOffscreen(&offscreen);
-            if (offscreen) continue;
+            if (offscreen) {
+                // ★ 丢掉是对的（offscreen 条目没有可信坐标，点了会打到别处），但**必须计数**：
+                //   滚动列表（历史记录/书签/文件列表）里没进视口的条目走的都是这条，
+                //   以前静默丢弃 ⇒ 模型看到「47 条」以为就这么多，于是转去 zoom 读像素。
+                //   把「还有 N 条在视口外」带回去，模型就知道该先 scrollWheel。
+                if (offscreenSkipped) ++*offscreenSkipped;
+                continue;
+            }
+
+            // ★可聚焦：读键盘可聚焦性（读失败按「不可聚焦」处理 —— 只有下面那几类
+            //   容器/文档控件依赖它做闸，读失败时宁可漏收，也不要把布局壳子灌进清单）。
+            BOOL focusable = FALSE;
+            const bool gotFocusable =
+                SUCCEEDED(el->get_CurrentIsKeyboardFocusable(&focusable));
+            const bool isFocusable = gotFocusable && focusable != FALSE;
+            // 文档区/分组/自定义控件**只有可聚焦**才算可交互（见 IsInteractiveControlType 末段）。
+            if (NeedsFocusableGate(ctype) && !isFocusable) continue;
 
             BSTR nameBstr = nullptr;
             el->get_CurrentName(&nameBstr);
             std::wstring name = TrimCopy(BstrToWide(nameBstr));
-            if (name.empty() || name.size() > 80) continue;
+            if (name.empty()) continue;
+            // ★ 超长名字**截断保留**，不是整条丢弃 —— 以前 `name.size() > 80` 直接 continue，
+            //   结果恰恰把「浏览器历史记录」这种长标题条目全滤掉了（那些正是模型要的）。
+            //   截断后仍保留前缀，足以辨认与匹配；真要全名可用 automationId / 滚动后重列。
+            if (name.size() > 80) name = name.substr(0, 79) + L"…";
 
             RECT rc{};
             if (FAILED(el->get_CurrentBoundingRectangle(&rc))) continue;
@@ -411,11 +568,24 @@ std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd, int maxCount) {
             info.name = std::move(name);
             info.controlType = ControlTypeLabel(ctype);
             info.controlTypeId = static_cast<int>(ctype);
+            info.action = UiActionVerbForControl(static_cast<int>(ctype));
             info.rect = rc;
+            // ★窗口自身的标题栏按钮（关/最小化/最大化）：仍然列出来（模型有知情权），
+            //   但**按名字选中它时会被拒** —— 它的名字和应用内按钮完全重名，
+            //   实测就是这样把整个游戏窗口关掉的。见 UiControlInfo::titleBarControl。
+            info.titleBarControl = IsWindowChromeButton(el.Get());
+        // ★ 桌面/资源管理器图标：shell 的 Invoke 只"选中"，"打开"要双击（见头文件说明）
+        info.shellIconItem = IsShellIconItem(el.Get());
             BOOL enabled = TRUE;
             if (SUCCEEDED(el->get_CurrentIsEnabled(&enabled))) info.enabled = enabled != FALSE;
             BSTR aid = nullptr;
             if (SUCCEEDED(el->get_CurrentAutomationId(&aid))) info.automationId = BstrToWide(aid);
+            // ★可聚焦：读键盘可聚焦性（失败按「不可聚焦」处理 —— 位置在下面按类型分流）。
+            info.focusable = isFocusable;
+            // ★★密码框：**必须在读 ValuePattern 之前**定下来 —— 它的值一律不回传
+            //   （UIA 在部分应用里会把密码明文交出来，照抄就进了 API 请求）。
+            BOOL isPwd = FALSE;
+            if (SUCCEEDED(el->get_CurrentIsPassword(&isPwd))) info.password = isPwd != FALSE;
             // 能力位：能不能直接 Invoke / 直接填值
             ComPtr<IUnknown> pat;
             if (SUCCEEDED(el->GetCurrentPattern(UIA_InvokePatternId, &pat)) && pat)
@@ -423,6 +593,85 @@ std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd, int maxCount) {
             pat.Reset();
             if (SUCCEEDED(el->GetCurrentPattern(UIA_ValuePatternId, &pat)) && pat)
                 info.valuePattern = true;
+            // ★★可读状态事实（见 UiControlInfo::state 的理由）：这些都是**画面上读不出来
+            //   或很容易读错**的东西，而它们恰恰决定下一步该不该动手、动哪一步。
+            pat.Reset();
+            ComPtr<IUIAutomationValuePattern> vp;
+            const bool hasVp = SUCCEEDED(el->GetCurrentPatternAs(UIA_ValuePatternId,
+                IID_PPV_ARGS(&vp))) && vp;
+            if (hasVp) {
+                BOOL ro = FALSE;
+                if (SUCCEEDED(vp->get_CurrentIsReadOnly(&ro)) && ro) info.state.push_back(L"readonly");
+                BSTR val = nullptr;
+                if (SUCCEEDED(vp->get_CurrentValue(&val))) {
+                    std::wstring v = TrimCopy(BstrToWide(val));
+                    // ⚠⚠ 密码框的值**绝不能回传**：UIA 在部分应用里会把明文给出来
+                    //    （不是所有都返回圆点）—— 那等于把用户的密码写进 API 请求。
+                    //    这一类只报「它是密码框」这个事实，值一个字都不给。
+                    if (info.password) {
+                        info.state.push_back(L"password(值不回传)");
+                    } else if (!v.empty()) {
+                        if (v.size() > 60) v = v.substr(0, 59) + L"…";
+                        info.state.push_back(L"value:\"" + v + L"\"");
+                    }
+                }
+            }
+            pat.Reset();
+            ComPtr<IUIAutomationRangeValuePattern> rvp;
+            if (SUCCEEDED(el->GetCurrentPatternAs(UIA_RangeValuePatternId,
+                    IID_PPV_ARGS(&rvp))) && rvp) {
+                double v = 0.0, lo = 0.0, hi = 0.0;
+                const bool okV = SUCCEEDED(rvp->get_CurrentValue(&v));
+                const bool okLo = SUCCEEDED(rvp->get_CurrentMinimum(&lo));
+                const bool okHi = SUCCEEDED(rvp->get_CurrentMaximum(&hi));
+                // 数量级差异极大（音量 0~100 / 缩放 0~500 / 视频进度 0~1e7）⇒ 用 %g 打印，
+                // 避免出现 `range:0-10000000` 这种把模型带偏的长数字串。
+                if (okV) info.state.push_back(L"value:" + FormatNumShort(v));
+                if (okLo && okHi) {
+                    info.state.push_back(L"range:" + FormatNumShort(lo) + L"-"
+                        + FormatNumShort(hi));
+                }
+            }
+            pat.Reset();
+            ComPtr<IUIAutomationTogglePattern> tp;
+            if (SUCCEEDED(el->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&tp)))
+                && tp) {
+                ToggleState ts = ToggleState_Indeterminate;
+                if (SUCCEEDED(tp->get_CurrentToggleState(&ts))) {
+                    info.state.push_back(ts == ToggleState_On ? L"toggle:on"
+                        : (ts == ToggleState_Off ? L"toggle:off" : L"toggle:indeterminate"));
+                }
+            }
+            pat.Reset();
+            ComPtr<IUIAutomationExpandCollapsePattern> ecp;
+            if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ExpandCollapsePatternId,
+                    IID_PPV_ARGS(&ecp))) && ecp) {
+                ExpandCollapseState es = ExpandCollapseState_Collapsed;
+                if (SUCCEEDED(ecp->get_CurrentExpandCollapseState(&es))) {
+                    if (es == ExpandCollapseState_Expanded) info.state.push_back(L"state:expanded");
+                    else if (es == ExpandCollapseState_Collapsed) info.state.push_back(L"state:collapsed");
+                }
+            }
+            pat.Reset();
+            ComPtr<IUIAutomationScrollPattern> sp;
+            if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&sp)))
+                && sp) {
+                BOOL vScrollable = FALSE;
+                double vPct = 0.0;
+                if (SUCCEEDED(sp->get_CurrentVerticallyScrollable(&vScrollable)) && vScrollable
+                    && SUCCEEDED(sp->get_CurrentVerticalScrollPercent(&vPct))) {
+                    info.state.push_back(L"v:" + FormatNumShort(vPct) + L"%");
+                }
+            }
+            pat.Reset();
+            BOOL hasFocus = FALSE;
+            if (SUCCEEDED(el->get_CurrentHasKeyboardFocus(&hasFocus)) && hasFocus) {
+                info.state.push_back(L"focused");
+            }
+            if (info.password) {
+                // ⚠ 密码框只报「它是密码框」这个事实，值一个字都不给（见上面 ValuePattern 那段）。
+                info.state.push_back(L"password(值不回传)");
+            }
             out.push_back(std::move(info));
         }
     }
@@ -441,14 +690,28 @@ std::vector<UiControlInfo> ListInteractiveUiControls(HWND hwnd, int maxCount) {
 std::wstring FormatUiControlListForAgent(const std::vector<UiControlInfo>& items,
     size_t maxChars) {
     if (items.empty()) return {};
-    std::wstring out;
+    // 先按行渲染（每行独立成串），再做预算内的挑选 —— 这样截断时能报出**还剩多少条**。
+    std::vector<std::wstring> lines;
+    lines.reserve(items.size());
     for (const auto& it : items) {
         std::wstring line = L"[" + std::to_wstring(it.id) + L"] ";
         line += it.controlType.empty() ? L"控件" : it.controlType;
         line += L" \"" + it.name + L"\"";
+        // ★动作能力动词：回答「这个控件支持哪一类操作」（对齐 Windows-MCP 的 `[action: …]`）。
+        //   它是**事实**不是建议 —— 模型不必靠截图猜「这是按钮还是输入框」。
+        if (!it.action.empty()) line += L" action:" + it.action;
+        // 标题栏按钮必须一眼可辨，否则模型会把它当成应用里的同名按钮
+        if (it.titleBarControl) line += L"（窗口自身按钮·勿按名字点击）";
         if (!it.enabled) line += L"（灰）";
         if (it.valuePattern) line += L" [可填]";
         if (!it.invokable) line += L" [需点击]";
+        // ★可读状态事实（focused / value:… / range:… / toggle:… / state:… / v:…% / readonly）
+        //   —— 这些在画面上读不出来或很容易读错，正是「先点一下看看」的主要成因。
+        for (const auto& s : it.state) {
+            line += L" [";
+            line += s;
+            line += L"]";
+        }
         if (it.rect.right > it.rect.left && it.rect.bottom > it.rect.top) {
             line += L" @";
             line += std::to_wstring((it.rect.left + it.rect.right) / 2);
@@ -456,11 +719,35 @@ std::wstring FormatUiControlListForAgent(const std::vector<UiControlInfo>& items
             line += std::to_wstring((it.rect.top + it.rect.bottom) / 2);
         }
         line += L"\n";
-        if (out.size() + line.size() > maxChars) {
-            out += L"…(截断)\n";
-            break;
-        }
-        out += line;
+        lines.push_back(std::move(line));
+    }
+
+    std::wstring out;
+    size_t shown = 0;
+    for (; shown < lines.size(); ++shown) {
+        // ★ 截断提示本身要留出预算，否则「还剩 N 条」会被挤掉 —— 而那正是模型
+        //   决定要不要换个办法的关键信息（以前只回一句「…(截断)」，模型以为
+        //   列表就这么长，于是转去 zoom 读像素，白烧好几轮）。
+        const size_t reserve = 160;
+        if (out.size() + lines[shown].size() + reserve > maxChars) break;
+        out += lines[shown];
+    }
+
+    if (shown < lines.size()) {
+        const size_t hidden = lines.size() - shown;
+        const int firstHiddenId = items[shown].id;
+        const int lastId = items.back().id;
+        out += L"…(共 " + std::to_wstring(lines.size()) + L" 条，这里只列了前 "
+            + std::to_wstring(shown) + L" 条；还有 " + std::to_wstring(hidden)
+            + L" 条没显示，编号 " + std::to_wstring(firstHiddenId) + L"–"
+            + std::to_wstring(lastId) + L")\n";
+        out += L"★ 要全量请调大 maxCount 重列（上限 80）；"
+               L"或在已知准确名字时**直接** invokeUiControl(name=…) —— "
+               L"宿主按名字重新定位，不依赖这里列没列出来。\n";
+        // 列表型内容（历史记录/书签/文件列表/消息列表）常常滚不到底：
+        // 这时「名字」才是正路，别去 zoom 看截图（标题在界面上是被省略号截断的）。
+        out += L"★ 若上面多为列表项：先 scrollWheel 滚动再重列，或直接用已知的完整名字触发；"
+               L"**别靠截图读标题** —— 界面上标题是省略号截断的，UIA 名字才是完整的。\n";
     }
     return out;
 }
@@ -483,6 +770,11 @@ int PickUiControlByName(const std::vector<UiControlInfo>& items, const std::wstr
         const UiControlInfo& it = items[i];
         const std::wstring n = LowerCopyLocal(TrimCopy(it.name));
         if (n.empty()) continue;
+        // ★窗口自身的标题栏按钮（关闭/最小化/最大化）**永不参与按名字挑选**。
+        //   它的名字（「关闭」）和应用内按钮完全一样，评分上还因为可 Invoke 白拿 120 分
+        //   ——实测就是这样把游戏窗口关掉的（模型想关卡牌面板，结果关了游戏）。
+        //   窗口生命周期操作必须走明确意图的通道，不能靠「找个叫『关闭』的东西点一下」。
+        if (it.titleBarControl) continue;
         int tier = 0;
         if (n == target) tier = 4;
         else if (n.rfind(target, 0) == 0) tier = 3;
@@ -531,7 +823,8 @@ int PickUiControlByName(const std::vector<UiControlInfo>& items, const std::wstr
 
 bool InvokeUiControlByName(const std::wstring& name, int expectedId,
     std::wstring& outActualName, int& outActualId, RECT& outRect, bool& outInvoked,
-    std::wstring& outWarn) {
+    std::wstring& outWarn, bool* outShellIconItem) {
+    if (outShellIconItem) *outShellIconItem = false;
     outActualName.clear();
     outActualId = 0;
     outRect = RECT{};
@@ -539,6 +832,23 @@ bool InvokeUiControlByName(const std::wstring& name, int expectedId,
     outWarn.clear();
 
     const std::vector<UiControlInfo> items = ListInteractiveUiControls(nullptr, 60);
+    // ★先单独判「这个名字只命中窗口自身的标题栏按钮」——那是最危险的一类误点
+    //   （「关闭」一击关掉整个窗口）。给出可执行的解释，而不是笼统的「没找到」。
+    {
+        const std::wstring wantLower = LowerCopyLocal(TrimCopy(name));
+        for (const auto& it : items) {
+            if (it.titleBarControl && LowerCopyLocal(TrimCopy(it.name)) == wantLower) {
+                outActualName = it.name;
+                outActualId = it.id;
+                outWarn = L"「" + it.name + L"」是**窗口自身**的标题栏按钮（关/最小化/最大化），"
+                    L"不是当前应用里的按钮 —— 按名字点它会把整个窗口关掉"
+                    L"（实测把游戏窗口关没了、进度丢失）。"
+                    L"窗口操作请走明确通道（switchWindow 关窗/切窗）；"
+                    L"要关应用内的面板，请用更具体的名字或 locateAndClick 描述面板内的关闭控件。";
+                return false;
+            }
+        }
+    }
     bool ambiguous = false;
     const int idx = PickUiControlByName(items, name, &ambiguous);
     if (idx < 0) return false;
@@ -577,6 +887,9 @@ bool InvokeUiControlByName(const std::wstring& name, int expectedId,
     if (FAILED(condHr) || !cond) return false;
     ComPtr<IUIAutomationElement> el;
     if (FAILED(root->FindFirst(TreeScope_Descendants, cond.Get(), &el)) || !el) return false;
+    // ★ 先把「这是 shell 图标」告诉调用方：shell 的 Invoke **只做选中**，
+    //   用户语义里的"打开"必须**双击**（见 `UiControlInfo::shellIconItem` 的说明）。
+    if (outShellIconItem) *outShellIconItem = IsShellIconItem(el.Get());
     ComPtr<IUnknown> pat;
     if (SUCCEEDED(el->GetCurrentPattern(UIA_InvokePatternId, &pat)) && pat) {
         ComPtr<IUIAutomationInvokePattern> invoke;
@@ -585,6 +898,46 @@ bool InvokeUiControlByName(const std::wstring& name, int expectedId,
         }
     }
     return true;
+}
+
+NonClientPointInfo ProbeWindowNonClientAtPoint(HWND hwnd, int screenX, int screenY) {
+    NonClientPointInfo info;
+    HWND target = hwnd;
+    if (!target || !IsWindow(target)) {
+        target = GetForegroundWindow();
+        if (!target || !IsWindow(target)) return info;   // 判不了 ⇒ probed=false ⇒ 放行
+        target = GetAncestor(target, GA_ROOT);
+        if (!target || !IsWindow(target)) target = GetForegroundWindow();
+    }
+    if (!target || !GetWindowRect(target, &info.windowRect)) return info;
+    RECT cr{};
+    if (!GetClientRect(target, &cr)) return info;
+    POINT tl{ cr.left, cr.top };
+    POINT br{ cr.right, cr.bottom };
+    if (!ClientToScreen(target, &tl) || !ClientToScreen(target, &br)) return info;
+    info.clientRect = RECT{ tl.x, tl.y, br.x, br.y };
+    // 客户区退化（最小化 / 还没建好）→ 量不准，按「判不了」处理，**别拦**
+    if (info.clientRect.right <= info.clientRect.left
+        || info.clientRect.bottom <= info.clientRect.top) {
+        return info;
+    }
+    info.probed = true;
+    info.nonClient = IsPointInWindowNonClientStrip(
+        screenX, screenY, info.windowRect, info.clientRect);
+    if (info.nonClient) {
+        if (ComPtr<IUIAutomation> uia = CreateAutomation()) {
+            POINT pt{ screenX, screenY };
+            ComPtr<IUIAutomationElement> el;
+            if (SUCCEEDED(uia->ElementFromPoint(pt, &el)) && el) {
+                BSTR nm = nullptr;
+                if (SUCCEEDED(el->get_CurrentName(&nm)) && nm) {
+                    info.hint = nm;
+                    SysFreeString(nm);
+                }
+            }
+        }
+    }
+    return info;
 }
 
 bool IsScreenPointOnForegroundWindow(int screenX, int screenY) {

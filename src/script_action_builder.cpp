@@ -359,6 +359,21 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
 
     switch (type) {
     case ActionType::MoveMouse:
+        // ★★ **缺坐标不许默默当 (0,0)**（2026-09-30 实测事故：模型发了个没有 x/y 的
+        //   `mouseClick`，被默认成 (0,0) ⇒ 真去点了屏幕左上角/广告位，用户看到
+        //   "点到广告那里了"）。判据**判严不判松**：只要 `x`/`y` 键缺失就拒绝——
+        //   显式写 0 仍然允许（那是模型明确要点的位置）。
+        if (!p.contains("x") || !p.contains("y")) {
+            // 变量表达式驱动移动的写法（moveVarExprX/Y）不需要字面 x/y，放行。
+            const bool varDriven = !Trim(JsonWString(p, "moveVarExprX")).empty()
+                || !Trim(JsonWString(p, "moveVarExprY")).empty()
+                || JsonBool(p, "moveFromVar");
+            if (!varDriven) {
+                return Fail(L"moveMouse 缺少 x/y 坐标。请给**upload 截图像素**坐标"
+                            L"（与元素索引同一套），或用 locateAndClick(target=\"名字\") 让本机定位。"
+                            L"⚠ 不会替你猜 (0,0)。");
+            }
+        }
         action.moveFromVar = JsonBool(p, "moveFromVar");
         action.moveVarExprX = Trim(JsonWString(p, "moveVarExprX"));
         action.moveVarExprY = Trim(JsonWString(p, "moveVarExprY"));
@@ -397,6 +412,14 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
 
     case ActionType::MouseClick:
         action.button = ParseButton(p);
+        // ★★ 同 `moveMouse`：**缺坐标不许默默当 (0,0)**（2026-09-30 实测：
+        //   模型发了个没有 x/y 的 `mouseClick`，被默认成 (0,0) ⇒ 真去点了屏幕左上角，
+        //   用户看到"点到广告那里了"）。要按名字点就 `locateAndClick(target=…)`。
+        if (!p.contains("x") || !p.contains("y")) {
+            return Fail(L"mouseClick 缺少 x/y 坐标。请给**upload 截图像素**坐标"
+                        L"（元素索引/文字索引里的那套），或用 locateAndClick(target=\"名字\")、"
+                        L"locateAndClick(elementId=N)。⚠ 不会替你猜 (0,0)。");
+        }
         action.x = JsonInt(p, "x");
         action.y = JsonInt(p, "y");
         ApplyModifierFields(action, p);
@@ -404,6 +427,21 @@ ScriptActionBuildResult BuildTypedAction(ActionType type, const json& p) {
         break;
 
     case ActionType::MouseDrag:
+        // ★★ 同 `mouseClick`/`moveMouse`：**缺坐标不许默默当 (0,0)**（2026-10-01 实测：
+        //   模型发了个没有 endX/endY 的拖拽 ⇒ 被默认成 (0,0)→(0,0)，等于"在原地拖"，
+        //   日志里出现 `鼠标拖拽左键 (0,0)→(0,0)` —— 与当初 mouseClick 那个坑一模一样。
+        //   ⚠ 图像定位式拖拽（带 findImage/locate 字段）不走 x/y，放行。
+        {
+            const bool imageDriven = p.contains("findImage") || p.contains("locateTarget")
+                || p.contains("template") || p.contains("imagePath");
+            if (!imageDriven
+                && (!p.contains("x") || !p.contains("y")
+                    || !p.contains("endX") || !p.contains("endY"))) {
+                return Fail(L"mouseDrag 需要起点与终点坐标：x/y（起点）+ endX/endY（终点），"
+                            L"都用**upload 截图像素**（与元素索引同一套）。"
+                            L"⚠ 不会替你猜 (0,0)。");
+            }
+        }
         action.button = ParseButton(p);
         action.x = JsonInt(p, "x");
         action.y = JsonInt(p, "y");
@@ -1276,6 +1314,8 @@ watchImage:     imagePath, matchThreshold, searchFullScreen, searchX1~Y2, imageS
                 children[]=命中监视图后执行（主流程跳过本容器；子树里若执行了跳转则以跳转为准）
 varCompute:     computeCode（类 C：赋值/if/for/while；行末分号可省略；局部变量默认销毁；return a,b 导出脚本变量）
                 字符串用 "+" 或 '+'（裸写 + 是加法）；split(s, "/")、parts[0]、parts.count；toInt/toString/trim
+                replace(s,"a","b")、numbers(s)（抠数字数组；解析 OCR 文本优先用它，全角括号下 split 拆不开）
+                比较注意类型：split 出来的是字符串，a[0] <= 60 是字典序比较；要数值比较用 numbers()/toInt()
                 ctrl:Clipboard() 为剪贴板文本或文件路径字符串（不是条件里的 0/1）
 runBlock:       blockName, clickCount, duration(重复间隔，仅 count>1), randomDuration
 if:             conditionExpr, children[]=成立时执行
@@ -1306,10 +1346,13 @@ findColor:      color/#RRGGBB, colorTolerance, searchFullScreen/searchX1~Y2,
                 offsetX/Y(点击/移动时相对色点), matchVarName,
                 imageLocate(1=先找图，再在命中图范围内找色；需 imagePath、matchThreshold、缩放、findTimeExpr)
 colorMatch:     x, y, color/#RRGGBB, colorTolerance, matchVarName, imageLocate(同 getColor)
-textRecognition: ocrResultMode(0文字/1查找), ocrFollowUp/followUp,
+textRecognition: ocrResultMode(0文字/1查找), ocrFollowUp/followUp(0点击 1移动 2保存结果),
                 matchVarName, ocrSearchText, ocrRegionByImage, ocrDigitsOnly, imageUseVar,
                 searchFullScreen, searchX1~Y2(绝对识别/找图区),
                 imageRegionX1~Y2(根据图片时模板内相对偏移), imagePath, offsetX/Y, findUntilFound
+                变量: mode=0 {name} 为识别文字；mode=1 {name} 为 0/1、
+                      {name}.matchData 为匹配度(0~100)、{name}.x/.y/.x1/.y1 为命中框坐标
+                      ★followUp=2 时：获取文字存**文字**，文字查找存**匹配度**
 
 ── 系统 ──
 runProgram:     shortcutPreset, targetPath, inputText
@@ -1439,6 +1482,17 @@ std::wstring SchemaTypeDetail(const std::wstring& typeName) {
 
 }  // namespace
 
+// ── Skill/section 清单：**单一来源** ────────────────────────────────────
+// 为什么单独抽出来（实测日志）：模型照 Skill 写 `lookupMacroAction(section=game)`，
+// 而兜底提示只列了 `agent, usage, composite, mouse, keyboard, flow, findImage,
+// ocr, system, ai, all` —— **没有 game / command / office**。模型于是只能靠猜，
+// 猜错就白烧一轮（日志里它连查两轮同一件事）。
+// 现在这份清单一处定义、两处使用（兜底提示 + lookupMacroAction 的工具描述与
+// 参数枚举），再加 section 就不会漏掉提示。
+const wchar_t* kMacroLookupSectionList =
+    L"agent, usage, composite, game, command, office, mouse, keyboard, flow, "
+    L"findImage, ocr, system, ai, all";
+
 std::wstring LookupMacroActionSchema(const std::wstring& typeOrSection) {
     const std::wstring q = ToLowerW(Trim(typeOrSection));
     if (q.empty() || q == L"catalog") return ScriptActionCatalog();
@@ -1513,7 +1567,7 @@ std::wstring LookupMacroActionSchema(const std::wstring& typeOrSection) {
 
     return L"[提示] 未找到「" + typeOrSection + L"」。\n"
         L"type 示例: keyClick, quickInput, findImage, wait\n"
-        L"section 示例: agent, usage, composite, mouse, keyboard, flow, findImage, ocr, system, ai, all\n\n"
+        L"section 示例: " + std::wstring(kMacroLookupSectionList) + L"\n\n"
         + ScriptActionCatalog();
 }
 

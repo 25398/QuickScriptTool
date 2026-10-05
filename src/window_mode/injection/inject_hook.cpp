@@ -41,8 +41,11 @@ DWORD FindUiThreadId(DWORD pid) {
 bool InjectSetWindowsHook(HANDLE process, DWORD pid,
                           const std::wstring& dllPath,
                           const InjectOptions& opts,
-                          HMODULE& outModule, std::wstring& err) {
+                          HMODULE& outModule, HMODULE& outHookModule,
+                          void*& outHookHandle, std::wstring& err) {
     outModule = nullptr;
+    outHookModule = nullptr;
+    outHookHandle = nullptr;
     if (opts.hookProcName.empty()) {
         err = L"SetWindowsHook 技术需要 hookProcName（DLL 导出的钩子过程名）";
         return false;
@@ -58,7 +61,11 @@ bool InjectSetWindowsHook(HANDLE process, DWORD pid,
     std::wstring baseName = detail::BaseNameOnly(dllPath);
     std::transform(baseName.begin(), baseName.end(), baseName.begin(), ::towlower);
     outModule = detail::FindRemoteModule(pid, baseName);
-    if (outModule) return true;
+    if (outModule) {
+        // 目标里已经有这个模块：本轮**不再装钩**（重复装钩 = 双重挂钩）。
+        // 也正因为没装钩，这里没有可归还的 HHOOK / 本地模块 —— 卸载走远程 FreeLibrary。
+        return true;
+    }
 
     DWORD threadId = opts.hookThreadId;
     if (threadId == 0 && opts.targetTop && IsWindow(opts.targetTop)) {
@@ -82,6 +89,8 @@ bool InjectSetWindowsHook(HANDLE process, DWORD pid,
         wchar_t wide[128]{};
         MultiByteToWideChar(CP_ACP, 0, opts.hookProcName.c_str(), -1, wide, 128);
         err = std::wstring(L"钩子 DLL 未导出: ") + wide;
+        // 旧实现这里直接 return ⇒ 本地模块引用永久 +1（本进程也就一直锁着这个文件）。
+        FreeLibrary(local);
         return false;
     }
 
@@ -89,6 +98,7 @@ bool InjectSetWindowsHook(HANDLE process, DWORD pid,
         reinterpret_cast<HOOKPROC>(proc), local, threadId);
     if (!hook) {
         err = L"SetWindowsHookEx 失败: " + detail::WinErrorText(GetLastError());
+        FreeLibrary(local);
         return false;
     }
 
@@ -115,10 +125,16 @@ bool InjectSetWindowsHook(HANDLE process, DWORD pid,
     } while (true);
     if (!found) {
         UnhookWindowsHookEx(hook);
+        FreeLibrary(local);
         err = L"SetWindowsHookEx 后目标进程未出现钩子 DLL（目标线程未处理消息？）";
         return false;
     }
     outModule = found;
+    // ⚠ 这两样必须交回调用方：HHOOK 决定「钩子还在不在」（钩在 ⇒ user32 钉住 DLL），
+    // 本地模块引用决定「我们进程自己锁不锁这个文件」。旧实现在这里丢掉句柄，
+    // 于是**永远拆不掉**这个钩：DLL 常驻目标进程 = 文件锁到目标退出/重启电脑。
+    outHookModule = local;
+    outHookHandle = hook;
     return true;
 }
 

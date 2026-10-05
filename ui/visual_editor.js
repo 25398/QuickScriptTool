@@ -59,6 +59,21 @@
   function state() {
     return A().state || {};
   }
+
+  /// 用户真的动过画布时通知宿主（宿主用它判断「有未保存的改动」）。
+  function notifyLayoutDirty() {
+    var api = A();
+    if (api && typeof api.markVisualLayoutDirty === "function") api.markVisualLayoutDirty();
+  }
+
+  /// 布局基线刷新：进入/离开可视化、重置画布时调用。
+  /// 此时若还没有未保存的画布改动，就让宿主把「当前布局」当成新基线，
+  /// 这样自动生成的布局不算改动；拖回原位 / 撤销回原样也能自动判定为「无改动」。
+  function refreshLayoutBaseline() {
+    var api = A();
+    if (api && typeof api.refreshVisualLayoutBaseline === "function")
+      api.refreshVisualLayoutBaseline();
+  }
   function actions() {
     return state().editorActions || [];
   }
@@ -184,8 +199,16 @@
   }
 
   function pushUndo() {
+    // 画布被真正改动（拖卡片 / 连线 / 增删节点 / 拖走线）—— 通知宿主登记「有未保存的画布改动」。
+    // 自动布局、缩放、滚动都不经过这里，所以「切到可视化」不会误报未保存。
+    notifyLayoutDirty();
     if (vis.holdUndo) return;
     if (typeof A().pushEditorHistory === "function") A().pushEditorHistory();
+  }
+
+  function markGraphTouched() {
+    vis.graphTouched = true;
+    notifyLayoutDirty();
   }
 
   function discardLastUndo() {
@@ -2260,7 +2283,7 @@
       return false;
     }
     pushUndo();
-    vis.graphTouched = true;
+    markGraphTouched();
     if (kind === "guard" || kind === "ifTrue") {
       vis.links = vis.links.filter(function (l) {
         return !(linkKey(l.from) === linkKey(from) && l.to === to && (l.kind || "seq") === kind);
@@ -2281,7 +2304,7 @@
     });
     if (next.length === vis.links.length) return;
     pushUndo();
-    vis.graphTouched = true;
+    markGraphTouched();
     vis.links = next;
     vis.selEdge = null;
     if (vis.wireRoutes) delete vis.wireRoutes[routeKey(edge)];
@@ -2368,7 +2391,7 @@
       else st.actionSel = map[st.actionSel];
     }
     vis.selEdge = null;
-    vis.graphTouched = true;
+    markGraphTouched();
     vis.loopMarks = vis.loopMarks
       .filter(function (m) {
         return keep[m.loop] && keep[m.head] && keep[m.tail];
@@ -2729,7 +2752,7 @@
       try {
         dropUnreachable(actions());
         rebuildOrderFromLinks();
-        vis.graphTouched = true;
+        markGraphTouched();
         if (vis.mode) renderCanvas();
         finishOk();
       } catch (err) {
@@ -2820,7 +2843,7 @@
     if (!mark || !list[mark.loop] || list[mark.loop].type !== "loop") return false;
     var loop = mark.loop;
     if (!opts.skipUndo) pushUndo();
-    vis.graphTouched = true;
+    markGraphTouched();
     vis.links = vis.links.filter(function (l) {
       return !((l.kind || "seq") === "back" && l.from === mark.tail && l.to === mark.head);
     });
@@ -2925,7 +2948,7 @@
       return m.head !== head && m.loop !== loopIdx;
     });
     vis.loopMarks.push({ loop: loopIdx, head: head, tail: tail });
-    vis.graphTouched = true;
+    markGraphTouched();
     vis.links.forEach(function (l) {
       if (l.to === loopIdx) l.to = head;
       if (l.from === loopIdx) l.from = head;
@@ -3629,7 +3652,7 @@
       indent = 0;
     }
     if (!A().insertEditorAction(act, pos, indent)) return;
-    vis.graphTouched = true;
+    markGraphTouched();
     vis.linksReady = true;
     if (act.type !== "loop" && !isDeclContainerType(act.type)) {
       var old = outgoingSeq(i);
@@ -3685,7 +3708,7 @@
       fromStart = false;
     }
     if (!A().insertEditorAction(act, pos, indent)) return;
-    vis.graphTouched = true;
+    markGraphTouched();
     if (fromStart) {
       var old = outgoingSeq("start");
       removeOutgoingKind("start", "seq");
@@ -3728,7 +3751,7 @@
       indent = clampIndent(list[st.actionSel].indent | 0);
     }
     if (!A().insertEditorAction(copy, pos, indent)) return;
-    vis.graphTouched = true;
+    markGraphTouched();
     st.actionSel = Math.min(pos, actions().length - 1);
     if (typeof A().loadEditDraftFromSelection === "function") A().loadEditDraftFromSelection();
     if (typeof A().renderEditorActions === "function") A().renderEditorActions(actions());
@@ -3765,7 +3788,7 @@
       }
       if (typeof A().deleteSubtreeAt !== "function") return;
       A().deleteSubtreeAt(i);
-      vis.graphTouched = true;
+      markGraphTouched();
       if (typeof A().renderEditorActions === "function") A().renderEditorActions(actions());
       return;
     }
@@ -3775,7 +3798,7 @@
       if (elseI > i) A().deleteSubtreeAt(elseI);
     }
     A().deleteSubtreeAt(i);
-    vis.graphTouched = true;
+    markGraphTouched();
     pruneBrokenLoops();
     if (typeof A().renderEditorActions === "function") A().renderEditorActions(actions());
   }
@@ -3795,7 +3818,7 @@
       if (destIndex > n - len) destIndex = n - len;
       var insertIndex = destIndex < i ? destIndex : destIndex + len;
       if (!A().moveActionSubtree(i, insertIndex, clampIndent(actions()[i].indent | 0))) return;
-      vis.graphTouched = true;
+      markGraphTouched();
       state().actionSel = destIndex;
       if (typeof A().loadEditDraftFromSelection === "function") A().loadEditDraftFromSelection();
       if (typeof A().renderEditorActions === "function") A().renderEditorActions(actions());
@@ -4018,7 +4041,7 @@
       }
     }
     vis.linksReady = true;
-    vis.graphTouched = true;
+    markGraphTouched();
     vis.needAlign = true;
     var focus = containerIndex;
     if (a && a.type === "loop") {
@@ -4695,7 +4718,7 @@
       vis.drag.pts = dragWirePts(vis.drag.pts, vis.drag.seg, ww.x, ww.y);
       if (!vis.wireRoutes) vis.wireRoutes = {};
       vis.wireRoutes[vis.drag.key] = interiorCorners(vis.drag.pts);
-      vis.graphTouched = true;
+      markGraphTouched();
       maybeAutoPan(ev);
       renderEdgesOnly();
     }
@@ -4913,6 +4936,8 @@
     } else if (typeof A().renderEditorActions === "function") {
       A().renderEditorActions(actions());
     }
+    // 进入/离开可视化会自动生成布局或回到列表：这不是用户改动，刷新布局基线。
+    refreshLayoutBaseline();
   }
 
   function tryLeaveVisual() {
@@ -4983,6 +5008,7 @@
     vis.wireRoutes = {};
     vis._edgePts = {};
     syncChrome();
+    refreshLayoutBaseline();
   }
 
   function applyLayout(layout) {
@@ -5002,6 +5028,7 @@
     if (Array.isArray(layout.links)) {
       vis.links = normalizeLinks(layout.links);
       vis.linksReady = true;
+      // 从脚本载入布局：不是用户改动，不能标脏（也不能走 markGraphTouched）
       vis.graphTouched = true;
     } else {
       vis.linksReady = false;
@@ -5037,6 +5064,21 @@
   function collectLayoutIfAny() {
     if (!vis.mode && !hasAnyLayout(actions()) && !vis.linksReady) return undefined;
     return collectLayout();
+  }
+
+  /// 布局的「内容」部分（去掉 viewMode / zoom / scroll 这类纯视图状态）。
+  /// 宿主用它做「有没有真的改动」判定：缩放、滚动、自动布局都不算改动。
+  function collectLayoutCore() {
+    if (!vis.mode && !hasAnyLayout(actions()) && !vis.linksReady) return null;
+    var list = actions();
+    return {
+      start: { x: Math.round(vis.start.x), y: Math.round(vis.start.y) },
+      nodes: list.map(function (a) {
+        var p = cardPos(a);
+        return { x: Math.round(p.x), y: Math.round(p.y) };
+      }),
+      routes: vis.wireRoutes || {},
+    };
   }
 
   function onActionsChanged() {
@@ -5110,6 +5152,7 @@
     setClipboard: setClipboard,
     collectLayout: collectLayout,
     collectLayoutIfAny: collectLayoutIfAny,
+    collectLayoutCore: collectLayoutCore,
     applyLayout: applyLayout,
     applyOpenView: applyOpenView,
     selectAction: selectAction,

@@ -144,6 +144,10 @@ std::wstring AppFinishSoundFilePath() {
     return AppDir() + L"\\finish.wav";
 }
 
+std::wstring AppPauseSoundFilePath() {
+    return AppDir() + L"\\pause.wav";
+}
+
 bool IsPlayableWavFile(const std::wstring& path) {
     if (path.empty()) return false;
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -163,6 +167,47 @@ bool IsPlayableWavFile(const std::wstring& path) {
         && std::memcmp(hdr + 8, "WAVE", 4) == 0;
 }
 
+DWORD WavDurationMs(const std::wstring& path) {
+    if (path.empty()) return 0;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 44) {
+        CloseHandle(h);
+        return 0;
+    }
+    std::vector<unsigned char> buf(static_cast<size_t>(sz.QuadPart));
+    DWORD got = 0;
+    const BOOL read = ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr);
+    CloseHandle(h);
+    if (!read || got < 44) return 0;
+    if (std::memcmp(buf.data(), "RIFF", 4) != 0 || std::memcmp(buf.data() + 8, "WAVE", 4) != 0) {
+        return 0;
+    }
+
+    auto u32 = [&](size_t off) -> unsigned {
+        return static_cast<unsigned>(buf[off]) | (static_cast<unsigned>(buf[off + 1]) << 8)
+            | (static_cast<unsigned>(buf[off + 2]) << 16)
+            | (static_cast<unsigned>(buf[off + 3]) << 24);
+    };
+    unsigned byteRate = 0;
+    unsigned dataSize = 0;
+    size_t pos = 12;
+    while (pos + 8 <= static_cast<size_t>(got)) {
+        const unsigned chunkSize = u32(pos + 4);
+        if (std::memcmp(buf.data() + pos, "fmt ", 4) == 0 && pos + 16 <= static_cast<size_t>(got)) {
+            byteRate = u32(pos + 12);   // fmt 块里的 dwAvgBytesPerSec
+        } else if (std::memcmp(buf.data() + pos, "data", 4) == 0) {
+            dataSize = chunkSize;
+            break;
+        }
+        pos += 8 + chunkSize + (chunkSize & 1u);   // 块按偶数字节对齐
+    }
+    if (byteRate == 0 || dataSize == 0) return 0;
+    return static_cast<DWORD>((static_cast<unsigned long long>(dataSize) * 1000ull) / byteRate);
+}
+
 namespace {
 void PlayWavOrFallbackBeep(const std::wstring& path) {
     // SND_NODEFAULT：自定义文件失败时不要再播一遍系统音，由下面统一 MessageBeep。
@@ -180,6 +225,10 @@ void PlayAppStartupSound() {
 
 void PlayAppFinishSound() {
     PlayWavOrFallbackBeep(AppFinishSoundFilePath());
+}
+
+void PlayAppPauseSound() {
+    PlayWavOrFallbackBeep(AppPauseSoundFilePath());
 }
 
 std::wstring ExpandEnvironmentVars(const std::wstring& text) {
@@ -446,6 +495,77 @@ bool ResolveLibraryScriptPath(const std::wstring& pathOrName, std::wstring& outP
         if (FindScriptJsonByFileName(RecordingsDir(), name, outPath)) return true;
     }
     return false;
+}
+
+// ── 助手「动手」层临时任务脚本（详见 utils.h 的说明）────────────────────────────
+
+const wchar_t* kAgentTaskTempScriptPrefix() {
+    return L"_agent_task_";
+}
+
+bool IsAgentTaskTempFileName(const std::wstring& fileName) {
+    const std::wstring prefix = kAgentTaskTempScriptPrefix();
+    if (fileName.size() <= prefix.size() + 5) return false;          // 至少要有 "0_0_0"
+    if (_wcsnicmp(fileName.c_str(), prefix.c_str(), prefix.size()) != 0) return false;
+    const size_t n = fileName.size();
+    if (_wcsicmp(fileName.c_str() + (n - 5), L".json") != 0) return false;
+
+    // 中段必须是严格的 <pid>_<tick>_<n>：全数字 + 两个下划线。
+    // 宁可判严（漏过滤一个）也不要判松（把用户自己起的 `_agent_task_备注.json` 吞掉）。
+    const std::wstring body = fileName.substr(prefix.size(), n - prefix.size() - 5);
+    int groups = 0;
+    size_t i = 0;
+    while (i < body.size()) {
+        size_t j = i;
+        while (j < body.size() && body[j] >= L'0' && body[j] <= L'9') ++j;
+        if (j == i) return false;                                     // 出现非数字
+        ++groups;
+        i = j;
+        if (i < body.size()) {
+            if (body[i] != L'_') return false;                        // 组间只允许下划线
+            ++i;
+        }
+    }
+    return groups == 3;
+}
+
+int SweepStaleAgentTaskTempScripts(const std::wstring& scriptsDir,
+    std::vector<std::wstring>* removed) {
+    if (scriptsDir.empty()) return 0;
+    const std::wstring prefix = kAgentTaskTempScriptPrefix();
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = scriptsDir + L"\\*.json";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int deleted = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring name(fd.cFileName);
+        if (!IsAgentTaskTempFileName(name)) continue;
+
+        // 取出 pid：prefix 之后、第一个下划线之前。
+        const std::wstring body = name.substr(prefix.size());
+        const size_t us = body.find(L'_');
+        if (us == std::wstring::npos) continue;
+        unsigned long pid = 0;
+        try { pid = static_cast<unsigned long>(std::stoul(body.substr(0, us))); } catch (...) { continue; }
+        if (pid == 0) continue;
+
+        // ⚠ 创建它的进程还活着 ⇒ 可能正有另一个实例在跑任务，**绝不能删**。
+        //    （PID 复用理论上会漏删，但漏删只是残留，误删会打断正在跑的任务。）
+        if (pid == GetCurrentProcessId()) continue;
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+        if (hProc) { CloseHandle(hProc); continue; }
+
+        const std::wstring full = scriptsDir + L"\\" + name;
+        if (DeleteFileW(full.c_str())) {
+            ++deleted;
+            if (removed) removed->push_back(full);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return deleted;
 }
 
 std::wstring NormalizeLibraryPathKey(const std::wstring& path) {
@@ -1400,18 +1520,58 @@ static bool WriteAllBytes(HANDLE h, const void* data, size_t size) {
     return true;
 }
 
+/// 在缓冲区里找 EOCD（zip 结尾记录）。
+///
+/// ⚠⚠ 必须**优先采信「自洽」的那个**，而不是最先撞见的那个（2026-09-28 修）。
+///   原因：EOCD 签名 `50 4B 05 06` 只有 4 字节，而它**完全可能自然出现在条目数据里**
+///   —— 用户上传的模板图/截图就是任意二进制。旧实现从 searchStart 起**向前**扫描、
+///   撞见第一个签名就返回，一旦命中的是数据里的假签名，`centralDirOffset`/`totalEntries`
+///   全是垃圾 ⇒ 解包 0 个条目 ⇒ 用户看到的是「脚本数据解包失败（可能被杀毒软件拦截）」，
+///   而真因与杀软毫无关系（这条报错文案会把排查方向整个带偏）。
+///   网页在线导出（`website/export/`）会把用户图片原样放进 payload，这条路径第一次被真实暴露。
+///
+/// 「自洽」的判据（zip 规范给的恒等式，与具体实现无关）：
+///   centralDirOffset + centralDirSize == EOCD 的偏移，且 EOCD + comment 正好收尾。
 static bool FindEocdInBuffer(const std::vector<uint8_t>& buf, ZipEndOfCentralDir& eocd, uint32_t& eocdOffset) {
     if (buf.size() < sizeof(ZipEndOfCentralDir)) return false;
     const size_t searchStart = (buf.size() > 65557) ? (buf.size() - 65557) : 0;
+
+    auto selfConsistent = [&](size_t pos, const ZipEndOfCentralDir& e) -> bool {
+        const uint64_t cdEnd = static_cast<uint64_t>(e.centralDirOffset)
+            + static_cast<uint64_t>(e.centralDirSize);
+        if (cdEnd != static_cast<uint64_t>(pos)) return false;
+        const uint64_t fileEnd = static_cast<uint64_t>(pos)
+            + sizeof(ZipEndOfCentralDir) + static_cast<uint64_t>(e.commentLen);
+        return fileEnd == static_cast<uint64_t>(buf.size());
+    };
+
+    bool sawAny = false;
+    ZipEndOfCentralDir anyEocd{};
+    uint32_t anyOffset = 0;
     for (size_t pos = searchStart; pos + 4 <= buf.size(); ++pos) {
         uint32_t sig = 0;
         memcpy(&sig, buf.data() + pos, 4);
-        if (sig == 0x06054b50) {
-            if (pos + sizeof(ZipEndOfCentralDir) > buf.size()) return false;
-            memcpy(&eocd, buf.data() + pos, sizeof(eocd));
+        if (sig != 0x06054b50) continue;
+        // 旧实现在这里 return false（截断的假签名会中止整次搜索）；跳过更稳。
+        if (pos + sizeof(ZipEndOfCentralDir) > buf.size()) continue;
+        ZipEndOfCentralDir candidate{};
+        memcpy(&candidate, buf.data() + pos, sizeof(candidate));
+        if (selfConsistent(pos, candidate)) {
+            eocd = candidate;
             eocdOffset = static_cast<uint32_t>(pos);
             return true;
         }
+        if (!sawAny) {
+            sawAny = true;
+            anyEocd = candidate;
+            anyOffset = static_cast<uint32_t>(pos);
+        }
+    }
+    // 一个都不自洽（畸形包）→ 沿用旧行为返回第一个，让上层照原样报错，不改变既有语义。
+    if (sawAny) {
+        eocd = anyEocd;
+        eocdOffset = anyOffset;
+        return true;
     }
     return false;
 }
@@ -1513,6 +1673,39 @@ CreateZipResult CreateZipFile(const std::wstring& zipPath,
     return result;
 }
 
+/// 逐级创建目录（CreateDirectoryW 只建**最后一级**，父级不存在时整条失败）。
+/// 两处踩过同一个坑：解压带子目录的 zip 条目、播放器创建 %LOCALAPPDATA%\QstPlayer\rt\<hash>。
+bool EnsureDirectoryTree(const std::wstring& dir) {
+    if (dir.empty()) return false;
+    if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+
+    std::wstring acc;
+    size_t seg = 0;
+    while (seg < dir.size()) {
+        if (seg == 0 && dir.size() > 1 && dir[1] == L':') {  // 盘符前缀
+            acc = dir.substr(0, 2);
+            seg = 2;
+            continue;
+        }
+        if (dir[seg] == L'\\' && !acc.empty()) {
+            CreateDirectoryW(acc.c_str(), nullptr);
+        }
+        acc += dir[seg];
+        ++seg;
+    }
+    if (!acc.empty()) CreateDirectoryW(acc.c_str(), nullptr);
+    return GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+/// 逐级创建 fullPath 的父目录（CreateDirectoryW 不建中间层）。
+/// 解压带子目录的 zip 条目时必需 —— 否则 CreateFileW 直接失败，
+/// 条目会被静默丢弃（脚本包的 scripts\xxx.json 就是这么丢的）。
+static void EnsureParentDirectory(const std::wstring& fullPath) {
+    const auto slash = fullPath.find_last_of(L'\\');
+    if (slash == std::wstring::npos || slash == 0) return;
+    EnsureDirectoryTree(fullPath.substr(0, slash));
+}
+
 int ExtractZipFile(const std::wstring& zipPath, const std::wstring& destDir) {
     std::vector<uint8_t> buf;
     if (!ReadBinaryFileW(zipPath, buf)) return -1;
@@ -1531,8 +1724,15 @@ int ExtractZipFile(const std::wstring& zipPath, const std::wstring& destDir) {
             const std::string seg = name.substr(i, j - i);
             if (seg == "..") return false;
             if (seg == ".") { i = j; continue; }
-            if (!rel.empty()) rel += L"\\";
-            rel += std::wstring(seg.begin(), seg.end());
+            if (!rel.empty()) rel += L'\\';
+            // ⚠ 条目名是 **UTF-8 字节**（CreateZipFile 走 ArchiveNameUtf8 写出），
+            //   必须解码成宽字符。旧写法 `std::wstring(seg.begin(), seg.end())` 是
+            //   **逐字节加宽** —— 中文名会变成一串乱码宽字符，`CreateFileW` 于是生成一个
+            //   名字不对的文件，而按真名去找的一方（ResolveLibraryScriptPath /
+            //   ResolveImagePath / FindImagesDir）永远找不到它。
+            //   症状是"嵌套宏/模板图在包里明明有，运行时却说找不到"，且只在
+            //   **非 ASCII 名字**上复现（纯英文名一直是好的，所以长期没暴露）。
+            rel += FromUtf8(seg);
             i = j;
         }
         if (rel.empty()) return false;
@@ -1572,6 +1772,10 @@ int ExtractZipFile(const std::wstring& zipPath, const std::wstring& destDir) {
 
         std::wstring destPath;
         if (!safeJoin(destDir, archiveName, destPath)) continue;
+
+        // 条目可能带子目录（如脚本包的 scripts/xxx.json）。
+        // CreateFileW 不会建中间目录，缺了它整条条目会被静默丢弃 —— 必须自己建。
+        EnsureParentDirectory(destPath);
 
         if (cd.localHeaderOffset + sizeof(ZipLocalFileHeader) > buf.size()) continue;
         ZipLocalFileHeader lh{};

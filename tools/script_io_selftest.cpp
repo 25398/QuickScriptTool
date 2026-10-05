@@ -4,20 +4,255 @@
 // 总索引：.cursor/skills/module-selftest/SKILL.md
 //   MSBuild ... /t:ScriptIoSelfTest
 //   build\Release\ScriptIoSelfTest.exe --json
+//
+// 另带一个**性能基准**模式（不参与自检断言，纯诊断）：
+//   ScriptIoSelfTest.exe --bench <脚本.json> [--rounds N]
+// 用来量化「打开优化界面」在 C++ 侧的成本，并**验证快慢两条解析路径等价**
+// （逐条序列化后逐字节比较）。
+//
+// 2026-10-03 的结论（基线：5881 条 / 14.4MB 录制 `键鼠录制-1791021669.json`）：
+//   `LoadScriptFileData` 793.7ms → 359.5ms，省在两处**重复劳动**：
+//     ① 逐块再解析（223ms）→ 借用已解析 DOM 取字段（71ms）—— `ParseScriptActionBlockWithView`
+//     ② `ExtractNamedJsonObject("visualLayout")`（190.9ms，整份重解析，**该键压根不存在**）
+//        → `SubObjectFromParsedRoot`（≈0ms，只在已解析根上 find + dump 子树）
+//   ⇒ 本 bench 里 `ExtractNamedJsonObject(visualLayout)` 那一行**故意保留旧函数**，
+//      作为「不做 ② 会付多少」的对照；紧跟的 ★ 行是新路径的真实边际成本。
+// ⚠ 数字只对本机当前构建有意义，别把绝对值当跨机器结论（看**相对**降幅）。
 // =============================================================================
 #include "selftest_harness.h"
 
 #include "script_io.h"
 #include "image_match.h"
 #include "image_var_util.h"
+#include "json_util.h"
+#include "recorder_timeline.h"
 #include "utils.h"
+
+#include <vector>
 
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <string>
 
+#include <chrono>
+#include <algorithm>
+#include <cstdio>
+#include <sstream>
+
 namespace {
+
+// ── 性能基准（--bench <脚本路径>）─────────────────────────────────
+// 只测「打开优化界面」在 C++ 侧的固定成本：
+//   ① LoadScriptFileData(path, true)  —— 读文件 + 解析成 ScriptAction 数组
+//   ② 逐条 ScriptActionToJsonString    —— 旧 FormatOptimizeRecordingJson 的重序列化
+// 两者相加即「桥发出去之前」的全部 CPU 成本。传输/JS 侧另算（载荷大小已量化）。
+int RunBench(const wchar_t* path, int rounds) {
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::duration d) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(d).count() / 1000.0;
+    };
+    if (rounds < 1) rounds = 1;
+
+    std::printf("bench file: %ls\n", path);
+
+    double bestLoad = 1e18, bestSer = 1e18;
+    size_t nActions = 0, payloadW = 0;
+    for (int r = 0; r < rounds; ++r) {
+        auto t0 = Clock::now();
+        ScriptFileData data = LoadScriptFileData(path, true);
+        auto t1 = Clock::now();
+        std::wstringstream oss;
+        for (const auto& a : data.actions) oss << ScriptActionToJsonString(a);
+        auto t2 = Clock::now();
+        bestLoad = std::min(bestLoad, ms(t1 - t0));
+        bestSer = std::min(bestSer, ms(t2 - t1));
+        nActions = data.actions.size();
+        payloadW = oss.str().size();
+    }
+    std::printf("actions          : %zu\n", nActions);
+    std::printf("LoadScriptFileData: %.1f ms  (读文件+解析成动作数组)\n", bestLoad);
+    std::printf("reserialize all   : %.1f ms  (逐条 ScriptActionToJsonString)\n", bestSer);
+    std::printf("payload(wide)     : %.2f MB\n", payloadW * 2.0 / 1048576.0);
+    std::printf("total before send : %.1f ms\n", bestLoad + bestSer);
+
+    // ── 分段剖析：把 LoadScriptFileData 的每一步单独计时 ──────────────
+    double bRead = 1e18, bWhole = 1e18, bBlocks = 1e18, bPerBlock = 1e18, bDomPath = 1e18;
+    size_t nBlocks = 0;
+    std::wstring content;
+    size_t domMismatch = 0, domCompared = 0;
+    for (int r = 0; r < rounds; ++r) {
+        auto t0 = Clock::now();
+        content = ReadAll(path);
+        auto t1 = Clock::now();
+        qst::jsonutil::WideObjectView whole(content);
+        auto t2 = Clock::now();
+        std::vector<std::wstring> blocks = ExtractJsonActionBlocks(content);
+        auto t3 = Clock::now();
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            ScriptAction a = ParseScriptActionBlock(blocks[i], i, true);
+            if (a.type != ActionType::CustomText || !a.customText.empty()) {}
+        }
+        auto t4 = Clock::now();
+
+        // ── 快路径计时 + 等价性：借用已解析 DOM，逐动作取字段 ──────────
+        std::vector<const nlohmann::json*> dom;
+        const auto& root = whole.raw();
+        const auto it = root.find("actions");
+        if (whole.valid() && it != root.end() && it->is_array()) {
+            bool allObj = true;
+            for (const auto& e : *it) { if (!e.is_object()) { allObj = false; break; } }
+            if (allObj && it->size() == blocks.size()) {
+                for (const auto& e : *it) dom.push_back(&e);
+            }
+        }
+        auto t5 = Clock::now();
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (i < dom.size()) {
+                ScriptAction a = ParseScriptActionBlockWithView(
+                    blocks[i], qst::jsonutil::WideObjectView(*dom[i]), i, true);
+                if (a.type != ActionType::CustomText || !a.customText.empty()) {}
+            }
+        }
+        auto t6 = Clock::now();
+
+        // 等价性：两条路径的 ScriptAction 序列化后必须逐字节相同
+        if (r == 0 && dom.size() == blocks.size()) {
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                const std::wstring s1 =
+                    ScriptActionToJsonString(ParseScriptActionBlock(blocks[i], i, true));
+                const std::wstring s2 = ScriptActionToJsonString(
+                    ParseScriptActionBlockWithView(blocks[i],
+                        qst::jsonutil::WideObjectView(*dom[i]), i, true));
+                ++domCompared;
+                if (s1 != s2) {
+                    if (domMismatch < 3) {
+                        std::printf("  [MISMATCH] action #%zu\n", i);
+                        std::printf("    block : %.200ls\n", s1.c_str());
+                        std::printf("    dom   : %.200ls\n", s2.c_str());
+                    }
+                    ++domMismatch;
+                }
+            }
+        }
+
+        bRead = std::min(bRead, ms(t1 - t0));
+        bWhole = std::min(bWhole, ms(t2 - t1));
+        bBlocks = std::min(bBlocks, ms(t3 - t2));
+        bPerBlock = std::min(bPerBlock, ms(t4 - t3));
+        bDomPath = std::min(bDomPath, ms(t6 - t5));
+        nBlocks = blocks.size();
+    }
+    std::printf("\n-- 分段 --\n");
+    std::printf("  ReadAll            : %7.1f ms\n", bRead);
+    std::printf("  整文件 WideObjectView: %7.1f ms  (ToUtf8 + nlohmann 解析整个 14MB)\n", bWhole);
+    std::printf("  ExtractJsonActionBlocks: %7.1f ms  (%zu 块, 每块一次宽串拷贝)\n", bBlocks, nBlocks);
+    std::printf("  逐块 ParseScriptActionBlock: %7.1f ms  (旧路径: 每块 ToUtf8 + nlohmann 再解析)\n", bPerBlock);
+    std::printf("  ★ 借用 DOM 取字段: %7.1f ms  (新路径: 零解析, 只有字段查表)\n", bDomPath);
+    std::printf("  分段合计           : %7.1f ms\n", bRead + bWhole + bBlocks + bPerBlock);
+    std::printf("\n-- 等价性（新路径 vs 旧路径，序列化后逐字节比较）--\n");
+    std::printf("  比对 %zu 条, 不一致 %zu 条 %s\n", domCompared, domMismatch,
+        domMismatch == 0 ? "OK" : "★ 有差异！");
+
+    // ── 定位「动作解析之外」的开销：LoadScriptFileData 里那几个全文扫描 ──
+    // 逐个 best-of-N 计时。★ `ExtractNamedJsonObject(visualLayout)` 是**旧实现**，
+    // 用来对照「不做 `SubObjectFromParsedRoot` 要付多少」；紧跟的 ★ 行是**新实现**
+    // 在同一份已解析根上的真实边际成本。两行相减 = 这一处改动的净收益。
+    {
+        std::wstring c = ReadAll(path);
+        double tWhole = 1e18, tWm = 1e18, tVl = 1e18, tVlNew = 1e18;
+        double tHasCm = 1e18, tCm = 1e18, tDenorm = 1e18;
+        bool vlPresent = false;   // 该脚本里到底有没有 visualLayout（决定新路径是 0 还是「dump 子树」）
+        for (int r = 0; r < rounds; ++r) {
+            auto a0 = Clock::now();
+            qst::jsonutil::WideObjectView whole2(c);
+            auto a1 = Clock::now();
+            (void)whole2;
+            auto a2 = Clock::now();
+            (void)windowmode::ParseWindowModeJson(c);
+            auto a3 = Clock::now();
+            (void)ExtractNamedJsonObject(c, L"visualLayout");   // 旧：整份重解析
+            auto a4 = Clock::now();
+            // 新：根已解析 ⇒ 只 find + dump 子树（与 SubObjectFromParsedRoot 等价的工作量）
+            {
+                const auto& doc = whole2.raw();
+                if (doc.is_object()) {
+                    const auto it = doc.find("visualLayout");
+                    if (it != doc.end() && it->is_object()) {
+                        vlPresent = true;
+                        (void)it->dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                    }
+                }
+            }
+            auto a5 = Clock::now();
+            (void)HasCoordMetaJson(c);
+            auto a6 = Clock::now();
+            (void)ParseCoordMetaJson(c);
+            auto a7 = Clock::now();
+            tWhole = std::min(tWhole, ms(a1 - a0));
+            tWm = std::min(tWm, ms(a3 - a2));
+            tVl = std::min(tVl, ms(a4 - a3));
+            tVlNew = std::min(tVlNew, ms(a5 - a4));
+            tHasCm = std::min(tHasCm, ms(a6 - a5));
+            tCm = std::min(tCm, ms(a7 - a6));
+        }
+        {
+            ScriptFileData d = LoadScriptFileData(path, false);
+            for (int r = 0; r < rounds; ++r) {
+                std::vector<ScriptAction> cp = d.actions;
+                auto b0 = Clock::now();
+                DenormalizeScriptToCurrentScreen(cp);
+                auto b1 = Clock::now();
+                tDenorm = std::min(tDenorm, ms(b1 - b0));
+            }
+        }
+        std::printf("\n-- 动作解析之外的全文扫描（逐个 best-of-%d）--\n", rounds);
+        std::printf("  整文件 WideObjectView      : %7.1f ms\n", tWhole);
+        std::printf("  ParseWindowModeJson        : %7.1f ms\n", tWm);
+        std::printf("  ExtractNamedJsonObject(visualLayout): %7.1f ms  [旧: 整份重解析]\n", tVl);
+        std::printf("  ★ find+dump 已解析根       : %7.1f ms  [新: 边际成本] 省 %7.1f ms\n",
+            tVlNew, tVl - tVlNew);
+        std::printf("    (本脚本%s visualLayout ⇒ 新路径%s)\n",
+            vlPresent ? "有" : "**没有**",
+            vlPresent ? "需 dump 子树（随子树大小）" : "只是一次 find 未命中");
+        std::printf("  HasCoordMetaJson           : %7.1f ms\n", tHasCm);
+        std::printf("  ParseCoordMetaJson         : %7.1f ms\n", tCm);
+        std::printf("  DenormalizeScriptToCurrentScreen: %7.1f ms\n", tDenorm);
+        std::printf("  小计（新口径）             : %7.1f ms\n",
+            tWhole + tWm + tVlNew + tHasCm + tCm + tDenorm);
+        std::printf("  小计（旧口径）             : %7.1f ms\n",
+            tWhole + tWm + tVl + tHasCm + tCm + tDenorm);
+    }
+
+    // ── 端到端：桥发出去之前的**全部** C++ 成本 ────────────────────────
+    // 复刻 webview_bridge_backend.cpp 的 FormatOptimizeRecordingJson 每条动作做的事：
+    //   ScriptActionToJsonString(全字段) → find/rfind → substr → ToUtf8 → 拼接
+    // 这一步是「载荷多大、序列化多贵」的直接来源。
+    {
+        auto t0 = Clock::now();
+        ScriptFileData data = LoadScriptFileData(path, true);
+        auto t1 = Clock::now();
+        std::string payload;
+        payload.reserve(12u << 20);
+        payload += "{\"path\":\"p\",\"name\":\"n\",\"durationSeconds\":1,\"actions\":[";
+        for (const auto& a : data.actions) {
+            std::wstring aj = ScriptActionToJsonString(a);
+            const size_t start = aj.find(L'{');
+            const size_t end = aj.rfind(L'}');
+            if (start == std::wstring::npos || end == std::wstring::npos) continue;
+            payload += ToUtf8(aj.substr(start, end - start));
+            payload += ",\"name\":\"X\"}";
+        }
+        payload += "]}";
+        auto t2 = Clock::now();
+        std::printf("\n-- 端到端（桥发送前）--\n");
+        std::printf("  LoadScriptFileData      : %7.1f ms\n", ms(t1 - t0));
+        std::printf("  序列化+UTF8+拼装成载荷  : %7.1f ms\n", ms(t2 - t1));
+        std::printf("  合计（UI 线程被冻住的时长）: %7.1f ms\n", ms(t2 - t0));
+        std::printf("  载荷(UTF-8)             : %.2f MB\n", payload.size() / 1048576.0);
+    }
+    return 0;
+}
 
 using selftest::Emit;
 
@@ -56,6 +291,8 @@ const selftest::CaseInfo kCases[] = {
         L"ScriptActionToJsonString emits type wait"},
     {L"timing_us_roundtrip", L"default",
         L"Wait timingUs survives parse/write roundtrip"},
+    {L"sub_ms_timeline_survives_io", L"default",
+        L"125µs 间隔穿过 保存→读取→时间轴编译 后总时长仍精确（防毫秒取整）"},
     {L"mouse_playback_speed_roundtrip", L"default",
         L"mousePlayback playbackSpeed parse/write; missing=1; clamp 0.25~4"},
     {L"nested_use_mode_inherit_default", L"default",
@@ -113,7 +350,7 @@ const selftest::CaseInfo kCases[] = {
     {L"recording_recovers_wm_from_rel_actions", L"default",
         L"录制保存时仅凭 windowRelative 动作 + 窗口身份即可复活 enabled"},
     {L"script_default_mode_not_revived", L"default",
-        L"鼠标宏 scripts 路径 enabled=0 保存后再读不得复活为窗口模式"},
+        L"鼠标宏 scripts 路径 enabled=0 保存后再读不得复活为窗口/后台窗口模式"},
     {L"recording_wipes_editor_window_mode", L"default",
         L"普通录制仍强制关闭编辑器残留的非窗口相对 windowMode"},
     {L"save_after_load_false_keeps_xy", L"default",
@@ -339,6 +576,84 @@ void CaseTimingUsRoundtrip() {
         && json.find(L"\"timingUs\"") != std::wstring::npos;
     Emit(L"timing_us_roundtrip", ok,
         ok ? L"" : (L"json=" + json).c_str());
+}
+
+/// 亚毫秒间隔必须完整穿过「保存 → 读取 → 时间轴编译」。
+/// 8kHz 鼠标的相对移动包间隔只有 125µs：链上任何一环按毫秒取整，整段录制就被
+/// 拉长数倍，而且**逐条断言看不出来**（每条只差不到 1ms）。所以这里断言的是
+/// 「200 包 × 125µs 的**总时长**精确等于 25000µs」这种全局量。
+void CaseSubMsTimelineSurvivesIo() {
+    constexpr int kPackets = 200;
+    constexpr uint64_t kGapUs = 125;  // 8kHz 相对移动包间隔
+
+    const std::wstring path = TempScriptPath(L"io_subms");
+    ScriptFileData data{};
+    data.scriptName = L"sub-ms-timeline";
+    data.coordMeta = StandardScriptCoordMeta();
+    data.coordsNormalized = true;
+    data.recordingCaptureMode = 1;  // 相对采集
+    data.inputTimingVersion = 2;
+    for (int i = 0; i < kPackets; ++i) {
+        data.actions.push_back(MakeExplicitWaitUs(kGapUs));
+        ScriptAction mv{};
+        mv.type = ActionType::MoveMouseRelative;
+        mv.x = 3;
+        mv.y = -1;
+        mv.duration = 0.0;
+        mv.originalNo = i + 1;
+        data.actions.push_back(mv);
+    }
+
+    const bool saved = SaveScriptFileData(path, data);
+    ScriptFileData loaded = LoadScriptFileData(path, false);
+    const std::wstring text = ReadAll(path);
+    DeleteFileW(path.c_str());
+
+    // ① 文件里必须是整数微秒；出现「0.125」这种毫秒化写法即视为刻度被改
+    const bool fileKeepsUs = text.find(L"\"timingUs\": 125") != std::wstring::npos;
+
+    // ② 逐条：间隔与位移一字不差
+    bool actionsOk = saved && loaded.actions.size() == data.actions.size();
+    for (int i = 0; i < kPackets && actionsOk; ++i) {
+        const ScriptAction& w = loaded.actions[static_cast<size_t>(i) * 2];
+        const ScriptAction& m = loaded.actions[static_cast<size_t>(i) * 2 + 1];
+        actionsOk = w.type == ActionType::Wait && w.timingUs == kGapUs
+            && m.type == ActionType::MoveMouseRelative && m.x == 3 && m.y == -1;
+    }
+
+    // ③ 时间轴总长精确等于 包数×间隔（毫秒取整会让它整段偏移）
+    const auto timeline = CompileInputTimeline(loaded.actions);
+    const uint64_t expectTotal = kGapUs * kPackets;
+    const uint64_t gotTotal = timeline.empty() ? 0 : timeline.back().deadlineUs;
+    const bool timelineOk = !timeline.empty() && gotTotal == expectTotal;
+
+    // ④ 位移总量（回放保真判据的分子）不得因读写而变
+    const auto totals = SumRelativeMoves(loaded.actions);
+    const bool moveOk = totals.dx == 3LL * kPackets && totals.dy == -kPackets
+        && totals.packets == static_cast<size_t>(kPackets);
+
+    // ⑤ 退化路径：老文件只有 duration（timingUs=0）时，17 位精度也必须还原 125µs
+    std::vector<ScriptAction> legacy = loaded.actions;
+    for (auto& a : legacy) a.timingUs = 0;
+    const auto legacyTl = CompileInputTimeline(legacy);
+    const uint64_t legacyTotal = legacyTl.empty() ? 0 : legacyTl.back().deadlineUs;
+    const bool legacyOk = !legacyTl.empty() && legacyTotal == expectTotal;
+
+    const bool ok = fileKeepsUs && actionsOk && timelineOk && moveOk && legacyOk;
+    if (ok) {
+        Emit(L"sub_ms_timeline_survives_io", true, L"");
+        return;
+    }
+    wchar_t msg[320]{};
+    swprintf_s(msg,
+        L"file=%d actions=%d timeline=%llu/%llu move=(%lld,%lld)/%llu legacy=%llu",
+        fileKeepsUs ? 1 : 0, actionsOk ? 1 : 0,
+        static_cast<unsigned long long>(gotTotal),
+        static_cast<unsigned long long>(expectTotal),
+        totals.dx, totals.dy,
+        static_cast<unsigned long long>(totals.packets),
+        static_cast<unsigned long long>(legacyTotal));
+    Emit(L"sub_ms_timeline_survives_io", false, msg);
 }
 
 void CaseMousePlaybackSpeed() {
@@ -1403,6 +1718,8 @@ void CaseParseArrowKeyTextVk() {
 
 int wmain(int argc, wchar_t** argv) {
     bool listOnly = false;
+    const wchar_t* benchPath = nullptr;
+    int benchRounds = 3;
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--json") == 0) {
             selftest::gJson = true;
@@ -1410,12 +1727,17 @@ int wmain(int argc, wchar_t** argv) {
         } else if (_wcsicmp(argv[i], L"--list") == 0) {
             listOnly = true;
             selftest::InitUtf8Stdout();
+        } else if (_wcsicmp(argv[i], L"--bench") == 0 && i + 1 < argc) {
+            benchPath = argv[++i];
+        } else if (_wcsicmp(argv[i], L"--rounds") == 0 && i + 1 < argc) {
+            benchRounds = _wtoi(argv[++i]);
         } else if (_wcsicmp(argv[i], L"--help") == 0 || _wcsicmp(argv[i], L"-h") == 0) {
             std::fwprintf(stderr,
-                L"  ScriptIoSelfTest.exe [--json] [--list] [--help]\n");
+                L"  ScriptIoSelfTest.exe [--json] [--list] [--bench <script.json> [--rounds N]] [--help]\n");
             return 0;
         }
     }
+    if (benchPath) return RunBench(benchPath, benchRounds);
     if (listOnly) {
         selftest::PrintCaseList(L"ScriptIoSelfTest", kCases,
             sizeof(kCases) / sizeof(kCases[0]));
@@ -1442,6 +1764,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseTruncated();
     CaseWriteActionJson();
     CaseTimingUsRoundtrip();
+    CaseSubMsTimelineSurvivesIo();
     CaseMousePlaybackSpeed();
     CaseNestedUseModeInheritDefault();
     CaseNestedUseModeWindowRoundtrip();

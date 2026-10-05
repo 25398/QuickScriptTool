@@ -283,12 +283,12 @@ bool EnableCdpViaProcessInject(HWND edgeTop, int preferredPort, std::wstring& er
         return false;
     }
 
-    WindowModeLogf(L"[窗口模式] CDP 注入 pid=%lu dll=%s",
+    WindowModeLogf(L"[窗口/后台窗口模式] CDP 注入 pid=%lu dll=%s",
         static_cast<unsigned long>(pid), dllPath.c_str());
 
     if (!RemoteLoadLibrary(process, pid, dllPath, err)) {
         CloseHandle(process);
-        WindowModeLogf(L"[窗口模式] CDP 注入失败: %s", err.c_str());
+        WindowModeLogf(L"[窗口/后台窗口模式] CDP 注入失败: %s", err.c_str());
         return false;
     }
     CloseHandle(process);
@@ -298,11 +298,11 @@ bool EnableCdpViaProcessInject(HWND edgeTop, int preferredPort, std::wstring& er
     if (!WaitForCdpList(preferredPort, 30000, &readyPort)) {
         err = L"CDP 注入完成，但 30 秒内未检测到 /json/list（详见 %TEMP%\\CdpEnable64.log；"
               L"签名可能仍不匹配当前 Edge 版本）";
-        WindowModeLog(L"[窗口模式] CDP 端口探测超时");
+        WindowModeLog(L"[窗口/后台窗口模式] CDP 端口探测超时");
         return false;
     }
 
-    WindowModeLogf(L"[窗口模式] CDP 已就绪 port=%d", readyPort);
+    WindowModeLogf(L"[窗口/后台窗口模式] CDP 已就绪 port=%d", readyPort);
     err.clear();
     return true;
 }

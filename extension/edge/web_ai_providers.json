@@ -1,0 +1,197 @@
+{
+  "_comment": [
+    "网页版 AI 站点适配配置（Web AI Backend，见 docs/web-ai-backend-design.md）。",
+    "架构参考 chen-squared/browser-ai-bridge（MIT）的 providers/registry：",
+    "  inputSelectors      输入框候选列表，按顺序取第一个可见的",
+    "  sendButtonSelectors 发送按钮候选；全部不可点击时退化为按 Enter",
+    "  responseSelectors   回复容器候选，应指向完整的 assistant 回复节点",
+    "  busySelectors       是否仍在生成（如「停止生成」按钮）。★必须配准，否则忙闲判定失效",
+    "  inputKind           'richtext' = contenteditable 富文本；'textarea' = 原生表单元素",
+    "                      ⚠ 富文本走 execCommand + beforeinput/keydown 增强路径（见 qstFillRef），",
+    "                        仅设 value / 仅派发 input 事件对它无效",
+    "  fileInputSelectors  传图用：页面上的 <input type=file> 候选（含 open shadow root 里搜）。",
+    "                      ⚠ 留空也能工作：扩展会全文档兜底搜 input[type=file]。",
+    "  fileButtonSelectors 传图兜底：找不到现成 input 时，点它来**唤出**文件选择器",
+    "                      （扩展用 Page.setInterceptFileChooserDialog 拦住选择器再挂文件）。",
+    "                      富文本站点常见形态：input 是点按钮时动态创建、用完即删。",
+    "  newChatUrl           ★ 开新对话的入口 URL。宿主每轮判定「这是新对话」时会把自己的",
+    "                      标签页导航到这里，拿到**干净上下文**（不复用用户自己的长对话）。",
+    "                      留空则退回 url。⚠ 必须是「新建对话」的地址，不是某个会话的地址。",
+    "selector 优先级：aria-label / data-testid / role > placeholder / name / type > class",
+    "  ❌ 禁止编译产物类名（.c3f91a._ab12），随版本变化",
+    "站点改版时改这份配置，不要改代码。"
+  ],
+  "version": 1,
+  "providers": {
+    "doubao": {
+      "label": "豆包",
+      "url": "https://www.doubao.com/chat/",
+      "newChatUrl": "https://www.doubao.com/chat/",
+      "urlHint": "doubao.com",
+      "inputSelectors": [
+        "textarea[data-testid='chat_input_input']",
+        "div[contenteditable='true'][role='textbox']",
+        "div[contenteditable='true']",
+        "textarea"
+      ],
+      "inputKind": "richtext",
+      "sendButtonSelectors": [
+        "button[data-testid='chat_input_send_button']",
+        "button[aria-label*='发送']",
+        "button[aria-label*='Send']"
+      ],
+      "responseSelectors": [
+        "[data-testid='receive_message']",
+        "[class*='message'][class*='assistant']",
+        ".ds-markdown",
+        "div[data-testid='message_text_content']"
+      ],
+      "busySelectors": [
+        "button[aria-label*='停止']",
+        "button[aria-label*='Stop']",
+        "[data-testid='chat_input_stop_button']",
+        "[data-testid='chat_input_stop']",
+        "[class*='thinking']",
+        "[class*='generating']",
+        "[class*='processing']"
+      ],
+      "fileInputSelectors": [
+        "input[type='file'][accept*='image']",
+        "input[type='file']"
+      ],
+      "fileButtonSelectors": [
+        "[data-testid='chat_input_upload_button']",
+        "button[aria-label*='上传']",
+        "button[aria-label*='附件']",
+        "button[aria-label*='Upload']",
+        "[class*='upload'] button",
+        "[class*='attach'] button"
+      ],
+      "readyTimeoutMs": 15000,
+      "submissionSignalTimeoutMs": 8000,
+      "progressIdleTimeoutMs": 30000,
+      "maxGenerationTimeoutMs": 600000
+    },
+    "deepseek": {
+      "label": "DeepSeek",
+      "url": "https://chat.deepseek.com/",
+      "newChatUrl": "https://chat.deepseek.com/",
+      "urlHint": "chat.deepseek.com",
+      "inputSelectors": [
+        "textarea",
+        "div[contenteditable='true'][role='textbox']"
+      ],
+      "inputKind": "textarea",
+      "sendButtonSelectors": [
+        "button[type='submit']",
+        "button[aria-label*='发送']",
+        "button[aria-label*='Send']"
+      ],
+      "responseSelectors": [
+        ".ds-markdown",
+        "[class*='assistant']"
+      ],
+      "busySelectors": [
+        "button[aria-label*='停止']",
+        "button[aria-label*='Stop']"
+      ],
+      "fileInputSelectors": [
+        "input[type='file']"
+      ],
+      "fileButtonSelectors": [
+        "button[aria-label*='上传']",
+        "button[aria-label*='附件']",
+        "button[aria-label*='Upload']",
+        "[class*='upload'] button"
+      ],
+      "readyTimeoutMs": 15000,
+      "submissionSignalTimeoutMs": 8000,
+      "progressIdleTimeoutMs": 30000,
+      "maxGenerationTimeoutMs": 600000
+    },
+    "yuanbao": {
+      "label": "腾讯元宝",
+      "url": "https://yuanbao.tencent.com/",
+      "newChatUrl": "https://yuanbao.tencent.com/",
+      "urlHint": "yuanbao.tencent.com",
+      "inputSelectors": [
+        "div[contenteditable='true'][role='textbox']",
+        "div[contenteditable='true']",
+        "textarea"
+      ],
+      "inputKind": "richtext",
+      "sendButtonSelectors": [
+        "a[class*='send']",
+        "button[aria-label*='发送']",
+        "button[aria-label*='Send']"
+      ],
+      "responseSelectors": [
+        "[class*='hyc-content-markdown']",
+        "[class*='agent-chat__bubble'] [class*='markdown']"
+      ],
+      "busySelectors": [
+        "a[class*='stop']",
+        "button[aria-label*='停止']"
+      ],
+      "fileInputSelectors": [
+        "input[type='file']"
+      ],
+      "fileButtonSelectors": [
+        "[class*='upload'] a",
+        "[class*='upload'] button",
+        "a[aria-label*='上传']",
+        "button[aria-label*='上传']"
+      ],
+      "readyTimeoutMs": 15000,
+      "submissionSignalTimeoutMs": 8000,
+      "progressIdleTimeoutMs": 30000,
+      "maxGenerationTimeoutMs": 600000
+    },
+    "qwen": {
+      "_note": [
+        "⚠ 2026-09-25 由用户提供入口 https://www.qianwen.com/（已核实是阿里官方域名：",
+        "  tongyi.aliyun.com/qianwen/ 与 www.qianwen.com 返回同一个官方落地页）。",
+        "⚠ 但**对话页的确切路径与输入框 selector 尚未真机标定** ——",
+        "  搜索「通义千问 网页版」时前排混着 cn.qianwen-ail.com.cn 这类**仿冒域名**，",
+        "  所以这里只用用户确认过的官方域名，selectors 用通用候选，待真机跑一次再校准。",
+        "  跑法：web_ai_probe.cmd --provider qwen  然后把 [!!] 那几行发回来。"
+      ],
+      "label": "千问",
+      "url": "https://www.qianwen.com/",
+      "newChatUrl": "https://www.qianwen.com/",
+      "urlHint": "qianwen.com",
+      "inputSelectors": [
+        "div[contenteditable='true'][role='textbox']",
+        "div[contenteditable='true']",
+        "textarea"
+      ],
+      "inputKind": "richtext",
+      "sendButtonSelectors": [
+        "button[aria-label*='发送']",
+        "button[aria-label*='Send']",
+        "button[type='submit']"
+      ],
+      "responseSelectors": [
+        "[class*='markdown']",
+        "[class*='message'][class*='assistant']",
+        "[class*='bubble']"
+      ],
+      "busySelectors": [
+        "button[aria-label*='停止']",
+        "button[aria-label*='Stop']"
+      ],
+      "fileInputSelectors": [
+        "input[type='file']"
+      ],
+      "fileButtonSelectors": [
+        "button[aria-label*='上传']",
+        "button[aria-label*='附件']",
+        "[class*='upload'] button"
+      ],
+      "readyTimeoutMs": 15000,
+      "submissionSignalTimeoutMs": 8000,
+      "progressIdleTimeoutMs": 30000,
+      "maxGenerationTimeoutMs": 600000
+    }
+  }
+}

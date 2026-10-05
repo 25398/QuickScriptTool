@@ -59,7 +59,9 @@ jobs:
       # 分开列 target（PowerShell 不要用 /t:A;B 拼多个 target，分号会拆命令）。
       - name: Build product shell
         shell: pwsh
-        run: cmake --build build --config Release --target QstWebViewShell
+        run: >
+          cmake --build build --config Release
+          --target QstWebViewShell --target QstScriptPlayer
 
       # 说明：这里也编 WindowModeSelfTest / VirtualHidSelfTest / InjectionSelfTest，
       # 虽然 -Tier logic 不跑它们——**保留编译覆盖**（它们能编过本身就是一道门禁：
@@ -69,12 +71,16 @@ jobs:
         shell: pwsh
         run: >
           cmake --build build --config Release
-          --target ScriptActionBuilderSelfTest --target ScriptIoSelfTest --target CoordSpaceSelfTest
+          --target ScriptActionBuilderSelfTest --target ScriptIoSelfTest --target ScriptPackageSelfTest --target CoordSpaceSelfTest
           --target MacroVariablesSelfTest --target ImageMatchSelfTest --target OcrSelfTest
-          --target AiActionRouterSelfTest --target AgentAssistantSelfTest --target AppSettingsStoreSelfTest
+          --target AiActionRouterSelfTest --target AgentAssistantSelfTest --target AgentDesktopTaskSelfTest --target AgentMcpSelfTest --target OoxmlSelfTest --target SqliteSelfTest --target AppSettingsStoreSelfTest
           --target ThemeUiSelfTest --target BreakoutCooldownSelfTest --target HotkeyStopSelfTest
+          --target FloatBallGeomSelfTest
+          --target OverlayInputGuardSelfTest
+          --target HotkeyScopeSelfTest
           --target ClickerTimingSelfTest --target ScheduledTaskSelfTest --target RecorderSelfTest
           --target BridgeJsonSelfTest --target ScriptRunnerSelfTest --target BridgeContractSelfTest --target ScriptSerializationSelfTest
+          --target TimeScaleSelfTest
           --target WindowModeSelfTest --target VirtualHidSelfTest --target InjectionSelfTest
 
       # ── 跑自检（--json，按 exit code 判定）─────────────────────────

@@ -637,9 +637,58 @@ void SyncNormFieldsFromPixels(std::vector<ScriptAction>& actions, const CoordMet
     }
 }
 
+namespace {
+/// 修复「录制本身按键不平衡」（2026-09-30）。
+/// 现场：用户录制的回放里 `键盘按下→` 之后整轮都没有 `键盘松开→`（调试日志按下 207 / 松开 206），
+/// 回放忠实重放这个不平衡 ⇒ 这一整轮方向键都是按住的 ⇒ **角色一路走到头还在走**；
+/// 轮末引擎的 `releaseHeldKeys()` 会抬起，所以下一轮看着又"正常"了 —— 症状因此表现为
+/// 「循环之后动作开始有问题，一会儿又好了」。
+/// 为什么放在这里：这是**动作表准备阶段**的唯一漏斗（顶层与嵌套宏都过它），
+/// 且引擎侧的"轮间抬起"只能救跨轮，救不了轮内。
+/// 做法：按出现顺序配对 KeyDown/KeyUp（同键重复按下不重复计数），把**结束时仍按住的键**
+/// 在末尾补一个 KeyUp，并按 `NormalizeScriptKeyVk` 归一化判据（与回放侧同一把尺）。
+/// ⚠ 只**补抬起**、绝不删按下：宁可多一次无害的 KEYUP，也不许悄悄吞掉用户的动作。
+int BalanceHeldKeysInActions(std::vector<ScriptAction>& actions, std::wstring* warn) {
+    std::unordered_set<UINT> held;
+    for (const auto& a : actions) {
+        if (a.type == ActionType::KeyDown) {
+            const UINT vk = NormalizeScriptKeyVk(a.keyVk, a.keyText);
+            if (vk) held.insert(vk);
+        } else if (a.type == ActionType::KeyUp) {
+            const UINT vk = NormalizeScriptKeyVk(a.keyVk, a.keyText);
+            if (vk) held.erase(vk);
+        }
+    }
+    if (held.empty()) return 0;
+    for (UINT vk : held) {
+        ScriptAction up{};
+        up.type = ActionType::KeyUp;
+        up.keyVk = vk;   // keyText 留空：回放侧 NormalizeScriptKeyVk(vk, text) 认 vk，
+                         // 别在这里另造一套键名（造错就是静默换键）。
+        actions.push_back(up);
+    }
+    if (warn) {
+        std::wstring keys;
+        wchar_t one[24]{};
+        for (UINT vk : held) {
+            if (!keys.empty()) keys += L", ";
+            swprintf_s(one, L"0x%02X", vk);
+            keys += one;
+        }
+        *warn = L"[录制修复] 该脚本/录制里有 " + std::to_wstring(held.size())
+            + L" 个按键只有按下没有松开（" + keys + L"），已在末尾补抬起 —— "
+            L"否则回放会把它们一路按住（表现为一直朝一个方向走/到头了还走）。建议重新录制该段。";
+    }
+    return static_cast<int>(held.size());
+}
+}  // namespace
+
 std::vector<ScriptAction> PrepareScriptActionsForExecution(
-    const std::vector<ScriptAction>& actions, const CoordMeta& scriptMeta) {
+    const std::vector<ScriptAction>& actions, const CoordMeta& scriptMeta,
+    std::wstring* outKeyBalanceWarn) {
     std::vector<ScriptAction> execActions = actions;
+    // ★键平衡修复必须在**任何提前 return 之前**（下面 refMeta 无效时会直接返回）。
+    BalanceHeldKeysInActions(execActions, outKeyBalanceWarn);
     const CoordMeta refMeta = ScriptCoordMetaForExecution(scriptMeta);
     if (refMeta.refWidth <= 0 || refMeta.refHeight <= 0) return execActions;
 
@@ -871,7 +920,7 @@ void ResolveFindImageClickPoint(const ImageMatchResult& match,
     int cy = 0;
     FindImageMatchCenter(match, cx, cy);
 
-    // nOffset 相对模板宽高。命中框可能已被窗口模式从截图像素映射到客户区，
+    // nOffset 相对模板宽高。命中框可能已被窗口/后台窗口模式从截图像素映射到客户区，
     // 必须跟框同一坐标系加偏移，不能再用 origTpl×match.scale（仍是模板/截图空间）。
     const int boxW = match.bottomRightX - match.topLeftX;
     const int boxH = match.bottomRightY - match.topLeftY;

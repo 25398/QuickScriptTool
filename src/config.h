@@ -107,13 +107,13 @@ constexpr int kEditorMacroNameLabelW = 66;
 constexpr int kEditorMacroNameEditX = 83 + kEditorChromeIndent;
 constexpr int kEditorMacroNameEditW = 690;
 constexpr int kEditorListLabelX = 13 + kEditorChromeIndent;
-// 动作列表工具栏（批量编辑等）— 位于宏名称/窗口模式行下方
+// 动作列表工具栏（批量编辑等）— 位于宏名称/窗口/后台窗口模式行下方
 constexpr int kEditorToolbarBtnY = 108;
 constexpr int kEditorToolbarBtnH = 31;
 constexpr int kEditorToolbarLabelY = 112;
 constexpr int kEditorListColumnHeaderY = 148;
 constexpr int kEditorActionComboY = 126;
-// 窗口模式顶部两行：左缘与宏名称输入对齐，右缘止于动作列表区域
+// 窗口/后台窗口模式顶部两行：左缘与宏名称输入对齐，右缘止于动作列表区域
 constexpr int kEditorWmContentRight = 776;
 constexpr int kEditorWmHeaderGap = 8;
 constexpr int kEditorWmNameEditW = 160;

@@ -1,0 +1,3 @@
+D:/other/software/tools/verify/hook_race/out_legacy/CMakeFiles/race_test_legacy.dir
+D:/other/software/tools/verify/hook_race/out_legacy/CMakeFiles/ALL_BUILD.dir
+D:/other/software/tools/verify/hook_race/out_legacy/CMakeFiles/ZERO_CHECK.dir

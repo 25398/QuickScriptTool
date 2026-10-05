@@ -158,15 +158,74 @@ std::vector<SwitchableWindow> ListSwitchableWindows(DWORD excludePid) {
     ctx.foreground = GetForegroundWindow();
     // EnumWindows 按 Z 序（前→后）回调，正好就是 Alt+Tab 的排列顺序
     EnumWindows(&EnumSwitchableProc, reinterpret_cast<LPARAM>(&ctx));
+    // ① 补「可辨识信息」：pid + 客户区尺寸 + 屏幕位置。
+    //    双开时两份客户端标题完全一样，只有这三样能把它们分开（原来只有句柄，对人没意义）。
+    for (auto& w : out) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w.hwnd, &pid);
+        w.pid = pid;
+        RECT cr{};
+        if (GetClientRect(w.hwnd, &cr)) {
+            w.clientWidth = static_cast<int>(cr.right - cr.left);
+            w.clientHeight = static_cast<int>(cr.bottom - cr.top);
+        }
+        RECT wr{};
+        if (GetWindowRect(w.hwnd, &wr)) {
+            w.left = static_cast<int>(wr.left);
+            w.top = static_cast<int>(wr.top);
+        }
+    }
+    // ② 同名兄弟数（同类名+同标题）>0 的条目会在 UI 里带 ⚠，也是"双开"的唯一可见判据。
+    for (size_t i = 0; i < out.size(); ++i) {
+        int peers = 0;
+        for (size_t j = 0; j < out.size(); ++j) {
+            if (i == j) continue;
+            if (_wcsicmp(out[i].title.c_str(), out[j].title.c_str()) == 0) ++peers;
+        }
+        out[i].sameNamePeers = peers;
+    }
     return out;
 }
 
+int CountSameNamePeers(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return 0;
+    wchar_t cls[128]{};
+    wchar_t title[256]{};
+    if (!GetClassNameW(hwnd, cls, 128)) return 0;
+    if (!GetWindowTextW(hwnd, title, 256)) return 0;
+    struct Ctx { HWND self; const wchar_t* cls; const wchar_t* title; int peers; };
+    Ctx ctx{hwnd, cls, title, 0};
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (!c || h == c->self) return TRUE;
+        wchar_t other[256]{};
+        if (!GetWindowTextW(h, other, 256) || _wcsicmp(other, c->title) != 0) return TRUE;
+        wchar_t otherCls[128]{};
+        if (!GetClassNameW(h, otherCls, 128) || _wcsicmp(otherCls, c->cls) != 0) return TRUE;
+        ++c->peers;
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.peers;
+}
+
 std::vector<SwitchableWindow> MatchWindows(
-    const std::vector<SwitchableWindow>& all, const std::wstring& query) {
-    if (query.empty()) return all;
+    const std::vector<SwitchableWindow>& all, const std::wstring& query, DWORD pid) {
+    // ★ pid 优先：进程号是**精确**的（台账里的 `pid=…`），而标题在双开/多标签时
+    //   完全可能一模一样 —— 先按 pid 收窄，再让标题做子串过滤（两者同给 = 取交集）。
+    // ★ pid 优先：进程号是**精确**的（台账里的 `pid=…`），而标题在双开/多标签时
+    //   完全可能一模一样 —— 先按 pid 收窄，再让标题做子串过滤（两者同给 = 取交集）。
+    std::vector<SwitchableWindow> pool;
+    if (pid) {
+        for (const auto& w : all) {
+            if (w.pid == pid) pool.push_back(w);
+        }
+    } else {
+        pool = all;
+    }
+    if (query.empty()) return pool;
     const std::wstring needle = NormalizeMatchText(query);
     std::vector<SwitchableWindow> hits;
-    for (const auto& w : all) {
+    for (const auto& w : pool) {
         if (WindowMatchesQuery(w, needle))
             hits.push_back(w);
     }
@@ -194,6 +253,17 @@ std::wstring FormatWindowList(const std::vector<SwitchableWindow>& list) {
         const auto& w = list[i];
         out += L"#" + std::to_wstring(i + 1) + L" " + w.title;
         if (!w.processName.empty()) out += L" [" + w.processName + L"]";
+        // 可辨识信息（双开时唯一能分清两份客户端的东西；句柄对人没意义）
+        if (w.pid) out += L" pid=" + std::to_wstring(w.pid);
+        if (w.clientWidth > 0 && w.clientHeight > 0) {
+            out += L" 客户区=" + std::to_wstring(w.clientWidth) + L"x"
+                + std::to_wstring(w.clientHeight);
+        }
+        out += L" @" + std::to_wstring(w.left) + L"," + std::to_wstring(w.top);
+        if (w.sameNamePeers > 0) {
+            out += L" ⚠同类名同标题共" + std::to_wstring(w.sameNamePeers + 1)
+                + L"个（按 pid/客户区区分，别只按标题选）";
+        }
         if (w.foreground) out += L"（前台）";
         if (w.minimized) out += L"（最小化）";
         if (i + 1 < list.size()) out += L"\n";

@@ -746,6 +746,15 @@ a.btn-primary:focus-visible {
   color: #6f8698;
   font-size: 12px;
 }
+/* 备案号：按工信部要求链接至 beian.miit.gov.cn */
+.site-footer .f-icp a {
+  color: #6f8698;
+  text-decoration: none;
+}
+.site-footer .f-icp a:hover {
+  color: var(--ice-300);
+  text-decoration: underline;
+}
 @media (max-width: 860px) {
   .site-footer .wrap { grid-template-columns: 1fr; gap: 24px; }
 }

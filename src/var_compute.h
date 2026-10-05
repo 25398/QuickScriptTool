@@ -12,6 +12,8 @@ struct VarComputeResult {
     std::wstring error;
     // return 列出的名字 → 可写回脚本的字符串值；未 return 则为空
     std::unordered_map<std::wstring, std::wstring> exported;
+    // 非致命提示（如引用了未定义变量而按 0 处理），由调用方写进运行日志
+    std::vector<std::wstring> warnings;
 };
 
 /// 只做语法检查，不执行。

@@ -22,7 +22,7 @@
 // 往返判定口径（刻意保守）：
 //   · 动作条数必须一致；
 //   · 每个动作的 ScriptActionToJsonString 必须逐字一致；
-//   · 关键顶层字段（名称/时长/热键/窗口模式/坐标元/计时版本）必须一致。
+//   · 关键顶层字段（名称/时长/热键/窗口/后台窗口模式/坐标元/计时版本）必须一致。
 //   任何一项不同即记为差异，并把前几条差异打进 detail。
 // =============================================================================
 #include "selftest_harness.h"
@@ -60,7 +60,8 @@ const selftest::CaseInfo kCases[] = {
     {L"save_is_deterministic", L"default",
         L"同一份数据连续保存两次，产物逐字节一致（无隐藏时间戳/顺序抖动）"},
     {L"field_mapping_anchors", L"default",
-        L"给定输入解析出的字段必须等于期望值（往返测试抓不到稳定映射错误）"},
+        L"给定输入解析出的字段必须等于期望值（往返测试抓不到稳定映射错误）；"
+        L"覆盖 11 种动作，含 moveMouseRelative 的相对位移分支（不参与归一化）"},
     {L"schema_version_chain", L"default",
         L"老文件无 v → 视为 v1 → 迁移到当前版本 → 保存写出 v → 读回一致（D3）"},
     {L"legacy_roundtrip_clean", L"default",
@@ -387,11 +388,22 @@ void CaseSchemaVersionChain() {
     const std::wstring v1 = LR"({"v":1,"scriptName":"x","actions":[{"type":"wait","duration":0.1}]})";
     const bool v1Migrated = ParseScriptContent(v1).schemaVersion == kScriptSchemaVersion;
 
-    const bool ok = migrated && saved && readOk && wroteV && readBack && v1Migrated;
+    // JSON 层迁移钩子（解析之前）必须**逐字节保真**：
+    // 今天 v1→v2 是空迁移，一旦它擅自改动文本就会让每次打开老脚本都触发一次
+    // 重新解析，更糟的是可能悄悄改掉用户数据。这里把它钉成契约。
+    const std::wstring jsonMigV1 = MigrateScriptJson(v1, 1);
+    const std::wstring jsonMigV2 = MigrateScriptJson(v1, kScriptSchemaVersion);
+    const std::wstring jsonMigUnknown = MigrateScriptJson(v1, 99);   // 未来版本号：不得崩
+    const bool jsonHookIdentity =
+        jsonMigV1 == v1 && jsonMigV2 == v1 && jsonMigUnknown == v1;
+
+    const bool ok = migrated && saved && readOk && wroteV && readBack && v1Migrated
+        && jsonHookIdentity;
     std::wstring detail = L"迁移=" + std::to_wstring(d.schemaVersion)
         + L" 写出" + needle + L"=" + (wroteV ? L"1" : L"0")
         + L" 读回=" + std::to_wstring(back.schemaVersion)
-        + L" v1迁移=" + (v1Migrated ? L"1" : L"0");
+        + L" v1迁移=" + (v1Migrated ? L"1" : L"0")
+        + L" JSON钩子保真=" + (jsonHookIdentity ? L"1" : L"0");
     Emit(L"schema_version_chain", ok, detail.c_str());
 }
 
@@ -418,6 +430,16 @@ void CaseLegacyRoundTripClean() {
 // 一模一样，往返是「零差异」—— 实测：注入这个变异后 ScriptIoSelfTest 变红 1 条，
 // 而往返套件 0 条变红。
 // 所以必须有「给定输入 → 解析出的字段必须等于期望值」的锚定断言。
+//
+// ⚠ 覆盖面的硬规则：**锚定断言的覆盖面 = 它下面列举的动作类型**。
+// 新加动作类型 / 新加字段时，必须在这里补一条，否则那类映射错误只有真实脚本语料
+// （`--corpus`）才可能碰到 —— 实测教训：把 MoveMouseRelative 分支的 x 映射改错，
+// 本用例曾**不变红**，就是因为当时没有这个动作类型。
+//
+// 当前覆盖：mouseClick(x/y/clickCount) · wait(duration) · findImage(imagePath/matchVarName)
+//   · moveMouse(x/y) · varCompute(computeCode) · **moveMouseRelative(x/y 整数 dx/dy，
+//   不参与归一化)** · mouseDrag(endX/endY/duration) · keyClick(keyText/keyVk/修饰键)
+//   · scrollWheel(clickCount/duration) · runProgram(targetPath) · loop(loopCount)
 void CaseFieldMappingAnchors() {
     // 关键：用**老脚本**（无 coordMeta）。解析路径是
     //   像素 → n*（按标准 2560×1440）→ 反归一化到当前虚拟屏
@@ -425,13 +447,22 @@ void CaseFieldMappingAnchors() {
     //   x_out = x_in / 2560 * vsW ,  y_out = y_in / 1440 * vsH
     // 这正是能抓到「x 读成 y」的地方 —— 只断言 n* 抓不到（n* 有独立的映射），
     // 只断言往返也抓不到（A/B 都错得一样）。
+    //
+    // 例外：moveMouseRelative 的 x/y 是**整数相对位移**，不参与归一化/反归一化
+    //   （script_io.cpp:159 走独立分支，coordsAreNormalized=false），期望值就是原值。
     const std::wstring content =
         LR"({"scriptName":"anchor","actions":[)"
         LR"({"type":"mouseClick","x":111,"y":222,"clickCount":3},)"
         LR"({"type":"wait","duration":1.75},)"
         LR"({"type":"findImage","imagePath":"images\a.png","matchVarName":"hit"},)"
         LR"({"type":"moveMouse","x":333,"y":444},)"
-        LR"({"type":"varCompute","computeCode":"a = 7;\nreturn a;"})"
+        LR"({"type":"varCompute","computeCode":"a = 7;\nreturn a;"},)"
+        LR"({"type":"moveMouseRelative","x":-17,"y":29},)"
+        LR"({"type":"mouseDrag","x":10,"y":20,"endX":555,"endY":666,"duration":0.25},)"
+        LR"({"type":"keyClick","keyText":"A","keyVk":65,"holdLeftCtrl":1},)"
+        LR"({"type":"scrollWheel","clickCount":4,"duration":0.05},)"
+        LR"({"type":"runProgram","targetPath":"C:\\tools\\a.exe"},)"
+        LR"({"type":"loop","loopCount":5})"
         R"(]})";
     const ScriptFileData d = ParseScriptContent(content);
     int vx = 0, vy = 0, vsW = 0, vsH = 0;
@@ -443,7 +474,7 @@ void CaseFieldMappingAnchors() {
         bad += what;
     };
 
-    if (d.actions.size() != 5) {
+    if (d.actions.size() != 11) {
         fail(L"动作数");
     } else {
         const ScriptAction& click = d.actions[0];
@@ -472,11 +503,51 @@ void CaseFieldMappingAnchors() {
         const ScriptAction& vc = d.actions[4];
         if (vc.type != ActionType::VarCompute) fail(L"[4].type");
         if (vc.computeCode.find(L"a = 7;") == std::wstring::npos) fail(L"[4].computeCode");
+
+        // ── 以下为「补全覆盖缺口」新增（原缺口：相对位移分支的映射错误抓不到）──
+        const ScriptAction& rel = d.actions[5];
+        if (rel.type != ActionType::MoveMouseRelative) fail(L"[5].type");
+        if (rel.coordsAreNormalized) fail(L"[5].coordsAreNormalized（相对位移被误归一化）");
+        if (rel.x != -17) fail(L"[5].x（dx 应原值 -17，不参与归一化）");
+        if (rel.y != 29) fail(L"[5].y（dy 应原值 29，不参与归一化）");
+
+        const ScriptAction& drag = d.actions[6];
+        if (drag.type != ActionType::MouseDrag) fail(L"[6].type");
+        if (std::fabs(drag.x - 10.0 / 2560.0 * vsW) > 1.0) fail(L"[6].x");
+        if (std::fabs(drag.y - 20.0 / 1440.0 * vsH) > 1.0) fail(L"[6].y");
+        if (std::fabs(drag.endX - 555.0 / 2560.0 * vsW) > 1.0) {
+            fail(L"[6].endX（endX/endY 读错？）");
+        }
+        if (std::fabs(drag.endY - 666.0 / 1440.0 * vsH) > 1.0) {
+            fail(L"[6].endY（endX/endY 读错？）");
+        }
+        if (std::fabs(drag.duration - 0.25) > 1e-6) fail(L"[6].duration");
+
+        const ScriptAction& key = d.actions[7];
+        if (key.type != ActionType::KeyClick) fail(L"[7].type");
+        if (key.keyText != L"A") fail(L"[7].keyText");
+        if (key.keyVk != static_cast<UINT>(L'A')) fail(L"[7].keyVk（键码未落到 keyVk？）");
+        if (!key.holdLeftCtrl) fail(L"[7].holdLeftCtrl（修饰键丢了）");
+
+        const ScriptAction& scroll = d.actions[8];
+        if (scroll.type != ActionType::ScrollWheel) fail(L"[8].type");
+        if (scroll.clickCount != 4) fail(L"[8].clickCount");
+        if (std::fabs(scroll.duration - 0.05) > 1e-6) fail(L"[8].duration");
+
+        const ScriptAction& run = d.actions[9];
+        if (run.type != ActionType::RunProgram) fail(L"[9].type");
+        if (run.targetPath.find(L"a.exe") == std::wstring::npos) fail(L"[9].targetPath");
+
+        const ScriptAction& loop = d.actions[10];
+        if (loop.type != ActionType::Loop) fail(L"[10].type");
+        if (loop.loopCount != 5) fail(L"[10].loopCount");
     }
 
     const bool ok = bad.empty();
-    std::wstring detail = ok ? std::wstring(L"5 个动作的字段全部落到正确成员（像素值按 2560x1440 参考精确核对）")
-                             : (L"字段映射错: " + bad);
+    std::wstring detail = ok
+        ? std::wstring(L"11 个动作的字段全部落到正确成员（像素值按 2560x1440 参考精确核对；"
+                       L"含相对位移分支不归一化）")
+        : (L"字段映射错: " + bad);
     if (!ok && d.actions.size() >= 4) {
         detail += L" | 实际 click=(" + std::to_wstring(d.actions[0].x) + L","
             + std::to_wstring(d.actions[0].y) + L") 期望=("

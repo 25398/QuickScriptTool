@@ -41,12 +41,20 @@ void RecordLastRunAppDir();
 std::wstring AppStartupSoundFilePath();
 /// 结束提示音路径：exe 旁 finish.wav
 std::wstring AppFinishSoundFilePath();
+/// 暂停提示音路径：exe 旁 pause.wav
+std::wstring AppPauseSoundFilePath();
 /// 存在且含 RIFF/WAVE 头则视为可播放（损坏/空文件返回 false）
 bool IsPlayableWavFile(const std::wstring& path);
+/// 读 wav 的时长（毫秒）。解析失败/非法文件返回 0。
+/// 用途：提示音是 `SND_ASYNC` 播的，进程若立刻退出会把声音**截断**
+/// （实测"结束音只响了一半"）——调用方据此等它放完。
+DWORD WavDurationMs(const std::wstring& path);
 /// 播放自定义启动提示音；文件缺失或 PlaySound 失败时回退 MessageBeep(MB_OK)
 void PlayAppStartupSound();
 /// 播放自定义结束提示音；文件缺失或 PlaySound 失败时回退 MessageBeep(MB_OK)
 void PlayAppFinishSound();
+/// 播放自定义暂停提示音；文件缺失或 PlaySound 失败时回退 MessageBeep(MB_OK)
+void PlayAppPauseSound();
 std::wstring ScriptsDir();
 std::wstring RecordingsDir();
 std::wstring FindImagesDir();
@@ -54,6 +62,9 @@ std::wstring FindImagesDir();
 std::wstring LibraryKindDir(const std::wstring& kind);
 void        EnsureScriptsDir();
 void        EnsureFindImagesDir();
+/// 逐级创建目录。**必须用它替代裸 CreateDirectoryW** —— 后者只建最后一级，
+/// 父级不存在时整条失败（解压 scripts\x.json、创建 %LOCALAPPDATA%\a\b\c 都踩过）。
+bool        EnsureDirectoryTree(const std::wstring& dir);
 void        EnsureLibraryKindDir(const std::wstring& kind);
 
 /// 脚本/录制 JSON 枚举项（支持子目录；folder 用 / 分隔的相对路径）
@@ -70,6 +81,25 @@ bool FindScriptJsonByFileName(const std::wstring& rootDir, const std::wstring& f
 /// 解析脚本/录制路径：现存完整路径优先；拖进专业模式子文件夹后仍按文件名找回。
 /// 只返回 scripts/ 或 recordings/ 目录内的文件，不会打开目录外路径。
 bool ResolveLibraryScriptPath(const std::wstring& pathOrName, std::wstring& outPath);
+
+/// ── 助手「动手」层（runDesktopTask）的**临时任务脚本** ────────────────────────────
+/// 它是给引擎跑的一次性产物，**不是用户脚本**：绝不能出现在脚本库列表里，
+/// 也不能被当成「用户资产」去备份/同步。文件名固定为
+/// `_agent_task_<pid>_<tick>_<n>.json`（生成点：src/agent_desktop_task.cpp）。
+///
+/// ⚠ 为什么需要这两个函数：正常路径跑完即删，但**崩溃 / 被强杀**会留下残留。
+/// 残留一旦进了列表，用户就会在自己脚本库里看到一个跑不了的鬼影条目。
+/// ⇒ ① 列表出口一律用 `IsAgentTaskTempFileName()` 过滤；
+///    ② 启动时用 `SweepStaleAgentTaskTempScripts()` 清掉**进程已不在**的残留。
+/// ⚠ 只过滤「列表」，**不要**去改 `EnumerateScriptJsonFiles` / `ResolveLibraryScriptPath`
+///   —— 引擎正是靠后者才找得到这个临时脚本，过滤掉就跑不起来了。
+const wchar_t* kAgentTaskTempScriptPrefix();          // L"_agent_task_"
+bool IsAgentTaskTempFileName(const std::wstring& fileName);
+/// 清扫 scriptsDir 下**创建它的进程已退出**的临时任务脚本（返回删除条数）。
+/// 只删严格匹配 `_agent_task_<pid>_<tick>_<n>.json` 的文件；进程还活着的一律不动
+/// （可能正有另一个实例在跑任务）。`removed` 非空时回填被删的完整路径。
+int SweepStaleAgentTaskTempScripts(const std::wstring& scriptsDir,
+    std::vector<std::wstring>* removed = nullptr);
 /// 规范化后大小写不敏感比较（缺失文件仍可比较弱规范路径）。
 bool LibraryPathsEqual(const std::wstring& a, const std::wstring& b);
 /// Win32 完整路径前缀判断（去 \\?\；缺失文件仍可判断是否落在目录树下）。

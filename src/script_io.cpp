@@ -34,6 +34,26 @@ bool VisualLayoutLooksValid(const std::wstring& json) {
     return end != std::wstring::npos && end + 1 == json.size();
 }
 
+/// 与 `ExtractNamedJsonObject` **输出完全一致**，但根对象**已经解析好** ⇒ 不再整份重解析。
+///
+/// 前科（2026-10-03 实测，5881 条 / 14.4MB 录制）：
+/// `ExtractNamedJsonObject(content, L"visualLayout")` 会走 `GetSubObjectText`，
+/// 而那里面是 `nlohmann::json::parse(ToUtf8(整份内容))` —— **单这一行 184.9ms**，
+/// 而这份文件**根本没有 visualLayout**（连键都找不到，照样付了整份解析的代价）。
+/// `LoadScriptFileData` 本来就为顶层字段解析过一份 `JC`，直接查它即可。
+///
+/// 输出格式必须与 `GetSubObjectText` 严格一致：紧凑 `dump(-1, ...)` +
+/// 非法 UTF-8 用 `error_handler_t::replace` 兜底（不是抛异常）。
+std::wstring SubObjectFromParsedRoot(const qst::jsonutil::WideObjectView& root,
+    const char* key) {
+    if (!root.valid() || !key) return L"";
+    const auto& doc = root.raw();
+    if (!doc.is_object()) return L"";
+    const auto it = doc.find(key);
+    if (it == doc.end() || !it->is_object()) return L"";
+    return FromUtf8(it->dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+}
+
 // 勿用 ExtractString 读 watchMode：值为数字时会误取到下一个键名。
 int ParseWatchModeField(const std::wstring& block) {
     const std::wstring key = L"\"watchMode\"";
@@ -95,10 +115,9 @@ bool IsRecordingScriptPath(const std::wstring& path) {
     return next == L'\0' || next == L'\\' || next == L'/';
 }
 
-ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo,
-    bool coordsNormalized) {
+ScriptAction ParseScriptActionBlockImpl(const std::wstring& block,
+    const qst::jsonutil::WideObjectView& J, size_t fallbackNo, bool coordsNormalized) {
     ScriptAction a{};
-    const qst::jsonutil::WideObjectView J(block);
     const auto type = J.GetString(L"type");
     if (type.empty()) return a;
     if (type == L"moveMouse") a.type = ActionType::MoveMouse;
@@ -304,7 +323,11 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
         }
         a.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
             J.GetNumber(L"breakoutTimeSeconds", 0.0));
-        const std::wstring nestedWm = ExtractNamedJsonObject(block, L"nestedWindowMode");
+        // ⚠ 这里曾经是 `ExtractNamedJsonObject(block, L"nestedWindowMode")` —— 块级
+        //    `ToUtf8 + nlohmann 解析`，而 `J` 就是**同一个对象的已解析视图**。
+        //    宏多的脚本按条付费（本基线里 0 条 RunMacro 所以测不出来）。
+        //    输出与 GetSubObjectText 严格一致（同 dump 参数），见 SubObjectFromParsedRoot。
+        const std::wstring nestedWm = SubObjectFromParsedRoot(J, "nestedWindowMode");
         if (!nestedWm.empty()) {
             a.nestedWindowMode = windowmode::ParseWindowModeConfigObject(nestedWm, false);
         }
@@ -482,6 +505,17 @@ ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo
     a.captureOffsetY = static_cast<int>(J.GetNumber(L"captureOffsetY", 0));
     NormalizeMultiMatchFields(a);
     return a;
+}
+
+ScriptAction ParseScriptActionBlock(const std::wstring& block, size_t fallbackNo,
+    bool coordsNormalized) {
+    const qst::jsonutil::WideObjectView J(block);
+    return ParseScriptActionBlockImpl(block, J, fallbackNo, coordsNormalized);
+}
+
+ScriptAction ParseScriptActionBlockWithView(const std::wstring& block,
+    const qst::jsonutil::WideObjectView& J, size_t fallbackNo, bool coordsNormalized) {
+    return ParseScriptActionBlockImpl(block, J, fallbackNo, coordsNormalized);
 }
 
 void WriteActionJson(std::wstringstream& file, const ScriptAction& a, bool last) {
@@ -760,6 +794,49 @@ bool ScriptNormValuesLookLikePixels(const std::vector<ScriptAction>& actions) {
 
 }  // namespace
 
+std::wstring MigrateScriptJson(const std::wstring& content, int fromVer) {
+    // ── JSON 层迁移链（**形状/改名**类；解析之前）────────────────────
+    // 与 MigrateScriptFileData 的分工：
+    //   本函数 = 字段改名 / 结构变化（解析器读不到旧名字，只能先改文本）
+    //   下面那个 = 值语义变化（枚举取值、单位换算、字段拆并）
+    // 今天 v1→v2 是空迁移（格式未变，v2 只是开始显式记版本），所以原样返回。
+    // 下一个**形状**变更时照抄这个模板：
+    //
+    //   if (fromVer < 3) {
+    //       // 例：把动作里的 "posX"/"posY" 改名为 "x"/"y"
+    //       qst::jsonutil::WideObjectView 只读；改写需要动原始文本或用 nlohmann 重排，
+    //       改完 return 新文本（调用方会重新解析）。
+    //   }
+    //
+    // 注意：**不要**在这里做值语义修正（那是 MigrateScriptFileData 的职责），
+    // 也不要做「顺手格式化」——本函数返回原串时调用方会复用已有解析结果，
+    // 一旦返回不同的串就会触发一次重新解析，别让它无谓地发生。
+    (void)content;
+    (void)fromVer;
+    if (fromVer < 2) {
+        // v1 → v2：格式未变，无需改文本
+    }
+    return content;
+}
+
+namespace {
+
+/// 解析脚本文本，必要时**先**做 JSON 层迁移。
+/// 返回的视图一定对应迁移后的文本；迁移没改文本时（今天恒如此）复用同一次解析，
+/// **零额外开销** —— 只有真发生形状迁移时才重新解析一次。
+qst::jsonutil::WideObjectView ParseWithJsonMigration(const std::wstring& text,
+    std::wstring& migratedOut) {
+    qst::jsonutil::WideObjectView view(text);
+    const int fileVer = std::max(1, static_cast<int>(view.GetNumber(L"v", 1)));
+    if (fileVer >= kScriptSchemaVersion) return view;
+    std::wstring migrated = MigrateScriptJson(text, fileVer);
+    if (migrated == text) return view;   // 空迁移：复用这次解析
+    migratedOut = std::move(migrated);
+    return qst::jsonutil::WideObjectView(migratedOut);
+}
+
+}  // namespace
+
 void MigrateScriptFileData(ScriptFileData& data, int fromVer) {
     // ── 逐版本迁移链 ────────────────────────────────────────────────
     // 每条分支只负责「把 fromVer 升到 fromVer+1」，逐级推进，不要跳级判断。
@@ -796,8 +873,11 @@ void NormalizeInputTiming(ScriptFileData& data, const std::wstring& path,
 ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDisplay) {
     ScriptFileData data{};
     if (path.empty()) return data;
-    const auto content = ReadAll(path);
-    const qst::jsonutil::WideObjectView JC(content);
+    std::wstring content = ReadAll(path);
+    // JSON 层迁移（形状/改名类）必须在解析之前；空迁移时复用同一次解析，无额外开销。
+    std::wstring migratedContent;
+    const qst::jsonutil::WideObjectView JC = ParseWithJsonMigration(content, migratedContent);
+    if (!migratedContent.empty()) content = std::move(migratedContent);
     // 格式版本：缺省（老文件）视为 1；低于当前版本则跑迁移链。
     data.schemaVersion = static_cast<int>(JC.GetNumber(L"v", 1));
     if (data.schemaVersion < 1) data.schemaVersion = 1;
@@ -816,7 +896,12 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
         JC.GetNumber(L"breakoutTimeSeconds", 0));
     data.windowMode = windowmode::ParseWindowModeJson(content);
-    data.visualLayoutJson = ExtractNamedJsonObject(content, L"visualLayout");
+    // ⚠ 从**已解析的 JC** 取，别再整份重解析：`ExtractNamedJsonObject` 内部是
+    // 「ToUtf8(整份) + nlohmann::parse(整份)」，14.4MB 录制实测 184.9ms。
+    // JC 不可用（严格解析失败）时才回退原路径，行为不变。
+    data.visualLayoutJson = JC.valid()
+        ? SubObjectFromParsedRoot(JC, "visualLayout")
+        : ExtractNamedJsonObject(content, L"visualLayout");
     if (!VisualLayoutLooksValid(data.visualLayoutJson)) data.visualLayoutJson.clear();
 
     // 解析 coordMeta
@@ -836,11 +921,53 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
     }
 
     const auto blocks = ExtractJsonActionBlocks(content);
+
+    // ── 快路径：动作字段**借用**已经解析好的 `JC`，不再逐块重复解析 ──────
+    // 背景（2026-10-03 实测，5881 条 / 14.4MB 录制）：`LoadScriptFileData` 共 793ms，
+    // 其中「整文件 nlohmann 解析」242ms +「逐块再解析一次」355ms —— 同一份 JSON
+    // 被解析了两遍，后者是纯重复劳动。这里让逐块解析复用 `JC`，只保留**仍然必须**
+    // 依赖 `block` 文本的 5 处：
+    //   · 原文扫描 3 处：`useMode` 引号判定 / `ParseWatchModeField` / `imageRegionX1` 存在性
+    //   · 字符串抠数组 2 处：`ExtractJsonStringArray(block,"imagePaths")` /
+    //     `ExtractJsonIntArray(block,"imageUseVars")`
+    // （原先还有第 6 处 `ExtractNamedJsonObject(block,"nestedWindowMode")` —— 那是**块级
+    //  重解析**，已改为 `SubObjectFromParsedRoot(J, …)`，与 `J` 同源、字节等价。）
+    //
+    // ⚠ 启用条件必须同时成立，否则 blocks[i] 与 DOM 元素不再一一对应：
+    //   ① DOM 里的 actions 是数组；② **每个元素都是对象**（ExtractJsonActionBlocks
+    //   只抠对象块，非对象元素会被跳过 ⇒ 下标错位）；③ 元素个数与块数相等。
+    // 任一不满足就整体回退到原来的逐块解析，行为与旧版完全一致。
+    std::vector<const nlohmann::json*> domActions;
+    if (JC.valid()) {
+        const auto& root = JC.raw();
+        const auto it = root.find("actions");
+        if (it != root.end() && it->is_array()) {
+            bool allObjects = true;
+            for (const auto& e : *it) {
+                if (!e.is_object()) { allObjects = false; break; }
+            }
+            if (allObjects && it->size() == blocks.size()) {
+                domActions.reserve(it->size());
+                for (const auto& e : *it) domActions.push_back(&e);
+            }
+        }
+    }
+
+    auto actionViewAt = [&](size_t i) -> qst::jsonutil::WideObjectView {
+        if (i < domActions.size()) return qst::jsonutil::WideObjectView(*domActions[i]);
+        return qst::jsonutil::WideObjectView(blocks[i]);
+    };
+    auto parseAt = [&](size_t i, bool norm) -> ScriptAction {
+        if (i < domActions.size()) {
+            return ParseScriptActionBlockWithView(blocks[i], actionViewAt(i), i, norm);
+        }
+        return ParseScriptActionBlock(blocks[i], i, norm);
+    };
+
     for (size_t i = 0; i < blocks.size(); ++i) {
-        const auto type = qst::jsonutil::WideObjectView(blocks[i]).GetString(L"type");
+        const auto type = actionViewAt(i).GetString(L"type");
         if (!type.empty()) {
-            data.actions.push_back(
-                ParseScriptActionBlock(blocks[i], i, data.coordsNormalized));
+            data.actions.push_back(parseAt(i, data.coordsNormalized));
         }
     }
 
@@ -849,9 +976,9 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
         data.actions.clear();
         data.coordsNormalized = false;
         for (size_t i = 0; i < blocks.size(); ++i) {
-            const auto type = qst::jsonutil::WideObjectView(blocks[i]).GetString(L"type");
+            const auto type = actionViewAt(i).GetString(L"type");
             if (!type.empty()) {
-                data.actions.push_back(ParseScriptActionBlock(blocks[i], i, false));
+                data.actions.push_back(parseAt(i, false));
             }
         }
     }
@@ -880,8 +1007,11 @@ ScriptFileData LoadScriptFileData(const std::wstring& path, bool denormForDispla
 
 ScriptFileData ParseScriptContent(const std::wstring& content) {
     ScriptFileData data{};
-    const qst::jsonutil::WideObjectView JC(content);
     if (content.empty()) return data;
+    // JSON 层迁移（形状/改名类）必须在解析之前；空迁移时复用同一次解析，无额外开销。
+    std::wstring migratedContent;
+    const qst::jsonutil::WideObjectView JC = ParseWithJsonMigration(content, migratedContent);
+    const std::wstring& body = migratedContent.empty() ? content : migratedContent;
     // 格式版本：缺省（老文件）视为 1；低于当前版本则跑迁移链。
     data.schemaVersion = static_cast<int>(JC.GetNumber(L"v", 1));
     if (data.schemaVersion < 1) data.schemaVersion = 1;
@@ -899,12 +1029,15 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
     data.hotkey.enabled = data.hotkey.vk != 0;
     data.breakoutTimeSeconds = NormalizeBreakoutTimeSeconds(
         JC.GetNumber(L"breakoutTimeSeconds", 0));
-    data.windowMode = windowmode::ParseWindowModeJson(content);
-    data.visualLayoutJson = ExtractNamedJsonObject(content, L"visualLayout");
+    data.windowMode = windowmode::ParseWindowModeJson(body);
+    // 同 LoadScriptFileData：复用已解析的 JC，别整份重解析（实测 184.9ms / 14.4MB）
+    data.visualLayoutJson = JC.valid()
+        ? SubObjectFromParsedRoot(JC, "visualLayout")
+        : ExtractNamedJsonObject(body, L"visualLayout");
     if (!VisualLayoutLooksValid(data.visualLayoutJson)) data.visualLayoutJson.clear();
 
-    if (HasCoordMetaJson(content)) {
-        data.coordMeta = ParseCoordMetaJson(content);
+    if (HasCoordMetaJson(body)) {
+        data.coordMeta = ParseCoordMetaJson(body);
         data.coordsNormalized = true;
     }
 
@@ -913,7 +1046,7 @@ ScriptFileData ParseScriptContent(const std::wstring& content) {
         data.coordMeta = StandardScriptCoordMeta();
     }
 
-    const auto blocks = ExtractJsonActionBlocks(content);
+    const auto blocks = ExtractJsonActionBlocks(body);
     for (size_t i = 0; i < blocks.size(); ++i) {
         const auto type = qst::jsonutil::WideObjectView(blocks[i]).GetString(L"type");
         if (!type.empty()) {

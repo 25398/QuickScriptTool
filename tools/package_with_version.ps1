@@ -26,11 +26,17 @@
 .PARAMETER Version
   目标版本号，形如 1.3.4（也接受 1.3 或 1.3.4.0）。必填。
 
+.PARAMETER Mode
+  发版产物模式（默认 all）：
+    all    便携 zip + 安装包，两个都出并同步到官网
+    zip    只出便携 zip（跳过 ISCC，省 2-3 分钟）—— 过渡版本常用
+    setup  只出安装包（不打便携 zip）
+
 .PARAMETER SkipBuild
   复用 build\Release 现有产物，不重新编译（代码没动、只想重出包时用）。
 
 .PARAMETER SkipInstaller
-  只出便携 zip，不编译 Inno 安装包。
+  旧写法，保留兼容：等价于 -Mode zip。
 
 .PARAMETER DryRun
   只做检查（版本号格式 / 工具链 / 构建目标）并打印将要执行的步骤，不改任何文件。
@@ -39,7 +45,16 @@
   失败时不回滚已写入的版本号（默认回滚）。
 
 .EXAMPLE
+  # 完整发版（zip + 安装包）
   powershell -ExecutionPolicy Bypass -File tools\package_with_version.ps1 -Version 1.3.4
+
+.EXAMPLE
+  # 过渡版本：只发便携 zip，不编安装包
+  powershell -ExecutionPolicy Bypass -File tools\package_with_version.ps1 -Version 1.3.4 -Mode zip
+
+.EXAMPLE
+  # 只发安装包
+  powershell -ExecutionPolicy Bypass -File tools\package_with_version.ps1 -Version 1.3.4 -Mode setup
 
 .EXAMPLE
   # 代码没动，只想用当前版本号重新出一次包
@@ -57,11 +72,25 @@ param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string]$Version,
 
+    [ValidateSet('all', 'zip', 'setup')]
+    [string]$Mode = 'all',
+
     [switch]$SkipBuild,
     [switch]$SkipInstaller,
     [switch]$DryRun,
     [switch]$KeepVersionOnFailure
 )
+
+# 旧写法兼容：-SkipInstaller 就是「只要 zip」
+if ($SkipInstaller) { $Mode = 'zip' }
+
+$wantZip   = ($Mode -eq 'all' -or $Mode -eq 'zip')
+$wantSetup = ($Mode -eq 'all' -or $Mode -eq 'setup')
+$modeDesc = @{
+    'all'   = '便携 zip + 安装包'
+    'zip'   = '只出便携 zip（跳过 ISCC）'
+    'setup' = '只出安装包（不打便携 zip）'
+}[$Mode]
 
 $ErrorActionPreference = 'Stop'
 $script:StartedAt = Get-Date
@@ -85,6 +114,18 @@ if ($env:CODEBUDDY_SAFE_DELETE_BULK_GUARD) {
             break
         }
     }
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# 0.5) 外部程序可执行性修复
+#   本机的 PowerShell 会话里 $env:PATHEXT 被削成只剩 ".CPL"，而 PowerShell 的命令
+#   发现依赖它 —— 于是 cmake / ISCC 既启动不了、也拿不到 $LASTEXITCODE（裸调用静默
+#   无输出，& $exe 报「无法在管道中间运行文档」），看起来很像「宿主禁止启动外部程序」。
+#   补回标准值即可，只影响当前进程。
+# ─────────────────────────────────────────────────────────────────────────
+if ($env:PATHEXT -notmatch '\.EXE') {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;' + $env:PATHEXT
+    Write-Host "[环境] 已补全 PATHEXT（原值缺 .EXE，会让 cmake/ISCC 启动失败）" -ForegroundColor DarkYellow
 }
 
 # 三个版本号文件实测都是 UTF-8 无 BOM；读写固定用同一编码，避免改个版本号顺带改编码
@@ -145,6 +186,69 @@ function Resolve-Tool {
     $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
     return $null
+}
+
+# 跑外部程序并把 stdout+stderr 一起捕获，同时拿到可靠的退出码。
+#
+# 为什么需要它：原生命令往 stderr 写东西时，`2>&1` 会把每一行变成 ErrorRecord；
+# 而本脚本开头设了 $ErrorActionPreference = 'Stop'，于是 **CMake 的普通警告也会被
+# 当成终止错误抛出**（实测：配置阶段第一条 `CMake Warning (dev) at CMakeLists.txt:624`
+# 就把整次发版干掉了，而且报的「原因」就是那条警告，完全看不出真伪）。
+# 这里临时放宽 EAP，让 stderr 老实进 $out；退出码单独取，与管道无关。
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @Arguments 2>&1
+        $rc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    # 无输出时 $out 是 $null，而 @($null) 会得到「含一个 $null 的数组」，
+    # 下游 [string]$_ 把它转成空串 → 日志里凭空多出空行。这里收口成真正的空数组。
+    $lines = if ($null -eq $out) { @() } else { @($out) }
+    return [pscustomobject]@{ Output = $lines; ExitCode = $rc }
+}
+
+# 统一判定外部程序的执行结果。
+#
+# 为什么单独区分「退出码为空」：外部程序被中途打断（手动 Ctrl+C、关窗口、杀软拦截
+# 新生成的大文件、内存不足）时，`$out = & exe ...` 的赋值根本走不完，$LASTEXITCODE
+# 保持为 $null。此时若只报「失败（exit ）」，用户完全看不出发生了什么 —— 实测 ISCC
+# 压到一半被打断，留下的半截 exe 只有 80MB（正常 207MB），而报错里毫无线索。
+function Assert-ExitCode {
+    param([Parameter(Mandatory)][string]$What, [object]$ExitCode)
+    if ($null -eq $ExitCode) {
+        throw @"
+FATAL: $What 被中途打断（没有拿到退出码）。
+
+  常见原因：手动 Ctrl+C、关闭了窗口、杀软拦截新生成的大文件、内存不足。
+  建议把 dist 目录加入杀软排除项后重试：
+    $DistRoot
+"@
+    }
+    if ($ExitCode -ne 0) {
+        throw "FATAL: $What 失败（exit $ExitCode）"
+    }
+}
+
+# 从日志里挑出「像报错」的行 —— 这些行自带文件与行号，是排查时最该先看的：
+#   MSVC    : D:\x\y.cpp(123,45): error C2065: 'xxx': 未声明的标识符 [...vcxproj]
+#   MSBuild : ... : error MSB6001: ...
+#   链接器  : ... : error LNK2019: ...
+#   CMake   : CMake Error at CMakeLists.txt:624 (add_custom_command):
+function Get-LogErrorLines {
+    param([Parameter(Mandatory)][string]$LogPath, [int]$Max = 20)
+    if (-not (Test-Path -LiteralPath $LogPath)) { return @() }
+    $pattern = 'error\s+[A-Z]+\d+|:\s*error\b|CMake Error|fatal error|错误\s+[A-Z]*\d+'
+    $hits = @(Get-Content -LiteralPath $LogPath -Encoding UTF8 -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match $pattern } | Select-Object -Unique)
+    if ($hits.Count -gt $Max) { $hits = @($hits[0..($Max - 1)]) }
+    return $hits
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -218,6 +322,8 @@ Write-Host ""
 Write-Host "QuickScriptTool 发版" -ForegroundColor White
 Write-Host "  目标版本 : $Version"
 if ($currentVersion) { Write-Host "  当前版本 : $currentVersion" }
+Write-Host "  产物模式 : $Mode —— $modeDesc"
+Write-Host "             （-Mode all 两个都出 / zip 只出便携包 / setup 只出安装包）" -ForegroundColor DarkGray
 Write-Host "  仓库根   : $RepoRoot"
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -263,19 +369,12 @@ if (-not $SkipInstaller -and -not $Iscc) {
 
 # 提前探测外部程序能否启动。受限宿主（某些 AI 终端 / 沙箱会话）会静默拦掉外部程序，
 # 表现为 $LASTEXITCODE 为空、直到构建阶段才以「配置失败」告终，极难定位。
+# 注意：这里只记标志、不立刻抛 —— DryRun 并不需要真的跑 cmake，受限宿主下也该能用
+# （照样能列出全部写入点并校验正则）。所以 DryRun 里降级为警告，正式执行时才抛。
+$hostBlocksExternal = $false
 if (-not $SkipBuild) {
     $null = & $Cmake --version 2>$null
-    if ($null -eq $LASTEXITCODE) {
-        throw @"
-FATAL: 当前宿主禁止启动外部程序（cmake 没有被真正执行）。
-
-  本脚本要调用 cmake / ISCC 这类外部程序，请在**普通 PowerShell 或 CMD 终端**里运行，
-  不要在某些受限的 AI 终端 / 沙箱会话里运行。
-
-  如果只想更新版本号并重打便携包（复用已有 build\Release），可以加：
-    -SkipBuild -SkipInstaller
-"@
-    }
+    if ($null -eq $LASTEXITCODE) { $hostBlocksExternal = $true }
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -285,6 +384,7 @@ if ($DryRun) {
     $targetArgs = ($BuildTargets | ForEach-Object { "--target $_" }) -join ' '
     Write-Host ""
     Write-Host "[DryRun] 将要执行：" -ForegroundColor Yellow
+    Write-Host ("  模式     : {0} —— {1}" -f $Mode, $modeDesc)
     Write-Host ("  1. 写入版本号 {0} 到 {1} 处：" -f $Version, $VersionWrites.Count)
     foreach ($w in $VersionWrites) { Write-Host ("       {0}" -f $w.Label) }
 
@@ -315,19 +415,42 @@ if ($DryRun) {
     } else {
         Write-Host "  2. (跳过构建，复用 build\Release)"
     }
-    Write-Host "  3. 组装 + 打包 + 同步 zip："
-    Write-Host "       & `"$PkgScript`" -SkipBuild"
-    if (-not $SkipInstaller) {
-        Write-Host "  4. 编安装包："
-        Write-Host "       & `"$Iscc`" `"$IssFile`""
-        Write-Host "  5. 再同步一次（把安装包推进官网目录）："
+    if ($wantZip) {
+        Write-Host "  3. 组装 dist + 便携 zip + 同步官网："
         Write-Host "       & `"$PkgScript`" -SkipBuild"
     } else {
-        Write-Host "  4. (跳过安装包)"
+        Write-Host "  3. 只组装 dist（不打便携 zip）："
+        Write-Host "       & `"$PkgScript`" -SkipBuild -SkipZip"
+    }
+    if ($wantSetup) {
+        Write-Host "  4. 编安装包："
+        Write-Host "       & `"$Iscc`" `"$IssFile`""
+        Write-Host "  5. 同步安装包到官网（zip 上一步已同步过，这里 -SkipZip）："
+        Write-Host "       & `"$PkgScript`" -SkipBuild -SkipZip"
+    } else {
+        Write-Host "  4. (模式 $Mode：跳过安装包)"
+    }
+    if ($hostBlocksExternal) {
+        Write-Warn2 "当前宿主禁止启动外部程序：正式执行会在构建阶段失败，请在普通 PowerShell / CMD 终端里跑。"
     }
     Write-Host ""
     Write-Host "[DryRun] 未改动任何文件。" -ForegroundColor Yellow
     exit 0
+}
+
+if ($hostBlocksExternal) {
+    throw @"
+FATAL: 当前宿主禁止启动外部程序（cmake 没有被真正执行）。
+
+  本脚本要调用 cmake / ISCC 这类外部程序，请在**普通 PowerShell 或 CMD 终端**里运行，
+  不要在某些受限的 AI 终端 / 沙箱会话里运行。
+
+  如果只想更新版本号并重打便携包（复用已有 build\Release），可以加：
+    -SkipBuild -SkipInstaller
+
+  只想看看会做什么（不改文件、也不需要外部程序），可以加：
+    -DryRun
+"@
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -376,8 +499,9 @@ function Set-VersionInFile {
 
 Write-Host "  过程日志 : $script:LogFile"
 Write-Host "  （cmake / ISCC 输出很长，完整内容写日志；控制台只显示关键行）" -ForegroundColor DarkGray
-"=== QuickScriptTool release $Version  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" |
-    Set-Content -LiteralPath $script:LogFile -Encoding UTF8
+# 日志用无 BOM 的 UTF-8 写：Set-Content -Encoding UTF8 在 PS5.1 下会带 BOM，
+# 而后续 AppendAllLines 追加的内容没有 BOM，读回来第一行会多出一个 BOM 字符。
+Write-Text $script:LogFile ("=== QuickScriptTool release {0}  {1} ===`r`n" -f $Version, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 
 try {
     # ---- 1/5 版本号 ----
@@ -394,14 +518,20 @@ try {
     }
 
     # ---- MSBuild 环境护栏 ----
-    # 同时存在 https_proxy 与 HTTPS_PROXY 时，MSBuild 构造子进程环境会抛
-    # MSB6001「已添加项。字典中的关键字:https_proxy」，报错极难定位。本进程内去掉一份。
-    foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
-        $lower = $name.ToLowerInvariant()
-        if ((Test-Path "Env:$name") -and (Test-Path "Env:$lower")) {
-            Write-Warn2 "检测到 $lower 与 $name 并存（会让 MSBuild 报 MSB6001），本进程内移除 $name"
-            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
-        }
+    # 环境块里可能同时存在 http_proxy 与 HTTP_PROXY（大小写不同的同名变量），而 MSBuild
+    # 用区分大小写的字典构造子进程环境 → 抛 MSB6001「已添加项。字典中的关键字:http_proxy」。
+    #
+    # 注意：**不能用 PowerShell 的 `Remove-Item Env:xxx`** —— Env: provider 在 Windows 上
+    # 不区分大小写，一次只删得掉其中一个，另一个仍在环境块里，构建照样失败（实测踩过：
+    # 护栏「看起来执行了」但 MSB6001 依旧）。必须走 .NET 的 SetEnvironmentVariable(name, $null)，
+    # 它按名字清掉全部大小写变体。只影响当前进程。
+    $proxyNames = @('http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY',
+                    'all_proxy', 'ALL_PROXY', 'no_proxy', 'NO_PROXY')
+    $proxyPresent = @([System.Environment]::GetEnvironmentVariables().Keys |
+        Where-Object { $proxyNames -contains $_ })
+    if ($proxyPresent.Count -gt 1) {
+        Write-Warn2 "环境里有 $($proxyPresent.Count) 个 proxy 变量（$($proxyPresent -join ', ')），会让 MSBuild 报 MSB6001；本进程内清除。"
+        foreach ($n in $proxyNames) { [System.Environment]::SetEnvironmentVariable($n, $null) }
     }
 
     # ---- 2/5 构建 ----
@@ -414,94 +544,133 @@ try {
         Write-Step "2/5 构建 Release（$($BuildTargets -join ', ')）"
         Write-Hint "cmake 配置 + 编译，约 2-4 分钟..."
 
-        # 注意：先整体捕获输出再过滤，而不是 `& exe ... | ForEach-Object`。
-        # 管道里跑原生命令后 $LASTEXITCODE 的取值虽通常保留，但发版脚本不赌这个；
-        # 先捕获能让退出码 100% 可靠（反正输出本来就要过滤，实时性没有损失）。
-        $out = & $Cmake -S $RepoRoot -B $BuildDir 2>&1
-        $rc = $LASTEXITCODE
-        $out | ForEach-Object { Write-ChildLine ([string]$_) }
+        $r = Invoke-Captured -Exe $Cmake -Arguments @('-S', $RepoRoot, '-B', $BuildDir)
+        $r.Output | ForEach-Object { Write-ChildLine ([string]$_) }
         Flush-Log
-        if ($null -eq $rc -or $rc -ne 0) { throw "FATAL: CMake 配置失败（exit $rc）" }
+        Assert-ExitCode -What 'CMake 配置' -ExitCode $r.ExitCode
 
         $buildArgs = @('--build', $BuildDir, '--config', 'Release')
         foreach ($t in $BuildTargets) { $buildArgs += @('--target', $t) }
         $buildArgs += @('-j', '16')
 
-        $out = & $Cmake @buildArgs 2>&1
-        $rc = $LASTEXITCODE
-        $out | ForEach-Object { Write-ChildLine ([string]$_) }
+        $r = Invoke-Captured -Exe $Cmake -Arguments $buildArgs
+        $r.Output | ForEach-Object { Write-ChildLine ([string]$_) }
         Flush-Log
-        if ($null -eq $rc -or $rc -ne 0) { throw "FATAL: 构建失败（exit $rc）" }
+        Assert-ExitCode -What '构建' -ExitCode $r.ExitCode
         Write-Ok "构建完成"
     }
 
-    # ---- 3/5 组装 + 便携 zip + 同步 ----
-    Write-Step "3/5 组装 dist + 便携 zip + 同步官网目录"
-    Write-Hint "拷贝约 630 MB 并压缩，约 1 分钟..."
-    & $PkgScript -SkipBuild *>&1 | ForEach-Object { Write-ChildLine ([string]$_) }
+    # ---- 3/5 组装 dist（+ 便携 zip + 同步）----
+    if ($wantZip) {
+        Write-Step "3/5 组装 dist + 便携 zip + 同步官网目录"
+        Write-Hint "拷贝约 630 MB 并压缩，约 1 分钟..."
+        & $PkgScript -SkipBuild *>&1 | ForEach-Object { Write-ChildLine ([string]$_) }
+    } else {
+        Write-Step "3/5 只组装 dist（模式 $Mode：不打便携 zip）"
+        Write-Hint "拷贝约 630 MB，约 1 分钟..."
+        & $PkgScript -SkipBuild -SkipZip *>&1 | ForEach-Object { Write-ChildLine ([string]$_) }
+    }
     Flush-Log
-    Write-Ok "便携包完成"
+    Write-Ok "dist 组装完成"
 
     # ---- 4/5 安装包 ----
-    if (-not $SkipInstaller) {
+    if ($wantSetup) {
         Write-Step "4/5 编译 Inno 安装包"
         Write-Hint "ISCC 要压缩 600+ 个文件（每个文件一行 Compressing），约 2-3 分钟，中间会安静一会儿..."
-        $out = & $Iscc $IssFile 2>&1
-        $rc = $LASTEXITCODE
-        $out | ForEach-Object { Write-ChildLine ([string]$_) }
+        $r = Invoke-Captured -Exe $Iscc -Arguments @($IssFile)
+        $r.Output | ForEach-Object { Write-ChildLine ([string]$_) }
         Flush-Log
-        if ($null -eq $rc -or $rc -ne 0) { throw "FATAL: ISCC 编译失败（exit $rc）" }
+        if ($null -eq $r.ExitCode -or $r.ExitCode -ne 0) {
+            # 先清掉可能残缺的安装包（ISCC 被中断会留下半截 exe：体积远小于正常值，
+            # 但时间戳很新、版本信息也读得出来，极容易被当成「这次成功了」误发），
+            # 再交给统一判定 —— 它会区分「被中途打断」和「编译报错」。
+            $half = Join-Path $DistRoot "QuickScriptTool-$Version.exe"
+            if (Test-Path -LiteralPath $half) {
+                $halfMB = [math]::Round((Get-Item -LiteralPath $half).Length / 1MB, 1)
+                try {
+                    Remove-Item -LiteralPath $half -Force
+                    Write-Warn2 "已删除残缺的安装包（$halfMB MB，正常约 200 MB）：$half"
+                } catch {
+                    Write-Warn2 "安装包可能是残缺的（$halfMB MB）且删除失败，请手动检查：$half"
+                }
+            }
+            Assert-ExitCode -What 'ISCC 编译' -ExitCode $r.ExitCode
+        }
         Write-Ok "安装包完成"
 
-        # ---- 5/5 再同步一次（这次 dist 里已有安装包）----
+        # ---- 5/5 同步安装包（zip 上一步已同步过，这里 -SkipZip 免得再压一遍 630MB）----
         Write-Step "5/5 同步安装包到 website\downloads"
-        & $PkgScript -SkipBuild *>&1 | ForEach-Object { Write-ChildLine ([string]$_) }
+        & $PkgScript -SkipBuild -SkipZip *>&1 | ForEach-Object { Write-ChildLine ([string]$_) }
         Flush-Log
         Write-Ok "安装包已同步"
     } else {
-        Write-Step "4/5 安装包（已跳过 -SkipInstaller）"
+        Write-Step "4/5 安装包（模式 $Mode：已跳过）"
+        # 提醒：只发 zip 时，官网的安装包会停留在上一轮。若 dist 里的安装包比本次构建
+        # 产物还旧，说明它不含最新代码 —— 此时官网的 zip 与安装包内容是不一致的，
+        # 装安装包的用户会拿到旧版本。这种情况在 ISCC 被中断过之后特别容易出现。
+        $setupStale = Join-Path $DistRoot "QuickScriptTool-$Version.exe"
+        $builtExe = Join-Path $BuildDir 'Release\QuickScriptTool.exe'
+        if ((Test-Path -LiteralPath $setupStale) -and (Test-Path -LiteralPath $builtExe)) {
+            if ((Get-Item -LiteralPath $setupStale).LastWriteTime -lt (Get-Item -LiteralPath $builtExe).LastWriteTime) {
+                Write-Warn2 "dist 里的安装包比本次构建产物旧（不含最新代码），官网的安装包仍是上一轮的。"
+                Write-Hint "要一起更新请用 -Mode setup 或 -Mode all。"
+            }
+        }
     }
 
-    # ---- 校验 ----
+    # ---- 校验（按模式只校验本次要出的产物）----
     Write-Step "校验"
     $problems = @()
-    $zipMB = 0
-
     $zipName = "QuickScriptTool-Release-$Version.zip"
-    $zipPath = Join-Path $DistRoot $zipName
-    if (Test-Path -LiteralPath $zipPath) {
-        $zipMB = [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
-        Write-Ok "$zipName  $zipMB MB"
+    $setupName = "QuickScriptTool-$Version.exe"
+
+    if ($wantZip) {
+        $zipPath = Join-Path $DistRoot $zipName
+        if (Test-Path -LiteralPath $zipPath) {
+            Write-Ok "$zipName  $([math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)) MB"
+        } else {
+            $problems += "缺 dist\$zipName"
+        }
+        $p = Join-Path $WebDl 'QuickScriptTool-Release.zip'
+        if (Test-Path -LiteralPath $p) {
+            Write-Ok "website\downloads\QuickScriptTool-Release.zip  $([math]::Round((Get-Item -LiteralPath $p).Length / 1MB, 1)) MB"
+        } else {
+            $problems += "缺 website\downloads\QuickScriptTool-Release.zip"
+        }
     } else {
-        $problems += "缺 dist\$zipName"
+        Write-Hint "（模式 $Mode：不校验便携 zip）"
     }
 
-    if (-not $SkipInstaller) {
-        $setupName = "QuickScriptTool-$Version.exe"
+    if ($wantSetup) {
         $setupPath = Join-Path $DistRoot $setupName
         if (Test-Path -LiteralPath $setupPath) {
+            $setupSize = (Get-Item -LiteralPath $setupPath).Length
             $vi = (Get-Item -LiteralPath $setupPath).VersionInfo
-            if ($vi.ProductVersion -eq $Version) {
-                Write-Ok "$setupName  ProductVersion=$($vi.ProductVersion)"
+            # 体积下限：ISCC 中途被打断会留下半截 exe（实测 80MB vs 正常 207MB），
+            # 而它的 PE 版本信息照样读得出来 —— 只比对版本号会漏过去。
+            # PE 版本字符串是定长字段，读出来尾部带空格填充（如 "1.3.3        "），
+            # 必须 Trim 后再比 —— 否则永远「不符」，把一次成功的发版误判成失败
+            # （实测踩过：ISCC 已成功编译出 200MB 安装包，却被这句校验判成失败）。
+            $fileVer = "$($vi.FileVersion)".Trim()
+            $prodVer = "$($vi.ProductVersion)".Trim()
+            if ($setupSize -lt 50MB) {
+                $problems += "$setupName 体积异常（$([math]::Round($setupSize / 1MB, 1)) MB，疑似 ISCC 编译未完成）"
+            } elseif ($prodVer -ne $Version) {
+                $problems += "$setupName 版本信息不符：File=$fileVer Product=$prodVer（期望 $Version）"
             } else {
-                $problems += "$setupName 版本信息不符：File=$($vi.FileVersion) Product=$($vi.ProductVersion)"
+                Write-Ok "$setupName  $([math]::Round($setupSize / 1MB, 1)) MB  ProductVersion=$prodVer"
             }
         } else {
             $problems += "缺 dist\$setupName"
         }
-    }
-
-    foreach ($pair in @(
-        @{ Name = 'QuickScriptTool-Release.zip'; Need = $true },
-        @{ Name = 'QuickScriptTool-Setup.exe';   Need = (-not $SkipInstaller) }
-    )) {
-        if (-not $pair.Need) { continue }
-        $p = Join-Path $WebDl $pair.Name
+        $p = Join-Path $WebDl 'QuickScriptTool-Setup.exe'
         if (Test-Path -LiteralPath $p) {
-            Write-Ok "website\downloads\$($pair.Name)  $([math]::Round((Get-Item -LiteralPath $p).Length / 1MB, 1)) MB"
+            Write-Ok "website\downloads\QuickScriptTool-Setup.exe  $([math]::Round((Get-Item -LiteralPath $p).Length / 1MB, 1)) MB"
         } else {
-            $problems += "缺 website\downloads\$($pair.Name)"
+            $problems += "缺 website\downloads\QuickScriptTool-Setup.exe"
         }
+    } else {
+        Write-Hint "（模式 $Mode：不校验安装包）"
     }
 
     # 版本号写入点是否真的都写进去了（清单来自 $VersionWrites，不再另列一份）
@@ -517,12 +686,10 @@ try {
     }
 
     $elapsed = (Get-Date) - $script:StartedAt
-    Write-Banner "发版成功  |  QuickScriptTool $Version" 'Green'
-    Write-Host "  便携包 : dist\$zipName"
-    if (-not $SkipInstaller) {
-        Write-Host "  安装包 : dist\QuickScriptTool-$Version.exe"
-    }
-    Write-Host "  官网   : website\downloads\  (QuickScriptTool-Release.zip / QuickScriptTool-Setup.exe)"
+    Write-Banner "发版成功  |  QuickScriptTool $Version  [$Mode]" 'Green'
+    if ($wantZip)   { Write-Host "  便携包 : dist\$zipName" }
+    if ($wantSetup) { Write-Host "  安装包 : dist\$setupName" }
+    Write-Host "  官网   : website\downloads\"
     Write-Host "  日志   : $script:LogFile"
     Write-Host "  耗时   : $([math]::Round($elapsed.TotalMinutes, 1)) 分钟"
     Write-Host ""
@@ -534,9 +701,20 @@ try {
     Write-Host "  原因 : $msg" -ForegroundColor Red
 
     if ($script:LogFile -and (Test-Path -LiteralPath $script:LogFile)) {
+        # 先挑出「具体报错」—— 这些行自带文件与行号，排查时最该先看
+        $errLines = Get-LogErrorLines -LogPath $script:LogFile -Max 20
+        if ($errLines.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  具体报错（最多 20 条，含文件与行号）：" -ForegroundColor Red
+            foreach ($e in $errLines) { Write-Host "    $e" -ForegroundColor Red }
+        } else {
+            Write-Host ""
+            Write-Host "  （日志里没匹配到 error 行，见下方末尾输出）" -ForegroundColor DarkGray
+        }
         Write-Host ""
         Write-Host "  日志末尾 20 行（完整日志：$script:LogFile）：" -ForegroundColor DarkGray
-        Get-Content -LiteralPath $script:LogFile -Tail 20 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        Get-Content -LiteralPath $script:LogFile -Encoding UTF8 -Tail 20 |
+            ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
     }
 
     if (-not $KeepVersionOnFailure -and $backups.Count -gt 0) {

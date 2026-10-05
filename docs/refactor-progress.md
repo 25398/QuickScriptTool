@@ -462,12 +462,12 @@ A=parse(content) 与 B=parse(save(A)) 都经过同一个被变异的解析器，
 
 ---
 
-## 九、第 3 轮记录（发版工具链 + FakeFocus32 + A4/A5 收尾）
+## 十一、第 3 轮记录（发版工具链 + FakeFocus32 + A4/A5 收尾）
 
 > 验收全文：[`docs/refactor-acceptance-round3.md`](refactor-acceptance-round3.md)
 > 本轮**不是重构轮**：主线是发版工具链与 FakeFocus32 构建修复；另由验收会话闭合了上轮的 A4/A5。
 
-### 9.1 发版工具链（新增）
+### 11.1 发版工具链（新增）
 
 | 文件 | 作用 |
 |------|------|
@@ -479,13 +479,13 @@ A=parse(content) 与 B=parse(save(A)) 都经过同一个被变异的解析器，
 
 **验收实测**：`-DryRun` exit 0、计划完整、三处版本号未变；两条版本号正则独立复核均匹配且各只替换 1 处、行尾保留；构建目标正确解析出 `QstWebViewShell, QstUninstall`；工具链探测到本机实际安装位置（BuildTools 的 cmake、`%LOCALAPPDATA%` 的 ISCC）。
 
-### 9.2 FakeFocus32 构建修复
+### 11.2 FakeFocus32 构建修复
 
 `src/window_mode/fake_focus/build_fakefocus32.cmd` 的括号打断 `if` 老坑已修：改成先 `set "PF86=%ProgramFiles(x86)%"` 再 `if not defined`，并加 vswhere 全路径兜底 + 已知路径回退链。
 
 **验收实测**：`cmake --build build --config Release --target FakeFocus32` 现在打印 **`[FakeFocus32] OK:`**（修复前是 `vcvarsall.bat not found - skip 32-bit DLL`）；PE 头校验 `Machine=0x014c`（真 32 位），`FakeFocus64.dll` = `0x8664`。打包脚本按文件名精确拷贝，`build\Release` 下的 `FakeFocus32.next/safe/v3/v4.dll` 陈旧实验产物不会进包。
 
-### 9.3 window_mode 后台输入调整
+### 11.3 window_mode 后台输入调整
 
 | 改动 | 位置 |
 |------|------|
@@ -496,7 +496,7 @@ A=parse(content) 与 B=parse(save(A)) 都经过同一个被变异的解析器，
 
 **仍未收敛**（reference.md 自述）：冒险岛「游戏已在前台、诊断却全零」——`gaks=0 gfw=0 diState=0 lastCb=0` 但钩子已装好，说明客户端根本不调这些 API。**不要再盲目补钩子，先看 `pollHit=`。**
 
-### 9.4 上轮遗留项 A4 / A5 已闭合
+### 11.4 上轮遗留项 A4 / A5 已闭合
 
 | 项 | 前 | 后 |
 |----|----|----|
@@ -505,7 +505,7 @@ A=parse(content) 与 B=parse(save(A)) 都经过同一个被变异的解析器，
 
 A5 能这么做的前提是**先确认两文件是纯函数**（只有匿名 namespace，无全局可变状态、无静态注册）——有静态注册的源放进 STATIC 库可能被链接器裁掉初始化，属静默故障。
 
-### 9.5 本轮回归
+### 11.5 本轮回归
 
 | 项 | 结果 |
 |----|------|
@@ -513,7 +513,7 @@ A5 能这么做的前提是**先确认两文件是纯函数**（只有匿名 nam
 | logic 档 18 个 suite | **665 用例 / 0 失败** |
 | MCP 端到端 | **26 项全通过 / exit 0** |
 
-### 9.6 本文件过时陈述更正（重要）
+### 11.6 本文件过时陈述更正（重要）
 
 本文件以下陈述在本轮已不成立，**请以本节为准**：
 
@@ -525,13 +525,144 @@ A5 能这么做的前提是**先确认两文件是纯函数**（只有匿名 nam
 | §5.3 | 「`build\` 仍有历史陈旧 `.obj`（如 `QuickScriptTool.dir\Release\utils.obj`）」 | ⚠ 仍属实，且影响面更大：`build\QuickScriptTool.vcxproj` 整个是 **09-18 13:02 的陈旧工程**，做「权威核对」时会被它干扰（第 3 轮验收差点误判 A5 未生效）。建议 `--target clean` 或重建 `build\` |
 | §七「下一步」 | 「C 段（#10 桥接契约正式化）」 | ❌ C 段已在本文件 §八 记录完成；下一步是 **D 段（#4 统一序列化）** |
 
-### 9.7 第 3 轮验收新发现（待处理）
+### 11.7 第 3 轮验收新发现（待处理）
 
 | # | 项 | 级别 | 说明 |
 |---|----|------|------|
 | F2 | `WindowModeSelfTest / background_minimized_quiet_restore` **抖动 40%**（10 次 4 失败） | P1 | 测试用固定 sleep 读 `GetForegroundWindow()`，而前台切换是异步的 → 属测试时序脆弱。该 suite 在 `full` 档，**当前不 gate CI**；修好前**不要**把 `-Tier full` 接进 CI。建议改成**轮询 + 超时**（改等待方式，不改判定标准） |
 | F3 | 发版脚本覆盖不到的 4 处硬编码版本号 | P2 | `installer/QuickScriptTool.iss:4`（自指检查行，每次发版必错）、`package_with_version.ps1:44`（示例）、`website/downloads/README.md:7-9`、`website/README.md:16-18` |
 | F4 | `-DryRun` 不校验版本号正则 | P2 | 它在 `Set-VersionInFile` 之前 `exit 0`，不会验证两个 `-Pattern` 能否匹配；建议加 5 行 `IsMatch` 检查 |
-| F1 | 本文件与 `refactor-changes-summary.md` 本轮未同步 | P1 | 已由本节 + §9.6 更正 |
+| F1 | 本文件与 `refactor-changes-summary.md` 本轮未同步 | P1 | 已由本节 + §11.6 更正 |
+
+---
+
+## 十二、D 段验收 + 补全锚定覆盖 / JSON 层钩子（2026-09-19）
+
+> 依据：用户指出的三处「还没做」—— CI #5 结果、`MigrateAction` 落在模型层、锚定用例覆盖面有限。
+> 人工验证步骤见 [`docs/refactor-manual-verification.md`](refactor-manual-verification.md)。
+
+### 12.1 D 段 D2/D3/D4 验收结论（独立复核）
+
+| 项 | 结论 |
+|----|------|
+| D2 字段提取统一到 nlohmann | ✅ `WideObjectView` 一次解析多次取值；199 处调用改走它；`GetBool` 保留「数字非 0 视为 true」的旧语义。**非法转义兜底**是必要设计（否则 `"images\a.png"` 会让该动作被静默丢弃） |
+| D3 schema 版本 + 迁移 | ✅ `schemaVersion` 从**原始 JSON** 读（缺省 1）；`LoadScriptFileData:802/872` 与 `ParseScriptContent:886/935` 两条路径都接上了迁移；保存写 `"v": 2` |
+| D4 锚定断言 | ✅ 思路正确且**实测有效**——往返测试确实抓不到稳定映射错误（A/B 都经同一被变异的解析器） |
+| 版本读写点 | ✅ 迁移判定 `schemaVersion < kScriptSchemaVersion` 在两条解析路径上一致 |
+
+### 12.2 补齐锚定用例覆盖面（用户指出的缺口）
+
+**缺口**：D4 记录「第一次变异打在 `MoveMouseRelative` 分支上，套件没变红 —— 因为锚定用例里没有这个动作类型」。
+
+**已补**：`field_mapping_anchors` 从 5 种动作扩到 **11 种**，新增
+`moveMouseRelative`（相对位移分支，**不参与归一化**）、`mouseDrag`（endX/endY + duration）、
+`keyClick`（keyText/keyVk/修饰键）、`scrollWheel`（clickCount/duration）、`runProgram`（targetPath）、
+`loop`（loopCount）。
+
+**变异验证（关键）**：把 `script_io.cpp:162` 的 `MoveMouseRelative` 分支 `a.x = J.GetNumber(L"x",0)`
+改成读 `L"y"` → 重建 → **立刻变红**，诊断精确：
+```
+{"name":"field_mapping_anchors","ok":false,
+ "detail":"字段映射错: [5].x（dx 应原值 -17，不参与归一化） | 实际 click=(74,148) 期望=(74,148) vs=1707x960"}
+exit=1
+```
+**这正是之前抓不到的那个变异。** 还原后 11/11 绿。
+
+并在用例头部把「覆盖面 = 它列举的动作类型，新加动作类型要同步补一条」写成硬规则。
+
+### 12.3 补齐 JSON 层钩子（回答「是否保留原始 JSON 层的钩子」）
+
+**结论：需要补，已补。** 理由是模型层迁移有一个**真实的结构性盲区**：
+
+> 字段**改名/结构变化**时，解析器只认当前字段名，老文件里的旧名字在**解析阶段**就被丢成默认值；
+> 等拿到 `ScriptFileData` 再迁移已经无从恢复。所以名字/结构类迁移必须在**解析之前**改文本。
+
+**实现（零额外开销）**：
+
+| 动作 | 位置 |
+|------|------|
+| 新增 `MigrateScriptJson(content, fromVer)`：JSON 层迁移链，今天 v1→v2 是**空迁移**（原样返回） | `src/script_io.cpp` / `.h` |
+| 新增内部 `ParseWithJsonMigration(text, migratedOut)`：**先解析读版本号 → 只有迁移真的改了文本才重新解析** | `src/script_io.cpp` |
+| 两条解析路径改走它：`LoadScriptFileData` / `ParseScriptContent` | 同上 |
+| 头文件把「改字段时必须做」清单补成 **④ 条**，第 ④ 条明确「改名/结构变化必须用 `MigrateScriptJson`」 | `src/script_io.h` |
+
+**为什么不是死代码**：调用点位于解析之前（这是最容易放错的位置），且空迁移时**复用同一次解析**，
+代价为零；`schema_version_chain` 新增断言把它钉成契约：
+```
+detail: 迁移=2 写出"v": 2=1 读回=2 v1迁移=1 JSON钩子保真=1
+```
+（`MigrateScriptJson` 对 v1 / 当前版本 / **未来版本号 99** 三种输入都必须逐字节保真。）
+
+### 12.4 CI #5 结果（悬着的那件事）
+
+**结果：`failure`。** 构建全过，失败在最后一步：
+
+| 步骤 | 结果 |
+|------|------|
+| Set up / checkout / Cache OpenCV / Setup OpenCV | ✅ success |
+| Configure CMake | ✅ success |
+| **Build product shell** | ✅ success（`nlohmann/json.hpp` 未入库的问题已修好） |
+| **Build selftest targets** | ✅ success |
+| **Run self-tests** | ❌ **failure** |
+| Upload self-test log | ✅ success |
+
+**已排除的假设**（本地实测）：
+
+1. ❌ CI 构建列表与 `run_all_selftests.ps1` 的 suite 列表不一致（会导致 exe 不存在）
+   → 实测**完全一致**（22 个 `--target` vs 19 logic + 3 interactive）
+2. ❌ 缺用户数据（干净克隆没有 `scripts/`）
+   → 把 `scripts/` 临时移走后跑 logic 档：**无失败**
+3. ❌ AppDir 里有用户数据导致差异
+   → 把 exe + DLL 复制到空目录（AppDir 变干净）跑 logic 档：**16/18 通过**，2 个是杀软瞬时文件锁（`Device or resource busy`），非测试失败
+4. ❌ 缺 Office / OCR 运行时
+   → `AgentAssistantSelfTest` 不碰 docx/COM；`OcrSelfTest` 不碰 Python/paddle
+
+**未能确定的部分**：GitHub 的 **job log 与 artifact 下载都需要仓库写权限**（实测 403 / 401），
+本地也复现不出，所以**无法读出具体是哪条用例**。剩下的差异只有**屏幕分辨率 / 语言区域 / 字体**这类环境量。
+
+**下一步怎么拿到答案**（任选其一，都在有仓库权限的机器上）：
+
+```bash
+gh run view 35419230673 --log-failed          # 直接看失败步骤日志
+# 或下载 artifact selftest-log（里面就是 build/selftest.log）
+gh run download 35419230673 -n selftest-log
+```
+
+**并且**：本次已让这个问题**下次自己暴露**（见 12.5）。
+
+### 12.5 让 CI 失败可读（`GITHUB_STEP_SUMMARY`）
+
+`tools/run_all_selftests.ps1` 新增 `Write-GitHubSummary`：在 Actions 里把结果写成**作业摘要**（Markdown 表格 + 失败用例明细）。
+摘要**公开可读，不需要仓库写权限**，也不用手动下载 artifact。
+
+**为什么加**：本次排查 CI 失败时，job log（403「Must have admin rights」）与 artifact（401「Requires authentication」）都取不到，只能靠猜。这条把「猜」变成「看」。
+
+**实测**：
+- 全绿时：`19 个 suite：19 通过 / 0 失败` + 逐套 PASS 表
+- 全红时（用空 `-BuildDir` 制造）：`19 个 suite：0 通过 / 19 失败` + FAIL 表 + 「失败用例」小节（无结构化失败行时回落打印原始尾部 15 行），脚本 exit=19
+- 不在 Actions 里（无 `$env:GITHUB_STEP_SUMMARY`）时**完全 no-op**，不影响本地行为
+
+### 12.6 人工验证手册
+
+新增 [`docs/refactor-manual-verification.md`](refactor-manual-verification.md)：把四轮成果逐项写成可复制执行的手工验证步骤
+（构建 → 一键自检 → 阶段 0 → #9 → A/B/C/D 段 → 发版工具链），每项含**怎么验 / 期望 / 失败意味着什么**，
+并单列「**变异自检法**」（三处已验证有效的变异）与「**当前验不过去的项**」（驱动缺失、前台抖动等，附原因）。
+
+### 12.7 本轮回归
+
+| 项 | 结果 |
+|----|------|
+| 全量构建（38 个目标） | ✅ exit 0，**零 error、零 warning** |
+| logic 档（统一入口） | ✅ **19 suite / 19 通过 / 676 用例 / 0 失败** |
+| `ScriptSerializationSelfTest` | ✅ 11/11（含新断言 `JSON钩子保真=1`） |
+| 变异 1（相对位移 x 读 y） | ✅ `field_mapping_anchors` 变红，诊断精确 |
+| 变异 2（`MigrateScriptJson` 保真） | ✅ 断言已钉入 `schema_version_chain` |
+
+### 12.8 下一步
+
+1. **拿到 CI #5 的具体失败用例**（`gh run view 35419230673 --log-failed`），修掉 → 这是唯一未闭合项
+2. 修好后把 `-Tier full` 接进 self-hosted runner（前置：F2 的 `background_click_keeps_foreground` 抖动）
+3. 之后再动 **#1（ActionHandler 注册表）** —— 序列化格式已稳定，`ActionContext` 的字段映射现在才有意义
+
 
 

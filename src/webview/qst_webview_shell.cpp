@@ -1,4 +1,4 @@
-﻿// ──────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────
 // qst_webview_shell.cpp — WebView2 UI shell (Fixed Runtime portable)
 // Icons/tray reuse taskbar_window.h + product resources; engine via bridge.
 // ──────────────────────────────────────────────────────────────────
@@ -9,18 +9,22 @@
 #include <wrl.h>
 
 #include "agent_ui_notify.h"
+#include "agent_mcp.h"   // SweepStaleMcpImages（启动清理附图落盘目录）
 #include "base64.h"
 #include "config.h"
 #include "desktop_tools/desktop_tools.h"
 #include "desktop_tools/float_ball.h"
 #include "engine/engine_ui_hooks.h"
 #include "json_util.h"
+#include "ai_decide.h"
 #include "mcp_server.h"
 #include "ocr_engine.h"
 #include "process_utils.h"
 #include "taskbar_window.h"
 #include "tray_menu.h"
 #include "ui_scale.h"
+#include "web_ai/web_ai_backend.h"
+#include "window_mode/fake_focus/fake_focus_stage.h"   // 启动清理注入副本 / 让位改名残留
 #include "utils.h"
 #include "engine/qst_engine.h"
 #include "webview/bridge_commands.h"
@@ -1619,21 +1623,53 @@ public:
             return DISP_E_MEMBERNOTFOUND;
         }
         std::string mode = "coordinates";
-        if (pDispParams && pDispParams->cArgs >= 1) {
-            VARIANT arg{};
-            VariantInit(&arg);
-            const VARIANT& in = pDispParams->rgvarg[pDispParams->cArgs - 1];
-            if (SUCCEEDED(VariantChangeType(&arg, const_cast<VARIANT*>(&in), 0, VT_BSTR))
-                && arg.bstrVal) {
-                mode = NarrowUtf8(arg.bstrVal);
+        std::string optsJson;
+        if (pDispParams) {
+            // ⚠ COM 的 `rgvarg` 是**反序**的：`rgvarg[0]` 是**最后一个**参数。
+            //   约定 `crosshairPick(mode, optsJson)` ⇒ rgvarg[1]=mode, rgvarg[0]=optsJson。
+            const UINT n = pDispParams->cArgs;
+            if (n >= 2) {
+                VARIANT a2{};
+                VariantInit(&a2);
+                if (SUCCEEDED(VariantChangeType(&a2,
+                        const_cast<VARIANT*>(&pDispParams->rgvarg[0]), 0, VT_BSTR))
+                    && a2.bstrVal) {
+                    optsJson = NarrowUtf8(a2.bstrVal);
+                }
+                VariantClear(&a2);
             }
-            VariantClear(&arg);
+            if (n >= 1) {
+                VARIANT arg{};
+                VariantInit(&arg);
+                const VARIANT& in = pDispParams->rgvarg[n - 1];
+                if (SUCCEEDED(VariantChangeType(&arg, const_cast<VARIANT*>(&in), 0, VT_BSTR))
+                    && arg.bstrVal) {
+                    mode = NarrowUtf8(arg.bstrVal);
+                }
+                VariantClear(&arg);
+            }
+        }
+        // ── 坐标系选项（2026-10-05）：`optsJson` 缺省 = 旧行为（屏幕坐标）──────
+        qst::desktop_tools::CrosshairPickOptions pickOpts;
+        if (!optsJson.empty()) {
+            int wc = 0;
+            JsonGetInt(optsJson, "windowClient", wc);
+            pickOpts.windowClient = (wc != 0);
+            if (pickOpts.windowClient) {
+                std::string s;
+                if (JsonGetString(optsJson, "windowClassName", s)) {
+                    pickOpts.windowClassName = FromUtf8(s);
+                }
+                if (JsonGetString(optsJson, "targetExePath", s)) pickOpts.exePath = FromUtf8(s);
+                if (JsonGetString(optsJson, "windowTitle", s)) pickOpts.title = FromUtf8(s);
+            }
         }
         std::string outJson;
         std::string err;
         bool ok = false;
         if (g_hwnd) {
-            const auto r = qst::desktop_tools::CrosshairPick(g_hwnd, mode);
+            const auto r = qst::desktop_tools::CrosshairPick(g_hwnd, mode,
+                pickOpts.windowClient ? &pickOpts : nullptr);
             if (r.ok) {
                 ok = true;
                 outJson = r.pickJson;
@@ -1905,9 +1941,15 @@ void StopAllFromDesktopFloatBall() {
     PushEngineStatusIfChanged(true);
 }
 
-void StartSelectedMacroFromFloatBall() {
+void StartSelectedFromFloatBall() {
+    // 球点击启动：宏/录制任一选中都可。RunScriptPath → EngineRunFromPath 内部用
+    // IsRecordingScriptPath 判录制并走同一套回放路径（自带 playback timeline / breakout）。
+    const std::string homeState = qst::engine::GetHomeStateJson();
     std::string pathUtf8;
-    JsonGetString(qst::engine::GetHomeStateJson(), "selectedScriptPath", pathUtf8);
+    JsonGetString(homeState, "selectedScriptPath", pathUtf8);
+    if (pathUtf8.empty()) {
+        JsonGetString(homeState, "selectedRecordingPath", pathUtf8);
+    }
     if (pathUtf8.empty()) return;
     std::wstring path;
     std::string err;
@@ -1925,33 +1967,49 @@ void UpdateDesktopFloatBallModel() {
     const bool recording = qst::engine::IsRecording();
     const bool breakout = running && qst::engine::IsBreakoutPaused();
     m.busy = running || clicking || recording;
+    // 面板两行（2026-09-24 改交互）：第一行 = 脚本名，第二行 = **脚本当前状态**
+    // （第二行原来放的是「启动/停止」按钮，按钮已删，启停改由圆头图标承担）。
+    // 状态文案只有一处来源：就是这里 —— 绘制层不许再自己推状态。
     if (breakout) {
         m.activity = FloatBallActivity::BreakoutPaused;
-        m.statusText = L"脱离中";
         m.title = FromUtf8(qst::engine::RunningScriptNameUtf8());
+        m.statusText = L"已暂停";
     } else if (recording) {
         m.activity = FloatBallActivity::Recording;
+        // 录制没有脚本名：状态行单独居中显示。
         m.statusText = L"录制中";
-        m.title = L"录制";
     } else if (clicking) {
         m.activity = FloatBallActivity::Clicking;
         m.statusText = L"连点中";
-        m.title = L"连点";
     } else if (running) {
         m.activity = FloatBallActivity::MacroRunning;
-        m.statusText = L"运行中";
         m.title = FromUtf8(qst::engine::RunningScriptNameUtf8());
         qst::engine::PlaybackProgress(m.actionIndex, m.actionTotal);
+        m.statusText = (m.actionTotal > 0)
+            ? (L"运行中 " + std::to_wstring(m.actionIndex) + L"/" + std::to_wstring(m.actionTotal))
+            : std::wstring(L"运行中");
     } else {
         m.activity = FloatBallActivity::Idle;
-        std::string pathUtf8;
-        JsonGetString(qst::engine::GetHomeStateJson(), "selectedScriptPath", pathUtf8);
-        const std::wstring path = FromUtf8(pathUtf8);
-        m.canStart = !path.empty();
-        m.title = m.canStart ? FloatBallScriptBaseName(path) : L"";
-        m.statusText = m.canStart ? L"空闲" : L"";
+        // 修复点：旧版只看 selectedScriptPath，主界面选中「录制」时
+        // canStart 仍为 false，状态停在「选择脚本」、title 空白，用户体感「状态不更新」。
+        // 这里把「宏」和「录制」并列：有任一选中就允许启动。
+        const std::string homeState = qst::engine::GetHomeStateJson();
+        std::string scriptPathUtf8;
+        std::string recPathUtf8;
+        JsonGetString(homeState, "selectedScriptPath", scriptPathUtf8);
+        JsonGetString(homeState, "selectedRecordingPath", recPathUtf8);
+        const std::wstring scriptPath = FromUtf8(scriptPathUtf8);
+        const std::wstring recPath = FromUtf8(recPathUtf8);
+        m.canStart = !scriptPath.empty() || !recPath.empty();
+        if (!scriptPath.empty()) {
+            m.title = FloatBallScriptBaseName(scriptPath);
+        } else if (!recPath.empty()) {
+            m.title = FloatBallScriptBaseName(recPath);
+        }
+        m.statusText = m.canStart ? L"已停止" : L"未选择脚本";
     }
-    if (m.title.empty() && (m.canStart || m.busy)) m.title = L"键鼠工坊";
+    // 脚本名取不到也不留空行（引擎还没回报时退化成应用名），保持两行结构稳定。
+    if (m.title.empty() && (running || breakout || m.canStart)) m.title = L"键鼠工坊";
     qst::desktop_tools::FloatBall::Instance().SetModel(m);
 }
 
@@ -1968,7 +2026,7 @@ void ApplyDesktopFloatBallFromSettings() {
 void EnsureDesktopFloatBall() {
     auto& ball = qst::desktop_tools::FloatBall::Instance();
     qst::desktop_tools::FloatBallCallbacks cb;
-    cb.onStartSelectedMacro = [] { StartSelectedMacroFromFloatBall(); };
+    cb.onStartSelectedMacro = [] { StartSelectedFromFloatBall(); };
     cb.onStopRunning = [] { StopAllFromDesktopFloatBall(); };
     cb.onShowMainWindow = [] { RestoreMainWindow(); };
     cb.onHideFromMenu = [] {
@@ -2227,10 +2285,15 @@ void HandleDebugBridgeMessage(const std::string& json) {
             g_debugController->put_IsVisible(TRUE);
         }
         if (g_debugWantShow) {
+            // ★★ **调试窗不许抢前台**（2026-09-30 实测事故）：AI 动作执行的观察帧是
+            //   **整屏截图**，调试窗一旦成为前台，截图里就是"我们自己的窗口"
+            //   ⇒ 模型看不到任务界面、只能凭记忆猜坐标（实测连续 11 轮全是
+            //   `观察帧画面主体：前台 = QuickScriptTool.exe 「调试信息输出窗口」`，整轮白跑）。
+            //   ⇒ 改成 SW_SHOWNOACTIVATE（窗口照常出现，但不激活）；Topmost 仍保留，
+            //     所以用户照样看得见它浮在最上层。
             if (IsIconic(g_debugHwnd)) ShowWindow(g_debugHwnd, SW_RESTORE);
-            else ShowWindow(g_debugHwnd, SW_SHOW);
+            else ShowWindow(g_debugHwnd, SW_SHOWNOACTIVATE);
             ApplyDebugTopmost();
-            ForceForegroundWindow(g_debugHwnd);
         }
         return;
     }
@@ -2249,10 +2312,10 @@ void EnsureDebugWebWindow(bool show) {
             ApplyControllerRaster1(g_debugController.Get());
         }
         const bool alreadyUp = IsWindowVisible(g_debugHwnd) && !IsIconic(g_debugHwnd);
+        // ★ 同上：**不抢前台**（观察帧是整屏截图，调试窗当前台会把任务界面挡住）
         if (IsIconic(g_debugHwnd)) ShowWindow(g_debugHwnd, SW_RESTORE);
-        else if (!alreadyUp) ShowWindow(g_debugHwnd, SW_SHOW);
+        else if (!alreadyUp) ShowWindow(g_debugHwnd, SW_SHOWNOACTIVATE);
         ApplyDebugTopmost();
-        if (!alreadyUp) ForceForegroundWindow(g_debugHwnd);
     };
     if (g_debugHwnd && IsWindow(g_debugHwnd) && g_debugWebview) {
         reveal();
@@ -2840,6 +2903,42 @@ void FinishAppClose(HWND hwnd) {
     if (hwnd && IsWindow(hwnd)) DestroyWindow(hwnd);
 }
 
+// ── 优化列表加载：放到后台线程，别冻住 UI ──────────────────────────────
+// `HandleBridgeMessage` 是在 WebView2 的 `WebMessageReceived` 回调里**同步**跑的，
+// 而那个回调在 UI 线程上 ⇒ 加载大录制（5881 条 / 14.4MB，实测 C++ 侧 700ms+）会把
+// 整个界面冻住：骨架屏的 CSS 动画也停摆，用户看到的就是「卡住不动」。
+// 这里照 installOcr 的既有套路（std::thread + PostToJsAsync）把它挪到后台，
+// 界面保持可交互、骨架屏照常动，结果回来再一次性灌进列表。
+//
+// `g_optLoadMutex` 串行化后台加载：`JsonLoadOptimizeRecording` 会写全局缓存
+// `g_optWork`（ScriptFileData，含 vector），并发赋值是数据竞争 ⇒ 必须互斥。
+// `g_optLoadSeq` 用来丢弃**过期**结果：用户快速连开两份录制时，先发起的那个
+// 可能后返回，绝不能让它覆盖后发起的。
+std::mutex g_optLoadMutex;
+std::atomic<uint64_t> g_optLoadSeq{0};
+
+void StartOptimizeRecordingLoad(const std::string& pathUtf8) {
+    const uint64_t seq = ++g_optLoadSeq;
+    std::thread([pathUtf8, seq]() {
+        std::string err;
+        std::string body;
+        {
+            std::lock_guard<std::mutex> lock(g_optLoadMutex);
+            // 拿到锁时可能已有更新的请求排在前面 ⇒ 直接放弃这一趟（省一次重解析）
+            if (seq != g_optLoadSeq.load()) return;
+            body = qst::webview::JsonLoadOptimizeRecording(pathUtf8, err);
+        }
+        if (seq != g_optLoadSeq.load()) return;   // 期间又被更新的请求取代 ⇒ 丢弃
+        if (!err.empty()) {
+            PostToJsAsync(std::string("{\"type\":\"loadOptimizeRecording.result\",\"ok\":false,\"detail\":\"")
+                + EscapeJsonUtf8(err) + "\"}");
+            return;
+        }
+        PostToJsAsync(std::string("{\"type\":\"loadOptimizeRecording.result\",\"ok\":true,\"recording\":")
+            + body + "}");
+    }).detach();
+}
+
 void HandleBridgeMessage(const std::string& json) {
     std::string type;
     if (!JsonGetString(json, "type", type) && !JsonGetString(json, "method", type)) {
@@ -3236,6 +3335,22 @@ void HandleBridgeMessage(const std::string& json) {
         }
         return;
     }
+    if (type == "editorVarItems") {
+        // 编辑器变量下拉：动作 JSON 交给引擎算清单（规则只在 C++ 一份）
+        std::string reqId;
+        JsonGetString(json, "reqId", reqId);
+        std::string varErr;
+        const std::string items = qst::webview::JsonEditorVarItems(json, varErr);
+        if (items.empty()) {
+            PostToJs(std::string("{\"type\":\"editorVarItems.result\",\"ok\":false,\"reqId\":\"")
+                + EscapeJsonUtf8(reqId) + "\",\"detail\":\""
+                + EscapeJsonUtf8(varErr.empty() ? std::string("变量清单为空") : varErr) + "\"}");
+            return;
+        }
+        PostToJs(std::string("{\"type\":\"editorVarItems.result\",\"ok\":true,\"reqId\":\"")
+            + EscapeJsonUtf8(reqId) + "\",\"items\":" + items + "}");
+        return;
+    }
     if (type == "previewScriptActions") {
         std::string pathUtf8, reqId, err;
         JsonGetString(json, "path", pathUtf8);
@@ -3324,11 +3439,50 @@ void HandleBridgeMessage(const std::string& json) {
             + ",\"recordings\":" + qst::webview::JsonListRecordings() + "}");
         return;
     }
+    if (type == "scanScriptForExport") {
+        std::string pathUtf8, err;
+        JsonGetString(json, "path", pathUtf8);
+        std::string scanJson = qst::webview::ScanScriptForExportJson(pathUtf8, err);
+        if (scanJson.empty()) {
+            PostToJs(std::string("{\"type\":\"scanScriptForExport.result\",\"ok\":false,\"detail\":\"")
+                + EscapeJsonUtf8(err.empty() ? "scan failed" : err) + "\"}");
+            return;
+        }
+        // scanJson 已经是 {"ok":true,...}，补上 type 前缀即可
+        std::string body = scanJson.substr(1);  // 去掉开头的 '{'
+        PostToJs("{\"type\":\"scanScriptForExport.result\"," + body);
+        return;
+    }
+    if (type == "exportScriptAsExe") {
+        std::string pathUtf8, outPathUtf8, err, infoJson;
+        int bundledOpenCv = 1, bundledOcr = 1, bundledFakeFocus = 1;
+        JsonGetString(json, "path", pathUtf8);
+        JsonGetString(json, "outPath", outPathUtf8);
+        JsonGetInt(json, "bundledOpenCv", bundledOpenCv);
+        JsonGetInt(json, "bundledOcr", bundledOcr);
+        JsonGetInt(json, "bundledFakeFocus", bundledFakeFocus);
+        if (!qst::webview::ExportScriptAsExe(pathUtf8, outPathUtf8,
+                bundledOpenCv != 0, bundledOcr != 0, bundledFakeFocus != 0,
+                err, &infoJson)) {
+            if (err == "cancelled") {
+                PostToJs("{\"type\":\"exportScriptAsExe.result\",\"ok\":false,\"detail\":\"cancelled\"}");
+            } else {
+                PostToJs(std::string("{\"type\":\"exportScriptAsExe.result\",\"ok\":false,\"detail\":\"")
+                    + EscapeJsonUtf8(err) + "\"}");
+            }
+            return;
+        }
+        std::string body = infoJson.empty() ? std::string("{\"ok\":true}") : infoJson;
+        PostToJs("{\"type\":\"exportScriptAsExe.result\","
+            + (body.size() > 1 ? body.substr(1) : std::string("}")));
+        return;
+    }
     if (type == "exportScript") {
-        std::string pathUtf8, err, skippedFilesJson;
+        std::string pathUtf8, err, skippedFilesJson, missingRefsJson;
         int skipped = 0;
         JsonGetString(json, "path", pathUtf8);
-        if (!qst::webview::ExportScriptFile(pathUtf8, err, &skipped, &skippedFilesJson)) {
+        if (!qst::webview::ExportScriptFile(pathUtf8, err, &skipped, &skippedFilesJson,
+                &missingRefsJson)) {
             if (err == "cancelled") {
                 PostToJs("{\"type\":\"exportScript.result\",\"ok\":false,\"detail\":\"cancelled\"}");
             } else {
@@ -3340,6 +3494,7 @@ void HandleBridgeMessage(const std::string& json) {
         std::ostringstream oss;
         oss << "{\"type\":\"exportScript.result\",\"ok\":true,\"skipped\":" << skipped;
         if (!skippedFilesJson.empty()) oss << ",\"skippedFiles\":" << skippedFilesJson;
+        if (!missingRefsJson.empty()) oss << ",\"missingRefs\":" << missingRefsJson;
         oss << "}";
         PostToJs(oss.str());
         return;
@@ -3368,12 +3523,22 @@ void HandleBridgeMessage(const std::string& json) {
         JsonGetInt(json, "hotkeyModifiers", modifiers);
         JsonGetInt(json, "hotkeyHold", hold);
         if (vk != 0) {
-            std::wstring conflict;
-            if (qst::engine::HotkeyChordConflicts(static_cast<UINT>(vk), static_cast<UINT>(modifiers),
-                    FromUtf8(pathUtf8), false, conflict)) {
+            // 与**全局启停热键**冲突：仍然报错 ——
+            // 静默把用户的启停键顶掉比「热键重复」更糟。
+            if (qst::engine::GlobalHotkeyConflicts(static_cast<UINT>(vk), static_cast<UINT>(modifiers))) {
                 PostToJs(std::string("{\"type\":\"setScriptHotkey.result\",\"ok\":false,\"detail\":\"")
-                    + EscapeJsonUtf8(ToUtf8(conflict)) + "\"}");
+                    + EscapeJsonUtf8(ToUtf8(L"与全局启停热键冲突")) + "\"}");
                 return;
+            }
+            // 与其它脚本/录制的**专属热键**重复：**不再提示重复，直接强行覆盖** ——
+            // 先把占着这个和弦的旧专属热键清掉，再把新键设到当前条目（采用最新设置的那个）。
+            std::vector<std::wstring> owners;
+            qst::engine::CollectDedicatedHotkeyOwners(static_cast<UINT>(vk),
+                static_cast<UINT>(modifiers), FromUtf8(pathUtf8), owners);
+            for (const std::wstring& owner : owners) {
+                std::string clearErr;
+                qst::webview::SetScriptHotkeyJson(
+                    ToUtf8(owner), std::string(), 0, 0, false, clearErr);
             }
         }
         if (!qst::webview::SetScriptHotkeyJson(pathUtf8, textUtf8,
@@ -3557,6 +3722,12 @@ void HandleBridgeMessage(const std::string& json) {
         int tab = 0;
         JsonGetInt(json, "tab", tab);
         qst::engine::SetActiveHomeTab(tab);
+        // 专属热键作用域：专业模式的脚本库/定时/设置页列出全部内容，
+        // 这些页面下所有专属热键都应响应；其余页面按 TAB 限定。
+        // 缺省 0 = 按 TAB 限定（极简模式的四个 TAB 都不传这个字段）。
+        int scopeAll = 0;
+        JsonGetInt(json, "scopeAll", scopeAll);
+        qst::engine::SetDedicatedHotkeyScopeAll(scopeAll != 0);
         // 主页 Tab 切换时武装热键：修复调试结束后误静音 / RegisterHotKey 丢失后 F8、录制热键全哑
         if (g_mode == UiMode::Home) {
             qst::engine::EnsureHotkeysArmed();
@@ -3696,16 +3867,10 @@ void HandleBridgeMessage(const std::string& json) {
         return;
     }
     if (type == "loadOptimizeRecording") {
-        std::string path, err;
+        std::string path;
         JsonGetString(json, "path", path);
-        const std::string body = qst::webview::JsonLoadOptimizeRecording(path, err);
-        if (!err.empty()) {
-            PostToJs(std::string("{\"type\":\"loadOptimizeRecording.result\",\"ok\":false,\"detail\":\"")
-                + EscapeJsonUtf8(err) + "\"}");
-            return;
-        }
-        PostToJs(std::string("{\"type\":\"loadOptimizeRecording.result\",\"ok\":true,\"recording\":")
-            + body + "}");
+        // 后台线程加载 + 异步回发，避免冻住 UI（详见 StartOptimizeRecordingLoad 注释）
+        StartOptimizeRecordingLoad(path);
         return;
     }
     if (type == "applyOptimizeRecording") {
@@ -3775,6 +3940,18 @@ void HandleBridgeMessage(const std::string& json) {
     if (type == "themeCatalog") {
         PostToJs(std::string("{\"type\":\"themeCatalog.result\",\"ok\":true,\"themes\":")
             + qst::webview::JsonThemeCatalog() + "}");
+        return;
+    }
+    // ★ 窗口 Agents（设置页「准星绑定窗口」）：列出可绑定的客户端 / 绑定·解绑。
+    //   ⚠ 两条都必须在 bridge_commands.h 登记（BridgeContractSelfTest 双向校验）。
+    if (type == "windowAgentList") {
+        PostToJs(std::string("{\"type\":\"windowAgentList.result\",\"payload\":")
+            + quickscript::webai::RunWindowAgentsListJson() + "}");
+        return;
+    }
+    if (type == "windowAgentBind") {
+        PostToJs(std::string("{\"type\":\"windowAgentBind.result\",\"payload\":")
+            + quickscript::webai::RunWindowAgentBindJson(json) + "}");
         return;
     }
     if (type == "applyTheme") {
@@ -4205,7 +4382,21 @@ void HandleBridgeMessage(const std::string& json) {
         std::string mode;
         JsonGetString(json, "mode", mode);
         if (mode.empty()) mode = "coordinates";
-        const auto r = qst::desktop_tools::CrosshairPick(g_hwnd, mode);
+        // ── 坐标系选项（2026-10-05）──────────────────────────────────────────
+        // JS 只在「窗口模式/后台窗口模式 + 已绑定窗口」时传 `windowClient:1`
+        // ⇒ 缺字段时 `windowClient=false`，行为与旧版**完全一致**（向后兼容）。
+        qst::desktop_tools::CrosshairPickOptions pickOpts;
+        int windowClient = 0;
+        JsonGetInt(json, "windowClient", windowClient);
+        pickOpts.windowClient = (windowClient != 0);
+        if (pickOpts.windowClient) {
+            std::string s;
+            if (JsonGetString(json, "windowClassName", s)) pickOpts.windowClassName = FromUtf8(s);
+            if (JsonGetString(json, "targetExePath", s)) pickOpts.exePath = FromUtf8(s);
+            if (JsonGetString(json, "windowTitle", s)) pickOpts.title = FromUtf8(s);
+        }
+        const auto r = qst::desktop_tools::CrosshairPick(g_hwnd, mode,
+            pickOpts.windowClient ? &pickOpts : nullptr);
         if (!r.ok) {
             PostToJs(std::string("{\"type\":\"crosshairPick.result\",\"ok\":false,\"detail\":\"")
                 + EscapeJsonUtf8(r.detail.empty() ? "cancelled" : r.detail) + "\"}");
@@ -5070,6 +5261,11 @@ void InstallShellUiHooks() {
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     g_instance = inst;
     qst::jsonutil::SetParseFailureSink(&JsonParseFailureToBootLog);
+    // 本地判断表诊断 → webview_boot.log。
+    // 与播放器同一条理由：这些「视觉闸为什么拦下 / 算不算游戏前台」的判断原本只进
+    // 宏调试窗（窗口没建就丢弃），软件里没有落盘痕迹。接上后既方便排查，
+    // 也给离线影子测试（tools/verify/ai_decide_shadow.py）提供了输入数据。
+    SetAiDecisionLogSink(+[](const std::wstring& line) { BootLogLineW(line); });
     InstallShellUiHooks();
     // ★--mcp：把产品当 MCP server 跑（stdio，一行一个 JSON-RPC）。
     // 必须在任何 UI/单实例/WebView2 初始化之前分流：MCP 客户端会以管道方式反复拉起它，
@@ -5106,6 +5302,57 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
             return windowmode::RunExtNativeMessagingHost();
         }
     }
+    // ★--export-exe：命令行导出（批处理 / 自动化 / 排查用），不进 UI。
+    //   用法：QuickScriptTool.exe --export-exe <脚本.json> <输出.exe> [--bundled]
+    //         --bundled = 「目标电脑没装软件」模式（找图/OCR/假焦点全部自带）
+    //   必须在 UI/单实例/WebView2 初始化之前分流：它不需要任何界面。
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        std::wstring scriptPath, outPath;
+        bool bundled = false;
+        bool want = false;
+        if (argv) {
+            for (int i = 1; i < argc; ++i) {
+                if (lstrcmpiW(argv[i], L"--export-exe") == 0) {
+                    want = true;
+                    if (i + 1 < argc) scriptPath = argv[++i];
+                    if (i + 1 < argc) outPath = argv[++i];
+                } else if (lstrcmpiW(argv[i], L"--bundled") == 0) {
+                    bundled = true;
+                }
+            }
+            LocalFree(argv);
+        }
+        if (want) {
+            if (scriptPath.empty() || outPath.empty()) {
+                MessageBoxW(nullptr,
+                    L"用法：QuickScriptTool.exe --export-exe <脚本.json> <输出.exe> [--bundled]",
+                    L"导出", MB_OK | MB_ICONINFORMATION);
+                return 2;
+            }
+            std::string err, info;
+            const bool ok = qst::webview::ExportScriptAsExe(
+                ToUtf8(scriptPath), ToUtf8(outPath), bundled, bundled, bundled, err, &info);
+            std::wstring msg = ok ? L"导出成功" : L"导出失败";
+            msg += ok ? (L"：\n" + FromUtf8(info)) : (L"：\n" + FromUtf8(err));
+            {
+                HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+                std::string line = ToUtf8(msg + L"\n");
+                DWORD put = 0;
+                if (h && h != INVALID_HANDLE_VALUE) WriteFile(h, line.data(),
+                    static_cast<DWORD>(line.size()), &put, nullptr);
+            }
+            // 排查用：结果同时落盘一份，避免 GUI 子系统拿不到 stdout
+            {
+                std::ofstream f(AppDir() + L"\\export_cli_result.txt",
+                    std::ios::binary | std::ios::trunc);
+                if (f) f << ToUtf8(msg);
+            }
+            return ok ? 0 : 1;
+        }
+    }
+
     StartupTrace("wWinMain enter");
     RecordLastRunAppDir();
     ProbeOptionalOpenCv();
@@ -5173,6 +5420,36 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     UiScaleInitFromPrimaryMonitor();
     input_emergency::RegisterExtraTeardown(EmergencyUnhookWebCaptureLl);
     CleanOrphanImages();
+    // 助手「动手」层（runDesktopTask）的临时任务脚本：正常路径跑完即删，但**崩溃/被强杀**
+    // 会留下残留 —— 启动时清掉「创建它的进程已不在」的那些（进程还活着的一律不动，
+    // 可能正有另一个实例在跑任务）。残留不清的话，用户脚本库里会多出跑不了的鬼影条目；
+    // 列表出口另有一道 `IsAgentTaskTempFileName` 过滤兜底，两道一起才叫干净。
+    {
+        std::vector<std::wstring> stale;
+        const int swept = SweepStaleAgentTaskTempScripts(ScriptsDir(), &stale);
+        StartupTrace(("agent task sweep removed=" + std::to_string(swept)).c_str());
+    }
+    // MCP 附图落盘目录同样只增不减（标记被消费时会从文本里删掉，历史不留路径）
+    // ⇒ 按年龄清理，否则用户 AppDir 会无限长。保留 7 天，详见 agent_mcp.h。
+    {
+        std::vector<std::wstring> stale;
+        const int swept = qst::agent::SweepStaleMcpImages(&stale);
+        StartupTrace(("mcp image sweep removed=" + std::to_string(swept)).c_str());
+    }
+    // 假焦点「注入副本」目录（%LOCALAPPDATA%\QuickScriptTool\module_stage）同样只增不减：
+    // 每个构建一份，而且**目标进程可能一直映射着旧副本**（宿主被强杀就再也拆不掉它）。
+    // 被占用的一律跳过；顺带清掉安装/卸载程序「让位改名」留下的 FakeFocus*.dll.locked-*。
+    {
+        const windowmode::FakeFocusSweepResult sw =
+            windowmode::SweepStaleFakeFocusArtifacts(AppDir(),
+                windowmode::kFakeFocusStageKeepDays);
+        char line[192]{};
+        sprintf_s(line,
+            "fakefocus stage sweep dirs=%d keptLocked=%d leftovers=%d keptLocked=%d",
+            sw.stageDirsRemoved, sw.stageKeptLocked, sw.leftoversRemoved,
+            sw.leftoversKeptLocked);
+        StartupTrace(line);
+    }
     StartupTrace("after CleanOrphanImages");
 
     if (!RegisterWndClass(inst)) {

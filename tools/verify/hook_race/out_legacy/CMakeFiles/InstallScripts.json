@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/other/software/tools/verify/hook_race/out_legacy/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>在线脚本工坊 · 键鼠工坊 QuickScriptTool</title>
+<meta name="description" content="在浏览器里写一个键鼠宏，直接下载成双击就能跑的独立 EXE。脚本数据全部在你的电脑上处理，不上传服务器。" />
+<link rel="icon" href="../favicon.ico" />
+<link rel="stylesheet" href="../css/site.css" />
+<link rel="stylesheet" href="export.css" />
+</head>
+<body class="we-page">
+
+<header class="we-topbar">
+  <a class="back" href="../index.html">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    返回官网
+  </a>
+  <span class="brand">在线脚本工坊</span>
+  <span class="spacer"></span>
+  <a class="t-btn ghost" href="../demo.html">体验完整界面</a>
+  <a class="t-btn" href="../index.html#download">下载 Windows 版</a>
+</header>
+
+<section class="we-hero-band">
+  <div class="we-main we-hero-inner">
+    <h1>写一个宏，下载成 <b>双击就能跑</b> 的 EXE</h1>
+    <p>
+      导出的 exe = <b>官方播放器</b> + 你的脚本，单文件、免安装、不用装 Python / AutoHotkey。
+      脚本在<strong>你的浏览器里</strong>组装完成，我们只提供一个 5.5 MB 的静态模板文件 ——
+      <b>你的脚本内容与图片都不会上传到服务器</b>。
+    </p>
+    <div class="we-hero-chips">
+      <span class="chip"><i></i>最多 128 个动作</span>
+      <span class="chip"><i></i>鼠标 / 键盘 / 等待 / 循环 / 找图</span>
+      <span class="chip"><i></i>含 AI 与后台窗口的动作不在网页版</span>
+      <span class="chip"><i></i>随时按 F9 停止</span>
+    </div>
+  </div>
+</section>
+
+<main class="we-main">
+  <div class="we-grid">
+
+    <!-- ── 左：动作列表 ─────────────────────────────────────── -->
+    <section class="we-card we-list-card">
+      <div class="we-card-head">
+        <h2>动作列表</h2>
+        <span class="we-count" id="weCount">0 / 128</span>
+      </div>
+
+      <div class="we-templates" id="weTemplates"></div>
+
+      <div class="we-actions" id="weActions"></div>
+
+      <div class="we-addbar">
+        <select id="weAddType" aria-label="选择要添加的动作"></select>
+        <button class="btn btn-primary" type="button" id="weAddBtn">＋ 添加动作</button>
+      </div>
+      <p class="we-hint" id="weAddHint"></p>
+    </section>
+
+    <!-- ── 右：设置与导出 ───────────────────────────────────── -->
+    <aside class="we-side">
+
+      <section class="we-card">
+        <div class="we-card-head"><h2>脚本信息</h2></div>
+        <label class="we-field">
+          <span>脚本名称</span>
+          <input type="text" id="weName" value="我的在线脚本" maxlength="40" />
+        </label>
+        <label class="we-field">
+          <span>你的屏幕分辨率</span>
+          <span class="we-inline">
+            <input type="number" id="weScreenW" min="640" max="16384" step="1" />
+            <em>×</em>
+            <input type="number" id="weScreenH" min="480" max="16384" step="1" />
+          </span>
+        </label>
+        <p class="we-hint" id="weScreenHint">
+          用于把"屏幕上的第几个像素"换算成脚本里的相对位置。已经自动填好，多显示器请填<b>主显示器</b>的分辨率。
+        </p>
+        <label class="we-check">
+          <input type="checkbox" id="weLoopWhole" />
+          <span>整段脚本循环播放（不勾＝跑完一次就自动退出）</span>
+        </label>
+        <label class="we-check">
+          <input type="checkbox" id="weLowPerf" />
+          <span>低性能模式（挂机时更省电、更凉）</span>
+        </label>
+      </section>
+
+      <section class="we-card we-export-card">
+        <div class="we-card-head"><h2>导出</h2></div>
+        <label class="we-field">
+          <span>模板图（仅"找图点击"需要）</span>
+          <input type="file" id="weImages" accept="image/png,image/bmp,image/jpeg" multiple />
+        </label>
+        <ul class="we-imgs" id="weImgList"></ul>
+
+        <div class="we-scan" id="weScan">还在检查…</div>
+
+        <div class="we-progress" id="weProgress" hidden>
+          <div class="bar"><i id="weProgressBar"></i></div>
+          <div class="txt" id="weProgressTxt"></div>
+        </div>
+
+        <button class="btn btn-primary we-export-btn" type="button" id="weExport">
+          导出为独立 EXE
+        </button>
+        <button class="btn ghost we-export-btn" type="button" id="weCancel" hidden>
+          取消导出
+        </button>
+        <button class="btn ghost we-export-btn" type="button" id="weCopyJson">
+          复制脚本 JSON（给已装客户端的人用）
+        </button>
+        <p class="we-hint" id="weStatus"></p>
+      </section>
+
+      <section class="we-card we-note">
+        <h3>怎么用</h3>
+        <ol>
+          <li>点上面的预设，或从下拉里添加动作。</li>
+          <li>点<b>导出为独立 EXE</b>，浏览器会下载一个 5~6 MB 的 exe。</li>
+          <li>把 exe 拷到目标电脑，<b>双击即跑</b>；跑完（或按 F9）自己退出，不驻留、不写注册表。</li>
+        </ol>
+        <h3>两点要知道</h3>
+        <ul>
+          <li><b>未签名的 exe</b>：首次运行 Windows SmartScreen 可能提示"更多信息 → 仍要运行"，这是所有未做代码签名的工具的通病。</li>
+          <li><b>找图点击</b>需要目标电脑有图像识别组件：装了「键鼠工坊」客户端就直接复用；没装则那一类动作会跳过。</li>
+        </ul>
+      </section>
+
+    </aside>
+  </div>
+</main>
+
+<!-- 动作编辑模板 -->
+<template id="weRowTpl">
+  <div class="we-row">
+    <span class="we-row-no"></span>
+    <span class="we-row-label"></span>
+    <div class="we-row-body"></div>
+    <div class="we-row-tail">
+      <label class="we-repeat">
+        <span>重复</span>
+        <input type="number" class="we-count-input" min="0" max="100000" step="1" title="执行次数；0 = 一直重复" />
+        <span>次，间隔</span>
+        <input type="number" class="we-interval-input" min="0" max="3600" step="0.1" title="两次之间的间隔秒数" />
+        <span>秒</span>
+      </label>
+      <button class="we-icon-btn" type="button" data-act="up" title="上移">↑</button>
+      <button class="we-icon-btn" type="button" data-act="down" title="下移">↓</button>
+      <button class="we-icon-btn danger" type="button" data-act="del" title="删除">×</button>
+    </div>
+  </div>
+</template>
+
+<script src="qst-web-export.js"></script>
+<script src="export.js"></script>
+</body>
+</html>

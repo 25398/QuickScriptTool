@@ -1,0 +1,42 @@
+#include "resource.h"
+#include <winver.h>
+
+#ifndef VS_VERSION_INFO
+#define VS_VERSION_INFO 1
+#endif
+
+// 播放器的版本信息刻意不写 "键鼠工坊" 的产品名：
+// 它是独立分发物，写清楚"脚本播放器"更利于用户/安全软件识别来源。
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "QuickScriptTool"
+            VALUE "FileDescription", "QuickScriptTool Script Player"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "QstScriptPlayer"
+            VALUE "LegalCopyright", "Copyright (C) QuickScriptTool"
+            VALUE "OriginalFilename", "QstPlayer.exe"
+            VALUE "ProductName", "QuickScriptTool Script Player"
+            VALUE "ProductVersion", "1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
+// 图标 ID 顺序与主程序保持一致，让托盘/任务栏图标行为可预期。
+IDI_APPICON ICON "app_icon.ico"
+IDI_TRAY_RUNNING ICON "tray_running.ico"
+IDI_BREAKOUT_PAUSE ICON "breakout_pause.ico"

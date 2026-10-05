@@ -276,9 +276,11 @@ std::wstring ActionName(const ScriptAction& action) {
         return L"变量运算[" + preview + L"]";
     }
     case ActionType::TextRecognition: {
-        const wchar_t* mode = action.ocrResultMode == 1 ? L"文字查找" : L"获取文字";
+        // 文案按模式分流：获取文字存文字，文字查找存**匹配度**（{变量}.matchData）
+        const bool search = action.ocrResultMode == 1;
+        const wchar_t* mode = search ? L"文字查找" : L"获取文字";
         const wchar_t* follow = action.ocrFollowUp == 1 ? L"移动到"
-            : action.ocrFollowUp == 2 ? L"保存变量" : L"点击";
+            : action.ocrFollowUp == 2 ? (search ? L"保存匹配度" : L"保存文字") : L"点击";
         return std::wstring(L"文字识别[") + mode + L"," + follow + L"]";
     }
     case ActionType::If: {
@@ -832,6 +834,56 @@ PlaybackProcessPriorityGuard::~PlaybackProcessPriorityGuard() {
     if (active_) SetPriorityClass(GetCurrentProcess(), prevClass_);
 }
 
+/// 取「效率核（E-core）组」的亲和掩码；拿不到拓扑信息时返回 0（调用方退回旧逻辑）。
+///
+/// 为什么需要它：回放线程每拍**整段自旋**（`kSpinRemainUs = 12000` 覆盖 8ms 一拍，
+/// 见 `input_timeline_scheduler.cpp`）。若这段自旋落在 P-core 上，就会与前台游戏抢 CPU
+/// —— 游戏掉帧会让「每帧累积的鼠标位移」变化，落点随之漂移（即 `[回放保真]` 里
+/// 「偏差在目标侧」的那一半）。
+/// 为什么绑**一组**而不是一个核：绑死单核会失去调度器的迁移能力，该核一旦被中断
+/// 或别的线程占用就**整拍停住**，反而制造 `late` 尖峰。
+static DWORD_PTR PickEfficiencyCoreMask(DWORD_PTR processMask) {
+    using GetCpuSetFn = BOOL (WINAPI*)(void*, ULONG, PULONG, HANDLE);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return 0;
+    auto getCpuSet = reinterpret_cast<GetCpuSetFn>(
+        GetProcAddress(k32, "GetSystemCpuSetInformation"));
+    if (!getCpuSet) return 0;
+
+    // SYSTEM_CPU_SET_INFORMATION = Size(DWORD) + Type(DWORD) + union{ CpuSet{...} }。
+    // 按字段偏移手工解析，避免依赖 SDK 的 _WIN32_WINNT 版本（本项目未显式定义它）。
+    // CpuSet 内：Id(+0) Group(+4) LogicalProcessorIndex(+6) CoreIndex(+7)
+    //            LastLevelCacheIndex(+8) NumaNodeIndex(+9) EfficiencyClass(+10)
+    alignas(8) unsigned char buf[8192]{};
+    ULONG len = sizeof(buf);
+    if (!getCpuSet(buf, len, &len, nullptr) || len < 16) return 0;
+
+    unsigned char bestEff = 0xFF;
+    DWORD_PTR mask = 0;
+    size_t off = 0;
+    while (off + 16 <= len) {
+        const unsigned int size = *reinterpret_cast<const unsigned int*>(buf + off);
+        const unsigned int type = *reinterpret_cast<const unsigned int*>(buf + off + 4);
+        if (size < 16 || off + size > len) break;
+        if (type == 0) {  // CpuSetInformation
+            unsigned short group = 0;
+            unsigned char logical = 0, eff = 0;
+            group = *reinterpret_cast<const unsigned short*>(buf + off + 12);
+            logical = buf[off + 14];
+            eff = buf[off + 18];
+            if (group == 0 && logical < 32) {  // 只处理单处理器组（<=64 逻辑核）
+                const DWORD_PTR bit = static_cast<DWORD_PTR>(1) << logical;
+                if (bit & processMask) {
+                    if (eff < bestEff) { bestEff = eff; mask = 0; }
+                    if (eff == bestEff) mask |= bit;
+                }
+            }
+        }
+        off += size;
+    }
+    return mask;
+}
+
 PlaybackThreadAffinityGuard::PlaybackThreadAffinityGuard(bool enable) {
     if (!enable) return;
     thread_ = GetCurrentThread();
@@ -840,10 +892,15 @@ PlaybackThreadAffinityGuard::PlaybackThreadAffinityGuard(bool enable) {
         || processMask == 0) {
         return;
     }
-    // 选 processMask 中编号最高的核，减少与 UI/游戏抢同一核的概率。
-    DWORD_PTR pin = 1;
-    while ((pin << 1) != 0 && ((pin << 1) & processMask) != 0) pin <<= 1;
-    if ((pin & processMask) == 0) pin = processMask & ~(processMask - 1);
+    // ① 优先：绑到效率核（E-core）组 —— 避开 P-core，同时保留组内迁移能力。
+    DWORD_PTR pin = PickEfficiencyCoreMask(processMask);
+    // ② 退化（全 P-core 机器 / 拿不到拓扑）：沿用「编号最高的核」，
+    //    减少与 UI/游戏抢同一核的概率（Intel 混合架构上最高编号恰好是 E-core）。
+    if (pin == 0) {
+        pin = 1;
+        while ((pin << 1) != 0 && ((pin << 1) & processMask) != 0) pin <<= 1;
+        if ((pin & processMask) == 0) pin = processMask & ~(processMask - 1);
+    }
     prevMask_ = SetThreadAffinityMask(thread_, pin);
     active_ = prevMask_ != 0;
 }

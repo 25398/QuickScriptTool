@@ -77,11 +77,16 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\app_icon.ico") -Destinati
 Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\tray_running.ico") -Destination $StageDir -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\startup.wav") -Destination $StageDir -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\finish.wav") -Destination $StageDir -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "resources\pause.wav") -Destination $StageDir -Force
+
+# NOTE (batch D): resources\models\vit.onnx is deliberately NOT shipped any more —
+# nothing in src/ loads it (the TrackerVit session was rolled back). See
+# tools/package_release.ps1 for the full note.
 
 # Agent Skills（文件化 Skill：对话编辑 / 撤销 / 命令行），随包分发到 skills\agent\
 $skillsStage = Join-Path $StageDir "skills\agent"
 New-Item -ItemType Directory -Force -Path $skillsStage | Out-Null
-foreach ($skillName in @("agent-conversation", "agent-revert", "agent-shell", "agent-script", "agent-optimize", "agent-command", "agent-office", "agent-game")) {
+foreach ($skillName in @("agent-conversation", "agent-revert", "agent-shell", "agent-script", "agent-optimize", "agent-command", "agent-office", "agent-game", "agent-desktop")) {
     $section = $skillName -replace "^agent-", ""
     if ($skillName -eq "agent-script") { $section = "scriptstrategy" }
     # 产品 Skill 优先从 skills/agent/<section>.md 取（我们的资产）；

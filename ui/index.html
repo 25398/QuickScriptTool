@@ -81,6 +81,22 @@ html,body{height:100%;width:100%;margin:0;overflow:hidden;background:var(--sky-1
 .field-grid{padding:0 calc(24px * var(--qst-u)) calc(18px * var(--qst-u));display:flex;flex-direction:column;gap:calc(16px * var(--qst-u))}
 .field label{display:flex;align-items:center;font-size:calc(12.5px * var(--qst-u));color:var(--text-2);margin:0}
 .radios{display:flex;gap:calc(10px * var(--qst-u));flex-wrap:wrap}
+/* ── 导出脚本（脚本包 / 独立 EXE）──────────────────────────────
+   刻意只用项目既有的主题变量（--text/--text-2/--line/--frost/--ice-*/--mint-*），
+   这样用户换主题时这个弹窗自动跟着变，不需要任何额外适配。 */
+.exp-body{display:flex;flex-direction:column;gap:calc(10px * var(--qst-u));padding:calc(14px * var(--qst-u)) calc(18px * var(--qst-u)) calc(6px * var(--qst-u))}
+.exp-name{font-size:calc(13px * var(--qst-u));color:var(--text-3)}
+.exp-opt{border:1px solid var(--line);border-radius:calc(10px * var(--qst-u));padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u));background:var(--frost);cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.exp-opt:hover{border-color:var(--ice-400);box-shadow:0 calc(4px * var(--qst-u)) calc(14px * var(--qst-u)) var(--glow-ice)}
+.exp-opt-h{display:flex;align-items:center;gap:calc(8px * var(--qst-u));font-size:calc(14px * var(--qst-u));font-weight:700;color:var(--text)}
+.exp-opt-tag{font-size:calc(11px * var(--qst-u));font-weight:500;color:var(--mint-400);border:1px solid var(--mint-400);border-radius:calc(6px * var(--qst-u));padding:calc(1px * var(--qst-u)) calc(6px * var(--qst-u))}
+.exp-opt-d{margin-top:calc(6px * var(--qst-u));font-size:calc(12.5px * var(--qst-u));color:var(--text-2);line-height:1.5}
+.exp-scan{border:1px solid var(--line);border-radius:calc(10px * var(--qst-u));background:var(--frost);padding:calc(12px * var(--qst-u)) calc(14px * var(--qst-u));font-size:calc(12.5px * var(--qst-u));color:var(--text-2);line-height:1.75}
+.exp-scan b{color:var(--text)}
+.exp-scan .warn{color:var(--rose);font-weight:700}
+.exp-sec-h{font-size:calc(13px * var(--qst-u));font-weight:700;color:var(--text);margin-bottom:calc(6px * var(--qst-u))}
+.exp-size{font-size:calc(13px * var(--qst-u));color:var(--text);font-weight:700}
+.exp-tip{font-size:calc(12px * var(--qst-u));color:var(--text-3);line-height:1.5}
 .radio{display:flex;align-items:center;gap:calc(8px * var(--qst-u));font-size:calc(13px * var(--qst-u));color:var(--text-2)}
 .radio.on{color:var(--text)}
 .radio i{width:calc(16px * var(--qst-u));height:calc(16px * var(--qst-u));border-radius:50%;border:1.5px solid var(--line-strong,#9eb4cb);display:inline-block}
@@ -808,7 +824,15 @@ body:not(.opt-open) .app{
   padding:calc(12px * var(--qst-opt-u));
 }
 .opt-layout .panel{min-height:0;display:flex;flex-direction:column;padding:calc(12px * var(--qst-opt-u)) !important}
-.opt-list{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:calc(8px * var(--qst-opt-u));background:var(--frost)}
+.opt-list{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:calc(8px * var(--qst-opt-u));background:var(--frost);position:relative;overflow-anchor:none}
+/* 虚拟滚动（窗口化）：.opt-vspace 用 height 撑起总高（超长列表时是**压缩后**的高度），
+   .opt-vwin 绝对定位、只装窗口内的那几十行，每帧用 transform 贴住视口。
+   DOM 恒定 ⇒ 几万条动作也和几十条一样流畅（分批追加做不到这点：
+   它只优化首屏，DOM 仍随滚动无限累积）。
+   ⚠ overflow-anchor:none：窗口内容每帧重建，禁掉浏览器的滚动锚定，
+   否则它会在内容变化时"帮"我们调 scrollTop，造成滚动跳动。 */
+.opt-vspace{position:relative;width:100%;overflow:hidden}
+.opt-vwin{position:absolute;left:0;right:0;top:0;will-change:transform}
 /* 优化列表独立栅格，勿套用编辑器 .arow 的序号/操作列 */
 .opt-headers,
 .opt-list .arow{
@@ -1015,9 +1039,15 @@ body:not(.opt-open) .app{
   background-repeat:no-repeat;
   background-size:100% 100%;
 }
-.arow:nth-child(even):not(.sel):not(.nest-tint){background:var(--sky-50)}
-.arow:nth-child(even):not(.sel).nest-tint{background-color:var(--sky-50)}
-.arow:nth-child(odd):not(.sel).nest-tint{background-color:var(--frost)}
+/* ⚠⚠ 必须限定在 .action-list（宏编辑器）内：这三条是**全局** `.arow` 规则，
+   特异性 (0,4,0) > 优化列表的 `.opt-list .arow.tone-a` (0,3,0) ⇒ 一旦泄漏到
+   优化列表，行底色就由**它在窗口 DOM 里的位置**（:nth-child 奇偶）决定；
+   而虚拟滚动的窗口起点随滚动变化 ⇒ 奇偶翻转 ⇒ **同一行滚动时不断换色**。
+   （探针 `probe_opt_list_virtual_scroll.py` 场景 D 钉死这条：滚动一行后
+    同一动作序号的底色必须不变。） */
+.action-list .arow:nth-child(even):not(.sel):not(.nest-tint){background:var(--sky-50)}
+.action-list .arow:nth-child(even):not(.sel).nest-tint{background-color:var(--sky-50)}
+.action-list .arow:nth-child(odd):not(.sel).nest-tint{background-color:var(--frost)}
 .arow .ano{
   display:flex;align-items:center;min-width:0;overflow:visible;
 }
@@ -3128,7 +3158,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
           </div>
           <div class="cta-side">
             <div class="rec-mode-pills">
-              <div class="mode-pill" id="recWindowMode" title="窗口模式：以鼠标所在最上层窗口为目标录制，回放跟随窗口">全屏模式 ▾</div>
+              <div class="mode-pill" id="recWindowMode" title="后台窗口模式：以鼠标所在最上层窗口为目标录制，回放跟随该窗口、不抢前台焦点，目标被遮挡也能操作（脚本内的模式即“后台窗口模式”）。前台模式则按屏幕绝对坐标操作，回放时窗口必须在前台。">前台模式 ▾</div>
               <div class="mode-pill" id="recMode" title="图片定位：点击前截模板，自动转找图">自动识别 ▾</div>
             </div>
             <div class="cta-key" id="ctaRecKey">F8</div>
@@ -3289,7 +3319,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
         <div class="st-tab active" data-stab="click">点击设置</div>
         <div class="st-tab" data-stab="play">宏回放设置</div>
         <div class="st-tab" data-stab="other">其他设置</div>
-        <div class="st-tab" data-stab="window">窗口模式</div>
+        <div class="st-tab" data-stab="window">窗口/后台窗口模式</div>
         <div class="st-tab" data-stab="ai">AI助手</div>
         <div class="st-tab" data-stab="about">关于</div>
       </div>
@@ -3313,6 +3343,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
               <div class="row"><span class="chk" id="setDebugWin"><i>✓</i></span><span class="lbl-w">宏调试窗口</span></div>
               <div class="row"><span class="chk on" id="setAutoKeyDebug"><i>✓</i></span><span class="lbl-w">自动输出关键信息</span></div>
               <div class="row"><span class="chk" id="setLowPerfMode"><i>✓</i></span><span class="lbl-w">低性能模式</span></div>
+              <div class="row"><span class="chk" id="setSpreadRelMoves"><i>✓</i></span><span class="lbl-w">细分位移铺满窗口（实验·实测变差）</span></div>
               <div class="row"><span class="chk on" id="setAiFastPaths"><i>✓</i></span><span class="lbl-w">AI 高级加速</span></div>
               <div class="row"><span class="chk" id="setFindGpuAccel"><i>✓</i></span><span class="lbl-w">找图 GPU 加速</span></div>
               <div class="row"><span class="chk on" id="setRecCaptureEn"><i>✓</i></span><span class="lbl-w">录制截模板半径</span><div class="inp sm" id="setRecCaptureHalf" contenteditable="true">40</div></div>
@@ -3361,6 +3392,10 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
                 <span class="chk on" id="setPlaySoundEnd"><i>✓</i></span>
                 <span class="lbl-w">脚本结束时播放声音</span>
               </span>
+              <span class="sound-chk-pair">
+                <span class="chk" id="setExportAsZip"><i>✓</i></span>
+                <span class="lbl-w">导出脚本默认为 zip 格式</span>
+              </span>
             </div>
             <div class="row"><span class="chk on" id="setHideTip"><i>✓</i></span><span class="lbl-w">关闭右下角运行提示</span></div>
             <div class="row"><span class="chk on" id="setCloseTray"><i>✓</i></span><span class="lbl-w">关闭按钮隐藏到托盘</span></div>
@@ -3387,26 +3422,44 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
           </div>
         </div>
         <div class="set-pane" data-pane="window">
-          <div class="panel"><div class="panel-head"><div><h3>窗口模式</h3><p>预览 · 健康检查 · 输入回退</p></div></div>
+          <div class="panel"><div class="panel-head"><div><h3>窗口/后台窗口模式</h3><p>预览 · 健康检查 · 输入回退</p></div></div>
             <div class="row"><span class="chk on" id="setWmPreviewThumb"><i>✓</i></span><span class="lbl-w">运行时显示目标窗口预览缩略图</span></div>
             <div class="row"><span class="lbl-w">预览刷新间隔</span><div class="inp sm" id="setWmPreviewMs" contenteditable="true">500</div><span class="lbl">毫秒(200~5000)</span></div>
             <div class="row"><span class="chk on" id="setWmBlockUnhealthy"><i>✓</i></span><span class="lbl-w">目标窗口不健康时阻止运行</span></div>
             <div class="row"><span class="chk" id="setWmFgFallback"><i>✓</i></span><span class="lbl-w">后台输入失败时允许前台输入回退</span></div>
             <div class="row"><span class="chk" id="setWmHideModule"><i>✓</i></span><span class="lbl-w">注入后隐藏模块（测试模块枚举检测）</span></div>
-            <div class="row"><span class="chk on" id="setWmEnableInject" title="关闭后窗口模式不向目标进程注入假焦点 DLL（联机/反作弊更安全）。冒险岛等后台游戏仍会强制注入，否则按键无效。"><i>✓</i></span><span class="lbl-w">启用假焦点注入</span>
+            <div class="row"><span class="chk on" id="setWmEnableInject" title="关闭后窗口/后台窗口模式不向目标进程注入假焦点 DLL（联机/反作弊更安全）。冒险岛等后台游戏仍会强制注入，否则按键无效。"><i>✓</i></span><span class="lbl-w">启用假焦点注入</span>
               <div class="combo" id="setWmInjectTech">经典远线程</div></div>
+            <div class="row"><span class="chk on" id="setWmTimeScale" title="回放倍速同时作用于目标窗口进程的时钟：脚本 2 倍速时游戏冷却/动画也 2 倍速，脚本才不会在冷却结束前就再次操作。仅在后台窗口模式生效；倍率 1.0 时不改变目标行为。与「启用假焦点注入」互相独立：即使关掉注入也照样生效（此时只注入时钟补丁，不改变键鼠路径）。"><i>✓</i></span><span class="lbl-w">启用窗口变速（回放倍速同步作用于目标窗口）</span></div>
           </div>
         </div>
         <div class="set-pane" data-pane="ai">
-          <div class="panel"><div class="panel-head"><div><h3>模型配置</h3><p>OpenAI 兼容</p></div>
-            <div style="display:flex;gap:8px"><button class="btn ghost">添加模型</button><button class="btn danger">删除</button></div></div>
+          <div class="panel"><div class="panel-head"><div><h3 id="aiPanelTitle">模型配置</h3><p id="aiPanelSub">OpenAI 兼容</p></div>
+            <div style="display:flex;gap:8px" id="aiModelBtns"><button class="btn ghost">添加模型</button><button class="btn danger">删除</button></div></div>
             <div class="row"><span class="chk on" id="aiEnabled"><i>✓</i></span><span class="lbl-w">启用 AI 脚本助手</span>
               <div class="combo" id="aiModelCombo">未添加模型</div></div>
-            <div class="row"><span class="lbl form-lab">API 地址</span><div class="inp grow" id="aiApiUrl" contenteditable="true"></div></div>
-            <div class="row"><span class="lbl form-lab">API 密钥</span><div class="inp grow" id="aiApiKey" contenteditable="true"></div></div>
-            <div class="row"><span class="lbl form-lab">模型名称</span><div class="inp grow" id="aiModelName" contenteditable="true"></div></div>
-            <div class="row"><span class="lbl form-lab">温度</span><div class="inp sm" id="aiTemp" contenteditable="true">0.3</div>
-              <span class="lbl">Token</span><div class="inp sm" id="aiTokens" contenteditable="true">4096</div></div>
+            <!-- ① API 模型：只显示这一组（选窗口应用时整组隐藏） -->
+            <div id="aiApiFields">
+              <div class="row"><span class="lbl form-lab">API 地址</span><div class="inp grow" id="aiApiUrl" contenteditable="true"></div></div>
+              <div class="row"><span class="lbl form-lab">API 密钥</span><div class="inp grow" id="aiApiKey" contenteditable="true"></div></div>
+              <div class="row"><span class="lbl form-lab">模型名称</span><div class="inp grow" id="aiModelName" contenteditable="true"></div></div>
+              <div class="row"><span class="lbl form-lab">温度</span><div class="inp sm" id="aiTemp" contenteditable="true">0.3</div>
+                <span class="lbl">Token</span><div class="inp sm" id="aiTokens" contenteditable="true">4096</div></div>
+            </div>
+            <!-- ② 窗口应用（窗口 Agents）：选中的是客户端窗口时**只显示这一组** -->
+            <div id="aiWindowAgentFields" hidden>
+              <div class="row"><span class="lbl form-lab">窗口应用</span>
+                <div class="inp grow" id="waPanelApp" contenteditable="false"></div></div>
+              <div class="row"><span class="lbl form-lab">进程</span>
+                <div class="inp grow" id="waPanelProcess" contenteditable="false"></div></div>
+              <div class="row"><span class="lbl form-lab">状态</span>
+                <p class="hint" id="waPanelState"></p></div>
+              <div class="row" style="gap:8px">
+                <button type="button" class="btn primary" id="btnWindowAgentOpen">选择窗口应用…</button>
+                <button type="button" class="btn ghost" id="btnWaPanelUnbind">解除绑定</button>
+              </div>
+              <div class="row"><p class="hint" id="windowAgentSummary"></p></div>
+            </div>
           </div>
         </div>
         <div class="set-pane" data-pane="about">
@@ -3740,6 +3793,30 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
     </div>
   </div>
 
+  <div class="overlay" id="ov-export-exe">
+    <div class="dlg">
+      <div class="dlg-title">导出为独立 EXE <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
+      <div class="dlg-body exp-body">
+        <div class="exp-scan" id="expScan">正在检查脚本…</div>
+        <div>
+          <div class="exp-sec-h">目标电脑装了「键鼠工坊」吗？</div>
+          <div class="radios" id="expTargetRadios">
+            <div class="radio on" data-v="none"><i></i>没装 / 不确定 —— 需要的能力全部自带（推荐）</div>
+            <div class="radio" data-v="installed"><i></i>装了 —— 复用软件里已有的组件（体积更小）</div>
+          </div>
+        </div>
+        <div id="expAdvanced" hidden>
+          <div class="exp-sec-h">分别指定</div>
+          <div class="row"><span class="chk on" id="expBundledOpenCv"><i>✓</i></span><span class="lbl-w">找图 / 找色：把图像识别组件打进 exe</span></div>
+          <div class="row"><span class="chk on" id="expBundledOcr"><i>✓</i></span><span class="lbl-w">文字识别：用目标电脑的系统 OCR</span></div>
+        </div>
+        <div class="exp-size" id="expSize">预计体积：—</div>
+        <div class="exp-tip">提示：导出的 exe 未做数字签名，对方首次运行可能看到 Windows 的安全提示，选择「仍要运行」即可。</div>
+      </div>
+      <div class="dlg-foot"><button class="btn lg cancel" data-close>取消</button><button class="btn lg primary" id="btnExportExeOk">导出</button></div>
+    </div>
+  </div>
+
   <div class="overlay" id="ov-opt">
     <div class="dlg opt-size">
       <div class="dlg-title"><span class="dlg-title-text">录制优化</span><div class="win-btns"><div class="win-btn close" data-close title="关闭" aria-label="关闭"></div></div></div>
@@ -3849,6 +3926,36 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
     </div>
   </div>
 
+  <div class="overlay" id="ov-window-agent">
+    <div class="dlg med">
+      <div class="dlg-title">选择窗口应用 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
+      <div class="dlg-body">
+        <div class="panel" style="padding:8px 4px">
+          <div class="row" style="justify-content:center;gap:10px;flex-wrap:wrap">
+            <span class="lbl-w">用准星指定一个窗口</span>
+            <button type="button" class="btn primary crosshair-btn" id="btnWaCrosshair"
+              title="按住不放，把准星拖到目标客户端窗口上松手">按住拖到目标窗口</button>
+          </div>
+          <div class="row"><span class="lbl form-lab">已选窗口</span>
+            <div class="inp grow" id="waPickedTitle" contenteditable="false" style="min-height:24px"></div></div>
+          <div class="row"><span class="lbl form-lab">进程</span>
+            <div class="inp grow" id="waPickedProcess" contenteditable="false"></div></div>
+          <div class="row"><span class="lbl form-lab">状态</span>
+            <p class="hint" id="waPickedState">还没有选择窗口</p></div>
+          <div class="row" style="gap:8px">
+            <button type="button" class="btn primary" id="btnWaBind" disabled>绑定为模型</button>
+            <button type="button" class="btn ghost" id="btnWaUnbind" disabled>解除绑定</button>
+          </div>
+        </div>
+        <div class="panel" style="padding:8px 4px;margin-top:8px">
+          <div class="panel-head"><div><h3>当前打开的窗口</h3><p>点一行即可选中（等价于准星拾取）</p></div></div>
+          <div id="waWindowList"></div>
+        </div>
+      </div>
+      <div class="dlg-foot"><button class="btn cancel" data-close>关闭</button></div>
+    </div>
+  </div>
+
   <div class="overlay" id="ov-theme">
     <div class="dlg med">
       <div class="dlg-title">界面主题 <div class="win-btns" style="margin-left:auto"><div class="win-btn close" data-close>×</div></div></div>
@@ -3888,7 +3995,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
     <div class="df-body"><pre class="debug-log" id="debugLog"></pre></div>
   </div>
 
-<!-- 阶段 C：运行 HUD / 窗口模式预览 / 驱动安装 -->
+<!-- 阶段 C：运行 HUD / 窗口模式预览 / 驱动安装（窗口模式=独立桌面模式，与后台窗口模式区分） -->
 <div class="run-hud" id="runHud">
   <div class="rh-title" id="runHudTitle">宏运行中</div>
   <div class="rh-meta" id="runHudMeta">日常挂机 · 主循环<br>模式：默认 · 已执行 12 步</div>
@@ -3900,7 +4007,7 @@ body.progressive-opt .skel-row{height:calc(34px * var(--qst-opt-u));margin:calc(
 <div class="wm-preview" id="wmPreview">
   <div class="desk"></div>
   <div class="target"></div>
-  <div class="label">窗口模式目标 · 目标窗口</div>
+  <div class="label">后台窗口目标 · 目标窗口</div>
 </div>
 
 <div class="overlay" id="ov-driver-ic">

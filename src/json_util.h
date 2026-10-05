@@ -33,6 +33,97 @@
 
 namespace qst {
 namespace jsonutil {
+/// ★★ **容错序列化**：坏 UTF-8 **不抛异常**，替换成 U+FFFD。
+///
+/// 起因（2026-09-30 真机）：网页通道读回的页面文本里出现了**被截断的多字节字符**
+///   （`0xEF` 之类），而 nlohmann 的 `json::parse` **不校验** UTF-8、`dump()` **校验**
+///   ⇒ 抛 `type_error.316 invalid UTF-8 byte at index 663` ⇒ 整个请求 500
+///   （`HANDLER_EXCEPTION`），宏当场结束。
+/// ⇒ **模型/页面给的文本都是不可信输入**，凡是要序列化出去（回执、请求体、落盘）
+///   都必须走这个函数，别直接用 `dump()`。
+/// ⚠ `indent < 0` 时等价于 `dump()`（紧凑）；`indent >= 0` 时等价于 `dump(indent)`。
+inline std::string DumpUtf8Safe(const nlohmann::json& j, int indent = -1) {
+    return j.dump(indent, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+/// ★★ **把一段字节流修成合法 UTF-8**（非法序列替换成 U+FFFD），返回修好的串。
+///
+/// 为什么需要（2026-09-30 连续两次 500 事故）：
+///   ① 归一化把模型文本里的坏字节带进动作 JSON ⇒ `dump()` 抛 316；
+///   ② 我在工具清单里做**定长截断**，只退了"续字节"、没退"被截断的头字节"
+///      ⇒ 留下半个汉字；而 `json` **从 string 构造时就校验** ⇒
+///      `type_error.316 invalid UTF-8 byte at index 1000: 0x0A`（换行本身合法，
+///      出问题的是它前面那半个字）⇒ 整个请求 500、宏当场结束。
+/// ⇒ 纪律：**任何"拼给外部（模型/文件/回执）的字符串"，出站前过一次这个函数**；
+///   别指望每一处 `substr`/截断都自己小心（已栽两次，症状都离原因极远）。
+/// ⚠ 它只**修**不报：要留痕就统计 `*outFixedBytes`（替换掉多少字节）后自己打日志。
+inline std::string SanitizeUtf8(const std::string& in, size_t* outFixedBytes = nullptr,
+                                size_t* outFirstBadOffset = nullptr) {
+    if (outFixedBytes) *outFixedBytes = 0;
+    if (outFirstBadOffset) *outFirstBadOffset = static_cast<size_t>(-1);
+    std::string out;
+    out.reserve(in.size() + 8);
+    size_t i = 0;
+    const size_t n = in.size();
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        size_t need = 0;
+        if (c < 0x80) need = 1;
+        else if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else need = 0;                       // 0x80~0xBF 单独出现 / 0xF8+ ⇒ 非法
+        bool ok = (need > 0) && (i + need <= n);
+        if (ok && need > 1) {
+            for (size_t k = 1; k < need; ++k) {   // 后续必须都是 10xxxxxx
+                if ((static_cast<unsigned char>(in[i + k]) & 0xC0) != 0x80) { ok = false; break; }
+            }
+            if (ok && need == 2 && c < 0xC2) ok = false;    // 过长编码
+            if (ok && need == 4 && c > 0xF4) ok = false;    // 超出 U+10FFFF
+        }
+        if (ok) {
+            out.append(in, i, need);
+            i += need;
+            continue;
+        }
+        out += "\xEF\xBF\xBD";               // U+FFFD
+        if (outFixedBytes) *outFixedBytes += 1;
+        if (outFirstBadOffset && *outFirstBadOffset == static_cast<size_t>(-1)) {
+            *outFirstBadOffset = i;          // 只记第一处：那才是要找的源头
+        }
+        ++i;
+        // 一个坏区只出一个替换符：紧跟的续字节一起吃掉（否则一串 ）
+        while (i < n && (static_cast<unsigned char>(in[i]) & 0xC0) == 0x80) {
+            if (outFixedBytes) *outFixedBytes += 1;
+            ++i;
+        }
+    }
+    return out;
+}
+
+
+/// ★★ **按字节上限截断，但保证不切开多字节字符**（2026-09-30）。
+///
+/// 为什么单独做成一个函数：这个坑**同一份写法在仓库里出现过两次**（工具清单截断、
+///   CollapseWhitespace 的截断），两次都只退了"续字节"`0x80~0xBF`、**没退被切断的头字节**
+///   ⇒ 留下半个汉字 ⇒ 后面的 `json` 构造抛 `type_error.316` ⇒ 请求 500 或线程内
+///   `std::terminate`（**静默闪退**，连崩溃日志都不写）。同一事实必须只有一份实现。
+/// 判据：先退续字节，再看剩下的头字节后面够不够长（不够就一起去掉），**宁可少一个字**。
+inline std::string TruncateUtf8Safe(const std::string& s, size_t maxBytes,
+                                    const char* ellipsis = "…") {
+    if (s.size() <= maxBytes) return s;
+    size_t n = maxBytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n - 1]) & 0xC0) == 0x80) --n;
+    if (n > 0) {
+        const unsigned char lead = static_cast<unsigned char>(s[n - 1]);
+        size_t need = 1;
+        if ((lead & 0xE0) == 0xC0) need = 2;
+        else if ((lead & 0xF0) == 0xE0) need = 3;
+        else if ((lead & 0xF8) == 0xF0) need = 4;
+        if (s.size() - (n - 1) < need) --n;   // 头字节后面不足 ⇒ 连它一起去掉
+    }
+    return s.substr(0, n) + (ellipsis ? ellipsis : "");
+}
 
 // ── 解析失败诊断（架构评估验收 A2）──────────────────────────────────
 // TryParse 失败时所有 GetX 都返回 false；没有诊断就无从定位「键取不到」的
@@ -229,7 +320,7 @@ class WideObjectView {
 public:
     explicit WideObjectView(const std::wstring& jsonText) {
         const std::string utf8 = ToUtf8(jsonText);
-        ok_ = TryParse(utf8, doc_) && doc_.is_object();
+        ok_ = TryParse(utf8, owned_) && owned_.is_object();
         if (ok_) return;
         // ── 唯一兜底：修掉**非法转义**后重试 ──────────────────────────
         // 为什么必须有：脚本里的路径若写成单个反斜杠（`"images\a.png"`），
@@ -258,34 +349,43 @@ public:
             }
             fixed.push_back(c);
         }
-        ok_ = TryParse(fixed, doc_) && doc_.is_object();
+        ok_ = TryParse(fixed, owned_) && owned_.is_object();
     }
+
+    /// ── 借用已解析对象（零拷贝）──────────────────────────────────
+    /// 用途：**整份文件已经解析过一次**时，逐动作取字段不该再解析一遍。
+    /// 前科（2026-10-03 实测）：`LoadScriptFileData` 先用本类解析整个 14.4MB 文件
+    /// （242ms），随后又对 `ExtractJsonActionBlocks` 抠出的 5881 个块**各解析一次**
+    /// （355ms）—— 同一份 JSON 被 nlohmann 解析两遍，597ms / 793ms 全是重复劳动。
+    /// 传入的 `obj` 必须比本视图活得久（调用点都是遍历已解析 DOM 的引用）。
+    explicit WideObjectView(const nlohmann::json& obj)
+        : borrowed_(&obj), ok_(obj.is_object()) {}
 
     bool valid() const { return ok_; }
 
     bool Has(const wchar_t* key) const {
         if (!ok_ || !key) return false;
-        return doc_.find(ToAsciiKey(key)) != doc_.end();
+        return Doc().find(ToAsciiKey(key)) != Doc().end();
     }
 
     std::wstring GetString(const wchar_t* key, const std::wstring& fallback = {}) const {
         if (!ok_ || !key) return fallback;
-        const auto it = doc_.find(ToAsciiKey(key));
-        if (it == doc_.end() || !it->is_string()) return fallback;
+        const auto it = Doc().find(ToAsciiKey(key));
+        if (it == Doc().end() || !it->is_string()) return fallback;
         return FromUtf8(it->get<std::string>());
     }
 
     double GetNumber(const wchar_t* key, double fallback) const {
         if (!ok_ || !key) return fallback;
-        const auto it = doc_.find(ToAsciiKey(key));
-        if (it == doc_.end() || !it->is_number()) return fallback;
+        const auto it = Doc().find(ToAsciiKey(key));
+        if (it == Doc().end() || !it->is_number()) return fallback;
         return it->get<double>();
     }
 
     bool GetBool(const wchar_t* key, bool fallback) const {
         if (!ok_ || !key) return fallback;
-        const auto it = doc_.find(ToAsciiKey(key));
-        if (it == doc_.end()) return fallback;
+        const auto it = Doc().find(ToAsciiKey(key));
+        if (it == Doc().end()) return fallback;
         if (it->is_boolean()) return it->get<bool>();
         // 兼容老脚本的 `1`/`0`
         if (it->is_number()) return it->get<double>() != 0.0;
@@ -293,7 +393,7 @@ public:
     }
 
     /// 直接拿已解析对象（少数需要遍历数组的场景）
-    const nlohmann::json& raw() const { return doc_; }
+    const nlohmann::json& raw() const { return Doc(); }
 
 private:
     /// 字段名都是 ASCII 字面量（调用点全是 L"..." 形式，已核对），窄化安全。
@@ -303,9 +403,46 @@ private:
         return s;
     }
 
-    nlohmann::json doc_;
+    /// 生效对象：借用时用外部引用，否则用自有解析结果（无效时是 null）。
+    const nlohmann::json& Doc() const { return borrowed_ ? *borrowed_ : owned_; }
+
+    nlohmann::json owned_;
+    const nlohmann::json* borrowed_ = nullptr;
     bool ok_ = false;
 };
+
+/// ★★ **抠出第一个「单个 JSON 对象」**（2026-09-30 实测事故：模型答对了、我们没认出）。
+///
+/// 起因：模型回的是**一个裸对象**
+///   `{"action":"mouseClick","params":{"x":172,"y":498}}`
+/// —— 单条动作它不套数组。而 `ExtractFirstJsonArray` 只找 `[...]` ⇒ 认不出 ⇒
+///   先被当成"嘴炮"（未调用工具）、再报「API 未返回有效动作 JSON」整轮失败，
+///   而**模型其实完全答对了**（用户看到"一题都没做"）。
+/// 判据与数组版同源：按深度配对 `{}`，字符串内的括号不计。
+inline std::wstring ExtractFirstJsonObject(const std::wstring& text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != L'{') continue;
+        int depth = 0;
+        bool inStr = false;
+        bool esc = false;
+        for (size_t k = i; k < text.size(); ++k) {
+            const wchar_t c = text[k];
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == L'\\') esc = true;
+                else if (c == L'"') inStr = false;
+                continue;
+            }
+            if (c == L'"') { inStr = true; continue; }
+            if (c == L'{') ++depth;
+            else if (c == L'}') {
+                --depth;
+                if (depth == 0) return text.substr(i, k - i + 1);
+            }
+        }
+    }
+    return {};
+}
 
 /// 从自由文本（LLM 回复、带 [EXECUTED] 标记的日志）里抠出第一个 JSON 数组。/// 跳过 `[` 后不是 `{`/`[` 的方括号，按深度配对（字符串内的括号不计）。
 inline std::wstring ExtractFirstJsonArray(const std::wstring& text) {

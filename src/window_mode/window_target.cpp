@@ -470,6 +470,15 @@ WindowTargetQuery BuildTargetQuery(const WindowModeScriptConfig& config) {
     // 「指定窗口类」：类名 + 进程路径 +（若有）文档/标题关键词。
     // 标题用文档名 stem（如 test.txt），避免绑到同程序其它空白窗。
     if (config.selectMethod == WindowSelectMethod::UseEditorWindowClass) {
+        // ⚠⚠ `windowNameIsHintOnly`（窗口相对录制的产物）：标题**不作匹配门**。
+        // 录制端写进 windowName 的只是「录制那一刻的标题」，不是用户的检索意图；
+        // 标题易变（换文档/换标签/游戏换场景）⇒ 当硬门会让回放枚举不到任何窗口。
+        // 此时身份只靠 进程路径 + 窗口类名(+子窗类名)，标题留给打分排序用。
+        if (config.windowNameIsHintOnly) {
+            query.allowStoreNotepadHandoff = true;
+            SanitizeWindowTargetQuery(query);
+            return query;
+        }
         const std::wstring& title = !config.windowName.empty()
             ? config.windowName : config.targetWindowTitle;
         std::wstring stem = title;
@@ -534,6 +543,9 @@ bool DoesTopWindowMatchConfig(HWND top, const WindowModeScriptConfig& config) {
 
     // 「指定窗口类」：有文档/标题关键词时必须对上，否则会误绑空白同程序窗并跳过自动打开。
     if (config.selectMethod == WindowSelectMethod::UseEditorWindowClass) {
+        // ⚠⚠ hint-only（窗口相对录制产物）：标题不是判据，别因标题变了就判「没绑到」——
+        // 那会让已正确绑定的目标被拒，回退成「不操作后台」。见 BuildTargetQuery 同处注释。
+        if (config.windowNameIsHintOnly) return true;
         if (query.titleContains.empty()) return true;
         wchar_t title[512]{};
         GetWindowTextW(top, title, 512);
@@ -878,7 +890,7 @@ void InsertWindowJustAboveShell(HWND hwnd) {
 }
 
 void DebugLogTarget(const wchar_t* msg) {
-    WindowModeLog(std::wstring(L"[窗口模式] ") + msg);
+    WindowModeLog(std::wstring(L"[窗口/后台窗口模式] ") + msg);
 }
 
 void EnsureWindowAtSavedNormalRect(HWND hwnd) {
@@ -1162,7 +1174,7 @@ bool ShowMacroDesktopWindow(HWND hwnd, LONG& savedExStyle, bool& layeredTouched,
     animationDisabled = false;
     if (!hwnd || !IsWindow(hwnd)) return false;
     if (!IsIconic(hwnd)) {
-        WindowModeLog(L"[窗口模式] ShowMacroDesktopWindow: 跳过(窗口未最小化)");
+        WindowModeLog(L"[窗口/后台窗口模式] ShowMacroDesktopWindow: 跳过(窗口未最小化)");
         return true;
     }
 
@@ -1431,21 +1443,21 @@ ScopedVisionCapturePrep::ScopedVisionCapturePrep(HWND hwnd, bool backgroundMode)
         // 宏桌面找图结束后统一回到最小化，避免还原为可见态（showCmd=1）引起切窗感。
         savedWp_.showCmd = SW_SHOWMINNOACTIVE;
         if (!IsIconic(root_)) {
-            WindowModeLog(L"[窗口模式] 找图准备: 宏桌面可见，先最小化再无感展开");
+            WindowModeLog(L"[窗口/后台窗口模式] 找图准备: 宏桌面可见，先最小化再无感展开");
             ShowWindow(root_, SW_SHOWMINNOACTIVE);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             if (!IsIconic(root_)) {
-                WindowModeLog(L"[窗口模式] 警告: SW_SHOWMINNOACTIVE 后仍非最小化，展开步骤可能跳过");
+                WindowModeLog(L"[窗口/后台窗口模式] 警告: SW_SHOWMINNOACTIVE 后仍非最小化，展开步骤可能跳过");
             }
             WindowModeLogDesktopSnap(L"最小化后", root_);
         } else {
-            WindowModeLog(L"[窗口模式] 找图准备: 宏桌面最小化，分层无感展开(SetWindowPlacement)");
+            WindowModeLog(L"[窗口/后台窗口模式] 找图准备: 宏桌面最小化，分层无感展开(SetWindowPlacement)");
             WindowModeLogDesktopSnap(L"展开前", root_);
         }
         ready_ = ShowMacroDesktopWindow(root_, savedExStyle_, layeredTouched_,
             savedLayeredAlpha_, savedLayeredFlags_, animationDisabled_, savedAnim_);
         if (!ready_) {
-            WindowModeLog(L"[窗口模式] 警告: ShowMacroDesktopWindow 未就绪");
+            WindowModeLog(L"[窗口/后台窗口模式] 警告: ShowMacroDesktopWindow 未就绪");
         }
         WindowModeLogDesktopSnap(L"展开后", root_);
         return;
@@ -1496,7 +1508,7 @@ ScopedVisionCapturePrep::~ScopedVisionCapturePrep() {
     }
 
     if (restoreOnDestroy_) {
-        WindowModeLog(L"[窗口模式] 找图结束: 还原窗口状态");
+        WindowModeLog(L"[窗口/后台窗口模式] 找图结束: 还原窗口状态");
         WINDOWPLACEMENT wp = savedWp_;
         if (!macroWindowMode
             && (wp.showCmd == SW_SHOWNORMAL || wp.showCmd == SW_SHOWMAXIMIZED)) {
@@ -1525,7 +1537,7 @@ ScopedVisionCapturePrep::~ScopedVisionCapturePrep() {
         auto& vda = VirtualDesktopAccessor::Instance();
         const int nowDesk = vda.GetCurrentDesktopNumber();
         if (nowDesk >= 0 && nowDesk != userDeskAtStart_) {
-            WindowModeLogf(L"[窗口模式] 找图结束: UserDesk %d->%d 切回用户桌面",
+            WindowModeLogf(L"[窗口/后台窗口模式] 找图结束: UserDesk %d->%d 切回用户桌面",
                 nowDesk, userDeskAtStart_);
             vda.GoToDesktopNumber(userDeskAtStart_);
         }
@@ -1609,7 +1621,7 @@ bool ParkHardwareInputTargetOffscreen(HWND hwnd, WINDOWPLACEMENT* savedWp, bool*
         SWP_NOACTIVATE | SWP_NOSENDCHANGING);
     RECT after{};
     if (!GetWindowRect(hwnd, &after) || after.left > -10000) {
-        WindowModeLog(L"[窗口模式] 屏外停放被系统钳回，已还原原位置");
+        WindowModeLog(L"[窗口/后台窗口模式] 屏外停放被系统钳回，已还原原位置");
         RestoreHardwareInputTargetOffscreen(hwnd, *savedWp, *savedTopmost);
         return false;
     }
@@ -2028,7 +2040,7 @@ bool CdpHideLiveOffscreen(HWND hwnd, int viewBefore) {
 
     if (vda.IsPinnedWindow(hwnd) <= 0) {
         if (!vda.PinWindow(hwnd)) {
-            WindowModeLog(L"[窗口模式] CDP 出帧: PinWindow 失败");
+            WindowModeLog(L"[窗口/后台窗口模式] CDP 出帧: PinWindow 失败");
         }
         std::lock_guard<std::mutex> lock(g_cdpParkMu);
         g_cdpPinned[hwnd] = true;
@@ -2038,7 +2050,7 @@ bool CdpHideLiveOffscreen(HWND hwnd, int viewBefore) {
 
     RECT afterPark{};
     if (!GetWindowRect(hwnd, &afterPark) || afterPark.left > -10000) {
-        WindowModeLog(L"[窗口模式] CDP 屏外停放被系统钳回，还原以免窗口留在左上角");
+        WindowModeLog(L"[窗口/后台窗口模式] CDP 屏外停放被系统钳回，还原以免窗口留在左上角");
         if (vda.IsPinnedWindow(hwnd) > 0) vda.UnPinWindow(hwnd);
         WINDOWPLACEMENT saved{};
         bool haveSaved = false;
@@ -2064,7 +2076,7 @@ bool CdpHideLiveOffscreen(HWND hwnd, int viewBefore) {
     }
 
     const bool live = !IsIconic(hwnd);
-    WindowModeLogf(L"[窗口模式] CDP 出帧隐藏: iconic=%d pin=%d offscreen=1 size=%dx%d",
+    WindowModeLogf(L"[窗口/后台窗口模式] CDP 出帧隐藏: iconic=%d pin=%d offscreen=1 size=%dx%d",
         live ? 0 : 1, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, w, h);
     return live;
 }
@@ -2151,7 +2163,7 @@ bool CdpRevealOnMacroForWatch(HWND hwnd) {
         SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         const bool ok = vda.IsPinnedWindow(hwnd) <= 0 && !IsIconic(hwnd);
-        WindowModeLogf(L"[窗口模式] 观看：仅 UnPin（已在屏上）ok=%d pin=%d pos=%d,%d",
+        WindowModeLogf(L"[窗口/后台窗口模式] 观看：仅 UnPin（已在屏上）ok=%d pin=%d pos=%d,%d",
             ok ? 1 : 0, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, wr.left, wr.top);
         return ok;
     }
@@ -2188,10 +2200,10 @@ bool CdpRevealOnMacroForWatch(HWND hwnd) {
     const bool ok = !IsIconic(hwnd) && PlacementLooksOnScreen(wr)
         && vda.IsPinnedWindow(hwnd) <= 0;
     if (ok) {
-        WindowModeLogf(L"[窗口模式] 观看：已 UnPin 并还原到宏桌面（可展开） pos=%d,%d %dx%d",
+        WindowModeLogf(L"[窗口/后台窗口模式] 观看：已 UnPin 并还原到宏桌面（可展开） pos=%d,%d %dx%d",
             wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top);
     } else {
-        WindowModeLogf(L"[窗口模式] 观看：展开未完成 iconic=%d pin=%d left=%d",
+        WindowModeLogf(L"[窗口/后台窗口模式] 观看：展开未完成 iconic=%d pin=%d left=%d",
             IsIconic(hwnd) ? 1 : 0, vda.IsPinnedWindow(hwnd) > 0 ? 1 : 0, wr.left);
     }
     return ok;
@@ -2505,7 +2517,7 @@ void ForceRevealMacroDesktopWindow(HWND hwnd) {
     if (!UserOnMacroDesktopNow()) return;
     if (!IsAppCloakedOrNearInvisible(hwnd)) return;
     StripCloakAndNearInvisibleAlpha(hwnd);
-    WindowModeLog(L"[窗口模式] ForceReveal: 已刮掉 Cloak/近透明 α（用户已在宏桌面）");
+    WindowModeLog(L"[窗口/后台窗口模式] ForceReveal: 已刮掉 Cloak/近透明 α（用户已在宏桌面）");
 }
 
 void RaiseMacroDesktopWindowForWatch(HWND hwnd) {
@@ -2525,7 +2537,7 @@ void RestoreMacroDesktopWindowAfterRun(HWND hwnd) {
     if (LooksLikeFullscreenGameTarget(hwnd)) return;
     ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
     if (RestoreCdpParkPlacementThenMinimize(hwnd)) {
-        WindowModeLog(L"[窗口模式] 会话结束: 已 UnPin/恢复坐标并最小化（禁 GoTo）");
+        WindowModeLog(L"[窗口/后台窗口模式] 会话结束: 已 UnPin/恢复坐标并最小化（禁 GoTo）");
         return;
     }
     auto& vda = VirtualDesktopAccessor::Instance();
@@ -2536,7 +2548,7 @@ void RestoreMacroDesktopWindowAfterRun(HWND hwnd) {
     if (!IsIconic(hwnd)) {
         ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
     }
-    WindowModeLog(L"[窗口模式] 会话结束: 已最小化目标（禁 GoTo/ForceReveal）");
+    WindowModeLog(L"[窗口/后台窗口模式] 会话结束: 已最小化目标（禁 GoTo/ForceReveal）");
 }
 
 bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
@@ -2548,7 +2560,7 @@ bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
     auto& vda = VirtualDesktopAccessor::Instance();
     std::wstring err;
     if (!vda.EnsureLoaded(err)) {
-        WindowModeLog(L"[窗口模式] CDP 停放: VDA 不可用");
+        WindowModeLog(L"[窗口/后台窗口模式] CDP 停放: VDA 不可用");
         return false;
     }
 
@@ -2556,7 +2568,7 @@ bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
 
     MacroVirtualDesktop desk;
     if (!desk.OpenOrCreate()) {
-        WindowModeLog(L"[窗口模式] CDP 停放: 宏桌面未就绪");
+        WindowModeLog(L"[窗口/后台窗口模式] CDP 停放: 宏桌面未就绪");
         return false;
     }
     const int macroIdx = desk.DesktopIndex();
@@ -2580,13 +2592,13 @@ bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
         }
         CdpRevealOnMacroForWatch(hwnd);
         holdView(80);
-        WindowModeLogf(L"[窗口模式] CDP 停放: 用户在宏桌面 iconic=%d",
+        WindowModeLogf(L"[窗口/后台窗口模式] CDP 停放: 用户在宏桌面 iconic=%d",
             IsIconic(hwnd) ? 1 : 0);
         return true;
     }
 
     if (IsCdpLiveOffscreenParked(hwnd)) {
-        WindowModeLog(L"[窗口模式] CDP 停放: 已 Pin+屏外出帧，跳过");
+        WindowModeLog(L"[窗口/后台窗口模式] CDP 停放: 已 Pin+屏外出帧，跳过");
         return true;
     }
 
@@ -2605,7 +2617,7 @@ bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
         holdView(40);
         if (!desk.MoveWindowToMacroDesktop(hwnd)) {
-            WindowModeLogf(L"[窗口模式] CDP 停放 Move 失败: %s", desk.LastError().c_str());
+            WindowModeLogf(L"[窗口/后台窗口模式] CDP 停放 Move 失败: %s", desk.LastError().c_str());
             holdView(150);
             return false;
         }
@@ -2614,7 +2626,7 @@ bool ParkCdpBrowserOnMacroDesktop(HWND hwnd) {
     ClearMacroDesktopTaskbarPreviewSuppression(hwnd);
     const bool live = CdpHideLiveOffscreen(hwnd, viewBefore);
     holdView(80);
-    WindowModeLogf(L"[窗口模式] CDP 停放: iconic=%d live=%d（Move+Pin屏外；禁异桌裸还原）",
+    WindowModeLogf(L"[窗口/后台窗口模式] CDP 停放: iconic=%d live=%d（Move+Pin屏外；禁异桌裸还原）",
         IsIconic(hwnd) ? 1 : 0, live ? 1 : 0);
     return live || alreadyOnMacro;
 }
@@ -2729,7 +2741,7 @@ void StartCdpMacroDesktopWatchPump(HWND hwnd) {
                         && !UserOnMacroDesktopNow()) {
                         const int view = VirtualDesktopAccessor::Instance().GetCurrentDesktopNumber();
                         if (CdpHideLiveOffscreen(h, view)) {
-                            WindowModeLog(L"[窗口模式] 用户已离宏桌面：已回 Pin+屏外（防切屏）");
+                            WindowModeLog(L"[窗口/后台窗口模式] 用户已离宏桌面：已回 Pin+屏外（防切屏）");
                         }
                         revealed = false;
                         revealTries = 0;

@@ -13,7 +13,7 @@ class ForegroundInputRouter {
 public:
     static ForegroundInputRouter& Instance();
 
-    /// 窗口模式回放应传 Software；连点/前台录制回放/鼠标宏传设置里的 foregroundInputBackend。
+    /// 窗口/后台窗口模式回放应传 Software；连点/前台录制回放/鼠标宏传设置里的 foregroundInputBackend。
     void BeginSession(quickscript::ForegroundInputBackend backend);
     /// 兼容旧调用：wantHid=true → Interception。
     void BeginSession(bool wantHid);

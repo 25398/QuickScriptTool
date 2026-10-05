@@ -4,7 +4,6 @@
 #include "action_utils.h"
 #include "agent_ai_actions.h"
 #include "agent_web.h"
-#include "ai_action_lookahead.h"
 #include "ai_action_router.h"
 #include "ai_locate_verify.h"
 #include "ai_logic_convert.h"
@@ -17,6 +16,7 @@
 #include "page_snapshot.h"
 #include "script_action_builder.h"
 #include "utils.h"
+#include "web_ai/web_ai_config.h"   // 桥判定（IsWebAiModelName）：单点事实，别在别处再判一次
 #include "window_mode/ui_element_probe.h"
 
 #include <opencv2/opencv.hpp>
@@ -32,64 +32,128 @@
 
 
 
-namespace {
-std::vector<AgentTool> BuildLookaheadDryToolsLocal() {
-    auto tools = BuildAiActionExecuteTools(nullptr, {});
-    for (auto& t : tools) {
-        const std::wstring name = t.name;
-        t.execute = [name](const std::wstring&) -> std::wstring {
-            return L"[LOOKAHEAD_DRY] " + name + L"（预规划未执行）";
-        };
-    }
-    return tools;
+
+
+/// ★★★ **该模型是不是「桥」（网页 AI / 窗口反代）**——判据只有一处：
+///      `quickscript::webai::IsWebAiModelName`（模型名注册表）。
+/// 为什么要它：**桥不产流**（网页 AI 只在整段生成完才给响应头）⇒ 走流式只会白等一轮空闲
+///   超时（用户实测：「正在连接…」卡到超时再重试）。所以桥必须直接走**完整响应**。
+/// ⚠ 别在别处再写一份判据（本仓这类"同一事实两处实现"漂移过多次）。
+static bool AiModelIsBridge(const std::wstring& modelName) {
+    if (modelName.empty()) return false;
+    return quickscript::webai::IsWebAiModelName(modelName);
 }
 
-std::vector<ToolCallRecord> LookaheadDefaultFetchImpl(
-    const AgentConfig& config,
-    const std::wstring& userPrompt,
-    const std::atomic_bool& stopFlag,
-    AiHttpAbortSlot* httpAbort,
-    const std::atomic_bool& cancelWorker) {
-    std::vector<ToolCallRecord> out;
-    if (stopFlag.load() || cancelWorker.load()) return out;
-    if (config.apiUrl.empty() || config.model.empty()) return out;
-    AgentConfig cfg = config;
-    cfg.recvTimeoutMs = (std::min)(cfg.recvTimeoutMs, 25000);
-    cfg.maxTokens = (std::min)(cfg.maxTokens > 0 ? cfg.maxTokens : 1024, 1024);
-    auto core = std::make_unique<AgentCore>(
-        cfg,
-        L"你是 Windows 桌面宏预规划助手。根据备忘与刚执行的工具摘要，"
-        L"假设界面已按预期变化，只规划下一步工具。必须 tool_calls。"
-        L"定位用 locateAndClick 短描述。预规划供宿主对照观察后选用。",
-        BuildLookaheadDryToolsLocal());
-    ChatMessage msg;
-    msg.role = L"user";
-    msg.content = userPrompt;
-    AgentSendCallbacks cb;
-    cb.cancelFlag = &stopFlag;
-    cb.httpAbort = httpAbort;
-    cb.preferNonStream = true;
-    cb.toolChoice = L"required";
-    cb.stopToolLoopAfterTools = []() { return true; };
-    (void)core->SendMessage(msg, cb);
-    if (stopFlag.load() || cancelWorker.load()) return out;
-    const auto& hist = core->GetHistory();
-    for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
-        if (it->role == L"assistant" && !it->tool_calls.empty()) {
-            out = it->tool_calls;
+/// ★★★ **混合分流执行**（2026-10-02 重建）：把模型的一批动作**按原顺序**执行 ——
+///   宏动作 → `hooks->onExecuteActions`（引擎回放）；工具名 → `BuildAiActionExecuteTools` 表里就地执行。
+///
+/// 为什么必须"按原顺序"：模型常在一批里混用（先 `updateTaskMemo` 记笔记 → 再 `mouseClick` 点 →
+///   再 `scrollWheel`）；若先把所有宏动作一起回放、再统一跑工具，工具看到的界面状态与模型设想
+///   的不同步（点了别处 / 记错了阶段）。
+/// ⚠ **全批都是宏动作时原样交给引擎一次**（不重组、不改字节）——常见路径**零行为变化**，
+///   这也是我敢重建它的前提。
+/// ⚠ **重入闸**：工具执行内部可能再回到这里（`submitMacroActions` → `onExecuteActions` → …）。
+///   深度超限时**如实拒绝**，绝不无限递归 —— 本仓为此付过 `0xC00000FD`（栈溢出）的代价。
+/// ⚠ 判据只看**工具名表**（`BuildAiActionExecuteTools` 的 name），不猜语义。
+std::wstring ExecuteActionJsonMixed(const std::wstring& actionsJson,
+    AiActionHostHooks* hooks, AiMacroLogFn logFn) {
+    thread_local int reentryDepth = 0;
+    struct DepthGuard {
+        int& d;
+        explicit DepthGuard(int& x) : d(x) { ++d; }
+        ~DepthGuard() { --d; }
+    } depthGuard(reentryDepth);
+    if (reentryDepth > 3) {
+        if (logFn) logFn(L"  [诊断] 混合执行重入过深（>" + std::to_wstring(3) + L"）⇒ 拒绝，防无限递归");
+        return L"[错误] 动作执行重入过深，已拒绝";
+    }
+
+    if (actionsJson.empty()) return std::wstring();
+
+    // 解析整批（数组优先；也接受裸对象）
+    nlohmann::json items = nlohmann::json::array();
+    try {
+        // ⚠ 限定名：`using qst::jsonutil::ExtractFirstJsonArray;` 在本文件 164 行，比本函数靠后。
+        const std::wstring arrW = qst::jsonutil::ExtractFirstJsonArray(actionsJson);
+        if (!arrW.empty()) {
+            items = nlohmann::json::parse(ToUtf8(arrW));
+        } else {
+            items = nlohmann::json::parse(ToUtf8(actionsJson));
+        }
+    } catch (...) {
+        items = nlohmann::json::array();
+    }
+    if (!items.is_array() || items.empty()) {
+        // 解析不出来就**原样**交给引擎（保持旧行为，不吞掉调用方的意图）
+        if (hooks && hooks->onExecuteActions) return hooks->onExecuteActions(actionsJson);
+        return std::wstring();
+    }
+
+    // 工具名表：判据单点（与 AgentCore 注册的是同一张表）
+    std::vector<AgentTool> tools = BuildAiActionExecuteTools(hooks, {});
+    auto isToolName = [&tools](const std::string& n) {
+        if (n.empty()) return false;
+        for (const auto& t : tools) {
+            if (ToUtf8(t.name) == n) return true;
+        }
+        return false;
+    };
+
+    // 先分类：全宏 ⇒ 原样一次性回放（零行为变化）
+    int toolItems = 0;
+    for (const auto& it : items) {
+        if (!it.is_object()) continue;
+        if (isToolName(it.value("type", ""))) ++toolItems;
+    }
+    if (toolItems == 0) {
+        if (hooks && hooks->onExecuteActions) return hooks->onExecuteActions(actionsJson);
+        return std::wstring();
+    }
+
+    // 混合：按原顺序走，遇到工具前先把已攒的宏动作 flush 掉
+    std::wstring out;
+    nlohmann::json macroGroup = nlohmann::json::array();
+    int macroItems = 0, macroBatches = 0, toolRuns = 0;
+    auto flushMacros = [&]() {
+        if (macroGroup.empty()) return;
+        if (hooks && hooks->onExecuteActions) {
+            hooks->onExecuteActions(FromUtf8(macroGroup.dump()));
+            ++macroBatches;
+        }
+        macroGroup = nlohmann::json::array();
+    };
+    for (const auto& it : items) {
+        if (!it.is_object()) continue;
+        const std::string t = it.value("type", "");
+        if (!isToolName(t)) {
+            macroGroup.push_back(it);
+            ++macroItems;
+            continue;
+        }
+        flushMacros();   // ★ 前面的宏动作先落地，工具才看得见正确的界面状态
+        std::wstring toolResult;
+        for (auto& tool : tools) {
+            if (ToUtf8(tool.name) != t) continue;
+            toolResult = tool.execute ? tool.execute(FromUtf8(it.dump())) : std::wstring();
             break;
         }
+        ++toolRuns;
+        if (logFn) {
+            std::wstring shown = toolResult.size() > 120 ? toolResult.substr(0, 120) + L"…"
+                                                         : toolResult;
+            logFn(L"  [诊断] 「" + FromUtf8(t) + L"」是**工具**（不是宏动作）⇒ 已按工具执行："
+                + shown);
+        }
+        if (!toolResult.empty()) out += toolResult + L"\n";
+    }
+    flushMacros();
+    if (logFn) {
+        logFn(L"  [诊断] 本次动作 JSON 混合执行：宏动作 " + std::to_wstring(macroItems)
+            + L" 条（分 " + std::to_wstring(macroBatches) + L" 批回放）；工具 "
+            + std::to_wstring(toolRuns) + L" 条就地执行");
     }
     return out;
 }
-
-struct LookaheadFetchRegistrar {
-    LookaheadFetchRegistrar() {
-        RegisterAiLookaheadDefaultFetch(LookaheadDefaultFetchImpl);
-    }
-};
-static LookaheadFetchRegistrar g_lookaheadFetchRegistrar;
-}  // namespace
 
 namespace {
 
@@ -177,7 +241,7 @@ void LogSubmittedActionsBrief(AiMacroLogFn logFn, const std::wstring& headline,
         }
         logFn(headline + std::to_wstring(j.size()) + L" 个：");
         size_t shown = 0;
-        for (const auto& step : j) {
+            for (const auto& step : j) {
             if (!step.is_object()) continue;
             if (shown >= maxItems) {
                 logFn(L"    · …共 " + std::to_wstring(j.size()) + L" 个，已省略");
@@ -595,8 +659,152 @@ double ComputeEffectiveAiImageScale(int width, int height, double userScale, int
     return userScale * static_cast<double>(maxLongEdge) / longAfterUser;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// 【重建】「上一次点击落在哪」的记账与帧内换算（2026-10-02）
+//
+// ⚠ 诚实标注：这一整块**不是复原**，而是**按 ai_action_service.h 的契约重写**。
+//   原因：工作区新版本的 `ai_action_service.cpp` 被我误用 `git checkout --` 覆盖，
+//   其中包含这些函数的原实现（同批丢失的还有混合分流 `ExecuteActionJsonMixed` 等）。
+//   契约来自头文件（未受损），语义逐条照抄头文件注释：
+//     · 坐标口径：调用方给**屏幕绝对像素**，帧内换算由编码方做；
+//     · 同一次点击**只标一帧**（`drawnX/drawnY` 记账）；
+//     · 落点跑到画面外**宁可不标**（画在边缘上等于编造）；
+//     · 提示词与画面必须是**同一句话**（标签口径只此一处）。
+//   引擎侧调用点（engine_script_run.cpp）未受损，说明契约是准的。
+// ══════════════════════════════════════════════════════════════════════════════
+namespace {
+
+/// 当前待标注的落点（模块内唯一一份状态）
+AiClickMarkState g_clickMark;
+/// 上一次编码是否**真的**把落点画进了帧（落点在捕获区域外时为 false）
+bool g_clickMarkDrawnInFrame = false;
+
+}  // namespace
+
+bool AiClickMarkToFramePoint(int screenX, int screenY, int capX1, int capY1, int capX2,
+    int capY2, int frameW, int frameH, int* fx, int* fy) {
+    const int regionW = capX2 - capX1;
+    const int regionH = capY2 - capY1;
+    if (regionW <= 0 || regionH <= 0 || frameW <= 0 || frameH <= 0) return false;
+    // ★ 帧必须与捕获区域**同纵横比**（编码只做等比缩放）：宽高比不一致说明调用方给错了帧，
+    //   此时换算出的位置必然偏 ⇒ **宁可不画**（画在错误位置上等于编造）。
+    //   用例 frame_click_mark_lifecycle⑥ 明确钉住：800×600 区域配 100×100 帧 ⇒ 不标。
+    //   ⚠ 允许 1% 取整误差（等比缩放后宽高会各自取整）。
+    {
+        const long long lhs = static_cast<long long>(frameW) * regionH;
+        const long long rhs = static_cast<long long>(frameH) * regionW;
+        const long long diff = lhs > rhs ? lhs - rhs : rhs - lhs;
+        if (rhs <= 0 || diff * 100 > rhs) return false;
+    }
+    const int x = static_cast<int>(
+        static_cast<long long>(screenX - capX1) * frameW / regionW);
+    const int y = static_cast<int>(
+        static_cast<long long>(screenY - capY1) * frameH / regionH);
+    if (x < 0 || y < 0 || x >= frameW || y >= frameH) return false;   // 画不出真实位置就不画
+    if (fx) *fx = x;
+    if (fy) *fy = y;
+    return true;
+}
+
+bool AiClickMarkTake(AiClickMarkState& st) {
+    if (st.screenX < 0 || st.screenY < 0) return false;                 // ① 有落点
+    if (st.screenX == st.drawnX && st.screenY == st.drawnY) return false; // ② 这一击还没标过
+    if (st.space == AiClickMarkState::CoordSpace::ScreenPx) {
+        int fx = 0, fy = 0;
+        if (!AiClickMarkToFramePoint(st.screenX, st.screenY, st.capX1, st.capY1,
+                st.capX2, st.capY2, st.frameW, st.frameH, &fx, &fy)) {
+            return false;                                               // ③ 落在画面内
+        }
+        st.x = fx;
+        st.y = fy;
+        st.space = AiClickMarkState::CoordSpace::FramePx;
+    } else {
+        if (st.x < 0 || st.y < 0
+            || (st.frameW > 0 && st.x >= st.frameW)
+            || (st.frameH > 0 && st.y >= st.frameH)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void AiClickMarkRecord(AiClickMarkState& st, int x, int y) {
+    // ★ 形参是**屏幕绝对像素**（头文件口径）⇒ 三个字段一起写：
+    //   `screenX/screenY` 是"这一击落在哪"的唯一真值（提示词与去重都读它），
+    //   `x/y` 只是 `AiClickMarkTake` 的工作坐标。
+    //   ⚠ 重建时漏了 screenX/screenY ⇒ 用例⑤「同一点再点一次可重标」失败（已按规格修）。
+    st.screenX = x;
+    st.screenY = y;
+    st.x = x;
+    st.y = y;
+    st.space = AiClickMarkState::CoordSpace::ScreenPx;
+    // 清掉「已画过」的记账：同一点**再点一次**也应该能再标（用户会连点同一个按钮）
+    st.drawnX = -1;
+    st.drawnY = -1;
+}
+
+void ResetAiActionClickMarks() {
+    g_clickMark = AiClickMarkState{};
+    g_clickMarkDrawnInFrame = false;
+}
+
+void SetAiActionClickIntent(const std::wstring& targetDesc) {
+    g_clickMark.intent = targetDesc;
+}
+
+void MarkLastAiClickScreenPoint(int sx, int sy) {
+    if (sx < 0 || sy < 0) return;   // 没点成功：保持旧值不动（头文件语义）
+    AiClickMarkRecord(g_clickMark, sx, sy);
+    g_clickMark.screenX = sx;
+    g_clickMark.screenY = sy;
+    g_clickMarkDrawnInFrame = false;   // 新的一击：允许下一帧再标
+}
+
+void ClearAiActionClickMark() {
+    g_clickMark.screenX = -1;
+    g_clickMark.screenY = -1;
+    g_clickMark.drawnX = -1;
+    g_clickMark.drawnY = -1;
+    g_clickMarkDrawnInFrame = false;
+}
+
+std::wstring FormatFrameClickMarkLabel(const std::wstring& targetDesc) {
+    // 只有这一处拼这句话：图上画的和提示词里说的必须是同一句（头文件的要求）。
+    // ⚠ 过长**必须截断并带 `…`**（用例 frame_click_mark_lifecycle 钉住：
+    //   长描述 ⇒ 含 `…` 且整体短于原描述）。图上画不下，提示词也不该被长描述淹没。
+    if (targetDesc.empty()) return L"× 上一次点击";
+    constexpr size_t kMaxDescChars = 18;
+    if (targetDesc.size() > kMaxDescChars) {
+        return L"× 上一次点击：" + targetDesc.substr(0, kMaxDescChars) + L"…";
+    }
+    return L"× 上一次点击：" + targetDesc;
+}
+
+bool GetAiActionClickMark(int* sx, int* sy, std::wstring* label) {
+    if (g_clickMark.screenX < 0 || g_clickMark.screenY < 0) return false;
+    if (sx) *sx = g_clickMark.screenX;
+    if (sy) *sy = g_clickMark.screenY;
+    if (label) *label = FormatFrameClickMarkLabel(g_clickMark.intent);
+    return true;
+}
+
+std::wstring CurrentAiActionClickMarkLabel() {
+    std::wstring label;
+    if (!GetAiActionClickMark(nullptr, nullptr, &label)) return std::wstring();
+    return label;
+}
+
+bool AiFrameClickMarkDrawnInFrame() {
+    return g_clickMarkDrawnInFrame;
+}
+
 AiImageEncodeResult EncodeBitmapForAiAnalysis(HBITMAP hBitmap, double userScale,
-    int maxLongEdge, const std::wstring* imeStatusText) {
+    int maxLongEdge, const std::wstring* imeStatusText,
+    // ⚠【重建】工作区新版本把它升到 5 参（多 clickMark：把「上一次点击落在哪」画成
+    //   红十字 + 标签）。该版本已随文件丢失 ⇒ 这里**先接住形参、暂不绘制**，
+    //   避免调用点歧义（4 参调用会与旧 4 参重载撞车，编译器报 C2668）。
+    //   待补：用 DrawPredictionCrossOnBitmap + AiFrameClickMarkToFramePoint 画十字。
+    const AiFrameClickMark* clickMark) {
     AiImageEncodeResult out;
     if (!hBitmap) return out;
     BITMAP bm{};
@@ -606,6 +814,44 @@ AiImageEncodeResult EncodeBitmapForAiAnalysis(HBITMAP hBitmap, double userScale,
     out.effectiveScale = ComputeEffectiveAiImageScale(bm.bmWidth, bm.bmHeight, userScale, maxLongEdge);
     out.outWidth = std::max(1, static_cast<int>(bm.bmWidth * out.effectiveScale));
     out.outHeight = std::max(1, static_cast<int>(bm.bmHeight * out.effectiveScale));
+    // ★【重建】真的把落点画进帧（2026-10-02）：头文件要求三条 ——
+    //   ① 有落点；② 这一击**还没标过**（同一击只标一帧，`drawnX/drawnY` 记账）；
+    //   ③ 落点落在画面内（画不出真实位置宁可不画）。
+    //   ⚠ 判据全在 `AiClickMarkTake`（纯函数），这里只负责"把结论落到像素上"。
+    bool markDrawn = false;
+    if (clickMark) {
+        AiClickMarkState mark = g_clickMark;
+        mark.screenX = clickMark->screenX;
+        mark.screenY = clickMark->screenY;
+        mark.capX1 = clickMark->capX1;
+        mark.capY1 = clickMark->capY1;
+        mark.capX2 = clickMark->capX2;
+        mark.capY2 = clickMark->capY2;
+        mark.frameW = out.outWidth;
+        mark.frameH = out.outHeight;
+        mark.space = AiClickMarkState::CoordSpace::ScreenPx;
+        if (AiClickMarkTake(mark)) {
+            HBITMAP marked = static_cast<HBITMAP>(CopyImage(hBitmap, IMAGE_BITMAP, 0, 0, 0));
+            if (marked) {
+                // 只在**副本**上画：原图还要当 diff 基线，改了会让每帧都算"界面已变"（烧 token）
+                if (DrawPredictionCrossOnBitmap(marked, mark.x, mark.y,
+                        (std::max)(6, out.outWidth / 90))) {
+                    out.base64 = BitmapToBase64Jpeg(marked, 62, out.effectiveScale);
+                    markDrawn = true;
+                    g_clickMark.drawnX = clickMark->screenX;   // 记账：这一击已标过
+                    g_clickMark.drawnY = clickMark->screenY;
+                }
+                DeleteBitmapHandle(marked);
+            }
+            if (markDrawn) {
+                g_clickMarkDrawnInFrame = true;
+                return out;
+            }
+        } else if (mark.screenX == g_clickMark.drawnX && mark.screenY == g_clickMark.drawnY) {
+            // 同一落点：这一帧**故意不重复标**（重复标注会让模型以为这里被点了很多次）
+            g_clickMarkDrawnInFrame = false;
+        }
+    }
     // 输入法状态画到截图左上角：TSF 输入法的候选框/组字框是 DirectComposition 独立
     // 悬浮窗，BitBlt+CAPTUREBLT 物理上拍不到；画上去等于把输入法状态烙进截图，
     // Agent 看图即知当前是中文还是英文、是否正在组字（免它盲猜/乱按快捷键）。
@@ -629,7 +875,7 @@ std::vector<std::string> EncodeClipboardSnapshotImages(const MacroClipboardSnaps
     std::vector<std::string> out;
     auto pushBmp = [&](HBITMAP bmp) {
         if (!bmp) return;
-        const AiImageEncodeResult enc = EncodeBitmapForAiAnalysis(bmp, 1.0, 1024, nullptr);
+        const AiImageEncodeResult enc = EncodeBitmapForAiAnalysis(bmp, 1.0, 1024, static_cast<const std::wstring*>(nullptr));
         if (!enc.base64.empty()) out.push_back(enc.base64);
     };
     if (snap.hasBitmap) {
@@ -894,19 +1140,123 @@ std::wstring MergeAllSubmittedActionsJson(const AgentCore* core) {
 
     auto mergeJsonArray = [&](const std::wstring& text) {
 
-        const std::wstring arr = ExtractFirstJsonArray(text);
+        std::wstring arr = ExtractFirstJsonArray(text);
+
+        // ★★ **裸对象也算一条动作**（2026-10-01 实测：模型答对了、我们没认出）。
+        //   单条动作模型常常不套数组，直接回 `{"action":"mouseClick","params":{…}}`；
+        //   旧实现只找 `[...]` ⇒ 认不出 ⇒ 先被当成"嘴炮"、再报「未返回有效动作 JSON」整轮失败。
+        //   ⇒ 数组抠不到时退回抠**单个对象**并包成单元素数组（后面的归一化/分流/回放全部照旧）。
+        if (arr.empty()) {
+            const std::wstring one = qst::jsonutil::ExtractFirstJsonObject(text);
+            if (!one.empty()) arr = L"[" + one + L"]";
+        }
 
         if (arr.empty()) return;
 
         try {
 
-            const nlohmann::json j = nlohmann::json::parse(ToUtf8(arr));
+            nlohmann::json j = nlohmann::json::parse(ToUtf8(arr));   // 可变：下面要就地归一化
 
             if (!j.is_array() || j.empty()) return;
 
             ++batchCount;
 
-            for (const auto& step : j) {
+            for (auto& step : j) {
+                // ★★ **先展开参数容器**（`arguments` / `params` 都认）——**无论有没有 type**。
+                //   实测：模型发过 `{"action":[{"name":"mouseClick","params":{…}}]}`（name+params 混合），
+                //   也把坐标写在**顶层**（`{"action":"mouseClick","x":…}`）⇒ 只认一种就丢坐标，白烧十几轮。
+                for (const char* pk : { "arguments", "params" }) {
+                    if (step.contains(pk) && step[pk].is_object()) {
+                        for (auto it = step[pk].begin(); it != step[pk].end(); ++it) {
+                            if (!step.contains(it.key())) step[it.key()] = it.value();
+                        }
+                    }
+                }
+                // ★★ **名字键五种写法都认**：type / name / action / tool / function。
+                //   实测第五种：`[{"tool":"mouseClick","params":{…}}]` —— 旧实现只认前三种，
+                //   整批变「（无效动作项）」⇒ 16 轮"点了没反应"。
+                if (!step.contains("type") || !step["type"].is_string()
+                    || step["type"].get<std::string>().empty()) {
+                    static const char* kNameKeys[] = { "name", "action", "tool", "function" };
+                    for (const char* k : kNameKeys) {
+                        if (step.contains(k) && step[k].is_string()
+                            && !step[k].get<std::string>().empty()) {
+                            step["type"] = step[k].get<std::string>();
+                            break;
+                        }
+                    }
+                }
+                // ★ **单键形状**（两种都要认）：
+                //   ① `{"computer":"screenshot"}`（值=字符串 ⇒ 那个字符串是 action）
+                //   ② `{"mouseClick":{"x":762,"y":387}}`（**值=对象** ⇒ 对象就是参数，并入顶层）
+                //   ⚠ ② 是 2026-10-02 真机新出现的形状：模型整轮只发这个 ⇒ 旧实现
+                //     `is_string()` 不成立 ⇒ 整批「（无效动作项）」⇒ 连续十几轮一步没动
+                //     （用户体感："咋思考半天都不开始操作呢"）。
+                if ((!step.contains("type") || !step["type"].is_string()) && step.size() == 1) {
+                    // ⚠ nlohmann 的对象迭代器：键用 `it.key()`（`*begin()` 给的是值）；
+                    //   且**改 `step` 之前**先把键/值取出来（改动会让迭代器失效）。
+                    const auto onlyIt = step.begin();
+                    const std::string onlyKey = onlyIt.key();
+                    const nlohmann::json onlyVal = onlyIt.value();
+                    if (onlyVal.is_string()) {
+                        step["type"] = onlyKey;
+                        step["action"] = onlyVal;
+                    } else if (onlyVal.is_object()) {
+                        step["type"] = onlyKey;
+                        for (auto v = onlyVal.begin(); v != onlyVal.end(); ++v) {
+                            if (!step.contains(v.key())) step[v.key()] = v.value();
+                        }
+
+                // ★★ **computer-use 词汇的裸动作 ⇒ 交给 `computer` 工具**（2026-10-02 真机实测）。
+                //   起因：网页端模型每隔一两轮就发 `{"action":"screenshot"}`（想"刷新画面"），
+                //   旧实现回「未知动作类型：screenshot」—— 那句话**没说该用什么**，模型无法据此
+                //   改进，于是下轮再发一次（白烧一轮）。而 `computer` 工具**本来就有**
+                //   `action=screenshot`，且它对"DOM 树可信还截图"是**有意拒绝并给出替代**的
+                //   （实测那页调了 21 次截图 ≈1.7MB 上传，拒绝 + 指向 clickRef 才是正解）。
+                //   ⚠ 工具读的是**条目自身**的 `action`（见 MakeComputerTool），所以保留 `action`、
+                //     只把 `type` 改成工具名 `computer`。
+                //   ⚠ 只映射 **computer-use 词汇**；`type`/`key`/`scroll`/`wait` 这类过于通用的词不碰
+                //     （与自有工具存在歧义风险）。
+                {
+                    const std::string t0 = step.value("type", "");
+                    static const char* kComputerVocab[] = {
+                        "screenshot", "cursor_position", "mouse_move", "left_click",
+                        "right_click", "middle_click", "double_click", "left_click_drag",
+                        "hold_key",
+                    };
+                    for (const char* v : kComputerVocab) {
+                        if (t0 == v) {
+                            step["action"] = t0;   // computer 工具读这一层
+                            step["type"] = "computer";
+                            break;
+                        }
+                    }
+                    // ★★ **computer 的"动作参数"名经常被写错**（2026-10-02 真机：
+                    //   模型发 `{"action":"computer","cmd":"screenshot"}` ⇒ 回
+                    //   「computer 需要 action」⇒ 白烧 2 轮（56s+107s）。
+                    //   `MakeComputerTool` 读的是条目**自身的** `action` 字段，
+                    //   所以把 `cmd` / 嵌套 `params.action|cmd` 归一到顶层 `action`。
+                    //   （兼容层：多认一种写法；规范写法仍是 `{"action":"<computer 动作>"}`。）
+                    if (t0 == "computer") {
+                        const bool actionIsToolName = !step.contains("action")
+                            || step["action"].is_null()
+                            || (step["action"].is_string()
+                                && step["action"].get<std::string>() == "computer");
+                        if (actionIsToolName) {
+                            if (step.contains("cmd") && step["cmd"].is_string()) {
+                                step["action"] = step["cmd"];
+                            } else if (step.contains("params") && step["params"].is_object()) {
+                                const json& p = step["params"];
+                                if (p.contains("action") && p["action"].is_string())
+                                    step["action"] = p["action"];
+                                else if (p.contains("cmd") && p["cmd"].is_string())
+                                    step["action"] = p["cmd"];
+                            }
+                        }
+                    }
+                }
+                    }
+                }
 
                 if (!step.is_object()) continue;
 
@@ -1151,7 +1501,15 @@ AiActionResult ExecuteAiImageAnalysis(
     if (core) core->SetRecvTimeoutMs(effectiveSec * 1000);
 
     AgentSendCallbacks cb = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
-    cb.preferNonStream = false;
+    // ★★ **桥（网页 AI / 窗口反代）不产流**：走流式只会白等一轮空闲超时 ⇒ 直接完整响应。
+    //   判据单点：`AiModelIsBridge` → `quickscript::webai::IsWebAiModelName`（不另抄名单）。
+    const bool qstModelIsBridge =
+        AiModelIsBridge(core ? core->GetConfig().model : std::wstring());
+    cb.preferNonStream = qstModelIsBridge;
+    if (qstModelIsBridge && logFn) {
+        logFn(L"  [诊断] 该模型是「桥」（网页 AI / 窗口反代）⇒ 直接走完整响应"
+            L"（桥不产流，走流式只会白等一轮空闲超时）");
+    }
 
     if (logFn) {
         logFn(L"  [诊断] 上下文模式: " + std::to_wstring(contextMode));
@@ -2299,7 +2657,16 @@ AiActionResult ExecuteAiActionExecute(
     const AiActionRouteKind route = routeOverride
         ? *routeOverride : ClassifyAiActionRoute(resolvedPrompt, withImage);
     result.routeKind = route;
-    const int effectiveTimeoutSec = ResolveAiActionExecuteTimeoutSec(timeoutSec, withImage);
+    int effectiveTimeoutSec = ResolveAiActionExecuteTimeoutSec(timeoutSec, withImage);
+    // ★★ **桥（网页 AI）超时地板抬到 240s**（2026-10-02 真机"反应太慢"）。
+    //
+    //   实测第 1 轮：100KB+图的请求豆包要想 75s+，宿主 90s 超时到点就掐断**重发**
+    //   ⇒ 同一豆包对话里再发一遍（更慢）⇒ 第 1 轮拖到 213s（2×90s 超时 + 重发）。
+    //   桥自己内部有 25/45s「没新回答就提前失败」+ 180s 总上限 ⇒ 宿主这边给 240s
+    //   **只为桥**：真 API 不动（它们流式回字节，秒级可判活）。
+    if (AiModelIsBridge(core ? core->GetConfig().model : std::wstring())) {
+        effectiveTimeoutSec = (std::max)(effectiveTimeoutSec, 240);
+    }
     core->SetRecvTimeoutMs(effectiveTimeoutSec * 1000);
 
     const bool agentic = hostHooks
@@ -2312,13 +2679,7 @@ AiActionResult ExecuteAiActionExecute(
         AiActionToolOptions opts;
         // Computer Use：坐标相对所见截图；无图时绝对点无映射，硬拒
         opts.allowAbsolutePointer = withImage;
-        opts.fillTableOnly = fillTableOnly;
         core->UpdateTools(BuildAiActionExecuteTools(agentic ? hostHooks : nullptr, opts));
-        if (fillTableOnly && logFn)
-            logFn(L"  [诊断] 动态填表工具白名单：禁 runProgram/openWebpage/hotkey 等");
-    }
-    if (agentic) {
-        SetAiActionPlanGateEnabled(true);
     }
 
     if (logFn) {
@@ -2372,8 +2733,9 @@ AiActionResult ExecuteAiActionExecute(
                 }
                 // 快路径：默认 1 级识图；简单目标「紧凑即点」跳过二级（省一轮 API），
                 // 粗框偏大/模糊时 lazy 补级自动升到 2（自适应精炼）。
+                // ⚠ 上游给该钩子加了 elementId（索引直查编号；0=不用编号）⇒ 这里补 0。
                 const std::wstring msg = hostHooks->onLocateAndClick(
-                    target, 1, button, clickCount);
+                    target, 1, button, clickCount, 0);
                 result.routeKind = route;
                 if (msg.rfind(L"[错误]", 0) == 0) {
                     result.ok = false;
@@ -2421,7 +2783,8 @@ AiActionResult ExecuteAiActionExecute(
                 zr.screenX, zr.screenY, true, clickButton, clickCount);
             result.ok = true;
             if (hadBefore && hostHooks && hostHooks->onExecuteActions) {
-                hostHooks->onExecuteActions(result.textResult);
+                // ★ 混合分流：宏动作交引擎回放、工具名就地执行（**按原顺序**）
+                ExecuteActionJsonMixed(result.textResult, hostHooks, logFn);
                 result.actionsAlreadyExecuted = true;
                 int ar[kClickColorGridN]{}, ag[kClickColorGridN]{}, ab[kClickColorGridN]{};
                 if (SampleClickColorGrid(zr.screenX, zr.screenY, ar, ag, ab)
@@ -2537,10 +2900,19 @@ AiActionResult ExecuteAiActionExecute(
             std::wstring lastChangeRoisText;
             /// 本地 OCR 的屏幕文字坐标索引（每轮注入；OCR 未装则为空）
             std::wstring lastTextIndex;
+            /// ★统一「可点元素索引」（UIA ∪ OCR 的带编号可点清单，见 BuildAiElementIndex）：
+            /// 模型按**编号/名字**说话，宿主直接查表拿坐标（0 次识图）；空则本轮不发。
+            std::wstring lastElementIndex;
+            // ★★ **清单与上一轮完全一致时，不再整张重发**（2026-10-02，用户实测"思考越来越久"）。
+            //   豆包对话里同一份 80 条元素索引被连续 3 轮**完整重复** ⇒ 请求体每轮白白膨胀，
+            //   模型每轮要重新消化几百行清单（日志：`等模型 21031ms + 本地 16ms` —— 全是模型在想）。
+            //   ⇒ 判据：文字索引与元素索引**双双**等于上一轮 ⇒ 只注入一句话"沿用上一轮清单"，
+            //     编号仍有效（编号本来就"只在当前这一帧有效"，帧没变自然有效）；
+            //     任一有变 ⇒ 照旧整张重发（准确性优先；**不做**"只发变化条目"——编号会随
+            //     增删漂移，半张清单会让模型拿旧编号点到隔壁）。
+            bool qstIndexSameAsLastRound = false;
             std::wstring repeatToolHint;
             std::wstring locateLoopHint;
-            AiActionLookahead lookahead;
-            std::wstring pendingLookaheadHint;
             std::wstring pendingPivotHint;
 
             auto historyHasLocateFail = [](const std::vector<ChatMessage>& hist, size_t afterIdx) {
@@ -2617,7 +2989,135 @@ AiActionResult ExecuteAiActionExecute(
                 return any;
             };
 
-            for (int round = 0; round < rounds; ++round) {
+            // ★★★ **批量选择题收割循环**（新路由，2026-10-02 用户批准；二版：翻页泛化）──
+    // 树里出现批量选择页（几何聚类判据，不认命名习惯）时，不再让模型自由发挥：
+    //   observePage → 几何聚类 → 逐题极短提示（只答一个字母）→ clickRef
+    //   → 树里有「下一页」按钮就点它、否则 scrollWheel 一屏 → 再 observePage …
+    //   直到"本页没有题组且没有翻页手段"或页数上限。
+    // ⚠ 任何一步失败都只跳过/收工，**绝不把任务交还给自由 agent 循环中途乱接**；
+    //   从未进入（首页就无题组形状）才放行给下面的 agent 循环。
+    {
+        std::wstring quizFgTitle;
+        if (HWND fg = GetForegroundWindow()) {
+            wchar_t buf[512]{};
+            GetWindowTextW(fg, buf, 512);
+            quizFgTitle = buf;
+        }
+        if (hostHooks && hostHooks->onObservePage && hostHooks->onClickRef && core) {
+            const int kMaxPages = 40;
+            int totalAnswered = 0;
+            int totalSkipped = 0;
+            bool entered = false;
+            std::wstring prevTree;
+            for (int page = 0; page < kMaxPages && !stopFlag.load(); ++page) {
+                const std::wstring quizTree = hostHooks->onObservePage(false, quizFgTitle, L"", 0);
+                if (quizTree.empty() || quizTree.rfind(L"[错误]", 0) == 0) break;
+                const PageSnapshot quizSnap = AiLastPageSnapshot();
+                std::vector<QuizChoiceGroup> quizGroups;
+                if (BuildQuizChoiceGroups(quizSnap, quizGroups)) {
+                    if (!entered && logFn)
+                        logFn(L"  [诊断] ★ 批量选择题收割循环：进入（几何聚类分组，"
+                            L"逐题短提示+clickRef，自动翻页）");
+                    entered = true;
+                    const int total = static_cast<int>(quizGroups.size());
+                    int pageAnswered = 0;
+                    // ★★★ **一次问全部 + 分批解析回复**（2026-10-03 用户要求）
+                    //
+                    //   ⚠⚠ 原来是**逐题问**（每题 1 轮 API）⇒ 真机每题 10~15 秒，
+                    //     27 题要 **5~9 分钟**（用户反复抱怨"慢"）✓
+                    //   ⇒ 现在把**整页题目一次发过去**，模型**一次返回 JSON 数组**
+                    //     （`["A","C","B",...]`），宿主再**逐条 clickRef** ✓
+                    //   ⇒ **1 轮 API 换 N 轮** ⇒ 20 题从 3~5 分钟降到 ~15 秒 ✓✓✓
+                    std::vector<wchar_t> answers(static_cast<size_t>(total), 0);
+                    {
+                        std::wstring allPrompt = FormatQuizAllQuestionsPrompt(quizGroups);
+                        AgentSendCallbacks qcb0 = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
+                        qcb0.preferNonStream = AiModelIsBridge(core->GetConfig().model);
+                        ChatMessage qMsg0;
+                        qMsg0.role = L"user";
+                        qMsg0.content = allPrompt;
+                        SuppressThinkingForNextRounds(1);   // 结构上只需一个字母数组
+                        const std::wstring qReply0 = core->SendMessage(qMsg0, qcb0);
+                        answers = ParseQuizAnswerArray(qReply0, static_cast<size_t>(total));
+                        int got = 0;
+                        for (wchar_t c : answers) if (c != 0) ++got;
+                        if (logFn)
+                            logFn(L"  [诊断] 收割循环（一次问全）：共 " + std::to_wstring(total)
+                                + L" 题，解析出 " + std::to_wstring(got) + L" 个答案"
+                                + (got == 0 ? L"（回复没按 JSON 数组格式 ⇒ 全跳过）" : L""));
+                    }
+                    for (int qi = 0; qi < total && !stopFlag.load(); ++qi) {
+                        const QuizChoiceGroup& g = quizGroups[qi];
+                        const wchar_t letter = answers[static_cast<size_t>(qi)];
+                        const QuizChoiceOption* hit = nullptr;
+                        if (letter != 0) {
+                            for (const auto& o : g.options) {
+                                if (!o.letter.empty() && o.letter[0] == letter) { hit = &o; break; }
+                            }
+                        }
+                        if (!hit) {
+                            ++totalSkipped;
+                            if (logFn)
+                                logFn(L"  [诊断] 收割循环：第 " + std::to_wstring(qi + 1)
+                                    + L" 题跳过（"
+                                    + (letter == 0 ? L"这一次的答案数组里这题是 ?（答不出）"
+                                        : L"字母 " + std::wstring(1, letter)
+                                        + L" 不在本页选项里（页边界截断）")
+                                    + L"）——继续下一题");
+                            continue;
+                        }
+                        const std::wstring clickRes = hostHooks->onClickRef(hit->ref, false);
+                        ++totalAnswered;
+                        ++pageAnswered;
+                        if (logFn)
+                            logFn(L"  [诊断] 收割循环第 " + std::to_wstring(totalAnswered) + L" 题："
+                                + g.title + L" → " + std::wstring(1, letter) + L"（ref="
+                                + hit->ref + L"）回执：" + TruncateForLog(clickRes, 60));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+                    }
+                } else if (!entered) {
+                    break;   // 首页就没有批量选择形状 ⇒ 交给下面的 agent 循环
+                }
+
+                // ★ 翻页手段（通用探测）：优先树里的「下一页」按钮；没有就滚轮一屏；
+                //   再没有 ⇒ 收工（如实汇报已答多少）。
+                const std::wstring nextRef = FindNextPageControlRef(quizSnap);
+                if (!nextRef.empty()) {
+                    hostHooks->onClickRef(nextRef, false);
+                    if (logFn)
+                        logFn(L"  [诊断] 收割循环：点「下一页」(ref=" + nextRef + L") ⇒ 继续");
+                } else if (hostHooks->onExecuteActions) {
+                    hostHooks->onExecuteActions(
+                        L"[{\"action\":\"scrollWheel\",\"scrollDirection\":1,\"scrollSteps\":8}]");   // ⚠ schema 是 scrollDirection(0/1)+scrollSteps；原来写成 direction/delta ⇒ 三字段全错 ⇒ 静默落默认=向上
+                    if (logFn)
+                        logFn(L"  [诊断] 收割循环：树里没有「下一页」⇒ scrollWheel 一屏 ⇒ 继续");
+                } else {
+                    if (logFn) logFn(L"  [诊断] 收割循环：无翻页手段 ⇒ 收工");
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                if (quizTree == prevTree) {
+                    if (logFn) logFn(L"  [诊断] 收割循环：翻页后树没变化 ⇒ 收工（防死循环）");
+                    break;
+                }
+                prevTree = quizTree;
+            }
+            if (entered && (totalAnswered > 0 || totalSkipped > 0)) {
+                result.routeKind = route;
+                result.ok = true;
+                result.actionsAlreadyExecuted = true;
+                result.anyActionsExecuted = true;
+                result.textResult = L"[quiz-pipeline] 已按答案点击 " + std::to_wstring(totalAnswered)
+                    + L" 题"
+                    + (totalSkipped > 0
+                        ? (L"，跳过 " + std::to_wstring(totalSkipped) + L" 题（选项不全/回复无字母）")
+                        : std::wstring());
+                return result;
+            }
+        }
+    }
+
+    for (int round = 0; round < rounds; ++round) {
                 if (stopFlag.load()) {
                     result.errorMessage = L"用户取消";
                     return result;
@@ -2678,9 +3178,10 @@ AiActionResult ExecuteAiActionExecute(
                         L"未装扩展或树上没有则 locateAndClick。"
                         L"禁止再 openWebpage/fetchWebPage 打开 api 接口或猜用户 UID。"
                         L"加载中只 wait。细则 section=agent。";
-                    pendingLookaheadHint.clear();
                     instruction.clear();
                     lastTextIndex.clear();
+                    lastElementIndex.clear();
+                    qstIndexSameAsLastRound = false;
                 } else if (!lastSettleHint.empty()) {
                     instruction = lastSettleHint;
                     if (!lastChangeRoisText.empty()) {
@@ -2712,29 +3213,10 @@ AiActionResult ExecuteAiActionExecute(
                     } else if (pk == L"dom") {
                         instruction += L"\n★pageKind=dom：搜人/搜词用 searchOnPage(query)，树上 clickRef/typeRef。"
                             L"树上有目标则 clickRef；没有或未装扩展则 locateAndClick。";
-                        if (LooksLikeSiteSearchResultsUrl(AiLastPageUrl())) {
-                            instruction += L"\n★已在搜索结果页：clickRef 用户卡片（href 含 space.bilibili.com，会打开主页）或视频。"
-                                L"点筛选项不会跳转。禁止再搜索。";
-                        } else if (LooksLikeUserSpaceSiteUrl(AiLastPageUrl())) {
-                            instruction += L"\n★这是某个用户空间，找别的UP请 searchOnPage(query)，勿用站内搜。";
-                        }
                     } else if (pk == L"mixed") {
                         instruction += L"\n★pageKind=mixed：网页按钮优先 clickRef/typeRef；树上没有则 locateAndClick。"
                             L"播放器在动也可点工具栏。";
                     }
-                }
-                // ★桌面游戏/自绘画面：每轮都必须把「用视觉推进」写进指令。
-                // 这类前台没有控件树、没有 DOM，模型若被其它提示（页面动态大/别点内容）
-                // 带偏就会一直观察+思考不出手 —— 用户实测的「游戏没反应」。
-                if (AiActionGameForegroundLikely()) {
-                    instruction += L"\n★前台是游戏/自绘动态画面（无控件树，UIA 无效）：**就用视觉推进**——"
-                        L"locateAndClick(target=短描述) 点画面里的按钮/植物/僵尸；"
-                        L"两步操作（拿卡→放卡、点A→点B）用 locateAndClick(targets=[\"A\",\"B\"]) "
-                        L"一次做完，不要分成两轮；同一张卡冷却独立，批量进攻就把多个目标一次列进 targets。"
-                        L"键盘用 keyClick / keyDown+keyUp（长按不要用 keyClick 连点）；"
-                        L"看不清先 screenshot。本轮必须至少落一个动作（点/按/找图），"
-                        L"不要只观察、不要反复 activateWindow。细则 lookupMacroAction(section=game)。"
-                        + AiGameNudgeOnce();
                 }
                 // ★通用「换策略」约束（不限游戏）：同一手段连续 3 轮没有进展就必须换，别原地重试。
                 // 实测：AI 会「同一个点连点被拦→再点→再被拦」或「同一只僵尸送死 5 轮」。
@@ -2748,7 +3230,25 @@ AiActionResult ExecuteAiActionExecute(
                 if (!unlimitedRounds && round + 1 >= rounds)
                     instruction += L" 最后一轮：做完或 completeTask 说明卡点。";
                 // ★文字索引排在最后：模型最容易看到，且它是「不必看图也能点」的依据
-                if (!lastTextIndex.empty()) instruction += L"\n" + lastTextIndex;
+                // ★可点元素索引排在**最前**（仅次于落点标注）：它是「所见即所得」的主通道 ——
+                // 模型应当优先用索引里的编号/名字说话，索引命中就 0 次识图；
+                // 排在最后会被长指令淹没，模型又回去「看图猜坐标」。
+                if (!lastElementIndex.empty()) {
+                    if (qstIndexSameAsLastRound) {
+                        // ★ 清单没变：只补一句（模型手里已有上一轮的全量清单，编号仍有效）
+                        instruction += L"\n（可点清单与上一轮完全相同 ⇒ 沿用上一轮清单与编号，"
+                            L"勿要求重发。）\n";
+                    } else {
+                        instruction += L"\n" + lastElementIndex;
+                        instruction += L"★优先用这张索引里的**名字**调 locateAndClick"
+                            L"（命中索引 = 0 次识图，比看图定位快一个数量级）；"
+                            L"索引里确实没有的目标才靠视觉定位。\n";
+                    }
+                }
+                // ★文字索引排在最后：模型最容易看到，且它是「不必看图也能点」的依据
+                // （索引没建起来时它仍在，作为兜底）
+                if (!lastTextIndex.empty() && lastElementIndex.empty())
+                    instruction += L"\n" + lastTextIndex;
                 // 对话框：只注入探测事实，不教操作菜单元
                 saveAsForeground = false;
                 if (hostHooks && hostHooks->onProbeForegroundDialog) {
@@ -2762,10 +3262,6 @@ AiActionResult ExecuteAiActionExecute(
                             L"\n[事实] 另存为导航：优先文件名框 quickInput(完整路径或纯文件名, clearFirst)"
                             L"→Enter；禁止 scrollWheel 空转找侧栏。滚动条用 mouseDrag。";
                     }
-                }
-                if (!pendingLookaheadHint.empty()) {
-                    instruction += L"\n" + pendingLookaheadHint;
-                    pendingLookaheadHint.clear();
                 }
                 if (!pendingPivotHint.empty()) {
                     instruction += L"\n" + pendingPivotHint;
@@ -2795,13 +3291,7 @@ AiActionResult ExecuteAiActionExecute(
                         instruction += L"\n" + ime;
                     }
                 }
-                if (round == 0 && AiActionPlanGateEnabled() && !AiActionPlanGateIsOpen()) {
-                    instruction += L"\n★第一轮先规划再动手："
-                        L"1) updateTaskMemo(section=goal|todos) 写出完整分步计划"
-                        L"（每步：做什么→用哪个工具→怎么验收）；"
-                        L"2) listWindows + activateWindow 确认目标窗口在前台。"
-                        L"窗口未确认为前台前，禁止 locateAndClick/quickInput/mouseClick/keyClick/scrollWheel。";
-                }
+                
                 {
                     const std::wstring memo = ReadAiTaskMemoText();
                     if (!memo.empty()) {
@@ -2845,7 +3335,6 @@ AiActionResult ExecuteAiActionExecute(
                 if (!curB64.empty()) {
                     AiActionToolOptions liveOpts;
                     liveOpts.allowAbsolutePointer = true;
-                    liveOpts.fillTableOnly = fillTableOnly;
                     core->UpdateTools(BuildAiActionExecuteTools(hostHooks, liveOpts));
                 }
 
@@ -2900,7 +3389,15 @@ AiActionResult ExecuteAiActionExecute(
                 AgentSendCallbacks cb = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
                 // 无图也走流式：豆包完整响应要等整段生成完才给响应头，TTFB 常超过
                 // 旧 5s 轮询；失败再回落完整响应（CallApi）。
-                cb.preferNonStream = false;
+                // ★★ **桥（网页 AI / 窗口反代）不产流**：走流式只会白等一轮空闲超时 ⇒ 直接完整响应。
+                //   判据单点：`AiModelIsBridge` → `quickscript::webai::IsWebAiModelName`（不另抄名单）。
+                const bool qstModelIsBridge =
+                    AiModelIsBridge(core ? core->GetConfig().model : std::wstring());
+                cb.preferNonStream = qstModelIsBridge;
+                if (qstModelIsBridge && logFn) {
+                    logFn(L"  [诊断] 该模型是「桥」（网页 AI / 窗口反代）⇒ 直接走完整响应"
+                        L"（桥不产流，走流式只会白等一轮空闲超时）");
+                }
                 cb.toolChoice = L"required";
                 cb.stopToolLoopAfterTools = [core, histBefore]() {
                     return HistoryHasCompleteTask(core->GetHistory(), histBefore)
@@ -2989,15 +3486,32 @@ AiActionResult ExecuteAiActionExecute(
                     break;
                 }
 
-                if (HistoryHasSubmitMacroActions(core->GetHistory(), histBefore)) {
+                // ★★ **可点清单还没建立时，每轮都必须真的观察**（2026-10-02 实测根因）。
+                //   实测（Web 反代路、豆包驱动）：`观察阶段` 0 次、`截屏完成` 1 次 ⇒ 整局共用第 1 张
+                //   初始截图；而「文字索引 / 元素索引」只在观察里构建 ⇒ 模型既没有新帧、也没有可点清单，
+                //   只能盯着旧图猜坐标（用户体感："像是乱点，选择了又取消选择 / 不会自己翻页"）。
+                //   ⚠ 判据必须在**最外层**：原来写在外层闸 `HistoryHasSubmitMacroActions` 里面，
+                //     而这条路上模型走的是**工具调用**（mouseClick 等）⇒ 外层为假 ⇒ 里面从未被求值。
+                //   ⚠ 幂等：`anyExecuted` 仍只在原条件成立时置真（不复原这条会把语义改宽）。
+                const bool qstIndexMissingForAgent =
+                    lastElementIndex.empty() && lastTextIndex.empty();
+                if (qstIndexMissingForAgent && logFn)
+                    logFn(L"  [诊断] 可点清单尚未建立（文字索引/元素索引都为空）⇒ 本轮强制观察");
+                if (HistoryHasSubmitMacroActions(core->GetHistory(), histBefore))
                     anyExecuted = true;
+                if (HistoryHasSubmitMacroActions(core->GetHistory(), histBefore)
+                    || qstIndexMissingForAgent) {
                     const bool needObserve = HistoryHasSubmitRequestingObserve(
                         core->GetHistory(), histBefore);
 
                     // Midscene：定位失败 / 对话框前台 / 灰钮·无反应·API超时 → 禁止 SKIP_OBSERVE
                     const bool mustObserve = lastLocateFailed || saveAsForeground
                         || forceObserveSignals;
-                    if (!needObserve && !mustObserve) {
+                    // ★★ **可点清单还没建立时不许省观察**（2026-10-02 真机实测：闸喊了话、这里仍照旧跳过）。
+                    //   内层这一条是第一轮就该加上的；当时那次字符串替换没命中，只加了外层变量 ⇒
+                    //   日志出现「可点清单尚未建立 ⇒ 本轮强制观察」紧跟「本轮 SKIP_OBSERVE」的自相矛盾。
+                    //   判据：外层已算好的 `qstIndexMissingForAgent`（别再重算一份）。
+                    if (!needObserve && !mustObserve && !qstIndexMissingForAgent) {
                         if (AiPageKindIsDom() && AiPageTreeTrusted()) {
                             curB64.clear();
                             if (logFn)
@@ -3009,25 +3523,6 @@ AiActionResult ExecuteAiActionExecute(
                             }
                         } else if (logFn) {
                             logFn(L"  [诊断] 本轮 SKIP_OBSERVE，跳过截屏观察（保留上次画面）");
-                        }
-                        if (!AiActionShouldSkipLookahead() && !lastOpenedWebpage && !AiPageKindIsDom()) {
-                            NoteAiActionLookaheadStarted();
-                            const std::wstring batch = SummarizeAiToolBatchForLookahead(
-                                core->GetHistory(), histBefore);
-                            lookahead.BeginAfterTools(
-                                core->GetConfig(), ReadAiTaskMemoText(), batch,
-                                stopFlag, httpAbort);
-                            pendingLookaheadHint = lookahead.TakeHintSkipObserve(
-                                kAiLookaheadSkipObserveWaitMs);
-                            if (logFn && !pendingLookaheadHint.empty())
-                                logFn(L"  [诊断] lookahead(SKIP_OBSERVE): "
-                                    + TruncateForLog(pendingLookaheadHint, 120));
-                        } else if (logFn) {
-                            logFn(lastOpenedWebpage
-                                ? L"  [诊断] 跳过 lookahead（刚 openWebpage，下一轮 observePage）"
-                                : AiPageKindIsDom()
-                                ? L"  [诊断] 跳过 lookahead（pageKind=dom，以控件树为准）"
-                                : L"  [诊断] 跳过 lookahead（动态干扰或次数上限）");
                         }
                         consecutiveUnchangedRounds = 0;
                         consecutiveBlindKeyRounds = 0;
@@ -3052,18 +3547,6 @@ AiActionResult ExecuteAiActionExecute(
                     lastObserveUnchanged = false;
                     bool captured = false;
                     bool lastOnlyDynamicChanged = false;
-                    if (!AiActionShouldSkipLookahead() && !lastOpenedWebpage) {
-                        NoteAiActionLookaheadStarted();
-                        const std::wstring batch = SummarizeAiToolBatchForLookahead(
-                            core->GetHistory(), histBefore);
-                        lookahead.BeginAfterTools(
-                            core->GetConfig(), ReadAiTaskMemoText(), batch,
-                            stopFlag, httpAbort);
-                    } else if (logFn) {
-                        logFn(lastOpenedWebpage
-                            ? L"  [诊断] 跳过 lookahead（刚 openWebpage，下一轮 observePage）"
-                            : L"  [诊断] 跳过 lookahead（动态干扰或次数上限）");
-                    }
                     if (hostHooks->onObserveScreen) {
                         const bool forceRefresh = forceRefreshObserve;
                         forceRefreshObserve = false;
@@ -3114,12 +3597,38 @@ AiActionResult ExecuteAiActionExecute(
                         }
                         if (!obs.foregroundFact.empty()) lastForegroundFact = obs.foregroundFact;
                         // ★文字坐标索引（通用）：每轮注入一次，让模型不靠看图也能准确点。
-                        if (!obs.textIndex.empty()) {
+                        // ★★ 与上一轮**双双一致** ⇒ 本轮不再整张重发（省投喂，见变量声明的注释）。
+                        qstIndexSameAsLastRound =
+                            !obs.textIndex.empty() && !obs.elementIndex.empty()
+                            && obs.textIndex == lastTextIndex
+                            && obs.elementIndex == lastElementIndex;
+                        if (!obs.textIndex.empty() && !qstIndexSameAsLastRound) {
                             lastTextIndex = obs.textIndex;
                             if (logFn)
                                 logFn(L"  [诊断] 文字索引 " + std::to_wstring(obs.textIndexCount)
                                     + L" 条（本地 OCR，模型可直接按文字/坐标点，不必看图猜）");
                         }
+                        // ★统一可点元素索引（UIA ∪ OCR，见 BuildAiElementIndex）：这是
+                        // 「所见即所得」的主通道 —— 模型按编号/名字说话，宿主直接查表拿坐标
+                        // （0 次识图）；索引里没有才回落识图。清空时同步清（界面换了旧编号就失效）。
+                        if (!obs.elementIndex.empty() && !qstIndexSameAsLastRound) {
+                            lastElementIndex = obs.elementIndex;
+                            if (logFn)
+                                logFn(L"  [诊断] 可点元素索引 "
+                                    + std::to_wstring(obs.elementIndexCount) + L" 条（其中 UIA 控件 "
+                                    + std::to_wstring(obs.elementIndexUiCount)
+                                    + L" 条、标签→图标槽推断 "
+                                    + std::to_wstring(obs.elementIndexIconCount)
+                                    + L" 条；查表直点 = 0 次识图）");
+                            // ★★ 把**索引正文**也落盘（docs §62）：只记计数时，「顶栏那些卡到底进没进
+                            //   索引」只能靠猜 —— 而它正是模型反复 zoom 的直接原因。
+                            //   ⚠ 截断只影响这份**给人看**的排查副本，不是喂模型的尺寸。
+                            if (logFn)
+                                logFn(L"  [诊断] 元素索引正文："
+                                    + TruncateForLog(obs.elementIndex, 900));
+                        }
+                        if (qstIndexSameAsLastRound && logFn)
+                            logFn(L"  [诊断] 清单与上一轮完全一致 ⇒ 本轮**不重发**（沿用上一轮，编号仍有效）");
                         if (!obs.settleHint.empty()) {
                             lastSettleHint = obs.settleHint;
                             if (!obs.changeRoisText.empty())
@@ -3274,20 +3783,6 @@ AiActionResult ExecuteAiActionExecute(
                                 && probe.find(L"kind=") != std::wstring::npos
                                 && probe.find(L"kind=none") == std::wstring::npos;
                         }
-                        pendingLookaheadHint = lookahead.TakeHintAfterObserve(
-                            lastObserveUnchanged, lastOnlyDynamicChanged,
-                            dialogBlocking, kAiLookaheadAfterObserveWaitMs);
-                        if (lastOpenedWebpage)
-                            pendingLookaheadHint.clear();
-                        if (logFn && !pendingLookaheadHint.empty())
-                            logFn(L"  [诊断] lookahead: "
-                                + TruncateForLog(pendingLookaheadHint, 120));
-                        else if (logFn && lookahead.LastTakeDiscardedNotReady())
-                            logFn(L"  [诊断] lookahead 预取未就绪（>" 
-                                + std::to_wstring(kAiLookaheadAfterObserveWaitMs)
-                                + L"ms）已中断丢弃，不让主链路等预规划");
-                        else if (logFn && lastObserveUnchanged)
-                            logFn(L"  [诊断] lookahead 已丢弃（界面未变）");
                     }
                     if (!captured && hostHooks->onCaptureScreen) {
                         std::string nextB64;
@@ -3326,14 +3821,24 @@ AiActionResult ExecuteAiActionExecute(
                 AiActionResult fallback = FinalizeToolActionsResult(core, response, stopFlag, logFn);
                 if (fallback.ok && !fallback.textResult.empty()) {
                     if (hostHooks->onExecuteActions) {
-                        hostHooks->onExecuteActions(fallback.textResult);
+                        // ★ 混合分流（同一份实现，别在别处再写一套）
+                        ExecuteActionJsonMixed(fallback.textResult, hostHooks, logFn);
                         anyExecuted = true;
                     }
                     result = fallback;
                     result.routeKind = route;
-                    result.actionsAlreadyExecuted = true;
                     result.ok = true;
-                    return result;
+                    // ★★ **执行完必须继续下一轮**（2026-10-02 真机实测：「点了一个选项就自己停了」）。
+                    //
+                    //   原来这里 `return result;` ⇒ 整个 AI 动作只跑一轮：
+                    //   引擎侧看到 `actionsAlreadyExecuted` 就认为动作已完成，随即
+                    //   `Agent 闭环结束 → …` 收工。而"闭环"的意义正是
+                    //   **动作 → 看结果 → 再决定下一步**；一轮就返回等于没有闭环。
+                    //   ⚠ 结束条件交回既有机制：模型 `completeTask` / 轮次上限 /
+                    //     模型不再给动作（下面的嘴炮分支）——都在循环里，别在这里提前收工。
+                    //   ⚠ `actionsAlreadyExecuted` / `anyActionsExecuted` 由**循环收尾**统一如实填写
+                    //     （见本函数末段），这里不抢先置真（否则就是"还没跑完就宣称跑完"）。
+                    continue;
                 }
                 // 嘴炮纠偏：给一次机会改走 submit/completeTask，避免只在调试框吐正文
                 if (!toolNudgeUsed && round + 1 < rounds) {
@@ -3403,7 +3908,15 @@ AiActionResult ExecuteAiActionExecute(
                     instruction, round == 0 ? screenshotBase64 : std::string{},
                     round == 0 ? extraImageJpegBase64 : nullptr);
                 AgentSendCallbacks cb = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
-                cb.preferNonStream = false;
+                // ★★ **桥（网页 AI / 窗口反代）不产流**：走流式只会白等一轮空闲超时 ⇒ 直接完整响应。
+                //   判据单点：`AiModelIsBridge` → `quickscript::webai::IsWebAiModelName`（不另抄名单）。
+                const bool qstModelIsBridge =
+                    AiModelIsBridge(core ? core->GetConfig().model : std::wstring());
+                cb.preferNonStream = qstModelIsBridge;
+                if (qstModelIsBridge && logFn) {
+                    logFn(L"  [诊断] 该模型是「桥」（网页 AI / 窗口反代）⇒ 直接走完整响应"
+                        L"（桥不产流，走流式只会白等一轮空闲超时）");
+                }
                 cb.toolChoice = L"required";
                 cb.stopToolLoopAfterTools = [core, histBefore]() {
                     return HistoryHasCompleteTask(core->GetHistory(), histBefore)
@@ -3443,7 +3956,15 @@ AiActionResult ExecuteAiActionExecute(
         const ChatMessage msg = BuildAiUserMessage(instruction, screenshotBase64,
             extraImageJpegBase64);
         AgentSendCallbacks cb = MakeAiMacroSendCallbacks(logFn, &stopFlag, httpAbort);
-        cb.preferNonStream = false;
+        // ★★ **桥（网页 AI / 窗口反代）不产流**：走流式只会白等一轮空闲超时 ⇒ 直接完整响应。
+        //   判据单点：`AiModelIsBridge` → `quickscript::webai::IsWebAiModelName`（不另抄名单）。
+        const bool qstModelIsBridge =
+            AiModelIsBridge(core ? core->GetConfig().model : std::wstring());
+        cb.preferNonStream = qstModelIsBridge;
+        if (qstModelIsBridge && logFn) {
+            logFn(L"  [诊断] 该模型是「桥」（网页 AI / 窗口反代）⇒ 直接走完整响应"
+                L"（桥不产流，走流式只会白等一轮空闲超时）");
+        }
         cb.toolChoice = L"required";
         cb.stopToolLoopAfterTools = [core, histBefore]() {
             return HistoryHasCompleteTask(core->GetHistory(), histBefore)

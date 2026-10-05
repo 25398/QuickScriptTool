@@ -41,6 +41,11 @@ bool IsAiActionComplexCompositePrompt(const std::wstring& prompt);
 /// 纯变量分析+按键等应返回 false，避免无谓全屏截图开销。
 bool AiActionPromptLikelyNeedsScreenCapture(const std::wstring& prompt);
 
+/// ★「打开目标」解析：完整网址 / 裸域名（补 https://）/ 常见站点名（哔哩哔哩、百度…）
+///   / 浏览器内置页 ⇒ 可直接打开的 URL；**解析不出来返回空**（调用方如实报错，不猜）。
+std::wstring ResolveOpenWebpageTargetUrl(const std::wstring& raw);
+std::wstring OpenWebpageTargetHint();
+
 /// 从 AI 文本中解析 (x,y) / x,y
 bool TryParseCoordinatePair(const std::wstring& text, int& outX, int& outY);
 
@@ -66,7 +71,41 @@ bool PromptIntendsRightClick(const std::wstring& prompt);
 bool IsVisionApiBoxTooLarge(int apiX1, int apiY1, int apiX2, int apiY2,
     int apiW, int apiH, double maxAreaRatio = 0.22);
 
+/// 识图回答给出了什么：一个框 / 一个点 / **什么都没给**。
+enum class AiVisionAnswerKind {
+    NoAnswer = 0,  ///< 解析不出位置，或给出的是**退化回答**（空框）
+    Box,           ///< 有效矩形
+    Point,         ///< 有效单点
+};
+
+/// 解析识图定位回答，并把「**模型其实没回答**」这件事显式说出来（docs §38.4）。
+///
+/// 由来（实测一局游戏日志）：模型对「左侧剩余植物」回了 `[0,0,0,0]`。
+/// `TryParseBoundingBox` 要求 `x2>x1 && y2>y1`，所以它对空框**返回 false** ——
+/// 调用方于是退回 `TryParseCoordinatePair`，从同一串里抓到了 `(0,0)`，
+/// 把「一个空框」当成了「图左上角这个点」，然后：
+///   ① 点屏幕 **(0,0)**（真正的桌面左上角）；
+///   ② 因为落点局部「变了」而回执 **「[结果] 界面已经变化 → 这一步已经生效」**；
+///   ③ 把这块垃圾存成定位模板并起了跟踪会话。
+/// 一次幻觉 = 一次错点 + 一个**假成功**回执，比直接失败糟得多。
+///
+/// 判据：**括号里有 4 个数、但撑不出面积**（`x2<=x1` 或 `y2<=y1`）⇒ 退化回答。
+/// 只有 2 个数才是「单点」，所以 `(500, 95)` 这类正常精点回答不受影响。
+AiVisionAnswerKind ParseVisionLocateAnswer(
+    const std::wstring& text, int& outX1, int& outY1, int& outX2, int& outY2);
+
 void MapApiPointToScreen(const AiCaptureMapping& map, int apiX, int apiY, int& screenX, int& screenY);
+
+/// 屏幕绝对像素 → **upload 截图像素**（`MapApiPointToScreen` 的逆运算）。
+///
+/// 为什么要有这个函数：给模型看的坐标**一律是 upload 像素**（`mouseClick`/
+/// `locateAndClick` 要的是它，元素索引/文字索引给的也是它）。任何「本地拿到的是屏幕像素、
+/// 却要说给模型听」的场合都得反着算一次 —— 各处自己写一遍必然漂移。
+/// 实测事故（用户日志）：观察帧上的红叉画在 upload 空间，配的文字却写「屏幕(2155,255)」，
+/// 模型拿着这句话去和 1024 宽的图对照，只能自己猜缩放比（"the red十字 at screen(2155,255)
+/// → upload ≈ (2155 * 1024/2400?)"），白烧几千 token 在换算上，还可能算错。
+/// 判据：**同一条回执里出现的每个坐标都要各自标名**（docs §33.1 / §50）。
+void MapScreenPointToApi(const AiCaptureMapping& map, int screenX, int screenY, int& apiX, int& apiY);
 
 /// 点是否明显落在上传图外（精炼幻觉坐标）
 bool IsApiPointClearlyOutsideImage(int apiX, int apiY, int apiW, int apiH);
@@ -188,12 +227,6 @@ std::wstring BuildCompositeLocatePrompt(const std::wstring& userTask,
 /// prompt 会说明这个参考物（但仍要求绝对坐标）。
 std::wstring BuildCompositeRefinePointPrompt(const std::wstring& userTask, int levelIndex,
     int imageWidth = 0, int imageHeight = 0, bool prevPredictionMarked = false);
-
-/// 「错点自纠」prompt（备用项）：第一次点击没有任何反应时，把**刚点的那个错点**
-/// 当红叉锚点画在放大图上，让识图模型重新给出目标的绝对坐标。
-/// ★仍要绝对坐标、不要偏移量（依据见 ai_action_service.h 的 DrawPredictionCrossOnBitmap）。
-std::wstring BuildMissSelfCorrectPrompt(const std::wstring& userTask,
-    int imageWidth = 0, int imageHeight = 0, int failedX = 0, int failedY = 0);
 
 /// 全图纠偏：告知上一轮候选框，要求重新框选真正目标（避免 Zoom 围着错误粗点打转）
 std::wstring BuildCompositeCorrectLocatePrompt(const std::wstring& userTask,

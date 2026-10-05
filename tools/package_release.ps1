@@ -26,7 +26,10 @@
 # ---------------------------------------------------------------------------
 
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # 只组装 dist（给后续 ISCC 编安装包用），不打便携 zip、也不把 zip 同步到官网。
+    # 过渡版本只发安装包时用它，能省掉打包 630MB 的时间。
+    [switch]$SkipZip
 )
 
 $ErrorActionPreference = "Stop"
@@ -236,11 +239,17 @@ Copy-VcRuntimeAppLocal -DestDir $DistDir
 # WebView UI + Fixed Runtime (portable, no system WebView2 install)
 # -Recurse 一次拷齐；勿再把 ui\vendor 目录本身拷进已存在的 ui\vendor（会变成 vendor\vendor）
 Copy-Item (Join-Path $RepoRoot "ui\*") (Join-Path $DistDir "ui") -Recurse -Force
-foreach ($ico in @("app_icon.ico", "tray_running.ico", "breakout_pause.ico", "startup.wav", "finish.wav")) {
+foreach ($ico in @("app_icon.ico", "tray_running.ico", "breakout_pause.ico", "startup.wav", "finish.wav", "pause.wav")) {
     $p = Join-Path $ReleaseDir $ico
     if (-not (Test-Path $p)) { $p = Join-Path $RepoRoot (Join-Path "resources" $ico) }
     if (Test-Path $p) { Copy-Item $p $DistDir -Force }
 }
+
+# NOTE (batch D): resources\models\vit.onnx is deliberately NOT shipped any more.
+# The TrackerVit "keep following a located target" session was rolled back as a whole
+# (the engine keeps no cross-frame world state), so nothing loads the model. The file
+# and its measurements stay in the repo (resources/models/ + tools/local_detection_bench/
+# + docs/local-detection-feasibility.md) for whoever redoes it as a *tool* later.
 $fixedSrc = Join-Path $ReleaseDir "WebView2Fixed"
 if (Test-Path (Join-Path $fixedSrc "msedgewebview2.exe")) {
     Copy-Item $fixedSrc (Join-Path $DistDir "WebView2Fixed") -Recurse -Force
@@ -269,7 +278,7 @@ Copy-Item (Join-Path $ReleaseDir "tools\requirements-ocr.txt") (Join-Path $DistD
 # Agent Skills（文件化 Skill：对话编辑 / 撤销 / 命令行），随包分发到 skills\agent\
 $skillsStage = Join-Path $DistDir "skills\agent"
 New-Item -ItemType Directory -Force -Path $skillsStage | Out-Null
-foreach ($skillName in @("agent-conversation", "agent-revert", "agent-shell", "agent-script", "agent-optimize", "agent-command", "agent-office", "agent-game")) {
+foreach ($skillName in @("agent-conversation", "agent-revert", "agent-shell", "agent-script", "agent-optimize", "agent-command", "agent-office", "agent-game", "agent-desktop")) {
     $section = $skillName -replace "^agent-", ""
     if ($skillName -eq "agent-script") { $section = "scriptstrategy" }
     # 产品 Skill 优先从 skills/agent/<section>.md 取（我们的资产）；老五份仍以 .cursor 为源
@@ -469,6 +478,11 @@ if ($gate.Count -gt 0) {
 $zipName = "QuickScriptTool-Release-$ProductVersion.zip"
 $zipPath = Join-Path $DistRoot $zipName
 $zipAlias = Join-Path $DistRoot "QuickScriptTool-Release.zip"
+if ($SkipZip) {
+    # $zipPath 置空后，下面的「同步到 website\downloads」会整段跳过（它按 $zipPath 判断）
+    Write-Host "  SkipZip: 跳过便携 zip（本次只组装 dist，供编安装包用）"
+    $zipPath = $null
+} else {
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 if (Test-Path $zipAlias) { Remove-Item $zipAlias -Force }
 try {
@@ -495,19 +509,56 @@ try {
     Write-Warning ("Zip failed (close QuickScriptTool if running, then re-run). Folder package is ready. " + $_.Exception.Message)
     $zipPath = $null
 }
+}
 
 function Copy-AtomicFile {
     param([string]$From, [string]$To)
     $dir = Split-Path -Parent $To
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $tmp = Join-Path $dir ((Split-Path -Leaf $To) + ".partial")
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     Copy-Item -LiteralPath $From -Destination $tmp -Force
-    Move-Item -LiteralPath $tmp -Destination $To -Force
+    # ⚠ 不要依赖 `Move-Item -Force` 覆盖既有目标：
+    #   2026-10-01 发 1.4.0 时实测报「当文件已存在时，无法创建该文件。」并**留下 .partial 残骸**
+    #   （目标既没被占用也不是只读），于是发版失败、官网下载目录里留的还是上一版安装包。
+    #   这里改成「先删目标（带重试）→ 再改名 → 失败再退回复制覆盖」，
+    #   并把"删不掉"的真实原因（占用/只读）带出来，别只丢一句系统错误。
+    if (Test-Path -LiteralPath $To) {
+        $removed = $false
+        for ($i = 0; $i -lt 5; $i++) {
+            try {
+                Remove-Item -LiteralPath $To -Force -ErrorAction Stop
+                $removed = $true
+                break
+            } catch {
+                if ($i -eq 4) {
+                    throw ("无法替换已存在的文件（可能被占用或只读）：`n  $To`n  " +
+                        "原因：$($_.Exception.Message)`n  " +
+                        "处理：关掉正在运行它的程序（安装包在运行 / 浏览器正在下载 / 杀软扫描）后重试。")
+                }
+                Start-Sleep -Milliseconds 400
+            }
+        }
+        if (-not $removed) { throw "无法删除既有文件：$To" }
+    }
+    try {
+        Move-Item -LiteralPath $tmp -Destination $To -ErrorAction Stop
+    } catch {
+        # 退路：改名失败（某些环境句柄/筛选器拦截 MoveFile）时用复制覆盖，再清临时文件。
+        Copy-Item -LiteralPath $tmp -Destination $To -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # 同步官网静态下载目录（部署 website/ 即可直接点按钮下载）
 $WebDl = Join-Path $RepoRoot "website\downloads"
 New-Item -ItemType Directory -Path $WebDl -Force | Out-Null
+# 清掉上次失败留下的 .partial 残骸（2026-10-01 事故：改名失败会把半成品留在官网下载目录里）
+Get-ChildItem -LiteralPath $WebDl -Filter "*.partial" -File -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        Write-Host "  cleanup: 删除残留 $($_.Name)"
+        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+    }
 $SetupName = "QuickScriptTool-Setup-$ProductVersion.exe"
 $SetupAlias = "QuickScriptTool-$ProductVersion.exe"
 # ISCC 当前输出 QuickScriptTool-<ver>.exe；Setup- 只做旧链接别名
@@ -546,6 +597,42 @@ $HidZipSrc = Join-Path $DistRoot $HidZipName
 if (Test-Path -LiteralPath $HidZipSrc) {
     Copy-AtomicFile $HidZipSrc (Join-Path $WebDl $HidZipName)
     Write-Host "  Website: website\downloads\$HidZipName  (optional HID/driver payload)"
+}
+
+# ── 同步「产品前端 + 播放器模板」到 website\（官网 Demo / 在线导出）──────────
+#
+# 为什么发版**必须**带上这一步：
+#   · website\demo\ 是 ui\ 的拷贝 —— 不同步 ⇒ 公网上的 Demo 停在旧 UI，
+#     用户看到的"网页版"和软件不是一回事；
+#   · website\export\player\QstPlayer.exe 是网页在线导出的 exe 模板 ——
+#     不同步 ⇒ 网页导出的 exe 在跑旧引擎（产物照样能跑，所以**看不出来**）。
+#   两件事都属于"忘了做也不会报错"的那一类，所以收进发版路径里强制执行。
+#
+# 只调一个入口（tools\sync_website.ps1）而不是在这里重写逻辑：
+# 手动同步与发版同步必须是**同一条路**，否则两边迟早漂移。
+$WebSync = Join-Path $PSScriptRoot "sync_website.ps1"
+if (Test-Path -LiteralPath $WebSync) {
+    Write-Host "  [Website] 同步产品前端 + 播放器模板到 website\ ..."
+    # ⚠ 必须**临时放宽 EAP** 再调子进程：本脚本是 $ErrorActionPreference = "Stop"，
+    #   而子 powershell 一旦失败就会往 stderr 写错误行 —— PowerShell 5.1 会把它
+    #   变成终止错误抛出，于是 `$LASTEXITCODE` 根本读不到，报出来的"原因"也退化成
+    #   一句 NativeCommandError，看不出真正是哪一步失败。
+    #   （同一个坑在 package_with_version.ps1 的 Invoke-Captured 里已经写过一次。）
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $WebSync 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+        $webSyncRc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($webSyncRc -ne 0) {
+        # 不静默放过：Demo 与软件不一致、或模板脱节，都是发出去就收不回的错。
+        throw "FATAL: website 同步失败（exit $webSyncRc）—— 见上方输出；修好后重跑（可加 -SkipBuild）"
+    }
+} else {
+    Write-Warning "  找不到 tools\sync_website.ps1 —— website\ 未同步（Demo 会停在旧 UI）"
 }
 
 Write-Host ""

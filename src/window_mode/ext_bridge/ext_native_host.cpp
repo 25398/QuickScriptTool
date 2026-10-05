@@ -12,6 +12,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -308,10 +309,51 @@ std::string ReadBridgeFileJson() {
 
 }  // namespace
 
+namespace {
+/// 默认允许（主程序行为不变）。播放器在 engine::Start 之前置 false。
+std::atomic<bool> g_nativeHostAllowed{true};
+
+/// ★原生消息宿主的 `path` 只能是**主程序 exe**，绝不能是「当前正在跑的那个 exe」。
+/// 现场事故（2026-09-24）：自测/诊断 exe 也会启动扩展桥服务，而它每 15s 重注册一次宿主 ——
+/// 用 `ExePath()` 就把它自己写成了宿主（实测 `path = ...\build\Release\WindowModeSelfTest.exe`）。
+/// 于是浏览器每次 `connectNative` 都启动一次**自测 exe**，它忽略浏览器参数、直接跑整套自测：
+/// 不停弹 notepad 窗口 + 写日志，用户体感是「自测模块在后台无限弹窗」。
+/// 判据：只认产品自己的 exe 名；当前进程不是产品时，退回同目录的 `QuickScriptTool.exe`；
+/// 两者都不成立（自测/诊断 exe 目录里没有主程序）就**一个字节都不写**。
+bool IsProductExeName(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    for (auto& c : name) c = static_cast<wchar_t>(towlower(c));
+    return name == L"quickscripttool.exe" || name == L"qstplayer.exe";
+}
+
+bool FileExistsForHost(const std::wstring& path) {
+    return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+}  // namespace
+
+void SetExtNativeHostAllowed(bool allowed) {
+    g_nativeHostAllowed.store(allowed, std::memory_order_release);
+}
+
+bool ExtNativeHostAllowed() {
+    return g_nativeHostAllowed.load(std::memory_order_acquire);
+}
+
+/// 原生消息宿主 `path` 合法性判据（导出给自检钉住规则本身：自测/诊断 exe **不得**当宿主）。
+bool NativeHostExeNameIsProduct(const std::wstring& exePath) {
+    return IsProductExeName(exePath);
+}
+
 void RegisterExtNativeMessagingHost() {
-    const std::wstring exe = ExePath();
+    // 播放器/被禁用的场景：一个字节都不写（既不写清单文件，也不写 HKCU 注册表）
+    if (!ExtNativeHostAllowed()) return;
+    const std::wstring self = ExePath();
     const std::wstring dir = ModuleDir();
-    if (exe.empty() || dir.empty()) return;
+    if (dir.empty()) return;
+    // 只把**产品 exe** 写成宿主（见 IsProductExeName 注释：自测/诊断 exe 不得抢宿主）。
+    const std::wstring exe = IsProductExeName(self) ? self : (dir + L"\\QuickScriptTool.exe");
+    if (!FileExistsForHost(exe)) return;
     const auto ids = DiscoverExtensionIds();
     std::string json = "{\n  \"name\": \"com.quickscripttool.bridge\",\n"
         "  \"description\": \"\xe9\x94\xae\xe9\xbc\xa0\xe5\xb7\xa5\xe5\x9d\x8a\xe6\xa1\xa5\",\n"

@@ -6,6 +6,8 @@
 #include "input_timeline_scheduler.h"
 #include "low_power_mode.h"
 #include "recorder_timeline.h"
+#include "recorder_diag_log.h"
+#include "recorder_report_interval.h"
 #include "recording_to_findimage.h"
 #include "recorder.h"
 
@@ -25,6 +27,18 @@ const selftest::CaseInfo kCases[] = {
     {L"micro_gap_relative_merge", L"default", L"sub-200us relative packets stay separate and gaps inflate"},
     {L"repair_compressed_rel_gaps", L"default", L"compressed Rel-Wait-Rel gaps inflate to median report interval"},
     {L"repair_copy_leaves_source", L"default", L"RepairCompressedRelativeGaps must not mutate the caller's original vector"},
+    {L"rel_report_interval_high_polling", L"default", L"8k/4k/1kHz 报告周期估计等于真实周期且不判为压缩"},
+    {L"rel_report_interval_compressed_burst", L"default", L"积压样本判为压缩、中位数不被污染、样本不足走回退"},
+    {L"rel_report_interval_background_cap", L"default", L"Win11 后台 125Hz(8ms) 不被误判为压缩；越界样本不入统计"},
+    {L"high_polling_rel_gaps_preserved", L"default", L"4kHz 录制的 250µs 相对间隔端到端保持不拉伸"},
+    {L"spread_relative_move_packets_preserves_totals", L"default",
+        L"细分位移铺满窗口：Σ等待/Σ位移严格不变、按窗口自适应、幂等"},
+    {L"prepare_playback_timeline_applies_spread", L"default",
+        L"统一回放入口：关开关不改包数、开开关必细分且 Σ位移守恒"},
+    {L"sum_relative_moves_counts_only_rel", L"default", L"保真度诊断只累加相对移动的位移与包数"},
+    {L"recorder_diag_trim_line_start", L"default", L"诊断日志超限裁剪按整行切；无换行/换行在末位都全留"},
+    {L"move_fidelity_verdict", L"default", L"回放保真判定：未统计必须优先于不一致（否则软输入模式误报）"},
+    {L"relative_capture_decision", L"default", L"Auto 采集判定：强制模式/防抖/刻意切换不得被粘滞吞掉"},
     {L"sub_threshold_rel_split", L"default", L"large relative packets split below accel threshold"},
     {L"mixed_capture_channels", L"default", L"auto mode transition keeps absolute and relative events"},
     {L"same_timestamp_button_order", L"default", L"same timestamp button down/up follows sequence"},
@@ -42,6 +56,8 @@ const selftest::CaseInfo kCases[] = {
     {L"expand_script_default_duration_no_wait", L"default", L"scripts default 0.1 cleared without Wait"},
     {L"expand_idempotent", L"default", L"Expand twice yields identical sequence"},
     {L"wait_stats_use_timing_us", L"default", L"ActionStepUs prefers timingUs for Wait"},
+    {L"timeline_injection_overrun_eats_short_wait", L"default",
+        L"注入超支吃掉后续短等待预算：立刻返回且 late 如实记录、4ms 量级不触发 rebase"},
     {L"timeline_catchup_skips_stall", L"default", L"small past-deadline jitter still catches up"},
     {L"timeline_large_stall_rebases", L"default", L"large stall shifts origin so later waits are not burst"},
     {L"timeline_wait_until_rebases", L"default", L"WaitUntilElapsedUs overshoot also rebases origin"},
@@ -239,6 +255,335 @@ void CaseRepairCopyLeavesSource() {
         && src[2].type == ActionType::MoveMouseRelative;
     const bool copyChanged = ActionStepUs(copy[1]) != waitUs || copy.size() != n;
     Emit(L"repair_copy_leaves_source", sourceUntouched && copyChanged, L"");
+}
+
+// ── 报告周期模型：高轮询率鼠标的时间轴不得被拉伸 ──────────────────
+// 旧实现：EMA 下限 1000µs + 只认 [2000,16000]µs 为「健康间隔」⇒ 2kHz 以上
+// 鼠标的录制被整体拉伸（4kHz 累计 32 倍）。这些用例在旧实现下会变红。
+
+void CaseRelReportIntervalHighPolling() {
+    // 8kHz(125µs) 与 4kHz(250µs)：估计周期必须等于真实周期，且判定为「未压缩」。
+    qst_recorder::ReportIntervalModel m8;
+    for (int i = 0; i < 16; ++i) m8.ObserveGap(125);
+    const bool ok8 = m8.MedianUs() == 125 && !m8.IsCompressedGap(125)
+        && m8.LooksHighPolling();
+
+    qst_recorder::ReportIntervalModel m4;
+    for (int i = 0; i < 16; ++i) m4.ObserveGap(250);
+    const bool ok4 = m4.MedianUs() == 250 && !m4.IsCompressedGap(250);
+
+    // 1kHz：既不能被当成积压，也不能把正常的 1ms 间隔误判成压缩。
+    qst_recorder::ReportIntervalModel m1;
+    for (int i = 0; i < 16; ++i) m1.ObserveGap(1000);
+    const bool ok1 = m1.MedianUs() == 1000 && !m1.IsCompressedGap(1000)
+        && !m1.LooksHighPolling();
+
+    Emit(L"rel_report_interval_high_polling", ok8 && ok4 && ok1, L"");
+}
+
+void CaseRelReportIntervalCompressedBurst() {
+    // 1kHz 基线中夹入积压样本（10µs）⇒ 必须判为压缩；中位数不被污染。
+    qst_recorder::ReportIntervalModel m;
+    for (int i = 0; i < 10; ++i) m.ObserveGap(1000);
+    m.ObserveGap(10);
+    const bool burstFlagged = m.IsCompressedGap(10) && !m.IsCompressedGap(1000);
+    const bool medianStable = m.MedianUs() == 1000;
+
+    // 样本不足时走保守回退（Windows 11 后台 Raw Input ~125Hz ⇒ 8000µs），
+    // 且此时过短间隔一律判为压缩 —— 与旧实现行为一致，避免短录制抖动。
+    qst_recorder::ReportIntervalModel few;
+    few.ObserveGap(150);
+    const bool fallback = few.MedianUs() == qst_recorder::kFallbackReportIntervalUs
+        && few.IsCompressedGap(150);
+
+    // 手写宏：中位数 10ms 的相对序列里夹一个刻意的 1ms 等待 ⇒ 不得被判为积压
+    // （旧实现阈值 500µs，这里必须保持一致，否则手写宏会被整体放慢 10 倍）。
+    qst_recorder::ReportIntervalModel hw;
+    for (int i = 0; i < 8; ++i) hw.ObserveGap(10000);
+    const bool handWrittenSafe = !hw.IsCompressedGap(1000) && hw.IsCompressedGap(300);
+    Emit(L"rel_report_interval_compressed_burst",
+        burstFlagged && medianStable && fallback && handWrittenSafe, L"");
+}
+
+void CaseRelReportIntervalBackgroundCap() {
+    // Windows 11 把后台 Raw Input 接收方限流到 ~125Hz：真实间隔就是 ~8ms，
+    // 不能被当成「压缩」而改写（否则后台录制的相对位移全部被压缩到同一时刻）。
+    qst_recorder::ReportIntervalModel m;
+    for (int i = 0; i < 12; ++i) m.ObserveGap(8000);
+    const bool ok = m.MedianUs() == 8000 && !m.IsCompressedGap(8000)
+        && m.IsCompressedGap(300);
+    // 越界样本只计数、不污染中位数（>20ms 的停顿不是报告周期）。
+    qst_recorder::ReportIntervalModel g;
+    for (int i = 0; i < 8; ++i) g.ObserveGap(1000);
+    const bool accepted = g.ObserveGap(250000) == false;
+    const bool ok2 = g.MedianUs() == 1000 && g.ObservedCount() == 9 && g.SampleCount() == 8;
+    Emit(L"rel_report_interval_background_cap", ok && accepted && ok2, L"");
+}
+
+void CaseHighPollingRelGapsPreserved() {
+    // 端到端：4kHz 鼠标录制的 250µs 间隔，经转换 + Repair 后必须原样保留。
+    // 旧实现：250µs 既不算「健康」(需 ≥2000) 又 <500 ⇒ 全部改写成 8000µs，
+    // 整段相对位移被拉伸 32 倍（回放时「转视角 + 走路」轨迹必然不同）。
+    std::vector<RecordedEvent> events;
+    for (int i = 0; i < 8; ++i) {
+        events.push_back(Ev(static_cast<uint64_t>(i) * 250, static_cast<uint64_t>(i + 1),
+            kWmRecordedRelativeMove, 1, 0));
+    }
+    auto converted = ConvertRecordedEventsToActions(events, {});
+    std::vector<uint64_t> relWaits;
+    for (size_t i = 1; i + 1 < converted.actions.size(); ++i) {
+        if (converted.actions[i].type != ActionType::Wait) continue;
+        if (converted.actions[i - 1].type != ActionType::MoveMouseRelative) continue;
+        if (converted.actions[i + 1].type != ActionType::MoveMouseRelative) continue;
+        relWaits.push_back(ActionStepUs(converted.actions[i]));
+    }
+    bool allPreserved = relWaits.size() == 7;
+    for (uint64_t us : relWaits) {
+        if (us != 250) allPreserved = false;
+    }
+    // 时间轴总时长必须仍是 7×250µs，而不是 7×8000µs。
+    const bool durationOk = converted.durationSeconds > 0.0
+        && converted.durationSeconds < 0.003;
+    Emit(L"high_polling_rel_gaps_preserved",
+        allPreserved && durationOk && converted.relativeMoveCount == 8, L"");
+}
+
+void CasePreparePlaybackTimelineAppliesSpread() {
+    // 统一入口的不变量：开关关闭 ⇒ 包数不变；打开 ⇒ 包数变多且 Σ 位移守恒。
+    // ⚠ 这条防的是「只补了一部分调用点」的回归 —— 2026-09-21 实测踩过：
+    //   `RepairCompressedRelativeGaps` 有 6 个调用点（`RunCurrentActions` 里就有两个平行块），
+    //   只补其中一个 ⇒ 用户勾了开关毫无效果（日志里包数仍是 790、等待仍是 0.008 秒）。
+    std::vector<ScriptAction> base;
+    for (int i = 0; i < 6; ++i) {
+        base.push_back(MakeExplicitWaitUs(8000, 0));
+        ScriptAction m{};
+        m.type = ActionType::MoveMouseRelative;
+        m.x = 4 + i;
+        m.y = 1;
+        base.push_back(std::move(m));
+    }
+
+    std::vector<ScriptAction> off = base;
+    PreparePlaybackTimeline(off, false);
+    uint64_t offBefore = 0, offAfter = 0;
+    LastSpreadPacketCounts(offBefore, offAfter);
+
+    std::vector<ScriptAction> on = base;
+    PreparePlaybackTimeline(on, true);
+    uint64_t onBefore = 0, onAfter = 0;
+    LastSpreadPacketCounts(onBefore, onAfter);
+
+    int64_t offDx = 0, onDx = 0;
+    for (const auto& a : off) {
+        if (a.type == ActionType::MoveMouseRelative) offDx += a.x;
+    }
+    for (const auto& a : on) {
+        if (a.type == ActionType::MoveMouseRelative) onDx += a.x;
+    }
+
+    Emit(L"prepare_playback_timeline_applies_spread",
+        offAfter == offBefore && onAfter > onBefore && offDx == onDx && onAfter > 0, L"");
+}
+
+void CaseSpreadRelativeMovePacketsPreservesTotals() {
+    // 细分变换的不变量：Σ等待 与 Σ位移 必须**严格不变**（这是它敢用在回放前的底线），
+    // 且细分数按窗口长度自适应、再跑一次不再变化（幂等）。
+    std::vector<ScriptAction> acts;
+    auto pushRel = [&](uint64_t waitUs, int dx, int dy) {
+        acts.push_back(MakeExplicitWaitUs(waitUs, 0));
+        ScriptAction m{};
+        m.type = ActionType::MoveMouseRelative;
+        m.x = dx;
+        m.y = dy;
+        acts.push_back(std::move(m));
+    };
+    pushRel(8000, 22, 4);     // 8ms ⇒ 4 份（每份 2ms）
+    pushRel(8000, -22, -4);   // 负位移
+    pushRel(8000, 1, 0);      // 小位移：部分子步为 0，被跳过但等待照发
+    pushRel(1000, 9, 3);      // < 2ms 不细分
+    pushRel(3000, 7, 5);      // 3ms ⇒ 2 份（每份 1.5ms）
+    pushRel(0, 0, 0);         // 零位移不细分
+
+    int64_t sumDx = 0, sumDy = 0;
+    uint64_t sumWait = 0;
+    int relCount = 0;
+    for (const auto& a : acts) {
+        if (a.type == ActionType::MoveMouseRelative) {
+            sumDx += a.x;
+            sumDy += a.y;
+            ++relCount;
+        } else if (a.type == ActionType::Wait) {
+            sumWait += ActionStepUs(a);
+        }
+    }
+    const int64_t wantDx = 22 - 22 + 1 + 9 + 7;
+    const int64_t wantDy = 4 - 4 + 0 + 3 + 5;
+    const uint64_t wantWait = 8000ULL * 3 + 1000 + 3000;
+    const bool baselineOk = sumDx == wantDx && sumDy == wantDy && sumWait == wantWait;
+
+    std::vector<ScriptAction> spread = acts;
+    SpreadRelativeMovePackets(spread, 4);
+
+    int64_t sDx = 0, sDy = 0;
+    uint64_t sWait = 0;
+    int sRelCount = 0;
+    uint64_t maxPartUs = 0;
+    for (const auto& a : spread) {
+        if (a.type == ActionType::MoveMouseRelative) {
+            sDx += a.x;
+            sDy += a.y;
+            ++sRelCount;
+        } else if (a.type == ActionType::Wait) {
+            const uint64_t w = ActionStepUs(a);
+            sWait += w;
+            if (w > maxPartUs) maxPartUs = w;
+        }
+    }
+    const bool totalsPreserved = sDx == sumDx && sDy == sumDy && sWait == sumWait;
+    const bool shapeOk = sRelCount > relCount && maxPartUs <= 2000;
+
+    std::vector<ScriptAction> again = spread;
+    SpreadRelativeMovePackets(again, 4);
+    const bool idemOk = again.size() == spread.size();
+
+    Emit(L"spread_relative_move_packets_preserves_totals",
+        baselineOk && totalsPreserved && shapeOk && idemOk, L"");
+}
+
+void CaseRelativeCaptureDecision() {
+    using M = RecordingCaptureMode;
+    const uint64_t sticky = kAutoRelativeStickyUs;
+    // 强制模式与相对状态无关。
+    const bool forced = EvaluateRelativeCapture(M::Relative, false, 0, 5000, sticky)
+        && !EvaluateRelativeCapture(M::Absolute, true, 0, 5000, sticky);
+
+    // Auto：相对态生效时立即按相对；从未相对过则按绝对。
+    const bool autoBase = EvaluateRelativeCapture(M::Auto, true, 0, 1000, sticky)
+        && !EvaluateRelativeCapture(M::Auto, false, 0, 1000, sticky);
+
+    // 防抖：离开相对态后**单帧级**抖动（16ms）仍按相对，跨过去就按绝对。
+    const bool antiFlap = EvaluateRelativeCapture(M::Auto, false, 10000, 10000 + 16000, sticky)
+        && !EvaluateRelativeCapture(M::Auto, false, 10000, 10000 + sticky, sticky);
+
+    // ★ 关键：粘滞窗口必须**短到不会吞掉刻意的模式切换**。
+    // 用户在抓取态按 E 开背包（游戏改为读光标位置）后，250ms 内的移动若仍按相对记账，
+    // 回放时就是幻影镜头旋转。这里以 120ms 为界做 A/B：
+    //   粘滞 60ms ⇒ 120ms 后已按绝对 ✔；粘滞 250ms ⇒ 仍按相对 ✗。
+    const bool deliberateSwitch = !EvaluateRelativeCapture(
+        M::Auto, false, 10000, 10000 + 120000, sticky);
+
+    // 时间戳回绕/相等不得判成相对（nowUs < last 视为无效历史）。
+    const bool clockGuard = !EvaluateRelativeCapture(M::Auto, false, 20000, 1000, sticky);
+
+    Emit(L"relative_capture_decision",
+        forced && autoBase && antiFlap && deliberateSwitch && clockGuard, L"");
+}
+
+void CaseSumRelativeMoves() {
+    // 回放保真度诊断的分子：只累加 MoveMouseRelative，忽略其它动作。
+    std::vector<ScriptAction> acts;
+    ScriptAction rel{};
+    rel.type = ActionType::MoveMouseRelative;
+    rel.x = 7; rel.y = -3;
+    acts.push_back(rel);
+    rel.x = -2; rel.y = 5;
+    acts.push_back(rel);
+    ScriptAction abs{};
+    abs.type = ActionType::MoveMouse;
+    abs.x = 1000; abs.y = 2000;
+    acts.push_back(abs);
+    ScriptAction wait{};
+    wait.type = ActionType::Wait;
+    wait.timingUs = 1000;
+    acts.push_back(wait);
+    const auto t = SumRelativeMoves(acts);
+    const auto empty = SumRelativeMoves({});
+    Emit(L"sum_relative_moves_counts_only_rel",
+        t.dx == 5 && t.dy == 2 && t.packets == 2
+        && empty.dx == 0 && empty.dy == 0 && empty.packets == 0, L"");
+}
+
+/// 回放保真判定：**「未统计」必须优先于「不一致」**。
+/// 窗口/后台窗口模式软输入 / CDP 下注入侧恒为 0，若先比数值就会报出「注入层改动了位移」，
+/// 在一切正常时把排查引到错误的一侧。这条用例就是钉住这个优先级。
+void CaseMoveFidelityVerdict() {
+    const bool notCounted = EvaluateMoveFidelity(false, 1204, -337, 0, 0)
+        == MoveFidelityVerdict::NotCounted;
+    // 两侧恰好都是 0 也不能当成 Match —— 那是巧合，不是「输入层忠实」的证据
+    const bool notCountedEvenEqual = EvaluateMoveFidelity(false, 0, 0, 0, 0)
+        == MoveFidelityVerdict::NotCounted;
+    const bool match = EvaluateMoveFidelity(true, 1204, -337, 1204, -337)
+        == MoveFidelityVerdict::Match;
+    const bool mismatchDx = EvaluateMoveFidelity(true, 1204, -337, 1200, -337)
+        == MoveFidelityVerdict::Mismatch;
+    const bool mismatchDy = EvaluateMoveFidelity(true, 1204, -337, 1204, -330)
+        == MoveFidelityVerdict::Mismatch;
+    // 无相对移动的脚本：两侧都是 0 ⇒ 一致，不该报异常
+    const bool bothZero = EvaluateMoveFidelity(true, 0, 0, 0, 0)
+        == MoveFidelityVerdict::Match;
+
+    const bool ok = notCounted && notCountedEvenEqual && match && mismatchDx
+        && mismatchDy && bothZero;
+    if (ok) {
+        Emit(L"move_fidelity_verdict", true, L"");
+        return;
+    }
+    wchar_t msg[192]{};
+    swprintf_s(msg, L"notCounted=%d evenEqual=%d match=%d dx=%d dy=%d zero=%d",
+        notCounted ? 1 : 0, notCountedEvenEqual ? 1 : 0, match ? 1 : 0,
+        mismatchDx ? 1 : 0, mismatchDy ? 1 : 0, bothZero ? 1 : 0);
+    Emit(L"move_fidelity_verdict", false, msg);
+}
+
+/// `recorder_diag.log` 超限裁剪只许按**整行**切。
+/// 直接按字节数切会把一行切成半行 —— 日志开头就是乱码，比不裁更糟。
+/// 约定「宁可多留」：找不到换行、或换行恰在末位，都返回 0（整块全留）。
+void CaseRecorderDiagTrimLineStart() {
+    const std::wstring block = L"aaa\nbbb\nccc";  // 无结尾换行
+    const wchar_t* p = block.c_str();
+    const size_t n = block.size();
+
+    const bool firstLine = qst_recorder::RecorderDiagLineStart(p, n) == 4;   // 跳过 "aaa\n"
+    const bool noNewline = qst_recorder::RecorderDiagLineStart(p, 3) == 0;   // 整块无换行 ⇒ 全留
+    const bool newlineLast = qst_recorder::RecorderDiagLineStart(p, 4) == 0; // 换行在末位 ⇒ 全留
+    const bool empty = qst_recorder::RecorderDiagLineStart(p, 0) == 0
+        && qst_recorder::RecorderDiagLineStart(nullptr, 5) == 0;
+    const bool leadNewline = qst_recorder::RecorderDiagLineStart(L"\nabc", 4) == 1;
+
+    // 保留量必须是整块的上限以内，且能整除一个 wchar（UTF-16 切半字符会成乱码）
+    const bool keepChars = qst_recorder::RecorderDiagTrimKeepChars() > 0
+        && qst_recorder::RecorderDiagTrimKeepChars() * sizeof(wchar_t) * 2
+            <= static_cast<size_t>(qst_recorder::kRecorderDiagMaxBytes);
+
+    // ★★同一套裁剪给**多个**诊断日志用（`recorder_diag.log` / `ai_action_debug.log`，
+    //   docs §61）⇒ 上限是参数。逐格钉住参数化后的行为，别让它只对默认值成立。
+    const bool paramKeep = qst_recorder::DiagTrimKeepChars(4 * 1024 * 1024)
+            == (4u * 1024u * 1024u / 2u) / sizeof(wchar_t)
+        && qst_recorder::DiagTrimKeepChars(qst_recorder::kRecorderDiagMaxBytes)
+            == qst_recorder::RecorderDiagTrimKeepChars();
+    const bool needsTrim = qst_recorder::DiagLogNeedsTrim(100, 50)
+        && !qst_recorder::DiagLogNeedsTrim(50, 50)
+        && !qst_recorder::DiagLogNeedsTrim(100, 0);      // 上限 0 = 不裁（别把日志裁没）
+    // 单行裁剪：短行**原样**（不许无端加尾巴），超长行截断且**如实留痕**
+    const std::wstring shortLine = qst_recorder::ClampDiagLogLine(std::wstring(L"abcdef"), 6);
+    const std::wstring clamped = qst_recorder::ClampDiagLogLine(std::wstring(L"abcdef"), 3);
+    const bool clampOk = shortLine == L"abcdef"
+        && clamped.size() > 3
+        && clamped.compare(0, 3, L"abc") == 0
+        && clamped.find(L"已截断 3 字") != std::wstring::npos;
+
+    const bool ok = firstLine && noNewline && newlineLast && empty
+        && leadNewline && keepChars && paramKeep && needsTrim && clampOk;
+    if (ok) {
+        Emit(L"recorder_diag_trim_line_start", true, L"");
+        return;
+    }
+    wchar_t msg[320]{};
+    swprintf_s(msg, L"first=%d none=%d last=%d empty=%d lead=%d keep=%zu p=%d trim=%d clamp=%d",
+        firstLine ? 1 : 0, noNewline ? 1 : 0, newlineLast ? 1 : 0,
+        empty ? 1 : 0, leadNewline ? 1 : 0, qst_recorder::RecorderDiagTrimKeepChars(),
+        paramKeep ? 1 : 0, needsTrim ? 1 : 0, clampOk ? 1 : 0);
+    Emit(L"recorder_diag_trim_line_start", false, msg);
 }
 
 void CaseSubThresholdRelSplit() {
@@ -552,6 +897,74 @@ void CaseWaitStatsUseTimingUs() {
     w.duration = 0.050;
     w.timingUs = 49937;
     Emit(L"wait_stats_use_timing_us", ActionStepUs(w) == 49937, L"");
+}
+
+/// 「注入超预算 ⇒ 后续短等待立刻过点」的最小复现与判读。
+///
+/// 现场症状（MC 1.21.1 后台回放）：`[时间轴统计]` 里 `p95` 改善但 `max` 不降，
+/// 且**每一行极短等待（0.000~0.003 秒）都带显著 `late=`**。看着像「等待实现不准」，
+/// 实际成因是**相反的方向**：相对移动/键盘注入本身耗掉了预算，等到 `WaitDeltaUs`
+/// 检查时 deadline 已经过去 ⇒ 它只能立刻返回并把超支如实记进 `late`。
+///
+/// 这条用例锁住的正是这个因果方向 —— 免得下次有人看到「短等待全带 late」
+/// 就去改 `input_timeline_scheduler` 的自旋/定时器切片（那一层没问题）。
+void CaseTimelineInjectionOverrunEatsShortWaitBudget() {
+    PrecisionInputTimeline tl;
+    tl.Reset();
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+    auto nowQpc = [] {
+        LARGE_INTEGER t{};
+        QueryPerformanceCounter(&t);
+        return t.QuadPart;
+    };
+    auto msBetween = [&](long long a, long long b) {
+        return (b - a) * 1000.0 / static_cast<double>(freq.QuadPart);
+    };
+
+    // 第一拍：正常 2ms，建立 origin 与 elapsedUs_。
+    tl.WaitDeltaUs(2000, [] { return false; });
+
+    // 模拟「一次注入把预算吃光」：在两次等待之间**烧掉 5ms**（真实里是
+    // `PrepareSoftInput` 的全树枚举 / 跨进程序列化，不是睡眠）。
+    {
+        const long long b0 = nowQpc();
+        while (msBetween(b0, nowQpc()) < 5.0) {
+        }
+    }
+
+    // 紧接一次极短等待（1ms）。deadline = origin + 3ms，而此刻已经是 origin + 7ms
+    // ⇒ 必须**立刻返回**，且 `LastLatenessUs()` 必须≈超出量（4ms 上下），
+    // 绝不能是 0（那意味着超支被静默吞掉，`late` 就失去判读价值）。
+    const long long t0 = nowQpc();
+    tl.WaitDeltaUs(1000, [] { return false; });
+    const double wallMs = msBetween(t0, nowQpc());
+    const uint64_t lateUs = tl.LastLatenessUs();
+    const auto st = tl.Stats();
+
+    // 立刻返回：墙钟耗时应远小于 1ms（不是「睡满 1ms」）。
+    const bool returnedImmediately = wallMs < 1.0;
+    // 超支被如实记录：4ms 量级（给宽区间以吸收调度抖动）。
+    const bool overrunRecorded = lateUs >= 2500 && lateUs <= 9000;
+    // 4ms 超支 < 8ms 重基准阈值 ⇒ 不许 rebase（rebase 会把相位整体平移，
+    // 用在「轻微超支」上会让落点整体漂移，正是用户说的「偏差更大」）。
+    const bool noRebaseOnModerateOverrun = st.rebaseCount == 0;
+    // 该笔迟到必须进入统计（否则 p95/max 看不见它）。
+    const bool countedInStats = st.eventCount == 2 && st.maxLateUs >= 2500;
+
+    const bool ok = returnedImmediately && overrunRecorded && noRebaseOnModerateOverrun
+        && countedInStats;
+    wchar_t detail[320]{};
+    swprintf_s(detail,
+        L"wall=%.2fms late=%lluus rebase=%llu events=%llu max=%lluus"
+        L" | imm=%d rec=%d noRebase=%d counted=%d",
+        wallMs, static_cast<unsigned long long>(lateUs),
+        static_cast<unsigned long long>(st.rebaseCount),
+        static_cast<unsigned long long>(st.eventCount),
+        static_cast<unsigned long long>(st.maxLateUs),
+        returnedImmediately ? 1 : 0, overrunRecorded ? 1 : 0,
+        noRebaseOnModerateOverrun ? 1 : 0, countedInStats ? 1 : 0);
+    Emit(L"timeline_injection_overrun_eats_short_wait", ok, detail);
 }
 
 void CaseTimelineCatchupSkipsStall() {
@@ -1113,6 +1526,16 @@ int wmain(int argc, wchar_t** argv) {
     CaseMicroGapRelativeMerge();
     CaseRepairCompressedRelGaps();
     CaseRepairCopyLeavesSource();
+    CaseRelReportIntervalHighPolling();
+    CaseRelReportIntervalCompressedBurst();
+    CaseRelReportIntervalBackgroundCap();
+    CaseHighPollingRelGapsPreserved();
+    CaseSpreadRelativeMovePacketsPreservesTotals();
+    CasePreparePlaybackTimelineAppliesSpread();
+    CaseSumRelativeMoves();
+    CaseRecorderDiagTrimLineStart();
+    CaseMoveFidelityVerdict();
+    CaseRelativeCaptureDecision();
     CaseSubThresholdRelSplit();
     CaseMixed();
     CaseButtonOrder();
@@ -1131,6 +1554,7 @@ int wmain(int argc, wchar_t** argv) {
     CaseExpandScriptDefaultNoWait();
     CaseExpandIdempotent();
     CaseWaitStatsUseTimingUs();
+    CaseTimelineInjectionOverrunEatsShortWaitBudget();
     CaseTimelineCatchupSkipsStall();
     CaseTimelineLargeStallRebases();
     CaseTimelineWaitUntilRebases();

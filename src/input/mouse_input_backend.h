@@ -14,6 +14,10 @@ struct MouseBackendStats {
     uint64_t failedEvents = 0;
     uint64_t pacedWaits = 0;
     uint64_t batchedSubmits = 0;
+    /// 实际注入的相对位移总量（回放保真度诊断：与录制脚本里的总量对比，
+    /// 相等说明输入层忠实，落点偏差来自目标侧；不等说明注入层改动了位移）。
+    long long movedDx = 0;
+    long long movedDy = 0;
 };
 
 /// SendInput 相对鼠标回放（关加速 + 必要时亚阈值拆分，贴近 Raw 计数）。
@@ -37,6 +41,11 @@ public:
     MouseBackendStats Stats() const;
 
 private:
+    /// 记录一次「已成功发出」的相对位移（拆分后按步累加，总和与请求一致）。
+    void NoteMoveSentLocked(int dx, int dy) {
+        stats_.movedDx += dx;
+        stats_.movedDy += dy;
+    }
     void PaceLocked();
     bool SendInputMoveLocked(int dx, int dy);
     bool SendInputMoveBatchLocked(const std::vector<std::pair<int, int>>& deltas);

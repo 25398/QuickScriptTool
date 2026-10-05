@@ -33,7 +33,7 @@ public:
         int regionY2 = 0;
     };
 
-    /// 窗口模式测试：搜索区已是目标窗口客户区，禁止因框小于模板而扩到整块虚拟屏。
+    /// 窗口/后台窗口模式测试：搜索区已是目标窗口客户区，禁止因框小于模板而扩到整块虚拟屏。
     void SetAllowExpandSearchToVirtualScreen(bool allow) {
         allowExpandSearchToVirtualScreen_ = allow;
     }

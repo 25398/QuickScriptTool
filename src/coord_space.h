@@ -5,7 +5,6 @@
 // 保存：编辑器像素（当前屏幕）→ n*；coordMeta 恒为 2560×1440。
 // 运行：PrepareScriptActionsForExecution 按当前屏幕生成执行副本（像素坐标）。
 // ──────────────────────────────────────────────────────────────────
-
 #include "script_types.h"
 #include "image_match.h"
 #include "window_mode/window_mode_types.h"
@@ -88,9 +87,12 @@ void SyncFindImageOffsetNorm(ScriptAction& a);
 /// 鼠标拖拽终点 / 找图定位偏移的归一化（与 x/y 成对）
 void SyncMouseDragNorm(ScriptAction& a);
 
-/// 执行前：从 n* 反算到目标分辨率像素（深拷贝 actions 后调用，即运行副本）
+/// 执行前：从 n* 反算到目标分辨率像素（深拷贝 actions 后调用，即运行副本）。
+/// outKeyBalanceWarn（可选）：非空时，若发现「只有按下没有松开」的按键并已补齐抬起，
+/// 写出给人看的告警（宿主据此打日志）。判据与理由见 .cpp 的 `BalanceHeldKeysInActions`。
 std::vector<ScriptAction> PrepareScriptActionsForExecution(
-    const std::vector<ScriptAction>& actions, const CoordMeta& scriptMeta);
+    const std::vector<ScriptAction>& actions, const CoordMeta& scriptMeta,
+    std::wstring* outKeyBalanceWarn = nullptr);
 
 /// 缩放模板加载（保留供预览等场景）
 HBITMAP LoadScaledTemplateBitmap(const std::wstring& path, double sx, double sy);

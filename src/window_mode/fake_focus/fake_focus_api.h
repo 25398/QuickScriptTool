@@ -33,6 +33,17 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_IsInstalled(void);
 /// Phase 2: non-zero when soft-input shared memory is mapped.
 FAKEFOCUS_API BOOL WINAPI FakeFocus_HasSoftInput(void);
 
+/// 仅安装窗口变速（时钟 IAT 补丁），不装任何假焦点钩。
+/// 「启用窗口变速」开而「启用假焦点注入」关时用它：变速照常生效，键鼠路径不变。
+FAKEFOCUS_API BOOL WINAPI FakeFocus_InstallTimeScaleOnly(HWND targetTop);
+
+/// 只拆假焦点钩，保留 DLL 与时钟轮询（全屏游戏拆钩但继续变速用）。
+FAKEFOCUS_API BOOL WINAPI FakeFocus_DisableFakeFocus(HWND unused);
+
+/// 窗口变速（变速齿轮）诊断：bit0=IAT 补丁已装 bit1=轮询线程在跑，高 16 位=当前倍率定点值
+/// （1000 = 1.0x；0 = 未启用/已卸载）。
+FAKEFOCUS_API DWORD WINAPI FakeFocus_TimeScaleDiag(HWND unused);
+
 /// 冒险岛诊断：低 16 位=轮询 API 槽数（GetCursorPos/GetAsyncKeyState/GetKeyState/GetKeyboardState/DirectInput8Create）；
 /// 高 16 位=diag 位图（1=Cursor 2=AsyncKey 4=KeyState 8=KbState 10=DiCreate 20=DiState 40=Flash
 /// 80=dinput已加载 100=Acquire 200=FgWnd 400=SetFg 800=GetDeviceState方法体JMP

@@ -4,10 +4,35 @@
 #include "ai_action_service.h"
 #include "ai_action_router.h"
 #include "macro_execute_tools.h"
+#include "web_ai/web_ai_config.h"
 
 #include <algorithm>
 
 namespace {
+
+/// ★★ 铸造一个**桥会话 key**（网页版 AI 靠它给对话分区；真 API 只当"终端用户标识"）。
+///
+/// 为什么需要（2026-10-02 真机"串台"）：会话 key 是 thread_local，宿主只在 UI 面板线程
+/// 设过它 ⇒ 引擎这条线程没有 ⇒ 桥回落成 `provider` ⇒ **桌面任务与网页任务共用一个豆包对话**
+/// ⇒ 模型看到别的任务的上下文并回答"当前会话上下文已经丢失…你最初想让我做什么？"。
+///
+/// 为什么不是"每次 AI 动作执行一个 key"：那会摧毁**规定的上下文语义**
+/// （`script_action_builder.cpp` 的 `aiContextMode`）—— 宏级要"同一脚本共用一个对话"、
+/// 循环级要"按嵌套深度分槽"、块级要"块自己的对话"、只有**无上下文**才是"每次独立请求"。
+/// ⇒ 所以 key 挂在 `AiSessionSlot` 上（宏 / loops[depth] / block），随槽存活；
+///    只有 mode 0 的一次性 core 才每次现铸一个。
+/// 无上下文 AI 动作共用的会话 key（见下方两处用法的说明）。
+/// ⚠ 必须是**稳定字符串**：桥按它给每个"软件侧对话"分配一个网页标签页。
+constexpr const char* kOnceSessionKey = "qst-once";
+
+std::string MintAiSessionKey(const char* kind) {
+    static std::atomic<unsigned long long> seq{0};
+    std::string k = "aiCtx:";
+    k += (kind && *kind) ? kind : "Slot";
+    k += ":";
+    k += std::to_string(++seq);
+    return k;
+}
 
 AgentCore* EnsureSlotCore(
     AiSessionSlot& slot,
@@ -34,8 +59,12 @@ AgentCore* EnsureSlotCore(
     if (!slot.core || slot.model != model) {
         slot.core = makeCore();
         slot.model = model;
-        return slot.core.get();
+        // ★★ 对话换了 ⇒ **key 必须跟着换**（桥按 key 记"已发到第几条"；沿用旧 key 会错乱）。
+        slot.sessionKey = MintAiSessionKey("Slot");
     }
+    // 本线程的请求发到**这个槽的对话**里（网页版 AI 以此分区；见 ai_action_runtime.h 的说明）
+    if (!slot.sessionKey.empty()) SetAgentSessionKeyForThisThread(slot.sessionKey);
+    return slot.core.get();
 
     quickscript::AiModelProfile profile;
     profile.modelName = model;
@@ -44,6 +73,9 @@ AgentCore* EnsureSlotCore(
     }
     if (profile.apiUrl.empty()) profile.apiUrl = settings.ai.apiUrl;
     if (profile.apiKey.empty()) profile.apiKey = settings.ai.apiKey;
+    // ★ 与 CreateAiActionExecuteCore 同一口径：网页版 AI 档案要把端口/token
+    //   规范到**当前**桥（否则复用 slot 时 UpdateConfig 会把新端口又改回旧的）。
+    quickscript::webai::ApplyProfileOverride(profile);
 
     AgentConfig cfg;
     cfg.apiUrl = profile.apiUrl;
@@ -216,6 +248,22 @@ std::unique_ptr<AgentCore> PrepareAiAnalysisCore(
         return nullptr;
     }
 
+    // ★ 无上下文（0）= 每次独立请求 ⇒ 每次一个**一次性**会话 key
+    // ★★★ 无上下文（`contextMode=0`）的 AI 动作 ⇒ **共用一个稳定的 key**
+        //   （2026-10-02 用户规则："在我们软件中共用一个对话的就共用一个网页 Agents，跟 API 一个道理"）
+        //
+        //   ⚠⚠ 原来这里每次 `MintAiSessionKey("Once")` 铸**新 key** ⇒ 桥按 key 分标签页
+        //     ⇒ **每次无上下文的动作都开一个新网页标签页**（真机：一次任务开出 4 个豆包标签页）。
+        //   ⚠ 复用 key **不会**让模型失忆：system 与协议**每轮都发**（见 web_ai_prompt.cpp），
+        //     历史本来就不发 ⇒ "无上下文"的语义不受影响。
+        // ★★★ 优先用**调用方（AI 助手）的会话 key**（2026-10-02 用户要求）：
+        //   AI 助手调 `runDesktopTask` ⇒ 引擎回放 ⇒ 这里的 AI 动作**应该打在助手那个对话里**，
+        //   **不要**另开新对话（用户原话："调用 AI 动作执行不要再开新对话，在原来的那个对话里面就行"）。
+        //   ⚠ 引擎是**另一个线程** ⇒ thread_local 传不过来 ⇒ 用全局 override（见 agent_core.h）。
+        {
+            const std::string ov = EngineSessionKeyOverride();
+            SetAgentSessionKeyForThisThread(ov.empty() ? std::string(kOnceSessionKey) : ov);
+        }
     return CreateAiActionCore(
         action.aiModelName, settings.ai.savedModels,
         settings.ai.apiUrl, settings.ai.apiKey,
@@ -270,12 +318,46 @@ std::unique_ptr<AgentCore> PrepareAiActionExecuteCore(
     }
 
     if (useTools) {
+        // ★ 无上下文（0）= **每次独立请求** ⇒ 每次铸一个一次性 key。
+        //   走上面那条（contextMode≠0）时 key 由槽自己持有（见 EnsureSlotCore），
+        //   这里**不要**覆盖它 —— 那正是"共用脚本对话/按深度分槽"被破坏的方式。
+        // ★★★ 无上下文（`contextMode=0`）的 AI 动作 ⇒ **共用一个稳定的 key**
+        //   （2026-10-02 用户规则："在我们软件中共用一个对话的就共用一个网页 Agents，跟 API 一个道理"）
+        //
+        //   ⚠⚠ 原来这里每次 `MintAiSessionKey("Once")` 铸**新 key** ⇒ 桥按 key 分标签页
+        //     ⇒ **每次无上下文的动作都开一个新网页标签页**（真机：一次任务开出 4 个豆包标签页）。
+        //   ⚠ 复用 key **不会**让模型失忆：system 与协议**每轮都发**（见 web_ai_prompt.cpp），
+        //     历史本来就不发 ⇒ "无上下文"的语义不受影响。
+        // ★★★ 优先用**调用方（AI 助手）的会话 key**（2026-10-02 用户要求）：
+        //   AI 助手调 `runDesktopTask` ⇒ 引擎回放 ⇒ 这里的 AI 动作**应该打在助手那个对话里**，
+        //   **不要**另开新对话（用户原话："调用 AI 动作执行不要再开新对话，在原来的那个对话里面就行"）。
+        //   ⚠ 引擎是**另一个线程** ⇒ thread_local 传不过来 ⇒ 用全局 override（见 agent_core.h）。
+        {
+            const std::string ov = EngineSessionKeyOverride();
+            SetAgentSessionKeyForThisThread(ov.empty() ? std::string(kOnceSessionKey) : ov);
+        }
         return CreateAiActionExecuteCore(
             effModel, settings.ai.savedModels,
             settings.ai.apiUrl, settings.ai.apiKey,
             sysPrompt, timeoutMs);
     }
 
+    // ★ 无上下文（0）= 每次独立请求 ⇒ 同样是**一次性 key**
+    // ★★★ 无上下文（`contextMode=0`）的 AI 动作 ⇒ **共用一个稳定的 key**
+        //   （2026-10-02 用户规则："在我们软件中共用一个对话的就共用一个网页 Agents，跟 API 一个道理"）
+        //
+        //   ⚠⚠ 原来这里每次 `MintAiSessionKey("Once")` 铸**新 key** ⇒ 桥按 key 分标签页
+        //     ⇒ **每次无上下文的动作都开一个新网页标签页**（真机：一次任务开出 4 个豆包标签页）。
+        //   ⚠ 复用 key **不会**让模型失忆：system 与协议**每轮都发**（见 web_ai_prompt.cpp），
+        //     历史本来就不发 ⇒ "无上下文"的语义不受影响。
+        // ★★★ 优先用**调用方（AI 助手）的会话 key**（2026-10-02 用户要求）：
+        //   AI 助手调 `runDesktopTask` ⇒ 引擎回放 ⇒ 这里的 AI 动作**应该打在助手那个对话里**，
+        //   **不要**另开新对话（用户原话："调用 AI 动作执行不要再开新对话，在原来的那个对话里面就行"）。
+        //   ⚠ 引擎是**另一个线程** ⇒ thread_local 传不过来 ⇒ 用全局 override（见 agent_core.h）。
+        {
+            const std::string ov = EngineSessionKeyOverride();
+            SetAgentSessionKeyForThisThread(ov.empty() ? std::string(kOnceSessionKey) : ov);
+        }
     return CreateAiActionCore(
         effModel, settings.ai.savedModels,
         settings.ai.apiUrl, settings.ai.apiKey,

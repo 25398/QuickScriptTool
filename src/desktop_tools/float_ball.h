@@ -1,5 +1,10 @@
 #pragma once
-// 桌面悬浮球：贴边半露 / 自由悬浮、悬停展开小面板、按钮启停。DesktopTools 永久原生窗。
+// 桌面悬浮球：贴边半露 / 自由悬浮、悬停展开小面板。DesktopTools 永久原生窗。
+//
+// 交互（2026-09-24 定稿，用户确认）：
+//   · 圆头图标 = 脚本启停开关（▶ 待启动 / ■ 运行中 / ‖ 已暂停 / ● 录制 / ··· 连点），
+//     点一下就在「启动 ↔ 停止」之间切换；没有独立按钮。
+//   · 面板（脚本名 + 当前状态那一块）= 点一下显示主界面。
 
 #include "desktop_tools/float_ball_geom.h"
 
@@ -18,8 +23,8 @@ enum class FloatBallActivity {
 
 struct FloatBallModel {
     FloatBallActivity activity = FloatBallActivity::Idle;
-    std::wstring title;
-    std::wstring statusText;
+    std::wstring title;       // 面板第一行：脚本名（无内容则不占位，第二行居中）
+    std::wstring statusText;  // 面板第二行（原「启动/停止」按钮位）：脚本当前状态
     bool canStart = false;
     bool busy = false;
     int actionIndex = 0;  // 1-based，当前动作；0=尚未进入
@@ -73,7 +78,7 @@ private:
 
     void ApplyLayout(bool paint);
     void ApplyShadowPad();
-    void RelayoutNoScriptButton();
+    void RelayoutPanelLines();
     bool CursorOnDockedStrip() const;
     void Paint();
     void TrackHover(bool over);
@@ -94,8 +99,6 @@ private:
     int HitTest(int x, int y) const;
     void ShowContextMenu(POINT screen);
     void OnPrimaryClick(int hit);
-    bool ButtonEnabled() const;
-    const wchar_t* ButtonLabel() const;
     bool BallPressed() const;
 
     HWND hwnd_ = nullptr;
@@ -109,10 +112,10 @@ private:
 
     bool userVisible_ = true;
     bool fsHidden_ = false;
+    DWORD fsExitTick_ = 0;  // 退出全屏的时刻（0=未在延迟窗口内），用于滞回恢复
     bool dragging_ = false;
     bool wantExpand_ = false;
     bool hoverInside_ = false;
-    bool btnDown_ = false;
     bool ballPressed_ = false;
     float expandT_ = 0.f;
     float pulse_ = 0.f;

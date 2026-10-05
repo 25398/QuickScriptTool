@@ -205,6 +205,26 @@ void EngineHost::SyncScriptWindowModeFromEditor() {
         }
         // 注意：切到默认模式时不要清内存/编辑框——手滑切走再切回要能恢复。
         // 持久化清空只在写盘：enabled=0 时 WriteWindowModeJson 落空配置。
+
+        // 坐标语义提示（2026-10-04）：脚本按**屏幕绝对坐标**存，用户却切到「后台窗口模式」
+        // ⇒ 回放时宿主会用**当前**窗口位置换算成客户区，窗口一动全部坐标动作整体偏移
+        // （用户报障原文：「编辑宏的时候，后台窗口模式下鼠标不会移动到指定位置」
+        //   「坐标是绝对坐标，窗口移动后就不能使用了」）。
+        // 只在**首次**切过来时提示一次，避免每次同步都弹（本函数调用很频繁）。
+        static bool warnedScreenAbsoluteInBackground = false;
+        if (!warnedScreenAbsoluteInBackground
+            && scriptWindowMode_.enabled
+            && scriptWindowMode_.executionKind
+                == windowmode::WindowModeExecutionKind::BackgroundWindow
+            && !scriptWindowMode_.windowRelativeCoordinates) {
+            warnedScreenAbsoluteInBackground = true;
+            promptModal_.ShowInfo(
+                L"这个脚本是按「屏幕绝对坐标」录制的。\n\n"
+                L"后台窗口模式要的是「窗口客户区坐标」才能跟随窗口。继续用的话，"
+                L"只要目标窗口被移动过（或摆到了别的位置），所有鼠标动作都会整体偏移 —— "
+                L"看起来就像「鼠标不往指定位置去」。\n\n"
+                L"建议：切回「窗口模式」；或者用后台窗口模式重新录一次这个脚本。");
+        }
     }
 
 // was engine_host_window.h:12039-12178
@@ -229,7 +249,7 @@ bool EngineHost::ResolveWindowModeSelectMethod(windowmode::WindowModeScriptConfi
                 HideUserFacingMainWindow(true);
                 hidForSelect = true;
                 windowmode::WindowModeLog(
-                    L"[窗口模式] 启动时当前所在窗口：本软件在前台，已先隐藏再取下一前台窗");
+                    L"[窗口/后台窗口模式] 启动时当前所在窗口：本软件在前台，已先隐藏再取下一前台窗");
                 fg = GetForegroundWindow();
                 pid = 0;
                 if (fg) GetWindowThreadProcessId(fg, &pid);

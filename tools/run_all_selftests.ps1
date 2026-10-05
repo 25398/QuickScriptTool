@@ -44,7 +44,44 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent $PSScriptRoot
+
+# 未捕获异常必须留下痕迹。宿主（AI 终端 / CI runner）经常只回一个 exit code ——
+# 既没有 stdout、也没有日志文件，只能靠反复重跑「猜」是不是抖动（实测踩过：
+# 同一个命令 7 次里失败 2 次，失败那两次磁盘上一个字节都没留下）。
+# 这个 trap 保证任何异常都以可读形式进 stdout + -LogPath 文件。
+trap {
+    $detail = "脚本异常终止：$($_.Exception.GetType().Name) :: $($_.Exception.Message)"
+    $pos = $_.InvocationInfo.PositionMessage
+    if ($pos) { $detail += "`n$pos" }
+    Write-Host $detail -ForegroundColor Red
+    if ($LogPath) {
+        try { Add-Content -Path $LogPath -Value $detail -Encoding UTF8 } catch { }
+    }
+    exit 3
+}
+
+# $PSScriptRoot 在部分宿主里为空 —— 典型是把命令拼成字符串再执行的包装器（AI 终端、
+# `powershell -Command "& .\tools\x.ps1"` 的某些实现），此时脚本内 $PSScriptRoot 拿不到值。
+# 直接 Split-Path -Parent $null 会抛「无法将参数绑定到参数"Path"，因为该参数是空值」，
+# 报错位置还指向调用方行号，极难定位。这里做三级兜底。
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Definition }
+    if ($selfPath -and (Test-Path -LiteralPath $selfPath)) {
+        $scriptDir = Split-Path -Parent $selfPath
+    }
+}
+$repoRoot = if ($scriptDir) { Split-Path -Parent $scriptDir } else { '' }
+if (-not $repoRoot -or -not (Test-Path (Join-Path $repoRoot 'CMakeLists.txt'))) {
+    # 兜底：当前目录就是仓库根（脚本里所有相对路径都相对仓库根）
+    $cwd = (Get-Location).Path
+    if (Test-Path (Join-Path $cwd 'CMakeLists.txt')) { $repoRoot = $cwd }
+}
+if (-not $repoRoot -or -not (Test-Path (Join-Path $repoRoot 'CMakeLists.txt'))) {
+    throw "无法定位仓库根目录（找不到 CMakeLists.txt）。请在仓库根目录下运行，或用 -BuildDir 显式指定。"
+}
+
 if (-not $BuildDir) { $BuildDir = Join-Path $repoRoot 'build' }
 $outDir = Join-Path $BuildDir $Configuration
 
@@ -63,28 +100,80 @@ function Write-Log {
     if ($script:LogFile) { Add-Content -Path $script:LogFile -Value $Text -Encoding UTF8 }
 }
 
+# 在 GitHub Actions 里额外写「作业摘要」：失败时**不用下载 artifact、不用仓库写权限**
+# 就能在 run 页面直接看到哪个 suite、哪条用例挂了。
+# 起因：本地排查 CI 失败时，job log 与 artifact 下载都需要仓库写权限（403/401），
+# 只能靠猜 —— 摘要是公开可读的，这条能把「猜」变成「看」。
+function Write-GitHubSummary {
+    param([object[]]$Results, [string]$Tier)
+    if (-not $env:GITHUB_STEP_SUMMARY) { return }
+    $bad = @($Results | Where-Object { -not $_.Ok })
+    $md = New-Object System.Collections.Generic.List[string]
+    $md.Add("## 自检结果（Tier=$Tier）")
+    $md.Add('')
+    $md.Add("**$($Results.Count) 个 suite：$($Results.Count - $bad.Count) 通过 / $($bad.Count) 失败**")
+    $md.Add('')
+    $md.Add('| suite | 结果 | passed | exit |')
+    $md.Add('|---|---|---|---|')
+    foreach ($r in $Results) {
+        $mark = if ($r.Ok) { 'PASS' } else { 'FAIL' }
+        $md.Add("| $($r.Suite) | $mark | $($r.Passed) | $($r.Exit) |")
+    }
+    if ($bad.Count -gt 0) {
+        $md.Add('')
+        $md.Add('### 失败用例')
+        foreach ($r in $bad) {
+            $md.Add('')
+            $md.Add("**$($r.Suite)**（exit=$($r.Exit)）")
+            $md.Add('')
+            $md.Add('```')
+            $fails = @($r.Raw -split "`r?`n" | Where-Object { $_ -match '"ok"\s*:\s*false' })
+            if ($fails.Count -gt 0) {
+                foreach ($f in $fails) { $md.Add($f.Trim()) }
+            } else {
+                # 没有结构化失败行（如进程崩溃/加载失败）时给原始尾部，别让摘要空着
+                $tail = @($r.Raw -split "`r?`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 15)
+                foreach ($t in $tail) { $md.Add($t.Trim()) }
+            }
+            $md.Add('```')
+        }
+    }
+    Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $md -Encoding UTF8
+}
+
 # ── suite 清单 ────────────────────────────────────────────────────
 # logic：纯逻辑，无 GUI / 无驱动 / 无需管理员。
 $LogicSuites = @(
     'ScriptActionBuilderSelfTest',
     'ScriptIoSelfTest',
+    'ScriptPackageSelfTest',
     'CoordSpaceSelfTest',
     'MacroVariablesSelfTest',
     'ImageMatchSelfTest',
     'OcrSelfTest',
     'AiActionRouterSelfTest',
     'AgentAssistantSelfTest',
+    'AgentDesktopTaskSelfTest',
+    'AgentMcpSelfTest',
+    'OoxmlSelfTest',
+    'SqliteSelfTest',
+    'WebAiSelfTest',
+    'WindowAiSelfTest',
     'AppSettingsStoreSelfTest',
     'ThemeUiSelfTest',
     'BreakoutCooldownSelfTest',
     'HotkeyStopSelfTest',
+    'FloatBallGeomSelfTest',
+    'OverlayInputGuardSelfTest',
+    'HotkeyScopeSelfTest',
     'ClickerTimingSelfTest',
     'ScheduledTaskSelfTest',
     'RecorderSelfTest',
     'BridgeJsonSelfTest',
     'ScriptRunnerSelfTest',
     'BridgeContractSelfTest',
-    'ScriptSerializationSelfTest'
+    'ScriptSerializationSelfTest',
+    'TimeScaleSelfTest'
 )
 
 # interactive：需要桌面会话（窗口模式）/ 已装内核驱动（虚拟 HID）/ 管理员（注入）。
@@ -187,6 +276,7 @@ $bad = @($results | Where-Object { -not $_.Ok })
 Write-Log ''
 Write-Log ("===== 汇总：{0} 个 suite，{1} 通过，{2} 失败（Tier={3}）=====" -f `
     $results.Count, ($results.Count - $bad.Count), $bad.Count, $Tier)
+Write-GitHubSummary -Results $results -Tier $Tier
 
 if ($bad.Count -gt 0) {
     Write-Log ''

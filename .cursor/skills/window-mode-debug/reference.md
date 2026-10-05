@@ -39,6 +39,98 @@
 - **测什么**：`WindowModeExecutor` 后台快捷输入写入 Edit。  
 - **代码**：`src/window_mode/window_mode_executor.cpp`  
 
+### `background_post_wrapped_container`
+
+- **测什么**：自建「顶层 └ 包装层 `NotepadTextBox` └ 真文本控件 `RichEditD2DPT`」三层树，断言
+  `FindBackgroundInputChild` 选出**真控件**（`kind=textInput`），且 `PostKeyToWindow` 投递后
+  **包装层收到 0 条键消息**（`wrapperMsgs==0`）；另断言**显式绑定的子窗不得被最大兄弟表面顶掉**。
+- **用户症状**（原话）：「**后台窗口模式按键点击不生效，按 A 打不到其他应用的后台里面**」（1.3.3 起存在）。
+  日志特征：`后台输入子窗 kind=renderSurface class=NotepadTextBox hwnd=0x…`。
+- **根因**：`PostMessage` **不向子窗转发** ⇒ 投给只作容器的父窗 = **完全没投**。
+  实测 Win11 商店版记事本（WinUI3，2026-09-23 本机）树：
+  ```
+  Notepad(top) └ NotepadTextBox(755x553) └ RichEditD2DPT(755x553)
+  ```
+  父子客户区**一样大**，而 `EnumChildWindows` 是「父先于子」，最大值启发式又用**严格大于**
+  ⇒「最大后代」取到**包装层** `NotepadTextBox`。受控实验：
+  投 `WM_CHAR` 给 `NotepadTextBox` → 文档**一个字都不进**；投给 `RichEditD2DPT` → 正常进字；
+  投给顶层 `Notepad` → 也不进。
+- **修法**：`background_input_target.cpp` 新增 `TextInputInsideSurface(top, surface, config)`，
+  判据是 **`IsChild(surface, input)`** —— 只在「真文本控件确实长在这个最大子窗**里面**」时让位；
+  原 `FindKnownRenderSurfaceChild` 里的「最大后代」启发式**移出**，统一到 `FindBackgroundInputChild`
+  （那里才有 config 能判「是否优先文本输入」）。
+  `ResolveSoftInputHwnd`：**已绑到子控件**时不得再用「无 config 重解析」覆盖它（绑定是
+  `ResolveBindHwnd` 带 config 选的，更可信）；唯一例外是绑到的只是包装层 ⇒ 让位给里面的真控件。
+- ⚠ **判据必须是 `IsChild`，不能是「窗口里有没有输入框」**：后者会把投递目标从主区域挪到
+  别处的小搜索框（既有选择被无理由改掉）。
+- **取证脚本**（`tools/verify/`，可复现）：`probe_bg_notepad.py`
+  `launch|hier|read|post|exp|close`（不激活起窗 / 打层级树 / 读文本 / 投递 / 对照实验 / 关闭）、
+  `probe_richedit_matrix.py`（消息矩阵隔离）、`probe_richedit_keyonly.py`（只发 KEYDOWN 覆盖度）、
+  `probe_richedit_backspace.py`（退格/删除/方向键）。
+  ⚠ 探针用 `SW_SHOWNOACTIVATE` 起记事本，**不抢前台**；测完自己 `close`。
+- **代码**：`background_input_target.cpp` `TextInputInsideSurface` / `FindBackgroundInputChild`；
+  `background_window_input.cpp` `ResolveSoftInputHwnd`；
+  用例 `background_input_wrapped_text_control` / `background_input_bound_child_respected`（均做过 A/B）。
+- **硬规则**：`window_mode_requirements.h` 第 15 条。
+
+### `background_self_translate_double_char`
+
+- **测什么**：纯判据真值表 —— `ClassSelfTranslatesPostedKeys`（只认 `RichEditD2DPT`，大小写不敏感，
+  对 `Edit`/`RICHEDIT50W`/空/null 为 false）+ `SelfTranslateKeyUsesWmChar(true, ch) == (ch >= 0x20)`
+  （`'a'`/`' '`/`'A'` 为 true；`'\r'`/`'\t'`/`0` 为 false）；**非自译目标行为不变**（显式断言）。
+- **用户症状**：**修好 `background_post_wrapped_container` 之后才显形** —— 按一次 A 出 `aa`。
+- **根因**：`PostKeyToWindow` 对 `WM_KEYDOWN` **同时**发了 KEYDOWN + `WM_CHAR`；
+  WinUI（XAML）文本控件**自己**把 `WM_KEYDOWN` 译成字符 ⇒ 双发。
+  实测 `RichEditD2DPT`：只 `KEYDOWN(A)` → `'a'`；只 `WM_CHAR('a')` → `'a'`；
+  **`KEYDOWN(A)+WM_CHAR('a')` → `'aa'`**。
+- **修法**（两种键走两条路，**永不双发**）：
+  - **可打印字符**（`ch >= 0x20`）⇒ **只发 `WM_CHAR`**。理由：该控件的自译只看**真实键态**，
+    脚本按住的 Shift 它看不见 ⇒ 走 KEYDOWN 会把 `Shift+A` 退化成 `a`；改由宿主用**软修饰键态**
+    译好字符（`SoftVkToChar` 已含 Shift/Ctrl 修正）。
+  - **不可打印**（Enter/Tab/退格/删除/方向键/功能键）⇒ **只发 `KEYDOWN`**。
+    实测 `WM_CHAR` 对 `'\r'`/`'\t'` **不换行/不制表**；`SoftVkToChar` 对它们返回 0。
+  - ⚠ 只发过 `WM_CHAR` 的键**没有配对的 KEYDOWN** ⇒ 松手时**不得**再补 KEYUP
+    （`g_softCharOnlyDown[256]` 记账，`ResetSoftKeyState()` 里一起清零）。
+- **代码**：`window_mode_types.h` `ClassSelfTranslatesPostedKeys` / `SelfTranslateKeyUsesWmChar`；
+  `background_window_input.cpp` `PostKeyToWindow`（`sendChar` / `selfTranslate` / `g_softCharOnlyDown`）；
+  用例 `background_key_self_translate_policy`。
+- **取证脚本**：`probe_richedit_keyonly.py`（只发 KEYDOWN 的覆盖度）、
+  `probe_richedit_backspace.py`（退格/删除/方向键）。
+- **硬规则**：`window_mode_requirements.h` 第 16 条。
+
+### `recorded_window_title_locks_rebind`
+
+- **测什么**：① 录制产物（`windowNameIsHintOnly=true`）经 `BuildTargetQuery` **不产生** `titleContains`；
+  ② 用户手配（默认 `false`）**仍产生** `titleContains`（旧语义不许漂移）；
+  ③ 同一真实窗口 + 标题已变 ⇒ `DoesTopWindowMatchConfig` 对 hint-only **放行**、对手配**拦截**；
+  ④ **端到端**：直接用产品真查找接口 `FindMainWindowDefault` 走完整枚举 —— hint-only **找得到**、
+  手配 **找不到**。A/B 全部在同一进程同一次运行内完成（排除环境差异）。
+- **用户症状**：**后台窗口模式「不操作后台」** —— 用「后台窗口模式 + 自动识别」录制的脚本，
+  回放时按键/点击到不了目标（用户原话「窗口模式自动识别，录制回放，不操作后台」）。
+  ⚠ **关键判读：这不是投递坏了，是根本没绑上。** 先确认绑没绑到（日志
+  `[窗口/后台窗口模式] 已绑定 hwnd=…`），**别一上来就去动注入 DLL**。
+- **根因**：录制保存把**录制瞬间的窗口标题**写进 `windowName`
+  （`SaveScriptFileData`：`wm.windowName = wmTgt.windowTitle` —— 那是「我当时在那个窗上录的」，
+  **不是**用户表达的「我要绑标题含 XX 的窗」）。回放端 `BuildTargetQuery` 对
+  `UseEditorWindowClass` 分支把它按 `" - "` 截成 stem 当 `titleContains`，而
+  `EnumWindowsOnDesktopProc` 里标题匹配是**硬门**（排在**类名匹配之前**）。
+  标题是**易变量**：换文档 / 换标签页 / 游戏换场景 / 存档改名 ⇒ 枚举**零命中** ⇒ 绑不到目标。
+- **修法**：`windowNameIsHintOnly` 字段（`window_mode_types.h`）——
+  - 录制端（`SaveScriptFileData`）置 `true`；
+  - `BuildTargetQuery` 在 hint-only 下**不产生** `titleContains`（身份 = 进程路径 + 类名 + 子窗类名）；
+  - `DoesTopWindowMatchConfig` 在 hint-only 下**不拿标题**判「没绑到」
+    （否则已正确绑定的目标会被拒，照样回退成「不操作后台」）；
+  - ⚠ 字段默认 `false`：**旧脚本 / 用户手配行为完全不变** —— 用户手配的标题关键词是**真意图**，
+    必须继续当硬门（自检里显式断言两条并存）。
+- **代码**：`window_mode/window_mode_types.h`（字段）、`window_target.cpp`
+  （`BuildTargetQuery` / `DoesTopWindowMatchConfig`）、`window_mode_json.cpp`（读写）、
+  `engine/engine_host_window.h`（录制保存端）。
+- **取证/复现脚本**：`tools/verify/probe_record_playback_bind.py`
+  —— 自建可控顶层窗（避开 Win11 记事本进程交接坑），复刻 `TitleMatches`/类名/`IsLikelyMainWindow`
+  判据跑对照：**同窗同类名，标题未变 ⇒ 命中 1；标题变了 ⇒ 命中 0；把标题过滤摘掉 ⇒ 命中 1**
+  （第三列是决定性反证）。
+- **硬规则**：`window_mode_requirements.h` 第 17 条。
+
 ### `background_click_keeps_foreground`
 
 - **测什么**：后台窗口模式对 Win32 目标 `PostMessage` 点击后，前台窗口不变；不走 UIA Invoke。最小化目标允许置底安静还原，但不得抢前台。  
@@ -184,6 +276,24 @@
 - **测什么**：本进程 `LoadLibrary(FakeFocus64/32.dll)` 后 `GetForegroundWindow` 返回目标 HWND；卸载后恢复。  
 - **代码**：`src/window_mode/fake_focus/**`  
 
+### `fake_focus_inject_copy`
+
+- **测什么**：注入前必须把 DLL **复制成副本**再注入 —— 副本落盘、**源文件一字不动**、副本文件名归一成
+  `FakeFocus32.dll`（`FakeFocus32.next.dll` 这类旁路槽也归一）、同一源同一路径、源变了换新目录。  
+- **用户症状**：软件关闭后安装目录里的 `FakeFocus32.dll` 还在被某个游戏进程映射 ⇒ 删不掉/覆盖不了，
+  安装包卡在覆盖这一步、用户被迫重启电脑才能装（见 [docs/fakefocus-dll-lock.md](../../docs/fakefocus-dll-lock.md)）。  
+- **代码**：`fake_focus_stage.cpp` `StageFakeFocusDllInto` / `FakeFocusStagedPathIn`；
+  接线在 `fake_focus_injector.cpp` 的 `ResolveDllPathForPid`  
+
+### `fake_focus_stage_sweep`
+
+- **测什么**：副本目录按年龄（30 天）回收、**被占用（独占打开）的跳过而不是报错**、放开占用后下一次能清掉；
+  安装目录里让位改名残留 `FakeFocus*.dll.locked-*` 被清掉，**且不动用户自己的 `*.locked-*` 文件**。  
+- **用户症状**：`%LOCALAPPDATA%\QuickScriptTool\module_stage` 只增不减；或安装包让位出来的
+  `FakeFocus32.dll.locked-…` 永久留在安装目录里。  
+- **代码**：`fake_focus_stage.cpp` `SweepStaleFakeFocusArtifacts{In}`（调用点：产品壳 `wWinMain`
+  与播放器 `player_main.cpp`）  
+
 ### `fake_focus_lite_unreal`
 
 - **测什么**：`FakeFocus_InstallLite` 导出存在，GetForegroundWindow 指向目标，且不钩 PeekMessage 注入 WM_INPUT。  
@@ -212,6 +322,24 @@
 - **测什么**：`ApolloRuntimeContentWindow` 上 `InstallLite` 后 `GetForegroundWindow` 指向目标，但 **不改 WndProc**、**不吞 SetCursorPos**、不往队列塞 `WM_INPUT`。  
 - **用户症状**：后台造梦西游一启动就卡死退出，鼠标原地抽。  
 - **代码**：`fake_focus_dll.cpp` `LooksLikeAdobeAirClassName` / `InstallCommon` airSafe 早退  
+
+### `fake_focus_air_child_iat_only`（2026-10-03 新增）
+
+- **测什么**：**包装窗（顶层）+ `ApolloRuntimeContentWindow` 子窗**这一真实微端结构下，`InstallLite` 仍按 AIR 处理 —— ① 顶层 `GWLP_WNDPROC` **不变**（不子类化）；② `FakeFocus_TimeScaleDiag` **bit6（`g_iatOnly`）= 1**（变速只补 IAT 槽、不碰代码页）。负对照：普通 `STATIC` 窗必须 **bit6 = 0**。  
+- **用户症状**：4399 微端（造梦西游）后台窗口模式崩溃 / 一启动就卡死退出 / 开倍速过一会闪退。  
+- **代码**：`fake_focus_dll.cpp` `HwndTreeLooksLikeAdobeAir`（看子窗）、`SetIatOnlyMode(mapleSafe || airSafe)`  
+
+### `setwindowshook_not_for_fragile_targets`（2026-10-03 新增）
+
+- **测什么**：`ForbidsSetWindowsHookTechnique()` 的真值表 —— Chromium 壳 / 微信 Qt / Qt 安卓壳 / 原生 3D / 桌面模拟器 / **Adobe AIR** 逐一命中都必须禁止 `setwindowshook`；普通目标必须放行（负对照，防「恒真」）。  
+- **用户症状**：把注入技术选成 `setwindowshook` 后，脆弱目标（含 AIR 微端）在目标 UI 线程里被 `LoadLibrary` ⇒ 当场崩/卡死退出。默认技术是 classic ⇒ 日常测不出来。  
+- **代码**：`window_mode_types.h` `ForbidsSetWindowsHookTechnique`；`window_mode_executor.cpp` `TryInstallFakeFocus`  
+
+### `injected_module_stale_detection`（2026-10-03 新增）
+
+- **测什么**：`InjectedModuleLooksStale(dllWrite, procStart)` 的真值表（6 格）—— ① 磁盘 DLL 写入时间 **晚于**目标进程启动时间 ⇒ **必须判旧**（`newerIsStale`）；② 早于 ⇒ 不许报警；③ 相等 ⇒ 保守判「不旧」；④⑤⑥ 负对照：`dllWrite=0` / `procStart=0` / 两者皆 0 ⇒ **一律不报警**（宁可漏报，不误报）。  
+- **用户症状**：冒险岛后台「**原地不动的平A，不能走A**」——升级了软件但**游戏进程没重启** ⇒ `LoadLibrary` 同路径**只加引用计数、不重跑 DllMain** ⇒ 进程里跑的还是旧 `FakeFocus32/64.dll` ⇒ 共享内存 `kSoftInputVersion`（7→10）不匹配 ⇒ `SoftInputStateLooksValid` 假 ⇒ 软键态 / DirectInput 全失效（只剩 PostMessage 的攻击键）。日志形态：一轮只有 `BeginRun`/`EndRun`，`假焦点已注入`/`冒险岛钩命中` 整段消失。  
+- **代码**：`window_mode_types.h` `InjectedModuleLooksStale`；`fake_focus_injector.cpp` `InjectAndInstall`（同路径分支打 `⚠ 目标进程 … 里挂的是**旧版** FakeFocus`，**只报警不阻断**）  
 
 ### `fake_focus_maplestory_focus_only`
 
@@ -259,8 +387,50 @@
   - `0x20000` GetKeyState 被调用过 / `0x40000` GetKeyboardState / `0x80000` GetCursorPos / `0x100000` GetProcAddress / `0x200000` GetProcAddress 的 IAT 槽已补 / `0x400000` dinput user32 IAT 补到过槽。
   - 判读：`pollHit=无` + `gaks=0 diState=0` ⇒ 客户端不走任何被拦 API（**不是**钩子没装上）；`pollHit=GetCursorPos` 但无键态项 ⇒ 客户端确实在轮询 Win32，键态走了别的入口。
   - **`iatPoll=2` 是异常值**：本地 dinput8 存在时应 ≥4。成因是 dinput8/dinput **懒加载**，PEB 那轮还没进进程；`InstallMapleIatHooks` 末尾已在 DI 虚表阶段之后补走一次 `MapleIatWalkGameDirDinputUser32()`。
+  - `stage=`：安装阶段号（1=入口 2=指针就绪 3=PEB/IAT 扫完 4=DI 钩完 5=全完成）；`fault=1` = 安装期抛过异常（已被 SEH 兜住，游戏保住）。`stage<5` 说明安装中途没了，那个数字就是死亡点。
+  - `pwPoll=`：进程级（堆 / 主模块映像之外）补到的**键态类**缓存指针数。0 = 那条路也没东西可补。
+- **2026-09-19 夜 实测读数（`diag=0x05314FE3`，`stage=5 fault=0`）**：`pollHit=` 只有 **`GetProcAddress`**，`gpaIat=1`；`GetCursorPos`/`GetKeyState`/`GetKeyboardState` **全没被调用过**；`gaks=0 diState=0 lastCb=0`。  
+  ⇒ 客户端确实会 `GetProcAddress`，但**不走**任何我们挂上的键态/光标入口；而 **真 `SendInput` 一打就灵**（前台启动能走）⇒ 它读的是**真实键盘状态**，入口在我们够不到的地方（最可能是堆上缓存的 `GetAsyncKeyState` 指针，故本轮加了 `MaplePatchPollPointersProcessWide`）。  
+- **前台启动 vs 后台启动的区别**：`PostKeyToWindow` 对方向键会**兼写真键**（`SendKeyboardKey`），但只在「目标就是前台窗」时补。所以**前台启动 = 真键在动 = 游戏读到 = 会走**；后台启动 = 只有 PostMessage + 软键态 = 游戏读不到 = 只会原地 A。**这条差异本身就是判据**，不要再往「DI 虚表没挂上」方向查。
 - **构建前提（踩过，别再踩）**：`src/window_mode/fake_focus/build_fakefocus32.cmd` 里 **禁止**写 `if defined ProgramFiles(x86)` —— 括号会打断 `if` 解析，BuildTools 装在「Program Files (x86)」时永远走到 `vcvarsall.bat not found - skip 32-bit DLL`，**32 位 DLL 被静默跳过**（症状：`FakeFocus32.dll` 时间戳远旧于 `FakeFocus64.dll`，任何 DLL 侧修复都没生效）。已改成先 `set "PF86=%ProgramFiles(x86)%"` 再判断，并加 vswhere 全路径兜底。验证：`cmake --build build --config Release --target FakeFocus32` 必须打印 `[FakeFocus32] OK:`。
 - **代码**：`UsesFakeFocus` / `UsesFakeFocusForTarget` 仍 false（保持 PostMessage）；`TryInstallFakeFocus` 对冒险岛注入 mapleSafe `InstallLite`（吞失活 + DI 填键）。`UsesMapleStoryFakeFocusInput` 恒 false。方向键：已注入时写 SoftInput + PostMessage，`SendKeyboardKey` **只在目标为前台窗时**才补（`TargetOwnsForegroundWindow`）。`WakeMapleStoryInputPolling()`（`window_mode_executor.cpp`，后台窗口模式 BeginRun 内）负责把「注入前已失焦」的客户端叫醒。`fake_focus_maplestory_focus_only` 约束 DLL：禁止假 WM_INPUT / 18 方法表 / user32 JMP。`MaplePollHitSummary()`（`window_mode_executor.cpp`）负责把诊断位解成人话。  
+
+### `background_fake_focus_not_degraded`
+
+- **测什么**：`ShouldInjectTimeScaleOnly(true, true)` 必须为 **false**（需要假焦点时不得只装时钟补丁）；`BackgroundTargetRequiresFakeFocus(后台+GLFW30, 关注入)` 为 true、设置开着时为 false、`HiddenDesktop` 时为 false。  
+- **用户症状**：**后台模式其实是「假后台」，跑脚本时鼠标/键盘被抢走**。实测 MC（`class=GLFW30`，Java 版）：脚本一动，用户就没法操作电脑。日志三连：
+  ```
+  [窗口模式] 已关闭假焦点注入，但启用了窗口变速：仅注入时钟补丁（不装假焦点钩，键鼠仍走软消息/必要时假前台）
+  [窗口模式] 假焦点未生效（未注入 / 仅时钟补丁 / 钩已拆），回退假前台 SendInput（绝对坐标；会占键鼠）
+  [窗口模式] 本机绝对光标 客户区(536,88) → 屏幕(1389,568)
+  ```
+- **根因**：`timeScaleOnlyInject` 的旧判据是 `timeScaleWanted && (!enableFakeFocusInjection_ || !fakeFocusNeeded)`。用户 `app_settings.json` 里 `enableFakeFocusInjection=false` + 开着变速 ⇒ 3D/GLFW 目标被带成「仅时钟补丁」⇒ DLL 里没有任何假焦点钩 ⇒ `fake_focus_active()` 为 false ⇒ `PreferHardwareInput()` 为 true ⇒ 回退假前台 SendInput。  
+- **修法**：
+  1. `ShouldInjectTimeScaleOnly(timeScaleWanted, fakeFocusNeeded) = timeScaleWanted && !fakeFocusNeeded` —— **判据里不得出现「用户关掉了假焦点注入」**。
+  2. `BackgroundTargetRequiresFakeFocus(config, hwnd, enableFakeFocusInjection)` —— 后台窗口模式 + 需要假焦点的 3D/游戏目标**忽略**该设置（理由同微信/冒险岛：没有假焦点就没有真后台）。
+  3. 边界：只对 `BackgroundWindow` 生效；`HiddenDesktop`（宏桌面）保持原行为 —— 那时用户本来就不在这台桌面上操作，占键鼠无所谓。
+- **代码**：`window_mode_types.h` `ShouldInjectTimeScaleOnly` / `BackgroundTargetRequiresFakeFocus`；`window_mode_executor.cpp` `TryInstallFakeFocus`（`timeScaleOnlyInject` 计算处 + `!enableFakeFocusInjection_` 分支）。  
+- **排查提示**：日志里出现「回退假前台 SendInput」＝后台承诺已破，先查这两条判据，别去动 DLL。  
+
+### `lca_nav_keyup_released_after_focus_loss`
+
+- **测什么**：`ShouldMirrorNavKeySend(down, targetOwnsForeground, mirroredDown)` —— 按下只在目标为前台时为 true；**松开只看 `mirroredDown`**，与此刻是否前台无关。  
+- **用户症状**（原话）：「**在游戏前台启动，再去浏览器看视频，就会朝离开时候的那一个方向 瞬移**」；切回任何程序都像在持续按方向键。  
+- **根因**：`PostKeyToWindow` 里 `SendKeyboardKey` 的判据原来每次调用都重算 `TargetOwnsForegroundWindow(send)`。按下时游戏在前台（补了真键 ↓）→ 用户切去浏览器 → 收到 KEYUP 时已不在前台 → 按「不在前台就不补」跳过 ⇒ **真键永久卡在按下状态**。游戏读真实键盘状态，于是朝那个方向一直走；整个系统也认为该键被按住。  
+- **修法**：`ShouldMirrorNavKeySend(down, fg, mirroredDown) = down ? fg : mirroredDown`；`PostKeyToWindow` 用 `g_mirroredNavDown[256]` 记录本会话补过 KEYDOWN 的方向键；新增 `ReleaseMirroredLcaNavKeys()`，在 `BeginRun` 开头与 `EndRun` 各调一次兜底松键。  
+- **注意与上一条的边界**：`lca_nav_key_leaks_to_foreground` 守的是**按下**（后台不得补，否则打进遮挡窗）；本条守的是**松开**（补过就必须补回来）。两条必须同时成立。  
+- **代码**：`background_window_input.h` `ShouldMirrorNavKeySend` / `ReleaseMirroredLcaNavKeys`；`background_window_input.cpp` `PostKeyToWindow`；`window_mode_executor.cpp` `BeginRun`/`EndRun`。  
+
+### `fakefocus_stale_module_crash`
+
+- **测什么**：`TargetHasStaleFakeFocusModule(pid)` 能按模块名发现目标进程里已加载的 `FakeFocus32.dll`/`FakeFocus64.dll`；`InstallMapleIatHooksGuarded()` 的 SEH 兜底不改变正常路径行为。  
+- **用户症状**：**注入后游戏立刻闪退**。日志特征：`冒险岛钩命中 … hitReady=1` 但 `冒险岛钩安装 … iatPoll=0 diag=0x00000000 foundVt=0 patchedSlot=0`（什么都没装上），紧接着 `目标窗口已消失（进程退出/闪退）`。  
+- **根因**：**同一个游戏进程反复注入**。第二次注入时 IAT 槽被两套 detour 覆盖、DirectInput 方法体 JMP 叠加、卸载时各按自己保存的原始字节回写 → 访问违例。现场最好认的证据是**日志里 `pid`/`hwnd` 跨小时甚至跨天完全不变**（实测 `pid=2489124 hwnd=0x0D06E6` 从 09-18 20:32 一直用到 09-19 16:24），说明用户一直没重启游戏。  
+- **修法**：注入前 `TargetHasStaleFakeFocusModule()`（Toolhelp，回传 **`szExePath` 完整路径**，只看模块名区分不出「两份不同路径」这种最危险的情况）警告「请先完全退出 MapleStoryt.exe」；`InstallMapleIatHooksGuarded()` 用 `__try/__except` 兜住安装期异常并置 `kMapleInstallFault`，先保游戏。  
+- **诊断读数全 0 的另一种成因（2026-09-20 补）**：日志出现 `iatPoll=0 diag=0x00000000 stage=0 hitReady=0` 但注入本身报成功 ⇒ 目标进程里已有一份**同一路径**的 FakeFocus，`InstallCommon` 走**早退路径**（`g_installed` 已为真）。此时 DLL 若不再往宿主新建的共享内存里写，宿主读到的就全是 0 —— 看着像「注入没生效」。已修：早退路径重新 `OpenSoftInputView` + `MaplePublishHits()`。**看到全 0 先排这一条，别急着怀疑钩子。**
+- **诊断契约补充**：`mapleDiag` 最高 8 位是安装阶段号（`MapleSetStage`，1=入口 2=指针就绪 3=PEB/IAT 扫完 4=DI 钩完 5=全部完成），宿主日志打 `stage=`/`fault=`。装到一半就没了 ⇒ `stage` 就是死亡点。  
+- **禁止**：用「文件大小 == 魔术数」判 DLL 新旧。源码一改大小就漂移，曾把 163840 判成「旧」、把源码注释里明写「164352 闪退」的尺寸当成「现行」，把整轮排查带偏。以共享内存 `diag`/`hitReady`/`stage` 为准。  
+- **代码**：`fake_focus_injector.cpp` `TargetHasStaleFakeFocusModule`；`fake_focus_dll.cpp` `InstallMapleIatHooksGuarded` / `MapleSetStage`；`window_mode_executor.cpp` `LogMapleHookHits`（解 `stage=`/`fault=`）。  
 
 ### `lca_arrow_key_lparam`
 

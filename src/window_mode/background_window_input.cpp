@@ -4,6 +4,7 @@
 #include "background_uia_input.h"
 #include "background_input_target.h"
 #include "cdp/cdp_input.h"
+#include "mouse_wheel_events.h"
 #include "utils.h"
 #include "window_coords.h"
 #include "window_mode_log.h"
@@ -77,6 +78,9 @@ int g_lastClientY = 0;
 HWND g_lastClientHwnd = nullptr;
 /// 软按键按下态（后台 PostMessage 路径自维护；物理 GetKeyState 看不到脚本修饰键）。
 bool g_softVkDown[256] = {};
+/// 自译目标（WinUI `RichEditD2DPT`）上「只发了 WM_CHAR、**没发** KEYDOWN」的键。
+/// 松开时不能再补一个无配对的 KEYUP（见 `SelfTranslateKeyUsesWmChar`）。
+bool g_softCharOnlyDown[256] = {};
 
 bool SoftIsVkDown(UINT vk) {
     return vk < 256 && g_softVkDown[vk];
@@ -173,6 +177,7 @@ void SoftSetVkDown(UINT vk, bool down) {
 
 void ResetSoftKeyState() {
     std::memset(g_softVkDown, 0, sizeof(g_softVkDown));
+    std::memset(g_softCharOnlyDown, 0, sizeof(g_softCharOnlyDown));
 }
 
 bool IsTextInputClass(const wchar_t* cls) {
@@ -629,7 +634,74 @@ bool SoftIsDoubleClick(HWND target, MouseButtonType button, int hitX, int hitY) 
     return false;
 }
 
-HWND ResolveBackgroundPostTarget(HWND hwnd, int& cx, int& cy) {
+/// 鼠标/滚轮的投递目标。
+///
+/// ★★ 这里做的就是**硬规则 ②**（`window_mode_requirements.h`：「已绑定到**子控件**时，
+///   投递路径不得再用『最大后代』重解析覆盖它」）在鼠标侧的那一次补齐
+///   （2026-09-30 真机报障「后台窗口滚动没效果」，目标 Win11 商店版记事本）：
+///
+///   绑定是 `ResolveBindHwnd(top, config)` **带 config** 选的（按录制到的
+///   `childWindowClassName` 命中 `RichEditD2DPT`）；而鼠标这条路原来直接调
+///   `ResolveBackgroundPostTarget` → `FindBackgroundInputChild(root, nullptr)`，
+///   **config 传 nullptr** ⇒ 把那个绑定丢掉，改用「最大后代」重新猜。
+///   实测窗口树（父子客户区一样大，父先于子）：
+///     `Notepad` ⊃ { `Microsoft.UI.Content.DesktopChildSiteBridge`, `RichEditD2DPT` }
+///   重解析猜到了**容器**那个桥，于是日志出现
+///     `滚轮投递 … 目标=0x…1307AE(Microsoft.UI.Content.DesktopChildSiteBridge) … 成功=1/1`
+///   —— 投递**成功**却等于没投：`PostMessage` 不向子窗转发。
+///
+///   ⚠ 判据刻意**收得很窄**，只动一种格：
+///     **绑定窗自己就是真文本控件，而重解析挑中的是包含它的容器** ⇒ 用绑定窗。
+///   其余一切照旧走 `ResolveBackgroundPostTarget`。
+///   这样既修掉真机那一格，又不会把「浏览器渲染子窗 / 模拟器渲染窗 / 桌面模拟器顶层」
+///   这些已经调好的选择改掉（那些格子里绑定窗不是文本控件，本判据不成立）。
+///
+///   ⚠ 键盘**早就不走这条路**（`PostKeyToWindow` 用 `ResolveSoftInputHwnd`，它认得
+///     子控件绑定）——所以这个缺陷只在鼠标侧显形，而且只在特定窗口树上显形。
+// 前置声明：`ResolveMousePostTarget` 定义在前，而它要用的启发式定义在后
+// （那个函数夹在一堆别的辅助函数中间，不便搬动）。
+HWND ResolveBackgroundPostTargetForMouse(HWND hwnd, int& cx, int& cy);
+
+HWND ResolveMousePostTarget(HWND bound, int& cx, int& cy) {
+    if (!bound || !IsWindow(bound)) return nullptr;
+    int hx = cx;
+    int hy = cy;
+    HWND target = ResolveBackgroundPostTargetForMouse(bound, hx, hy);
+    if (!target) return bound;
+
+    if (target != bound) {
+        // `IsChild(a, b)` = b 是 a 的后代。
+        // ⚠ 两种情况**不能**混为一谈：
+        //   · `IsChild(bound, target)`：重解析挑中了绑定窗**里面**的窗。
+        //     若绑定窗自己就是真文本控件（`RichEditD2DPT` 是叶子，正常不会命中这里，
+        //     但容器型绑定会）⇒ 听绑定的；否则按硬规则 ① 让位给里面的真控件（保持原样）。
+        //   · 两边**不相干**（真机那一格：绑定 edit 与容器 bridge 是**兄弟**）
+        //     ⇒ 绑定窗自己就是文本控件，容器只是被启发式误选 ⇒ **听绑定的**。
+        wchar_t boundCls[256]{};
+        GetClassNameW(bound, boundCls, 256);
+        const bool boundIsTextInput = IsTextInputClass(boundCls);
+        if (boundIsTextInput && !IsChild(bound, target)) {
+            // 兄弟/无关窗 + 绑定就是真控件 ⇒ 启发式选错了，用绑定窗。
+            target = bound;
+        }
+    }
+
+    if (target == bound) {
+        cx = hx;
+        cy = hy;
+        return bound;
+    }
+    int tx = hx;
+    int ty = hy;
+    if (MapClientPointBetweenHwnds(bound, target, tx, ty)) {
+        cx = tx;
+        cy = ty;
+    }
+    MaybeRemapTopClientToPostTarget(bound, target, cx, cy);
+    return target;
+}
+
+HWND ResolveBackgroundPostTargetForMouse(HWND hwnd, int& cx, int& cy) {
     if (!hwnd || !IsWindow(hwnd)) return nullptr;
 
     HWND root = TopLevelTargetWindow(hwnd);
@@ -701,12 +773,26 @@ HWND ResolveSoftInputHwnd(HWND hwnd) {
     HWND root = TopLevelTargetWindow(hwnd);
     if (!root) root = hwnd;
     if (ShouldPostLcaQueuedKeys(root) || ShouldPostLcaQueuedKeys(hwnd)) return root;
+
+    // 已绑定到**子控件**时不得再用「无 config 重解析」覆盖它。
+    // 绑定是 `ResolveBindHwnd`（带 config、按录制的子窗类名/拾取点）选的，比这里可信 ——
+    // 否则用户明确选中的输入框会被「最大子表面」顶掉。
+    // 唯一例外：绑到的只是**包装层**（真文本控件长在它里面）——PostMessage 不向子窗转发，
+    // 投给包装层等于完全没投（现代记事本 NotepadTextBox ⊃ RichEditD2DPT，实测），
+    // 这时让位给里面的真控件。
+    if (hwnd != root) {
+        if (HWND input = FindTextInputTarget(hwnd)) {
+            if (input != hwnd) return input;
+        }
+        return hwnd;
+    }
+
     int lastX = 0;
     int lastY = 0;
     if (GetLastSoftMouseClientPos(hwnd, lastX, lastY)) {
         int hitX = lastX;
         int hitY = lastY;
-        if (HWND hit = ResolveBackgroundPostTarget(hwnd, hitX, hitY)) return hit;
+        if (HWND hit = ResolveBackgroundPostTargetForMouse(hwnd, hitX, hitY)) return hit;
     }
     if (HWND surface = FindBackgroundInputChild(root, nullptr)) {
         if (surface != root) return surface;
@@ -714,6 +800,24 @@ HWND ResolveSoftInputHwnd(HWND hwnd) {
     if (HWND edit = FindTextInputTarget(root)) return edit;
     return hwnd;
 }
+
+/// 鼠标/滚轮的投递目标：**与键盘用同一个解析器**（`ResolveSoftInputHwnd`），
+/// 并把客户区坐标换算到该目标。
+///
+/// ⚠⚠ 为什么必须换掉原来的 `ResolveBackgroundPostTarget(hwnd, …)`
+///   （2026-09-30 真机报障「后台窗口滚动没效果」，目标是 Win11 商店版记事本）：
+///   `ResolveBackgroundPostTarget` 内部调的是 `FindBackgroundInputChild(root, nullptr)`
+///   —— **config 传 nullptr**。而绑定是 `ResolveBindHwnd(top, config)` **带 config** 选的
+///   （按录制的 `childWindowClassName` 命中 `RichEditD2DPT`）。
+///   ⇒ 鼠标这条路等于把用户明确绑定的子控件**丢掉**，再用「最大后代」重新猜一个，
+///   于是猜到了**容器** `Microsoft.UI.Content.DesktopChildSiteBridge`（父子客户区一样大，
+///   父先于子 ⇒ 最大值启发式取父）。`PostMessage` **不向子窗转发** ⇒ 滚轮投给容器
+///   会**如实报「成功=1/1」却等于没投** —— 日志上完全看不出来。
+///
+///   键盘早就不走这条路：`PostKeyToWindow` 用的是 `ResolveSoftInputHwnd`，
+///   它认得「已绑定到子控件就不要重解析」（`window_mode_requirements.h` 硬规则 ②）。
+///   四种投递（移动/按键/点击/滚轮）必须是**同一个目标**，否则同一份脚本
+///   在不同动作上手感不一致，而且这种不一致**只在特定窗口树上才显形**。
 
 bool SendQuickInputViaSoftChars(HWND input, const std::wstring& text, double charInterval,
     const std::atomic_bool* cancelFlag) {
@@ -738,6 +842,10 @@ bool SendQuickInputViaSoftChars(HWND input, const std::wstring& text, double cha
 }
 
 }  // namespace
+
+HWND ResolveMousePostTargetForTest(HWND bound, int& cx, int& cy) {
+    return ResolveMousePostTarget(bound, cx, cy);
+}
 
 void SetLcaBackgroundMessageMode(bool enabled) {
     g_lcaQueuedKeys = enabled;
@@ -824,8 +932,8 @@ bool SendQuickInputViaPostedKeys(HWND hwnd, const std::wstring& text, double cha
         && FakeFocusSoftInput_PostKeyEventsEnabled();
     const bool weixin = LooksLikeWeixinSoftHwnd(hwnd) || LooksLikeWeixinSoftHwnd(top);
     WindowModeLog(weixin
-        ? L"[窗口模式] 微信 Qt 快捷输入走 KEY*/Ctrl+V，不向 QWindow 发 WM_PASTE"
-        : L"[窗口模式] 快捷输入：非 Edit 走 KEY*/Ctrl+V（不发 WM_PASTE）");
+        ? L"[窗口/后台窗口模式] 微信 Qt 快捷输入走 KEY*/Ctrl+V，不向 QWindow 发 WM_PASTE"
+        : L"[窗口/后台窗口模式] 快捷输入：非 Edit 走 KEY*/Ctrl+V（不发 WM_PASTE）");
 
     // 按住/间隔：见 PostedKeyStepMs 注释。用户给了字间隔就取较大者，绝不低于最小时序。
     const int stepMs = PostedKeyStepMs();
@@ -935,7 +1043,7 @@ bool SendQuickInputViaPostedKeys(HWND hwnd, const std::wstring& text, double cha
         if (useBarrier) swprintf_s(pacing, L"队列屏障");
         else swprintf_s(pacing, L"%dms", stepMs);
         WindowModeLogf(
-            L"[窗口模式] 快捷输入逐字投递 %zu 字 按住=%s 间隔=%dms 文本=\"%s\"",
+            L"[窗口/后台窗口模式] 快捷输入逐字投递 %zu 字 按住=%s 间隔=%dms 文本=\"%s\"",
             text.size(), pacing, gapMs, preview.c_str());
     }
 
@@ -1086,7 +1194,7 @@ void PostQuickInputToWindow(HWND hwnd, const std::wstring& text, double charInte
         return;
     }
 
-    WindowModeLog(L"[窗口模式] 快捷输入失败：目标窗口不支持无焦点输入");
+    WindowModeLog(L"[窗口/后台窗口模式] 快捷输入失败：目标窗口不支持无焦点输入");
 }
 
 void PostScrollWheelToWindow(HWND hwnd, int cx, int cy, int steps, bool vertical, bool positive) {
@@ -1096,9 +1204,12 @@ void PostScrollWheelToWindow(HWND hwnd, int cx, int cy, int steps, bool vertical
 
     int hitX = cx;
     int hitY = cy;
-    HWND target = ResolveBackgroundPostTarget(hwnd, hitX, hitY);
+    // ★★ 滚轮就是栽在这一行：原来走 `ResolveBackgroundPostTarget`（内部 config=nullptr）
+    //    ⇒ 把用户绑定的 RichEditD2DPT 丢掉、改用「最大后代」猜到容器
+    //    ⇒ 投给容器"成功=1"却等于没投（PostMessage 不向子窗转发）。
+    //    现在与键盘共用 `ResolveSoftInputHwnd`（硬规则 ②）。
+    HWND target = ResolveMousePostTarget(hwnd, hitX, hitY);
     if (!target) target = hwnd;
-    MaybeRemapTopClientToPostTarget(hwnd, target, hitX, hitY);
     cx = hitX;
     cy = hitY;
 
@@ -1119,15 +1230,43 @@ void PostScrollWheelToWindow(HWND hwnd, int cx, int cy, int steps, bool vertical
         }
     }
 
-    // 与桌面路径对齐：每步一个 WHEEL_DELTA，禁止 steps*delta 挤进一条消息。
-    if (steps > 200) steps = 200;
-    const SHORT notch = static_cast<SHORT>(positive ? WHEEL_DELTA : -WHEEL_DELTA);
+    // 与桌面路径对齐：**一条消息只表达有限格数**，多出来的拆成多条。
+    //
+    // ⚠⚠ 这里原来是 `const SHORT notch = steps > 200 ? 200 : steps;`
+    //   —— 两层错：① `steps` 被静默截到 200（用户填 300 只滚 200 且无任何提示）；
+    //   ② 更致命的是**它根本没做乘法**，所以 `steps = 300` 时那条消息仍然只表达
+    //   **1 格**（`wp = notch`，notch 是"格数"却被当成"增量"塞进 wParam 高位）
+    //   ⇒ 多步滚动被静默压成一步。现在统一走 `MouseWheelEventsForSteps`。
+    int deltas[8]{};
+    const int wantEvents = WheelNotchEventCount(steps);
+    const int gotEvents = MouseWheelEventsForSteps(steps, positive, deltas,
+        static_cast<int>(sizeof(deltas) / sizeof(deltas[0])));
+    if (gotEvents < wantEvents) {
+        // 记账而不是静默：被 cap 截断时至少让日志里查得到（8 条 × 64 格 = 512 格上限）
+        WindowModeLogf(L"[窗口/后台窗口模式] 滚轮步数 %d 超出单次上限，已截断为 %d 格"
+            L"（请拆成多条滚动动作）", steps, gotEvents * kMaxWheelNotchesPerEvent);
+    }
     const UINT msg = vertical ? WM_MOUSEWHEEL : WM_MOUSEHWHEEL;
     const LPARAM lp = MAKELPARAM(sx, sy);
-    for (int i = 0; i < steps; ++i) {
-        const WPARAM wp = MAKEWPARAM(static_cast<WORD>(ModifierKeyFlags() | g_softMouseFlags), notch);
-        DeliverWindowMessage(target, msg, wp, lp);
+    int delivered = 0;
+    for (int i = 0; i < gotEvents; ++i) {
+        const WPARAM wp = MAKEWPARAM(static_cast<WORD>(ModifierKeyFlags() | g_softMouseFlags),
+            static_cast<WORD>(static_cast<SHORT>(deltas[i])));
+        // ⚠ `DeliverWindowMessage` 走 PostMessage/Notify 分支，**不抛也不报**：
+        //   投递失败（窗口已销毁/被 UIPI 拦/句柄失效）在这里完全无声。
+        //   2026-09-30 真机（Win11 记事本）正是这样：滚轮动作在日志里
+        //   **一行都没有**，无法判断"没送到"还是"送到了目标不认"。
+        //   ⇒ 逐条记账，把成功条数打出来。
+        if (DeliverWindowMessage(target, msg, wp, lp)) ++delivered;
     }
+    // 每次滚动动作一行（不是每格一行）：滚轮动作本来就低频，而这一行是
+    // 「到底送到谁、坐标多少、几条成功」的唯一证据。
+    wchar_t targetCls[128]{};
+    if (target && IsWindow(target)) GetClassNameW(target, targetCls, 128);
+    WindowModeLogf(L"[窗口/后台窗口模式] 滚轮投递 %s %s 步数=%d 目标=0x%p(%s) "
+        L"客户区=(%d,%d) 屏幕=(%d,%d) 成功=%d/%d",
+        vertical ? L"竖向" : L"横向", positive ? L"正向" : L"反向",
+        steps, target, targetCls, cx, cy, sx, sy, delivered, gotEvents);
 }
 
 bool IsArrowVirtualKey(UINT vk) {
@@ -1155,6 +1294,24 @@ bool TargetOwnsForegroundWindow(HWND hwnd) {
     HWND top = TopLevelTargetWindow(hwnd);
     if (top && IsWindow(top) && (fg == top || IsChild(top, fg))) return true;
     return false;
+}
+
+/// 我们真正用 SendInput 补过 KEYDOWN 的方向键（本机键态）。
+/// ⚠ KEYUP 必须看「当初补没补」，**不能**看「此刻目标在不在前台」：
+/// 按下时目标在前台（补了真键 ↓）、用户切去浏览器后才收到 KEYUP（那时已不在前台）——
+/// 若此时按「不在前台就不补」跳过，真键会**永久卡在按下状态**：
+/// 游戏朝那个方向一直走（用户实测「朝离开时候的那一个方向 瞬移」），
+/// 而且整个系统都认为该键被按住（切回任何程序都在持续按方向键）。
+static bool g_mirroredNavDown[256] = {};
+
+/// EndRun/开始新会话的兜底：把本会话补过 KEYDOWN 的方向键全部松开。
+/// 脚本中途停止、目标闪退、切换模式都可能让某一对 DOWN/UP 不配对，这里收尾。
+void ReleaseMirroredLcaNavKeys() {
+    for (int i = 0; i < 256; ++i) {
+        if (!g_mirroredNavDown[i]) continue;
+        g_mirroredNavDown[i] = false;
+        SendKeyboardKey(static_cast<UINT>(i), false);
+    }
 }
 
 void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
@@ -1204,15 +1361,19 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
                 mapleDiLive = diState > 0 && lastCb == 256;
             }
             // 兜底真键只在目标就是前台窗时补：后台时它打的是遮挡窗（浏览器视频 ←→ 跳转）。
-            const bool mirrorLocalKey = !mapleDiLive && TargetOwnsForegroundWindow(send);
+            // 但**松开**要看「当初按下时补过没有」—— 中途切走就再也不补 KEYUP 会卡死真键。
+            const int navIdx = static_cast<int>(vk & 0xFFu);
+            const bool mirrorLocalKey = ShouldMirrorNavKeySend(
+                down, !mapleDiLive && TargetOwnsForegroundWindow(send),
+                g_mirroredNavDown[navIdx]);
             static bool loggedArrowKeyState = false;
             if (!loggedArrowKeyState) {
                 loggedArrowKeyState = true;
                 WindowModeLogf(
-                    L"[窗口模式] 方向键%s本机键态 vk=0x%02X lParam=0x%08X"
-                    L"（DI lastCb=%lu diState=%lu；仅目标为前台时才补真键，后台不再打进遮挡窗）",
-                    mapleDiLive ? L"改走 DirectInput 软键、不再写"
-                                : (mirrorLocalKey ? L"兼写" : L"目标在后台、不写"),
+                    L"[窗口/后台窗口模式] 方向键%s本机键态 vk=0x%02X lParam=0x%08X"
+                    L"（DI lastCb=%lu diState=%lu；按下只在目标为前台时补，松开按当初是否补过必补）",
+                    mirrorLocalKey ? (down ? L"按下兼写" : L"松开补 KEYUP（按下时补过）")
+                                   : (down ? L"按下不写（目标在后台）" : L"松开无需补"),
                     vk, static_cast<unsigned>(lp),
                     static_cast<unsigned long>(lastCb),
                     static_cast<unsigned long>(diState));
@@ -1220,7 +1381,7 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
                 if (LooksLikeMapleStoryHwnd(send) && FakeFocusSoftInput_IsAttached()
                     && FakeFocusSoftInput_ReadMapleInstall(diag, iatPoll, diVt)) {
                     WindowModeLogf(
-                        L"[窗口模式] 冒险岛首方向键后 hitReady=%lu gfw=%lu gaks=%lu diState=%lu "
+                        L"[窗口/后台窗口模式] 冒险岛首方向键后 hitReady=%lu gfw=%lu gaks=%lu diState=%lu "
                         L"lastCb=%lu iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu",
                         static_cast<unsigned long>(hitReady),
                         static_cast<unsigned long>(gfw),
@@ -1233,7 +1394,10 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
                         static_cast<unsigned long>((diVt >> 8) & 0xFFu));
                 }
             }
-            if (mirrorLocalKey) SendKeyboardKey(vk, down);
+            if (mirrorLocalKey) {
+                g_mirroredNavDown[navIdx] = down;
+                SendKeyboardKey(vk, down);
+            }
         }
         PostMessageW(send, down ? WM_KEYDOWN : WM_KEYUP, vk, lp);
         PostMessageW(send, WM_NULL, 0, 0);
@@ -1243,22 +1407,46 @@ void PostKeyToWindow(HWND hwnd, UINT vk, bool down) {
     // 微信 4.x Qt：自己把 KEYDOWN 转成字，再吃宿主 WM_CHAR 就会一次变两次。
     const bool androidEmu = IsAndroidEmulatorTarget(top ? top : target, nullptr);
     HWND send = (weixinQt && top && IsWindow(top)) ? top : target;
+    // WinUI（XAML）文本控件同样会**自己**把 KEYDOWN 译成字符（实测 `RichEditD2DPT`：
+    // KEYDOWN(A)+WM_CHAR('a') → 'aa'），但它与 Qt/Android 不同 —— 它靠 `WM_CHAR` 也收字，
+    // 而 Enter/Tab/退格/方向键**只能**靠 KEYDOWN（WM_CHAR 不换行/不制表）。
+    // 它的自译只看**真实键态**（脚本按住的 Shift 它看不见）⇒ 可打印字符改由宿主发 WM_CHAR，
+    // 字符用软修饰键态译好（`SoftVkToChar` 已含 Shift/Ctrl 修正）。
+    wchar_t sendChar = 0;
+    wchar_t sendCls[128]{};
+    GetClassNameW(send, sendCls, 128);
+    const bool selfTranslate = ClassSelfTranslatesPostedKeys(sendCls);
     if (down) {
-        const UINT keyMsg = useSys ? WM_SYSKEYDOWN : WM_KEYDOWN;
-        DeliverWindowMessage(send, keyMsg, vk, BuildKeyLParam(vk, true));
-        if (!androidEmu && !qtWindow) {
-            if (wchar_t ch = SoftVkToChar(vk)) {
+        sendChar = SoftVkToChar(vk);
+        const int idx = static_cast<int>(vk & 0xFFu);
+        if (SelfTranslateKeyUsesWmChar(selfTranslate, sendChar)) {
+            // 只发字符：控件不会再自译一次，一次就一个字符。
+            const UINT charMsg = useSys ? WM_SYSCHAR : WM_CHAR;
+            DeliverWindowMessage(send, charMsg, static_cast<WPARAM>(sendChar),
+                BuildKeyLParam(vk, true));
+            g_softCharOnlyDown[idx] = true;
+        } else {
+            const UINT keyMsg = useSys ? WM_SYSKEYDOWN : WM_KEYDOWN;
+            DeliverWindowMessage(send, keyMsg, vk, BuildKeyLParam(vk, true));
+            if (!androidEmu && !qtWindow && !selfTranslate && sendChar) {
                 const UINT charMsg = useSys ? WM_SYSCHAR : WM_CHAR;
-                DeliverWindowMessage(send, charMsg, static_cast<WPARAM>(ch),
+                DeliverWindowMessage(send, charMsg, static_cast<WPARAM>(sendChar),
                     BuildKeyLParam(vk, true));
             }
+            g_softCharOnlyDown[idx] = false;
         }
         if (weixinQt) {
             PostMessageW(send, WM_NULL, 0, 0);
         }
     } else {
-        const UINT keyMsg = useSys ? WM_SYSKEYUP : WM_KEYUP;
-        DeliverWindowMessage(send, keyMsg, vk, BuildKeyLParam(vk, false));
+        const int idx = static_cast<int>(vk & 0xFFu);
+        const bool charOnly = g_softCharOnlyDown[idx];
+        g_softCharOnlyDown[idx] = false;
+        // 只发过 WM_CHAR 的键没有配对的 KEYDOWN，别再补 KEYUP。
+        if (!charOnly) {
+            const UINT keyMsg = useSys ? WM_SYSKEYUP : WM_KEYUP;
+            DeliverWindowMessage(send, keyMsg, vk, BuildKeyLParam(vk, false));
+        }
         if (weixinQt) {
             PostMessageW(send, WM_NULL, 0, 0);
         }
@@ -1297,9 +1485,9 @@ void PostMouseMoveToWindow(HWND hwnd, int cx, int cy) {
 
     int hitX = cx;
     int hitY = cy;
-    HWND target = ResolveBackgroundPostTarget(hwnd, hitX, hitY);
+    // ★ 与键盘同一解析器（硬规则 ②：已绑定子控件不得被「最大后代」重解析覆盖）
+    HWND target = ResolveMousePostTarget(hwnd, hitX, hitY);
     if (!target) target = hwnd;
-    MaybeRemapTopClientToPostTarget(hwnd, target, hitX, hitY);
 
     if (ShouldThrottleDesktopEmuMouseMove(target, hitX, hitY)) return;
 
@@ -1314,9 +1502,9 @@ void PostMouseButtonToWindow(HWND hwnd, int cx, int cy, MouseButtonType button, 
 
     int hitX = cx;
     int hitY = cy;
-    HWND target = ResolveBackgroundPostTarget(hwnd, hitX, hitY);
+    // ★ 同上：点击也必须落在用户绑定的那个控件上
+    HWND target = ResolveMousePostTarget(hwnd, hitX, hitY);
     if (!target) target = hwnd;
-    MaybeRemapTopClientToPostTarget(hwnd, target, hitX, hitY);
 
     const WPARAM buttonFlag = ButtonFlag(button);
     UINT downMsg = WM_LBUTTONDOWN;

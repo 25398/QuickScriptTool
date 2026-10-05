@@ -1,5 +1,5 @@
 // =============================================================================
-// WindowModeSelfTest — 窗口模式自检（Agent 入口）
+// WindowModeSelfTest — 窗口/后台窗口模式自检（Agent 入口）
 // =============================================================================
 // 总索引：.cursor/skills/module-selftest/SKILL.md
 // 专项：.cursor/skills/window-mode-debug/SKILL.md + reference.md
@@ -22,7 +22,10 @@
 #include "window_mode/window_list.h"
 #include "window_mode/window_mode_permission.h"
 #include "window_mode/ext_bridge/ext_bridge_server.h"
+#include "window_mode/window_mode_log.h"
+#include "window_mode/mouse_wheel_events.h"
 #include "window_mode/fake_focus/fake_focus_soft_input_host.h"
+#include "window_mode/fake_focus/fake_focus_stage.h"   // 注入副本（安装目录那份不被映射）
 #include "window_mode/ui_element_probe.h"
 #include "window_mode/virtual_desktop_accessor.h"
 #include "window_mode/injection/inject_common.h"
@@ -46,7 +49,28 @@ namespace {
 using selftest::Emit;
 using selftest::gJson;
 
+// ★★ 桌面/资源管理器图标：shell 的 InvokePattern 只"选中"，"打开"必须双击（2026-09-29）
+//   实测报障：点桌面「Edge」/列表项「Microsoft Edge」后回执说"已触发"，浏览器却没起来。
+//   判据只看结构（父链上有没有外壳视图宿主类），不看名字 —— 名字会本地化/重名。
+void TestShellIconHostClass() {
+    const bool yes = windowmode::ClassNameIsShellIconHost(L"SHELLDLL_DefView")
+        && windowmode::ClassNameIsShellIconHost(L"shelldll_defview");   // 大小写不敏感
+    // ⚠ 资源管理器**窗口**类/桌面宿主**本身**不算：窗口里嵌的 WebView/普通控件父链上也有它们，
+    //   认了就会把"网页里的按钮"误判成桌面图标（那会变成双击网页元素）。
+    const bool no = !windowmode::ClassNameIsShellIconHost(L"CabinetWClass")
+        && !windowmode::ClassNameIsShellIconHost(L"Progman")
+        && !windowmode::ClassNameIsShellIconHost(L"WorkerW")
+        && !windowmode::ClassNameIsShellIconHost(L"SysListView32")
+        && !windowmode::ClassNameIsShellIconHost(L"Chrome_WidgetWin_1")
+        && !windowmode::ClassNameIsShellIconHost(L"")
+        && !windowmode::ClassNameIsShellIconHost(nullptr);
+    selftest::Emit(L"shell_icon_host_class", yes && no, L"");
+}
 const selftest::CaseInfo kCases[] = {
+    {L"ext_bridge_concurrent_no_cross",
+     L"桥的并发请求回执不许串台（多会话并行的地基）"},
+    {L"long_log_does_not_terminate",
+     L"超长日志不得终止进程（固定缓冲 + vswprintf_s 会静默闪退）"},
     {L"quote_args_strip", L"default",
         L"Strip outer quotes on document path (avoids Notepad invalid-filename)"},
     {L"no_select_ignores_doc", L"default",
@@ -73,6 +97,20 @@ const selftest::CaseInfo kCases[] = {
         L"FindBackgroundInputChild finds nested Qt QWindowIcon under MuMu title"},
     {L"background_input_desktop_emu_top", L"default",
         L"FindBackgroundInputChild keeps DeSmuME top (not toolbar/largest child) when config=null"},
+    {L"background_input_wrapped_text_control", L"default",
+        L"Wrapper layer (NotepadTextBox) must yield to the real text control (RichEditD2DPT) inside it"},
+    {L"background_wheel_reaches_wrapped_input", L"default",
+        L"包装层**自己命中「已知渲染面」**时（真机类名 Microsoft.UI.Content.DesktopChildSiteBridge，"
+        L"含 Render 会被评分表命中）仍必须让位给里面的 RichEditD2DPT：投给容器 = PostMessage "
+        L"不转发 = 键鼠与滚轮全部石沉大海（2026-09-30「后台滚动没效果」的根因）"},
+    {L"wheel_targets_bound_child_not_wrapper", L"default",
+        L"★ 真机复现（Win11 记事本树）：绑定 RichEdit 而旁边有同为最大后代的容器兄弟时，"
+        L"鼠标/滚轮必须投给**绑定的** RichEdit —— 原来鼠标走 config=nullptr 的重解析，"
+        L"把绑定丢掉、投给容器并如实报「成功=1/1」，等于没投"},
+    {L"background_input_bound_child_respected", L"default",
+        L"PostKeyToWindow must not override an explicitly bound child with the largest sibling surface"},
+    {L"background_key_self_translate_policy", L"default",
+        L"WinUI RichEditD2DPT self-translates KEYDOWN: printable -> WM_CHAR only, Enter/Tab/nav -> KEYDOWN only"},
     {L"android_qt_fake_focus_gate", L"default",
         L"MuMu/LDPlayer must not auto fake-focus (PostMessage to render child)"},
     {L"weixin_qt_fake_focus", L"default",
@@ -87,6 +125,12 @@ const selftest::CaseInfo kCases[] = {
         L"LCA/game posted quick-input holds each key >=1 frame and keeps DOWN-CHAR-UP order (no swallowed digit)"},
     {L"soft_key_combo_state_race", L"default",
         L"Soft-input combo keys: target must still read the modifier as down when it processes the char keydown (Ctrl+V paste)"},
+    {L"native_host_manifest_points_to_product", L"default",
+        L"Native-messaging host path may only be a product exe; self-test/diag exes must never be registered"},
+    {L"maple_keystate_stall_resync", L"default",
+        L"Maple keystate stall: stale arrow bits are cleared while the client polls nothing, and re-asserted from the script's held keys on resume (never drops key events)"},
+    {L"selftest_refuses_foreign_launcher", L"default",
+        L"Self-test exe launched with browser/WebView args must refuse to run any case (exit 0, no suite)"},
     {L"background_quick_input", L"default",
         L"WindowModeExecutor background quick-input succeeds"},
     {L"background_click_keeps_foreground", L"default",
@@ -141,6 +185,10 @@ const selftest::CaseInfo kCases[] = {
         L"VirtualDesktopAccessor picks Win11 24H2+/23H2/Win10 DLL by OS build; no cross-OS fallback"},
     {L"fake_focus_hook_local", L"default",
         L"Load FakeFocus64/32 locally: GetForegroundWindow returns target; uninstall restores"},
+    {L"fake_focus_inject_copy", L"default",
+        L"注入走副本：源文件不被映射/名字归一成 FakeFocus32.dll/同一构建同一路径"},
+    {L"fake_focus_stage_sweep", L"default",
+        L"副本目录按年龄回收 + 被占用的跳过 + 让位改名残留 FakeFocus*.dll.locked-* 被清掉"},
     {L"fake_focus_lite_unreal", L"default",
         L"FakeFocus_InstallLite fakes foreground without hooking PeekMessage"},
     {L"fake_focus32_export_rva", L"default",
@@ -153,10 +201,20 @@ const selftest::CaseInfo kCases[] = {
         L"GLFW30 lite still hooks GetCursorPos (click coords); SetCursorPos warp swallowed"},
     {L"fake_focus_air_focus_only", L"default",
         L"ApolloRuntime AIR: fake GetForegroundWindow, no WndProc subclass, SetCursorPos not swallowed"},
+    {L"fake_focus_air_child_iat_only", L"default",
+        L"包装窗+AIR 子窗仍按 AIR 处理：不子类化；变速时钟钩只补 IAT（bit6=1），普通窗 bit6=0"},
+    {L"setwindowshook_not_for_fragile_targets", L"default",
+        L"setwindowshook 注入必须避开脆弱目标（含 Adobe AIR/造梦微端）；普通目标仍放行"},
+    {L"injected_module_stale_detection", L"default",
+        L"同路径复用旧实例判据：磁盘 DLL 晚于目标进程启动 ⇒ 判旧版（软键态会失效）；拿不到时间 ⇒ 不误报"},
     {L"fake_focus_maplestory_focus_only", L"default",
         L"MapleStoryClass IAT: fake GetCursorPos/GetAsyncKeyState, no WndProc subclass, no WM_INPUT"},
     {L"fake_focus_soft_input", L"default",
         L"Phase2: soft shared memory drives GetCursorPos/GetAsyncKeyState/GetKeyboardState + Raw Input"},
+    {L"window_time_scale_iat", L"default",
+        L"窗口变速：内联钩装上/2 倍速下 QPC 走快 2 倍/**缓存指针也走快**/关闭后彻底还原"},
+    {L"window_time_scale_only_iat", L"default",
+        L"仅变速注入：关掉假焦点注入时变速照常生效，且一个假焦点钩都没装"},
     {L"anjuzhen_script_wm_config", L"default",
         L"Parse build/*/scripts/安居镇.json windowMode: fakeFocus + Chrome child class"},
     {L"permission_match_uipi", L"default",
@@ -165,6 +223,10 @@ const selftest::CaseInfo kCases[] = {
         L"PermissionMismatch/DesktopNotReady must abort auto-launch (do not re-open MapleStoryt.exe)"},
     {L"maplestory_bg_fake_focus", L"default",
         L"MapleStoryClass / MapleStory.exe / 冒险岛 title →LCA PostMessage + mapleSafe lite；UsesFakeFocus=0、不最小化"},
+    {L"background_fake_focus_not_degraded", L"default",
+        L"后台+GLFW30+关注入 ⇒ 必须注入假焦点（否则回退假前台 SendInput 会抢鼠标）；仅时钟补丁判据不带「关了注入」"},
+    {L"fake_focus_uses_bound_hwnd_class", L"default",
+        L"配置类名为空（拖拽拾取）时必须按已绑定 HWND 的类名判假焦点；GLFW30/SDL_app 不得漏判"},
     {L"lca_bg_unknown_game", L"default",
         L"未登记游戏类名走 LCA 窗口消息；Unity 仍注入；记事本仍走Edit/WM_CHAR"},
     {L"tianlong_bg_fake_focus", L"default",
@@ -173,8 +235,19 @@ const selftest::CaseInfo kCases[] = {
         L"方向键lParam 扫描码0x4B + KF_EXTENDED；←/U+2190 规整为VK_LEFT"},
     {L"lca_nav_key_leaks_to_foreground", L"default",
         L"目标不在前台时方向键兜底不得SendInput（否则打进遮挡窗：浏览器视频跳进度/调音量）"},
+    {L"lca_nav_keyup_released_after_focus_loss", L"default",
+        L"方向键：按下时在前台补了真键、松开时已切走也必须补KEYUP（否则真键卡死，游戏朝一个方向一直走）"},
     {L"window_mode_target_lost_stops", L"default",
         L"BeginRun then DestroyWindow → TargetStillAlive is false (game crash must stop the script)"},
+    {L"ext_browser_leaf_predicate", L"default",
+        L"「浏览器是不是已经开着」判据：整名+大小写无关；msedgewebview2.exe / 自家 exe / "
+        L"片段名一律**不算**浏览器（算错就会在用户没开浏览器时静默不拉，或反过来白开一个窗口）"},
+    {L"mouse_wheel_step_events", L"default",
+        L"滚轮 步数→消息：一条只表达 ±64 格，多步拆多条；**任何一条的增量都必须装得进 SHORT**"
+        L"（274 格 = 120×274 > 32767，旧实现回绕成反向 ⇒ 滚轮像坏了一样）"},
+    {L"fake_focus_wheel_enqueue", L"default",
+        L"滚轮必须**无条件入队**（不依赖只有 Chromium/Qt 壳才置的 kSoftFlagPostKeyEvents）："
+        L"旧实现里普通游戏的滚轮请求被静默丢弃，而日志照样说投递成功"},
     {L"uwp_frame_bind_pid_still_alive", L"default",
         L"UWP ApplicationFrameHost vs CoreWindow PID mismatch must not look like a crash"},
     {L"invisible_child_class_bind", L"default",
@@ -195,8 +268,19 @@ const selftest::CaseInfo kCases[] = {
         L"UIA 控件按名字选：完全同名 > 前缀；灰控件降权；近似竞争判歧义；同分取阅读顺序最前"},
     {L"uia_control_list_format", L"default",
         L"UIA 控件台账文本：编号连续、含类型/名字/灰态能力位与坐标"},
+    {L"uia_action_verb_table", L"default",
+        L"控件类型→动作能力动词的穷尽表：输入框=fill、复选框=toggle、滑块=slide、滚动条=scroll、"
+        L"下拉/列表/树/数据项=select、按钮/链接=click；未知类型必须给 focus（绝不冒充 click）"},
+    {L"uia_control_list_carries_action_and_state", L"default",
+        L"台账文本透出 action:… 与可读状态（focused/value:/range:/toggle:/state:/v:%/readonly）"
+        L"——这些正是截图读不出来、导致模型「先点一下看看」的事实"},
+    {L"shell_icon_host_class", L"default",
+        L"★桌面/资源管理器图标判据（外壳视图宿主类）——它决定「打开」要不要双击"},
     {L"screen_point_occlusion_check", L"default",
         L"IsScreenPointOnForegroundWindow：屏幕外点必须判「不属于前台」；抢到前台时窗口内点必须判「属于前台」"},
+    {L"soft_input_fast_path", L"default",
+        L"每拍输入快速路径：几何/绑定/顶窗类名全未变才放行；顶窗失效、子窗绑定、尺寸变化、"
+        L"无缓存、HWND 复用（类名变）一律退回完整路径"},
 };
 
 void TestUiaControlPickByName() {
@@ -296,8 +380,113 @@ void TestUiaControlListFormat() {
         ok ? (emptyOk ? L"" : L"empty-list not empty") : text.c_str());
 }
 
-void TestScreenPointOcclusionCheck() {
-    // 屏幕外的点：WindowFromPoint 取不到窗口→必须判定为「不属于前台。
+// ── 控件类型 → 动作能力动词：**遍历实现用的同一张表**，逐格断言 ──────────────
+// 这张表是「半视觉」的事实核心：模型据此知道某个条目支持哪一类操作，
+// 而不是靠截图猜、或先点一下试试。它必须是**纯函数**（不碰 UIA），才测得到。
+//
+// ⚠ 自检**不自己抄 `UIA_*ControlTypeId` 常量**（那要拉 COM 头，且两份常量必然漂移：
+//   加了类型而自检表没跟上就依然全绿）。改为遍历 `UiControlTypeTable()` 本身 ——
+//   与实现同一份事实，本仓 §43 的同一条纪律。
+void TestUiaActionVerbTable() {
+    int n = 0;
+    const windowmode::UiControlTypeRow* rows = windowmode::UiControlTypeTable(&n);
+
+    std::wstring bad;
+    int checked = 0;
+    for (int i = 0; i < n; ++i) {
+        const windowmode::UiControlTypeRow& r = rows[i];
+        ++checked;
+        // ① 表里的 action 必须与按类型查出来的**完全一致**（表的两个出口不许各说各话）
+        const std::wstring got = windowmode::UiActionVerbForControl(r.controlTypeId);
+        if (got != r.action) {
+            bad += L" row" + std::to_wstring(i) + L" id=" + std::to_wstring(r.controlTypeId)
+                + L" verb=" + got + L" table=" + r.action + L";";
+        }
+        // ② 空角色/空动词等于台账那行少一段 ⇒ 模型又看不出能力（这一轮就白做了）
+        if (!r.label || !r.label[0]) bad += L" row" + std::to_wstring(i) + L" label-empty;";
+        if (!r.action || !r.action[0]) bad += L" row" + std::to_wstring(i) + L" action-empty;";
+    }
+
+    // ③ 未知类型必须给 `focus`，**绝不冒充 `click`** ——
+    //    点一个说不清是什么的东西会打错目标；「可聚焦」不构成任何能力承诺。
+    const int unknownIds[] = { 0, -1, 99999 };
+    for (int id : unknownIds) {
+        if (std::wstring(windowmode::UiActionVerbForControl(id)) != L"focus") {
+            bad += L" unknown id=" + std::to_wstring(id) + L" not focus;";
+        }
+    }
+    // ④ 表本身不许为空（空表会让上面所有循环静默通过 = 假绿）
+    const bool nonEmpty = n > 0;
+    if (!nonEmpty) bad += L" table-empty;";
+
+    const bool ok = bad.empty();
+    selftest::Emit(L"uia_action_verb_table", ok,
+        ok ? L"" : (L"rows=" + std::to_wstring(n) + bad).c_str());
+}
+
+// ── 台账文本必须把 action + 可读状态一起透出去 ──────────────────────────────
+// 这条钉的是**给模型看的那一行**：角色/能力/状态缺一个，模型就得回到截图。
+void TestUiaControlListCarriesActionAndState() {
+    // 类型 id 从**实现的那张表**里按角色标签取（不在自检里抄 UIA 常量：那要拉 COM 头，
+    // 且两份常量必然漂移）。取不到就让用例转红，而不是静默拿一个 0 去测。
+    auto typeIdByLabel = [](const wchar_t* label) -> int {
+        int n = 0;
+        const windowmode::UiControlTypeRow* rows = windowmode::UiControlTypeTable(&n);
+        for (int i = 0; i < n; ++i) {
+            if (std::wstring(rows[i].label) == label) return rows[i].controlTypeId;
+        }
+        return 0;
+    };
+    const int sliderType = typeIdByLabel(L"滑块");
+    const int editType = typeIdByLabel(L"输入框");
+    const int checkType = typeIdByLabel(L"复选框");
+
+    windowmode::UiControlInfo slider;
+    slider.id = 1;
+    slider.name = L"音量";
+    slider.controlType = L"滑块";
+    slider.action = windowmode::UiActionVerbForControl(sliderType);
+    slider.rect = RECT{ 100, 100, 400, 130 };
+    slider.state = { L"value:42", L"range:0-100" };
+
+    windowmode::UiControlInfo edit;
+    edit.id = 2;
+    edit.name = L"密码";
+    edit.controlType = L"输入框";
+    edit.action = windowmode::UiActionVerbForControl(editType);
+    edit.rect = RECT{ 100, 200, 400, 230 };
+    edit.password = true;
+    // ⚠ 密码框只报「它是密码框」，**值一个字都不给**（值回传会进 API 请求）。
+    edit.state = { L"password(值不回传)" };
+
+    windowmode::UiControlInfo toggle;
+    toggle.id = 3;
+    toggle.name = L"自动更新";
+    toggle.controlType = L"复选框";
+    toggle.action = windowmode::UiActionVerbForControl(checkType);
+    toggle.rect = RECT{ 100, 300, 300, 330 };
+    toggle.state = { L"toggle:on", L"focused" };
+
+    const std::wstring text =
+        windowmode::FormatUiControlListForAgent({ slider, edit, toggle }, 4000);
+    const bool ok = sliderType != 0 && editType != 0 && checkType != 0
+        && text.find(L"action:slide") != std::wstring::npos
+        && text.find(L"action:fill") != std::wstring::npos
+        && text.find(L"action:toggle") != std::wstring::npos
+        && text.find(L"[value:42]") != std::wstring::npos
+        && text.find(L"[range:0-100]") != std::wstring::npos
+        && text.find(L"[toggle:on]") != std::wstring::npos
+        && text.find(L"[focused]") != std::wstring::npos
+        && text.find(L"[password(值不回传)]") != std::wstring::npos
+        // 台账里**不许**出现任何密码值（这里没有值可泄，但要求「只报事实」的形态成立）
+        && text.find(L"value:\"") == std::wstring::npos;
+    selftest::Emit(L"uia_control_list_carries_action_and_state", ok,
+        ok ? L"" : (L"slider=" + std::to_wstring(sliderType) + L" edit="
+            + std::to_wstring(editType) + L" check=" + std::to_wstring(checkType) + L"\n"
+            + text).c_str());
+}
+
+void TestScreenPointOcclusionCheck() {    // 屏幕外的点：WindowFromPoint 取不到窗口→必须判定为「不属于前台。
     const bool outside = !windowmode::IsScreenPointOnForegroundWindow(-20000, -20000);
     // 自建窗口并置前（不复用文件后面的 helper，避免依赖定义顺序）；
     // 窗口内中心点必须判定为「属于前台」，否则会把正常点击误拦。
@@ -332,9 +521,61 @@ void TestScreenPointOcclusionCheck() {
             + std::to_wstring(insideOk ? 1 : 0)).c_str());
 }
 
+void TestSoftInputFastPath() {
+    // 允许：顶窗活着 + 绑定就是顶层 + 有缓存 + 几何一致。
+    const bool allow = windowmode::CanUseSoftInputFastPath(
+        /*topAlive*/ true, /*boundIsTopLevel*/ true,
+        /*haveCached*/ true, 800, 600, 800, 600);
+    // 每条前提单独破坏都必须退回完整路径 —— 任一条漏了都会在真实回放里
+    // 「窗口重开 / 缩放 / 子窗绑定」时拿旧几何继续跑，落点整体偏移。
+    const bool topDead = !windowmode::CanUseSoftInputFastPath(false, true, true, 800, 600, 800, 600);
+    const bool childBind = !windowmode::CanUseSoftInputFastPath(true, false, true, 800, 600, 800, 600);
+    const bool noCache = !windowmode::CanUseSoftInputFastPath(true, true, false, 800, 600, 800, 600);
+    const bool resized = !windowmode::CanUseSoftInputFastPath(true, true, true, 800, 600, 801, 600);
+    const bool resizedH = !windowmode::CanUseSoftInputFastPath(true, true, true, 800, 600, 800, 599);
+    // 缓存里的尺寸非法（首次绑定没量到）也必须退回。
+    const bool zeroCache = !windowmode::CanUseSoftInputFastPath(true, true, true, 0, 0, 0, 0);
+
+    // ── 类名维度（CanUseSoftInputFastPathClass）─────────────────────────
+    // 为什么必须有这一层：**窗口句柄会被系统复用**。关掉旧目标再开新目标
+    // （或目标闪退后重开）可能拿到同一个 HWND 值，客户区尺寸也恰好相同 ——
+    // 那时「HWND 相等 + 几何一致」全部成立，只靠上面那套判据会拿**旧绑定**
+    // 去投递，输入落到错误的目标上，且**不报任何错**。
+    const bool clsAllow = windowmode::CanUseSoftInputFastPathClass(
+        true, true, true, /*classMatches*/ true, 800, 600, 800, 600);
+    // 类名不同（= HWND 被复用）→ 必须退回完整路径重新绑定。
+    const bool clsReused = !windowmode::CanUseSoftInputFastPathClass(
+        true, true, true, /*classMatches*/ false, 800, 600, 800, 600);
+    // 类名不符时其余条件再好也不放行（逐条确认没有被短路掉）。
+    const bool clsReusedBeatsGeom = !windowmode::CanUseSoftInputFastPathClass(
+        true, true, true, false, 800, 600, 800, 600);
+    // 类名相同时，原有前提依然各自生效（不能因为加了类名就漏掉旧判据）。
+    const bool clsTopDead = !windowmode::CanUseSoftInputFastPathClass(
+        false, true, true, true, 800, 600, 800, 600);
+    const bool clsChildBind = !windowmode::CanUseSoftInputFastPathClass(
+        true, false, true, true, 800, 600, 800, 600);
+    const bool clsResized = !windowmode::CanUseSoftInputFastPathClass(
+        true, true, true, true, 800, 600, 801, 600);
+
+    const bool ok = allow && topDead && childBind && noCache && resized && resizedH && zeroCache
+        && clsAllow && clsReused && clsReusedBeatsGeom
+        && clsTopDead && clsChildBind && clsResized;
+    wchar_t detail[480]{};
+    swprintf_s(detail,
+        L"allow=%d topDead=%d childBind=%d noCache=%d resized=%d resizedH=%d zero=%d"
+        L" | clsAllow=%d clsReused=%d clsTopDead=%d clsChildBind=%d clsResized=%d",
+        allow ? 1 : 0, topDead ? 1 : 0, childBind ? 1 : 0, noCache ? 1 : 0,
+        resized ? 1 : 0, resizedH ? 1 : 0, zeroCache ? 1 : 0,
+        clsAllow ? 1 : 0, clsReused ? 1 : 0,
+        clsTopDead ? 1 : 0, clsChildBind ? 1 : 0, clsResized ? 1 : 0);
+    selftest::Emit(L"soft_input_fast_path", ok,
+        ok ? L"几何/绑定/顶窗类名全部未变才走快速路径；各类失效场景一律退回完整路径"
+           : detail);
+}
+
 void PrintHelp() {
     std::fwprintf(stderr,
-        L"WindowModeSelfTest — QuickScriptTool 窗口模式自检\n"
+        L"WindowModeSelfTest — QuickScriptTool 窗口/后台窗口模式自检\n"
         L"\n"
         L"用法:\n"
         L"  WindowModeSelfTest.exe [--json] [--list] [--macro] [--help]\n"
@@ -842,7 +1083,7 @@ void TestFakeFocusJsonRoundtrip() {
     const auto round = windowmode::ParseWindowModeJson(written);
     const bool roundOk = round.fakeFocusEnabled;
 
-    // 关闭窗口模式后写盘/读盘不得保留路径与类名。
+    // 关闭窗口/后台窗口模式后写盘/读盘不得保留路径与类名。
     windowmode::WindowModeScriptConfig disabled = cfg;
     disabled.enabled = false;
     disabled.targetExePath = L"C:\\\\Games\\\\a.exe";
@@ -1066,6 +1307,501 @@ void TestExtBridgeConfigParse() {
         "{\"port\":80,\"token\":\"short\"}", badPort, badTok);
     Emit(L"ext_bridge_config_parse", good && reject,
         (good && reject) ? L"" : L"ext bridge config parse failed");
+}
+
+// ── 扩展桥：AbortPending 之后**新连接仍必须被受理** ──────────────────────
+// 为什么有这个用例（2026-09-24 真实故障）：
+//   `EngineHost::StopRun()` 每次停止脚本都会调
+//   `WindowModeExecutor::NotifyCancel()` ⇒ `ExtBridgeServer::AbortPending()` ⇒ abort_=true。
+//   而清它的 `EndRun()` **只在窗口模式会话开着时**才跑 ⇒ 跑「窗口模式关闭」的脚本后
+//   闩锁**永久为 true**。当时 `HandleClient()` 开头写的是
+//   `if (stop_.load() || abort_.load()) return false;` ⇒ 桥**永久变聋**：
+//   新连接 TCP 连得上（内核 backlog），但不读请求、不回响应、**不留日志**，
+//   客户端只看到「连接被重置」，进程却完全健康 ⇒ 症状与「扩展没连上」一模一样。
+// 本用例直接打真 socket，钉死修复后的语义：**abort 只打断在途等待，不拒绝新连接**。
+// ── 日志：超长行**不得**终止进程（2026-09-25 闪退事故的回归）─────────────
+//
+// ⚠⚠ 前科：`WindowModeLogf/Verbosef/Eventf` 曾用 `wchar_t buf[1024]{} + vswprintf_s`。
+//   `vswprintf_s` 在**截断**时返回 -1 并调用 **invalid parameter handler**，
+//   默认 handler 会**直接终止进程** ⇒ **一条过长的日志就能让软件静默闪退**
+//   （没有日志、没有退出码，排查时完全看不出跟日志有关）。
+//   而我们的日志里会拼入网页返回的错误消息 / URL / 路径，长度**不受我们控制**。
+//
+// 本用例故意打一条 ~4000 字符的日志：
+//   · 修好后 ⇒ 正常通过；
+//   · 改回固定缓冲 ⇒ **测试进程当场消失**（不是红，是崩溃）——
+//     所以这条用例的"失败形态"就是进程没了，看 exe 有没有正常输出汇总行即可。
+// ── 桥：**并发请求的回执不许串台**（2026-09-25，为了「多会话并行」）─────────
+//
+// ⚠⚠ 为什么必须测这个：桥原来是**全局单槽**等待
+//   （`waitingId_` + 一份 `waitingResult_`/`waitingDone_`）⇒
+//   两条并发请求会互相吞掉对方的回执（后发的把 `waitingId_` 覆盖掉，
+//   先发的永远等不到 ⇒ 表现成"莫名超时"）。
+//   这正是 `web_ai_driver.cpp` 不得不用一把全局锁把调用串起来的原因。
+//   改成「按请求 id 关联的等待槽」之后，**必须证明**并发不串 —— 光看代码不算。
+//
+// 手法：在自检里**冒充一路扩展**（真 WS 握手 + 真帧），
+//   让它收到两条请求后**倒序回执**（先回后到的那条），
+//   再断言两个调用方各自拿到**自己那条**的回执。
+//   ⚠ 倒序回执是关键：如果实现是"按到达顺序配对"，就会错。
+
+namespace {
+
+/// 极简 WebSocket 客户端（只支持：文本帧、无分片、无扩展）。
+/// 仅供自检冒充"一路扩展"用。
+class MiniWsClient {
+public:
+    ~MiniWsClient() { Close(); }
+
+    bool Connect(int port, const std::string& path, const std::string& token = {}) {
+        s_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s_ == INVALID_SOCKET) return false;
+        DWORD tv = 6000;
+        ::setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        ::setsockopt(s_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(static_cast<u_short>(port));
+        a.sin_addr.s_addr = htonl(0x7F000001);
+        if (::connect(s_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return false;
+
+        // ★ 桥现在**要求** `?token=`（与产品里扩展走的是同一条判据：空 token 一律 401）。
+        //   这里不再"允许不传"——假扩展必须和真扩展用同一套握手，否则自检过的
+        //   是一条产品里根本不存在的路径。
+        const std::string req =
+            "GET " + path + "?token=" + token + " HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        if (!SendAll(req.data(), static_cast<int>(req.size()))) return false;
+
+        std::string hdr;
+        char c = 0;
+        while (hdr.size() < 8192) {
+            const int n = ::recv(s_, &c, 1, 0);
+            if (n != 1) return false;
+            hdr.push_back(c);
+            if (hdr.size() >= 4 && hdr.compare(hdr.size() - 4, 4, "\r\n\r\n") == 0) break;
+        }
+        return hdr.find("101") != std::string::npos;
+    }
+
+    bool SendText(const std::string& payload) {
+        std::string f;
+        f.push_back(static_cast<char>(0x81));   // FIN + opcode=text
+        const size_t n = payload.size();
+        if (n < 126) {
+            f.push_back(static_cast<char>(0x80 | static_cast<int>(n)));
+        } else if (n <= 0xFFFF) {
+            f.push_back(static_cast<char>(0x80 | 126));
+            f.push_back(static_cast<char>((n >> 8) & 0xFF));
+            f.push_back(static_cast<char>(n & 0xFF));
+        } else {
+            return false;
+        }
+        unsigned char mask[4];
+        for (int i = 0; i < 4; ++i) {
+            mask[i] = static_cast<unsigned char>(::rand() & 0xFF);
+        }
+        f.append(reinterpret_cast<const char*>(mask), 4);
+        for (size_t i = 0; i < n; ++i) {
+            f.push_back(static_cast<char>(payload[i] ^ mask[i % 4]));
+        }
+        return SendAll(f.data(), static_cast<int>(f.size()));
+    }
+
+    /// 读一条**文本**帧（跳过 ping，遇到 close 返回 false）
+    bool RecvText(std::string& out, int timeoutMs) {
+        DWORD tv = static_cast<DWORD>(timeoutMs > 0 ? timeoutMs : 6000);
+        ::setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        for (;;) {
+            unsigned char h[2] = {0, 0};
+            if (!ReadExact(h, 2)) return false;
+            const int opcode = h[0] & 0x0F;
+            const bool masked = (h[1] & 0x80) != 0;
+            unsigned long long len = h[1] & 0x7F;
+            if (len == 126) {
+                unsigned char e[2] = {0, 0};
+                if (!ReadExact(e, 2)) return false;
+                len = (static_cast<unsigned long long>(e[0]) << 8) | e[1];
+            } else if (len == 127) {
+                unsigned char e[8] = {0};
+                if (!ReadExact(e, 8)) return false;
+                len = 0;
+                for (int i = 0; i < 8; ++i) len = (len << 8) | e[i];
+            }
+            unsigned char mask[4] = {0, 0, 0, 0};
+            if (masked && !ReadExact(mask, 4)) return false;
+            std::string payload(static_cast<size_t>(len), '\0');
+            if (len && !ReadExact(reinterpret_cast<unsigned char*>(&payload[0]),
+                                  static_cast<int>(len))) {
+                return false;
+            }
+            if (masked) {
+                for (size_t i = 0; i < payload.size(); ++i) {
+                    payload[i] = static_cast<char>(payload[i] ^ mask[i % 4]);
+                }
+            }
+            if (opcode == 0x8) return false;   // close
+            if (opcode == 0x9) continue;       // ping：忽略（桥不用，但保险）
+            out = payload;
+            return true;
+        }
+    }
+
+    void Close() {
+        if (s_ != INVALID_SOCKET) {
+            ::closesocket(s_);
+            s_ = INVALID_SOCKET;
+        }
+    }
+
+private:
+    bool SendAll(const char* p, int n) {
+        int sent = 0;
+        while (sent < n) {
+            const int r = ::send(s_, p + sent, n - sent, 0);
+            if (r <= 0) return false;
+            sent += r;
+        }
+        return true;
+    }
+    bool ReadExact(unsigned char* buf, int n) {
+        int got = 0;
+        while (got < n) {
+            const int r = ::recv(s_, reinterpret_cast<char*>(buf + got), n - got, 0);
+            if (r <= 0) return false;
+            got += r;
+        }
+        return true;
+    }
+    SOCKET s_ = INVALID_SOCKET;
+};
+
+/// 从 `{"id":123,...}` 里取 id（极简，够自检用）
+int JsonIntLocal(const std::string& s, const char* key) {
+    const std::string pat = std::string("\"") + key + "\":";
+    const size_t k = s.find(pat);
+    if (k == std::string::npos) return -1;
+    return std::atoi(s.c_str() + k + pat.size());
+}
+
+/// 从 `{"type":"xxx",...}` 里取字符串值（极简）
+std::string JsonStrLocal(const std::string& s, const char* key) {
+    const std::string pat = std::string("\"") + key + "\":\"";
+    const size_t k = s.find(pat);
+    if (k == std::string::npos) return {};
+    const size_t b = k + pat.size();
+    const size_t e = s.find('"', b);
+    if (e == std::string::npos) return {};
+    return s.substr(b, e - b);
+}
+
+}  // namespace
+
+void TestBridgeConcurrentRequestsDoNotCross() {
+    auto& bridge = windowmode::ExtBridgeServer::Instance();
+    std::wstring startErr;
+    if (!bridge.Start(startErr)) {
+        Emit(L"ext_bridge_concurrent_no_cross", true,
+            L"skipped: bridge Start failed (port busy?)");
+        return;
+    }
+
+    MiniWsClient ws;
+    if (!ws.Connect(bridge.Port(), "/qst/ws", bridge.Token())) {
+        bridge.Stop();
+        Emit(L"ext_bridge_concurrent_no_cross", false, L"假扩展 WS 握手失败");
+        return;
+    }
+    // hello（桥要求握手后 5 秒内发，否则关连接）
+    ws.SendText("{\"type\":\"hello\",\"token\":\"" + bridge.Token() + "\"}");
+    for (int i = 0; i < 150 && !bridge.IsExtensionConnected(); ++i) {
+        ::Sleep(20);
+    }
+    if (!bridge.IsExtensionConnected()) {
+        ws.Close();
+        bridge.Stop();
+        Emit(L"ext_bridge_concurrent_no_cross", false, L"假扩展未被登记（hello 失败？）");
+        return;
+    }
+
+    // 两条**并发**请求
+    std::string r1, r2;
+    std::wstring e1, e2;   // ⚠ `Request` 的 err 是 **wstring**
+    std::atomic<bool> ok1{false};
+    std::atomic<bool> ok2{false};
+    std::thread t1([&]() { ok1.store(bridge.Request("pingA", "", r1, e1, 8000)); });
+    std::thread t2([&]() { ok2.store(bridge.Request("pingB", "", r2, e2, 8000)); });
+
+    // 假扩展：收两条，**倒序**回执（先回后到的那条）
+    std::string f1, f2;
+    const bool got1 = ws.RecvText(f1, 5000);
+    const bool got2 = ws.RecvText(f2, 5000);
+    bool replied = false;
+    if (got1 && got2) {
+        const int id1 = JsonIntLocal(f1, "id");
+        const int id2 = JsonIntLocal(f2, "id");
+        const std::string t1s = JsonStrLocal(f1, "type");
+        const std::string t2s = JsonStrLocal(f2, "type");
+        // ★ 倒序回：如果桥是"按到达顺序配对"，这里就会串台
+        ws.SendText("{\"id\":" + std::to_string(id2) + ",\"type\":\"result\",\"ok\":true,\"echo\":\"" + t2s + "\"}");
+        ws.SendText("{\"id\":" + std::to_string(id1) + ",\"type\":\"result\",\"ok\":true,\"echo\":\"" + t1s + "\"}");
+        replied = true;
+    }
+    t1.join();
+    t2.join();
+    ws.Close();
+    bridge.Stop();
+
+    const bool aOk = ok1.load() && r1.find("\"echo\":\"pingA\"") != std::string::npos;
+    const bool bOk = ok2.load() && r2.find("\"echo\":\"pingB\"") != std::string::npos;
+    const bool ok = replied && aOk && bOk;
+    std::wstring detail;
+    if (!ok) {
+        detail = L"got1=" + std::to_wstring(got1 ? 1 : 0)
+            + L" got2=" + std::to_wstring(got2 ? 1 : 0)
+            + L" okA=" + std::to_wstring(aOk ? 1 : 0)
+            + L" okB=" + std::to_wstring(bOk ? 1 : 0)
+            + L" | A=" + std::wstring(r1.begin(), r1.end()).substr(0, 80)
+            + L" | B=" + std::wstring(r2.begin(), r2.end()).substr(0, 80);
+    }
+    Emit(L"ext_bridge_concurrent_no_cross", ok, detail.c_str());
+}
+
+void TestLongLogDoesNotTerminateProcess() {
+    const std::wstring big(4000, L'字');
+    windowmode::WindowModeLogf(L"[自检] 超长日志回归 %s", big.c_str());
+    windowmode::WindowModeLogEventf(L"[自检] 超长日志回归（持久化路径）%s", big.c_str());
+    Emit(L"long_log_does_not_terminate", true, L"4000 字已打印，进程仍在");
+}
+
+/// 「浏览器已经在跑就别再拉一个」的判据（2026-09-27 真机事故）。
+///
+/// 事故形态：扩展离线（陈旧 token）时宿主无条件 `ShellExecute(msedge.exe)`，
+/// 而用户**本来就开着浏览器**（脚本目标窗口就在里面）⇒ 又冒出一个窗口/新标签页。
+/// 用户原话：「缩略图已经定位到目标窗口了，可是还是打开了新标签页」。
+///
+/// ⚠ 这条用例只钉**纯判据**（不真开浏览器）：判据错了就是"要么白开一个窗口、
+///   要么该开的时候不开"，两种都由下面这几格直接暴露。
+void TestBrowserLeafNameIsBrowser() {
+    namespace wm = windowmode;
+    struct Case { const wchar_t* leaf; bool want; const wchar_t* why; };
+    const Case cases[] = {
+        {L"msedge.exe", true, L"Edge 本体算浏览器"},
+        {L"MSEDGE.EXE", true, L"进程名大小写不保证，必须无关大小写"},
+        {L"chrome.exe", true, L"Chrome 算"},
+        {L"firefox.exe", true, L"Firefox 算"},
+        // ★★ 反例比正例重要：把下面这些算成浏览器 ⇒ 该拉浏览器时**静默不拉**。
+        {L"msedgewebview2.exe", false, L"WebView2 宿主不是用户浏览器（产品自己就带一个）"},
+        {L"QuickScriptTool.exe", false, L"自家 exe 不是浏览器"},
+        {L"explorer.exe", false, L"资源管理器不是浏览器"},
+        {L"", false, L"空名不算（枚举失败时的兜底格）"},
+        // ⚠ 判据是**整名**比对，不是子串：`edg` 这类片段不许命中。
+        {L"edge", false, L"片段不算（必须整名 + .exe）"},
+    };
+    bool ok = true;
+    std::wstring detail;
+    for (const auto& c : cases) {
+        const bool got = wm::ExtBrowserLeafNameIsBrowser(c.leaf);
+        if (got == c.want) continue;
+        ok = false;
+        if (!detail.empty()) detail += L"；";
+        detail += std::wstring(L"「") + c.leaf + L"」→ " + (got ? L"true" : L"false")
+            + L"，期望 " + (c.want ? L"true" : L"false") + L"（" + c.why + L"）";
+    }
+    Emit(L"ext_browser_leaf_predicate", ok, ok ? L"" : detail.c_str());
+}
+
+/// 滚轮「步数 → 消息」展开规则（2026-09-30 真机报障「滚动不能正常滚动」）。
+///
+/// ⚠⚠ 这条用例存在的原因：三处调用点各自手写过
+///     `delta = (positive ? WHEEL_DELTA : -WHEEL_DELTA) * steps` 再 `static_cast<SHORT>`，
+///     而 `SHORT` 只到 ±32767 ⇒ **steps = 274 就回绕成负数**（正着滚变成倒着滚）。
+///     裸眼看不出来，语法检查也全绿，只有真机滚不动才暴露。
+///     所以规则收成纯函数后，这里把**临界值与表意**一起钉死。
+///     ⚠ 另一处更隐蔽的错法也一并钉住：把"步数"当"增量"直接塞进 wParam 高位
+///     （`notch = steps`）—— 表现是"填 300 步也只滚 1 格"，同样没有任何报错。
+void TestMouseWheelStepEvents() {
+    namespace wm = windowmode;
+    int buf[16]{};
+    bool ok = true;
+    std::wstring detail;
+    auto check = [&](bool cond, const wchar_t* what) {
+        if (cond) return;
+        ok = false;
+        if (!detail.empty()) detail += L"；";
+        detail += what;
+    };
+
+    // ① 单格：一条，正负号正确。
+    int n = wm::MouseWheelEventsForSteps(1, true, buf, 16);
+    check(n == 1 && buf[0] == WHEEL_DELTA, L"1 格正向应为一条 +120");
+    n = wm::MouseWheelEventsForSteps(1, false, buf, 16);
+    check(n == 1 && buf[0] == -WHEEL_DELTA, L"1 格反向应为一条 -120");
+
+    // ② 3 格（编辑器/助手默认值）：一条 +360 —— 增量是 **3×120**，不是 3。
+    n = wm::MouseWheelEventsForSteps(3, true, buf, 16);
+    check(n == 1 && buf[0] == 3 * WHEEL_DELTA, L"3 格应合成一条 +360（不是把 3 当增量）");
+
+    // ③ ★ 溢出边界：274 格（120×274 = 32880 > 32767）。
+    //    旧实现这一步会回绕成 −32656（方向反过来）——本条就是那次事故的钉子。
+    const int big = 274;
+    const int need = wm::WheelNotchEventCount(big);
+    n = wm::MouseWheelEventsForSteps(big, true, buf, 16);
+    check(n == need, L"274 格应拆成多条");
+    int sum = 0;
+    bool allInShort = true;
+    for (int i = 0; i < n; ++i) {
+        sum += buf[i];
+        if (buf[i] > 32767 || buf[i] < -32768) allInShort = false;
+    }
+    check(allInShort, L"每条增量都必须装得进 SHORT（否则 wParam 高位回绕）");
+    check(sum == big * WHEEL_DELTA, L"拆分后总增量必须等于 步数×120（不许丢格）");
+
+    // ④ 反向同样成立（负向更容易踩回绕）。
+    n = wm::MouseWheelEventsForSteps(big, false, buf, 16);
+    sum = 0;
+    allInShort = true;
+    for (int i = 0; i < n; ++i) {
+        sum += buf[i];
+        if (buf[i] > 32767 || buf[i] < -32768) allInShort = false;
+    }
+    check(allInShort && sum == -big * WHEEL_DELTA, L"反向 274 格：不得回绕且总增量正确");
+
+    // ⑤ steps < 1 视为 1（滚轮动作画不出"滚 0 格"），不许返回 0 条。
+    n = wm::MouseWheelEventsForSteps(0, true, buf, 16);
+    check(n == 1 && buf[0] == WHEEL_DELTA, L"steps=0 应按 1 格处理");
+
+    // ⑥ cap 截断必须**可判定**：调用方靠 WheelNotchEventCount 比对才知道没写完
+    //    （写不完还闷着不吭声，就等于丢格）。
+    n = wm::MouseWheelEventsForSteps(big, true, buf, 2);
+    check(n == 2 && wm::WheelNotchEventCount(big) > 2,
+        L"cap 截断时必须能靠 WheelNotchEventCount 判定出来");
+
+    Emit(L"mouse_wheel_step_events", ok, ok ? L"" : detail.c_str());
+}
+
+/// 滚轮**入队**这一步必须真的发生（2026-09-30 真机报障的第二半）。
+///
+/// ⚠⚠ 原实现：`FakeFocusSoftInput_PushWheel` 一进门就
+///     `if (!(flags & kSoftFlagPostKeyEvents)) return;` —— 那个标志只有
+///     Chromium 壳 / Qt 安卓壳 / Electron 会置。普通游戏（GLFW/Unity/UE）走的是
+///     "目标进程内软输入"，于是滚轮请求被**直接丢掉**，而调用点照样打日志说
+///     「假焦点软滚轮 steps=N …DLL/PostMessage 队列」——
+///     日志里没有任何异常，用户只能看到"滚轮没反应"。
+///     这条用例直接盯**共享内存里的写游标**：不涨就是没入队，别信日志。
+void TestWheelQueueAcceptsWithoutPostKeyEventsFlag() {
+    namespace wm = windowmode;
+    if (wm::FakeFocusSoftInput_IsAttached()) wm::FakeFocusSoftInput_Detach();
+    std::wstring err;
+    if (!wm::FakeFocusSoftInput_Attach(::GetCurrentProcessId(), err)) {
+        // 共享内存建不起来（权限/已存在）就跳过，不让本 suite 因环境而红
+        Emit(L"fake_focus_wheel_enqueue", true,
+            (L"skipped: soft-input attach failed: " + err).c_str());
+        return;
+    }
+    // ★ 明确**不**置 kSoftFlagPostKeyEvents：这正是普通游戏的样子。
+    wm::FakeFocusSoftInput_SetPostKeyEvents(false);
+
+    uint32_t w0 = 0;
+    uint32_t r0 = 0;
+    const bool cursorsOk = wm::FakeFocusSoftInput_WheelCursors(w0, r0);
+    wm::FakeFocusSoftInput_PushWheel(true, false, 3);
+    uint32_t w1 = 0;
+    uint32_t r1 = 0;
+    wm::FakeFocusSoftInput_WheelCursors(w1, r1);
+    wm::FakeFocusSoftInput_PushWheel(false, true, 1);
+    uint32_t w2 = 0;
+    uint32_t r2 = 0;
+    wm::FakeFocusSoftInput_WheelCursors(w2, r2);
+
+    const bool ok = cursorsOk && (w1 == w0 + 1) && (w2 == w1 + 1);
+    wchar_t detail[192]{};
+    swprintf_s(detail, L"write %u→%u→%u（期望各 +1）；read=%u 未动=%d",
+        w0, w1, w2, r2, (r2 == r0) ? 1 : 0);
+    wm::FakeFocusSoftInput_Detach();
+    Emit(L"fake_focus_wheel_enqueue", ok, ok ? L"" : detail);
+}
+
+void TestExtBridgeAbortDoesNotRefuseNewClients() {
+    using namespace std::chrono;
+    namespace wm = windowmode;
+
+    auto& bridge = wm::ExtBridgeServer::Instance();
+    std::wstring startErr;
+    if (!bridge.Start(startErr)) {
+        // 端口被别的实例占了就跳过（不让本 suite 因环境而红）
+        Emit(L"ext_bridge_abort_keeps_serving", true,
+            L"skipped: bridge Start failed (port busy?)");
+        return;
+    }
+
+    // 发一个裸 HTTP GET，返回 true = 收到了任何响应字节；false = 连接被重置/无响应。
+    auto rawHttpGet = [](int port, const std::string& path) -> std::pair<bool, std::string> {
+        SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return {false, "socket()"};
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(static_cast<u_short>(port));
+        a.sin_addr.s_addr = htonl(0x7F000001);
+        DWORD tv = 4000;
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        std::string resp;
+        bool got = false;
+        if (::connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+            const std::string req = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                    "Connection: close\r\n\r\n";
+            if (::send(s, req.data(), static_cast<int>(req.size()), 0) > 0) {
+                char buf[2048];
+                const int n = ::recv(s, buf, sizeof(buf), 0);
+                if (n > 0) {
+                    got = true;
+                    resp.assign(buf, static_cast<size_t>(n));
+                }
+            }
+        }
+        ::closesocket(s);
+        return {got, resp};
+    };
+
+    const int port = bridge.Port();
+
+    // ① 基线：没 abort 时应答正常
+    const auto before = rawHttpGet(port, "/qst/status");
+    const bool baseOk = before.first && before.second.find("200") != std::string::npos;
+
+    // ② 置 abort（模拟「停止过一次脚本」）—— **不再调用 ClearAbort**
+    //    这正是故障现场：StopRun 置位，而 EndRun 因为窗口模式关闭而没跑。
+    bridge.AbortPending();
+    const bool abortedFlag = bridge.IsAborted();
+
+    const auto after = rawHttpGet(port, "/qst/status");
+    // ★★ 核心断言：abort 之后**仍然**必须拿到 HTTP 响应（而不是连接被重置）。
+    const bool stillServes = after.first && after.second.find("200") != std::string::npos;
+
+    // ③ 放掉闩锁后，等回执的路径也要恢复（ClearAbort 的语义）
+    bridge.ClearAbort();
+    const bool cleared = !bridge.IsAborted();
+    const auto afterClear = rawHttpGet(port, "/qst/status");
+    const bool servesAfterClear = afterClear.first
+        && afterClear.second.find("200") != std::string::npos;
+
+    bridge.Stop();
+
+    const bool ok = baseOk && abortedFlag && stillServes && cleared && servesAfterClear;
+    std::wstring detail;
+    if (!ok) {
+        detail = L"base=" + std::to_wstring(baseOk)
+            + L" abortedFlag=" + std::to_wstring(abortedFlag)
+            + L" stillServes=" + std::to_wstring(stillServes)   // ← 故障时这里会是 0
+            + L" cleared=" + std::to_wstring(cleared)
+            + L" servesAfterClear=" + std::to_wstring(servesAfterClear);
+    }
+    Emit(L"ext_bridge_abort_keeps_serving", ok, detail.c_str());
 }
 
 void TestFakeFocusMinimizeGate() {
@@ -1664,6 +2400,219 @@ std::wstring SelfExeDir() {
     return full.substr(0, slash + 1);
 }
 
+// ── 注入副本（fake_focus_stage）用例的夹具 ─────────────────────────────────
+// 全部走 %TEMP%，并显式传 stageRoot（FakeFocusStagedPathIn/StageFakeFocusDllInto/
+// SweepStaleFakeFocusArtifactsIn）—— 绝不去碰用户真实的 %LOCALAPPDATA%\QuickScriptTool。
+std::wstring MakeProbeDir(const wchar_t* tag) {
+    wchar_t tmp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return L"";
+    static int seq = 0;
+    wchar_t full[MAX_PATH]{};
+    swprintf_s(full, L"%sqst_wm_%s_%lu_%d", tmp, tag,
+        static_cast<unsigned long>(GetCurrentProcessId()), ++seq);
+    CreateDirectoryW(full, nullptr);
+    return full;
+}
+
+void RemoveProbeTree(const std::wstring& dir) {
+    if (dir.empty()) return;
+    WIN32_FIND_DATAW fd{};
+    const std::wstring glob = dir + L"\\*";
+    HANDLE find = FindFirstFileW(glob.c_str(), &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            const std::wstring child = dir + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveProbeTree(child);
+            } else {
+                DeleteFileW(child.c_str());
+            }
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+bool WriteProbeFile(const std::wstring& path, size_t bytes, unsigned char fill) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::vector<unsigned char> data(bytes, fill);
+    DWORD wrote = 0;
+    const bool ok = WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr)
+        && wrote == data.size();
+    CloseHandle(h);
+    return ok;
+}
+
+bool ReadProbeFile(const std::wstring& path, std::vector<unsigned char>& out) {
+    out.clear();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    unsigned char buf[4096]{};
+    DWORD read = 0;
+    while (ReadFile(h, buf, sizeof(buf), &read, nullptr) && read > 0) {
+        out.insert(out.end(), buf, buf + read);
+    }
+    CloseHandle(h);
+    return true;
+}
+
+std::wstring ProbeBaseName(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+bool PathExistsProbe(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool DirExistsProbe(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/// 把目录的「最后写入时间」拨到 daysAgo 天前（清扫按它判年龄）。
+bool BackdateProbeDir(const std::wstring& dir, int daysAgo) {
+    HANDLE h = CreateFileW(dir.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER v{};
+    v.LowPart = now.dwLowDateTime;
+    v.HighPart = now.dwHighDateTime;
+    v.QuadPart -= static_cast<ULONGLONG>(daysAgo) * 24ull * 60ull * 60ull * 10000000ull;
+    FILETIME back{};
+    back.dwLowDateTime = v.LowPart;
+    back.dwHighDateTime = v.HighPart;
+    const bool ok = SetFileTime(h, nullptr, nullptr, &back) != FALSE;
+    CloseHandle(h);
+    return ok;
+}
+
+void TestFakeFocusInjectCopy() {
+    const std::wstring root = MakeProbeDir(L"stage");
+    const std::wstring srcDir = root + L"\\src";
+    const std::wstring stageRoot = root + L"\\stage_root";
+    CreateDirectoryW(srcDir.c_str(), nullptr);
+    // 用 FakeFocus32.next.dll 当源：正好钉住「旁路槽名要归一成 FakeFocus32.dll」这条判据
+    // （MapleIsFakeFocusModulePath / TargetHasStaleFakeFocusModule 都按名认）。
+    const std::wstring source = srcDir + L"\\FakeFocus32.next.dll";
+    bool ioOk = WriteProbeFile(source, 2048, 0xAB);
+    std::vector<unsigned char> sourceBytes;
+    ioOk = ioOk && ReadProbeFile(source, sourceBytes);
+
+    std::wstring staged;
+    std::wstring err;
+    const bool staged1 = windowmode::StageFakeFocusDllInto(stageRoot, source, staged, err);
+    std::vector<unsigned char> stagedBytes;
+    const bool readOk = staged1 && ReadProbeFile(staged, stagedBytes);
+
+    // 第二次必须复用同一路径（同一构建同一副本，不重复落盘）
+    std::wstring stagedAgain;
+    std::wstring err2;
+    const bool staged2 = windowmode::StageFakeFocusDllInto(stageRoot, source, stagedAgain, err2);
+
+    // 源文件内容变了 ⇒ 新构建 ⇒ 必须换一份新副本（旧副本可能还被目标进程映射着）
+    const bool changed = WriteProbeFile(source, 4096, 0xCD);
+    std::wstring staged3;
+    std::wstring err3;
+    const bool staged3Ok = windowmode::StageFakeFocusDllInto(stageRoot, source, staged3, err3);
+
+    const std::wstring base1 = ProbeBaseName(staged);
+    const bool samePathOk = staged1 && staged2
+        && _wcsicmp(staged.c_str(), stagedAgain.c_str()) == 0;
+    const bool canonicalNameOk = _wcsicmp(base1.c_str(), L"FakeFocus32.dll") == 0;
+    const bool notSourceOk = staged1 && _wcsicmp(staged.c_str(), source.c_str()) != 0;
+    const bool contentOk = readOk && stagedBytes.size() == sourceBytes.size()
+        && !stagedBytes.empty()
+        && memcmp(stagedBytes.data(), sourceBytes.data(), sourceBytes.size()) == 0;
+    const bool newBuildOk = staged3Ok && _wcsicmp(staged3.c_str(), staged.c_str()) != 0;
+    // 源文件必须**原样不动**（这一层只读它）：改完之后仍是 4096 字节且首字节是我们写的 0xCD。
+    std::vector<unsigned char> sourceNow;
+    const bool sourceUntouched = ReadProbeFile(source, sourceNow)
+        && sourceNow.size() == 4096 && sourceNow[0] == 0xCD;
+
+    const bool ok = ioOk && changed && staged1 && staged2 && staged3Ok
+        && samePathOk && canonicalNameOk && notSourceOk && contentOk && newBuildOk
+        && sourceUntouched;
+    wchar_t detail[512]{};
+    swprintf_s(detail,
+        L"staged=%d same=%d name=%s notSource=%d content=%d newBuild=%d err=%s",
+        staged1 ? 1 : 0, samePathOk ? 1 : 0, base1.c_str(), notSourceOk ? 1 : 0,
+        contentOk ? 1 : 0, newBuildOk ? 1 : 0,
+        (err.empty() ? err2.c_str() : err.c_str()));
+    Emit(L"fake_focus_inject_copy", ok, ok ? L"" : detail);
+    RemoveProbeTree(root);
+}
+
+void TestFakeFocusStageSweep() {
+    const std::wstring root = MakeProbeDir(L"sweep");
+    const std::wstring stageRoot = root + L"\\stage_root";
+    const std::wstring exeDir = root + L"\\app";
+    const std::wstring srcDir = root + L"\\src";
+    CreateDirectoryW(srcDir.c_str(), nullptr);
+    CreateDirectoryW(exeDir.c_str(), nullptr);
+    const std::wstring source = srcDir + L"\\FakeFocus64.dll";
+    const bool wrote = WriteProbeFile(source, 1024, 0x11);
+
+    std::wstring oldCopy;
+    std::wstring freshCopy;
+    std::wstring err;
+    const bool oldOk = windowmode::StageFakeFocusDllInto(stageRoot, source, oldCopy, err);
+    // 造一份「另一构建」的副本目录：改源文件大小 ⇒ 新目录（旧目录留着当老古董）
+    WriteProbeFile(source, 2048, 0x22);
+    const bool freshOk = windowmode::StageFakeFocusDllInto(stageRoot, source, freshCopy, err);
+
+    // 老目录里按住一个「被占用」的文件（独占打开 = 模拟被进程映射）。
+    // ⚠ 顺序要紧：**先建文件、后拨时间** —— 在目录里建/删文件会把目录的
+    // 「最后写入时间」刷新成当前，而清扫正是按它判年龄的。
+    const std::wstring oldDir = oldCopy.substr(0, oldCopy.find_last_of(L'\\'));
+    const std::wstring heldPath = oldDir + L"\\held.dat";
+    const bool heldWrote = WriteProbeFile(heldPath, 64, 0x33);
+    HANDLE held = CreateFileW(heldPath.c_str(), GENERIC_READ, 0, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool backdated = BackdateProbeDir(oldDir, 40);
+
+    // 让位改名残留：一个该清、一个不该动
+    const std::wstring leftover = exeDir + L"\\FakeFocus32.dll.locked-20260101000000";
+    const std::wstring byuser = exeDir + L"\\user_notes.locked-keep.txt";
+    const bool leftoversWrote = WriteProbeFile(leftover, 16, 0x44)
+        && WriteProbeFile(byuser, 16, 0x55);
+
+    const windowmode::FakeFocusSweepResult r =
+        windowmode::SweepStaleFakeFocusArtifactsIn(stageRoot, exeDir, 30);
+
+    const bool oldDirKeptLocked = DirExistsProbe(oldDir) && r.stageKeptLocked == 1;
+    const bool freshKept = PathExistsProbe(freshCopy);
+    const bool leftoverGone = !PathExistsProbe(leftover) && r.leftoversRemoved == 1;
+    const bool userFileKept = PathExistsProbe(byuser);
+
+    if (held != INVALID_HANDLE_VALUE) CloseHandle(held);
+    // 放开占用 + 又过了 30 天（再拨一次时间）后重扫：这次老目录应该被整个删掉
+    // —— 证明"被占用就跳过"不是"永远留下"。
+    const bool rebackdated = BackdateProbeDir(oldDir, 40);
+    const windowmode::FakeFocusSweepResult r2 =
+        windowmode::SweepStaleFakeFocusArtifactsIn(stageRoot, exeDir, 30);
+    const bool oldRemovedAfterUnlock = !DirExistsProbe(oldDir) && r2.stageDirsRemoved == 1;
+
+    const bool ok = wrote && oldOk && freshOk && heldWrote && backdated && leftoversWrote
+        && oldDirKeptLocked && freshKept && leftoverGone && userFileKept
+        && rebackdated && (held != INVALID_HANDLE_VALUE) && oldRemovedAfterUnlock;
+    wchar_t detail[512]{};
+    swprintf_s(detail,
+        L"keptLocked=%d fresh=%d leftover=%d userKept=%d removedAfterUnlock=%d err=%s",
+        r.stageKeptLocked, freshKept ? 1 : 0, r.leftoversRemoved, userFileKept ? 1 : 0,
+        oldRemovedAfterUnlock ? 1 : 0, err.c_str());
+    Emit(L"fake_focus_stage_sweep", ok, ok ? L"" : detail);
+    RemoveProbeTree(root);
+}
+
 void TestFakeFocusHookLocal() {
 #if defined(_WIN64)
     const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
@@ -1837,6 +2786,110 @@ void TestFakeFocusAirFocusOnly() {
         installed ? 1 : 0, updated ? 1 : 0, hooked == hwnd ? 1 : 0, procOk ? 1 : 0,
         after.x, after.y, peekEmpty ? 1 : 0);
     Emit(L"fake_focus_air_focus_only", ok, ok ? L"" : detail);
+}
+
+// ── Adobe AIR：包装窗 + AIR 内容子窗（4399 微端 / 造梦西游的真实结构）──────────
+// 钉两条「注入不许把游戏带走」的防线：
+//   ① **AIR 识别必须看子窗** —— `ApolloRuntimeContentWindow` 常是**内容子窗**，父窗是
+//      启动器/包装窗；而 `InstallCommon` 拿到的 top 是 GA_ROOT。只看顶层 ⇒ 漏判 ⇒
+//      走**全量 Phase2**（子类化 + 光标钩 + RawInput）⇒ AIR「一启动就卡死退出，鼠标原地抽」。
+//   ② **AIR 的变速时钟钩不得改代码页** —— 它原本装在 `airSafe` 早退**之前**（whitelist 泄漏），
+//      而 AIR 已知脆 ⇒ 只允许 IAT 槽补丁（诊断 bit6 = `g_iatOnly`）。
+// 负对照：普通窗（STATIC）必须 bit6=0 —— 否则「bit6 恒为 1」也能让断言变绿。
+void TestFakeFocusAirChildIatOnly() {
+    const wchar_t* kName = L"fake_focus_air_child_iat_only";
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        Emit(kName, false, (L"LoadLibrary failed: " + dllPath).c_str());
+        return;
+    }
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    using DiagFn = DWORD(WINAPI*)(HWND);
+    auto* installLite = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_InstallLite"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    auto* diag = reinterpret_cast<DiagFn>(GetProcAddress(mod, "FakeFocus_TimeScaleDiag"));
+    if (!installLite || !uninstall || !diag) {
+        FreeLibrary(mod);
+        Emit(kName, false, L"missing FakeFocus_InstallLite/Uninstall/TimeScaleDiag");
+        return;
+    }
+
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSW wcChild{};
+    wcChild.lpfnWndProc = DefWindowProcW;
+    wcChild.hInstance = inst;
+    wcChild.lpszClassName = L"ApolloRuntimeContentWindow";
+    RegisterClassW(&wcChild);
+    WNDCLASSW wcWrap{};
+    wcWrap.lpfnWndProc = DefWindowProcW;
+    wcWrap.hInstance = inst;
+    wcWrap.lpszClassName = L"QstAirWrapperProbe";
+    RegisterClassW(&wcWrap);
+
+    HWND top = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, wcWrap.lpszClassName,
+        L"QST AIR wrapper", WS_OVERLAPPEDWINDOW, 80, 80, 320, 200,
+        nullptr, nullptr, inst, nullptr);
+    if (!top) {
+        FreeLibrary(mod);
+        UnregisterClassW(wcWrap.lpszClassName, inst);
+        UnregisterClassW(wcChild.lpszClassName, inst);
+        Emit(kName, false, L"CreateWindow wrapper failed");
+        return;
+    }
+    // ★ 子窗用 AIR 类名：真实微端就是「启动器窗 + ApolloRuntimeContentWindow 子窗」。
+    HWND airChild = CreateWindowExW(0, wcChild.lpszClassName, L"AIR content",
+        WS_CHILD | WS_VISIBLE, 0, 0, 300, 160, top, nullptr, inst, nullptr);
+    if (!airChild) {
+        DestroyWindow(top);
+        FreeLibrary(mod);
+        UnregisterClassW(wcWrap.lpszClassName, inst);
+        UnregisterClassW(wcChild.lpszClassName, inst);
+        Emit(kName, false, L"CreateWindow AIR child failed");
+        return;
+    }
+    ShowWindow(top, SW_SHOWNOACTIVATE);
+
+    // ① 顶层是包装窗、AIR 只在子窗上：必须仍按 AIR 处理 ⇒ 不子类化顶层。
+    const LONG_PTR procBefore = GetWindowLongPtrW(top, GWLP_WNDPROC);
+    const BOOL airInstalled = installLite(top);
+    const LONG_PTR procAfter = GetWindowLongPtrW(top, GWLP_WNDPROC);
+    const DWORD airDiag = airInstalled ? diag(nullptr) : 0u;
+    uninstall();
+
+    // ② 负对照：普通窗必须 bit6=0（否则 bit6 恒 1，断言毫无意义）。
+    HWND plain = CreateWindowExW(0, L"STATIC", L"QST plain probe",
+        WS_OVERLAPPEDWINDOW, 80, 80, 200, 100, nullptr, nullptr, inst, nullptr);
+    DWORD plainDiag = 0;
+    bool plainInstalled = false;
+    if (plain) {
+        plainInstalled = installLite(plain) != FALSE;
+        if (plainInstalled) plainDiag = diag(nullptr);
+        uninstall();
+        DestroyWindow(plain);
+    }
+
+    DestroyWindow(top);
+    FreeLibrary(mod);
+    UnregisterClassW(wcWrap.lpszClassName, inst);
+    UnregisterClassW(wcChild.lpszClassName, inst);
+
+    const bool procOk = procBefore == procAfter;
+    const bool airIatOnly = (airDiag & 64u) != 0;   // bit6：只补 IAT 槽、不碰代码页
+    const bool plainNotIatOnly = plainInstalled && (plainDiag & 64u) == 0u;
+    const bool ok = airInstalled && procOk && airIatOnly && plainNotIatOnly;
+    wchar_t detail[260]{};
+    swprintf_s(detail,
+        L"install=%d proc=%d airDiag=0x%08x(bit6=%d) plainInstalled=%d plainDiag=0x%08x(bit6=%d)",
+        airInstalled ? 1 : 0, procOk ? 1 : 0, static_cast<unsigned>(airDiag),
+        (airDiag & 64u) ? 1 : 0, plainInstalled ? 1 : 0, static_cast<unsigned>(plainDiag),
+        (plainDiag & 64u) ? 1 : 0);
+    Emit(kName, ok, ok ? L"" : detail);
 }
 
 void TestFakeFocusMapleStoryFocusOnly() {
@@ -2286,6 +3339,268 @@ void TestFakeFocusSoftInput() {
     Emit(L"fake_focus_soft_input", ok, ok ? L"" : detail);
 }
 
+// ── 窗口变速（变速齿轮）端到端 ─────────────────────────────────────────────
+// 为什么放在交互档而不是纯逻辑档：变速的实现在**目标进程内**（IAT 补丁 + 虚拟时钟），
+// 必须在真实进程里注入并真的读一次时钟才算验过。这里把 FakeFocus 装到自检进程自己身上，
+// 然后：
+//   ① 用 Sleep(300)（内核定时器，不受变速影响）当真实时间基准；
+//   ② 读 QueryPerformanceCounter —— 它此刻已被补丁接管；
+//   ③ 断言 2 倍速下 QPC 走的量 ≈ 2 × 真实睡眠，关闭后回到 ≈ 1 ×。
+// 这同时覆盖了「补丁装上了」「倍率真的生效」「关闭后彻底还原」三件事。
+// ── 仅变速注入（关掉「启用假焦点注入」时的路径）────────────────────────────
+// 用户关掉假焦点注入、却开着窗口变速时，窗口/后台窗口模式改走 FakeFocus_InstallTimeScaleOnly：
+// 只装时钟 IAT 补丁，一个假焦点钩都不装。这条路径必须单独测，因为它一旦回归
+// （比如忘了 early-return，顺手把全套钩子也装上），用户特意关掉的注入就会悄悄生效，
+// 而且**没有任何报错** —— 是最难发现的那种坏。
+// 断言两件事：① 变速照常生效（2 倍速下 QPC 真的走快 2 倍）；② 诊断 bit2 证明没走假焦点安装。
+void TestWindowTimeScaleOnlyIat() {
+    const wchar_t* kName = L"window_time_scale_only_iat";
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+    std::wstring softErr;
+    if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+        Emit(kName, false, softErr.empty() ? L"Attach soft input failed" : softErr.c_str());
+        return;
+    }
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, (L"LoadLibrary failed: " + dllPath).c_str());
+        return;
+    }
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    using DiagFn = DWORD(WINAPI*)(HWND);
+    auto* installTs = reinterpret_cast<InstallFn>(
+        GetProcAddress(mod, "FakeFocus_InstallTimeScaleOnly"));
+    auto* installFull = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_Install"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    auto* diag = reinterpret_cast<DiagFn>(GetProcAddress(mod, "FakeFocus_TimeScaleDiag"));
+    if (!installTs || !installFull || !uninstall || !diag) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false,
+            L"missing FakeFocus_InstallTimeScaleOnly/Install/Uninstall/TimeScaleDiag"
+            L"（DLL 版本过旧？）");
+        return;
+    }
+
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"QST TimeScaleOnly Probe",
+        WS_OVERLAPPEDWINDOW, 80, 80, 200, 100, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, L"CreateWindow failed");
+        return;
+    }
+    if (!installTs(hwnd)) {
+        DestroyWindow(hwnd);
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, L"FakeFocus_InstallTimeScaleOnly failed");
+        return;
+    }
+
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+    const auto measure = [&freq]() -> double {
+        LARGE_INTEGER a{}, b{};
+        QueryPerformanceCounter(&a);
+        Sleep(300);
+        QueryPerformanceCounter(&b);
+        if (freq.QuadPart <= 0) return -1.0;
+        return static_cast<double>(b.QuadPart - a.QuadPart)
+            / static_cast<double>(freq.QuadPart);
+    };
+
+    windowmode::FakeFocusSoftInput_SetTimeScale(1.0);
+    Sleep(250);
+    const double base = measure();
+    windowmode::FakeFocusSoftInput_SetTimeScale(2.0);
+    Sleep(250);
+    const DWORD diagTs = diag(nullptr);
+    const double fast = measure();
+    windowmode::FakeFocusSoftInput_SetTimeScale(0.0);
+    Sleep(250);
+    const DWORD diagOff = diag(nullptr);
+    const double back = measure();
+
+    // 换成完整安装：bit2 必须自己清掉（证明它描述的是「本次安装」，不是粘住的全局态）。
+    uninstall();
+    const bool fullInstalled = installFull(hwnd) != FALSE;
+    const DWORD diagFull = fullInstalled ? diag(nullptr) : 0u;
+    uninstall();
+
+    DestroyWindow(hwnd);
+    FreeLibrary(mod);
+    windowmode::FakeFocusSoftInput_Detach();
+
+    const uint32_t scaleTs = (diagTs >> 16) & 0xFFFFu;
+    const uint32_t slotsTs = (diagTs >> 8) & 0xFFu;
+    const bool tsOnlyFlag = (diagTs & 4u) != 0;             // bit2：确实走的「仅变速」分支
+    const bool tsInstalled = (diagTs & 1u) != 0 && scaleTs == 2000u && slotsTs > 0u;
+    const bool tsRemoved = (diagOff & 1u) == 0;
+    const bool fullClearsFlag = fullInstalled && (diagFull & 4u) == 0u;
+    const bool baseOk = base > 0.20 && base < 0.70;
+    const bool fastOk = fast > base * 1.5 && fast < base * 2.6;
+    const bool backOk = back > 0.20 && back < 0.70;
+    const bool ok = tsOnlyFlag && tsInstalled && tsRemoved && fullClearsFlag
+        && baseOk && fastOk && backOk;
+
+    wchar_t detail[640]{};
+    swprintf_s(detail,
+        L"diagTs=0x%08x(仅变速bit=%d 倍率%u 槽%u) diagOff=0x%08x diagFull=0x%08x(仅变速bit=%d) "
+        L"| 300ms: 原速%.3f 2倍速%.3f 关闭%.3f（期望 ≈%.3f/%.3f/%.3f）",
+        static_cast<unsigned>(diagTs), tsOnlyFlag ? 1 : 0, scaleTs, slotsTs,
+        static_cast<unsigned>(diagOff), static_cast<unsigned>(diagFull),
+        (diagFull & 4u) ? 1 : 0, base, fast, back, base, base * 2.0, base);
+    Emit(kName, ok, ok ? L"" : detail);
+}
+
+void TestWindowTimeScaleIat() {
+    const wchar_t* kName = L"window_time_scale_iat";
+#if defined(_WIN64)
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus64.dll";
+#else
+    const std::wstring dllPath = SelfExeDir() + L"FakeFocus32.dll";
+#endif
+    std::wstring softErr;
+    if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+        Emit(kName, false, softErr.empty() ? L"Attach soft input failed" : softErr.c_str());
+        return;
+    }
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, (L"LoadLibrary failed: " + dllPath).c_str());
+        return;
+    }
+    using InstallFn = BOOL(WINAPI*)(HWND);
+    using UninstallFn = BOOL(WINAPI*)();
+    using DiagFn = DWORD(WINAPI*)(HWND);
+    auto* install = reinterpret_cast<InstallFn>(GetProcAddress(mod, "FakeFocus_Install"));
+    auto* uninstall = reinterpret_cast<UninstallFn>(GetProcAddress(mod, "FakeFocus_Uninstall"));
+    auto* diag = reinterpret_cast<DiagFn>(GetProcAddress(mod, "FakeFocus_TimeScaleDiag"));
+    if (!install || !uninstall || !diag) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, L"missing FakeFocus_Install/Uninstall/TimeScaleDiag");
+        return;
+    }
+
+    // ⚠⚠ 本用例的核心：在装钩子**之前**把 QPC 的真实地址缓存下来。
+    //   目标进程（Unity）正是这么做的 —— 启动时拿到地址存进自己的结构体，之后不再走导入表。
+    //   旧实现只改 IAT 槽，对这类目标完全无效：实测补了 239 个槽、倍率也正确下发，
+    //   游戏照样不变速，白白查了三轮。现在改成内联钩函数体，所以**走这个缓存指针也必须变速**。
+    //   这一条断言就是当初该有却没有的那条。
+    auto* cachedQpc = reinterpret_cast<BOOL(WINAPI*)(LARGE_INTEGER*)>(
+        GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "QueryPerformanceCounter"));
+    if (!cachedQpc) {
+        cachedQpc = reinterpret_cast<BOOL(WINAPI*)(LARGE_INTEGER*)>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlQueryPerformanceCounter"));
+    }
+    if (!cachedQpc) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, L"找不到可用于模拟「目标缓存指针」的 QPC 地址");
+        return;
+    }
+
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"QST TimeScale Probe",
+        WS_OVERLAPPEDWINDOW, 80, 80, 200, 100, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, L"CreateWindow failed");
+        return;
+    }
+    if (!install(hwnd)) {
+        DestroyWindow(hwnd);
+        FreeLibrary(mod);
+        windowmode::FakeFocusSoftInput_Detach();
+        Emit(kName, false, L"FakeFocus_Install failed");
+        return;
+    }
+
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+    // ① 走 IAT 的 QPC（静态导入的调用方）
+    const auto measure = [&freq]() -> double {
+        LARGE_INTEGER a{}, b{};
+        QueryPerformanceCounter(&a);
+        Sleep(300);
+        QueryPerformanceCounter(&b);
+        if (freq.QuadPart <= 0) return -1.0;
+        return static_cast<double>(b.QuadPart - a.QuadPart)
+            / static_cast<double>(freq.QuadPart);
+    };
+    // ② 走「缓存指针」的 QPC（模拟 Unity 这类目标的真实行为）
+    const auto measureCached = [&freq, cachedQpc]() -> double {
+        LARGE_INTEGER a{}, b{};
+        cachedQpc(&a);
+        Sleep(300);
+        cachedQpc(&b);
+        if (freq.QuadPart <= 0) return -1.0;
+        return static_cast<double>(b.QuadPart - a.QuadPart)
+            / static_cast<double>(freq.QuadPart);
+    };
+
+    windowmode::FakeFocusSoftInput_SetTimeScale(1.0);
+    Sleep(250);
+    const double base = measure();
+    const double baseCached = measureCached();
+    windowmode::FakeFocusSoftInput_SetTimeScale(2.0);
+    Sleep(250);
+    const DWORD diag2x = diag(nullptr);
+    const double fast = measure();
+    const double fastCached = measureCached();
+    windowmode::FakeFocusSoftInput_SetTimeScale(0.0);
+    Sleep(250);
+    const DWORD diagOff = diag(nullptr);
+    const double back = measure();
+    const double backCached = measureCached();
+
+    // 钩子调用计数必须涨 —— 否则说明钩子根本没进入调用路径，
+    // 那前面那些"耗时变了"的断言就是假的。
+    // ⚠ 必须在 Detach 之前读：Detach 会关掉宿主视图，读到的会是 null。
+    uint32_t hookCalls[6]{};
+    const bool haveCalls = windowmode::FakeFocusSoftInput_TimeHookCalls(hookCalls, 6);
+    const bool hookFired = haveCalls && hookCalls[0] > 0u;
+
+    uninstall();
+    DestroyWindow(hwnd);
+    FreeLibrary(mod);
+    windowmode::FakeFocusSoftInput_Detach();
+
+    const uint32_t scale2x = (diag2x >> 16) & 0xFFFFu;
+    const uint32_t hooks2x = (diag2x >> 8) & 0xFFu;
+    const bool installed = (diag2x & 1u) != 0 && scale2x == 2000u && hooks2x > 0u;
+    const bool removed = (diagOff & 1u) == 0 && ((diagOff >> 16) & 0xFFFFu) == 0u;
+    const bool baseOk = base > 0.20 && base < 0.70;
+    const bool fastOk = fast > base * 1.5 && fast < base * 2.6;
+    const bool backOk = back > 0.20 && back < 0.70;
+    // ★ 决定性断言：缓存指针也必须被拦住（旧实现就是死在这一条上）
+    const bool cachedFastOk = fastCached > baseCached * 1.5 && fastCached < baseCached * 2.6;
+    const bool cachedBackOk = backCached > 0.20 && backCached < 0.70;
+    const bool ok = installed && removed && baseOk && fastOk && backOk
+        && cachedFastOk && cachedBackOk && hookFired;
+
+    wchar_t detail[700]{};
+    swprintf_s(detail,
+        L"diag2x=0x%08x(倍率%u 钩%u) diagOff=0x%08x 调用计数=%u(有=%d) | "
+        L"走IAT 300ms %.3f/%.3f/%.3f | 走缓存指针 300ms %.3f/%.3f/%.3f"
+        L"（期望 原速≈0.3 / 2倍速≈0.6 / 关闭≈0.3）",
+        static_cast<unsigned>(diag2x), scale2x, hooks2x, static_cast<unsigned>(diagOff),
+        hookCalls[0], haveCalls ? 1 : 0,
+        base, fast, back, baseCached, fastCached, backCached);
+    Emit(kName, ok, ok ? L"" : detail);
+}
+
 std::wstring ReadFileUtf8AsWide(const std::wstring& path) {
     HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2474,6 +3789,169 @@ void TestMapleStoryBackgroundFakeFocus() {
            : L"MapleStory not classified or UsesFakeFocus/minimize/lite flag wrong");
 }
 
+/// `SetWindowsHook` 是「把 DLL 装进**目标 UI 线程**」的注入方式：脆弱目标必须降级成 classic。
+///
+/// 前科：GLFW/Java《我的世界》在目标消息线程里 `LoadLibrary` ⇒ 当场崩；
+/// **Adobe AIR（造梦西游 / 4399 微端）⇒ 一启动就卡死退出，鼠标原地抽**。
+/// 这条断言钉住「AIR 在禁止名单里」—— 少了它，用户把注入技术选成 `setwindowshook`
+/// 时 AIR 微端就会被带走；而默认技术是 classic ⇒ **日常完全测不出来**。
+/// 负对照：普通目标（一个都不命中）必须放行，否则「恒真」也能让上面全绿。
+void TestSetWindowsHookNotForFragileTargets() {
+    const wchar_t* kName = L"setwindowshook_not_for_fragile_targets";
+    using windowmode::ForbidsSetWindowsHookTechnique;
+    const bool eachAir = ForbidsSetWindowsHookTechnique(false, false, false, false, false, true);
+    const bool eachChromium = ForbidsSetWindowsHookTechnique(true, false, false, false, false, false);
+    const bool eachWeixin = ForbidsSetWindowsHookTechnique(false, true, false, false, false, false);
+    const bool eachAndroid = ForbidsSetWindowsHookTechnique(false, false, true, false, false, false);
+    const bool eachNative3d = ForbidsSetWindowsHookTechnique(false, false, false, true, false, false);
+    const bool eachEmu = ForbidsSetWindowsHookTechnique(false, false, false, false, true, false);
+    const bool plainAllowed = !ForbidsSetWindowsHookTechnique(false, false, false, false, false, false);
+    const bool ok = eachAir && eachChromium && eachWeixin && eachAndroid && eachNative3d
+        && eachEmu && plainAllowed;
+    wchar_t detail[220]{};
+    swprintf_s(detail, L"air=%d chromium=%d weixin=%d android=%d native3d=%d emu=%d plainAllowed=%d",
+        eachAir ? 1 : 0, eachChromium ? 1 : 0, eachWeixin ? 1 : 0, eachAndroid ? 1 : 0,
+        eachNative3d ? 1 : 0, eachEmu ? 1 : 0, plainAllowed ? 1 : 0);
+    Emit(kName, ok, ok ? L"" : detail);
+}
+
+/// 同路径 ≠ 同一份内容（2026-10-03 用户报障「冒险岛后台原地不动的平A，不能走A」）。
+/// 用户升级/重建软件后游戏进程**没重启** ⇒ 只比路径会判「同一份文件」⇒ 复用旧实例，
+/// 而 `LoadLibrary` 同路径不会重新执行 DllMain ⇒ 进程里是旧代码。共享内存结构加过字段
+/// （`kSoftInputVersion` 7→10）后旧 DLL 与新宿主不兼容 ⇒ 软键态/DirectInput 全失效。
+/// 这里逐格钉住判据 + 负对照：**拿不到时间必须不报警**（否则用户被无谓要求重启游戏）。
+void TestInjectedModuleStaleDetection() {
+    const wchar_t* kName = L"injected_module_stale_detection";
+    using windowmode::InjectedModuleLooksStale;
+    // ① 磁盘 DLL（200）晚于进程启动（100）⇒ 进程内是旧代码 ⇒ 必须判旧。
+    const bool newerIsStale = InjectedModuleLooksStale(200, 100);
+    // ② 反例：进程启动（200）晚于 DLL 写入（100）⇒ 进程加载的就是当前文件 ⇒ 不许报警。
+    const bool olderIsFresh = !InjectedModuleLooksStale(100, 200);
+    // ③ 相等（同一瞬间）⇒ 不报警（保守）。
+    const bool equalNotStale = !InjectedModuleLooksStale(150, 150);
+    // ④⑤⑥ 负对照：任一为 0（拿不到进程启动时间 / 文件时间）⇒ 必须**不**报警。
+    const bool zeroDllNotStale = !InjectedModuleLooksStale(0, 100);
+    const bool zeroProcNotStale = !InjectedModuleLooksStale(100, 0);
+    const bool bothZeroNotStale = !InjectedModuleLooksStale(0, 0);
+    const bool ok = newerIsStale && olderIsFresh && equalNotStale
+        && zeroDllNotStale && zeroProcNotStale && bothZeroNotStale;
+    wchar_t detail[260]{};
+    swprintf_s(detail,
+        L"newerIsStale=%d olderIsFresh=%d equalNotStale=%d zeroDll=%d zeroProc=%d bothZero=%d",
+        newerIsStale ? 1 : 0, olderIsFresh ? 1 : 0, equalNotStale ? 1 : 0,
+        zeroDllNotStale ? 1 : 0, zeroProcNotStale ? 1 : 0, bothZeroNotStale ? 1 : 0);
+    Emit(kName, ok, ok ? L"" : detail);
+}
+
+/// 后台窗口模式 + 3D/游戏目标（MC / GLFW30）：即使设置里关了「假焦点注入」也必须注入假焦点。
+/// 否则引擎只能回退「假前台 SendInput（绝对坐标）」—— 会抢鼠标/键盘，用户看到的就是**假后台**。
+/// 同时锁住「仅时钟补丁」的判据里**不能**再带「用户关了假焦点注入」这一项（那正是 MC 踩到的坑）。
+void TestBackgroundFakeFocusNotDegraded() {
+    const wchar_t* kName = L"background_fake_focus_not_degraded";
+
+    // ① 纯判据：需要假焦点时绝不允许只装时钟补丁。
+    const bool onlyOk = !windowmode::ShouldInjectTimeScaleOnly(true, true)
+        && windowmode::ShouldInjectTimeScaleOnly(true, false)
+        && !windowmode::ShouldInjectTimeScaleOnly(false, true)
+        && !windowmode::ShouldInjectTimeScaleOnly(false, false);
+
+    // ② 真窗口 + GLFW30 类名，走完整判定链（UsesFakeFocusForTarget 需要真实 HWND）。
+    const wchar_t* kClass = L"GLFW30";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kClass;
+    const ATOM atom = RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, kClass, L"QST GLFW30 Probe", WS_OVERLAPPEDWINDOW,
+        64, 64, 240, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    windowmode::WindowModeScriptConfig bg{};
+    bg.enabled = true;
+    bg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    bg.inputStrategy = windowmode::WindowModeInputStrategy::SoftMessage;
+    bg.windowClassName = kClass;
+
+    bool forced = false;      // 后台 + GLFW30 + 关注入 ⇒ 仍须注入
+    bool respectOn = false;   // 设置开着时不该强行覆盖
+    bool hiddenDeskNo = false; // 宏桌面（HiddenDesktop）不属于这条，保持原行为
+    if (hwnd) {
+        forced = windowmode::BackgroundTargetRequiresFakeFocus(bg, hwnd, false);
+        respectOn = !windowmode::BackgroundTargetRequiresFakeFocus(bg, hwnd, true);
+        auto hidden = bg;
+        hidden.executionKind = windowmode::WindowModeExecutionKind::HiddenDesktop;
+        hiddenDeskNo = !windowmode::BackgroundTargetRequiresFakeFocus(hidden, hwnd, false);
+    }
+
+    if (hwnd) DestroyWindow(hwnd);
+    if (atom) UnregisterClassW(kClass, GetModuleHandleW(nullptr));
+
+    const bool ok = onlyOk && hwnd && forced && respectOn && hiddenDeskNo;
+    wchar_t detail[240]{};
+    swprintf_s(detail, L"only=%d hwnd=%d forced=%d respectOn=%d hiddenDeskNo=%d",
+        onlyOk ? 1 : 0, hwnd ? 1 : 0, forced ? 1 : 0, respectOn ? 1 : 0,
+        hiddenDeskNo ? 1 : 0);
+    Emit(kName, ok,
+        ok ? L"后台+GLFW30+关注入 ⇒ 必须注入假焦点；仅时钟补丁判据不带「关了注入」这一项"
+           : detail);
+}
+
+/// 后台 + GLFW30，但**配置里类名为空**（拖拽拾取后只记录在窗口上，没回填配置）。
+/// 这时 `UsesFakeFocus` 只看 `config.windowClassName` 会判 false ⇒ 假焦点被跳过 ⇒
+/// `PreferHardwareInput()` 里 `if (FakeFocusActive()) return false;` 不成立 ⇒ 落到软输入
+/// `PostMouseMoveToWindow`：每一步相对移动一次跨进程 WM_MOUSEMOVE，对 GLFW 无效、纯延迟。
+/// 断言：传 hwnd 时必须能识别出「这是需要假焦点的游戏」。
+void TestFakeFocusUsesBoundHwndClass() {
+    const wchar_t* kName = L"fake_focus_uses_bound_hwnd_class";
+
+    // GLFW30（Minecraft）与 SDL_APP 都是「只在窗口上」的类名。
+    struct Probe { const wchar_t* cls; bool wantGame; };
+    const Probe probes[] = {
+        {L"GLFW30", true},
+        {L"SDL_app", true},
+        {L"Notepad", false},
+    };
+
+    int pass = 0;
+    int total = 0;
+    wchar_t detail[320]{};
+    size_t used = 0;
+    for (const auto& p : probes) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = p.cls;
+        const ATOM atom = RegisterClassExW(&wc);
+        HWND hwnd = CreateWindowExW(0, p.cls, L"QST probe", WS_OVERLAPPEDWINDOW,
+            64, 64, 200, 100, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+        windowmode::WindowModeScriptConfig cfg{};
+        cfg.enabled = true;
+        cfg.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+        cfg.inputStrategy = windowmode::WindowModeInputStrategy::SoftMessage;
+        cfg.windowClassName.clear();          // ← 关键：配置里没有类名
+        cfg.childWindowClassName.clear();
+
+        const bool withHwnd = windowmode::UsesFakeFocus(cfg, hwnd);
+        const bool withoutHwnd = windowmode::UsesFakeFocus(cfg, nullptr);
+        ++total;
+        if (withHwnd == p.wantGame && !withoutHwnd) ++pass;
+
+        if (hwnd) DestroyWindow(hwnd);
+        if (atom) UnregisterClassW(p.cls, GetModuleHandleW(nullptr));
+
+        if (used < 220) {
+            used += static_cast<size_t>(swprintf_s(detail + used, 320 - used,
+                L"%s:withHwnd=%d(noHwnd=%d) ", p.cls, withHwnd ? 1 : 0,
+                withoutHwnd ? 1 : 0));
+        }
+    }
+
+    const bool ok = pass == total;
+    Emit(kName, ok, ok ? L"类名只在窗口上时（配置为空）仍按 HWND 判定为需要假焦点" : detail);
+}
+
 void TestLcaBackgroundUnknownGame() {
     windowmode::WindowModeScriptConfig unknown{};
     unknown.enabled = true;
@@ -2506,6 +3984,31 @@ void TestLcaBackgroundUnknownGame() {
         && windowmode::LooksLikeInjectRequiredGameClass(L"GLFW30")
         && !windowmode::LooksLikeInjectRequiredGameClass(L"MapleStoryClass");
 
+    // ⚠ 回归守：**GLFW30 作为配置类名**（后台窗口模式录制回填的正是这种）必须整条链走假焦点。
+    // 上一版用例只断言了 `LooksLikeInjectRequiredGameClass(L"GLFW30")`，
+    // **从没检查 GLFW30 作为 windowClassName 时 UsesFakeFocus 是否成立** ——
+    // 于是「MC 后台回放全程软输入、SendInput ok=0」漏了出去。
+    windowmode::WindowModeScriptConfig glfw{};
+    glfw.enabled = true;
+    glfw.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    glfw.windowClassName = L"GLFW30";
+    glfw.targetExePath = L"C:\\Users\\u\\AppData\\Roaming\\.minecraft\\runtime\\java.exe";
+    const bool glfwLca = windowmode::PrefersLcaBackgroundMessages(glfw, nullptr);
+    const bool glfwNeeds = windowmode::NeedsFakeFocusInjection(glfw, nullptr);
+    const bool glfwUses = windowmode::UsesFakeFocus(glfw);
+    const bool glfwHw = windowmode::GameTargetNeedsHardwareWithoutFakeFocus(glfw, nullptr);
+    const bool glfwOk = !glfwLca && glfwNeeds && glfwUses;
+
+    // 同理 SDL_app / UnrealWindow 也要整条链成立。
+    windowmode::WindowModeScriptConfig sdl = glfw;
+    sdl.windowClassName = L"SDL_app";
+    windowmode::WindowModeScriptConfig ue = glfw;
+    ue.windowClassName = L"UnrealWindow";
+    const bool sdlOk = !windowmode::PrefersLcaBackgroundMessages(sdl, nullptr)
+        && windowmode::UsesFakeFocus(sdl);
+    const bool ueOk = !windowmode::PrefersLcaBackgroundMessages(ue, nullptr)
+        && windowmode::UsesFakeFocus(ue);
+
     windowmode::WindowModeScriptConfig note{};
     note.enabled = true;
     note.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
@@ -2514,10 +4017,16 @@ void TestLcaBackgroundUnknownGame() {
         && !windowmode::NeedsFakeFocusInjection(note, nullptr)
         && windowmode::ShouldMinimizeTargetAfterBind(note);
 
-    const bool ok = unknownOk && hiddenOk && unityOk && noteOk;
+    const bool ok = unknownOk && hiddenOk && unityOk && noteOk && glfwOk && sdlOk && ueOk;
+    wchar_t detail[420]{};
+    swprintf_s(detail,
+        L"unknown=%d hidden=%d unity=%d note=%d | GLFW30 lca=%d needs=%d uses=%d hwNoFF=%d sdl=%d ue=%d",
+        unknownOk ? 1 : 0, hiddenOk ? 1 : 0, unityOk ? 1 : 0, noteOk ? 1 : 0,
+        glfwLca ? 1 : 0, glfwNeeds ? 1 : 0, glfwUses ? 1 : 0, glfwHw ? 1 : 0,
+        sdlOk ? 1 : 0, ueOk ? 1 : 0);
     Emit(L"lca_bg_unknown_game", ok,
-        ok ? L"unknown IWWindowClass →LCA; Unity inject; Notepad Edit path"
-           : L"LCA unknown-game gate / Unity inject / Notepad split failed");
+        ok ? L"unknown IWWindowClass →LCA; Unity/GLFW30/SDL_app/Unreal inject; Notepad Edit path"
+           : detail);
 }
 
 void TestTianLongBaBuFakeFocus() {
@@ -2717,6 +4226,63 @@ void TestLcaNavKeyLeakGuard() {
     swprintf_s(detail, L"predicate=%d bgNoLeak=%d keyBusy=%d",
         predicateOk ? 1 : 0, noLeak ? 1 : 0, keyBusy ? 1 : 0);
     Emit(L"lca_nav_key_leaks_to_foreground", ok, ok ? L"" : detail);
+}
+
+/// 方向键兜底真键：**按下时目标在前台（补了真键 ↓）、松开时用户已切走（不在前台），
+/// 也必须补 KEYUP**。否则真键永久卡在按下状态 —— 游戏朝离开时那个方向一直走，
+/// 而且整个系统都认为该键被按住。
+/// 现场症状（用户原话）：「在游戏前台启动，再去浏览器看视频，就会朝离开时候的那一个方向 瞬移」。
+void TestLcaNavKeyupReleasedAfterFocusLoss() {
+    using windowmode::ShouldMirrorNavKeySend;
+    // 按下：只在目标就是前台窗时补（后台补会打进遮挡窗 —— 由 lca_nav_key_leaks_to_foreground 守）。
+    const bool downFg = ShouldMirrorNavKeySend(true, true, false);
+    const bool downBg = !ShouldMirrorNavKeySend(true, false, false);
+    // 松开：只看「当初补过没有」，与此刻是否前台无关。
+    const bool upAfterLost = ShouldMirrorNavKeySend(false, false, true);   // ← 本轮核心回归
+    const bool upNotMirrored = !ShouldMirrorNavKeySend(false, true, false);
+    const bool upStillFg = ShouldMirrorNavKeySend(false, true, true);
+
+    // 真机复核：后台目标走一遍 DOWN/UP + 兜底松键后，系统键态不得残留按下。
+    constexpr wchar_t kCls[] = L"QstNavKeyupProbe";
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kCls;
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    HWND hwnd = registered
+        ? CreateWindowExW(0, kCls, L"QST Nav Keyup Probe", WS_OVERLAPPEDWINDOW,
+            72, 72, 220, 110, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr)
+        : nullptr;
+    bool released = true;
+    if (hwnd) {
+        if ((GetAsyncKeyState(VK_LEFT) & 0x8000) == 0) {
+            windowmode::SetLcaBackgroundMessageMode(true);
+            windowmode::PostKeyToWindow(hwnd, VK_LEFT, true);
+            windowmode::PostKeyToWindow(hwnd, VK_LEFT, false);
+            windowmode::ReleaseMirroredLcaNavKeys();
+            windowmode::SetLcaBackgroundMessageMode(false);
+            for (int i = 0; i < 30; ++i) {
+                if ((GetAsyncKeyState(VK_LEFT) & 0x8000) == 0) break;
+                Sleep(5);
+            }
+            released = (GetAsyncKeyState(VK_LEFT) & 0x8000) == 0;
+        }
+        DestroyWindow(hwnd);
+    }
+
+    const bool ok = downFg && downBg && upAfterLost && upNotMirrored && upStillFg
+        && hwnd && released;
+    wchar_t detail[260]{};
+    swprintf_s(detail,
+        L"downFg=%d downBg=%d upAfterLost=%d upNotMirrored=%d upStillFg=%d released=%d",
+        downFg ? 1 : 0, downBg ? 1 : 0, upAfterLost ? 1 : 0, upNotMirrored ? 1 : 0,
+        upStillFg ? 1 : 0, released ? 1 : 0);
+    Emit(L"lca_nav_keyup_released_after_focus_loss", ok,
+        ok ? L"按下只在前台补；松开按当初是否补过必补（切走后不卡键）" : detail);
 }
 
 void TestTargetLostAfterDestroy() {
@@ -2982,6 +4548,7 @@ void TestWindowListAndActivate(HWND edit) {
     if (!top) {
         Emit(L"window_list_enumerates_self", false, L"no top window");
         Emit(L"window_list_match_and_format", false, L"skipped");
+        Emit(L"window_list_match_by_pid", false, L"skipped");
         Emit(L"window_activate_foreground", false, L"skipped");
         Emit(L"window_activate_by_process", false, L"skipped");
         return;
@@ -3020,6 +4587,35 @@ void TestWindowListAndActivate(HWND edit) {
     const bool matchOk = matchedByTitle && noHits.empty() && formatOk && edgeMatchOk;
     Emit(L"window_list_match_and_format", matchOk,
         matchOk ? L"" : L"MatchWindows/FormatWindowList failed");
+
+    // ★ pid 精确过滤（2026-10-02）：双开同名窗口时标题**完全一样**，只有 pid 能唯一锁定；
+    //   而台账 `FormatWindowList` 本来就打印 `pid=…`、还叫模型「按 pid/客户区区分，别只按标题选」
+    //   ⇒ 匹配端必须支持 pid，否则产品是在叫模型做一件它不支持的事。
+    windowmode::SwitchableWindow twinA;
+    twinA.hwnd = top;
+    twinA.title = L"造梦无双 - 双开";
+    twinA.processName = L"maple.exe";
+    twinA.pid = 11111;
+    windowmode::SwitchableWindow twinB = twinA;
+    twinB.pid = 22222;
+    const std::vector<windowmode::SwitchableWindow> twins = {twinA, twinB};
+    const auto byPidA = windowmode::MatchWindows(twins, L"", 11111);
+    const auto byPidB = windowmode::MatchWindows(twins, L"", 22222);
+    const auto byBadPid = windowmode::MatchWindows(twins, L"", 99999);
+    const auto pidPlusQuery = windowmode::MatchWindows(twins, L"造梦", 22222);
+    const auto pidQueryMiss = windowmode::MatchWindows(twins, L"zzz-no-such", 11111);
+    const bool pidFilterOk = byPidA.size() == 1 && byPidA.front().pid == 11111
+        && byPidB.size() == 1 && byPidB.front().pid == 22222
+        && byBadPid.empty()
+        && pidPlusQuery.size() == 1 && pidPlusQuery.front().pid == 22222
+        && pidQueryMiss.empty();
+    // 负对照：pid=0 =「不按 pid 过滤」⇒ 行为必须与旧版**完全一致**（两条都返回）
+    const bool pidZeroKeepsOldBehavior =
+        windowmode::MatchWindows(twins, L"", 0).size() == 2
+        && windowmode::MatchWindows(twins, L"造梦").size() == 2;
+    const bool pidCaseOk = pidFilterOk && pidZeroKeepsOldBehavior;
+    Emit(L"window_list_match_by_pid", pidCaseOk,
+        pidCaseOk ? L"" : L"MatchWindows(pid) filter failed");
 
     ShowWindow(top, SW_MINIMIZE);
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
@@ -3762,6 +5358,412 @@ void TestBackgroundInputDesktopEmulatorTop() {
         ok ? L"" : L"DeSmuME must post to top-level hwnd, not child surface");
 }
 
+// ---------------------------------------------------------------------------
+// 「按键点击打不进后台」回归（用户反馈 1.3.3 起，2026-09-23 定位）
+//
+// 实测树（Windows 11 商店版记事本 / WinUI3）：
+//     Notepad(top) └ NotepadTextBox(755x553) └ RichEditD2DPT(755x553)
+// 父子客户区一样大 + EnumChildWindows「父先于子」+ 最大值判据用**严格大于**
+// ⇒ 「最大后代」启发式取到**包装层**；而 PostMessage **不向子窗转发**，投给包装层
+// 等于完全没投（本机实测：投 WM_CHAR 给 NotepadTextBox → 文档一个字都不进；
+// 投给 RichEditD2DPT → 正常进字）。`ResolveSoftInputHwnd` 又用**无 config** 的重解析
+// 把已经绑对的 RichEditD2DPT 覆盖掉。两条都要挡。
+// ---------------------------------------------------------------------------
+
+struct KeyMsgRecord {
+    HWND hwnd = nullptr;
+    UINT msg = 0;
+};
+
+std::vector<KeyMsgRecord> g_keyMsgs;
+
+LRESULT CALLBACK KeyRecordProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CHAR: case WM_SYSCHAR:
+    case WM_KEYDOWN: case WM_KEYUP:
+    case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        g_keyMsgs.push_back(KeyMsgRecord{hwnd, msg});
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int CountKeyMsgs(HWND hwnd) {
+    int n = 0;
+    for (const KeyMsgRecord& r : g_keyMsgs) {
+        if (r.hwnd == hwnd) ++n;
+    }
+    return n;
+}
+
+int CountCharMsgs(HWND hwnd) {
+    int n = 0;
+    for (const KeyMsgRecord& r : g_keyMsgs) {
+        if (r.hwnd == hwnd && (r.msg == WM_CHAR || r.msg == WM_SYSCHAR)) ++n;
+    }
+    return n;
+}
+
+int CountKeyDownMsgs(HWND hwnd) {
+    int n = 0;
+    for (const KeyMsgRecord& r : g_keyMsgs) {
+        if (r.hwnd == hwnd && (r.msg == WM_KEYDOWN || r.msg == WM_SYSKEYDOWN)) ++n;
+    }
+    return n;
+}
+
+/// WinUI 自译判据（纯逻辑）：类名识别 + 「哪些键走 WM_CHAR」。
+/// 实测依据见 `window_mode_requirements.h` 第 16 条。
+void TestBackgroundKeySelfTranslatePolicy() {
+    const bool clsOk = windowmode::ClassSelfTranslatesPostedKeys(L"RichEditD2DPT")
+        && windowmode::ClassSelfTranslatesPostedKeys(L"richeditd2dpt")
+        && !windowmode::ClassSelfTranslatesPostedKeys(L"Edit")
+        && !windowmode::ClassSelfTranslatesPostedKeys(L"RICHEDIT50W")
+        && !windowmode::ClassSelfTranslatesPostedKeys(L"")
+        && !windowmode::ClassSelfTranslatesPostedKeys(nullptr);
+
+    const bool charOk = windowmode::SelfTranslateKeyUsesWmChar(true, L'a')
+        && windowmode::SelfTranslateKeyUsesWmChar(true, L' ')
+        && windowmode::SelfTranslateKeyUsesWmChar(true, L'A')
+        // Enter/Tab（'\r'/'\t'）实测 WM_CHAR **不换行/不制表** ⇒ 必须走 KEYDOWN
+        && !windowmode::SelfTranslateKeyUsesWmChar(true, L'\r')
+        && !windowmode::SelfTranslateKeyUsesWmChar(true, L'\t')
+        // 退格/删除/方向键/功能键：SoftVkToChar 返回 0 ⇒ 走 KEYDOWN
+        && !windowmode::SelfTranslateKeyUsesWmChar(true, 0)
+        // 非自译目标：一切照旧（KEYDOWN + WM_CHAR）
+        && !windowmode::SelfTranslateKeyUsesWmChar(false, L'a')
+        && !windowmode::SelfTranslateKeyUsesWmChar(false, 0);
+
+    const bool ok = clsOk && charOk;
+    Emit(L"background_key_self_translate_policy", ok,
+        ok ? L"" : (clsOk ? L"selfTranslateKeyUsesWmChar wrong" : L"selfTranslate class match wrong"));
+}
+
+/// 窗口相对录制产物：`windowName` 只是「录制那一刻的标题」，**不得**当硬匹配门。
+/// 前科：回放时标题一变（换文档/换标签/游戏换场景）就枚举不到任何窗口 ⇒ 绑不到目标
+/// ⇒ 用户看到「后台窗口模式不操作后台」。复现见 tools/verify/probe_record_playback_bind.py。
+void TestRecordedWindowTitleIsHintOnly() {
+    constexpr wchar_t kCls[] = L"QstWmHintOnlyCls";
+    constexpr wchar_t kRecTitle[] = L"REC_DOC.txt - 某程序";
+
+    // ── ① 录制产物（hint-only）：不得产生标题硬门 ──
+    windowmode::WindowModeScriptConfig rec{};
+    rec.enabled = true;
+    rec.executionKind = windowmode::WindowModeExecutionKind::BackgroundWindow;
+    rec.selectMethod = windowmode::WindowSelectMethod::UseEditorWindowClass;
+    rec.windowRelativeCoordinates = true;
+    rec.windowName = kRecTitle;          // = 录制瞬间标题
+    rec.windowClassName = kCls;
+    rec.windowNameIsHintOnly = true;     // ← 录制端必须置位
+
+    const windowmode::WindowTargetQuery qRec = windowmode::BuildTargetQuery(rec);
+    const bool recNoTitleGate = qRec.titleContains.empty()
+        && qRec.className == kCls;
+
+    // ── ② 用户手配（默认 false）：旧语义必须保留，标题仍是硬门 ──
+    windowmode::WindowModeScriptConfig man = rec;
+    man.windowNameIsHintOnly = false;
+    const windowmode::WindowTargetQuery qMan = windowmode::BuildTargetQuery(man);
+    const bool manKeepsTitleGate = !qMan.titleContains.empty()
+        && qMan.titleContains == L"REC_DOC.txt";
+
+    // ── ③ 真值表：同一窗口 + 标题已变，hint-only 放行、手配拦截 ──
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = KeyRecordProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = kCls;
+    RegisterClassExW(&wc);
+    HWND top = CreateWindowExW(0, kCls, L"PLAY_DOC.txt - 某程序", WS_OVERLAPPEDWINDOW,
+        60, 60, 700, 500, nullptr, nullptr, hInst, nullptr);
+    ShowWindow(top, SW_SHOW);
+    UpdateWindow(top);
+    PumpMessagesFor(std::chrono::milliseconds(60));
+
+    wchar_t liveTitle[512]{};
+    GetWindowTextW(top, liveTitle, 512);
+    const bool titleChanged = std::wstring(liveTitle) != kRecTitle;
+    const bool hintAllows = windowmode::DoesTopWindowMatchConfig(top, rec);
+    const bool manualBlocks = !windowmode::DoesTopWindowMatchConfig(top, man);
+
+    // ── ④ 端到端（决定性证据）：用产品真查找接口 FindMainWindowDefault 走完整枚举。
+    //    同一窗口、标题已变：hint-only 必须找得到；手配（titleContains=REC_DOC.txt）找不到。
+    //    这一条直接对应线上症状「回放时枚举不到任何窗口 ⇒ 绑不到 ⇒ 不操作后台」。
+    windowmode::WindowTargetQuery qRecExe = qRec;
+    qRecExe.exePath = L"";           // 自检窗口在本进程：不能按 exe 路径过滤掉自己
+    qRecExe.className = kCls;
+    const HWND foundHint = windowmode::FindMainWindowDefault(qRecExe, true);
+    windowmode::WindowTargetQuery qManExe = qMan;
+    qManExe.exePath = L"";
+    qManExe.className = kCls;
+    const HWND foundManual = windowmode::FindMainWindowDefault(qManExe, true);
+    const bool e2eHintFound = foundHint == top;
+    const bool e2eManualMissed = foundManual != top;
+
+    DestroyWindow(top);
+
+    const bool ok = recNoTitleGate && manKeepsTitleGate
+        && titleChanged && hintAllows && manualBlocks
+        && e2eHintFound && e2eManualMissed;
+    wchar_t detail[320]{};
+    swprintf_s(detail,
+        L"recNoGate=%d manGate=%d titleChanged=%d hintAllows=%d manualBlocks=%d "
+        L"e2eHintFound=%d e2eManualMissed=%d",
+        recNoTitleGate ? 1 : 0, manKeepsTitleGate ? 1 : 0, titleChanged ? 1 : 0,
+        hintAllows ? 1 : 0, manualBlocks ? 1 : 0,
+        e2eHintFound ? 1 : 0, e2eManualMissed ? 1 : 0);
+    Emit(L"background_recorded_title_is_hint_only", ok, detail);
+}
+
+void TestBackgroundInputWrappedTextControl() {
+    constexpr wchar_t kTopCls[] = L"QstWmWinUiTop";
+    constexpr wchar_t kWrapperCls[] = L"NotepadTextBox";   // 包装层（非输入类名）
+    constexpr wchar_t kEditCls[] = L"RichEditD2DPT";       // 真文本控件（IsTextInputClass）
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = KeyRecordProc;
+    wc.hInstance = hInst;
+    for (const wchar_t* name : {kTopCls, kWrapperCls, kEditCls}) {
+        wc.lpszClassName = name;
+        RegisterClassExW(&wc);
+    }
+
+    HWND parent = CreateWindowExW(0, kTopCls, L"Notepad", WS_OVERLAPPEDWINDOW,
+        40, 40, 820, 620, nullptr, nullptr, hInst, nullptr);
+    HWND wrapper = CreateWindowExW(0, kWrapperCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, parent, nullptr, hInst, nullptr);
+    HWND edit = CreateWindowExW(0, kEditCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, wrapper, nullptr, hInst, nullptr);
+    ShowWindow(parent, SW_SHOW);
+    UpdateWindow(parent);
+
+    windowmode::BackgroundInputTargetKind kind = windowmode::BackgroundInputTargetKind::TopLevel;
+    const HWND found = windowmode::FindBackgroundInputChild(parent, nullptr, &kind);
+    const bool foundEdit = found == edit
+        && kind == windowmode::BackgroundInputTargetKind::TextInput;
+
+    // 端到端：把「包装层」当绑定目标投键（与用户日志 bind=包装层/子窗 的形态对齐），
+    // 键必须落到里面的真控件上 —— 包装层一个键消息都不该收到。
+    g_keyMsgs.clear();
+    windowmode::ResetSoftMouseState();
+    windowmode::PostKeyToWindow(wrapper, 'A', true);
+    windowmode::PostKeyToWindow(wrapper, 'A', false);
+    PumpMessagesFor(std::chrono::milliseconds(80));
+    const int editChars = CountCharMsgs(edit);
+    const int editKeys = CountKeyDownMsgs(edit);
+    const int wrapperMsgs = CountKeyMsgs(wrapper);
+
+    // editChars == 1：RichEditD2DPT 会自译 KEYDOWN，宿主再补 WM_CHAR 就**一次变两次**
+    //   ⇒ 只发 WM_CHAR，且只发一次。
+    // editKeys == 0：不能再有 KEYDOWN（否则控件会再自插一个字符）。
+    const bool ok = foundEdit && editChars == 1 && editKeys == 0 && wrapperMsgs == 0;
+    wchar_t detail[224]{};
+    swprintf_s(detail,
+        L"found=0x%p wrapper=0x%p edit=0x%p kind=%s editChars=%d editKeys=%d wrapperMsgs=%d",
+        static_cast<void*>(found), static_cast<void*>(wrapper), static_cast<void*>(edit),
+        windowmode::BackgroundInputTargetKindName(kind), editChars, editKeys, wrapperMsgs);
+
+    DestroyWindow(parent);
+    for (const wchar_t* name : {kEditCls, kWrapperCls, kTopCls}) {
+        UnregisterClassW(name, hInst);
+    }
+    Emit(L"background_input_wrapped_text_control", ok, ok ? L"" : detail);
+}
+
+/// 已知渲染面若是**包装层**，必须让位给里面的真文本控件（2026-09-30）。
+///
+/// 背景：`FindBackgroundInputChild` 里「包装层让位」这条修正原先只加在
+/// 「最大后代(≥320x240)」那一段，而**它上面那条 `FindKnownRenderSurfaceChild` 早退**漏了。
+/// 两处必须同一把尺 —— 投给容器 = `PostMessage` 不转发 = 键鼠与滚轮全部石沉大海。
+///
+/// ⚠ 用例的**边界**（别把它当成"真机记事本已修"的证明）：
+///   合成窗里用的是高分表命中的类名（`Chrome_RenderWidgetHostHWND`），
+///   而**真机那台 Win11 记事本实际命中的是哪条分支，要看日志里的「判据=」**
+///   —— 为此 `FindBackgroundInputChild` 现在会把命中的分支名一起打出来。
+///   本条只保证：**一旦**容器命中了"已知渲染面"，选中的仍是里面那个真控件。
+///
+/// ⚠ 也**不断言滚轮落点**：`RichEditD2DPT` 自己处理滚轮（滚动自己的文档）且不再转发，
+///   所以"容器与控件各收几条"只反映 DefWindowProc 的脾气，与产品行为无关。
+void TestBackgroundWheelReachesInputInsideKnownRenderSurface() {
+    constexpr wchar_t kTopCls[] = L"QstWmWinUiBridgeTop";
+    // 用高分表真会命中的类名，才能走到那条早退分支。
+    // ⚠ 不能用 `Chrome_RenderWidgetHostHWND`：它在**更早**的 `FindBrowserRenderWidget`
+    //   就被命中（用例实测 kind=browserRender），根本到不了本条要钉的那一段。
+    //   `SDL_app` 只命中高分表、不被浏览器分支抢走。
+    constexpr wchar_t kBridgeCls[] = L"SDL_app";
+    constexpr wchar_t kEditCls[] = L"RichEditD2DPT";
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = KeyRecordProc;
+    wc.hInstance = hInst;
+    for (const wchar_t* name : {kTopCls, kBridgeCls, kEditCls}) {
+        wc.lpszClassName = name;
+        RegisterClassExW(&wc);
+    }
+
+    HWND parent = CreateWindowExW(0, kTopCls, L"*test.txt - Notepad", WS_OVERLAPPEDWINDOW,
+        40, 40, 820, 620, nullptr, nullptr, hInst, nullptr);
+    HWND bridge = CreateWindowExW(0, kBridgeCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, parent, nullptr, hInst, nullptr);
+    HWND edit = CreateWindowExW(0, kEditCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, bridge, nullptr, hInst, nullptr);
+    ShowWindow(parent, SW_SHOW);
+    UpdateWindow(parent);
+
+    windowmode::BackgroundInputTargetKind kind = windowmode::BackgroundInputTargetKind::TopLevel;
+    const HWND found = windowmode::FindBackgroundInputChild(parent, nullptr, &kind);
+    const bool foundEdit = found == edit
+        && kind == windowmode::BackgroundInputTargetKind::TextInput;
+
+    // 端到端：以**绑定子窗**（真机日志里 bind=RichEditD2DPT）为入口投一格滚轮。
+    // 滚轮必须落在真控件上；容器一个字节都不该收到。
+    g_keyMsgs.clear();
+    windowmode::ResetSoftMouseState();
+    windowmode::PostScrollWheelToWindow(edit, 100, 100, 1, true, false);
+    PumpMessagesFor(std::chrono::milliseconds(80));
+    int editWheel = 0;
+    int bridgeWheel = 0;
+    int parentWheel = 0;
+    for (const KeyMsgRecord& r : g_keyMsgs) {
+        if (r.msg != WM_MOUSEWHEEL) continue;
+        if (r.hwnd == edit) ++editWheel;
+        else if (r.hwnd == bridge) ++bridgeWheel;
+        else if (r.hwnd == parent) ++parentWheel;
+    }
+    // ② 真正的判据：必须选中**里面那个真控件**，而不是容器。
+    //    （旧代码在这一格返回 bridge ⇒ 直接红。）
+    const bool ok = foundEdit && bridgeWheel == 0 && parentWheel == 0;
+    wchar_t detail[288]{};
+    swprintf_s(detail,
+        L"found=0x%p edit=0x%p bridge=0x%p kind=%s | 滚轮 edit=%d（仅供参考）、"
+        L"bridge=%d parent=%d（都必须 0）",
+        static_cast<void*>(found), static_cast<void*>(edit), static_cast<void*>(bridge),
+        windowmode::BackgroundInputTargetKindName(kind), editWheel, bridgeWheel, parentWheel);
+
+    DestroyWindow(parent);
+    for (const wchar_t* name : {kEditCls, kBridgeCls, kTopCls}) {
+        UnregisterClassW(name, hInst);
+    }
+    Emit(L"background_wheel_reaches_wrapped_input", ok, ok ? L"" : detail);
+}
+
+/// ★★★ 真机复现：绑定到 RichEdit，旁边还有一个**同为"最大后代"的容器兄弟**时，
+///   鼠标/滚轮必须投给**绑定的那个 RichEdit**，不能投给容器（2026-09-30 真机日志）。
+///
+/// 真机窗口树（Win11 商店版记事本，用户日志实测 hwnd）：
+///   `Notepad`(顶, 0x1A0694)
+///     ├─ `Microsoft.UI.Content.DesktopChildSiteBridge`(0x1307AE) ← FindBackgroundInputChild 选它
+///     └─ `RichEditD2DPT`(0x20906)                                ← 绑定用的就是它（configChild）
+///
+/// 真机症状：`滚轮投递 … 目标=0x…1307AE(DesktopChildSiteBridge) … 成功=1/1` ——
+/// **投递成功，但投给了容器**。`PostMessage` 不向子窗转发 ⇒ 等于没投。
+/// 根因：鼠标/滚轮走的是 `ResolveBackgroundPostTarget`（内部 `FindBackgroundInputChild(root,
+/// nullptr)`，**config=nullptr**），把 `ResolveBindHwnd(top, config)` 带 config 选出来的
+/// 绑定**丢掉了**，再用「最大后代」重新猜，猜到了容器。
+/// 键盘不走这条路（用 `ResolveSoftInputHwnd`）——所以这是硬规则 ② 在鼠标侧漏了一次。
+///
+/// 本用例结构上**就是**真机那棵树，因此它红/绿能直接代表真机。
+void TestWheelTargetsBoundChildNotWrapperSurface() {
+    constexpr wchar_t kTopCls[] = L"QstWmNotepadLikeTop";
+    constexpr wchar_t kBridgeCls[] = L"QstWmSiteBridgeSurface";  // 无渲染面评分，纯"最大后代"
+    constexpr wchar_t kEditCls[] = L"RichEditD2DPT";
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = KeyRecordProc;
+    wc.hInstance = hInst;
+    for (const wchar_t* name : {kTopCls, kBridgeCls, kEditCls}) {
+        wc.lpszClassName = name;
+        RegisterClassExW(&wc);
+    }
+
+    HWND parent = CreateWindowExW(0, kTopCls, L"*test.txt - Notepad", WS_OVERLAPPEDWINDOW,
+        40, 40, 820, 620, nullptr, nullptr, hInst, nullptr);
+    // 容器：与真机一样，客户区**和真控件一样大**（父子同尺寸 ⇒ 最大值启发式取父）。
+    HWND bridge = CreateWindowExW(0, kBridgeCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, parent, nullptr, hInst, nullptr);
+    // 真控件：与容器**同级**（真机实测就是这个形状），绑定用的就是它。
+    HWND edit = CreateWindowExW(0, kEditCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, parent, nullptr, hInst, nullptr);
+    ShowWindow(parent, SW_SHOW);
+    UpdateWindow(parent);
+
+    // ① 无 config 的启发式确实会挑容器（记录现状，**不是**断言目标）
+    windowmode::BackgroundInputTargetKind autoKind = windowmode::BackgroundInputTargetKind::TopLevel;
+    const HWND autoPick = windowmode::FindBackgroundInputChild(parent, nullptr, &autoKind);
+
+    // ② ★★ 真正的判据：以**绑定的 RichEdit** 为入口时，鼠标/滚轮的投递目标必须是它自己。
+    //    ⚠ 这里只钉**选择结果**，不数消息：投出去之后落在哪由
+    //      `SendNotifyMessage` + `DefWindowProc` 决定，在自建的假 WndProc 上不可观测
+    //      （上一版就是去数消息 ⇒ 用例本身不可靠，红绿都不代表产品行为）。
+    int cx = 200;
+    int cy = 200;
+    const HWND resolved = windowmode::ResolveMousePostTargetForTest(edit, cx, cy);
+
+    const bool ok = resolved == edit;
+    wchar_t detail[320]{};
+    swprintf_s(detail,
+        L"（无 config 启发式挑 0x%p kind=%s —— 仅供对照，它挑容器正是真机症状）| "
+        L"绑定 edit=0x%p → 投递目标=0x%p（必须等于 edit），坐标=(%d,%d)",
+        static_cast<void*>(autoPick), windowmode::BackgroundInputTargetKindName(autoKind),
+        static_cast<void*>(edit), static_cast<void*>(resolved), cx, cy);
+
+    DestroyWindow(parent);
+    for (const wchar_t* name : {kEditCls, kBridgeCls, kTopCls}) {
+        UnregisterClassW(name, hInst);
+    }
+    Emit(L"wheel_targets_bound_child_not_wrapper", ok, ok ? L"" : detail);
+}
+
+void TestBackgroundInputBoundChildRespected() {
+    constexpr wchar_t kTopCls[] = L"QstWmBoundTop";
+    constexpr wchar_t kBigCls[] = L"QstWmBigSurface";
+    constexpr wchar_t kChildCls[] = L"QstWmBoundChild";
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = KeyRecordProc;
+    wc.hInstance = hInst;
+    for (const wchar_t* name : {kTopCls, kBigCls, kChildCls}) {
+        wc.lpszClassName = name;
+        RegisterClassExW(&wc);
+    }
+
+    HWND parent = CreateWindowExW(0, kTopCls, L"App", WS_OVERLAPPEDWINDOW,
+        60, 60, 820, 620, nullptr, nullptr, hInst, nullptr);
+    // 更大的兄弟子窗：旧代码的「无 config 重解析」会挑它，把用户明确绑定的子窗顶掉。
+    HWND big = CreateWindowExW(0, kBigCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 800, 600, parent, nullptr, hInst, nullptr);
+    HWND child = CreateWindowExW(0, kChildCls, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 200, 40, parent, nullptr, hInst, nullptr);
+    (void)big;
+    ShowWindow(parent, SW_SHOW);
+    UpdateWindow(parent);
+
+    g_keyMsgs.clear();
+    windowmode::ResetSoftMouseState();
+    windowmode::PostKeyToWindow(child, 'A', true);
+    windowmode::PostKeyToWindow(child, 'A', false);
+    PumpMessagesFor(std::chrono::milliseconds(80));
+    const int childMsgs = CountKeyMsgs(child);
+    const int bigMsgs = CountKeyMsgs(big);
+
+    const bool ok = childMsgs > 0 && bigMsgs == 0;
+    wchar_t detail[192]{};
+    swprintf_s(detail, L"childMsgs=%d bigMsgs=%d", childMsgs, bigMsgs);
+
+    DestroyWindow(parent);
+    for (const wchar_t* name : {kChildCls, kBigCls, kTopCls}) {
+        UnregisterClassW(name, hInst);
+    }
+    Emit(L"background_input_bound_child_respected", ok, ok ? L"" : detail);
+}
+
 void TestBackgroundInputMumuQtRecursive() {
     constexpr wchar_t kParentCls[] = L"QstWmMumuParent";
     constexpr wchar_t kQtShellCls[] = L"Qt5156QWindowIcon";
@@ -4435,7 +6437,210 @@ void TestSoftKeyComboStateRace() {
     Emit(L"soft_key_combo_state_race", ok, detail);
 }
 
-void TestPostedQuickKeysTiming() {    constexpr wchar_t kCls[] = L"QstLcaPostedKeyProbe";
+// ── 原生消息宿主护栏（2026-09-24 事故回归）──────────────────────────────
+// 事故：宿主清单的 path 取「当前进程 exe」⇒ 自测 exe 把自己写成宿主 ⇒ 浏览器每次
+// connectNative 都拉起自测 exe ⇒ 它忽略参数跑整套自测 ⇒ 无限弹 notepad/窗口。
+// 两条用例分别钉「规则本身」（纯函数）与「第二道护栏」（外部启动器拉起时不跑用例）。
+void TestNativeHostManifestPointsToProduct() {
+    const std::wstring selfDir = SelfExeDir();
+    const bool selfNotProduct = !windowmode::NativeHostExeNameIsProduct(
+        selfDir + L"WindowModeSelfTest.exe");
+    const bool productOk = windowmode::NativeHostExeNameIsProduct(L"C:\\x\\QuickScriptTool.exe")
+        && windowmode::NativeHostExeNameIsProduct(L"D:\\y\\QstPlayer.exe")
+        && windowmode::NativeHostExeNameIsProduct(L"c:\\Z\\quickscripttool.EXE");
+    const bool otherNotProduct =
+        !windowmode::NativeHostExeNameIsProduct(L"C:\\Windows\\notepad.exe")
+        && !windowmode::NativeHostExeNameIsProduct(selfDir + L"WindowModeDiag.exe")
+        && !windowmode::NativeHostExeNameIsProduct(L"")
+        && !windowmode::NativeHostExeNameIsProduct(L"C:\\x\\QuickScriptTool.exe.bak");
+
+    // 现场清单（本目录若注册过）：path 必须是产品 exe —— 这条直接盯住事故产物。
+    bool manifestOk = true;
+    std::string manifestDetail = "no manifest";
+    {
+        const std::wstring path = selfDir + L"com.quickscripttool.bridge.json";
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            char body[4096]{};
+            DWORD got = 0;
+            ReadFile(f, body, sizeof(body) - 1, &got, nullptr);
+            CloseHandle(f);
+            const std::string text(body, got);
+            const size_t k = text.find("\"path\"");
+            if (k == std::string::npos) {
+                manifestOk = false;
+                manifestDetail = "manifest has no path";
+            } else {
+                const size_t q1 = text.find('"', text.find(':', k));
+                const size_t q2 = q1 == std::string::npos ? std::string::npos
+                    : text.find('"', q1 + 1);
+                const std::string p = (q1 == std::string::npos || q2 == std::string::npos)
+                    ? std::string() : text.substr(q1 + 1, q2 - q1 - 1);
+                const bool product = p.find("QuickScriptTool.exe") != std::string::npos
+                    || p.find("QstPlayer.exe") != std::string::npos;
+                const bool looksLikeTest = p.find("SelfTest.exe") != std::string::npos
+                    || p.find("WindowModeDiag.exe") != std::string::npos;
+                manifestOk = product && !looksLikeTest;
+                manifestDetail = p;
+            }
+        }
+    }
+    const bool ok = selfNotProduct && productOk && otherNotProduct && manifestOk;
+    wchar_t detail[512]{};
+    if (!ok) {
+        swprintf_s(detail,
+            L"selfNotProduct=%d productOk=%d otherNotProduct=%d manifestOk=%d path=%S",
+            selfNotProduct ? 1 : 0, productOk ? 1 : 0, otherNotProduct ? 1 : 0,
+            manifestOk ? 1 : 0, manifestDetail.c_str());
+    }
+    Emit(L"native_host_manifest_points_to_product", ok, ok ? L"" : detail);
+}
+
+void TestSelfTestRefusesForeignLauncher() {
+    const std::wstring exe = SelfExeDir() + L"WindowModeSelfTest.exe";
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr;
+    HANDLE wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) {
+        Emit(L"selftest_refuses_foreign_launcher", false, L"CreatePipe failed");
+        return;
+    }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    std::wstring cmd = L"\"" + exe + L"\" chrome-extension://abcdef/ --parent-window=0 --json";
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    si.hStdInput = nullptr;
+    PROCESS_INFORMATION pi{};
+    const BOOL started = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    std::string out;
+    DWORD exitCode = 1;
+    bool finished = false;
+    // ⚠ 收尾必须把管道**读干净**：子进程可能刚写完护栏那行就退出，
+    //   而循环是「先 Peek 再等进程」——进程一 signaled 就 break 会把已到达的数据丢掉
+    //   （第一版就这么假红：out 为空、refused=0，其实护栏是对的）。
+    auto drainPipe = [&]() {
+        for (;;) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) || avail == 0) return;
+            char buf[512]{};
+            DWORD got = 0;
+            if (!ReadFile(rd, buf, sizeof(buf) - 1, &got, nullptr) || got == 0) return;
+            out.append(buf, got);
+        }
+    };
+    if (started) {
+        CloseHandle(pi.hThread);
+        // 读输出 + 等退出（6s 上限；超时强杀 —— 万一护栏坏了也不让子进程跑完整套自测）。
+        const DWORD deadline = GetTickCount() + 6000;
+        for (;;) {
+            drainPipe();
+            if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) {
+                finished = true;
+                break;
+            }
+            if (GetTickCount() > deadline) {
+                TerminateProcess(pi.hProcess, 99);
+                WaitForSingleObject(pi.hProcess, 1000);
+                break;
+            }
+        }
+        drainPipe();
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+    }
+    CloseHandle(rd);
+    const bool refused = out.find("refusing") != std::string::npos;
+    const bool ranSuite = out.find("\"passed\"") != std::string::npos;
+    const bool ok = started && finished && exitCode == 0 && refused && !ranSuite;
+    wchar_t detail[256]{};
+    if (!ok) {
+        swprintf_s(detail, L"started=%d finished=%d exit=%lu refused=%d ranSuite=%d out=%.120S",
+            started ? 1 : 0, finished ? 1 : 0, static_cast<unsigned long>(exitCode),
+            refused ? 1 : 0, ranSuite ? 1 : 0, out.c_str());
+    }
+    Emit(L"selftest_refuses_foreign_launcher", ok, ok ? L"" : detail);
+}
+
+// 键态停摆 / 恢复（2026-10-01）：钉住"陈旧方向位会被清、恢复后按持键重发"。
+// ⚠ 必须**精确断言是哪个键**：只看"按下总数"会把"清错了键、又置回了别的键"判成通过。
+void TestMapleKeyStateStallResync() {
+    // ① 纯判据逐格（先把逻辑钉死，再看副作用）
+    const bool tableOk =
+        windowmode::EvaluateKeyStatePhase(100, 100, false) == windowmode::KeyStatePhase::Stalled
+        && windowmode::EvaluateKeyStatePhase(100, 101, true) == windowmode::KeyStatePhase::Resumed
+        && windowmode::EvaluateKeyStatePhase(100, 101, false) == windowmode::KeyStatePhase::None
+        && windowmode::EvaluateKeyStatePhase(100, 100, true) == windowmode::KeyStatePhase::None;
+    // ★ 2026-10-02 回归：旧 DLL 把钩命中计数夹在 255（`MapleBumpHit` 的历史写法）⇒ 计数恒为 255，
+    //   「变没变」永久为假 ⇒ 每轮看门狗都误判「键态停摆」⇒ 清掉脚本正按着的方向键。
+    //   钉住：夹顶时**不得**判停摆（宁可不判，也不能误清脚本意图）。
+    //   本用例在修复前必红：旧实现返回 Stalled。
+    const bool ceilingOk =
+        windowmode::EvaluateKeyStatePhase(255, 255, false) == windowmode::KeyStatePhase::None
+        && windowmode::EvaluateKeyStatePhase(255, 255, true) == windowmode::KeyStatePhase::None;
+
+    // ② 真实共享内存副作用（宿主侧即可验证）
+    std::wstring softErr;
+    if (!windowmode::FakeFocusSoftInput_Attach(GetCurrentProcessId(), softErr)) {
+        Emit(L"maple_keystate_stall_resync", false, L"soft attach failed");
+        return;
+    }
+    windowmode::FakeFocusSoftInput_ClearKeys();
+    windowmode::FakeFocusSoftInput_SetKey(VK_LEFT, true);   // 陈旧方向位（无人认领）
+    windowmode::FakeFocusSoftInput_SetKey(VK_RIGHT, true);  // 陈旧方向位（无人认领）
+    windowmode::FakeFocusSoftInput_SetKey('A', true);       // 非方向键：**不许**被清理逻辑碰
+    const int cleared = windowmode::ClearStaleArrowSoftKeys(std::unordered_set<UINT>{});
+    const bool afterClear =
+        !windowmode::FakeFocusSoftInput_IsKeyDown(VK_LEFT)
+        && !windowmode::FakeFocusSoftInput_IsKeyDown(VK_RIGHT)
+        && windowmode::FakeFocusSoftInput_IsKeyDown('A');
+
+    // ★★ 2026-10-02 回归（本用例修复前必红）：**脚本正按着的方向键不是"陈旧位"**。
+    //   现场：录制宏在 t=2.03s 按下 → 并一直按到 t=9.55s；看门狗在 ~5s 误判停摆，
+    //   把 → 清掉 ⇒ 角色「原地打、然后乱走」。日志铁证：`持键 2 个` = {→, C} 而
+    //   `已清方向键陈旧位（1 个）` 正是那个 →。⇒ 传入持键集后，被持的 → 必须原封不动。
+    windowmode::FakeFocusSoftInput_SetKey(VK_RIGHT, true);  // 脚本按着的 →
+    windowmode::FakeFocusSoftInput_SetKey(VK_LEFT, true);   // 无人认领的陈旧 ←
+    const int heldCleared =
+        windowmode::ClearStaleArrowSoftKeys(std::unordered_set<UINT>{VK_RIGHT});
+    const bool heldSurvived =
+        windowmode::FakeFocusSoftInput_IsKeyDown(VK_RIGHT)      // 脚本意图必须保住
+        && !windowmode::FakeFocusSoftInput_IsKeyDown(VK_LEFT);  // 真陈旧的照清
+
+    // 恢复：脚本此刻只持 ←（模拟"恢复后按持键重发"）
+    const int pressed = windowmode::ResyncSoftHeldKeys(std::vector<UINT>{VK_LEFT});
+    const bool afterResync =
+        windowmode::FakeFocusSoftInput_IsKeyDown(VK_LEFT)
+        && !windowmode::FakeFocusSoftInput_IsKeyDown(VK_RIGHT)   // 没持的必须保持抬起
+        && windowmode::FakeFocusSoftInput_IsKeyDown('A');        // 非方向键不受影响
+    windowmode::FakeFocusSoftInput_ClearKeys();
+    windowmode::FakeFocusSoftInput_Detach();
+
+    const bool ok = tableOk && ceilingOk && cleared == 2 && afterClear
+        && heldCleared == 1 && heldSurvived && pressed == 1 && afterResync;
+    wchar_t detail[400]{};
+    if (!ok) {
+        swprintf_s(detail,
+            L"tableOk=%d ceilingOk=%d cleared=%d(期望2) afterClear=%d "
+            L"heldCleared=%d(期望1) heldSurvived=%d pressed=%d(期望1) afterResync=%d",
+            tableOk ? 1 : 0, ceilingOk ? 1 : 0, cleared, afterClear ? 1 : 0,
+            heldCleared, heldSurvived ? 1 : 0, pressed, afterResync ? 1 : 0);
+    }
+    Emit(L"maple_keystate_stall_resync", ok, ok ? L"" : detail);
+}
+
+void TestPostedQuickKeysTiming() {
+    constexpr wchar_t kCls[] = L"QstLcaPostedKeyProbe";
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = PostedKeyProbeProc;
@@ -4517,6 +6722,8 @@ void TestPostedQuickKeysTiming() {    constexpr wchar_t kCls[] = L"QstLcaPostedK
 }
 
 int wmain(int argc, wchar_t** argv) {
+    // 外部启动器护栏已由 selftest_harness.h 的静态初始化期守卫统一拦下（所有 suite 生效），
+    // 这里不再重复；对应回归用例见 `selftest_refuses_foreign_launcher`。
     bool runMacro = false;
     bool listOnly = false;
     for (int i = 1; i < argc; ++i) {
@@ -4549,6 +6756,7 @@ int wmain(int argc, wchar_t** argv) {
     TestQuoteArgs();
     TestNoSelectIgnoresDocument();
     TestImeFilter();
+    TestShellIconHostClass();   // 纯判据，不需要窗口
 
     HWND edit = CreateTestEditWindow();
     if (!edit) {
@@ -4588,6 +6796,12 @@ int wmain(int argc, wchar_t** argv) {
     TestBackgroundInputCoordMap();
     TestBackgroundInputSdlSurface();
     TestBackgroundInputDesktopEmulatorTop();
+    TestBackgroundInputWrappedTextControl();
+    TestBackgroundWheelReachesInputInsideKnownRenderSurface();
+    TestWheelTargetsBoundChildNotWrapperSurface();
+    TestBackgroundInputBoundChildRespected();
+    TestBackgroundKeySelfTranslatePolicy();
+    TestRecordedWindowTitleIsHintOnly();
     TestBackgroundInputMumuQtRecursive();
     TestAndroidQtFakeFocusGate();
     TestWeixinQtFakeFocus();
@@ -4596,12 +6810,21 @@ int wmain(int argc, wchar_t** argv) {
     TestSoftKeyComboStateRace();
     TestQuickInputSkipsPasteNonEdit();
     TestPostedQuickKeysTiming();
+    TestMapleKeyStateStallResync();
+    TestNativeHostManifestPointsToProduct();
+    TestSelfTestRefusesForeignLauncher();
 
     TestDesktopQuickInputCancel();
     TestFakeFocusJsonRoundtrip();
     TestKernelAnticheatBlocksBackground();
     TestInputStrategyCdpAuto();
     TestExtBridgeConfigParse();
+    TestExtBridgeAbortDoesNotRefuseNewClients();
+    TestBrowserLeafNameIsBrowser();
+    TestMouseWheelStepEvents();
+    TestWheelQueueAcceptsWithoutPostKeyEventsFlag();
+    TestLongLogDoesNotTerminateProcess();
+    TestBridgeConcurrentRequestsDoNotCross();
     TestFakeFocusMinimizeGate();
     TestSoftMessageExeGates();
     TestRestorePreferMaximized();
@@ -4612,22 +6835,32 @@ int wmain(int argc, wchar_t** argv) {
     TestClampRectShrinksIntoWork();
     TestVdaSelectsOsDll();
     TestFakeFocusHookLocal();
+    TestFakeFocusInjectCopy();
+    TestFakeFocusStageSweep();
     TestFakeFocusLiteUnreal();
     TestFakeFocusAirFocusOnly();
+    TestFakeFocusAirChildIatOnly();
     TestFakeFocusMapleStoryFocusOnly();
     TestFakeFocus32ExportRva();
     TestRemoteModuleKernel32();
     TestFakeFocusHeaderExportRva();
     TestFakeFocusGlfwLiteCursor();
     TestFakeFocusSoftInput();
+    TestWindowTimeScaleIat();
+    TestWindowTimeScaleOnlyIat();
     TestAnjuzhenScriptWmConfig();
     TestPermissionMatchUipi();
     TestPermissionMismatchNoAutolaunch();
     TestMapleStoryBackgroundFakeFocus();
+    TestSetWindowsHookNotForFragileTargets();
+    TestInjectedModuleStaleDetection();
+    TestBackgroundFakeFocusNotDegraded();
+    TestFakeFocusUsesBoundHwndClass();
     TestLcaBackgroundUnknownGame();
     TestTianLongBaBuFakeFocus();
     TestLcaArrowKeyLParam();
     TestLcaNavKeyLeakGuard();
+    TestLcaNavKeyupReleasedAfterFocusLoss();
     TestTargetLostAfterDestroy();
     TestUwpFrameBindPidStillAlive();
     TestInvisibleChildClassBind();
@@ -4635,7 +6868,10 @@ int wmain(int argc, wchar_t** argv) {
     TestCdpParkExpandable();
     TestUiaControlPickByName();
     TestUiaControlListFormat();
+    TestUiaActionVerbTable();
+    TestUiaControlListCarriesActionAndState();
     TestScreenPointOcclusionCheck();
+    TestSoftInputFastPath();
 
     if (runMacro) TestMacroDesktopSmoke();
 

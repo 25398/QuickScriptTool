@@ -48,6 +48,11 @@ struct ScheduledTask {
     ScheduledTaskTime time{};
     ScheduledTaskStatus status = ScheduledTaskStatus::Enabled;
     bool customFired = false;
+    /// 上一次触发的「秒级去重键」（`ScheduledTaskScheduler::FireKey` 的格式）。
+    /// **必须落盘**：原来只存在内存 map 里，进程一死就丢 —— 强杀后重开，同一个任务
+    /// 会在同一个秒上**再触发一次**（用户实测「卡死强杀后重开又自动开始回放」）。
+    /// 落盘后，任何已触发过的时刻都不可能重复触发。
+    std::wstring lastFireKey;
     /// 专业模式逻辑目录（相对 library/sched，空=未分类）
     std::wstring folder;
 };

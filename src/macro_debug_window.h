@@ -100,4 +100,4 @@ std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchRe
                                   bool hasTarget = false, int targetX = 0, int targetY = 0);
 
 std::wstring FormatOcrDebug(const ScriptAction& action, const std::wstring& textContent,
-                            bool searchFound, const MacroVariableContext& ctx);
+                            bool searchFound, int matchData, const MacroVariableContext& ctx);

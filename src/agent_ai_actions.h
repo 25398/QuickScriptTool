@@ -19,6 +19,11 @@ bool ModelSupportsVision(const std::wstring& modelName);
 /// Grok Reasoning 等）：这些模型不接受 temperature 等采样参数，需在请求层自适应。
 bool ModelIsReasoningType(const std::wstring& modelName);
 
+/// 判断模型是否接受 OpenAI 兼容的 `reasoning_effort`（思考档位 low/high/max）。
+/// ⚠ 只列**有官方文档支持**的模型，不确定的一律返回 false —— 宁可不发这个字段，
+///   也不能因为多发一个字段让网关报 400（那是把「省时间」换成「跑不成」）。
+bool ModelSupportsReasoningEffort(const std::wstring& modelName);
+
 /// 从已保存模型中解析可用模型名；requireVision 时优先返回识图模型
 std::wstring ResolveAiModelName(const quickscript::AiApiSettings& ai,
     bool requireVision, const std::wstring& preferred = L"");

@@ -107,8 +107,6 @@ const selftest::CaseInfo kCases[] = {
         L"实测 iGPU(OpenCL) vs CPU 跑 matchTemplate：只要求位置一致；无 OpenCL 设备时直接过"},
     {L"gpu_accel_same_result_and_area_gate", L"default",
         L"找图 GPU 加速：大区域命中位置/分数与 CPU 一致；小区域（<500k 像素）不受 GPU 开关影响"},
-    {L"find_image_fastpath_gate", L"default",
-        L"找图「上一帧命中」本地复核守卫：只在同请求+上次全屏慢+命中新鲜时规划窗口，窗口必须包住漂移带；命中需同实例且分数留 3 点余量"},
 };
 
 bool Near(double a, double b, double eps = 1e-6) {
@@ -1172,8 +1170,139 @@ void CaseDiffIgnoresBusyDynamicOnly() {
             + L" raw=" + std::to_wstring(d.rawChangedRatio)).c_str());
 }
 
-void CaseNormalizeBelow() {
-    ImageMatchResult m{};
+// 「这一击到底有没有引起反应」的判据（docs §39.4 + §40.1）。
+// 实测第十九份日志：`reacted` 原本是「baseline 与当前帧的**任意**差异」，而游戏画面每帧都在
+// 重绘 ⇒ reacted 必真 ⇒ `NoReaction` **不可达** ⇒ 死点表（§35）、布局记忆/定位缓存作废、
+// 同一目标连败表、以及 §36/§38 的「界面没有变化 → 这一击很可能没生效」全部变成死代码。
+//
+// 第二十份日志又暴露了两件事（§40.1）：
+//   ① **「局部变化在别处」这一档恒真 ⇒ 零信息量**：动态画面上实体/计时器每帧都在产生
+//      局部变化，实测一整局**从没出现过「局部 0」**。把它也算成反应，等于把 `reacted`
+//      又变回「必真」—— 模型每次点完都被告知「已经生效，不要重做」，于是同一张卡连点 3 次、
+//      同一坐标空转 8 轮。**恒真的判据不是判据**（§39.4 那个 bug 的同一个形状）。
+//   ② **绝对像素阈值会把真反应误判成「大面积」**：那张卡牌高亮是 263×104（占画面 0.74%），
+//      因 `263 > 220` 被判大面积 ⇒ 落点上的真反应被丢掉，同一批数据还写出
+//      「算反应」与「首次点击附近无变化」两句互相拆台的话。
+void CaseUiReactionLocality() {
+    bool ok = true;
+    std::wstring detail;
+
+    auto roi = [](int x1, int y1, int x2, int y2) {
+        ScreenChangeRoi r;
+        r.x1 = x1; r.y1 = y1; r.x2 = x2; r.y2 = y2;
+        r.areaPx = (x2 - x1) * (y2 - y1);
+        return r;
+    };
+    auto pt = [](int x, int y) { POINT p{}; p.x = x; p.y = y; return p; };
+    // 实测那一局的画面尺寸（2560×1440 全屏截图）
+    const int FW = 2560, FH = 1440;
+
+    // ① 空变化区 → 没反应，而且这是**唯一能确定**的「没反应」
+    {
+        const auto v = AiJudgeUiReaction({}, { pt(100, 100) }, /*dynamic=*/true, 48, FW, FH);
+        ok = ok && !v.reacted && v.kind == AiUiReactionKind::None;
+        if (v.reacted) detail += L" empty_rois_reacted";
+        ok = ok && v.conclusive;   // 画面一动没动 ⇒ 确定
+        if (!v.conclusive) detail += L" empty_rois_not_conclusive";
+    }
+
+    // ② 动态前台 + **只有大面积运动** → **不算反应**（§39.4 那个不可达分支）
+    {
+        std::vector<ScreenChangeRoi> rs = {
+            roi(1393, 225, 2450, 1368),   // 实测 1057×1143 = 画面 32.8% → 大面积
+        };
+        const auto v = AiJudgeUiReaction(rs, { pt(100, 100) }, /*dynamic=*/true, 48, FW, FH);
+        ok = ok && !v.reacted && v.kind == AiUiReactionKind::LargeMotionOnly;
+        if (v.reacted) detail += L" large_motion_counted_as_reaction";
+        if (v.kind != AiUiReactionKind::LargeMotionOnly) detail += L" wrong_kind";
+        ok = ok && v.why.find(L"没有") != std::wstring::npos;
+        if (v.why.empty()) detail += L" no_why";
+        // 画面自己在动 ⇒ **不能**说「确定没反应」（否则正确的点击会被记进死点表）
+        ok = ok && !v.conclusive;
+        if (v.conclusive) detail += L" large_motion_claimed_conclusive";
+    }
+
+    // ③ 局部变化落在落点附近 → 算反应（唯一算反应的一档）
+    {
+        std::vector<ScreenChangeRoi> rs = { roi(80, 80, 140, 120) };
+        const auto v = AiJudgeUiReaction(rs, { pt(100, 100) }, /*dynamic=*/true, 48, FW, FH);
+        ok = ok && v.reacted && v.kind == AiUiReactionKind::NearInput && v.conclusive;
+        if (!v.reacted || v.kind != AiUiReactionKind::NearInput) detail += L" near_input_miss";
+        if (!v.conclusive) detail += L" near_input_not_conclusive";
+    }
+
+    // ④ ★★核心用例（§40.1）：动态前台 + 局部变化**全在别处** → **不算反应，且不确定**。
+    //    ⚠⚠ 这条**必须**是 false。第一版写成「仍算反应（面板可能在别处打开）」，
+    //      理由本身不错，但动态画面上实体/计时器**每帧都在产生局部变化**
+    //      ⇒ 这一档**恒真** ⇒ 等于把 `reacted` 又变回「必真」：
+    //      实测模型每次点完都被告知「已经生效，不要重做」，同一张卡连点 3 次、
+    //      同一坐标空转 8 轮（用户说的「卡在放僵尸界面」）。
+    //    ⚠ 但也**不能**说「确定没反应」：那样一个正确的点击会被记进死点表 ⇒
+    //      模型再也点不动它（§36.6 同类事故）。所以 conclusive 必须为 false。
+    {
+        std::vector<ScreenChangeRoi> rs = { roi(1248, 886, 1453, 1049) };  // 实测：落点在 (1375,400)，它在下边 486px
+        const auto v = AiJudgeUiReaction(rs, { pt(1375, 400) }, /*dynamic=*/true, 48, FW, FH);
+        ok = ok && !v.reacted && v.kind == AiUiReactionKind::AwayFromInput;
+        if (v.reacted) detail += L" away_compact_must_not_react";
+        ok = ok && !v.conclusive;
+        if (v.conclusive) detail += L" away_compact_must_not_be_conclusive";
+        ok = ok && v.why.find(L"无法确认") != std::wstring::npos;
+        if (v.why.find(L"无法确认") == std::wstring::npos) detail += L" away_why_not_actionable";
+    }
+
+    // ⑤ **非动态前台不受影响**：巨框是**真重绘**（点链接整页跳转就是一个巨框），
+    //    必须照旧算反应（与改动前逐字等价），而且**确定**（静态画面没有「画面自己在动」）。
+    {
+        std::vector<ScreenChangeRoi> rs = { roi(0, 0, 2000, 1200) };
+        const auto v = AiJudgeUiReaction(rs, { pt(100, 100) }, /*dynamic=*/false, 48, FW, FH);
+        ok = ok && v.reacted && v.conclusive;
+        if (!v.reacted) detail += L" static_full_repaint_lost";
+        if (!v.conclusive) detail += L" static_not_conclusive";
+    }
+
+    // ⑥ 无落点动作（键盘/输入）：动态前台里**没有可归因的点** ⇒ 局部变化也不算反应，
+    //    但也**不能**说确定没反应（画面自己在动）。判据不能靠猜。
+    {
+        std::vector<ScreenChangeRoi> rs = { roi(80, 80, 140, 120) };
+        const auto v = AiJudgeUiReaction(rs, {}, /*dynamic=*/true, 48, FW, FH);
+        ok = ok && !v.reacted && !v.conclusive;
+        if (v.reacted) detail += L" keyboard_no_input_must_not_react";
+        std::vector<ScreenChangeRoi> big = { roi(1393, 225, 2450, 1368) };
+        const auto v2 = AiJudgeUiReaction(big, {}, /*dynamic=*/true, 48, FW, FH);
+        ok = ok && !v2.reacted;
+        if (v2.reacted) detail += L" keyboard_large_motion_reacted";
+    }
+
+    // ⑦ ★「大面积」改成**相对画面**（§40.1 的第二个缺陷）：这两块实测数据必须分开。
+    //    旧绝对阈值（w>220 就算大面积）把它们**都**判成大面积 —— 差 44 倍的东西。
+    {
+        const ScreenChangeRoi card = roi(117, 58, 380, 162);       // 263×104 = 0.74%：卡牌高亮=真反应
+        const ScreenChangeRoi churn = roi(1393, 225, 2450, 1368);  // 1057×1143 = 32.8%：整片在动
+        ok = ok && AiRoiIsLocalMotion(card, FW, FH);
+        if (!AiRoiIsLocalMotion(card, FW, FH)) detail += L" card_highlight_misjudged_large";
+        ok = ok && !AiRoiIsLocalMotion(churn, FW, FH);
+        if (AiRoiIsLocalMotion(churn, FW, FH)) detail += L" screen_churn_misjudged_local";
+        // 同一块 263×104 在小窗口里就该是「大面积」—— 判据必须随画面尺寸走
+        ok = ok && !AiRoiIsLocalMotion(card, 320, 200);
+        if (AiRoiIsLocalMotion(card, 320, 200)) detail += L" ruler_not_relative_to_frame";
+    }
+
+    // ⑧ 拿不到画面尺寸时退回绝对阈值（旧行为逐字保留，别让无尺寸的调用方静默变语义）
+    {
+        std::vector<ScreenChangeRoi> rs = { roi(0, 0, kAiReactionMaxRoiW + 1, 10) };
+        const auto v = AiJudgeUiReaction(rs, {}, /*dynamic=*/true);   // 不传 frameW/H
+        ok = ok && !v.reacted && v.kind == AiUiReactionKind::LargeMotionOnly;
+        if (v.reacted) detail += L" no_frame_dims_lost_absolute_fallback";
+        std::vector<ScreenChangeRoi> local = { roi(10, 10, 60, 40) };
+        const auto v2 = AiJudgeUiReaction(local, { pt(30, 20) }, /*dynamic=*/true);
+        ok = ok && v2.reacted;
+        if (!v2.reacted) detail += L" no_frame_dims_local_miss";
+    }
+
+    Emit(L"ui_reaction_locality", ok, detail.c_str());
+}
+
+void CaseNormalizeBelow() {    ImageMatchResult m{};
     m.found = true;
     m.score = 50.0;
     m.x = 1;
@@ -1300,70 +1429,6 @@ void CaseFindPeaksSqdiffTwoMinima() {
     Emit(L"findpeaks_sqdiff_keeps_two_minima", ok, detail.c_str());
 }
 
-void CaseFindImageFastPathGate() {
-    // 「上一帧命中」本地复核的判据是纯函数，这里穷举守卫。核心承诺：
-    //   ① 只有「同一请求 + 上次全屏很慢 + 命中新鲜」才规划窗口
-    //   ② 窗口必须完整包住整个漂移带（否则宁可回退全屏，也不给出「找不到」）
-    //   ③ 命中必须同实例（漂移 ≤8px）且分数比阈值高 3 个点
-    const FindImageFastPathParams p{};
-    bool ok = true;
-    std::wstring detail;
-
-    auto plan = [&](int rx1, int ry1, int rx2, int ry2, int px, int py, int tw, int th,
-                    double ms, long long age, int& wx1, int& wy1, int& wx2, int& wy2) {
-        return PlanFindImageFastPath(p, rx1, ry1, rx2, ry2, px, py, tw, th, ms, age,
-            wx1, wy1, wx2, wy2);
-    };
-
-    int wx1 = 0, wy1 = 0, wx2 = 0, wy2 = 0;
-    // ① 正常全屏：命中 (1000,700)，窗口应远小于搜索区且包住漂移带
-    const bool legit = plan(0, 0, 2560, 1440, 1000, 700, 96, 96, 60.0, 100, wx1, wy1, wx2, wy2);
-    const int legitWx1 = wx1;
-    const int legitWy1 = wy1;
-    const int legitWx2 = wx2;
-    const int legitWy2 = wy2;
-    const bool legitBand = legit
-        && wx1 <= 1000 - p.maxDriftPx && wx2 - 96 >= 1000 + p.maxDriftPx
-        && wy1 <= 700 - p.maxDriftPx && wy2 - 96 >= 700 + p.maxDriftPx;
-    const bool legitSmall = legit
-        && static_cast<long long>(wx2 - wx1) * (wy2 - wy1) * 4
-            < static_cast<long long>(2560) * 1440;
-    ok = ok && legit && legitBand && legitSmall;
-    if (!(legit && legitBand && legitSmall)) detail += L" legit";
-
-    // ② 上次搜索本来很快（区域找图）→ 不规划
-    ok = ok && !plan(0, 0, 2560, 1440, 1000, 700, 96, 96, 3.0, 100, wx1, wy1, wx2, wy2);
-    // ③ 上一帧太旧 → 不规划
-    ok = ok && !plan(0, 0, 2560, 1440, 1000, 700, 96, 96, 60.0, 5000, wx1, wy1, wx2, wy2);
-    // ④ 命中贴搜索区左/上边 → 漂移带放不进窗口 → 不规划
-    ok = ok && !plan(0, 0, 2560, 1440, 0, 700, 96, 96, 60.0, 100, wx1, wy1, wx2, wy2);
-    ok = ok && !plan(0, 0, 2560, 1440, 1000, 0, 96, 96, 60.0, 100, wx1, wy1, wx2, wy2);
-    // ⑤ 命中贴右/下边（模板右下角正好顶到搜索区边界）→ 不规划
-    ok = ok && !plan(0, 0, 2560, 1440, 2560 - 96, 700, 96, 96, 60.0, 100, wx1, wy1, wx2, wy2);
-    ok = ok && !plan(0, 0, 2560, 1440, 1000, 1440 - 96, 96, 96, 60.0, 100, wx1, wy1, wx2, wy2);
-    // ⑥ 搜索区本身就只比模板大一点（窗口≈搜索区）→ 没收益 → 不规划
-    ok = ok && !plan(1000, 700, 1000 + 96 + 20, 700 + 96 + 20, 1000, 700, 96, 96,
-        60.0, 100, wx1, wy1, wx2, wy2);
-    // ⑦ 模板尺寸非法 → 不规划
-    ok = ok && !plan(0, 0, 2560, 1440, 1000, 700, 0, 96, 60.0, 100, wx1, wy1, wx2, wy2);
-
-    // ⑧ 命中判据：同实例 + 分数留余量
-    const bool acc0 = AcceptFindImageFastPathHit(p, 1000, 700, 1000, 700, 65.0, 99.0);
-    const bool accDriftOk = AcceptFindImageFastPathHit(p, 1000, 700, 1008, 692, 65.0, 99.0);
-    const bool accDriftBad = AcceptFindImageFastPathHit(p, 1000, 700, 1009, 700, 65.0, 99.0);
-    const bool accScoreEdge = AcceptFindImageFastPathHit(p, 1000, 700, 1000, 700, 65.0, 66.9);
-    const bool accScoreOk = AcceptFindImageFastPathHit(p, 1000, 700, 1000, 700, 65.0, 68.0);
-    ok = ok && acc0 && accDriftOk && !accDriftBad && !accScoreEdge && accScoreOk;
-    if (!(acc0 && accDriftOk && !accDriftBad && !accScoreEdge && accScoreOk)) detail += L" accept";
-
-    // ⑨ 目标动了：同一窗口内找不到上一帧实例 → 规划仍为真（会去搜），
-    //    但用旧坐标之外的命中做判据必须被拒（否则会点到别的实例）
-    const bool movedRejected = !AcceptFindImageFastPathHit(p, 1000, 700, 1120, 700, 65.0, 99.0);
-    ok = ok && movedRejected;
-    detail += L" 正常窗口=" + std::to_wstring(legitWx1) + L"," + std::to_wstring(legitWy1) + L"-"
-        + std::to_wstring(legitWx2) + L"," + std::to_wstring(legitWy2);
-    Emit(L"find_image_fastpath_gate", ok, detail.c_str());
-}
 
 void CaseGpuAccelSameResultAndGate() {
     // 走**公开入口**验证两件事：
@@ -1797,9 +1862,9 @@ int wmain(int argc, wchar_t** argv) {
     CaseScreenDiffFindsRoi();
     CaseBusyMaskPersistentMotion();
     CaseDiffIgnoresBusyDynamicOnly();
+    CaseUiReactionLocality();
     CaseFullscreenLocatePerf();
     CaseOpenClMatchTemplateBench();
-    CaseFindImageFastPathGate();
     CaseGpuAccelSameResultAndGate();
     CaseTemplateBitmapCache();
     CaseLowPowerLimitsCvThreads();

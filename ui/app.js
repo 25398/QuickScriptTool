@@ -48,7 +48,7 @@
     addPreview: null,
     editDraft: null, // 选中动作的右栏草稿；点「修改」才写回列表（对齐原生）
     recMode: 0,
-    recWindowMode: 0, // 0=全屏模式 1=窗口模式（窗口相对录制）
+    recWindowMode: 0, // 0=前台模式（屏幕绝对坐标） 1=后台窗口模式（窗口相对录制）
     uiMode: "simple", // 极简 / 专业（专业模式主界面为设计稿样式）
     hideBottomRightTip: true,
     pendingPath: "",
@@ -70,6 +70,10 @@
     _executedSteps: 0,
     _runningMacroName: "",
     _editorSnapshot: "",
+    // 可视化画布改动单独跟踪：画布布局不进 _editorSnapshot（自动布局 / 缩放 / 滚动都不算改动），
+    // 只有用户在画布上真正动手（拖卡片、连线、增删节点、拖起始点、拖走线）才置 true。
+    _editorLayoutDirty: false,
+    _editorLayoutBaseline: "",
     _editorRevertPayload: null,
     _saveEditorIntent: "",
     _saveEditorBusy: false,
@@ -114,12 +118,12 @@
   ];
   const ED_MODES = [
     { t: "默认模式", v: 0 },
-    { t: "窗口模式", v: 1 },
+    { t: "独立桌面模式", v: 1 },
     { t: "后台窗口模式", v: 2 },
   ];
   const NESTED_USE_MODES = [
     { t: "默认模式", v: 0 },
-    { t: "窗口模式", v: 1 },
+    { t: "独立桌面模式", v: 1 },
     { t: "后台窗口模式", v: 2 },
     { t: "继承模式", v: 3 },
   ];
@@ -526,17 +530,34 @@
   function appendDebugLogLines(lines) {
     const log = $("#debugLog");
     if (!log || !lines || !lines.length) return;
-    const chunk = lines.map((t) => String(t || "")).join("\n");
-    if (!chunk) return;
-    log.textContent += (log.textContent ? "\n" : "") + chunk;
-    // 行数计数：仅在超预算时整段裁剪，避免每条消息都全量 split/join（O(n²)）
+    // ⚠ 不要用 `textContent +=`：它会把已有内容整体重解析一遍，高频日志下是 O(n²)。
+    // 长时运行（几万条动作、每步一条日志）实测会把调试窗卡到「未响应」。
+    // 这里按「一批一个文本节点」追加，裁剪时从头部删节点，都不碰已有内容。
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+    const node = document.createTextNode(
+      (log.childNodes.length ? "\n" : "") + lines.map((t) => String(t || "")).join("\n")
+    );
+    node._qstLines = lines.length;
+    log.appendChild(node);
     log._qstLineCount = (log._qstLineCount | 0) + lines.length;
-    if (log._qstLineCount > DEBUG_LOG_MAX + 200) {
-      const parts = log.textContent.split("\n");
-      log.textContent = parts.slice(Math.max(0, parts.length - DEBUG_LOG_MAX)).join("\n");
-      log._qstLineCount = DEBUG_LOG_MAX;
+    if (log._qstLineCount > DEBUG_LOG_MAX + 400) {
+      let remove = log._qstLineCount - DEBUG_LOG_MAX;
+      while (remove > 0 && log.firstChild) {
+        const n = log.firstChild;
+        const nl = n._qstLines | 0 || 1;
+        log.removeChild(n);
+        remove -= nl;
+        log._qstLineCount -= nl;
+      }
+      if (log._qstLineCount < 0) log._qstLineCount = 0;
     }
-    log.scrollTop = log.scrollHeight;
+    // 只在用户本来就在底部时自动跟随，并且每帧最多滚一次（滚动会触发布局）。
+    if (atBottom && !log._qstScrollRaf) {
+      log._qstScrollRaf = requestAnimationFrame(() => {
+        log._qstScrollRaf = 0;
+        log.scrollTop = log.scrollHeight;
+      });
+    }
   }
 
   function showDebugFloat(opts) {
@@ -944,12 +965,15 @@
         return "变量运算[" + preview + "]";
       }
       case "textRecognition": {
-        const mode = (a.ocrResultMode | 0) === 1 ? "文字查找" : "获取文字";
+        const search = (a.ocrResultMode | 0) === 1;
+        const mode = search ? "文字查找" : "获取文字";
         const follow =
           (a.ocrFollowUp | 0) === 1
             ? "移动到"
             : (a.ocrFollowUp | 0) === 2
-              ? "保存变量"
+              ? search
+                ? "保存匹配度"
+                : "保存文字"
               : "点击";
         return "文字识别[" + mode + "," + follow + "]";
       }
@@ -1657,6 +1681,11 @@
       if (p.closest("#ov-editor-settings")) return;
       p.classList.toggle("active", p.dataset.pane === stab);
     });
+    // ★ 切到「AI 助手」页时刷新窗口 Agents 列表并接好准星按钮
+    //   （列表要问原生"进程在不在跑 / 校准没有"，所以不在页面初始化时预取）
+    if (stab === "ai" && typeof loadWindowAgents === "function") {
+      loadWindowAgents();
+    }
   }
 
   function quietSaveSettings(partial) {
@@ -1709,6 +1738,8 @@
       showAddTypePreview();
     } else if (kind === "opt") {
       showContentSkeleton("optList", 14);
+      // 骨架期作废窗口化状态：否则滚动事件会拿上一份录制的 actions 往骨架里塞行
+      state._optVirt = null;
       if ($("#optSelCount")) $("#optSelCount").textContent = "…";
       if ($("#optSelN")) $("#optSelN").textContent = "0";
     }
@@ -2041,7 +2072,7 @@
     const hint = $("#recModeHint");
     if (hint) hint.hidden = (state.recMode | 0) !== 3;
     const wmEl = $("#recWindowMode");
-    if (wmEl) wmEl.textContent = (state.recWindowMode | 0) === 1 ? "窗口模式 ▾" : "全屏模式 ▾";
+    if (wmEl) wmEl.textContent = (state.recWindowMode | 0) === 1 ? "后台窗口模式 ▾" : "前台模式 ▾";
     const wmHint = $("#recWindowHint");
     if (wmHint) wmHint.hidden = (state.recWindowMode | 0) !== 1;
   }
@@ -2284,10 +2315,10 @@
           const runMode = state._runningMode | 0;
           const mode =
             runMode === 2
-              ? "后台窗口"
+              ? "后台窗口模式"
               : runMode === 1
-                ? "窗口模式"
-                : "默认";
+                ? "独立桌面模式"
+                : "默认模式";
           const steps = state._executedSteps | 0;
           const rwm = state._runningWindowMode || {};
           const target =
@@ -2582,6 +2613,9 @@
       tech.style.opacity = on ? "" : "0.45";
       tech.style.pointerEvents = on ? "" : "none";
     }
+    // 窗口变速**不**依赖假焦点注入：注入关掉时窗口/后台窗口模式会改为「仅注入时钟补丁」，
+    // 所以这里绝不能把它置灰 —— 置灰会让人以为「必须先开注入才能变速」（曾经就是这样，
+    // 结果用户把两个开关都试了一遍都以为坏了）。
   }
 
   const PLAYBACK_SPEED_NODES = [0.25, 0.5, 0.75, 1, 1.25, 2, 4];
@@ -3162,6 +3196,10 @@
       playback.lowPerformanceMode == null ? false : !!playback.lowPerformanceMode
     );
     setChk(
+      $("#setSpreadRelMoves"),
+      playback.spreadRelativeMovePackets == null ? false : !!playback.spreadRelativeMovePackets
+    );
+    setChk(
       $("#setFindGpuAccel"),
       playback.findImageGpuAccel == null ? false : !!playback.findImageGpuAccel
     );
@@ -3190,6 +3228,7 @@
     setChk($("#setAutoHide"), other.autoHideMainWindow == null ? true : !!other.autoHideMainWindow);
     setChk($("#setPlaySound"), other.playSoundOnStart == null ? true : !!other.playSoundOnStart);
     setChk($("#setPlaySoundEnd"), other.playSoundOnEnd == null ? true : !!other.playSoundOnEnd);
+    setChk($("#setExportAsZip"), !!other.exportScriptAsZip);
     setChk($("#setHideTip"), other.hideBottomRightTip == null ? true : !!other.hideBottomRightTip);
     setChk($("#setCloseTray"), other.closeToTray == null ? true : !!other.closeToTray);
     setChk($("#setFloatBall"), other.showFloatBall == null ? true : !!other.showFloatBall);
@@ -3230,6 +3269,10 @@
     const wmTechEl = $("#setWmInjectTech");
     if (wmTechEl) wmTechEl.textContent = (wmTechItem || WM_TECH_LIST[0]).t;
     setChk($("#setWmHideModule"), !!windowMode.hideInjectedModule);
+    setChk(
+      $("#setWmTimeScale"),
+      windowMode.enableWindowTimeScale == null ? true : !!windowMode.enableWindowTimeScale
+    );
     syncWmInjectUi();
 
     if (typeof home.clickerButton === "number") state.clickBtn = home.clickerButton;
@@ -3356,8 +3399,189 @@
     };
   }
 
-  function refreshAiModelCombos() {
-    const models = Array.isArray(state._aiSavedModels) ? state._aiSavedModels : [];
+  // ── 窗口 Agents：把客户端窗口登记成模型 ───────────────────────────────
+  //   ★ 设置页是**两套互斥组件**（用户 2026-09-27 明确要求）：
+  //     · 选中的是普通 API 模型 ⇒ 只显示 API 地址/密钥/模型名称/温度；
+  //     · 选中的是**窗口应用**（豆包客户端 / Cursor…）⇒ 只显示窗口应用那一组
+  //       （应用名 / 进程 / 状态 / 选择·解绑），**API 那几个框一个都不显示**。
+  //   判据 = 当前选中的模型名是否命中窗口档案 id（原生 `windowAgentList` 给的 clients）。
+  const waState = { clients: [], windows: [], picked: null };
+
+  function waSelectedModelName() {
+    const combo = $("#aiModelCombo");
+    const t = combo ? String(combo.textContent || "").trim() : "";
+    return t || String(state.agentModel || "").trim();
+  }
+
+  function waModelIsWindowAgent() {
+    const name = waSelectedModelName();
+    if (!name) return false;
+    return waState.clients.some((c) => String(c.id) === name);
+  }
+
+  /** 按"选中模型是 API 还是窗口应用"切换两套组件（互斥显示） */
+  function syncAiPaneMode() {
+    const isApp = waModelIsWindowAgent();
+    if ($("#aiApiFields")) $("#aiApiFields").hidden = isApp;
+    if ($("#aiWindowAgentFields")) $("#aiWindowAgentFields").hidden = !isApp;
+    if ($("#aiModelBtns")) $("#aiModelBtns").style.display = isApp ? "none" : "";
+    if ($("#aiPanelTitle")) $("#aiPanelTitle").textContent = isApp ? "窗口应用" : "模型配置";
+    if ($("#aiPanelSub")) {
+      $("#aiPanelSub").textContent = isApp
+        ? "把这个客户端窗口当成模型（会抢前台）"
+        : "OpenAI 兼容";
+    }
+    if (isApp) {
+      const cur = waState.clients.find((c) => String(c.id) === waSelectedModelName()) || {};
+      if ($("#waPanelApp")) $("#waPanelApp").textContent = cur.label || cur.id || "";
+      if ($("#waPanelProcess")) $("#waPanelProcess").textContent = (cur.processNames || []).join(" / ");
+      const st = $("#waPanelState");
+      if (st) {
+        const bits = [];
+        bits.push(cur.running
+          ? (cur.foreground ? "窗口在前台" : "窗口在后台（跑之前请切到前台）")
+          : "**客户端没在运行**");
+        bits.push(cur.calibrated
+          ? "几何判据已校准"
+          : "**几何判据未校准** ⇒ 请先用窗口探针量出输入框/操作栏");
+        st.textContent = bits.join(" · ");
+      }
+      const un = $("#btnWaPanelUnbind");
+      if (un) un.disabled = !cur.id;
+      waSummary();
+    }
+  }
+
+  function waSummary() {
+    const bound = waState.clients.filter((c) => c.bound);
+    const el = $("#windowAgentSummary");
+    if (!el) return;
+    el.textContent = bound.length
+      ? `已绑定 ${bound.length} 个窗口应用：${bound.map((c) => c.label || c.id).join("、")}`
+      : "还没有绑定窗口应用。点上面的「选择窗口应用…」用准星指定一个客户端窗口。";
+  }
+
+  function waRenderPicked() {
+    const p = waState.picked;
+    if ($("#waPickedTitle")) $("#waPickedTitle").textContent = p ? p.title || "(无标题)" : "";
+    if ($("#waPickedProcess")) $("#waPickedProcess").textContent = p ? p.process || "" : "";
+    const st = $("#waPickedState");
+    if (st) {
+      if (!p) st.textContent = "还没有选择窗口";
+      else if (p.client) {
+        const c = waState.clients.find((x) => x.id === p.client) || {};
+        st.textContent = `${c.label || p.client} · 已匹配档案`
+          + (c.calibrated ? "（几何判据已校准，可直接用）" : "（**几何判据未校准** ⇒ 需先用窗口探针量出输入框/操作栏）");
+      } else {
+        st.textContent = "没有匹配到档案 ⇒ 绑定会按进程名新建一条**骨架**档案，仍需用探针校准";
+      }
+    }
+    const bindBtn = $("#btnWaBind");
+    const unbindBtn = $("#btnWaUnbind");
+    const boundIds = waState.clients.filter((c) => c.bound).map((c) => c.id);
+    const pid = p ? p.client : "";
+    if (bindBtn) bindBtn.disabled = !p || !pid || boundIds.includes(pid);
+    if (unbindBtn) unbindBtn.disabled = !p || !pid || !boundIds.includes(pid);
+  }
+
+  function waPickFromWindowInfo(info) {
+    waState.picked = info;
+    waRenderPicked();
+  }
+
+  function waRenderWindows() {
+    const box = $("#waWindowList");
+    if (!box) return;
+    const ws = Array.isArray(waState.windows) ? waState.windows : [];
+    if (!ws.length) {
+      box.innerHTML = `<div class="row"><p class="hint">没有检测到可切换的窗口</p></div>`;
+      return;
+    }
+    box.innerHTML = "";
+    ws.forEach((w) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.style.cursor = "pointer";
+      const title = (w.title || "").replace(/</g, "&lt;");
+      row.innerHTML = `<span class="lbl-w">${w.process || ""}</span>
+        <span class="hint" style="margin-left:8px">${title}</span>`;
+      row.addEventListener("click", () => {
+        waPickFromWindowInfo({ process: w.process || "", title: w.title || "", client: w.client || "" });
+      });
+      box.appendChild(row);
+    });
+  }
+
+  function waOpen() {
+    if (typeof openOv === "function") openOv("window-agent");
+    if (window.qst && qst.windowAgentList) qst.windowAgentList();
+  }
+
+  function waBindPicked(unbind) {
+    const p = waState.picked;
+    if (!p || !window.qst || !qst.windowAgentBind) return;
+    if (p.client) {
+      qst.windowAgentBind({ client: p.client, unbind: !!unbind });
+    } else if (p.process) {
+      qst.windowAgentBind({ process: p.process, title: p.title || "", unbind: !!unbind });
+    }
+  }
+
+  function waWire() {
+    const openBtn = $("#btnWindowAgentOpen");
+    if (openBtn && !openBtn._qstWaOpen) {
+      openBtn._qstWaOpen = true;
+      openBtn.addEventListener("click", waOpen);
+    }
+    const cx = $("#btnWaCrosshair");
+    if (cx) wireCrosshairPointerDown(cx, "window", "windowAgent");
+    const bindBtn = $("#btnWaBind");
+    if (bindBtn && !bindBtn._qstWaBind) {
+      bindBtn._qstWaBind = true;
+      bindBtn.addEventListener("click", () => waBindPicked(false));
+    }
+    const unbindBtn = $("#btnWaUnbind");
+    if (unbindBtn && !unbindBtn._qstWaUnbind) {
+      unbindBtn._qstWaUnbind = true;
+      unbindBtn.addEventListener("click", () => waBindPicked(true));
+    }
+    // 设置页里那个「解除绑定」（窗口应用模式下的组件）
+    const panelUnbind = $("#btnWaPanelUnbind");
+    if (panelUnbind && !panelUnbind._qstWaPanelUnbind) {
+      panelUnbind._qstWaPanelUnbind = true;
+      panelUnbind.addEventListener("click", () => {
+        const id = waSelectedModelName();
+        if (id && window.qst && qst.windowAgentBind) qst.windowAgentBind({ client: id, unbind: true });
+      });
+    }
+  }
+
+  function renderWindowAgents(payload) {
+    payload = payload || {};
+    waState.clients = Array.isArray(payload.clients) ? payload.clients : [];
+    waState.windows = Array.isArray(payload.windows) ? payload.windows : [];
+    // 把"这个窗口属于哪个已注册档案"标出来（原生按进程名匹配好了）
+    waState.windows.forEach((w) => {
+      const hit = waState.clients.find((c) => (c.processNames || []).some(
+        (p) => String(p).toLowerCase() === String(w.process || "").toLowerCase()));
+      w.client = hit ? hit.id : "";
+    });
+    waSummary();
+    waRenderWindows();
+    waRenderPicked();
+    waWire();
+    // ★ 列表回来后要**按"选中模型是不是窗口应用"重排设置页的两套组件**
+    //   （列表是异步到的，第一帧还不知道哪些模型是窗口应用）
+    if (typeof syncAiPaneMode === "function") syncAiPaneMode();
+  }
+
+  function loadWindowAgents() {
+    waWire();
+    if (!window.qst || !qst.windowAgentList) return;
+    qst.windowAgentList();
+  }
+
+  function refreshAiModelCombos() {    const models = Array.isArray(state._aiSavedModels) ? state._aiSavedModels : [];
     const modelLabels = models.length
       ? models.map((m) => ({ t: m.modelName || "model", v: m.modelName, profile: m }))
       : [];
@@ -3376,6 +3600,8 @@
     }
     if ($("#aiModelCombo")) $("#aiModelCombo").textContent = label;
     if ($("#agentModelCombo")) $("#agentModelCombo").textContent = label;
+    // ★ 选中的模型变了 ⇒ 立刻切换设置页的两套组件（API ↔ 窗口应用）
+    if (typeof syncAiPaneMode === "function") syncAiPaneMode();
     const tab = typeof activeAgentTab === "function" ? activeAgentTab() : null;
     if (tab && label && label !== "未添加模型") tab.model = label;
   }
@@ -4022,6 +4248,7 @@
     assignChk(out, "autoHideMainWindow", "setAutoHide");
     assignChk(out, "playSoundOnStart", "setPlaySound");
     assignChk(out, "playSoundOnEnd", "setPlaySoundEnd");
+    assignChk(out, "exportScriptAsZip", "setExportAsZip");
     assignChk(out, "hideBottomRightTip", "setHideTip");
     assignChk(out, "closeToTray", "setCloseTray");
     assignChk(out, "showFloatBall", "setFloatBall");
@@ -4044,6 +4271,7 @@
     assignChk(out, "enableDebugOutputWindow", "setDebugWin");
     assignChk(out, "autoOutputKeyFunctionDebug", "setAutoKeyDebug");
     assignChk(out, "lowPerformanceMode", "setLowPerfMode");
+    assignChk(out, "spreadRelativeMovePackets", "setSpreadRelMoves");
     assignChk(out, "findImageGpuAccel", "setFindGpuAccel");
     assignChk(out, "aiFastPaths", "setAiFastPaths");
     assignChk(out, "recordingClickCaptureEnabled", "setRecCaptureEn");
@@ -4078,6 +4306,7 @@
     out.injectionTechnique =
       typeof state._wmInjectTech === "number" ? state._wmInjectTech : 0;
     assignChk(out, "hideInjectedModule", "setWmHideModule");
+    assignChk(out, "enableWindowTimeScale", "setWmTimeScale");
 
     out.clickerScrollOffset = state._clickerScrollOffset | 0;
     out.macroScrollOffset = state._macroScrollOffset | 0;
@@ -4665,34 +4894,9 @@
     return null;
   }
 
-  function collectVarComputeReturnNames(code) {
-    const names = [];
-    const seen = new Set();
-    const src = String(code || "");
-    const re = /\breturn\b/g;
-    let m;
-    while ((m = re.exec(src))) {
-      let i = m.index + m[0].length;
-      const skipWs = () => {
-        while (i < src.length && /[ \t\r\n]/.test(src[i])) i++;
-      };
-      skipWs();
-      while (i < src.length) {
-        const id = src.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
-        if (!id) break;
-        if (!seen.has(id[0])) {
-          seen.add(id[0]);
-          names.push(id[0]);
-        }
-        i += id[0].length;
-        skipWs();
-        if (src[i] !== ",") break;
-        i++;
-        skipWs();
-      }
-    }
-    return names;
-  }
+  // ⚠ 原先这里还有一个 JS 版 `collectVarComputeReturnNames`（解析 `return a, b` 取变量名）。
+  //   变量清单已统一由引擎算（C++ 的 `CollectVarComputeReturnNames` 在 BuildQuickInputVarItems
+  //   里用它），JS 这份成了第二事实来源 ⇒ 已删。要加新规则请改 C++ 那份。
 
   function startSyntheticAnchorOverlay(mode, imagePath) {
     if (!window.qst) {
@@ -4729,82 +4933,87 @@
     return true;
   }
 
-  function buildEditorVarItems() {
-    const items = [];
-    const seen = new Set();
-    const push = (code, tip) => {
-      const c = String(code || "").trim();
-      if (!c || seen.has(c)) return;
-      seen.add(c);
-      items.push({ t: c, v: c, code: c, insert: "{" + c + "}", d: tip || "" });
-    };
-    (state.editorActions || []).forEach((a) => {
-      if (!a || a._preview) return;
-      const t = a.type || "";
-      if (t === "findImage") {
-        const fu = a.findImageFollowUp | 0;
-        if (fu === 3) {
-          const n = (a.matchVarName || "image").trim() || "image";
-          if (!n.includes("\\") && !n.includes("/") && !(n.length >= 2 && n[1] === ":")) {
-            push(n, "图片变量");
-          }
-        } else {
-          const n = (a.matchVarName || "matchRet").trim() || "matchRet";
-          push(n + ".matchData", "找图匹配度");
-          push(n + ".x", "找图左上角 X");
-          push(n + ".y", "找图左上角 Y");
-          push(n + ".x1", "找图右下角 X");
-          push(n + ".y1", "找图右下角 Y");
-        }
-      } else if (t === "textRecognition") {
-        const n = (a.matchVarName || "a").trim() || "a";
-        push(n, "OCR 结果");
-        push(n + ".x", "OCR 区域 X");
-        push(n + ".y", "OCR 区域 Y");
-      } else if (t === "loop") {
-        const n = (a.loopVarName || "").trim();
-        if (n) push(n, "循环计数");
-      } else if (t === "getCursorPos") {
-        const n = (a.matchVarName || "a").trim() || "a";
-        push(n + ".x", "光标 X");
-        push(n + ".y", "光标 Y");
-      } else if (t === "timerRecordTime") {
-        const n = (a.loopVarName || a.matchVarName || "t").trim() || "t";
-        push(n, "计时秒数");
-      } else if (
-        t === "aiTextAnalysis" ||
-        t === "aiImageAnalysis" ||
-        t === "aiActionExecute"
-      ) {
-        const n = (a.aiOutputVarName || "aiResult").trim() || "aiResult";
-        push(n, "AI 输出");
-      } else if (t === "varCompute") {
-        collectVarComputeReturnNames(a.computeCode).forEach((n) => push(n, "变量运算"));
-      } else if (t === "multiMatch") {
-        const n = (a.matchVarName || "matchRet").trim() || "matchRet";
-        push(n + ".count", "多图匹配命中个数");
-        push(n + "[n]", "多图匹配第 n 处（把 n 换成 0、1、2…）");
-        push(n + "[0]", "多图匹配第一处是否命中");
-        push(n + "[0].matchData", "第一处匹配度");
-        push(n + "[0].x", "第一处左上角 X");
-        push(n + "[0].y", "第一处左上角 Y");
-        push(n + "[0].x1", "第一处右下角 X");
-        push(n + "[0].y1", "第一处右下角 Y");
-        push(n + "[0].cx", "第一处中心 X");
-        push(n + "[0].cy", "第一处中心 Y");
-        push(n + "[0].hit", "命中模板序号(从1计)");
-        push(n + "[0].hitName", "命中模板文件名");
-      }
-    });
-    // 固定变量：无论脚本是否添加了动作，始终可用
-    const fixed = [
+  /**
+   * 编辑器变量清单 —— **规则只有一份，在 C++**（`BuildQuickInputVarItems`）。
+   *
+   * 为什么改成这样（2026-09-30）：这里原先另抄了一份「哪种动作产出哪些变量」的规则，
+   * 两份必然漂移 —— 实测找图漏 `.cx/.cy`、C++ 那份漏 `aiActionExecute`、颜色动作两边都漏。
+   * 现在把动作原样发给引擎（`qst.editorVarItems`），用**构建宏时的同一份实现**算清单。
+   *
+   * ⚠ 拿不到引擎清单时（演示版 bridge.stub / 首次渲染 / 桥接失败）**只显示固定变量**：
+   *   宁可少显示，也不要在 JS 里再猜一份 —— 猜的那份就是漂移的来源。
+   */
+  function fixedEditorVarItems() {
+    return [
       ["ctrl:CurLoops()", "宏运行次数：当前宏从头执行的第几次（固定变量）"],
       ["ctrl:Random()", "随机变量：每次引用随机取 1~100 的整数（固定变量）"],
       ["ctrl:Hour()", "当前小时：本地时 0–23（固定变量）"],
       ["ctrl:Minute()", "当前分钟：本地时 0–59（固定变量）"],
       ["ctrl:Clipboard()", "剪贴板：条件里有内容为1否则0；输入展开文字或全部文件路径；AI图片分析/动作可附图（固定变量）"],
-    ];
-    fixed.forEach(([code, tip]) => push(code, tip));
+    ].map(([code, tip]) => ({
+      t: code,
+      v: code,
+      code,
+      insert: "{" + code + "}",
+      d: tip,
+    }));
+  }
+
+  /** 引擎清单（+ 固定变量）→ 下拉项；**不含** C++ 之外的任何「猜」规则。 */
+  function editorVarItemsRaw() {
+    const fromEngine = Array.isArray(state.editorVarItemsFromEngine)
+      ? state.editorVarItemsFromEngine
+      : [];
+    const merged = fromEngine.concat(fixedEditorVarItems());
+    const items = [];
+    const seen = new Set();
+    merged.forEach((it) => {
+      const code = String((it && it.code) || "").trim();
+      if (!code || seen.has(code)) return;
+      seen.add(code);
+      items.push({
+        t: code,
+        v: code,
+        code,
+        insert: (it && it.insert) || "{" + code + "}",
+        d: (it && (it.d || it.tip)) || "",
+      });
+    });
+    return items;
+  }
+
+  /** 拉一份最新清单（异步）。桥不可用/超时/失败 ⇒ 保留现有缓存（至少固定变量还在）。 */
+  function fetchEditorVarItems() {
+    return new Promise((resolve) => {
+      const local = buildEditorVarItems();
+      if (!window.qst || typeof qst.editorVarItems !== "function") {
+        resolve(local);
+        return;
+      }
+      const actions = (state.editorActions || []).filter((x) => x && !x._preview);
+      const reqId = "vars-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+      if (!state._varItemsWaiters) state._varItemsWaiters = {};
+      const timer = setTimeout(() => {
+        if (state._varItemsWaiters && state._varItemsWaiters[reqId]) {
+          delete state._varItemsWaiters[reqId];
+          resolve(local);
+        }
+      }, 5000);
+      state._varItemsWaiters[reqId] = (msg) => {
+        clearTimeout(timer);
+        if (msg && msg.ok && Array.isArray(msg.items)) {
+          state.editorVarItemsFromEngine = msg.items;
+          resolve(buildEditorVarItems());
+        } else {
+          resolve(local);
+        }
+      };
+      qst.editorVarItems(actions, reqId);
+    });
+  }
+
+  function buildEditorVarItems() {
+    const items = editorVarItemsRaw();
     const other = (state.settings && state.settings.other) || {};
     const hideFixed = otherFlag(other, "editorHideFixedVars", false);
     const hideCoord = otherFlag(other, "editorHideCoordVars", false);
@@ -4921,6 +5130,15 @@
           return;
         }
         if (k === "useMode") {
+          // ⚠ 先按**标签精确查表**：`v.includes("窗口")` 认不出「独立桌面模式」(v=1)，
+          //   会把它落到 else ⇒ 被静默改回「默认模式」。下面的子串分支只为兼容旧文案。
+          const exactMode = NESTED_USE_MODES.find(
+            (x) => x.t === String(v || "").trim()
+          );
+          if (exactMode) {
+            action.useMode = exactMode.v;
+            return;
+          }
           if (v.includes("继承")) action.useMode = 3;
           else if (v.includes("后台")) action.useMode = 2;
           else if (v.includes("窗口")) action.useMode = 1;
@@ -4960,9 +5178,13 @@
           return;
         }
         if (k === "ocrFollowUp") {
-          if (v.includes("变量")) action.ocrFollowUp = 2;
-          else if (v.includes("移动")) action.ocrFollowUp = 1;
-          else action.ocrFollowUp = 0;
+          // ⚠ 文案按模式分流（文字查找=「保存匹配度」、获取文字=「保存文字到变量」），所以
+          //   **不能**再写 `v.includes("变量")`：前者不含「变量」，会被判成「点击」——
+          //   用户选了「保存匹配度」，一改别的字段就被静默改回点击。
+          //   查选项表本身（标签的唯一来源），以后改文案也不会漂。
+          const ocrFuAll = ocrFollowUpOptions(true).concat(ocrFollowUpOptions(false));
+          const ocrFuHit = ocrFuAll.find((o) => o.t === String(v || "").trim());
+          action.ocrFollowUp = ocrFuHit ? ocrFuHit.v : 0;
           return;
         }
         if (k === "shortcutPreset") {
@@ -5208,9 +5430,27 @@
     action.nestedWindowMode = wm;
   }
 
+  /**
+   * 选中「要运行的鼠标宏 / 录制」后，把**调用方**的使用模式对齐到目标脚本自己的模式，
+   * 并把它的窗口绑定预填进 nestedWindowMode（用户可在此基础上再改）。
+   * 返回实际采用/推导出的模式（供调用方提示），失败返回 -1。
+   * ⚠ 模式与目标一致才叫「按目标宏运行」：目标是后台窗口模式 ⇒ 调用方也用后台窗口模式，
+   *   否则嵌套脚本会跑到独立桌面/默认模式下去，行为与它自己单独跑时不同。
+   */
   function applyTargetScriptUseMode(a, meta) {
-    if (!a || !meta) return;
-    const mode = typeof meta.mode === "number" ? meta.mode | 0 : 0;
+    if (!a || !meta) return -1;
+    // 优先用 C++ 给的 mode；缺字段（老数据/录制）时从 windowMode 现推，
+    // 免得「读到了目标但模式字段没有」被当成默认模式。
+    let mode = typeof meta.mode === "number" ? meta.mode | 0 : -1;
+    if (mode < 0) {
+      const wm0 = meta.windowMode && typeof meta.windowMode === "object" ? meta.windowMode : null;
+      if (wm0 && (wm0.enabled | 0)) {
+        mode = String(wm0.executionKind || "") === "backgroundWindow" ? 2 : 1;
+      } else {
+        mode = 0;
+      }
+    }
+    if (mode !== 1 && mode !== 2) mode = 0;
     if (mode === 1 || mode === 2) {
       a.useMode = mode;
       const src = meta.windowMode && typeof meta.windowMode === "object" ? meta.windowMode : {};
@@ -5238,6 +5478,25 @@
         a.breakoutTimeSeconds = Number.isFinite(n) && n > 0 ? n : 0;
       }
     }
+    return mode;
+  }
+
+  /** 选中目标宏/录制后的统一收尾：对齐模式 + 如实提示 + 重画面板 */
+  function afterPickTargetScript(a, msg) {
+    if (msg && msg.ok) {
+      const mode = applyTargetScriptUseMode(a, msg);
+      if (mode >= 0) {
+        toast("已按目标宏切换使用模式：" + nestedUseModeLabel(mode) + "（可再改）");
+      } else {
+        // 理论上到不了（meta 非空）；真到了就**别说**切了，否则提示本身在撒谎
+        toast("读不到目标宏的模式，使用模式保持不变");
+      }
+    } else {
+      // 读不到目标脚本头就不能猜模式：**保持原样**并说明，
+      // 免得用户以为「模式自己变回默认了」（这正是改这一处的起因）。
+      toast((msg && msg.detail) || "读不到目标宏的模式，使用模式保持不变");
+    }
+    renderParamPanel(a);
   }
 
   function nestedUseModeHtml(a) {
@@ -5293,6 +5552,20 @@
 
   function chkField(key, on) {
     return `<div class="chk ${on ? "on" : ""}" data-k="${esc(key)}"><i>✓</i></div>`;
+  }
+
+  /**
+   * 文字识别的「后续操作」选项。
+   * ★两种模式的 followUp=2 **存的不是同一样东西**，所以文案必须按模式分流：
+   *   获取文字 → 存识别到的文字；文字查找 → 存**匹配度**（{变量}.matchData，0~100）。
+   * ⚠ 渲染与下拉弹窗都从这里取，别在两处各写一份字面量（写死两句必然漂移）。
+   */
+  function ocrFollowUpOptions(searchMode) {
+    return [
+      { t: "点击", v: 0 },
+      { t: "鼠标移动到", v: 1 },
+      { t: searchMode ? "保存匹配度" : "保存文字到变量", v: 2 },
+    ];
   }
 
   function renderParamPanel(a) {
@@ -5429,7 +5702,7 @@
         );
       }
       html += fline("保存到", inpField("matchVarName", a.matchVarName || "colorRet"));
-      html += `<p class="hint">*提示:读取屏幕坐标颜色，写入变量（#RRGGBB）</p>`;
+      html += `<p class="hint">*提示:读取屏幕坐标颜色，写入变量（#RRGGBB）；取点失败写空（不保留上一次的颜色）。</p>`;
     } else if (t === "findColor") {
       const followLabs = ["点击", "鼠标移动到", "保存到变量"];
       const fu = Math.min(2, Math.max(0, a.findImageFollowUp | 0));
@@ -5458,7 +5731,7 @@
         html += `<p class="hint">循环次数是在找到的颜色位置重复点击。</p>`;
       }
       html += fline("变量名", inpField("matchVarName", a.matchVarName || "colorRet"));
-      html += `<p class="hint">*点击/移动到找到的颜色位置；保存到变量只写入结果、不点不移。三种后续都会写入 colorRet（#RRGGBB 与坐标）。找色没有「保存图片」。</p>`;
+      html += `<p class="hint">*点击/移动到找到的颜色位置；保存到变量只写入结果、不点不移。三种后续都会写入变量：{变量}=命中点实际颜色(#RRGGBB)，未命中/失败写空；{变量}.matchData=匹配度(0~100，未命中 0)；{变量}.x/.y=命中点坐标。找色没有「保存图片」。</p>`;
     } else if (t === "colorMatch") {
       const locate = !!(a.imageLocate | 0);
       html += labOnly(locate ? "相对图中心偏移" : "读取位置");
@@ -5475,6 +5748,8 @@
       html += fline("目标颜色", inpField("inputText", a.inputText || `#${((a.colorR|0)<<16|(a.colorG|0)<<8|(a.colorB|0)).toString(16).padStart(6,"0")}`));
       html += fline("容差", inpField("colorTolerance", a.colorTolerance ?? 16));
       html += fline("变量名", inpField("matchVarName", a.matchVarName || "colorRet"));
+      // 这里存的是「该点实际颜色」，**不是**是否匹配 —— 判断匹配请用 {变量}.matchData
+      html += `<p class="hint">*{变量}=该点实际颜色(#RRGGBB)；{变量}.matchData=匹配度(0~100，未匹配为 0)；{变量}.x/.y=坐标。取点失败时两者都写空/0（不保留上一次）。</p>`;
     } else if (t === "findImage") {
       const followLabs = ["点击", "鼠标移动到", "保存匹配度", "保存图片"];
       const fu = Math.min(3, Math.max(0, a.findImageFollowUp | 0));
@@ -5499,6 +5774,9 @@
           "匹配度保存到",
           inpField("matchVarName", a.matchVarName || "matchRet")
         );
+        // 找图变量是「属性型」：{变量} 本身解析不到，能用的是这些属性。
+        // 别写成「{变量}=是否找到(0/1)」—— 那是多图匹配的 {变量[0]} 才有的事。
+        html += `<p class="hint">*{变量}.matchData=匹配度(0~100)；{变量}.x/.y=左上角坐标；{变量}.x1/.y1=右下角坐标；{变量}.cx/.cy=中心坐标。</p>`;
       } else if (fu === 3) {
         const saveImg =
           !a.matchVarName || a.matchVarName === "matchRet" ? "image" : a.matchVarName;
@@ -5515,7 +5793,7 @@
         html += `<div class="fline"><button type="button" class="btn ghost fluid" data-fi="offset">选择偏移点击位置</button></div>`;
         if (fu === 0) {
           html += repeatBlock(a);
-          html += `<p class="hint">循环次数是在找图落点（含偏移）重复点击，不必再加「鼠标点击」。默认模式会先激活落点窗口并用绝对坐标点下去；游戏不在前台时请先点进游戏，或改用窗口模式。</p>`;
+          html += `<p class="hint">循环次数是在找图落点（含偏移）重复点击，不必再加「鼠标点击」。默认模式会先激活落点窗口并用绝对坐标点下去；游戏不在前台时请先点进游戏，或改用后台窗口模式。</p>`;
         }
       }
       if (findImageShowsFindTime(a)) html += findImageTimeRowHtml(a);
@@ -5626,7 +5904,7 @@
       html += `<div class="fline"><textarea class="inp ed-area ed-code" data-k="computeCode" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" placeholder="int a = 2&#10;return a">${esc(
         a.computeCode || ""
       )}</textarea></div>`;
-      html += `<p class="hint">*类 C：int/double/string、if/else、for/while。字符串用 "+" 或 '+'（裸写 + 是加法）。split(s, "/") 按你写的分隔符拆成数组，用 parts[0]、parts.count（可负下标）。toInt("123") 转数字，toString(x) 转文字，trim(s) 去首尾空格。行末可省略分号。局部变量默认销毁；末尾 return a, b 导出。ctrl:Clipboard() 为文本或文件路径，不是 0/1。</p>`;
+      html += `<p class="hint">*类 C：int/double/string、if/else、for/while。字符串用 "+" 或 '+'（裸写 + 是加法）。split(s, "/") 按你写的分隔符拆成数组，用 parts[0]、parts.count（可负下标）。replace(s,"a","b") 替换文本；numbers(s) 抠出文本里所有数字（数组，解析 OCR 结果优先用它——识别引擎换版本后括号/百分号可能是全角，split(hp,"(") 会拆不开，取 [1] 就报「下标越界」）。<b>比较注意类型</b>：split 出来的是字符串，<code>a[0] &lt;= 60</code> 走字典序（"9.5" 会被判为大于 "60"），要数值比较请用 numbers()/toInt() 转成数字。toInt("123") 转数字，toString(x) 转文字，trim(s) 去首尾空格。行末可省略分号。局部变量默认销毁；末尾 return a, b 导出。ctrl:Clipboard() 为文本或文件路径，不是 0/1。</p>`;
     } else if (t === "quickInput") {
       const parseOn = a.parseEscapes == null ? false : !!a.parseEscapes;
       html += `<div class="fline"><span class="tl">要输入的文字</span>${chkLabeled(
@@ -5715,18 +5993,21 @@
       const ocrMode = searchMode ? "文字查找" : "获取文字";
       html += fline("结果处理", comboField("ocrResultMode", ocrMode));
       if (searchMode) {
-        html += fline(
+        // 标签单独一排；「查找文字输入框 + 插入变量」占下一整排。
+        // ⚠ 别再改回 fline("查找文字", rowHtml)：两者挤在标签同一行时，窄侧栏下
+        //   输入框被压出面板、插入变量按钮被裁掉（用户截图报障的那一处）。
+        html += flineStack(
           "查找文字",
-          `<div class="row" style="gap:6px;flex:1;min-width:0">${inpField(
+          `<div class="ocr-search-row">${inpField(
             "ocrSearchText",
             a.ocrSearchText || "",
-            120
+            "full"
           )}<button type="button" class="btn ghost sm" data-fi="insertVar" data-target="ocrSearchText">插入变量</button></div>`
         );
       }
-      const ocrFuLabs = ["点击", "鼠标移动到", "保存到变量"];
+      const ocrFuOpts = ocrFollowUpOptions(searchMode);
       const ofu = Math.min(2, Math.max(0, a.ocrFollowUp | 0));
-      html += fline("后续操作", comboField("ocrFollowUp", ocrFuLabs[ofu]));
+      html += fline("后续操作", comboField("ocrFollowUp", ocrFuOpts[ofu].t));
       if (searchMode) {
         html += `<div class="fline wrap">${chkLabeled(
           "findUntilFound",
@@ -5748,8 +6029,14 @@
           html += repeatBlock(a);
           html += `<p class="hint">循环次数是在识别落点重复点击。</p>`;
         }
+      } else if (searchMode) {
+        // 文字查找存的是「是否找到 + 匹配度 + 命中框坐标」，不是一个值 —— 名字与
+        // 字段都写清楚，别让「保存匹配度」被误读成 {变量} 本身就是匹配度。
+        html += flineStack("查找结果保存到", inpField("matchVarName", a.matchVarName || "a"));
+        html += `<p class="hint">*{变量}=是否找到(0/1)；{变量}.matchData=匹配度(0~100)；{变量}.x/.y/.x1/.y1=命中文字框坐标。</p>`;
       } else {
-        html += flineStack("结果保存到", inpField("matchVarName", a.matchVarName || "a"));
+        html += flineStack("文字保存到", inpField("matchVarName", a.matchVarName || "a"));
+        html += `<p class="hint">*{变量}=识别到的整段文字（可直接用 {变量} 引用，或做文字查找/条件判断）。</p>`;
       }
       html += `<div class="fline"><button type="button" class="btn primary crosshair-btn" data-fi="ocrTest">测试</button></div>`;
     } else if (t === "customText") {
@@ -6237,11 +6524,7 @@
         e.stopPropagation();
         showPopup(
           ocrFuCombo,
-          [
-            { t: "点击", v: 0 },
-            { t: "鼠标移动到", v: 1 },
-            { t: "保存到变量", v: 2 },
-          ],
+          ocrFollowUpOptions((a.ocrResultMode | 0) === 1),
           (it) => {
             a.ocrFollowUp = it.v;
             renderParamPanel(a);
@@ -6511,15 +6794,20 @@
       if (varCombo) {
         varCombo.addEventListener("click", (e) => {
           e.stopPropagation();
-          const items = buildEditorVarItems().filter((x) => x.code);
-          if (!items.length) {
-            toast("暂无可用变量");
-            return;
-          }
-          showPopup(varCombo, items, (it) => {
-            a._ifVarCode = it.code;
-            a._ifVarLabel = it.t;
-            varCombo.textContent = it.t;
+          // 清单来自引擎（唯一实现）⇒ 先取再弹，别用旧缓存弹一个可能过期的表
+          fetchEditorVarItems().then((all) => {
+            const items = all.filter((x) => x.code);
+            if (!items.length) {
+              toast("暂无可用变量");
+              return;
+            }
+            // 异步等待期间面板可能已重绘：锚点被移除时改挂面板，否则弹窗会跑到屏幕左上角
+            const anchor = varCombo.isConnected ? varCombo : panel;
+            showPopup(anchor, items, (it) => {
+              a._ifVarCode = it.code;
+              a._ifVarLabel = it.t;
+              varCombo.textContent = it.t;
+            });
           });
         });
       }
@@ -6568,10 +6856,7 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          peekScriptActions(a.targetPath).then((msg) => {
-            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
-            renderParamPanel(a);
-          });
+          peekScriptActions(a.targetPath).then((msg) => afterPickTargetScript(a, msg));
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -6605,10 +6890,7 @@
           a.targetPath = it.v;
           a.blockName = it.name || it.t;
           if (anchor) anchor.textContent = a.blockName;
-          peekScriptActions(a.targetPath).then((msg) => {
-            if (msg && msg.ok) applyTargetScriptUseMode(a, msg);
-            renderParamPanel(a);
-          });
+          peekScriptActions(a.targetPath).then((msg) => afterPickTargetScript(a, msg));
         },
         { selectedIndex: sel >= 0 ? sel : 0, minRows: 8 }
       );
@@ -6728,7 +7010,7 @@
         }
         if (act === "full") {
           if (editorUsesWindowTarget()) {
-            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
             return;
           }
           applyFullScreenSearchCoords(a);
@@ -6745,7 +7027,7 @@
         }
         if (act === "absRegion") {
           if (editorUsesWindowTarget()) {
-            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
             return;
           }
           state._pendingRegionTarget = "search";
@@ -6789,22 +7071,26 @@
         }
         if (act === "insertVar") {
           const target = btn.dataset.target || "inputText";
-          const items = buildEditorVarItems().filter((x) => x.code);
-          if (!items.length) {
-            toast("暂无可用变量");
-            return;
-          }
-          showPopup(btn, items, (it) => {
-            const el = panel.querySelector(`[data-k="${target}"]`);
-            const insert = it.insert || "{" + it.code + "}";
-            if (el) {
-              const cur = el.textContent || "";
-              el.textContent = cur + insert;
-              a[target] = el.textContent;
-            } else {
-              a[target] = (a[target] || "") + insert;
-              renderParamPanel(a);
+          fetchEditorVarItems().then((all) => {
+            const items = all.filter((x) => x.code);
+            if (!items.length) {
+              toast("暂无可用变量");
+              return;
             }
+            // 同 varCombo：异步期间按钮可能已被重绘移除，别拿一个脱离 DOM 的锚点去定位
+            const anchor = btn.isConnected ? btn : panel;
+            showPopup(anchor, items, (it) => {
+              const el = panel.querySelector(`[data-k="${target}"]`);
+              const insert = it.insert || "{" + it.code + "}";
+              if (el) {
+                const cur = el.textContent || "";
+                el.textContent = cur + insert;
+                a[target] = el.textContent;
+              } else {
+                a[target] = (a[target] || "") + insert;
+                renderParamPanel(a);
+              }
+            });
           });
           return;
         }
@@ -6924,7 +7210,7 @@
         }
         if (act === "aiFull") {
           if (editorUsesWindowTarget()) {
-            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
             return;
           }
           a.aiSearchRegion = 0;
@@ -6934,7 +7220,7 @@
         }
         if (act === "aiRegion") {
           if (editorUsesWindowTarget()) {
-            toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+            toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
             return;
           }
           state._pendingRegionTarget = "ai";
@@ -7004,7 +7290,7 @@
                 : a.imagePath;
           if (act === "region" && !imgPath) {
             if (editorUsesWindowTarget()) {
-              toast("窗口模式下已使用整个目标窗口，无需选取屏幕区域");
+              toast("窗口/后台窗口模式下已使用整个目标窗口，无需选取屏幕区域");
               return;
             }
             state._pendingRegionTarget = "search";
@@ -7102,7 +7388,7 @@
       showWm &&
       (methodV === "useEditorWindowClass" || methodV === "noSelect");
     const showClassBtn = showWm && methodV === "useEditorWindowClass";
-    const showFocus = showWm && (mode === 1 || mode === 2); // 窗口模式 / 后台窗口模式
+    const showFocus = showWm && (mode === 1 || mode === 2); // 独立桌面模式 / 后台窗口模式
     const showTargetRow = showPathChrome || showClassBtn || showFocus;
 
     if ($("#edTargetPath")) {
@@ -7284,7 +7570,7 @@
       }
       if (classText) wm.windowClassName = classText;
     }
-    // 假焦点：窗口模式与后台窗口模式均可写（Unity 等游戏会自动启用，勾选可强制）
+    // 假焦点：独立桌面模式与后台窗口模式均可写（Unity 等游戏会自动启用，勾选可强制）
     if (state.editorMode === 1 || state.editorMode === 2) {
       wm.fakeFocusEnabled = $("#edFocus")?.classList.contains("on") ? 1 : 0;
     } else {
@@ -10777,6 +11063,9 @@
     state._editorOpenedNew = !state.editorPath;
     state.editorName = name || "";
     state.editorActions = [];
+    // 换脚本 ⇒ 引擎变量清单必须作废（否则下拉里短暂显示上一个脚本的变量名）
+    state.editorVarItemsFromEngine = null;
+    state._varItemsWaiters = {};
     state.editDraft = null;
     state.addActionType = firstVisibleActionType();
     resetEditorHistory();
@@ -10843,13 +11132,50 @@
       breakout: ($("#edBreakout")?.textContent || "").trim(),
       windowMode: collectWindowModeForSave() || {},
       actions: (state.editorActions || []).map(scrub),
-      visualLayout: collectVisualLayoutForSave() || null,
     });
+  }
+
+  /// 画布（可视化布局）改动登记：由 visual_editor.js 在用户真正改动画布时回调。
+  /// 刻意不进 captureEditorSnapshot —— 「切到可视化」会触发生成默认布局 / 缩放 / 滚动，
+  /// 那些都不是用户改动，不能算「未保存的改动」。
+  function markVisualLayoutDirty() {
+    if (!state.editor) return;
+    state._editorLayoutDirty = true;
+  }
+
+  /// 布局内容指纹（不含 viewMode / zoom / scroll）。无布局时为空串。
+  function currentVisualLayoutKey() {
+    const V = window.QstVisualEditor;
+    if (!V || typeof V.collectLayoutCore !== "function") return "";
+    const core = V.collectLayoutCore();
+    return core ? JSON.stringify(core) : "";
+  }
+
+  /// 刷新布局基线（进入/离开可视化、打开编辑器、保存成功后调用）。
+  /// 已有未保存的画布改动时不覆盖基线，避免把用户的改动「洗白」。
+  function refreshVisualLayoutBaseline() {
+    if (!state.editor) return;
+    if (state._editorLayoutDirty) return;
+    state._editorLayoutBaseline = currentVisualLayoutKey();
+  }
+
+  function resetEditorDirtyBaseline() {
+    state._editorSnapshot = captureEditorSnapshot();
+    state._editorLayoutDirty = false;
+    state._editorLayoutBaseline = currentVisualLayoutKey();
   }
 
   function isEditorDirty() {
     if (!state.editor) return false;
     if (!state._editorSnapshot) return false;
+    if (state._editorLayoutDirty) {
+      // 拖回原位 / 撤销回原样：布局与基线一致即视为无改动
+      if (currentVisualLayoutKey() === state._editorLayoutBaseline) {
+        state._editorLayoutDirty = false;
+      } else {
+        return true;
+      }
+    }
     return captureEditorSnapshot() !== state._editorSnapshot;
   }
 
@@ -10970,6 +11296,8 @@
         state._editorRevertPayload.path = msg.path;
     }
     state._editorSnapshot = captureEditorSnapshot();
+    state._editorLayoutDirty = false;
+    state._editorLayoutBaseline = currentVisualLayoutKey();
     if (intent === "autosave") {
       if (state._saveEditorQueuedClose) {
         state._saveEditorQueuedClose = false;
@@ -11080,6 +11408,8 @@
     state.actionSel = -1;
     state.editorPath = "";
     state._editorSnapshot = "";
+    state._editorLayoutDirty = false;
+    state._editorLayoutBaseline = "";
     // 动作详情草稿/预览缓存：退出编辑器后清掉，避免下次进入残留
     state.addPreview = null;
     state.editDraft = null;
@@ -11216,6 +11546,135 @@
 
   function itemPath(item) {
     return (item && (item.path || item.id)) || "";
+  }
+
+  // ── 导出脚本：按设置决定走 zip 还是独立 EXE ─────────────────────
+  // 「其他设置 → 导出脚本默认为 zip 格式」勾选 → 老路径（zip 脚本包）；
+  // 默认（不勾）→ 直接走独立 EXE（免安装、能被本软件导入）。
+  function startExport(path, name) {
+    if (!path) {
+      toast("请先选中要导出的脚本");
+      return;
+    }
+    state._exportPath = path;
+    state._exportName = name || "";
+    const other = (state.settings && state.settings.other) || {};
+    if (other.exportScriptAsZip) {
+      if (window.qst) qst.exportScript(path);
+      return;
+    }
+    beginExportExe();
+  }
+  // 专业模式的右键菜单在 pro-mode.js 里，通过这个全局入口复用同一套流程
+  window.QstExport = { open: startExport };
+
+  function fmtBytes(n) {
+    const v = Number(n) || 0;
+    if (v <= 0) return "—";
+    if (v >= 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+    if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+    return `${v} B`;
+  }
+
+  function renderExportScan(scan) {
+    const el = $("#expScan");
+    if (!el) return;
+    const rows = [];
+    rows.push(`动作 <b>${scan.totalActions | 0}</b> 个`);
+    if (scan.imageActions > 0) rows.push(`找图 / 找色 <b>${scan.imageActions}</b> 处`);
+    if (scan.ocrActions > 0) rows.push(`文字识别 <b>${scan.ocrActions}</b> 处`);
+    if (scan.aiActions > 0) rows.push(`AI 动作 <b>${scan.aiActions}</b> 处`);
+    if (scan.windowMode) rows.push(`后台窗口模式 <b>是</b>`);
+    if (scan.nestedScripts > 0) rows.push(`引用的子脚本 <b>${scan.nestedScripts}</b> 个（已打包）`);
+    let html = rows.join(" · ");
+    if (!scan.templateAvailable) {
+      html += `<br><span class="warn">缺少播放器模板，无法导出 EXE（重装「键鼠工坊」可恢复）。</span>`;
+    }
+    if (scan.aiActions > 0) {
+      html += `<br><span class="warn">注意：AI 动作需要目标电脑配置自己的 API Key，否则该动作会失败。</span>`;
+    }
+    const missing = Array.isArray(scan.missingRefs) ? scan.missingRefs : [];
+    if (missing.length) {
+      html += `<br><span class="warn">有 ${missing.length} 个引用的子脚本找不到，不会被导出：${esc(missing.slice(0, 3).join("、"))}</span>`;
+    }
+    if (scan.selfContainedOnly) {
+      html += `<br>这个脚本不依赖任何外部组件，导出的体积最小、最省心。`;
+    }
+    el.innerHTML = html;
+
+    const adv = $("#expAdvanced");
+    if (adv) adv.hidden = !(scan.imageActions > 0 || scan.ocrActions > 0);
+    const chkOcv = $("#expBundledOpenCv");
+    const chkOcr = $("#expBundledOcr");
+    if (chkOcv) chkOcv.parentElement.hidden = !(scan.imageActions > 0);
+    if (chkOcr) chkOcr.parentElement.hidden = !(scan.ocrActions > 0);
+    updateExportSize(scan);
+  }
+
+  function updateExportSize(scan) {
+    const el = $("#expSize");
+    if (!el) return;
+    const s = scan || state._exportScan || {};
+    let bytes = Number(s.templateBytes) || 0;
+    if ((s.imageActions | 0) > 0 && $("#expBundledOpenCv")?.classList.contains("on")) {
+      bytes += Number(s.openCvBytes) || 0;
+    }
+    if (s.windowMode) bytes += Number(s.fakeFocusBytes) || 0;
+    const extra = [];
+    if ((s.imageActions | 0) > 0) {
+      extra.push(
+        $("#expBundledOpenCv")?.classList.contains("on")
+          ? "图像识别组件：自带"
+          : "图像识别组件：用软件里的"
+      );
+    }
+    if ((s.ocrActions | 0) > 0) {
+      extra.push(
+        $("#expBundledOcr")?.classList.contains("on")
+          ? "文字识别：系统 OCR"
+          : "文字识别：用软件里的"
+      );
+    }
+    el.textContent =
+      `预计体积：约 ${fmtBytes(bytes)}` + (extra.length ? `（${extra.join("；")}）` : "");
+  }
+
+  function syncExportTargetRadios() {
+    const bundled = $("#expTargetRadios .radio.on")?.dataset.v !== "installed";
+    const ocv = $("#expBundledOpenCv");
+    const ocr = $("#expBundledOcr");
+    if (ocv) ocv.classList.toggle("on", bundled);
+    if (ocr) ocr.classList.toggle("on", bundled);
+    updateExportSize();
+  }
+
+  function beginExportExe() {
+    const path = state._exportPath;
+    if (!path) return;
+    state._exportScan = null;
+    const scanEl = $("#expScan");
+    if (scanEl) scanEl.textContent = "正在检查脚本…";
+    const sizeEl = $("#expSize");
+    if (sizeEl) sizeEl.textContent = "预计体积：—";
+    openOv("export-exe");
+    if (window.qst && typeof qst.scanScriptForExport === "function") {
+      qst.scanScriptForExport(path);
+    } else if (scanEl) {
+      scanEl.textContent = "当前版本不支持导出 EXE。";
+    }
+  }
+
+  function confirmExportExe() {
+    const path = state._exportPath;
+    if (!path) return;
+    if (window.qst && typeof qst.exportScriptAsExe === "function") {
+      qst.exportScriptAsExe({
+        path,
+        bundledOpenCv: $("#expBundledOpenCv")?.classList.contains("on") ? 1 : 0,
+        bundledOcr: $("#expBundledOcr")?.classList.contains("on") ? 1 : 0,
+        bundledFakeFocus: 1,
+      });
+    }
   }
 
   function askConfirm(msg, onOk) {
@@ -12047,6 +12506,63 @@
   }
 
   /** 对齐原生：pointerdown 按住即开始准星拖拽（同步 HostObject，避免松手后再拾取） */
+  /** 坐标系选项（2026-10-05）：只在「窗口模式 / 后台窗口模式」且已绑定窗口时启用
+   *  窗口基准 —— 默认模式回放不做坐标换算，给客户区坐标反而会错。
+   *  ⚠ 判「是不是窗口模式」**只信 `state.editorMode`**（UI 的实时选择）：
+   *    `wm.enabled` 只在保存时被 `collectWindowModeForSave` 同步，新开编辑器时可能是旧值。 */
+  function crosshairCoordOptions() {
+    const wm = state.windowMode || {};
+    if (!(state.editorMode > 0)) return {};
+    const cls = wm.windowClassName || "";
+    const exe = wm.targetExePath || "";
+    if (!cls && !exe) return {};   // 没身份 ⇒ 原生找不到窗口，给了也白给
+    return {
+      windowClient: 1,
+      windowClassName: cls,
+      targetExePath: exe,
+      windowTitle: wm.windowName || "",
+    };
+  }
+
+  /** 一次性确认框。⚠ WebView2 里 `window.confirm` 默认不可用（宿主没处理
+   *  ScriptDialogOpening）⇒ 自建 DOM 模态框。返回 Promise<boolean>：
+   *  true = 继续用窗口相对；false = **放弃本次取点**（不写值、不改脚本）。
+   *  ⚠ 刻意**不提供**「本次用屏幕坐标」：坐标系是**脚本级**的
+   *  （`collectWindowModeForSave` 的 `anyRel` 只要 `wm.windowRelativeCoordinates`
+   *   或任一动作 `windowRelative` 为真就整脚本切客户区）⇒ 单个动作存屏幕坐标会被
+   *   当成客户区解释，**静默错位**。要么整脚本客户区，要么整脚本屏幕。 */
+  function askCoordSpaceConfirm() {
+    return new Promise((resolve) => {
+      const mask = document.createElement("div");
+      mask.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);"
+        + "display:flex;align-items:center;justify-content:center;z-index:99999";
+      const box = document.createElement("div");
+      box.style.cssText = "max-width:460px;background:#fff;color:#222;border-radius:10px;"
+        + "padding:18px 20px;box-shadow:0 8px 32px rgba(0,0,0,.25);font-size:13px;line-height:1.7";
+      box.innerHTML =
+        '<div style="font-weight:600;font-size:14px;margin-bottom:8px">将以「窗口相对坐标」取点</div>'
+        + '<div style="margin-bottom:14px">取到的点以 <b>目标窗口客户区</b> 为基准，窗口移动也不会失效。<br>'
+        + '⚠ 坐标系是<b>整脚本</b>的：本脚本<b>已有的坐标动作</b>会一起按客户区解释 —— '
+        + '如果你之前是按屏幕坐标录的，请重新取点。<br>'
+        + '（只想放弃这一次取点，点「取消」。）</div>';
+      const actions = document.createElement("div");
+      actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end";
+      const bCancel = document.createElement("button");
+      bCancel.className = "btn";
+      bCancel.textContent = "取消";
+      const bOk = document.createElement("button");
+      bOk.className = "btn primary";
+      bOk.textContent = "继续（窗口相对）";
+      const done = (v) => { mask.remove(); resolve(v); };
+      bCancel.onclick = () => done(false);
+      bOk.onclick = () => done(true);
+      actions.append(bCancel, bOk);
+      box.append(actions);
+      mask.append(box);
+      document.body.append(mask);
+    });
+  }
+
   function startNativeCrosshair(mode, pending) {
     state._pendingCrosshair = pending || mode;
     state._crosshairMode = mode;
@@ -12060,9 +12576,11 @@
       chrome.webview.hostObjects &&
       chrome.webview.hostObjects.sync &&
       chrome.webview.hostObjects.sync.qst;
+    const coordOpts = crosshairCoordOptions();
     if (syncHost && typeof syncHost.crosshairPick === "function") {
       try {
-        const raw = syncHost.crosshairPick(String(mode || "coordinates"));
+        const raw = syncHost.crosshairPick(String(mode || "coordinates"),
+          JSON.stringify(coordOpts));
         let msg = raw;
         if (typeof raw === "string") {
           try {
@@ -12081,7 +12599,7 @@
         console.warn("sync crosshairPick failed, fallback async", err);
       }
     }
-    qst.crosshairPick(mode);
+    qst.crosshairPick(mode, coordOpts);
   }
 
   function openCrosshairWeb(mode, pending) {
@@ -12656,6 +13174,21 @@
       applyThemeFromSettings(state.settings || {});
       return;
     }
+    // ★ 窗口 Agents：列表 / 绑定结果。绑定成功后**立刻重列**（用户要看到状态变了）
+    if (type === "windowAgentList.result") {
+      renderWindowAgents(msg.payload || {});
+      return;
+    }
+    if (type === "windowAgentBind.result") {
+      const payload = msg.payload || {};
+      if (payload.ok) {
+        toast(payload.bound === false ? "已解除绑定" : "已绑定窗口 Agent");
+        loadWindowAgents();
+      } else {
+        toast(payload.error || "绑定失败");
+      }
+      return;
+    }
     if (type === "debugWindow.needTheme") {
       pushThemeCssToDebug();
       return;
@@ -12822,24 +13355,62 @@
         toast(`定点 ${pick.x | 0},${pick.y | 0}`);
       } else if (mode === "coordinates" || pending === "coord" || pending === "coordEnd") {
         const a = editorParamAction();
-        if (a) {
-          if (pending === "coordEnd") {
-            a.endX = pick.x | 0;
-            a.endY = pick.y | 0;
-          } else {
-            a.x = pick.x | 0;
-            a.y = pick.y | 0;
-          }
-          renderParamPanel(a);
-        } else {
+        if (!a) {
           toast("请先选中或添加动作");
-        }
-        if (a) {
-          toast(
-            pending === "coordEnd"
-              ? `终点 ${a.endX},${a.endY}`
-              : `坐标 ${a.x},${a.y}`
-          );
+        } else {
+          // ── 坐标系（2026-10-05）────────────────────────────────────────────
+          // 原生在「窗口模式 + 已绑定窗口」时返回 coordSpace:"windowClient"
+          // ⇒ 取到的 x/y 已是客户区像素。给动作打 windowRelative 标记 ——
+          //   保存时 collectWindowModeForSave 的 anyRel 会把**整脚本**切到 windowClient。
+          const isClient = pick.coordSpace === "windowClient";
+          const apply = (useClient) => {
+            const px = useClient ? pick.x : (pick.screenX != null ? pick.screenX : pick.x);
+            const py = useClient ? pick.y : (pick.screenY != null ? pick.screenY : pick.y);
+            if (pending === "coordEnd") {
+              a.endX = px | 0;
+              a.endY = py | 0;
+            } else {
+              a.x = px | 0;
+              a.y = py | 0;
+            }
+            a.windowRelative = !!useClient;
+            if (useClient && pick.clientW > 0 && pick.clientH > 0) {
+              // ⚠⚠ 必须**同时**记下取点时的客户区尺寸（2026-10-05）。
+              //   回放端 `RecordedClientSize()` 在 recordClientWidth/Height 为 0 时
+              //   会回退到 `coordMeta.capture`（**屏幕分辨率** 2560x1440）当「录制客户区」
+              //   ⇒ 把**已经是客户区的坐标**再缩一次 ⇒ 点错位置。
+              //   用户实测（UWP 计算器，客户区 480x799）：动作 (181,599) 被缩成 (34,332)
+              //   ⇒ 表现就是「鼠标移动了但点击没反应」。
+              //   记下真实尺寸后缩放比 = 1；窗口**被改变大小**时才按比例缩放（这是期望行为）。
+              state.windowMode = state.windowMode || {};
+              state.windowMode.recordClientWidth = pick.clientW | 0;
+              state.windowMode.recordClientHeight = pick.clientH | 0;
+            }
+            renderParamPanel(a);
+            const tag = useClient ? "窗口相对坐标" : "屏幕坐标";
+            const out = (useClient && pick.outside) ? "（此点在窗口外）" : "";
+            toast(pending === "coordEnd"
+              ? `${tag} 终点 ${a.endX},${a.endY}${out}`
+              : `${tag} ${a.x},${a.y}${out}`);
+          };
+          if (!isClient) {
+            // 原生没给客户区坐标（未启用窗口模式 / 找不到窗口 / 转换失败）
+            // ⇒ 走原来的屏幕坐标路径，**行为与旧版一致**
+            apply(false);
+          } else if (state._wmCoordPref === true) {
+            apply(true);   // 用户已确认过「继续用窗口相对」⇒ 不再打扰
+          } else {
+            // 首次切到窗口相对 ⇒ **确认框**（它会改变整脚本的解释方式，值得打断一次）
+            askCoordSpaceConfirm().then((ok) => {
+              if (ok) {
+                state._wmCoordPref = true;
+                apply(true);
+              } else {
+                toast("已取消本次取点");
+              }
+            });
+          }
+          if (pick.coordNote) toast(String(pick.coordNote));
         }
       } else if (mode === "programPath" || pending === "program") {
         const a = editorParamAction();
@@ -12850,6 +13421,23 @@
           toast(pick.processPath);
         } else {
           toast(pick.processPath || "未获取路径");
+        }
+      } else if (pending === "windowAgent") {
+        // ★ 窗口 Agents 绑定：准星拾取到的窗口 → 交给原生匹配/新建档案并写 windowClients。
+        //   ⚠ 拾取结果里**没有 hwnd**（原生 WindowTargetResult 只给路径/标题/类名）
+        //     ⇒ 按 **exe 文件名 + 标题** 交给原生去匹配内置档案。
+        //   ⚠ 拾取结果里**没有 hwnd**（原生 WindowTargetResult 只给路径/标题/类名）
+        //     ⇒ 按 **exe 文件名 + 标题** 交给原生匹配档案；匹配不到就建骨架档案。
+        //   ★ 只做"选中"：绑定要用户在浮层里按「绑定为模型」确认（别一点就改配置）
+        const exeName = String(pick.processPath || "").split("\\").pop() || "";
+        if (!exeName) {
+          toast("没拿到进程名，请对准客户端的窗口本体再松手");
+        } else {
+          const hit = (typeof waState !== "undefined" ? waState.clients : []).find((c) =>
+            (c.processNames || []).some((p) => String(p).toLowerCase() === exeName.toLowerCase()));
+          waPickFromWindowInfo({ process: exeName, title: pick.windowTitle || "", client: hit ? hit.id : "" });
+          if (typeof waOpen === "function") waOpen();
+          toast(`已选中 ${exeName}`);
         }
       } else if (mode === "windowTarget" || pending === "windowClass" || pending === "window"
           || pending === "nestedWm" || pending === "nestedWmClass") {
@@ -13497,7 +14085,7 @@
           wm.windowClassName ||
           wm.windowTitle ||
           "目标窗口";
-        if (lab) lab.textContent = "窗口模式目标 · " + label;
+        if (lab) lab.textContent = "后台窗口目标 · " + label;
         if (target && msg.dataUrl) {
           target.style.backgroundImage = `url("${msg.dataUrl}")`;
           target.style.backgroundSize = "cover";
@@ -13586,6 +14174,15 @@
       }
       return;
     }
+    if (type === "editorVarItems.result") {
+      const reqId = String(msg.reqId || "");
+      const waiter = state._varItemsWaiters && state._varItemsWaiters[reqId];
+      if (waiter) {
+        delete state._varItemsWaiters[reqId];
+        waiter(msg);
+      }
+      return;
+    }
     if (type === "openEditor.result") {
       if (state._editorOpenWatchdog) {
         clearTimeout(state._editorOpenWatchdog);
@@ -13657,6 +14254,8 @@
       showAddTypePreview();
       resetEditorHistory({ keepClipboard: true });
       state._editorSnapshot = captureEditorSnapshot();
+      state._editorLayoutDirty = false;
+      state._editorLayoutBaseline = currentVisualLayoutKey();
       try {
         state._editorRevertPayload = collectEditorSavePayload();
       } catch (_) {
@@ -13725,12 +14324,43 @@
       closeAllOv();
       return;
     }
+    if (type === "scanScriptForExport.result") {
+      if (!msg.ok) {
+        const el = $("#expScan");
+        if (el) el.textContent = msg.detail || "检查失败";
+        return;
+      }
+      state._exportScan = msg;
+      renderExportScan(msg);
+      return;
+    }
+    if (type === "exportScriptAsExe.result") {
+      if (!msg.ok) {
+        if (msg.detail && msg.detail !== "cancelled") toast(msg.detail);
+        return;
+      }
+      const missing = Array.isArray(msg.missingRefs) ? msg.missingRefs : [];
+      if (missing.length) {
+        toast(`已导出，但有 ${missing.length} 个引用的子脚本没找到`);
+      } else if ((msg.skipped | 0) > 0) {
+        toast(`已导出，但有 ${msg.skipped} 个文件被跳过`);
+      } else {
+        toast(`已导出独立 EXE（${fmtBytes(msg.bytes)}）`);
+      }
+      if (msg.aiKeyEmbedded) {
+        toast("注意：AI 密钥已随 exe 打包，请只发给可信的人");
+      }
+      closeAllOv();
+      return;
+    }
     if (type === "exportScript.result") {
       if (!msg.ok) {
         if (msg.detail && msg.detail !== "cancelled") toast(msg.detail);
         return;
       }
       const skipped = msg.skipped | 0;
+      const missing = Array.isArray(msg.missingRefs) ? msg.missingRefs : [];
+      const parts = [];
       if (skipped > 0) {
         const files = Array.isArray(msg.skippedFiles) ? msg.skippedFiles : [];
         const names = files
@@ -13738,11 +14368,19 @@
           .filter(Boolean)
           .slice(0, 5);
         const more = files.length > 5 ? ` 等${files.length}个` : "";
-        toast(
+        parts.push(
           names.length
-            ? `导出成功，但有 ${skipped} 个文件被跳过：${names.join("、")}${more}`
-            : `导出成功，但有 ${skipped} 个文件被跳过`
+            ? `${skipped} 个文件被跳过：${names.join("、")}${more}`
+            : `${skipped} 个文件被跳过`
         );
+      }
+      if (missing.length) {
+        const names = missing.slice(0, 3).join("、");
+        const more = missing.length > 3 ? ` 等${missing.length}个` : "";
+        parts.push(`引用的子脚本找不到，未打包：${names}${more}`);
+      }
+      if (parts.length) {
+        toast(`导出成功，但${parts.join("；")}`);
       } else {
         toast("已导出");
       }
@@ -13838,6 +14476,11 @@
       return;
     }
     if (type === "loadOptimizeRecording.result") {
+      // ⚠ 加载已挪到**后台线程**（大录制解析要几百 ms），结果可能晚到 —— 若用户在这期间
+      // 已经关掉优化窗，就丢弃它：否则下面的 tryRevealOptMode → revealModeAfterPaint
+      // 会对着一个已经关掉的界面调 qst.modeReady()，让壳按优化模式改窗口尺寸。
+      // （C++ 侧另有请求序号去重；这里只管「面板不在了」这一种。）
+      if (!document.body.classList.contains("opt-open")) return;
       if (!msg.ok) {
         endModeTransition("force");
         toast(msg.detail || "加载录制失败");
@@ -14847,11 +15490,116 @@
     return "选中范围内至少需要两个鼠标移动点。";
   }
 
-  /** 只改勾选/高亮 class，避免整表 innerHTML 重绘闪烁 */
+  /// ── 优化列表选择态 ────────────────────────────────────────────
+  /// 选择态**只**存在 state.optSelected（下标数组，后端要的就是它）。
+  /// 渲染时一律**实时**读取，绝不在渲染时做快照 —— 原实现把
+  /// `new Set(optSelected)` 存进渲染批次里，于是「全选」之后滚动新出现的行
+  /// 仍是未选中态（用户报的「全选只能选到已加载的部分」就是这么来的）。
+  /// Set 只是查询缓存：改动选择后置 dirty，下次读取时重建。
+  function optSelSet() {
+    if (state._optSelDirty !== false || !(state._optSelSet instanceof Set)) {
+      state._optSelSet = new Set(Array.isArray(state.optSelected) ? state.optSelected : []);
+      state._optSelDirty = false;
+    }
+    return state._optSelSet;
+  }
+
+  function markOptSelDirty() {
+    state._optSelDirty = true;
+  }
+
+  // ── @opt-virtual-math:begin ──
+  // 纯函数：无 DOM、无 state 依赖。tools/verify/opt_list_virtual_scroll.js
+  // 提取本段源码做边界断言（改签名要同步改那个测试）。
+  /** 由滚动位置算需要渲染的行区间 [start, end)。overscan 上下各多渲染几行。 */
+  function computeOptWindow(scrollTop, viewH, rowH, total, overscan) {
+    if (!(total > 0) || !(rowH > 0)) return { start: 0, end: 0 };
+    const over = Math.max(0, overscan | 0);
+    const top = Math.max(0, Number(scrollTop) || 0);
+    const vh = Math.max(1, Number(viewH) || 1);
+    let start = Math.floor(top / rowH) - over;
+    if (start < 0) start = 0;
+    let end = Math.ceil((top + vh) / rowH) + over;
+    if (end > total) end = total;
+    if (end < start) end = start;
+    return { start, end };
+  }
+
+  /**
+   * 超长列表的**滚动压缩映射**（browser 单元素高度上限 ≈ 33,554,432px，
+   * 保守取 16,000,000 —— Safari/Firefox 更低，官网 Demo 要在真浏览器里跑）。
+   * 超过上限时 scrollbar 会失效、**滚不到列表末尾**（静默），所以必须压缩。
+   *
+   * 行**仍按真实行高渲染**（不视觉压扁），只把「可滚动区间」线性对齐：
+   *
+   *   realMax = actualSize  − viewH     （真实可滚距离）
+   *   virtMax = virtualSize − viewH     （压缩后可滚距离）
+   *   ratio   = virtMax / realMax
+   *   actualOffset = scrollTop / ratio  （压缩位置 → 真实偏移）
+   *
+   * ⚠⚠ 必须对齐**可滚动区间**，不能直接按总高比例（ratio = virtualSize/actualSize）：
+   *   后者滚到底时真实偏移只能到 `actualSize − viewH/ratio`，于是**最后一屏
+   *   （viewH/ratio/rowH 行）永远滚不到** —— 列表越长漏得越多（70 万条漏约 39 行）。
+   *   对齐区间后：scrollTop=0 → 顶部；scrollTop=virtMax → 真实偏移正好
+   *   `actualSize − viewH` ⇒ 最后一行落在视口内。
+   * 该映射是双射 ⇒ 每个行号都可达；ratio === 1 时退化为恒等（零行为变化）。
+   */
+  function computeOptScale(total, rowH, maxVirtual, viewH) {
+    const n = Number(total);
+    const h = Number(rowH);
+    const cap = Number(maxVirtual);
+    const vh = Number(viewH);
+    // 非有限值一律当 0 处理：Infinity 会一路传成 spacer 高度/scrollTop 的 NaN，
+    // 静默把列表弄成空白（虽然 actions.length 不可能无穷，但这条路径零成本兜底）。
+    const actualSize =
+      Number.isFinite(n) && n > 0 && Number.isFinite(h) && h > 0 ? n * h : 0;
+    const view = Number.isFinite(vh) && vh > 0 ? vh : 0;
+    if (!(actualSize > 0) || !Number.isFinite(cap) || !(cap > 0) || actualSize <= cap) {
+      return { actualSize, virtualSize: actualSize, ratio: 1 };
+    }
+    const virtualSize = cap;
+    const realMax = Math.max(0, actualSize - view);
+    const virtMax = Math.max(0, virtualSize - view);
+    return {
+      actualSize,
+      virtualSize,
+      ratio: realMax > 0 && virtMax > 0 ? virtMax / realMax : 1,
+    };
+  }
+  // ── @opt-virtual-math:end ──
+
+  /// 浏览器单元素高度的保守上限（Chrome/Edge ≈33.5M、Firefox ≈17.8M、Safari ≈16.7M）。
+  /// 官网 Demo 用的是同一份 app.js、跑在真浏览器里 ⇒ 取跨浏览器安全值。
+  const OPT_MAX_VSPACE_PX = 16_000_000;
+  /// 窗口还不可见（clientHeight=0）时的视口高估值，仅用于首帧算窗口范围。
+  const OPT_FALLBACK_VIEW_H = 900;
+
+  /// 单个优化行的高度（px）。CSS 里 `.opt-list .arow{height:38px * --qst-opt-u}`
+  /// 是固定的 ⇒ 虚拟滚动可以纯数学定位，不必逐行测量。
+  /// 优先用实测值（calibrateOptRowHeight 写入），否则由 --qst-opt-u 推算。
+  function optRowHeightPx() {
+    const cached = Number(state._optRowH);
+    if (Number.isFinite(cached) && cached > 1) return cached;
+    const u = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--qst-opt-u")
+    );
+    return Number.isFinite(u) && u > 0 ? 38 * u : 38 * 1.491;
+  }
+
+  /// 当前列表视口高（px）。窗口还不可见时用估值，只影响首帧窗口范围与压缩比。
+  /// ⚠ 压缩比依赖它（见 computeOptScale）：行按真实行高渲染 ⇒ 视口容量恒为 viewH。
+  function optViewportH(list) {
+    const el = list || $("#optList");
+    const h = el ? el.clientHeight : 0;
+    return h > 1 ? h : OPT_FALLBACK_VIEW_H;
+  }
+
+  /** 只改勾选/高亮 class，避免整表 innerHTML 重绘闪烁。
+   *  窗口化之后 #optList 里只有窗口内的几十行 ⇒ 这里是 O(窗口)，不再随条数增长。 */
   function syncOptListSelectionUi() {
     const list = $("#optList");
     if (!list) return;
-    const selSet = new Set(state.optSelected || []);
+    const selSet = optSelSet();
     list.querySelectorAll(".arow").forEach((row) => {
       const i = row.dataset.i | 0;
       const on = selSet.has(i);
@@ -14872,64 +15620,226 @@
     syncOptSelCount();
     if (state.optHighlight >= 0) {
       const hiRow = list.querySelector(`.arow[data-i="${state.optHighlight}"]`);
-      hiRow?.scrollIntoView({ block: "nearest" });
+      // 窗口化后高亮行常常不在当前窗口里 ⇒ 先把它滚进来，再交给 CSS 定位
+      if (hiRow) hiRow.scrollIntoView({ block: "nearest" });
+      else scrollOptToIndex(state.optHighlight);
     }
+  }
+
+  /// 单行 HTML（原逻辑原样抽出，供窗口化复用）。
+  function optRowHtml(a, i, selSet, progressive) {
+    const label = optActionDisplayName(a);
+    const on = selSet.has(i);
+    const hi = state.optHighlight === i;
+    const keyOp = isOptKeyOperation(a);
+    const tone = keyOp ? "" : i % 2 === 0 ? "tone-a" : "tone-b";
+    const cls = [
+      "arow",
+      on ? "checked" : "",
+      hi ? "focus" : "",
+      keyOp ? "key-op" : "",
+      tone,
+      progressive ? "reveal-in" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const delay = progressive ? ` style="animation-delay:${Math.min(i, 40) * 10}ms"` : "";
+    return `<div class="${cls}" data-i="${i}"${delay}>
+        <span class="chk ${on ? "on" : ""}" data-opt-sel="${i}"><i>${on ? "✓" : ""}</i></span>
+        <span class="${on ? "" : "muted"}">${String(i + 1)}</span>
+        <span class="opt-aname">${esc(label)}</span>
+        <span class="${on ? "" : "muted"}">${esc(a.remark || "")}</span>
+      </div>`;
+  }
+
+  /// ── 优化列表虚拟滚动（窗口化）──────────────────────────────────
+  /// 原「分批追加」只解决了首屏：DOM 仍随滚动**无限累积**，5.8 万行时光滚动
+  /// 就卡死（每行还带 tone/checked 的 inset 阴影，几十万个节点一起重绘）。
+  /// 现在改成真·窗口化：DOM 恒定 = 视口行数 + 上下 overscan，条数再多也不影响滚动。
+  /// 行高固定（CSS `height:38px * --qst-opt-u`）⇒ spacer 撑总高 + 窗口绝对定位，
+  /// 纯数学定位，不需要逐行测量。
+  const OPT_VIRT_OVERSCAN = 12;
+  /// 小数据量仍走一次性渲染（保留入场动画，视觉与旧版一致）。
+  const OPT_RENDER_CHUNK = 300;
+
+  /** 建窗口骨架：spacer 撑起 virtualSize 的总高，窗口在其中绝对定位。 */
+  function buildOptViewport(list, actions) {
+    state._optRowH = 0; // 每次打开都按当前缩放倍率重推，别吃上一次的缓存
+    const rowH = optRowHeightPx();
+    const sc = computeOptScale(actions.length, rowH, OPT_MAX_VSPACE_PX, optViewportH(list));
+    list.innerHTML =
+      '<div class="opt-vspace" id="optVspace"><div class="opt-vwin" id="optWin"></div></div>';
+    const vspace = $("#optVspace");
+    if (vspace) vspace.style.height = sc.virtualSize + "px";
+    state._optVirt = {
+      total: actions.length,
+      rowH,
+      start: -1,
+      end: -1,
+      actions,
+      actualSize: sc.actualSize,
+      virtualSize: sc.virtualSize,
+      ratio: sc.ratio,
+    };
+    return state._optVirt;
+  }
+
+  /// 行高 / 视口变化（首窗口实测校准、缩放倍率变化、壳切模式）后，重算总高与压缩比。
+  function applyOptRowHeight(v, h) {
+    v.rowH = h;
+    const sc = computeOptScale(v.total, h, OPT_MAX_VSPACE_PX, optViewportH());
+    v.actualSize = sc.actualSize;
+    v.virtualSize = sc.virtualSize;
+    v.ratio = sc.ratio;
+    const vspace = $("#optVspace");
+    if (vspace) vspace.style.height = sc.virtualSize + "px";
+    v.start = -1;
+    v.end = -1;
+  }
+
+  /** 只渲染窗口内的行。start/end 没变就直接返回（滚动时会大量调用）。 */
+  function renderOptWindow(force) {
+    const list = $("#optList");
+    const v = state._optVirt;
+    if (!list || !v) return;
+    const win = $("#optWin");
+    if (!win) return;
+    const viewH = optViewportH(list);
+    const scrollTop = list.scrollTop;
+    // 压缩映射：scrollTop 在「压缩空间」，行位置在「真实空间」。
+    // 行按真实行高渲染 ⇒ 视口在真实空间里也只装得下 viewH（不是 viewH/ratio）。
+    const actualOffset = v.ratio === 1 ? scrollTop : scrollTop / v.ratio;
+    const w = computeOptWindow(actualOffset, viewH, v.rowH, v.total, OPT_VIRT_OVERSCAN);
+    if (!force && w.start === v.start && w.end === v.end) return;
+    v.start = w.start;
+    v.end = w.end;
+    const selSet = optSelSet(); // 实时读取 ⇒ 全选后滚到哪儿都是勾选态
+    const parts = [];
+    for (let i = w.start; i < w.end; ++i) {
+      parts.push(optRowHtml(v.actions[i], i, selSet, false));
+    }
+    win.innerHTML = parts.join("");
+    // 窗口贴住视口：元素的 content 坐标 = 当前 scrollTop + (首行的真实位置 − 当前真实偏移)。
+    // 这样窗口在视口里的位置恒等于「首行相对视口的偏移」，压缩与否都成立。
+    win.style.transform =
+      "translateY(" + (scrollTop + w.start * v.rowH - actualOffset) + "px)";
+  }
+
+  /// 首窗口渲染后量一次真实行高：CSS 的 u 缩放有取整误差，
+  /// 累积到 5.8 万行会明显漂移（滚动条位置与内容错位）。
+  function calibrateOptRowHeight() {
+    const v = state._optVirt;
+    const win = $("#optWin");
+    const row = win && win.firstElementChild;
+    if (!v || !row) return;
+    const h = row.getBoundingClientRect().height;
+    if (!(h > 1) || Math.abs(h - v.rowH) < 0.5) return;
+    applyOptRowHeight(v, h);
+    renderOptWindow(true);
+  }
+
+  /** 滚动 / 视口变化只绑一次（#optList 是静态 DOM，跨多次加载复用）。 */
+  function bindOptVirtualScroll(list) {
+    if (list._qstVirtBound) return;
+    list._qstVirtBound = true;
+    list.addEventListener(
+      "scroll",
+      () => {
+        if (!state._optVirt) return;
+        if (state._optScrollRaf) return;
+        state._optScrollRaf = requestAnimationFrame(() => {
+          state._optScrollRaf = 0;
+          renderOptWindow(false);
+        });
+      },
+      { passive: true }
+    );
+    // 壳 setMode / 用户改缩放倍率都会改变视口与行高 ⇒ 重算总高并重绘。
+    if (typeof ResizeObserver === "function") {
+      const ro = new ResizeObserver(() => {
+        if (!state._optVirt) return;
+        if (state._optResizeRaf) return;
+        state._optResizeRaf = requestAnimationFrame(() => {
+          state._optResizeRaf = 0;
+          const v = state._optVirt;
+          if (!v) return;
+          state._optRowH = 0; // 倍率可能变了 ⇒ 重新推算
+          applyOptRowHeight(v, optRowHeightPx());
+          renderOptWindow(true);
+          requestAnimationFrame(calibrateOptRowHeight);
+        });
+      });
+      ro.observe(list);
+      state._optResizeObserver = ro;
+    }
+  }
+
+  /** 滚到指定行（关键操作查找 / 高亮定位）。小数据量走原生 scrollIntoView。 */
+  function scrollOptToIndex(i) {
+    const list = $("#optList");
+    const v = state._optVirt;
+    if (!list) return;
+    if (!v) {
+      list.querySelector(`.arow[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    const viewH = optViewportH(list);
+    const viewActual = viewH; // 行按真实行高渲染 ⇒ 视口真实容量就是 viewH
+    const scrollTop = list.scrollTop;
+    const curActual = v.ratio === 1 ? scrollTop : scrollTop / v.ratio;
+    const rowTop = i * v.rowH;
+    const rowBottom = rowTop + v.rowH;
+    let wantActual = curActual;
+    if (rowTop < curActual) wantActual = rowTop - v.rowH * 2;
+    else if (rowBottom > curActual + viewActual) wantActual = rowBottom - viewActual + v.rowH * 2;
+    if (wantActual !== curActual) {
+      // 真实偏移 → 压缩空间；再夹到可滚动范围（压缩后 maxScroll = virtualSize − viewH）
+      const maxTop = Math.max(0, v.virtualSize - viewH);
+      list.scrollTop = Math.max(0, Math.min(maxTop, wantActual * v.ratio));
+    }
+    v.start = -1;
+    v.end = -1;
+    renderOptWindow(true);
   }
 
   function renderOptListRows(opts) {
     const list = $("#optList");
     if (!list) return;
     if (!Array.isArray(state.optSelected)) state.optSelected = [];
-    const selSet = new Set(state.optSelected);
+    markOptSelDirty();
     const actions = state.optActions || [];
     const progressive =
       !!opts?.progressive || document.body.classList.contains("progressive-opt");
-    const rows = actions.map((a, i) => {
-      const label = optActionDisplayName(a);
-      const on = selSet.has(i);
-      const hi = state.optHighlight === i;
-      const keyOp = isOptKeyOperation(a);
-      const tone = keyOp ? "" : i % 2 === 0 ? "tone-a" : "tone-b";
-      const cls = [
-        "arow",
-        on ? "checked" : "",
-        hi ? "focus" : "",
-        keyOp ? "key-op" : "",
-        tone,
-        progressive ? "reveal-in" : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
-      const delay = progressive ? ` style="animation-delay:${Math.min(i, 40) * 10}ms"` : "";
-      return `<div class="${cls}" data-i="${i}"${delay}>
-          <span class="chk ${on ? "on" : ""}" data-opt-sel="${i}"><i>${on ? "✓" : ""}</i></span>
-          <span class="${on ? "" : "muted"}">${String(i + 1)}</span>
-          <span class="opt-aname">${esc(label)}</span>
-          <span class="${on ? "" : "muted"}">${esc(a.remark || "")}</span>
-        </div>`;
-    });
+
     const finish = () => {
       syncOptSelCount();
       if (state.optHighlight >= 0) {
         const hiRow = list.querySelector(`.arow[data-i="${state.optHighlight}"]`);
-        hiRow?.scrollIntoView({ block: "nearest" });
+        if (hiRow) hiRow.scrollIntoView({ block: "nearest" });
+        else scrollOptToIndex(state.optHighlight);
       }
       if (opts && typeof opts.onDone === "function") opts.onDone();
     };
-    const CHUNK = 48;
-    if (!progressive || rows.length <= CHUNK) {
-      list.innerHTML = rows.join("");
+
+    // 小数据量：保持原路径（一次性渲染 + 入场动画）。
+    if (actions.length <= OPT_RENDER_CHUNK) {
+      state._optVirt = null;
+      const selSet = optSelSet();
+      list.innerHTML = actions.map((a, i) => optRowHtml(a, i, selSet, progressive)).join("");
       finish();
       return;
     }
-    list.innerHTML = "";
-    // 先揭开模糊，再分批填入动作行（时长跟数据量/帧率走）
+
+    // 大数据量：窗口化。只渲染首窗口，之后滚动只是替换窗口内容（DOM 恒定）。
     endProgressiveLoad();
-    const chunks = [];
-    for (let i = 0; i < rows.length; i += CHUNK) {
-      chunks.push(rows.slice(i, i + CHUNK).join(""));
-    }
-    appendActionRowsChunked(list, chunks, finish);
+    // 让上一次还没跑完的渐进流程失效。
+    state._progressiveToken = (state._progressiveToken | 0) + 1;
+    buildOptViewport(list, actions);
+    list.scrollTop = 0;
+    bindOptVirtualScroll(list);
+    renderOptWindow(true);
+    requestAnimationFrame(calibrateOptRowHeight);
+    finish();
   }
 
   function fillOptUi(rec, opts) {
@@ -14937,6 +15847,12 @@
     state.optPath = rec.path || state.optPath || "";
     state.optSelected = [];
     state.optHighlight = -1;
+    // 上一份录制的窗口化状态作废（总条数/行高缓存都要重来）
+    state._optVirt = null;
+    state._optRowH = 0;
+    // 「关键操作查找」的游标也要重置，否则换一份录制后仍从上一份的行号往下找
+    state._optKeySearchIdx = null;
+    markOptSelDirty();
     if (!opts?.keepName && $("#optName")) $("#optName").textContent = rec.name || "";
     const dur = Number(rec.durationSeconds);
     const durTxt = Number.isFinite(dur) ? dur.toFixed(2) + "s" : "—";
@@ -15358,6 +16274,8 @@
         const p = it.profile || findAiSavedProfile(it.v);
         if (p) applyAiProfileToForm(p);
         else if ($("#aiModelName")) $("#aiModelName").textContent = state.agentModel;
+        // ★ 切换模型 ⇒ 立刻重排设置页：API 组件 ↔ 窗口应用组件（互斥显示）
+        if (typeof syncAiPaneMode === "function") syncAiPaneMode();
         quietSaveSettings(collectSettings());
       });
     });
@@ -15376,8 +16294,8 @@
       showPopup(
         e.currentTarget,
         [
-          { t: "全屏模式", v: 0 },
-          { t: "窗口模式", v: 1 },
+          { t: "前台模式", v: 0 },
+          { t: "后台窗口模式", v: 1 },
         ],
         (it) => {
           state.recWindowMode = it.v | 0;
@@ -15860,6 +16778,22 @@
     $("#recList")?.addEventListener("scroll", onListScroll, { passive: true });
     $("#aiList")?.addEventListener("scroll", onListScroll, { passive: true });
 
+    $("#btnExportExeOk")?.addEventListener("click", confirmExportExe);
+    $("#expTargetRadios")?.addEventListener("click", (ev) => {
+      const item = ev.target.closest(".radio");
+      if (!item) return;
+      $$("#expTargetRadios .radio").forEach((r) => r.classList.toggle("on", r === item));
+      syncExportTargetRadios();
+    });
+    $("#expBundledOpenCv")?.addEventListener("click", (ev) => {
+      ev.currentTarget.classList.toggle("on");
+      updateExportSize();
+    });
+    $("#expBundledOcr")?.addEventListener("click", (ev) => {
+      ev.currentTarget.classList.toggle("on");
+      updateExportSize();
+    });
+
     $("#btnMacroImport")?.addEventListener("click", () => {
       if (window.qst) qst.importScript("macro");
     });
@@ -15869,7 +16803,7 @@
         toast("请先选中要导出的宏");
         return;
       }
-      if (window.qst) qst.exportScript(itemPath(m));
+      startExport(itemPath(m), m.name);
     });
     $("#btnRecImport")?.addEventListener("click", () => {
       if (window.qst) qst.importScript("recording");
@@ -15880,7 +16814,7 @@
         toast("请先选中要导出的录制");
         return;
       }
-      if (window.qst) qst.exportScript(itemPath(r));
+      startExport(itemPath(r), r.name);
     });
 
     const bindActionTypeCombo = () => {
@@ -16829,10 +17763,21 @@
       const i = row.dataset.i | 0;
       if (!Array.isArray(state.optSelected)) state.optSelected = [];
       const pos = state.optSelected.indexOf(i);
-      if (pos >= 0) state.optSelected.splice(pos, 1);
-      else state.optSelected.push(i);
-      state.optSelected.sort((a, b) => a - b);
+      if (pos >= 0) {
+        state.optSelected.splice(pos, 1);
+      } else {
+        // 保持有序（后端按序处理）：二分插入，别每次都全量 sort 几万项
+        let lo = 0;
+        let hi = state.optSelected.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (state.optSelected[mid] < i) lo = mid + 1;
+          else hi = mid;
+        }
+        state.optSelected.splice(lo, 0, i);
+      }
       state.optHighlight = i;
+      markOptSelDirty();
       // 就地更新勾选态，禁止整表重绘（否则 reveal 动画导致整列闪烁）
       syncOptListSelectionUi();
     });
@@ -16882,6 +17827,8 @@
         }
         state._optKeySearchIdx = found;
         state.optHighlight = found;
+        // 窗口化后目标行很可能不在 DOM 里 ⇒ 先滚过去（会渲染出该行）再高亮
+        scrollOptToIndex(found);
         syncOptListSelectionUi();
         toast(`关键操作 #${found + 1}`);
       });
@@ -16955,6 +17902,10 @@
           for (let i = sorted[0]; i <= sorted[sorted.length - 1]; ++i) next.push(i);
         }
         state.optSelected = next;
+        markOptSelDirty();
+        // 窗口化：重绘当前窗口，让**可见**的行立刻显示新勾选态；
+        // 窗口外的行不需要处理 —— 滚到时按最新 optSelected 渲染（不再有渲染快照）。
+        renderOptWindow(true);
         syncOptListSelectionUi();
       });
     });
@@ -17126,14 +18077,14 @@
       if (!window.qst) return;
       if (state.macroRunning) {
         if ((state._runningMode | 0) <= 0) {
-          toast("正在运行的脚本未启用窗口模式");
+          toast("正在运行的脚本未启用窗口/后台窗口模式");
           return;
         }
         qst.showWindowModePreview({ fromRunning: 1 });
         return;
       }
       if ((state.editorMode | 0) === 0 && !(state.windowMode && state.windowMode.enabled)) {
-        toast("请先在编辑器启用窗口模式");
+        toast("请先在编辑器启用窗口/后台窗口模式");
         return;
       }
       qst.showWindowModePreview({
@@ -17261,6 +18212,8 @@
     flushPendingLiveEdit,
     saveEditorNow,
     editorAutoSaveOn,
+    markVisualLayoutDirty,
+    refreshVisualLayoutBaseline,
     syncEdRemarkFromSelection,
     editorParamAction,
     readParamPanelInto,

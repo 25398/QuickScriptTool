@@ -49,13 +49,12 @@ set(QST_ENGINE_SOURCES
     src/app_theme.cpp
     src/agent_attachment.cpp
     src/ai_action_service.cpp
-    src/ai_locate_cache.cpp
     src/ai_locate_verify.cpp
     src/office_doc.cpp
     src/mcp_server.cpp
-    src/ai_action_lookahead.cpp
     src/ai_action_runtime.cpp
     src/ai_action_router.cpp
+    src/ai_decide.cpp
     src/ai_logic_convert.cpp
     src/scheduled_task_types.cpp
     src/scheduled_task_store.cpp
@@ -71,8 +70,39 @@ set(QST_ENGINE_SOURCES
     src/agent_conversation_store.cpp
     src/agent_tools.cpp
     src/agent_ai_actions.cpp
+    src/agent_desktop_task.cpp
+    src/agent_mcp.cpp
     src/agent_undo.cpp
     src/agent_shell.cpp
+    # 网页版 AI 后端（C 方案，见 docs/web-ai-backend-design.md）：
+    #   端点挂在 ExtBridgeServer 的监听器上（同一端口/同一 token），不是新服务。
+    #   ⚠ web_ai_prompt.cpp 是**纯逻辑**（无 Win32），单测 `WebAiSelfTest` 只链它 + qst_utils。
+    src/web_ai/web_ai_prompt.cpp
+    src/web_ai/web_ai_image.cpp
+    src/web_ai/web_ai_config.cpp
+    src/web_ai/web_ai_config_parse.cpp
+    src/web_ai/web_ai_driver.cpp
+    src/web_ai/web_ai_backend.cpp
+    # ★ 窗口反代（B 类·界面反代，docs/ai-proxy-roadmap.md §3）：
+    #   把 GUI 客户端窗口（豆包客户端 / Cursor / 终端 TUI）当成 AI 后端。
+    #   ⚠ `window_ai_profile.cpp` 是**纯逻辑**（只 include UIAutomation.h 取常量，
+    #     不调任何 UIA 函数）⇒ `WindowAiSelfTest` 只链它 + qst_utils，
+    #     不需要 uiautomationcore、不需要窗口。
+    src/web_ai/window_ai_profile.cpp
+    src/web_ai/window_ai_driver.cpp
+    # OOXML 层（自研，不依赖 Office / 第三方库）：写 .xlsx 靠它（见 agent_shell 的
+    # writeSpreadsheet）。⚠ 这三个源也编进 OoxmlSelfTest（只链 qst_utils）。
+    src/ooxml/inflate.cpp
+    src/ooxml/zip_archive.cpp
+    src/ooxml/xlsx_doc.cpp
+    # SQLite 只读层（自研，不依赖 sqlite3.c / Python）：读浏览器历史库靠它。
+    # ⚠ sqlite_read.cpp 是纯逻辑（也编进 SqliteSelfTest）；
+    #   sqlite_file.cpp 依赖 Win32（FILE_SHARE_* 打开被占用的库），只进产品库。
+    src/sqlite/sqlite_read.cpp
+    src/sqlite/sqlite_file.cpp
+    # ★ 把「读浏览器历史/书签」接成助手工具（替代 observePage + 截图那条慢路）。
+    #   依赖 Win32（注册表/LOCALAPPDATA/FileTimeToSystemTime）⇒ 只进产品库，不进纯逻辑自检。
+    src/sqlite/browser_history.cpp
     src/agent_web.cpp
     src/agent_webview.cpp
     src/macro_execute_tools.cpp

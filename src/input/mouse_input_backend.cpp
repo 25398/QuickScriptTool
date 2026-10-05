@@ -114,6 +114,7 @@ bool MouseInputRouter::SendInputMoveLocked(int dx, int dy) {
         if (!needSplit) {
             const bool ok = ForegroundInputRouter::Instance().MoveRelative(dx, dy);
             ok ? ++stats_.sentEvents : ++stats_.failedEvents;
+            if (ok) NoteMoveSentLocked(dx, dy);
             if (!ok) lastError_ = L"HID relative move failed";
             return ok;
         }
@@ -125,6 +126,7 @@ bool MouseInputRouter::SendInputMoveLocked(int dx, int dy) {
                 allOk = false;
             } else {
                 ++stats_.sentEvents;
+                NoteMoveSentLocked(s.first, s.second);
             }
         }
         if (!allOk) {
@@ -143,6 +145,7 @@ bool MouseInputRouter::SendInputMoveLocked(int dx, int dy) {
         FillMoveInput(input, dx, dy);
         const bool ok = SendInput(1, &input, sizeof(input)) == 1;
         ok ? ++stats_.sentEvents : ++stats_.failedEvents;
+        if (ok) NoteMoveSentLocked(dx, dy);
         if (!ok) lastError_ = L"SendInput relative move failed";
         return ok;
     }
@@ -160,6 +163,8 @@ bool MouseInputRouter::SendInputMoveLocked(int dx, int dy) {
     const bool ok = sent == inputs.size();
     if (ok) {
         stats_.sentEvents += sent;
+        // 拆包保和：steps 的总和就是请求的 (dx,dy)。
+        NoteMoveSentLocked(dx, dy);
     } else {
         stats_.failedEvents += inputs.size() - sent;
         lastError_ = L"SendInput relative move failed";
@@ -206,6 +211,7 @@ bool MouseInputRouter::SendInputMoveBatchLocked(
                 allOk = false;
             } else {
                 ++stats_.sentEvents;
+                NoteMoveSentLocked(s.first, s.second);
             }
         }
         if (allOk) ++stats_.batchedSubmits;
@@ -236,6 +242,7 @@ bool MouseInputRouter::SendInputMoveBatchLocked(
     if (ok) {
         stats_.sentEvents += sent;
         ++stats_.batchedSubmits;
+        for (const auto& s : steps) NoteMoveSentLocked(s.first, s.second);
     } else {
         stats_.failedEvents += inputs.size() - sent;
         lastError_ = L"SendInput relative batch failed";

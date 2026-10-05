@@ -98,15 +98,119 @@ void StartWatchdogLocked() {
     if (th) g_watchdogThread.store(th, std::memory_order_release);
 }
 
+/// ★★ **崩溃归因：地址 → 模块+偏移**（2026-09-30 闪退事故）。
+///
+/// 起因：连续三次闪退都是 `code=0xC00000FD`（**栈溢出 ⇒ 无限递归**），
+///   而崩溃日志只有裸地址（`addr=00007FF8A424678C`）——
+///   三次地址几乎相同 ⇒ 故障模块**不带 ASLR**（固定基址），但光看地址谁也不知道是谁。
+///   现在把 `addr` 解析成「模块名 + 偏移」，一次就能点名（是 msedgewebview2、
+///   是 VirtualDesktopAccessor11，还是我们自己的 exe）。
+static void DescribeFaultAddress(void* addr, char* out, size_t outLen) {
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+    if (!addr) return;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return;
+    const auto base = reinterpret_cast<HMODULE>(mbi.AllocationBase);
+    if (!base) return;
+    wchar_t wpath[MAX_PATH]{};
+    if (!GetModuleFileNameW(base, wpath, MAX_PATH)) return;
+    const wchar_t* name = wcsrchr(wpath, L'\\');
+    name = name ? (name + 1) : wpath;
+    char narrow[MAX_PATH * 2]{};
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, sizeof(narrow), nullptr, nullptr);
+    const unsigned long long off = reinterpret_cast<unsigned long long>(addr)
+        - reinterpret_cast<unsigned long long>(base);
+    sprintf_s(out, outLen, "module=%s +0x%llX", narrow, off);
+}
+
+/// ★★ **递归指纹**：从当前栈里抓"像代码地址"的字，按「模块+偏移」聚合，报出现最多的几个。
+///
+/// 为什么需要：栈溢出时最要紧的信息是"**哪个函数在自己调自己**"。
+///   x64 上不一定有帧指针，逐帧回溯不可靠；但**深递归会把同一个返回地址在栈上重复几百次**
+///   ⇒ 按 (模块,偏移) 计数、取前几名，重复次数最高的那一条**就是那个递归函数**。
+/// ⚠ 纯尽力而为（读栈可能越界/读到陈旧数据）：只用于崩溃后归因，不影响正常路径。
+static void DescribeStackRecursion(char* out, size_t outLen) {
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+    struct Frame { unsigned long long mod; unsigned long long off; int count; };
+    Frame frames[12]{};
+    int frameCount = 0;
+    const unsigned long long sp = reinterpret_cast<unsigned long long>(_AddressOfReturnAddress());
+    const unsigned long long limit = sp + 512ULL * 1024ULL;   // 最多扫 512KB 栈
+    for (unsigned long long p = sp; p + 8 <= limit; p += 8) {
+        unsigned long long v = 0;
+        __try {
+            v = *reinterpret_cast<const unsigned long long*>(p);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        if (v < 0x10000ULL) continue;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(v), &mbi, sizeof(mbi)) == 0) continue;
+        if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                | PAGE_EXECUTE_WRITECOPY))) {
+            continue;
+        }
+        const unsigned long long mod = reinterpret_cast<unsigned long long>(mbi.AllocationBase);
+        const unsigned long long off = v - mod;
+        bool merged = false;
+        for (int i = 0; i < frameCount; ++i) {
+            if (frames[i].mod == mod && frames[i].off == off) {
+                ++frames[i].count;
+                merged = true;
+                break;
+            }
+        }
+        if (!merged && frameCount < 12) {
+            frames[frameCount].mod = mod;
+            frames[frameCount].off = off;
+            frames[frameCount].count = 1;
+            ++frameCount;
+        }
+    }
+    // 按出现次数排序（冒泡，最多 12 项），取前 4
+    for (int i = 0; i < frameCount; ++i) {
+        for (int j = i + 1; j < frameCount; ++j) {
+            if (frames[j].count > frames[i].count) {
+                const Frame t = frames[i];
+                frames[i] = frames[j];
+                frames[j] = t;
+            }
+        }
+    }
+    size_t used = 0;
+    for (int i = 0; i < frameCount && i < 4; ++i) {
+        wchar_t wpath[MAX_PATH]{};
+        char nm[64] = "?";
+        if (GetModuleFileNameW(reinterpret_cast<HMODULE>(frames[i].mod), wpath, MAX_PATH)) {
+            const wchar_t* b = wcsrchr(wpath, L'\\');
+            b = b ? (b + 1) : wpath;
+            WideCharToMultiByte(CP_UTF8, 0, b, -1, nm, sizeof(nm), nullptr, nullptr);
+        }
+        const int n = sprintf_s(out + used, outLen - used, "%s+0x%llX x%d; ",
+            nm, frames[i].off, frames[i].count);
+        if (n <= 0 || static_cast<size_t>(n) >= outLen - used) break;
+        used += static_cast<size_t>(n);
+    }
+}
+
 void AppendCrashBreadcrumb(DWORD code, void* addr) {
     // 极早/崩溃路径：尽量留下可读痕迹（exe 旁 + LocalAppData）
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    char line[192]{};
+    char where[320]{};
+    DescribeFaultAddress(addr, where, sizeof(where));
+    char stackTop[512]{};
+    if (code == 0xC00000FDu) {          // STATUS_STACK_OVERFLOW ⇒ 抓递归指纹
+        DescribeStackRecursion(stackTop, sizeof(stackTop));
+    }
+    char line[1200]{};
     sprintf_s(line,
-        "%04u-%02u-%02u %02u:%02u:%02u FATAL unhandled code=0x%08lX addr=%p\r\n",
+        "%04u-%02u-%02u %02u:%02u:%02u FATAL unhandled code=0x%08lX addr=%p %s%s%s\r\n",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-        code, addr);
+        code, addr, where,
+        (stackTop[0] ? " | 递归指纹(重复最多的代码地址): " : ""), stackTop);
     const DWORD lineLen = static_cast<DWORD>(strlen(line));
 
     auto appendOne = [&](const wchar_t* path) {

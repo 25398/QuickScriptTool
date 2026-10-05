@@ -834,7 +834,7 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
         if (std::abs(a.playbackSpeed - 1.0) > 1e-6)
             s += L" " + FmtNum(a.playbackSpeed) + L"x";
         if (a.useMode == kNestedUseModeDefault) s += L" 默认模式";
-        else if (a.useMode == kNestedUseModeWindow) s += L" 窗口模式";
+        else if (a.useMode == kNestedUseModeWindow) s += L" 独立桌面模式";
         else if (a.useMode == kNestedUseModeBackground) s += L" 后台窗口";
         else s += L" 继承模式";
         return s;
@@ -842,7 +842,7 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
     case ActionType::RunMacro: {
         std::wstring s = L"运行宏 " + RunTargetText(a) + RepeatBrief(a);
         if (a.useMode == kNestedUseModeDefault) s += L" 默认模式";
-        else if (a.useMode == kNestedUseModeWindow) s += L" 窗口模式";
+        else if (a.useMode == kNestedUseModeWindow) s += L" 独立桌面模式";
         else if (a.useMode == kNestedUseModeBackground) s += L" 后台窗口";
         else s += L" 继承模式";
         return s;
@@ -885,7 +885,11 @@ std::wstring DescribeOneAction(const ScriptAction& a) {
         if (a.ocrDigitsOnly) s += L" 数字模式";
         if (a.ocrFollowUp == 0) s += L" → 点击";
         else if (a.ocrFollowUp == 1) s += L" → 移动";
-        else if (a.ocrFollowUp == 2) s += L" → 保存到" + a.matchVarName;
+        else if (a.ocrFollowUp == 2) {
+            // 文字查找存的是匹配度（{变量}.matchData），获取文字存的是识别文字
+            s += a.ocrResultMode == 1 ? L" → 保存匹配度到" : L" → 保存文字到";
+            s += a.matchVarName;
+        }
         if (a.findUntilFound) s += L" 循环直到找到";
         if (a.offsetX != 0 || a.offsetY != 0)
             s += L" 偏移" + CoordText(a, a.offsetX, a.offsetY);

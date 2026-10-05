@@ -69,6 +69,42 @@ constexpr uint64_t kAbsoluteMoveSampleUs = 1000;
 /// 相对位移：每个 Raw Input 包立即落盘（不再合并），此常量仅作兼容保留
 constexpr uint64_t kRelativeMoveSampleUs = 0;
 
+/// Auto 模式「离开相对态后的粘滞窗口」：防抖，只用来跨越**单帧级**的光标可见性抖动。
+///
+/// ⚠ 不能设长。粘滞期内一律按「相对」采集 —— 若窗口过长（历史值 250ms），
+/// 用户在抓取态按 E 打开背包（光标变为可见、游戏改为读光标位置）后，
+/// 这 250ms 内的真实鼠标移动会被录成**相对镜头位移**，而真正该录的光标移动被丢弃：
+///   - 回放时游戏若仍处于抓取态 ⇒ 注入出**幻影镜头旋转**；
+///   - 回放时游戏若处于菜单态 ⇒ 光标移动缺失 ⇒ 点击落点错。
+/// 两者都是「偏移」，且随回放时序不同而不同 —— 正是「每次位置都不一样」的来源之一。
+/// 抖动发生在帧级（~16ms），60ms 已足够跨越，故取 60ms。
+constexpr uint64_t kAutoRelativeStickyUs = 60000;
+
+/// 纯逻辑（selftest / 钩子共用）：Auto 模式下「此刻是否按相对采集」。
+///
+/// 入参 relativeActiveNow：此刻光标是否处于相对捕获（隐藏，或被 ClipCursor 裁剪到非整屏）。
+/// 调用方负责在 relativeActiveNow 为真时把 lastRelativeActiveUs 更新为 nowUs。
+inline bool EvaluateRelativeCapture(
+    RecordingCaptureMode mode,
+    bool relativeActiveNow,
+    uint64_t lastRelativeActiveUs,
+    uint64_t nowUs,
+    uint64_t stickyUs) {
+    switch (mode) {
+    case RecordingCaptureMode::Relative:
+        return true;
+    case RecordingCaptureMode::Absolute:
+        return false;
+    case RecordingCaptureMode::Auto:
+    default:
+        if (relativeActiveNow) return true;
+        if (lastRelativeActiveUs == 0) return false;
+        // 粘滞：刚离开相对态的**短时间**内仍走 Raw，跨越单帧级抖动。
+        return nowUs >= lastRelativeActiveUs
+            && (nowUs - lastRelativeActiveUs) < stickyUs;
+    }
+}
+
 /// 重置录制时钟（QPC）；StartRecording 时调用
 void InitRecordingClock();
 
@@ -82,7 +118,7 @@ bool IsRelativeMouseCaptureActive();
 void SetRecordingCaptureMode(RecordingCaptureMode mode);
 RecordingCaptureMode GetRecordingCaptureMode();
 
-/// 设置窗口相对录制目标（窗口模式录制）；enabled=false 恢复屏幕绝对录制。
+/// 设置窗口相对录制目标（后台窗口模式录制）；enabled=false 恢复屏幕绝对录制。
 void SetRecordingWindowTarget(const RecordingWindowTarget& target);
 /// 当前窗口相对录制目标（快照拷贝）。
 RecordingWindowTarget GetRecordingWindowTarget();
@@ -113,6 +149,16 @@ struct RecordingDebugStats {
     uint64_t wheel = 0;
     uint64_t absMove = 0;
     uint64_t relMove = 0;
+    /// 相对包的报告周期估计（µs）。>=2000 说明是低轮询率或后台 Raw Input 被限流。
+    uint64_t relReportIntervalUs = 0;
+    /// 因判定为「队列积压 / 被系统合并」而重建时间戳的相对包数。
+    uint64_t relStampRebuilt = 0;
+    /// 过短（<125µs）而不入统计的相对间隔数，即真实存在的高频包数。
+    uint64_t relGapDropped = 0;
+    /// 采集通道切换次数（绝对↔相对）。频繁切换说明目标在抓取/菜单间抖动，
+    /// 或存在真实模式切换 —— 后者会让粘滞窗口内的移动被记成幻影相对位移。
+    uint64_t captureSwitchToAbs = 0;
+    uint64_t captureSwitchToRel = 0;
 };
 RecordingDebugStats GetRecordingDebugStats();
 

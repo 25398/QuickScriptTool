@@ -466,3 +466,31 @@ body.editor-autosave #btnEdSave {
   flex: 0 0 auto;
   font-weight: 500;
 }
+/*
+ * 文字识别「查找文字」：「输入框 + 插入变量」单独占一整排（标签在上一排）。
+ * ⚠ 输入框是 `.stack-ctrl` 的**孙节点** ⇒ 不会被 `.fline-stack .stack-ctrl > .inp`
+ *    的黄金分割宽度（φ）命中，必须在这里显式拉满；否则又会被压窄。
+ * ⚠ 也别把两者塞回标签同一行（原先的 `.row` + flex:1 写法）：窄侧栏下输入框会被
+ *    压出面板、插入变量按钮被裁掉。
+ */
+.param-block .fline-stack .stack-ctrl > .ocr-search-row {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--qst-u, 1.5));
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+.param-block .fline-stack .stack-ctrl > .ocr-search-row > .inp {
+  flex: 1 1 0;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+.param-block .fline-stack .stack-ctrl > .ocr-search-row > button.btn {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  white-space: nowrap;
+}

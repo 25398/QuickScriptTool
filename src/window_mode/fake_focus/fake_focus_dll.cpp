@@ -1,6 +1,10 @@
 #include "fake_focus_api.h"
 #include "fake_focus_hook.h"
 #include "fake_focus_soft_input.h"
+#include "fake_focus_time_scale.h"
+// 滚轮「步数 → 消息」展开规则：与宿主、硬件路径**共用同一张表**
+// （见该头文件顶部：三处各写一份 `WHEEL_DELTA * steps` 正是 2026-09-30 那次事故的成因）。
+#include "window_mode/mouse_wheel_events.h"
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +26,12 @@ std::atomic<HWND> g_targetTop{nullptr};
 std::atomic<HWND> g_focusHwnd{nullptr};
 std::atomic_bool g_installed{false};
 bool g_liteMode = false;
+/// 本次安装是否为「仅变速」（一个假焦点钩都没装）。自检用它证明
+/// 「关掉假焦点注入后键鼠路径没被改」，也是 FakeFocus_TimeScaleDiag 的 bit2。
+bool g_timeScaleOnly = false;
+/// 假焦点钩已被单独拆掉（全屏游戏为了不冻 DXGI），但 DLL 与时钟轮询**仍然留着**。
+/// 供诊断 bit3 与自检使用。
+bool g_fakeFocusDisabled = false;
 bool g_electronSafe = false;
 bool g_airSafe = false;
 bool g_weixinSafe = false;
@@ -34,6 +44,14 @@ volatile LONG g_mapleHitDiData = 0;
 volatile LONG g_mapleLastDiStateCb = 0;
 volatile LONG g_mapleHitGfw = 0;
 volatile LONG g_mapleHitFocus = 0;
+// ── 输入路径体检（宿主日志 `冒险岛输入体检`）────────────────────────────────
+// 只回答一个问题：**客户端到底经哪条路读键**。三条候选路的判据见共享内存头注释。
+volatile LONG g_mapleHitPump = 0;      // 消息泵 API 命中次数
+volatile LONG g_mapleMsgInput = 0;     // WM_INPUT（Raw Input）
+volatile LONG g_mapleMsgKey = 0;       // WM_KEYDOWN/WM_KEYUP（消息驱动）
+volatile LONG g_mapleMsgActivate = 0;  // WM_ACTIVATE/KILLFOCUS/ACTIVATEAPP
+volatile LONG g_mapleRescanAdds = 0;   // 周期补挂累计新增槽数
+volatile LONG g_mapleRescanRounds = 0;
 fakefocus::SoftInputState* g_softView = nullptr;
 bool g_softWritable = false;
 int g_mapleInputHookCount = 0;
@@ -41,6 +59,9 @@ DWORD g_mapleDiag = 0;
 int g_diVtPatchN = 0;
 int g_mapleFoundVt = 0;
 int g_mapleHeapVt = 0;
+/// 进程级（堆 / 主模块映像之外的其它模块）补到的**键态类**缓存指针数。
+/// 打包器会把 GetAsyncKeyState 之类缓存到堆结构体里，PE 节扫描看不到（GFW 早有同类修法）。
+int g_maplePwPollPatched = 0;
 void MaplePublishHits() {
     if (!g_softWritable || !g_softView) return;
     if (!fakefocus::SoftInputStateLooksValid(g_softView)) return;
@@ -51,12 +72,19 @@ void MaplePublishHits() {
     g_softView->hitGfw = static_cast<uint32_t>(g_mapleHitGfw);
     g_softView->hitFocus = static_cast<uint32_t>(g_mapleHitFocus);
     g_softView->hitReady = 1;
+    g_softView->hitPump = static_cast<uint32_t>(g_mapleHitPump);
+    g_softView->msgInput = static_cast<uint32_t>(g_mapleMsgInput);
+    g_softView->msgKey = static_cast<uint32_t>(g_mapleMsgKey);
+    g_softView->msgActivate = static_cast<uint32_t>(g_mapleMsgActivate);
+    g_softView->rescanAdds = static_cast<uint32_t>(g_mapleRescanAdds);
+    g_softView->rescanRounds = static_cast<uint32_t>(g_mapleRescanRounds);
     g_softView->mapleDiag = g_mapleDiag;
     g_softView->mapleIatPoll = static_cast<uint32_t>(g_mapleInputHookCount);
     const uint32_t foundVt = static_cast<uint32_t>(g_mapleFoundVt) & 0xFFu;
     const uint32_t patched = static_cast<uint32_t>(g_diVtPatchN) & 0xFFu;
     const uint32_t heapVt = static_cast<uint32_t>(g_mapleHeapVt) & 0xFFu;
-    g_softView->mapleDiVt = foundVt | (patched << 8) | (heapVt << 16);
+    const uint32_t pwPoll = static_cast<uint32_t>(g_maplePwPollPatched) & 0xFFu;
+    g_softView->mapleDiVt = foundVt | (patched << 8) | (heapVt << 16) | (pwPoll << 24);
 }
 void MapleNoteDiStateCb(DWORD cb) {
     const LONG store = cb > 0x7FFFFFFFu ? 0x7FFFFFFF : static_cast<LONG>(cb);
@@ -64,8 +92,14 @@ void MapleNoteDiStateCb(DWORD cb) {
 }
 void MapleBumpHit(volatile LONG* c) {
     if (!c) return;
-    const LONG v = InterlockedIncrement(c);
-    if (v > 255) InterlockedExchange(c, 255);
+    // ⚠⚠ 绝不夹到 255（历史写法是 `if (v > 255) InterlockedExchange(c, 255)`）。
+    //   宿主用「这个计数变没变」判「客户端还在不在查键态」（`EvaluateKeyStatePhase`）。
+    //   一旦夹住，计数就**永远不再变化** ⇒ 被误判成「键态停摆」⇒ 宿主清掉**脚本正按着**的
+    //   方向键（`ClearStaleArrowSoftKeys`），且因判据再也无法变真，「轮询恢复」永不触发
+    //   ⇒ 按住的 → / ← 永久丢失 ⇒ 角色原地打、然后乱走。见 window_mode_requirements.h 第 18 条。
+    //   去掉夹取不影响打包诊断 API（`FakeFocus_MapleHookHits` 本来就逐字段 `& 0xFF`），
+    //   也不影响 `MapleClientProgress()` 的求和（它只关心"变没变"）。
+    InterlockedIncrement(c);
     MaplePublishHits();
 }
 
@@ -88,6 +122,16 @@ void MapleMarkCalled(DWORD bit) {
     MaplePublishHits();
 }
 
+constexpr DWORD kMapleInstallFault = 0x0800000u;  // 装钩子过程中抛过异常（已被 SEH 兜住）
+/// 安装阶段号写进 diag 的最高 8 位。装到一半进程就没了的话，宿主日志里的 stage 就是死亡点 ——
+/// 比「diag=0 什么都没装」这种结论精确得多。
+constexpr int kMapleStageShift = 24;
+void MapleSetStage(int stage) {
+    g_mapleDiag = (g_mapleDiag & 0x00FFFFFFu)
+        | ((static_cast<DWORD>(stage) & 0xFFu) << kMapleStageShift);
+    MaplePublishHits();
+}
+
 void MapleResetHookHits() {
     InterlockedExchange(&g_mapleHitGaks, 0);
     InterlockedExchange(&g_mapleHitDiState, 0);
@@ -95,7 +139,36 @@ void MapleResetHookHits() {
     InterlockedExchange(&g_mapleLastDiStateCb, 0);
     InterlockedExchange(&g_mapleHitGfw, 0);
     InterlockedExchange(&g_mapleHitFocus, 0);
+    InterlockedExchange(&g_mapleHitPump, 0);
+    InterlockedExchange(&g_mapleMsgInput, 0);
+    InterlockedExchange(&g_mapleMsgKey, 0);
+    InterlockedExchange(&g_mapleMsgActivate, 0);
+    InterlockedExchange(&g_mapleRescanAdds, 0);
+    InterlockedExchange(&g_mapleRescanRounds, 0);
     MaplePublishHits();
+}
+
+/// 消息分类计数（只数，不改消息）：区分 Raw Input / 消息驱动 / 激活态门控。
+void MapleNotePumpMessage(UINT msg) {
+    // ⚠ 2026-10-04：这里原来是 `if (!g_mapleSafe) return;` —— 于是**只有冒险岛目标**
+    //   会计数，其它假焦点目标（Unity / UE / GLFW / 桌面模拟器）的体检字段**恒为 0**。
+    //   宿主读到的全 0 会被当成「钩子没被调到」，而真相是**根本没人在数**。
+    //   ⇒ 改成对所有假焦点目标都计数。判读只看「是否 > 0」，所以即便冒险岛同时装了
+    //     通用泵钩子导致双倍计数，也不影响结论。
+    InterlockedIncrement(&g_mapleHitPump);
+    switch (msg) {
+    case WM_INPUT:
+        InterlockedIncrement(&g_mapleMsgInput);
+        break;
+    case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        InterlockedIncrement(&g_mapleMsgKey);
+        break;
+    case WM_ACTIVATE: case WM_ACTIVATEAPP: case WM_KILLFOCUS: case WM_NCACTIVATE:
+        InterlockedIncrement(&g_mapleMsgActivate);
+        break;
+    default:
+        break;
+    }
 }
 BOOL (WINAPI* g_mapleRealGetCursorPos)(LPPOINT) = nullptr;
 BOOL (WINAPI* g_mapleRealSetCursorPos)(int, int) = nullptr;
@@ -209,6 +282,35 @@ const fakefocus::SoftInputState* SoftState() {
     return g_softView;
 }
 
+/// 变速齿轮：轮询线程读宿主下发的倍率。刻意不调 SoftState()（它会尝试重开映射），
+/// 卸载流程里先 StopPoll 再 CloseSoftInputView，所以这里直接读 g_softView 是安全的。
+uint32_t DesiredTimeScale() {
+    fakefocus::SoftInputState* view = g_softView;
+    if (!view || !fakefocus::SoftInputStateLooksValid(view)) {
+        // ⚠ 必须能重试。安装那一刻共享内存可能还没就绪（或首次打开失败），
+        // 而轮询线程会一直跑 —— 如果这里只试一次，就会永远读不到倍率，
+        // 表现为「注入成功、日志正常，但目标时钟纹丝不动」，极难排查。
+        // SoftState() 一直有重试，这里曾经漏了。
+        // 用 RealTick64()（未挂钩的真实时间）而不是 GetTickCount()：
+        // 我们现在把 kernel32!GetTickCount 的函数体也钩了，用它算节流会读到**虚拟时间**，
+        // 倍率越高重试越频繁。
+        static uint64_t s_lastOpenTry = 0;
+        const uint64_t now = fakefocus::timescale::RealTick64();
+        if (now - s_lastOpenTry >= 1000) {
+            s_lastOpenTry = now;
+            OpenSoftInputView(g_softPid);
+            // 重试成功后要把计数汇重新挂上（视图可能是刚建的）。
+            if (g_softView && g_softWritable) {
+                fakefocus::timescale::SetCallSink(&g_softView->timeHookCalls[0]);
+        fakefocus::unity::SetStateSink(&g_softView->unityState);
+            }
+        }
+        view = g_softView;
+        if (!view || !fakefocus::SoftInputStateLooksValid(view)) return 0;
+    }
+    return view->timeScaleMilli;
+}
+
 bool IsMouseVk(int vk) {
     return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON
         || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
@@ -222,33 +324,45 @@ bool IsOurHwnd(HWND hwnd) {
     return IsChild(top, hwnd) != FALSE;
 }
 
-void* CallOrigFg(void*) {
-    return reinterpret_cast<void*>(GetForegroundWindow());
+// ── 原函数调用器 ─────────────────────────────────────────────────────────
+// ⚠ 每个 `CallOrigXxx` 的**第一个参数就是 trampoline**（见 `fake_focus_hook.h` 的
+//   `OriginalInvoker`），按原签名转型后直接调用 —— **不再还原目标函数头**。
+//   旧实现「临时还原 + 重写跳转」在多线程目标上会取到「半个跳转」⇒ 目标 0xC0000005
+//   闪退（Unity/UE 这类 3D 游戏），并伴随静默漏钩。事故记录与复现见
+//   `fake_focus_hook.h` 顶部 + `build/_tmp/hookrace/`。
+
+void* CallOrigFg(void* tramp, void*) {
+    using Fn = HWND(WINAPI*)();
+    return reinterpret_cast<void*>(reinterpret_cast<Fn>(tramp)());
 }
 
 struct SetFgCallCtx {
     HWND hwnd = nullptr;
     BOOL ok = FALSE;
 };
-void* CallOrigSetFg(void* raw) {
+void* CallOrigSetFg(void* tramp, void* raw) {
     auto* ctx = static_cast<SetFgCallCtx*>(raw);
-    ctx->ok = SetForegroundWindow(ctx->hwnd);
+    using Fn = BOOL(WINAPI*)(HWND);
+    ctx->ok = reinterpret_cast<Fn>(tramp)(ctx->hwnd);
     return nullptr;
 }
-void* CallOrigActive(void*) {
-    return reinterpret_cast<void*>(GetActiveWindow());
+void* CallOrigActive(void* tramp, void*) {
+    using Fn = HWND(WINAPI*)();
+    return reinterpret_cast<void*>(reinterpret_cast<Fn>(tramp)());
 }
-void* CallOrigFocus(void*) {
-    return reinterpret_cast<void*>(GetFocus());
+void* CallOrigFocus(void* tramp, void*) {
+    using Fn = HWND(WINAPI*)();
+    return reinterpret_cast<void*>(reinterpret_cast<Fn>(tramp)());
 }
 
 struct CursorCallCtx {
     LPPOINT pt = nullptr;
     BOOL ok = FALSE;
 };
-void* CallOrigCursor(void* raw) {
+void* CallOrigCursor(void* tramp, void* raw) {
     auto* ctx = static_cast<CursorCallCtx*>(raw);
-    ctx->ok = GetCursorPos(ctx->pt);
+    using Fn = BOOL(WINAPI*)(LPPOINT);
+    ctx->ok = reinterpret_cast<Fn>(tramp)(ctx->pt);
     return nullptr;
 }
 
@@ -256,9 +370,10 @@ struct AsyncKeyCallCtx {
     int vk = 0;
     SHORT result = 0;
 };
-void* CallOrigAsyncKey(void* raw) {
+void* CallOrigAsyncKey(void* tramp, void* raw) {
     auto* ctx = static_cast<AsyncKeyCallCtx*>(raw);
-    ctx->result = GetAsyncKeyState(ctx->vk);
+    using Fn = SHORT(WINAPI*)(int);
+    ctx->result = reinterpret_cast<Fn>(tramp)(ctx->vk);
     return nullptr;
 }
 
@@ -266,9 +381,10 @@ struct KeyStateCallCtx {
     int vk = 0;
     SHORT result = 0;
 };
-void* CallOrigKeyState(void* raw) {
+void* CallOrigKeyState(void* tramp, void* raw) {
     auto* ctx = static_cast<KeyStateCallCtx*>(raw);
-    ctx->result = GetKeyState(ctx->vk);
+    using Fn = SHORT(WINAPI*)(int);
+    ctx->result = reinterpret_cast<Fn>(tramp)(ctx->vk);
     return nullptr;
 }
 
@@ -276,9 +392,10 @@ struct KeyboardStateCallCtx {
     PBYTE keys = nullptr;
     BOOL ok = FALSE;
 };
-void* CallOrigKeyboardState(void* raw) {
+void* CallOrigKeyboardState(void* tramp, void* raw) {
     auto* ctx = static_cast<KeyboardStateCallCtx*>(raw);
-    ctx->ok = GetKeyboardState(ctx->keys);
+    using Fn = BOOL(WINAPI*)(PBYTE);
+    ctx->ok = reinterpret_cast<Fn>(tramp)(ctx->keys);
     return nullptr;
 }
 
@@ -286,9 +403,10 @@ struct VisibleCallCtx {
     HWND hwnd = nullptr;
     BOOL ok = FALSE;
 };
-void* CallOrigVisible(void* raw) {
+void* CallOrigVisible(void* tramp, void* raw) {
     auto* ctx = static_cast<VisibleCallCtx*>(raw);
-    ctx->ok = IsWindowVisible(ctx->hwnd);
+    using Fn = BOOL(WINAPI*)(HWND);
+    ctx->ok = reinterpret_cast<Fn>(tramp)(ctx->hwnd);
     return nullptr;
 }
 
@@ -299,9 +417,10 @@ struct DwmAttrCallCtx {
     DWORD cb = 0;
     HRESULT hr = E_FAIL;
 };
-void* CallOrigDwmAttr(void* raw) {
+void* CallOrigDwmAttr(void* tramp, void* raw) {
     auto* ctx = static_cast<DwmAttrCallCtx*>(raw);
-    ctx->hr = DwmGetWindowAttribute(ctx->hwnd, ctx->attr, ctx->pv, ctx->cb);
+    using Fn = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
+    ctx->hr = reinterpret_cast<Fn>(tramp)(ctx->hwnd, ctx->attr, ctx->pv, ctx->cb);
     return nullptr;
 }
 
@@ -340,9 +459,10 @@ struct SetCursorCallCtx {
     int y = 0;
     BOOL ok = FALSE;
 };
-void* CallOrigSetCursor(void* raw) {
+void* CallOrigSetCursor(void* tramp, void* raw) {
     auto* ctx = static_cast<SetCursorCallCtx*>(raw);
-    ctx->ok = SetCursorPos(ctx->x, ctx->y);
+    using Fn = BOOL(WINAPI*)(int, int);
+    ctx->ok = reinterpret_cast<Fn>(tramp)(ctx->x, ctx->y);
     return nullptr;
 }
 BOOL CallOriginalSetCursorPos(int x, int y) {
@@ -355,9 +475,10 @@ struct ClipCursorCallCtx {
     const RECT* rc = nullptr;
     BOOL ok = FALSE;
 };
-void* CallOrigClipCursor(void* raw) {
+void* CallOrigClipCursor(void* tramp, void* raw) {
     auto* ctx = static_cast<ClipCursorCallCtx*>(raw);
-    ctx->ok = ClipCursor(ctx->rc);
+    using Fn = BOOL(WINAPI*)(const RECT*);
+    ctx->ok = reinterpret_cast<Fn>(tramp)(ctx->rc);
     return nullptr;
 }
 BOOL CallOriginalClipCursor(const RECT* rc) {
@@ -370,9 +491,10 @@ struct SetCaptureCallCtx {
     HWND hwnd = nullptr;
     HWND prev = nullptr;
 };
-void* CallOrigSetCapture(void* raw) {
+void* CallOrigSetCapture(void* tramp, void* raw) {
     auto* ctx = static_cast<SetCaptureCallCtx*>(raw);
-    ctx->prev = SetCapture(ctx->hwnd);
+    using Fn = HWND(WINAPI*)(HWND);
+    ctx->prev = reinterpret_cast<Fn>(tramp)(ctx->hwnd);
     return nullptr;
 }
 HWND CallOriginalSetCapture(HWND hwnd) {
@@ -385,9 +507,10 @@ struct ShowCursorCallCtx {
     BOOL show = FALSE;
     int count = 0;
 };
-void* CallOrigShowCursor(void* raw) {
+void* CallOrigShowCursor(void* tramp, void* raw) {
     auto* ctx = static_cast<ShowCursorCallCtx*>(raw);
-    ctx->count = ShowCursor(ctx->show);
+    using Fn = int(WINAPI*)(BOOL);
+    ctx->count = reinterpret_cast<Fn>(tramp)(ctx->show);
     return nullptr;
 }
 int CallOriginalShowCursor(BOOL show) {
@@ -398,6 +521,14 @@ int CallOriginalShowCursor(BOOL show) {
 
 bool SoftCursorSwallowsWarp() {
     if (g_electronSafe) return false;
+    // ⚠⚠ AIR（ApolloRuntimeContentWindow）**不吞**（2026-10-05）：
+    //   AIR 的假焦点**只钩 `GetForegroundWindow`**（见本文件顶部对 airSafe 的说明：
+    //   「AIR/冒险岛只骗前景查询」）—— 它**没有软光标机制**，也不钩 GetCursorPos。
+    //   ⇒ 吞掉 `SetCursorPos` 只会让目标自己摆正光标的动作失效，没有任何收益。
+    //   前科：`WindowModeSelfTest` 的 `fake_focus_air_focus_only` 用例名就写着
+    //   「SetCursorPos not swallowed」，它**长期是红的**，只是之前 `FakeFocus32.dll`
+    //   没被重建（用的是更早的版本）而没暴露；2026-10-04 重建后开始失败。
+    if (g_airSafe) return false;
     // lite（GLFW/UE5）：游戏一旦以为自己有焦点就会 SetCursorPos/ClipCursor，
     // 不能等软光标播种之后才吞，否则前台真光标会被夹走。
     if (g_liteMode) return true;
@@ -725,13 +856,30 @@ void DrainSoftKeyEventsPost() {
         // 滚轮：vk=0xFE 竖向 / 0xFD 横向；down=正向；pad=步进。
         if (e.vk == 0xFE || e.vk == 0xFD) {
             int steps = e.pad ? static_cast<int>(e.pad) : 1;
-            short delta = static_cast<short>((e.down ? WHEEL_DELTA : -WHEEL_DELTA) * steps);
-            WPARAM wp = MAKEWPARAM(MouseMkFlags(st), delta);
+            // ★ 滚轮的两条落点（2026-09-30；宿主已经把这一格写进共享内存队列）：
+            //   ① **Raw Input 游戏**（Unity/UE/GLFW —— 假焦点存在的理由）只认
+            //      `WM_INPUT` / `GetRawInputData`，`WM_MOUSEWHEEL` 对它们等于没发。
+            //      这一路由 `FillPendingRawInput()` 统一产出：它每次被调用都会
+            //      **优先**取一格滚轮，于是 `Hook_GetCursorPos` / `Hook_GetAsyncKeyState` /
+            //      本循环起的 `WM_INPUT` 三条入口都会把它带走 —— 不需要额外接线。
+            //   ② **消息驱动应用**读 `WM_MOUSEWHEEL`：下面照发（DLL 在目标进程内发，
+            //      比宿主外部 PostMessage 少一层消息队列归属问题）。
+            // ⚠ 不要在这里再往共享内存里"回写"一格（曾这么写过）：宿主已经写过一次，
+            //   再写就是**同一格滚两次**。
+            //
+            // ⚠ 展开成多条（`short` 只装得下 ±273 格，多步塞一条会回绕成反向）
+            int deltas[4]{};
+            const int n = windowmode::MouseWheelEventsForSteps(steps, e.down != 0, deltas,
+                static_cast<int>(sizeof(deltas) / sizeof(deltas[0])));
             UINT msg = (e.vk == 0xFE) ? WM_MOUSEWHEEL : WM_MOUSEHWHEEL;
-            // 滚轮 lParam 为屏幕坐标。
-            PostMessageW(hwnd, msg, wp,
-                MAKELPARAM(static_cast<WORD>(st->cursorScreenX),
-                    static_cast<WORD>(st->cursorScreenY)));
+            for (int i = 0; i < n; ++i) {
+                WPARAM wp = MAKEWPARAM(MouseMkFlags(st),
+                    static_cast<WORD>(static_cast<SHORT>(deltas[i])));
+                // 滚轮 lParam 为屏幕坐标。
+                PostMessageW(hwnd, msg, wp,
+                    MAKELPARAM(static_cast<WORD>(st->cursorScreenX),
+                        static_cast<WORD>(st->cursorScreenY)));
+            }
             continue;
         }
 
@@ -1000,25 +1148,37 @@ WPARAM MapleNeutralizeDeactivateParams(HWND hwnd, UINT msg, WPARAM wp) {
 BOOL WINAPI Hook_MaplePeekMessageW(LPMSG lpMsg, HWND hWnd, UINT min, UINT max, UINT remove) {
     auto orig = g_mapleRealPeekMessageW ? g_mapleRealPeekMessageW : PeekMessageW;
     const BOOL got = orig(lpMsg, hWnd, min, max, remove);
-    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    if (got && lpMsg) {
+        MapleNotePumpMessage(lpMsg->message);
+        MapleNeutralizeDeactivateMsg(lpMsg);
+    }
     return got;
 }
 BOOL WINAPI Hook_MaplePeekMessageA(LPMSG lpMsg, HWND hWnd, UINT min, UINT max, UINT remove) {
     auto orig = g_mapleRealPeekMessageA ? g_mapleRealPeekMessageA : PeekMessageA;
     const BOOL got = orig(lpMsg, hWnd, min, max, remove);
-    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    if (got && lpMsg) {
+        MapleNotePumpMessage(lpMsg->message);
+        MapleNeutralizeDeactivateMsg(lpMsg);
+    }
     return got;
 }
 BOOL WINAPI Hook_MapleGetMessageW(LPMSG lpMsg, HWND hWnd, UINT min, UINT max) {
     auto orig = g_mapleRealGetMessageW ? g_mapleRealGetMessageW : GetMessageW;
     const BOOL got = orig(lpMsg, hWnd, min, max);
-    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    if (got && lpMsg) {
+        MapleNotePumpMessage(lpMsg->message);
+        MapleNeutralizeDeactivateMsg(lpMsg);
+    }
     return got;
 }
 BOOL WINAPI Hook_MapleGetMessageA(LPMSG lpMsg, HWND hWnd, UINT min, UINT max) {
     auto orig = g_mapleRealGetMessageA ? g_mapleRealGetMessageA : GetMessageA;
     const BOOL got = orig(lpMsg, hWnd, min, max);
-    if (got) MapleNeutralizeDeactivateMsg(lpMsg);
+    if (got && lpMsg) {
+        MapleNotePumpMessage(lpMsg->message);
+        MapleNeutralizeDeactivateMsg(lpMsg);
+    }
     return got;
 }
 LRESULT WINAPI Hook_MapleDispatchMessageW(const MSG* lpMsg) {
@@ -1026,6 +1186,7 @@ LRESULT WINAPI Hook_MapleDispatchMessageW(const MSG* lpMsg) {
     MSG copy{};
     if (lpMsg) {
         copy = *lpMsg;
+        MapleNotePumpMessage(copy.message);
         MapleNeutralizeDeactivateMsg(&copy);
         return orig(&copy);
     }
@@ -1036,6 +1197,7 @@ LRESULT WINAPI Hook_MapleDispatchMessageA(const MSG* lpMsg) {
     MSG copy{};
     if (lpMsg) {
         copy = *lpMsg;
+        MapleNotePumpMessage(copy.message);
         MapleNeutralizeDeactivateMsg(&copy);
         return orig(&copy);
     }
@@ -1047,6 +1209,7 @@ BOOL WINAPI Hook_MapleTranslateMessage(const MSG* lpMsg) {
 }
 LRESULT WINAPI Hook_MapleCallWindowProcW(WNDPROC prev, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto orig = g_mapleRealCallWindowProcW ? g_mapleRealCallWindowProcW : CallWindowProcW;
+    MapleNotePumpMessage(msg);
     if (msg == WM_KILLFOCUS && (IsOurHwnd(hwnd)
         || (hwnd && IsOurHwnd(GetAncestor(hwnd, GA_ROOT))))) {
         return 0;
@@ -1056,6 +1219,7 @@ LRESULT WINAPI Hook_MapleCallWindowProcW(WNDPROC prev, HWND hwnd, UINT msg, WPAR
 }
 LRESULT WINAPI Hook_MapleCallWindowProcA(WNDPROC prev, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto orig = g_mapleRealCallWindowProcA ? g_mapleRealCallWindowProcA : CallWindowProcA;
+    MapleNotePumpMessage(msg);
     if (msg == WM_KILLFOCUS && (IsOurHwnd(hwnd)
         || (hwnd && IsOurHwnd(GetAncestor(hwnd, GA_ROOT))))) {
         return 0;
@@ -1093,6 +1257,36 @@ bool LooksLikeAdobeAirClassName(const wchar_t* cls) {
     CharLowerW(lower);
     return wcsstr(lower, L"apolloruntime") != nullptr
         || wcsstr(lower, L"adobeair") != nullptr;
+}
+
+/// 顶层窗**或它的任一子窗**是 Adobe AIR（`ApolloRuntimeContentWindow` 等）。
+///
+/// ⚠⚠ 为什么不能只看顶层：`ApolloRuntimeContentWindow` 常常是**内容子窗**，它的父窗是
+/// 启动器/包装窗（4399 微端这类就是「启动器 + AIR 内容窗」的结构）。而 `InstallCommon`
+/// 拿到的 `top` 是 `GA_ROOT` ⇒ 只看顶层类名会**漏判** ⇒ 走**全量 Phase2**
+/// （子类化 + 光标钩 + RawInput）⇒ 造梦西游/AIR 播放器「一启动就卡死退出，鼠标原地抽」。
+///
+/// 配置侧（`window_mode_executor.cpp` 的 `adobeAir`）本来就同时看 `windowClassName`
+/// 与 `childWindowClassName` —— 这里补齐，让 DLL 与宿主用同一套判据，不再出现
+/// 「宿主认它是 AIR、DLL 认它不是」的错位。
+bool HwndTreeLooksLikeAdobeAir(HWND top) {
+    if (!top || !IsWindow(top)) return false;
+    wchar_t cls[256]{};
+    GetClassNameW(top, cls, 256);
+    if (LooksLikeAdobeAirClassName(cls)) return true;
+    struct Ctx { bool found = false; } ctx;
+    // 跨进程 EnumChildWindows 是内核侧枚举，不需要目标进程配合（同 FindChromeRenderWidget）。
+    EnumChildWindows(top, [](HWND w, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        wchar_t childCls[256]{};
+        GetClassNameW(w, childCls, 256);
+        if (LooksLikeAdobeAirClassName(childCls)) {
+            c->found = true;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
 }
 
 bool LooksLikeMapleStoryClassName(const wchar_t* cls) {
@@ -1385,8 +1579,18 @@ MapleDiVtPatch g_diVtPatch[kMapleDiVtCap]{};
 bool MapleIatPatchSlot(void** slot, void* detour, bool countPoll) {
     if (!slot || !detour || g_mapleIatCount >= kMapleIatCap) return false;
     if (*slot == detour) return true;
+    // ⚠ 临时放开的保护**必须保住执行位**：原先一律用 PAGE_READWRITE，
+    //   而 RWX 页（打包器/保护壳常见）与只读代码页被改成 RW 的那一瞬间**执行权限没了** ——
+    //   正好有线程在那页上执行就是一次取指异常。判据按当前页保护选 RWX/RW。
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool executable = VirtualQuery(slot, &mbi, sizeof(mbi)) == sizeof(mbi)
+        && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                | PAGE_EXECUTE_WRITECOPY)) != 0;
     DWORD old = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+    if (!VirtualProtect(slot, sizeof(void*),
+            executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &old)) {
+        return false;
+    }
     g_mapleIat[g_mapleIatCount].slot = slot;
     g_mapleIat[g_mapleIatCount].original = *slot;
     ++g_mapleIatCount;
@@ -1593,6 +1797,61 @@ int MapleIatFillFocusPairs(MapleIatPair* out, int cap) {
     add(reinterpret_cast<void*>(g_mapleRealIsIconic),
         reinterpret_cast<void*>(&Hook_IsIconic));
     add(g_mapleNtUserGfw, reinterpret_cast<void*>(&Hook_GetForegroundWindow));
+    return n;
+}
+
+/// 键态/光标类（poll）API 对，用于**进程级**缓存指针扫描。
+/// 为什么必须单独一组：主模块的 PE 可写节由 MaplePatchWritablePointers 覆盖，
+/// 但打包器/客户端常把 `GetAsyncKeyState` 这类地址缓存到**堆结构体**里 —— 那里
+/// 只有进程级扫描够得着（GFW/IsWindowVisible 早就因此加过同一套扫描）。
+/// 现场依据：星辰冒险岛客户端「前台启动就走、后台启动不走」，且 `gaks=0 diState=0`
+/// ⇒ 它读键态走的是我们没接住的入口，而真 SendInput 一打就灵。
+int MapleIatFillPollPairs(MapleIatPair* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    int n = 0;
+    auto add = [&](void* original, void* detour) {
+        if (!original || !detour || n >= cap) return;
+        out[n].original = original;
+        out[n].detour = detour;
+        out[n].poll = true;
+        ++n;
+    };
+    add(reinterpret_cast<void*>(g_mapleRealGetCursorPos),
+        reinterpret_cast<void*>(&Hook_GetCursorPos));
+    add(reinterpret_cast<void*>(g_mapleRealGetAsyncKeyState),
+        reinterpret_cast<void*>(&Hook_GetAsyncKeyState));
+    add(reinterpret_cast<void*>(g_mapleRealGetKeyState),
+        reinterpret_cast<void*>(&Hook_GetKeyState));
+    add(reinterpret_cast<void*>(g_mapleRealGetKeyboardState),
+        reinterpret_cast<void*>(&Hook_GetKeyboardState));
+    add(g_mapleNtUserCursor, reinterpret_cast<void*>(&Hook_GetCursorPos));
+    add(g_mapleNtUserGaks, reinterpret_cast<void*>(&Hook_GetAsyncKeyState));
+    add(g_mapleNtUserKeyState, reinterpret_cast<void*>(&Hook_GetKeyState));
+    add(g_mapleNtUserKbState, reinterpret_cast<void*>(&Hook_GetKeyboardState));
+    // ★消息泵 + 激活查询也必须进这一组（原先只有键态/光标）：
+    //   冒险岛后台走路的前提是「IAT 吞失活 ⇒ 客户端一直轮询」。而失活消息是靠
+    //   PeekMessage/GetMessage/DispatchMessage/CallWindowProc 钩子吞掉的 —— 如果客户端
+    //   把这几个地址**缓存/晚解析**了，钩子就不在它的调用路径上（日志特征：focus=0 且
+    //   客户端在注入前已失活，于是 dinput8 永远不再轮询 ⇒ diState 恒 0、后台只会原地平A）。
+    //   加进 poll 组就能被进程级（堆/其它模块）缓存指针扫描补上，与 GFW/IsWindowVisible 同一套修法。
+    add(reinterpret_cast<void*>(g_mapleRealPeekMessageW),
+        reinterpret_cast<void*>(&Hook_MaplePeekMessageW));
+    add(reinterpret_cast<void*>(g_mapleRealPeekMessageA),
+        reinterpret_cast<void*>(&Hook_MaplePeekMessageA));
+    add(reinterpret_cast<void*>(g_mapleRealGetMessageW),
+        reinterpret_cast<void*>(&Hook_MapleGetMessageW));
+    add(reinterpret_cast<void*>(g_mapleRealGetMessageA),
+        reinterpret_cast<void*>(&Hook_MapleGetMessageA));
+    add(reinterpret_cast<void*>(g_mapleRealDispatchMessageW),
+        reinterpret_cast<void*>(&Hook_MapleDispatchMessageW));
+    add(reinterpret_cast<void*>(g_mapleRealDispatchMessageA),
+        reinterpret_cast<void*>(&Hook_MapleDispatchMessageA));
+    add(reinterpret_cast<void*>(g_mapleRealCallWindowProcW),
+        reinterpret_cast<void*>(&Hook_MapleCallWindowProcW));
+    add(reinterpret_cast<void*>(g_mapleRealCallWindowProcA),
+        reinterpret_cast<void*>(&Hook_MapleCallWindowProcA));
+    add(reinterpret_cast<void*>(g_mapleRealGetActiveWindow),
+        reinterpret_cast<void*>(&Hook_GetActiveWindow));
     return n;
 }
 
@@ -1938,6 +2197,8 @@ bool MapleIsDinputModule(HMODULE mod);
 
 void MapleIatWalkGameDirDinputUser32();
 void MaplePatchFocusPointersProcessWide();
+void StartMapleRescanThread();
+void StopMapleRescanThread();
 
 bool MapleModuleInGameDir(HMODULE mod, const wchar_t* exeDirLower) {
     if (!mod || !exeDirLower || !*exeDirLower) return false;
@@ -2534,22 +2795,77 @@ void MapleIatWalkGameDirDinputUser32() {
     }
 }
 
-void MaplePatchFocusPointersProcessWide() {
-    MapleIatPair pairs[12]{};
-    const int nPairs = MapleIatFillFocusPairs(pairs, 12);
-    if (nPairs <= 0) return;
+/// 进程级扫描**键态类**缓存指针（堆 / 主模块映像之外）。
+/// 与 MaplePatchFocusPointersProcessWide 同一套机制、同一套安全判据（跳过 dinput 与
+/// 本 DLL 自己的内存、按 8 字节对齐、上限 48 个）。区别只是 API 组。
+/// 判据/动机见 MapleIatFillPollPairs 注释。
+//
+// ── 进程级指针扫描的共用实现（两个 API 组各一份游标）──────────────────────────
+// 2026-09-27 扩：**只读数据页也要扫**。
+//   现场判据：冒险岛 `冒险岛输入体检 泵=0 … rescan=3轮/+0槽` ⇒ 它既不走我们补过的 IAT，
+//   也没有「晚出现」的可写缓存点。而打包器/保护壳的典型形态是
+//   「解析出 API 地址 → 写进缓冲区 → VirtualProtect(PAGE_READONLY)」（或直接落在只读段），
+//   ⇒ **只扫可写区的扫描永远看不到这些指针**。写入由 MapleIatPatchSlot 临时放开保护
+//   （DI 虚表本来就活在 .rdata，同一做法）。
+// ⚠ **不扫可执行页**（PAGE_EXECUTE_READ / PAGE_EXECUTE / _EXECUTE_WRITECOPY）：
+//   代码页里 8 字节对齐的值可能是指令的**立即数或常量**，改它 = 改指令语义，
+//   而这个客户端有明确闪退史 ⇒ 只读**数据**页与代码页必须区别对待。
+//   （原本就在扫的 RW/RWX 页保持不动 —— 那是既有覆盖面，别顺手缩。）
+// ⚠ 只读区体量远大于可写区（主模块 + 系统 DLL 的 .rdata 全在内）⇒ 两道护栏：
+//   ① 单次调用**扫描预算** `kMaplePwScanBudgetMs`，超时就停（不让重扫卡住游戏）；
+//   ② **游标轮转**：下一轮从上次停下的区接着扫 ⇒ 几轮内覆盖全量，
+//      而不是每次从头扫、后半段永远轮不到（这是「扫描类诊断」最容易犯的错）。
+constexpr DWORD kMaplePwScanBudgetMs = 80;
+void* g_maplePwScanCursor[2] = {nullptr, nullptr};
+
+/// 目标 exe 所在目录（小写）——只读页收窄判据用。
+/// 刻意用 C 数组：本文件这一段没有 `std::wstring` 依赖（引入它会连带拉 <string>）。
+/// 首次调用算一次；并发最坏是各算一遍、结果相同（幂等），不引锁。
+const wchar_t* MapleGameDirLowerForScan() {
+    static wchar_t dir[MAX_PATH]{};
+    static bool ready = false;
+    if (!ready) {
+        wchar_t exe[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exe, MAX_PATH) && exe[0]) {
+            wchar_t* slash = wcsrchr(exe, L'\\');
+            if (slash) {
+                *slash = 0;
+                CharLowerW(exe);
+                lstrcpynW(dir, exe, MAX_PATH);
+            }
+        }
+        ready = true;
+    }
+    return dir[0] ? dir : nullptr;
+}
+
+int MaplePatchPointersProcessWideByPairs(
+    const MapleIatPair* pairs, int nPairs, int group, bool countPoll) {
+    if (!pairs || nPairs <= 0) return 0;
+    const DWORD startTick = GetTickCount();
+    const int g = group & 1;
     int patched = 0;
-    BYTE* addr = nullptr;
-    for (int regions = 0; regions < 4096 && patched < 48; ++regions) {
+    int regions = 0;
+    bool walkedToEnd = false;
+    BYTE* addr = static_cast<BYTE*>(g_maplePwScanCursor[g]);
+    for (; regions < 4096 && patched < 48; ++regions) {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+            walkedToEnd = true;
+            break;
+        }
         BYTE* regionEnd = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd <= addr) break;
+        if (regionEnd <= addr) {
+            walkedToEnd = true;
+            break;
+        }
         const DWORD page = mbi.Protect & 0xFF;
-        const bool writable = mbi.State == MEM_COMMIT
-            && (mbi.Protect & PAGE_GUARD) == 0
-            && (page == PAGE_READWRITE || page == PAGE_WRITECOPY);
-        if (writable) {
+        const bool committed = mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_GUARD) == 0;
+        const bool writableData = committed
+            && (page == PAGE_READWRITE || page == PAGE_WRITECOPY
+                || page == PAGE_EXECUTE_READWRITE || page == PAGE_EXECUTE_WRITECOPY);
+        const bool readonlyData = committed && page == PAGE_READONLY;  // ★本次新增的覆盖面
+        if (writableData || readonlyData) {
             HMODULE owner = static_cast<HMODULE>(mbi.AllocationBase);
             bool skip = MapleIsDinputModule(owner);
             if (!skip && owner) {
@@ -2558,6 +2874,17 @@ void MaplePatchFocusPointersProcessWide() {
                     CharLowerW(path);
                     skip = MapleIsFakeFocusModulePath(path);
                 }
+            }
+            if (!skip && readonlyData) {
+                // ★只读页**额外收窄**（2026-09-27，与可写页策略不同，故意的）：
+                //   系统 DLL 的只读段装的是**系统自己的分派表**（例如 user32 内部存的
+                //   GetAsyncKeyState/PeekMessage 地址），改它 = 改整个进程里**所有**调用方
+                //   （含保护/反作弊模块）的行为 —— 那不是「补客户端自己的缓存点」，
+                //   收益不变而爆炸半径大得多（宽扫把网络栈时钟一起虚拟化导致掉线，是同类教训）。
+                //   所以只读页只认两类：① 匿名内存（打包器解密缓冲区的典型形态，AllocationBase 为空）
+                //   ② **游戏目录内**的模块（客户端自己 .rdata 里的缓存点）。
+                const wchar_t* gameDir = MapleGameDirLowerForScan();
+                skip = (owner != nullptr) && !MapleModuleInGameDir(owner, gameDir);
             }
             if (!skip) {
                 BYTE* aligned = reinterpret_cast<BYTE*>(
@@ -2571,7 +2898,7 @@ void MaplePatchFocusPointersProcessWide() {
                     for (int k = 0; k < nPairs; ++k) {
                         if (pairs[k].original && cur == pairs[k].original) {
                             if (MapleIatPatchSlot(reinterpret_cast<void**>(aligned),
-                                    pairs[k].detour, false)) {
+                                    pairs[k].detour, countPoll)) {
                                 ++patched;
                             }
                             break;
@@ -2581,7 +2908,28 @@ void MaplePatchFocusPointersProcessWide() {
             }
         }
         addr = regionEnd;
+        if ((regions & 0x1F) == 0 && GetTickCount() - startTick > kMaplePwScanBudgetMs) {
+            ++regions;  // 预算用完：本轮到此为止，游标停在这里，下轮接着扫
+            break;
+        }
     }
+    g_maplePwScanCursor[g] = (walkedToEnd || regions >= 4096) ? nullptr : addr;
+    return patched;
+}
+
+void MaplePatchPollPointersProcessWide() {
+    // 组内条数见 MapleIatFillPollPairs（键态/光标 + 消息泵 + 激活查询）。
+    MapleIatPair pairs[24]{};
+    const int nPairs = MapleIatFillPollPairs(pairs, 24);
+    // 累计（宿主日志 `pwPoll=`）：轮转扫描是多次调用，单次赋值会越报越少。
+    const int patched = MaplePatchPointersProcessWideByPairs(pairs, nPairs, 0, false);
+    if (patched > 0) g_maplePwPollPatched += patched;
+}
+
+void MaplePatchFocusPointersProcessWide() {
+    MapleIatPair pairs[12]{};
+    const int nPairs = MapleIatFillFocusPairs(pairs, 12);
+    (void)MaplePatchPointersProcessWideByPairs(pairs, nPairs, 1, false);
 }
 
 FARPROC WINAPI Hook_GetProcAddress(HMODULE module, LPCSTR name) {
@@ -3115,6 +3463,7 @@ void RemoveMapleIatHooks() {
 
 void InstallMapleIatHooks() {
     MapleResetHookHits();
+    MapleSetStage(1);  // 1 = 进入安装
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (!user32) return;
     g_mapleRealGetCursorPos = reinterpret_cast<BOOL(WINAPI*)(LPPOINT)>(
@@ -3202,6 +3551,7 @@ void InstallMapleIatHooks() {
             GetProcAddress(di7, "DirectInputCreateEx"));
     }
     MapleIatInstallFromPeb();
+    MapleSetStage(3);  // 3 = PEB/IAT 扫描完成（iatPoll 此时应已 >0）
     // 已有键盘设备在注入前 CreateDevice：改确认过的设备 vtable 槽，并对
     // 这些表上唯一的 Acquire/GetDeviceState 方法体打 JMP（dinput .text）。
     // GetDeviceData 只改虚表槽，不打方法体。禁止 user32/win32u 方法体 JMP。
@@ -3209,16 +3559,109 @@ void InstallMapleIatHooks() {
     // 禁止 Poll、禁止注入线程 CreateDevice。
     MapleHookDinputVtables();
     MaplePatchDiCachedAll();
+    MapleSetStage(4);  // 4 = DirectInput 虚表/方法体钩完成
     // dinput8/dinput 常晚于注入才被游戏 LoadLibrary（日志特征：iatPoll=2 而 foundVt>0）。
     // PEB 那一轮它们还没进进程，user32 IAT 自然一个槽都没补上；这里在 DI 阶段之后再补一次，
     // 之后 iatPoll 应 ≥4（主程序 2 + 本地 dinput user32 的 GAKS/光标 2）。
     MapleIatWalkGameDirDinputUser32();
+    // 再补一次**进程级**键态缓存指针（堆/主模块之外）：打包器会把 GetAsyncKeyState 之类
+    // 缓存进堆结构体，主模块 PE 节扫描看不到 —— 现场「前台启动才走、后台不走」正是这个特征。
+    // 补到的个数写进 mapleDiVt 高 8 位（宿主日志 `pwPoll=`），0 就说明这条路也没东西可补。
+    MaplePatchPollPointersProcessWide();
+    MapleSetStage(5);  // 5 = 安装全部完成
     MaplePublishHits();
     // 164352 闪退：禁止假 WM_INPUT、禁止改 dinput8 可写节、禁止注入线程
     // RegisterRawInputDevices / SetCooperativeLevel / Prime SendMessage。
+    StartMapleRescanThread();
+}
+
+// ── 周期补挂（只补「装完那一刻还不存在」的东西）────────────────────────────
+// 为什么需要：注入是一次性的，而客户端的输入路径是**逐步长出来**的 ——
+//   · dinput8/dinput 常常晚于注入才 LoadLibrary（一次性的 `MapleIatWalkGameDirDinputUser32`
+//     跑空 ⇒ 日志 `dinputIat=0`）；
+//   · 打包器把 PeekMessage/GetAsyncKeyState 之类**先解析后缓存**，缓存点在扫描之后才被写；
+//   · 场景切换会重建模块/结构体，新缓存点又出现。
+// 现象上就是「时灵时不灵 / 前台启动才走、后台不走」。这里在会话期间按节拍**重跑同一批
+// 幂等补挂**（`MapleIatPatchSlot` 对已补槽直接返回，不会二次包装 detour），
+// 新增数量写进共享内存（宿主日志 `rescan=`/`+N`）——数字为 0 就说明路已经铺满了。
+volatile LONG g_mapleRescanStop = 0;
+HANDLE g_mapleRescanThread = nullptr;
+
+void RescanMapleInputHooksOnce() {
+    HMODULE mainMod = GetModuleHandleW(nullptr);
+    const int iat0 = g_mapleInputHookCount;
+    const DWORD diag0 = g_mapleDiag;
+    __try {
+        MapleIatWalkModuleByName(mainMod, MapleIatWalkKind::All);
+        MaplePatchWritablePointers(mainMod, 0);
+        MapleIatWalkGameDirModules(mainMod);
+        MapleIatWalkGameDirDinputUser32();
+        MaplePatchPollPointersProcessWide();
+        MaplePatchFocusPointersProcessWide();
+        MaplePatchWritableFocusPointers(mainMod, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_mapleDiag |= kMapleInstallFault;
+        MaplePublishHits();
+        return;
+    }
+    if (g_mapleDiag != diag0) {
+        // 晚加载的 dinput8/dinput 这一轮才补上 → 让宿主日志的 dinputIat 翻转。
+        MaplePublishHits();
+    }
+    const int added = g_mapleInputHookCount - iat0;
+    if (added > 0) InterlockedExchangeAdd(&g_mapleRescanAdds, added);
+    InterlockedIncrement(&g_mapleRescanRounds);
+    MaplePublishHits();
+}
+
+DWORD WINAPI MapleRescanThreadProc(LPVOID) {
+    int round = 0;
+    while (InterlockedCompareExchange(&g_mapleRescanStop, 0, 0) == 0) {
+        // 还没看见「客户端在轮询」时密扫（前 ~12s 每 1.5s），看见之后降到 8s 做 upkeep。
+        // 判据用 DLL 自己的计数（g_mapleHitDiState），不依赖宿主侧 API。
+        const bool polling = InterlockedCompareExchange(&g_mapleHitDiState, 0, 0) > 0;
+        RescanMapleInputHooksOnce();
+        ++round;
+        const DWORD waitMs = polling ? 8000u : (round < 8 ? 1500u : 4000u);
+        for (DWORD slept = 0; slept < waitMs; slept += 50) {
+            if (InterlockedCompareExchange(&g_mapleRescanStop, 0, 0) != 0) return 0;
+            Sleep(50);
+        }
+    }
+    return 0;
+}
+
+void StartMapleRescanThread() {
+    if (g_mapleRescanThread) return;
+    InterlockedExchange(&g_mapleRescanStop, 0);
+    g_mapleRescanThread = CreateThread(nullptr, 0, MapleRescanThreadProc, nullptr, 0, nullptr);
+    if (g_mapleRescanThread) SetThreadPriority(g_mapleRescanThread, THREAD_PRIORITY_BELOW_NORMAL);
+}
+
+void StopMapleRescanThread() {
+    if (!g_mapleRescanThread) return;
+    InterlockedExchange(&g_mapleRescanStop, 1);
+    WaitForSingleObject(g_mapleRescanThread, 2000);
+    CloseHandle(g_mapleRescanThread);
+    g_mapleRescanThread = nullptr;
+}
+
+/// 装钩子的异常兜底：注入进程里任何一次访问违例都会把**游戏**一起带走，
+/// 而「游戏闪退」比「假焦点没装上」严重得多（用户没法继续用，也拿不到诊断）。
+/// 这里用 SEH 兜住：出事先保游戏，置 kMapleInstallFault，stage 留在最后一步 ——
+/// 宿主日志里 `stage=N fault=1` 直接指出死在哪一段。
+/// 注意本函数内不得有需要 C++ 栈展开的对象（MSVC C2712），所以只做一层薄壳。
+void InstallMapleIatHooksGuarded() {
+    __try {
+        InstallMapleIatHooks();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_mapleDiag |= kMapleInstallFault;
+        MaplePublishHits();
+    }
 }
 
 void RemoveAllHooks() {
+    StopMapleRescanThread();
     RemoveMapleIatHooks();
     RemoveRawInputHooks();
     fakefocus::RemoveInlineHook(g_hookDwmAttr);
@@ -3375,7 +3818,7 @@ bool InstallPhase2Hooks() {
     return true;
 }
 
-BOOL InstallCommon(HWND targetTop, bool lite) {
+BOOL InstallCommon(HWND targetTop, bool lite, bool timeScaleOnly = false) {
     if (!targetTop || !IsWindow(targetTop)) return FALSE;
     HWND top = GetAncestor(targetTop, GA_ROOT);
     if (!top) top = targetTop;
@@ -3384,6 +3827,25 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
         g_targetTop.store(top, std::memory_order_relaxed);
         HWND render = ResolveSoftInputPostHwnd(top);
         g_focusHwnd.store((render && IsWindow(render)) ? render : top, std::memory_order_relaxed);
+        // 复用已装好的实例时必须**重新打开共享内存并重发一遍状态**：
+        // 宿主每轮 BeginRun 都会 Attach（先 Detach 再建），旧 view 可能已经失效或指向旧对象；
+        // 不重开的话宿主读到的全是 0（`stage=0 hitReady=0 diag=0`），
+        // 看起来像「注入没生效」，实际只是没人往新映射里写。
+        //
+        // ⚠⚠ 这里**不能**加 `if (!g_softView)` 守卫（2026-10-03 修）：
+        //   `g_softView` 非空 ≠ 视图有效 —— 宿主重建映射后，旧 view 可能还指向
+        //   一个**布局已变**的旧 section（本结构体加过字段，尺寸变了）。此时
+        //   `SoftInputStateLooksValid` 为假 ⇒ `MaplePublishHits` 直接 return ⇒
+        //   宿主读到全 0（诊断行凭空消失），**且软键态/DirectInput 全失效** ——
+        //   后台模式只剩 PostMessage 的攻击键（用户报障：「原地不动的平A，不能走A」）。
+        //   `OpenSoftInputView` 内部已经处理了「非空但无效 ⇒ CloseSoftInputView 再重开」，
+        //   有效时是 O(1) 直接返回，所以这里**无条件调用**即可。
+        {
+            DWORD softPid = 0;
+            GetWindowThreadProcessId(top, &softPid);
+            OpenSoftInputView(softPid);
+        }
+        MaplePublishHits();
         return TRUE;
     }
 
@@ -3396,7 +3858,7 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
         || (_wcsicmp(cls, L"CefBrowserWindow") == 0)
         || (_wcsicmp(cls, L"CefClientWindow") == 0)
         || (FindChromeRenderWidget(top) != nullptr));
-    const bool airSafe = !mapleSafe && LooksLikeAdobeAirClassName(cls);
+    const bool airSafe = !mapleSafe && HwndTreeLooksLikeAdobeAir(top);
     const bool weixinSafe = !mapleSafe && !electronSafe && HwndLooksLikeWeixinClient(top);
     const bool tianlongSafe = !mapleSafe && !electronSafe && !weixinSafe
         && ClassLooksLikeTianLongBaBu(cls);
@@ -3417,7 +3879,52 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
     DWORD softPid = 0;
     GetWindowThreadProcessId(top, &softPid);
     OpenSoftInputView(softPid);
+    // 把变速 detour 的调用计数直接挂到共享内存上，宿主随时可读（不需远程调用）。
+    // “计数涨不涨”是判断钩子有没有真正进入目标调用路径的唯一硬证据。
+    if (g_softView && g_softWritable) {
+        fakefocus::timescale::SetCallSink(&g_softView->timeHookCalls[0]);
+        fakefocus::unity::SetStateSink(&g_softView->unityState);
+    }
 
+    // 窗口变速（变速齿轮）：宿主未下发倍率时完全惰性。
+    // 默认把目标进程里「读时钟」的**函数体**换成我们的实现（内联钩）：
+    // 目标（Unity）启动时就把函数地址缓存了，只改 IAT 够不着 —— 详见 fake_focus_time_scale.h。
+    // 冒险岛（nProtect GameGuard）有硬约束「只装 IAT，禁止改函数体」，
+    // 所以它走 **IAT-only 模式**：只改导入表槽（数据），不碰代码页，
+    // 与它已有的键鼠 IAT 补丁同一类修改。
+    //
+    // ★★ Adobe AIR（造梦西游 / 4399 微端）**同待遇**（2026-10-03 修）：
+    //    这里的时钟钩是**内联钩（改函数体）**，而它装在下面 `airSafe` 早退**之前** ——
+    //    等于把 AIR 从「不改代码页」的 whitelist 里漏了出去（本仓
+    //    `.cursor/skills/window-mode-debug/SKILL.md` 记的就是这条）。
+    //    现场：AIR 播放器「开倍速过一会就闪退」（同 fake_focus_time_scale.h:481
+    //    记的那类事故：调用面全虚拟化 ⇒ 面太大）。
+    //    ⇒ 与冒险岛一样只补 IAT 槽：游戏自己的代码仍在 exe 目录内，变速照常生效，
+    //      但系统 DLL 的时钟函数一个字节都不动。
+    //
+    // 诊断走 FakeFocus_TimeScaleDiag（DLL 里没有 window_mode_log.cpp，不能用 WindowModeLogf）。
+    fakefocus::timescale::SetIatOnlyMode(mapleSafe || airSafe);
+    if (fakefocus::timescale::InitRealTimeApi()) {
+        fakefocus::timescale::StartPoll(&DesiredTimeScale);
+    }
+
+    // ── 仅变速注入 ──────────────────────────────────────────────────────────
+    // 「启用窗口变速」开、「启用假焦点注入」关时走这条：DLL 只接管时钟，一个假焦点钩都不装，
+    // 键鼠路径与「完全不注入」时一致，把行为变化压到最小。
+    // 这里若顺手把全套钩子装上，用户特意关掉的注入就会悄悄生效 —— 那是背刺，不是修复。
+    if (timeScaleOnly) {
+        g_timeScaleOnly = true;
+        g_fakeFocusDisabled = false;
+        g_targetTop.store(top, std::memory_order_relaxed);
+        HWND renderTs = ResolveSoftInputPostHwnd(top);
+        g_focusHwnd.store((renderTs && IsWindow(renderTs)) ? renderTs : top,
+            std::memory_order_relaxed);
+        g_installed.store(true, std::memory_order_release);
+        return TRUE;
+    }
+
+    g_timeScaleOnly = false;
+    g_fakeFocusDisabled = false;
     g_targetTop.store(top, std::memory_order_relaxed);
     HWND render = ResolveSoftInputPostHwnd(top);
     g_focusHwnd.store((render && IsWindow(render)) ? render : top, std::memory_order_relaxed);
@@ -3425,7 +3932,7 @@ BOOL InstallCommon(HWND targetTop, bool lite) {
     // 冒险岛：IAT + 吞失活消息 + DirectInput 后台协作。禁止 user32/win32u 方法体 JMP。
     // 禁止 CallThroughOriginal、子类化 WndProc、假 WM_INPUT、注入线程里 CreateDevice。
     if (mapleSafe) {
-        InstallMapleIatHooks();
+        InstallMapleIatHooksGuarded();
         g_installed.store(true, std::memory_order_release);
         return TRUE;
     }
@@ -3575,6 +4082,33 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_InstallLite(HWND targetTop) {
     return InstallCommon(targetTop, true);
 }
 
+/// 仅安装窗口变速（时钟 IAT 补丁），不装任何假焦点钩。
+/// 「启用窗口变速」开而「启用假焦点注入」关时用它：变速照常生效，键鼠路径不变。
+FAKEFOCUS_API BOOL WINAPI FakeFocus_InstallTimeScaleOnly(HWND targetTop) {
+    return InstallCommon(targetTop, true, true);
+}
+
+/// 只拆假焦点钩，**保留** DLL 与时钟轮询线程。
+/// 全屏游戏必须拆钩（钩 PeekMessage 会冻 DXGI），但窗口变速还需要目标进程里有代码 ——
+/// 两个需求方向相反，所以不能走完整 Uninstall（那会把变速一起杀掉）。
+FAKEFOCUS_API BOOL WINAPI FakeFocus_DisableFakeFocus(HWND) {
+    if (!g_installed.load(std::memory_order_acquire)) return TRUE;
+    // 注意顺序与 Uninstall 一致，但**不** StopPoll、**不** CloseSoftInputView：
+    // 时钟轮询要读 g_softView，关掉视图变速就没了。
+    StopSoftKeyDrainThread();
+    DetachSubclass();
+    RemoveAllHooks();
+    ClipCursor(nullptr);
+    ReleaseCapture();
+    ResetRawInputState();
+    ResetFocusModeFlags();
+    g_keyEventRead = 0;
+    g_mouseMoveRead = 0;
+    g_lastFocusRefreshMs = 0;
+    g_fakeFocusDisabled = true;
+    return TRUE;
+}
+
 FAKEFOCUS_API BOOL WINAPI FakeFocus_UpdateTarget(HWND targetTop) {
     if (!g_installed.load(std::memory_order_acquire)) return FALSE;
     if (!targetTop || !IsWindow(targetTop)) return FALSE;
@@ -3597,11 +4131,14 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_UpdateTarget(HWND targetTop) {
 
 FAKEFOCUS_API BOOL WINAPI FakeFocus_Uninstall(void) {
     if (!g_installed.load(std::memory_order_acquire)) {
+        fakefocus::timescale::StopPoll();
         StopSoftKeyDrainThread();
         CloseSoftInputView();
         return TRUE;
     }
 
+    // 先停变速轮询（它会读 g_softView），再关共享内存视图。
+    fakefocus::timescale::StopPoll();
     StopSoftKeyDrainThread();
     DetachSubclass();
     RemoveAllHooks();
@@ -3613,6 +4150,8 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_Uninstall(void) {
     g_keyEventRead = 0;
     g_mouseMoveRead = 0;
     g_lastFocusRefreshMs = 0;
+    g_timeScaleOnly = false;
+    g_fakeFocusDisabled = false;
     g_targetTop.store(nullptr, std::memory_order_relaxed);
     g_focusHwnd.store(nullptr, std::memory_order_relaxed);
     g_installed.store(false, std::memory_order_release);
@@ -3625,6 +4164,12 @@ FAKEFOCUS_API BOOL WINAPI FakeFocus_IsInstalled(void) {
 
 FAKEFOCUS_API BOOL WINAPI FakeFocus_HasSoftInput(void) {
     return SoftState() ? TRUE : FALSE;
+}
+
+FAKEFOCUS_API DWORD WINAPI FakeFocus_TimeScaleDiag(HWND) {
+    // bit2 = 本次是「仅变速」安装（一个假焦点钩都没装）；bit3 = 假焦点钩已被单独拆掉但时钟仍在。
+    return fakefocus::timescale::Diag() | (g_timeScaleOnly ? 4u : 0u)
+        | (g_fakeFocusDisabled ? 8u : 0u);
 }
 
 FAKEFOCUS_API DWORD WINAPI FakeFocus_MapleIatCount(HWND) {

@@ -1,5 +1,6 @@
 // engine_hotkeys.cpp — F2 slice: global/script hotkey register + capture release + OnHotkey
 #include "engine/engine_host_window.h"
+#include "engine/hotkey_scope.h"
 
 // was engine_host_window.h:11550-11578
 void EngineHost::BeginHotkeyCaptureRelease(const Hotkey& editing) {
@@ -96,6 +97,12 @@ void EngineHost::RegisterAllHotkeys() {
             ghPlaybackScriptHooks[ghPlaybackScriptHookCount++] = PlaybackScriptHook{
                 hk.vk, hk.modifiers, HOTKEY_RECORDING_BASE + i, hk.holdMode};
         }
+        // 专属热键作用域：LL 钩子靠它决定「吞键」还是「原样放行」。
+        // 作用域外必须放行 —— 回放挂起 / IME 兼容 / 注册失败时钩子是唯一通道。
+        for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+            auto& h = ghPlaybackScriptHooks[i];
+            h.inScope = DedicatedHotkeyInScope(h.hotkeyId >= HOTKEY_RECORDING_BASE);
+        }
         bool anyArmed = ghHotkeyMouseHoldArmed;
         for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
             auto& h = ghPlaybackScriptHooks[i];
@@ -150,6 +157,12 @@ void EngineHost::RegisterAllHotkeys() {
             }
             return false;
         };
+        // 专属热键额外受作用域限制：**作用域外绝不注册 RegisterHotKey**。
+        // 一旦注册，系统会吞掉该键 —— 表现为「按 P 既不起脚本、又打不出 P」。
+        // 作用域外交给前台程序，切回对应 TAB 时由 RefreshDedicatedHotkeyScope 补注册。
+        auto skipDedicatedFor = [&](const Hotkey& hk, bool isRecording) {
+            return skipRegisterHotKeyFor(hk) || !DedicatedHotkeyInScope(isRecording);
+        };
 
         std::wstring regFail;
         auto tryReg = [&](int id, UINT mods, UINT vk, const std::wstring& label) {
@@ -182,14 +195,14 @@ void EngineHost::RegisterAllHotkeys() {
             }
             for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
                 const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
-                if (hk.enabled && hk.vk && !skipRegisterHotKeyFor(hk)) {
+                if (hk.enabled && hk.vk && !skipDedicatedFor(hk, false)) {
                     tryReg(HOTKEY_SCRIPT_BASE + i, hk.modifiers, hk.vk,
                         L"脚本「" + scripts_[static_cast<size_t>(i)].name + L"」");
                 }
             }
             for (int i = 0; i < static_cast<int>(recordings_.size()) && i < 100; ++i) {
                 const auto& hk = recordings_[static_cast<size_t>(i)].hotkey;
-                if (hk.enabled && hk.vk && !skipRegisterHotKeyFor(hk)) {
+                if (hk.enabled && hk.vk && !skipDedicatedFor(hk, true)) {
                     tryReg(HOTKEY_RECORDING_BASE + i, hk.modifiers, hk.vk,
                         L"录制「" + recordings_[static_cast<size_t>(i)].name + L"」");
                 }
@@ -203,14 +216,14 @@ void EngineHost::RegisterAllHotkeys() {
             if (!ghPlaybackHotkeySuspended && !typingMuted) {
                 for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
                     const auto& hk = scripts_[static_cast<size_t>(i)].hotkey;
-                    if (hk.enabled && hk.vk && IsMouseVk(hk.vk) && !skipRegisterHotKeyFor(hk)) {
+                    if (hk.enabled && hk.vk && IsMouseVk(hk.vk) && !skipDedicatedFor(hk, false)) {
                         tryReg(HOTKEY_SCRIPT_BASE + i, hk.modifiers, hk.vk,
                             L"脚本「" + scripts_[static_cast<size_t>(i)].name + L"」");
                     }
                 }
                 for (int i = 0; i < static_cast<int>(recordings_.size()) && i < 100; ++i) {
                     const auto& hk = recordings_[static_cast<size_t>(i)].hotkey;
-                    if (hk.enabled && hk.vk && IsMouseVk(hk.vk) && !skipRegisterHotKeyFor(hk)) {
+                    if (hk.enabled && hk.vk && IsMouseVk(hk.vk) && !skipDedicatedFor(hk, true)) {
                         tryReg(HOTKEY_RECORDING_BASE + i, hk.modifiers, hk.vk,
                             L"录制「" + recordings_[static_cast<size_t>(i)].name + L"」");
                     }
@@ -378,6 +391,83 @@ void EngineHost::RefreshGlobalHotkeyHooks() {
             { UnhookWindowsHookEx(ghHotkeyMouseHook); ghHotkeyMouseHook = nullptr; }
         EnsureHotkeyAuxTimers();
     }
+
+// ── 专属热键作用域刷新 ────────────────────────────────────────────
+// 作用域外的专属热键**既不注册、也不吞键**：它只在自己 TAB 里存在，
+// 其它页面必须让这个物理键原样落到前台程序（否则「按 P 打不出 P」）。
+//
+// 切 TAB / 改「全部页面生效」后必须同时刷新两处，缺一不可：
+//   ① LL 钩子表 inScope —— 回放挂起 / IME 兼容 / RegisterHotKey 失败时，
+//      钩子是唯一通道，作用域外必须 CallNextHookEx 放行
+//   ② RegisterHotKey 注销 / 补注册 —— 系统热键通道会直接吞键
+// 运行中保留注册（热键要能停宏）；回放挂起时本就全部注销、改走 LL 钩子。
+void EngineHost::RefreshDedicatedHotkeyScope() {
+#ifndef MOD_NOREPEAT
+#define MOD_NOREPEAT 0x4000
+#endif
+    const bool macroOk = DedicatedHotkeyInScope(false);
+    const bool recOk = DedicatedHotkeyInScope(true);
+    for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
+        auto& h = ghPlaybackScriptHooks[i];
+        h.inScope = (h.hotkeyId >= HOTKEY_RECORDING_BASE) ? recOk : macroOk;
+        if (!h.inScope && !h.holdActive && !IsActiveHoldHotkeyId(h.hotkeyId)) {
+            // 作用域外不再武装长按：清掉闩锁，避免切页前按住的键在切页后仍被吞
+            h.holdArmed = false;
+            h.holdDownTick = 0;
+            h.holdDownQpc = 0;
+        }
+    }
+    if (!hwnd_ || !IsWindow(hwnd_)) return;
+
+    const bool keepForStop = running_ || clicking_ || recording_
+        || ghHotkeySessionBusy.load(std::memory_order_relaxed);
+    const bool passMode = appSettings_.other.resolveImeConflict;
+    const bool skipKeyboardRegister = ghPlaybackHotkeySuspended || passMode
+        || ghUiModeHotkeysMuted.load(std::memory_order_relaxed) || UiTypingHotkeysMuted();
+
+    int nReg = 0;
+    int nUnreg = 0;
+    auto syncOne = [&](int id, const Hotkey& hk, bool isRecording) {
+        // 输入框聚焦 / IME 兼容 / 回放挂起：键盘热键不注册（鼠标键仍可走 RegisterHotKey）
+        const bool skipTyping = skipKeyboardRegister && !IsMouseVk(hk.vk);
+        // 长按 / 左键 / 与全局启停同键：本来就不走 RegisterHotKey（走 LL 或全局通道）
+        const bool notRegisterChannel = hk.holdMode || hk.vk == VK_LBUTTON
+            || (globalHotkey_.enabled && globalHotkey_.vk
+                && hk.vk == globalHotkey_.vk && hk.modifiers == globalHotkey_.modifiers);
+        // 作用域外注销（不再吞键）；运行中保留，保证按热键还能停宏。
+        // 判据见 engine/hotkey_scope.h（产品与 HotkeyScopeSelfTest 共用一份）。
+        const bool outOfScope = !qst::hotkey_scope::AllowSystemRegister(
+            DedicatedHotkeyInScope(isRecording), keepForStop);
+        if (!hk.enabled || skipTyping || notRegisterChannel || outOfScope) {
+            if (UnregisterHotKey(hwnd_, id)) ++nUnreg;  // 只有真的注销了才计数
+            RemoveRegFailId(id);
+            return;
+        }
+        if (RegisterHotKey(hwnd_, id, hk.modifiers | MOD_NOREPEAT, hk.vk)) {
+            RemoveRegFailId(id);
+            ++nReg;
+        } else {
+            AddRegFailId(id);
+        }
+    };
+    for (int i = 0; i < static_cast<int>(scripts_.size()) && i < 100; ++i) {
+        syncOne(HOTKEY_SCRIPT_BASE + i, scripts_[static_cast<size_t>(i)].hotkey, false);
+    }
+    for (int i = 0; i < static_cast<int>(recordings_.size()) && i < 100; ++i) {
+        syncOne(HOTKEY_RECORDING_BASE + i, recordings_[static_cast<size_t>(i)].hotkey, true);
+    }
+    // 诊断：只在真的发生注册/注销时打一行。实机核对「切到别的 TAB 后专属热键
+    // 是否被释放（不再吞键）」就看 webview_boot.log 里的 HOTKEY: 行 ——
+    // 切到作用域外的 TAB 应出现 unregistered>=1，切回来应出现 registered>=1。
+    if (nReg != 0 || nUnreg != 0) {
+        HotkeyDiagLog("scope refresh tab=" + std::to_string(static_cast<int>(activeHomeTab_))
+            + " scopeAll=" + std::to_string(homeHotkeyScopeAll_ ? 1 : 0)
+            + " macroOk=" + std::to_string(macroOk ? 1 : 0)
+            + " recOk=" + std::to_string(recOk ? 1 : 0)
+            + " registered=" + std::to_string(nReg)
+            + " unregistered=" + std::to_string(nUnreg));
+    }
+}
 
 // was engine_host_window.h:11817-11977
 void EngineHost::OnHotkey(int id, int holdCmd) {
@@ -574,6 +664,9 @@ void EngineHost::OnHotkey(int id, int holdCmd) {
             }
             if (holdKey && holdCmd == static_cast<int>(kHotHoldStart)) {
                 if (running_) return;
+                // 专属热键作用域：只有「当前页面列出了该条目」才允许**启动**回放。
+                // （停止在上面已放行，不受此限制）
+                if (!DedicatedHotkeyInScope(true)) return;
                 for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
                     auto& h = ghPlaybackScriptHooks[i];
                     if (h.hotkeyId != id) continue;
@@ -623,6 +716,8 @@ void EngineHost::OnHotkey(int id, int holdCmd) {
                 StopRun();
                 return;
             }
+            // 专属热键作用域：停止已在上方放行，这里只管启动。
+            if (!DedicatedHotkeyInScope(true)) return;
             if (!recConsumeOk) return;
             if (tickSlot) *tickSlot = now;
             SetScriptToggleNeedKeyUp(id, true);
@@ -652,6 +747,8 @@ void EngineHost::OnHotkey(int id, int holdCmd) {
             }
             if (holdKey && holdCmd == static_cast<int>(kHotHoldStart)) {
                 if (running_) return;
+                // 专属热键作用域：只有「当前页面列出了该条目」才允许**启动**回放。
+                if (!DedicatedHotkeyInScope(false)) return;
                 // 短按抬起已作废：丢弃迟到 Start
                 for (int i = 0; i < ghPlaybackScriptHookCount; ++i) {
                     auto& h = ghPlaybackScriptHooks[i];
@@ -704,6 +801,8 @@ void EngineHost::OnHotkey(int id, int holdCmd) {
                 StopRun();
                 return;
             }
+            // 专属热键作用域：停止已在上方放行，这里只管启动。
+            if (!DedicatedHotkeyInScope(false)) return;
             if (!scriptConsumeOk) return;
             if (tickSlot) *tickSlot = now;
             SetScriptToggleNeedKeyUp(id, true);

@@ -5,6 +5,7 @@
 #include "desktop_tools/float_ball.h"
 
 #include "app_theme.h"
+#include "overlay_input_guard.h"
 #include "themed_popup_menu.h"
 
 #include <objidl.h>
@@ -26,10 +27,16 @@ constexpr UINT kCollapseTimer = 2;
 constexpr UINT kAnimTimer = 3;
 constexpr UINT kFsTimer = 4;
 constexpr UINT kPulseTimer = 5;
+/// 拖拽兜底自检（见 overlay_input_guard.h）。悬浮球是 **WS_EX_TOPMOST 常显窗**，
+/// 拖拽期间它扣着鼠标捕获；终止事件（抬起）丢了就会永久扣住 ⇒ 整个桌面点不动。
+constexpr UINT kDragGuardTimer = 6;
 constexpr UINT kCollapseDelayMs = 140;
 constexpr int kDragSlopPx = 6;
+// 进入全屏立即隐藏；退出全屏延迟这么久再恢复，避免 Alt+Tab / 全屏切换瞬间闪烁。
+// 实际生效延迟 ≈ 本值向上取整到 kFsTimer 周期（400ms）。
+constexpr DWORD kFsRestoreDelayMs = 400;
 
-enum Hit : int { HitNone = 0, HitBall = 1, HitButton = 2, HitPanel = 3 };
+enum Hit : int { HitNone = 0, HitBall = 1, HitPanel = 2 };
 
 Gdiplus::Color Argb(BYTE a, COLORREF c) {
     return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
@@ -44,33 +51,8 @@ void AddRoundRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rc, float r
     path.CloseFigure();
 }
 
-bool IsOwnProcessWindow(HWND hwnd) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    return pid == GetCurrentProcessId();
-}
-
-bool IsForegroundFullscreen() {
-    HWND fg = GetForegroundWindow();
-    if (!fg || !IsWindow(fg) || IsOwnProcessWindow(fg)) return false;
-    wchar_t cls[64]{};
-    GetClassNameW(fg, cls, 64);
-    if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"WorkerW") == 0
-        || _wcsicmp(cls, L"Shell_TrayWnd") == 0) {
-        return false;
-    }
-    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(mon, &mi)) return false;
-    RECT wr{};
-    if (!GetWindowRect(fg, &wr)) return false;
-    const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-    const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-    const int ww = wr.right - wr.left;
-    const int wh = wr.bottom - wr.top;
-    return mw > 0 && mh > 0 && ww >= mw * 95 / 100 && wh >= mh * 95 / 100;
-}
+// 全屏判据统一在 float_ball_geom.h 的 FloatBallIsForegroundFullscreen()：
+// 产品与诊断探针（tools/float_ball_probe.cpp）共用同一份，避免口径漂移。
 
 struct MonitorPick {
     RECT work{};
@@ -221,8 +203,14 @@ void DrawActivityGlyph(Gdiplus::Graphics& g, float cx, float cy, float rad,
     FloatBallActivity activity, Gdiplus::Color accent) {
     Gdiplus::SolidBrush glyph(accent);
     const float s = rad * 0.34f;
-    if (activity == FloatBallActivity::BreakoutPaused
-        || activity == FloatBallActivity::MacroRunning) {
+    if (activity == FloatBallActivity::MacroRunning) {
+        // 视频播放器语义：运行中 = ■ 停止（与待启动 ▶ 对仗）。
+        // BreakoutPaused（脱离态）单独保留两竖，因为脱离 = 暂停，混用会让用户分不清。
+        const float side = s * 1.45f;
+        Gdiplus::GraphicsPath stop;
+        AddRoundRect(stop, Gdiplus::RectF(cx - side * 0.5f, cy - side * 0.5f, side, side), 2.4f);
+        g.FillPath(&glyph, &stop);
+    } else if (activity == FloatBallActivity::BreakoutPaused) {
         Gdiplus::GraphicsPath pause;
         AddRoundRect(pause, Gdiplus::RectF(cx - s * 0.62f, cy - s, s * 0.36f, s * 2), 2.4f);
         AddRoundRect(pause, Gdiplus::RectF(cx + s * 0.22f, cy - s, s * 0.36f, s * 2), 2.4f);
@@ -234,6 +222,7 @@ void DrawActivityGlyph(Gdiplus::Graphics& g, float cx, float cy, float rad,
         g.FillEllipse(&glyph, cx - s * 0.20f, cy - s * 0.20f, s * 0.40f, s * 0.40f);
         g.FillEllipse(&glyph, cx + s * 0.68f, cy - s * 0.20f, s * 0.40f, s * 0.40f);
     } else {
+        // Idle / 其它：▶ 播放图标（待启动）。
         Gdiplus::GraphicsPath play;
         Gdiplus::PointF tri[3] = {
             {cx - s * 0.38f, cy - s * 0.92f},
@@ -293,6 +282,52 @@ void DrawHeadRing(Gdiplus::Graphics& g, float cx, float cy, float rad,
 
     Gdiplus::SolidBrush spec(Gdiplus::Color(70, 255, 255, 255));
     g.FillEllipse(&spec, cx - rad * 0.46f, cy - rad * 0.58f, rad * 0.55f, rad * 0.28f);
+}
+
+// 状态行墨色：未运行=中性灰蓝；运行/连点=主题强调色；录制/脱离=琥珀（与圆头 ring 同色系）。
+COLORREF StatusInk(const quickscript::AppTheme& theme, FloatBallActivity activity) {
+    switch (activity) {
+    case FloatBallActivity::Recording:
+        return RGB(217, 119, 6);
+    case FloatBallActivity::BreakoutPaused:
+        return RGB(180, 83, 9);
+    case FloatBallActivity::Clicking:
+    case FloatBallActivity::MacroRunning:
+        return theme.accentColor;
+    default:
+        return RGB(100, 116, 139);
+    }
+}
+
+// 面板第二行 = ● + 文案（同色），整体在 rect 内水平居中（长文案走省略号，不越出胶囊）。
+void DrawStatusLine(Gdiplus::Graphics& g, const Gdiplus::FontFamily* fam, const RECT& rc,
+    const std::wstring& text, COLORREF ink) {
+    if (text.empty()) return;
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+    const float lineH = static_cast<float>(rc.bottom - rc.top);
+    Gdiplus::Font font(fam, (std::max)(12.f, lineH * 0.46f), Gdiplus::FontStyleBold,
+        Gdiplus::UnitPixel);
+    if (font.GetLastStatus() != Gdiplus::Ok) return;
+    Gdiplus::StringFormat fmt;
+    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    const Gdiplus::RectF box(static_cast<Gdiplus::REAL>(rc.left), static_cast<Gdiplus::REAL>(rc.top),
+        static_cast<Gdiplus::REAL>(rc.right - rc.left), static_cast<Gdiplus::REAL>(rc.bottom - rc.top));
+    Gdiplus::RectF bounds;
+    if (g.MeasureString(text.c_str(), -1, &font, box, &fmt, &bounds) != Gdiplus::Ok) return;
+    const float dotR = (std::max)(2.6f, lineH * 0.10f);
+    const float gap = (std::max)(4.f, lineH * 0.15f);
+    float groupW = dotR * 2.f + gap + bounds.Width;
+    if (groupW > box.Width) groupW = box.Width;
+    const float groupL = box.X + (box.Width - groupW) * 0.5f;
+    const float midY = box.Y + box.Height * 0.5f;
+    Gdiplus::SolidBrush brush(Argb(255, ink));
+    g.FillEllipse(&brush, groupL, midY - dotR, dotR * 2.f, dotR * 2.f);
+    const float textL = groupL + dotR * 2.f + gap;
+    g.DrawString(text.c_str(), -1, &font,
+        Gdiplus::RectF(textL, box.Y, (std::max)(1.f, box.GetRight() - textL), box.Height),
+        &fmt, &brush);
 }
 
 }  // namespace
@@ -399,16 +434,19 @@ void FloatBall::SetVisible(bool show) {
     userVisible_ = show;
     if (!hwnd_ || !IsWindow(hwnd_)) return;
     if (!show) {
+        fsExitTick_ = 0;
         ShowWindow(hwnd_, SW_HIDE);
         return;
     }
-    TickFullscreen();
-    if (!fsHidden_) {
-        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
-        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        ApplyLayout(true);
-    }
+    // 用户主动显示：直接按当前全屏状态决定，跳过"退出全屏延迟"
+    // （那个滞回只为自动切换服务，手动开关应当立刻生效）。
+    fsExitTick_ = 0;
+    fsHidden_ = FloatBallIsForegroundFullscreen();
+    if (fsHidden_) return;
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ApplyLayout(true);
 }
 
 void FloatBall::SetPlacement(bool docked, int edge, double xRatio, double yRatio,
@@ -430,7 +468,7 @@ void FloatBall::SetPlacement(bool docked, int edge, double xRatio, double yRatio
 
 void FloatBall::SetModel(const FloatBallModel& model) {
     model_ = model;
-    RelayoutNoScriptButton();
+    RelayoutPanelLines();
     if (hwnd_ && IsWindow(hwnd_)) Paint();
 }
 
@@ -458,7 +496,7 @@ FloatBallMetrics FloatBall::ScaledMetrics(HMONITOR mon) const {
     m.neckPx = S(32);
     m.gapPx = 0;
     m.padPx = S(8);
-    m.buttonH = S(28);
+    m.lineH = S(28);
     m.snapPx = (std::max)(40, S(56));
     m.shadowPx = (std::max)(4, S(6));
     return m;
@@ -508,7 +546,7 @@ void FloatBall::ApplyLayout(bool paint) {
         frame_ = ComputeDockedAnimFrame(work, edge_, xRatio_, yRatio_, metrics_, t);
     }
     ApplyShadowPad();
-    RelayoutNoScriptButton();
+    RelayoutPanelLines();
     const int w = (std::max)(1, static_cast<int>(frame_.window.right - frame_.window.left));
     const int h = (std::max)(1, static_cast<int>(frame_.window.bottom - frame_.window.top));
     RECT cur{};
@@ -540,7 +578,6 @@ void FloatBall::ApplyShadowPad() {
     };
     off(frame_.local.ball);
     off(frame_.local.panel);
-    off(frame_.local.button);
     off(frame_.local.title);
     off(frame_.local.status);
     frame_.window.left -= padL;
@@ -549,21 +586,11 @@ void FloatBall::ApplyShadowPad() {
     frame_.window.bottom += padB;
 }
 
-void FloatBall::RelayoutNoScriptButton() {
-    if (model_.canStart || model_.busy) return;
-    RECT& btn = frame_.local.button;
-    RECT& title = frame_.local.title;
-    if (btn.right <= btn.left || btn.bottom <= btn.top) return;
-    RECT slot = btn;
-    if (title.bottom > title.top) {
-        slot.top = (std::min)(btn.top, title.top);
-        slot.bottom = (std::max)(btn.bottom, title.bottom);
-    }
-    const int slotH = static_cast<int>(slot.bottom - slot.top);
-    const int bh = (std::min)(metrics_.buttonH, (std::max)(16, slotH));
-    const int y = slot.top + ((slot.bottom - slot.top) - bh) / 2;
-    btn = {slot.left, y, slot.right, y + bh};
-    title = {};
+// 面板文字只有一行时让它占满整个 body（垂直居中），别留出半屏空白。
+// 判断本体是 float_ball_geom.h 的纯函数 LayoutPanelLines()（自检逐格断言），
+// 这里只负责把 model 的文本有无喂进去。
+void FloatBall::RelayoutPanelLines() {
+    LayoutPanelLines(frame_.local, metrics_, !model_.title.empty(), !model_.statusText.empty());
 }
 
 float FloatBall::LayoutT() const {
@@ -644,7 +671,6 @@ void FloatBall::Paint() {
         const float cx = (brc.left + brc.right) * 0.5f;
         const float cy = (brc.top + brc.bottom) * 0.5f;
         const float rad = (brc.right - brc.left) * 0.5f - 1.f;
-        const bool headLook = dragging_ || !docked_ || LayoutT() >= kFloatBallDockBallPhase;
         const bool panelOn = PanelVisible();
         const bool showChrome = panelOn && LayoutT() >= 0.62f;
 
@@ -655,7 +681,8 @@ void FloatBall::Paint() {
         Gdiplus::StringFormat center;
         center.SetAlignment(Gdiplus::StringAlignmentCenter);
         center.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        center.SetTrimming(Gdiplus::StringTrimmingNone);
+        // 脚本名可能很长：宁可省略号，也不许越出胶囊压到圆头上。
+        center.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
         center.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 
         const int sh = metrics_.shadowPx;
@@ -720,44 +747,53 @@ void FloatBall::Paint() {
 
             g.SetClip(&stadium, Gdiplus::CombineModeIntersect);
 
-            const RECT& btn = frame_.local.button;
-            const bool en = ButtonEnabled();
-            const bool hoverBtn = hoverHit_ == HitButton;
-            COLORREF btnFill = model_.busy ? glow : theme.mainColor;
-            if (!en) btnFill = RGB(148, 163, 176);
-            const int btnW = btn.right - btn.left;
-            const int btnH = btn.bottom - btn.top;
-            if (showChrome && btnW > 8 && btnH >= 16) {
-                Gdiplus::GraphicsPath btnPath;
-                const Gdiplus::RectF btnRf(
-                    static_cast<Gdiplus::REAL>(btn.left),
-                    static_cast<Gdiplus::REAL>(btn.top),
-                    static_cast<Gdiplus::REAL>(btnW),
-                    static_cast<Gdiplus::REAL>(btnH));
-                AddRoundRect(btnPath, btnRf, (std::min)(btnRf.Width, btnRf.Height) * 0.5f);
-                Gdiplus::Color btnA = Argb(en ? 255 : 150, btnFill);
-                Gdiplus::Color btnB = en
-                    ? Gdiplus::Color(255,
-                        static_cast<BYTE>((std::min)(255, GetRValue(btnFill) + (hoverBtn ? 18 : 8))),
-                        static_cast<BYTE>((std::min)(255, GetGValue(btnFill) + (hoverBtn ? 18 : 8))),
-                        static_cast<BYTE>((std::min)(255, GetBValue(btnFill) + (hoverBtn ? 12 : 4))))
-                    : btnA;
-                Gdiplus::LinearGradientBrush btnBr(btnRf, btnA, btnB, 90.f);
-                g.FillPath(&btnBr, &btnPath);
-                Gdiplus::Font btnFont(useFam, (std::max)(15.f, static_cast<float>(metrics_.buttonH) * 0.58f),
-                    Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-                Gdiplus::SolidBrush btnText(Gdiplus::Color(255, 255, 255, 255));
-                g.DrawString(ButtonLabel(), -1, &btnFont, btnRf, &center, &btnText);
+            // 面板内容（2026-09-24 改交互，用户定稿）：
+            //   第一行 title  = 脚本名
+            //   第二行 status = 脚本当前状态（**原「启动/停止」按钮的位置**，按钮已删）
+            // 启停归圆头图标；整块面板点击 = 显示主窗口（HitTest → HitPanel）。
+            // 只有一行内容时由 RelayoutPanelLines() 居中占满。
+            if (hoverHit_ == HitPanel) {
+                // 悬停反馈：只提亮可点的文字块（不含圆头 —— 圆头是启停开关，另一件事）。
+                RECT wash{};
+                auto merge = [&wash](const RECT& r) {
+                    if (r.right <= r.left || r.bottom <= r.top) return;
+                    if (wash.right <= wash.left || wash.bottom <= wash.top) {
+                        wash = r;
+                        return;
+                    }
+                    wash.left = (std::min)(wash.left, r.left);
+                    wash.top = (std::min)(wash.top, r.top);
+                    wash.right = (std::max)(wash.right, r.right);
+                    wash.bottom = (std::max)(wash.bottom, r.bottom);
+                };
+                merge(frame_.local.title);
+                merge(frame_.local.status);
+                if (wash.right > wash.left && wash.bottom > wash.top) {
+                    const RECT& pr = frame_.local.panel;
+                    wash.left = (std::max)(wash.left - 5, pr.left);
+                    wash.right = (std::min)(wash.right + 5, pr.right);
+                    wash.top = (std::max)(wash.top - 3, pr.top);
+                    wash.bottom = (std::min)(wash.bottom + 3, pr.bottom);
+                    const Gdiplus::RectF washRf(
+                        static_cast<Gdiplus::REAL>(wash.left),
+                        static_cast<Gdiplus::REAL>(wash.top),
+                        static_cast<Gdiplus::REAL>(wash.right - wash.left),
+                        static_cast<Gdiplus::REAL>(wash.bottom - wash.top));
+                    Gdiplus::GraphicsPath washPath;
+                    AddRoundRect(washPath, washRf, (std::min)(washRf.Width, washRf.Height) * 0.5f);
+                    Gdiplus::SolidBrush hoverWash(Argb(16, theme.mainColor));
+                    g.FillPath(&hoverWash, &washPath);
+                }
             }
 
             const RECT& titleRc = frame_.local.title;
-            if (showChrome && (model_.canStart || model_.busy)
+            if (showChrome && !model_.title.empty()
                 && titleRc.right > titleRc.left && titleRc.bottom > titleRc.top) {
-                Gdiplus::Font titleFont(useFam, (std::max)(12.5f, static_cast<float>(metrics_.buttonH) * 0.48f),
+                Gdiplus::Font titleFont(useFam,
+                    (std::max)(12.5f, static_cast<float>(metrics_.lineH) * 0.48f),
                     Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
                 Gdiplus::SolidBrush muted(Gdiplus::Color(255, 38, 52, 70));
-                const std::wstring sub = model_.title;
-                g.DrawString(sub.c_str(), -1, &titleFont,
+                g.DrawString(model_.title.c_str(), -1, &titleFont,
                     Gdiplus::RectF(
                         static_cast<Gdiplus::REAL>(titleRc.left),
                         static_cast<Gdiplus::REAL>(titleRc.top),
@@ -765,22 +801,22 @@ void FloatBall::Paint() {
                         static_cast<Gdiplus::REAL>(titleRc.bottom - titleRc.top)),
                     &center, &muted);
             }
+
+            const RECT& statusRc = frame_.local.status;
+            if (showChrome) {
+                DrawStatusLine(g, useFam, statusRc, model_.statusText,
+                    StatusInk(theme, model_.activity));
+            }
             g.ResetClip();
         } else {
             DrawHeadRing(g, cx, cy, rad, ring, glow, model_.activity != FloatBallActivity::Idle,
                 pulse, true, remain01);
         }
 
-        if (headLook && !model_.statusText.empty()) {
-            Gdiplus::Font headFont(useFam, (std::max)(14.f, rad * 0.42f),
-                Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-            Gdiplus::SolidBrush ink(Gdiplus::Color(255, 28, 52, 72));
-            g.DrawString(model_.statusText.c_str(), -1, &headFont,
-                Gdiplus::RectF(cx - rad * 0.78f, cy - rad * 0.36f, rad * 1.56f, rad * 0.72f),
-                &center, &ink);
-        } else if (!headLook) {
-            DrawActivityGlyph(g, cx, cy, rad, model_.activity, Argb(255, ring));
-        }
+        // 圆头图标 = 启停开关，同时也是状态指示：
+        // Idle=▶ 待启动 / MacroRunning=■ 停止 / Recording=● 录制 / Clicking=··· 连点 /
+        // BreakoutPaused=‖ 已暂停。面板文字不再参与球心（旧 statusText 球心文案路径已删）。
+        DrawActivityGlyph(g, cx, cy, rad, model_.activity, Argb(255, ring));
     }
 
     HDC mem = CreateCompatibleDC(screen);
@@ -920,9 +956,28 @@ void FloatBall::TickAnim() {
 }
 
 void FloatBall::TickFullscreen() {
-    const bool fs = IsForegroundFullscreen();
-    if (fs == fsHidden_) return;
-    fsHidden_ = fs;
+    const bool fs = FloatBallIsForegroundFullscreen();
+    const DWORD now = GetTickCount();
+    if (fs) {
+        // 进入全屏：立即隐藏（不遮挡全屏内容）
+        fsExitTick_ = 0;
+        if (fsHidden_) return;
+        fsHidden_ = true;
+    } else {
+        if (!fsHidden_) {
+            fsExitTick_ = 0;
+            return;
+        }
+        // 退出全屏：延迟恢复。全屏切换（Alt+Tab、播放器退出、UAC 提权）过程中
+        // 前台窗口会短暂在"覆盖整屏/不覆盖"之间跳，立即恢复会让悬浮球闪烁。
+        if (fsExitTick_ == 0) {
+            fsExitTick_ = now ? now : 1;
+            return;
+        }
+        if (now - fsExitTick_ < kFsRestoreDelayMs) return;
+        fsExitTick_ = 0;
+        fsHidden_ = false;
+    }
     if (!hwnd_ || !IsWindow(hwnd_) || !userVisible_) return;
     ShowWindow(hwnd_, fsHidden_ ? SW_HIDE : SW_SHOWNOACTIVATE);
     if (!fsHidden_) {
@@ -973,6 +1028,8 @@ void FloatBall::BeginDrag() {
     dragGrab_.x = screen.x - (wr.left + frame_.local.ball.left);
     dragGrab_.y = screen.y - (wr.top + frame_.local.ball.top);
     SetCapture(hwnd_);
+    // ★ 兜底：抬起丢了要能自己收尾 —— 悬浮球是顶置常显窗，扣住捕获就是整个桌面点不动
+    if (hwnd_) SetTimer(hwnd_, kDragGuardTimer, overlay_guard::kGuardTickMs, nullptr);
     Paint();
 }
 
@@ -1008,6 +1065,8 @@ void FloatBall::UpdateDrag(POINT screen) {
 }
 
 void FloatBall::EndDrag() {
+    // 兜底定时器必须在早退之前停掉，否则「本来就没在拖」的那次调用会把定时器留在世上
+    if (hwnd_) KillTimer(hwnd_, kDragGuardTimer);
     if (!pendingDrag_ && !dragging_) return;
     ReleaseCapture();
     pendingDrag_ = false;
@@ -1064,33 +1123,28 @@ int FloatBall::HitTest(int x, int y) const {
         if (PointInCircle(x, y, frame_.local.ball) || inStadium) return HitBall;
         return HitNone;
     }
-    const bool panelOn = PanelVisible();
-    if (panelOn && PointInRect(x, y, frame_.local.button)) return HitButton;
+    // 新交互（2026-09-24）：球 = 切启动/停止；其它可点区域 = 显示主窗口。
+    // 不再有独立的「按钮」hit —— button 矩形不再绘制也不参与命中。
     if (PointInCircle(x, y, frame_.local.ball)) return HitBall;
-    if (panelOn && PointInRect(x, y, frame_.local.panel)) return HitPanel;
-    if (inStadium) return panelOn ? HitPanel : HitBall;
+    if (inStadium) return HitPanel;
     if (docked_ && x >= 0 && y >= 0 && x < ww && y < hh) return HitBall;
     return HitNone;
 }
 
-bool FloatBall::ButtonEnabled() const {
-    return true;
-}
-
-const wchar_t* FloatBall::ButtonLabel() const {
-    if (model_.busy) return L"停止";
-    if (model_.canStart) return L"启动";
-    return L"选择脚本";
-}
-
 void FloatBall::OnPrimaryClick(int hit) {
-    if (hit != HitButton) return;
-    if (model_.busy) {
-        if (cb_.onStopRunning) cb_.onStopRunning();
-    } else if (model_.canStart) {
-        if (cb_.onStartSelectedMacro) cb_.onStartSelectedMacro();
-    } else if (cb_.onShowMainWindow) {
-        cb_.onShowMainWindow();
+    if (hit == HitBall) {
+        // 球 = 切启动/停止。Idle/Recording/Clicking/BreakoutPaused/MacroRunning 都走这个分支：
+        // busy ⇒ 停；canStart（无脚本选中不算）⇒ 启；都没有 ⇒ 兜底显示主窗口。
+        if (model_.busy) {
+            if (cb_.onStopRunning) cb_.onStopRunning();
+        } else if (model_.canStart) {
+            if (cb_.onStartSelectedMacro) cb_.onStartSelectedMacro();
+        } else if (cb_.onShowMainWindow) {
+            cb_.onShowMainWindow();
+        }
+    } else if (hit == HitPanel) {
+        // 标题/面板 = 显示主窗口。
+        if (cb_.onShowMainWindow) cb_.onShowMainWindow();
     }
 }
 
@@ -1133,6 +1187,13 @@ LRESULT FloatBall::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         ApplyLayout(true);
         return 0;
     case WM_TIMER:
+        if (wp == kDragGuardTimer) {
+            // ★ 兜底（overlay_input_guard.h）：拖拽的终止事件（抬起）丢了 ⇒ 这个**顶置常显**窗
+            //   会永久扣住鼠标捕获 ⇒ 整个桌面点不动。本地还能乱点自救，远控下几乎没有别的入口。
+            //   判据：捕获在我们手上 + **没有**任何鼠标键按下 + 已停手 ≥1200ms（三条同时成立）。
+            if (overlay_guard::ShouldAbortStuckCaptureNow(hwnd_)) EndDrag();
+            return 0;
+        }
         if (wp == kCollapseTimer) {
             KillTimer(hwnd_, kCollapseTimer);
             if (!docked_) return 0;
@@ -1210,7 +1271,6 @@ LRESULT FloatBall::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         TrackHover(false);
-        btnDown_ = false;
         ballPressed_ = false;
         hoverHit_ = HitNone;
         Paint();
@@ -1219,18 +1279,13 @@ LRESULT FloatBall::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         pressHit_ = HitTest(pt.x, pt.y);
         hoverHit_ = pressHit_;
-        btnDown_ = (pressHit_ == HitButton);
-        ballPressed_ = (pressHit_ == HitBall || pressHit_ == HitPanel || pressHit_ == HitButton);
+        ballPressed_ = (pressHit_ != HitNone);
         if (pressHit_ != HitNone)
             BeginDrag();
         else
             Paint();
         EnsureMoveCursors();
-        if (pressHit_ == HitButton && !dragMoved_) {
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        } else if (pressCursor_) {
-            SetCursor(pressCursor_);
-        }
+        if (pressCursor_) SetCursor(pressCursor_);
         return 0;
     }
     case WM_LBUTTONUP: {
@@ -1240,10 +1295,11 @@ LRESULT FloatBall::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         EndDrag();
         ballPressed_ = false;
         if (!wasDrag || !moved) {
+            // 同一 hit 才触发点击（按下时和松开时都命中相同区域）。
+            // 这样避免在按住期间鼠标滑出球再松手还误触。
             const int hit = HitTest(pt.x, pt.y);
-            if (btnDown_ && hit == HitButton) OnPrimaryClick(HitButton);
+            if (hit != HitNone && hit == pressHit_) OnPrimaryClick(hit);
         }
-        btnDown_ = false;
         pressHit_ = HitNone;
         hoverHit_ = HitTest(pt.x, pt.y);
         Paint();
@@ -1252,7 +1308,7 @@ LRESULT FloatBall::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDBLCLK: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         const int hit = HitTest(pt.x, pt.y);
-        if (hit != HitButton && hit != HitNone && cb_.onShowMainWindow) {
+        if (hit != HitNone && cb_.onShowMainWindow) {
             cb_.onShowMainWindow();
         }
         return 0;
@@ -1269,7 +1325,8 @@ LRESULT FloatBall::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         POINT c = pt;
         ScreenToClient(hwnd_, &c);
         const int hit = (dragging_ || pendingDrag_) ? HitBall : HitTest(c.x, c.y);
-        if (hit == HitButton) {
+        // 不再区分 ball vs 旧 button —— 整窗都是「可点/可拖」，统一用 hover/press cursor。
+        if (hit == HitNone) {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         } else {
             EnsureMoveCursors();

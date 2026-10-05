@@ -1,5 +1,6 @@
 #include "office_doc.h"
 
+#include "ooxml/xlsx_doc.h"
 #include "utils.h"
 
 #include <windows.h>
@@ -196,6 +197,36 @@ OfficeDocResult ReadOfficeDocument(const std::wstring& path, int maxChars, int p
     if (maxChars > 60000) maxChars = 60000;
     if (pageLimit < 1) pageLimit = 1;
     if (pageLimit > 20) pageLimit = 20;
+
+    // ★原生 xlsx 快路径（2026-09-23，自研 src/ooxml/）：**不依赖 PowerShell、不依赖 Office**。
+    //   为什么值得抢在脚本前面：
+    //     ① 不起进程 —— 脚本每次都要拉 `powershell.exe`（60s 超时），这是纯开销；
+    //     ② 环境里 PowerShell 被限制/不可用时也能读；
+    //     ③ ★**日期能正确还原** —— 脚本的 OOXML 回退分支只取 `<v>` 原文，
+    //        而 Excel 把日期存成序列号（2024-01-01 = 45292）⇒ 那条路线上的日期**一直是坏的**
+    //        （只有装了 Office 的 COM 路线才对）。原生路径按 `cellXfs` 的 numFmtId 还原成 ISO。
+    //   ⚠ 失败就**静默回退**到脚本（加密文件 / .xls 老格式 / 结构怪异 / 不支持的压缩方式），
+    //     所以行为只会变好，不会倒退。
+    if (format == L"xlsx" || format == L"xlsm") {
+        qst::ooxml::XlsxDoc xdoc;
+        std::string nerr;
+        if (xdoc.LoadFromFile(trimmed, nerr)) {
+            std::string text;
+            std::string derr;
+            // 行/列上限与脚本一致（200 行 / 40 列），免得同一份文件两条路线给的量差太多
+            if (xdoc.DumpWorkbookAsText(200, 40, text, derr)) {
+                out.ok = true;
+                out.engine = L"ooxml-native";
+                out.text = FromUtf8(text);
+                if (out.text.size() > static_cast<size_t>(maxChars)) {
+                    out.text.resize(static_cast<size_t>(maxChars));
+                    out.truncated = true;
+                    out.note = L"已按 maxChars 截断";
+                }
+                return out;
+            }
+        }
+    }
 
     std::wstring cmd = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ";
     cmd += QuoteWinArg(script);

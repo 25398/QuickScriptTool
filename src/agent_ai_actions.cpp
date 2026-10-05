@@ -1,9 +1,11 @@
 #include "agent_ai_actions.h"
 
+#include "ai_decide.h"
 #include "app_settings_store.h"
 #include "script_action_builder.h"
 #include "script_types.h"
 #include "utils.h"
+#include "web_ai/web_ai_config.h"
 
 #include <algorithm>
 #include <cctype>
@@ -25,6 +27,29 @@ bool ModelExistsInSettings(const quickscript::AiApiSettings& ai, const std::wstr
         if (m.modelName == name) return true;
     }
     return ai.modelName == name;
+}
+
+/// 网页版 AI 的**最后手段**模型名（用户显式开了开关、且设置里**没有任何可用 API Key**）。
+///
+/// ⚠⚠ 只能放在 `ResolveAiModelName` 的**所有既有分支之后**。放到前面会抢走
+///   「按 `ai.modelName` / `savedModels` 兜底」的既有顺序 —— 实测立刻转红：
+///   `AiActionRouterSelfTest/action_model_not_silently_swapped`（那条用例期望
+///   「动作写的模型不在设置里 → 退到 `ai.modelName`」，而 `ResolveActionAiModelName`
+///   正是**传空 preferred** 进来的，兜底会被误触发）。
+///   ⇒ 兜底的语义是「本来会得到**空**，才接手」，不是「优先用我」。
+std::wstring WebAiLastResortModel(const quickscript::AiApiSettings& ai, bool requireVision) {
+    if (!quickscript::webai::Enabled()) return L"";
+    bool hasRealKey = !Trim(ai.apiKey).empty();
+    if (!hasRealKey) {
+        for (const auto& m : ai.savedModels) {
+            if (!Trim(m.apiKey).empty()) { hasRealKey = true; break; }
+        }
+    }
+    if (hasRealKey) return L"";  // 用户有自己的 API ⇒ 绝不抢占（MEMORY.md §14 / 设计 §6）
+    const std::wstring webModel = quickscript::webai::ModelNameW();
+    if (webModel.empty()) return L"";
+    if (requireVision && !ModelSupportsVision(webModel)) return L"";
+    return webModel;
 }
 
 }  // namespace
@@ -55,12 +80,30 @@ bool ActionRequiresVisionModel(const ScriptAction& action) {
 quickscript::AppSettings LoadAgentAppSettings() {
     quickscript::AppSettings settings = quickscript::DefaultAppSettings();
     LoadAppSettings(settings);
+    // 网页版 AI（`AppDir()\web_ai_config.json` 里 enabled=true 才生效）：
+    //   ① 把 `doubao-web` 档案补进 savedModels（用户能在设置页看见它）
+    //   ② 若设置里**没有任何可用 API Key**，把默认模型指到本机网页 AI
+    //   ③ 功能关闭时本函数**什么都不做**（不碰用户任何 AI 配置）
+    // ⚠ 必须在 LoadAppSettings **之后**：否则刚读进来的用户配置会覆盖掉改写。
+    quickscript::webai::EnsureProfileInSettings(settings.ai);
     return settings;
 }
 
 bool ModelSupportsVision(const std::wstring& modelName) {
     const std::wstring lower = ToLowerCopy(Trim(modelName));
     if (lower.empty()) return false;
+
+    // ★★ 网页 AI 桥接（模型名 `web` / `doubao-web` / `deepseek-web` …）**能传图**。
+    //
+    //   为什么这条必须写在最前面：网页通道会经**扩展把图上传进那个对话**
+    //   （`web_ai_backend.cpp` 的 `AttachImagesToPage` → `WebAiDriver::UploadImages`），
+    //   而 `PlanTurn(..., imagesAttached=...)` 也确实收到了真实张数。
+    //   ⚠ 这里曾经漏判 —— 名字 `web` 里没有任何 `vl/vision/doubao/seed` 线索 ⇒
+    //     被判成「非多模态」⇒ **观察截图一律不上传**，模型只能靠文字索引猜屏幕
+    //     （用户实测报障：「网页 Agents 的 web 被判断为不能识图」）。
+    //   ⚠ 判据要用**桥自己的**判定函数（`IsWebAiModelName`），不要在这里另抄一份名单
+    //     （抄两份必然漂移：站点/默认模型名一改就漏）。
+    if (quickscript::webai::IsWebAiModelName(modelName)) return true;
 
     // DeepSeek：**v4 起是原生多模态**（v4-flash / v4.1-flash / *-vision 都能收图），
     // 而 V3.x / R1 / chat / reasoner 仍是纯文本。
@@ -114,6 +157,27 @@ bool ModelIsReasoningType(const std::wstring& modelName) {
     return false;
 }
 
+bool ModelSupportsReasoningEffort(const std::wstring& modelName) {
+    const std::wstring lower = ToLowerCopy(Trim(modelName));
+    if (lower.empty()) return false;
+    // DeepSeek V4/V5 系列：官方《Thinking Mode》明确 `reasoning_effort` 取
+    // low/high/max（默认 high），并给出档位映射表。
+    if (lower.find(L"deepseek-v4") != std::wstring::npos
+        || lower.find(L"deepseek-v5") != std::wstring::npos) {
+        return true;
+    }
+    // OpenAI o 系列：同样接受 `reasoning_effort`。
+    if (lower.find(L"o1") != std::wstring::npos
+        || lower.find(L"o3") != std::wstring::npos
+        || lower.find(L"o4") != std::wstring::npos) {
+        return true;
+    }
+    // 其余（deepseek-r1/reasoner、kimi-k2-thinking、grok-*-reasoning、豆包…）：
+    // 官方没写支持 ⇒ **不发**。它们在 ModelIsReasoningType 里仍然成立（那条判据
+    // 管的是「不发 temperature」），但两件事不能混为一谈。
+    return false;
+}
+
 std::wstring ResolveAiModelName(const quickscript::AiApiSettings& ai,
     bool requireVision, const std::wstring& preferred) {
     const std::wstring pref = Trim(preferred);
@@ -132,13 +196,16 @@ std::wstring ResolveAiModelName(const quickscript::AiApiSettings& ai,
         for (const auto& m : ai.savedModels) {
             if (ModelSupportsVision(m.modelName)) return m.modelName;
         }
-        return L"";
+        // ★ 最后手段：本来会得到空（"没有可用识图模型"）时才轮到网页版 AI
+        return WebAiLastResortModel(ai, /*requireVision=*/true);
     }
 
     for (const auto& m : ai.savedModels) {
         if (!m.modelName.empty()) return m.modelName;
     }
-    return ai.modelName;
+    if (!ai.modelName.empty()) return ai.modelName;
+    // ★ 最后手段：连一个模型名都没有时才轮到网页版 AI
+    return WebAiLastResortModel(ai, /*requireVision=*/false);
 }
 
 std::wstring FormatAvailableAiModelsList(const quickscript::AiApiSettings& ai) {
@@ -258,8 +325,13 @@ std::wstring MissingVisionModelError(const std::wstring& primaryModel) {
 }
 
 bool ShouldAttachObserveImageToPlanner(const std::wstring& plannerModel, bool haveImage) {
-    if (!haveImage) return false;
-    return ModelSupportsVision(plannerModel);
+    // 判断表（src/ai_decide.h）：判决与旧实现逐字等价（能看图 + 有图 → 附），
+    // 但把理由与置信度留进诊断 —— 「这轮为什么带了大图」过去只能靠读代码回答。
+    AiDecisionRecord rec;
+    const AiAttachFrame v = AiDecideAttachObserveFrame(
+        ModelSupportsVision(plannerModel), haveImage, &rec);
+    NoteAiDecisionLog(FormatAiDecision(L"attach_observe_frame", AiAttachFrameName(v), rec));
+    return v == AiAttachFrame::YesFrame;
 }
 
 std::wstring BuildSingleAgentActionResult(const nlohmann::json& actionParams,

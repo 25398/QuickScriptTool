@@ -1,5 +1,7 @@
 # Build output
 build/
+# 独立构建目录（build-solo，MSBuild 中间产物，与 build/ 同理）
+build-solo/
 out/
 dist/
 driver/qst_vhid/bin/
@@ -21,6 +23,8 @@ driver/qst_vhid/install_log.txt
 # IDE / temp
 .vscode/
 .tmp/
+# 手工备份的旧版文件（如 extension/edge/*.bak-20260921）
+*.bak-*
 *.user
 *.suo
 *.sdf
@@ -29,7 +33,12 @@ driver/qst_vhid/install_log.txt
 *.VC.opendb
 
 # Third-party binaries (install via scripts/setup_opencv.ps1)
-third_party/
+# ⚠ 用 `third_party/*` 而不是 `third_party/`：git **无法重新包含「已被排除的目录」下的文件**，
+#   而 MinHook（third_party/minhook/，随源码分发的 inline hook 引擎，BSD-2-Clause）必须入库 ——
+#   CMakeLists.txt 的 qst_minhook 目标直接编译它的 C 源码，不入库则新克隆 / CI 编译不过。
+third_party/*
+!third_party/minhook/
+!third_party/minhook/**
 
 # 例外：src/third_party 是**随源码分发的单头依赖**（nlohmann/json.hpp），
 # 必须入库 —— 否则新克隆编译不过（src/agent_core.h 直接 include 它）。
@@ -74,3 +83,10 @@ extension/edge/bridge_runtime.json
 # Website download binaries (generated; upload with site deploy)
 website/downloads/*.exe
 website/downloads/*.zip
+
+# 网页在线导出的播放器模板（同上：二进制由发版脚本生成，不入库）
+#   website/export/player/QstPlayer.exe 被上面的 *.exe 规则覆盖 —— 这是**有意**的，
+#   与 website/downloads/ 同一策略。补它的方式见 website/export/player/README.md：
+#     powershell -File tools\sync_web_export_player.ps1
+#   部署后打开 export/selftest.html 可确认它在位（缺了会报「模板不是有效的 exe」）。
+

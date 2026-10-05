@@ -139,8 +139,8 @@ Phase C（体验）
 | A2 另存为恢复菜单 | Agent 轮注入固定恢复步骤 |
 | L1 低特征模板 | 抬阈值 + 锚点邻域搜索 |
 | L2 OCR 列表校验 | `LooksLikeListOcrText` + listActivate 再 OCR |
-| L3 填表工具白名单 | `fillTableOnly` 过滤 runProgram/网页/hotkey |
-| L5 自检 | `locate_fail_key_block` / `fill_table_only_tools` / `list_ocr_heuristic` 等 |
+| L3 填表工具白名单 | ~~`fillTableOnly` 过滤 runProgram/网页/hotkey~~ **已整族撤销（批 E，docs §48）**：引擎不按提示词文本裁工具表 |
+| L5 自检 | `locate_fail_key_block` / ~~`fill_table_only_tools`（随裁表一并删除，批 E）~~ / `list_ocr_heuristic` 等 |
 
 ---
 

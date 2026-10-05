@@ -74,8 +74,11 @@ inline constexpr BridgeJsCommand kBridgeJsCommands[] = {
     {L"deleteLibraryFolder", L"bridge.js"},
     {L"deleteScheduledTask", L"bridge.js"},
     {L"deleteScript", L"bridge.js"},
+    {L"editorVarItems", L"bridge.js"},
     {L"endHotkeyCapture", L"bridge.js"},
     {L"exportScript", L"bridge.js"},
+    {L"scanScriptForExport", L"bridge.js"},
+    {L"exportScriptAsExe", L"bridge.js"},
     {L"findImageCrop", L"bridge.js"},
     {L"findImageMatch", L"bridge.js"},
     {L"formatHotkey", L"bridge.js"},
@@ -151,6 +154,9 @@ inline constexpr BridgeJsCommand kBridgeJsCommands[] = {
     {L"window.setHomeSize", L"bridge.js"},
     {L"window.setMode", L"bridge.js"},
     {L"window.uncloak", L"bridge.js"},
+    // ★ 窗口 Agents（把客户端窗口登记成模型；设置页「准星绑定窗口」入口）
+    {L"windowAgentList", L"bridge.js"},
+    {L"windowAgentBind", L"bridge.js"},
 };
 inline constexpr size_t kBridgeJsCommandCount =
     sizeof(kBridgeJsCommands) / sizeof(kBridgeJsCommands[0]);

@@ -1,6 +1,7 @@
 #include "recorder_timeline.h"
 
 #include "action_utils.h"
+#include "recorder_report_interval.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,11 +10,7 @@
 
 namespace {
 
-// Raw 队列积压时 QPC 戳会挤在亚毫秒内；真实 HID 报告多在 1–8ms。
-constexpr uint64_t kCompressedRelGapMaxUs = 500;
-constexpr uint64_t kDefaultRelReportUs = 8000;
-constexpr uint64_t kHealthyRelGapMinUs = 2000;
-constexpr uint64_t kHealthyRelGapMaxUs = 16000;
+constexpr double kExpandDurationEps = 1e-9;
 
 bool RecordedEventMatchesHotkey(const RecordedEvent& e, const Hotkey& hk) {
     if (!hk.enabled || !hk.vk) return false;
@@ -41,7 +38,18 @@ uint64_t SecondsToUs(double seconds) {
     return static_cast<uint64_t>(std::llround(us));
 }
 
-constexpr double kExpandDurationEps = 1e-9;
+/// 供诊断：最近一次 `PreparePlaybackTimeline` 的「细分前 / 细分后」相对移动包数。
+/// 回放线程写、回放线程读（`[时间轴统计]` 就在同一线程输出），不需要原子量。
+uint64_t g_spreadBefore = 0;
+uint64_t g_spreadAfter = 0;
+
+uint64_t CountRelativeMoves(const std::vector<ScriptAction>& actions) {
+    uint64_t n = 0;
+    for (const auto& a : actions) {
+        if (a.type == ActionType::MoveMouseRelative) ++n;
+    }
+    return n;
+}
 
 }  // namespace
 
@@ -100,34 +108,31 @@ void MergeAdjacentExplicitWaits(std::vector<ScriptAction>& actions) {
 void RepairCompressedRelativeGaps(std::vector<ScriptAction>& actions) {
     if (actions.size() < 2) return;
 
-    std::vector<uint64_t> healthy;
-    healthy.reserve(64);
-    for (size_t i = 1; i + 1 < actions.size(); ++i) {
-        if (actions[i].type != ActionType::Wait) continue;
-        if (actions[i - 1].type != ActionType::MoveMouseRelative) continue;
-        if (actions[i + 1].type != ActionType::MoveMouseRelative) continue;
-        if (actions[i].randomDuration > kExpandDurationEps) continue;
-        const uint64_t us = ActionStepUs(actions[i]);
-        if (us >= kHealthyRelGapMinUs && us <= kHealthyRelGapMaxUs)
-            healthy.push_back(us);
-    }
-
-    uint64_t targetUs = kDefaultRelReportUs;
-    if (!healthy.empty()) {
-        const size_t mid = healthy.size() / 2;
-        std::nth_element(healthy.begin(), healthy.begin() + static_cast<std::ptrdiff_t>(mid),
-            healthy.end());
-        targetUs = healthy[mid];
-        if (targetUs < 1000) targetUs = 1000;
-        if (targetUs > kHealthyRelGapMaxUs) targetUs = kHealthyRelGapMaxUs;
-    }
+    // 只修「明显短于本机报告周期」的间隔（队列积压 / 被系统合并）。
+    // ⚠ 旧实现把 [2000,16000]µs 认作唯一「健康」区间、其余一律回退 8000µs，
+    //   并把 <500µs 的间隔全部改写 ⇒ 2kHz 以上鼠标的录制在转换阶段被整体拉伸
+    //   （4kHz 的 250µs 间隔被拉到 8000µs，累计 32 倍），回放时「转视角 + 走路」
+    //   的位移与录制完全不同。改用中位数模型，见 recorder_report_interval.h。
+    qst_recorder::ReportIntervalModel model;
+    auto isRelWaitRel = [&](size_t i) {
+        if (i == 0 || i + 1 >= actions.size()) return false;
+        if (actions[i].type != ActionType::Wait) return false;
+        if (actions[i - 1].type != ActionType::MoveMouseRelative) return false;
+        if (actions[i + 1].type != ActionType::MoveMouseRelative) return false;
+        if (actions[i].randomDuration > kExpandDurationEps) return false;
+        return true;
+    };
 
     for (size_t i = 1; i + 1 < actions.size(); ++i) {
-        if (actions[i].type != ActionType::Wait) continue;
-        if (actions[i - 1].type != ActionType::MoveMouseRelative) continue;
-        if (actions[i + 1].type != ActionType::MoveMouseRelative) continue;
-        if (actions[i].randomDuration > kExpandDurationEps) continue;
-        if (ActionStepUs(actions[i]) >= kCompressedRelGapMaxUs) continue;
+        if (!isRelWaitRel(i)) continue;
+        model.ObserveGap(ActionStepUs(actions[i]));
+    }
+
+    const uint64_t targetUs = model.MedianUs();
+
+    for (size_t i = 1; i + 1 < actions.size(); ++i) {
+        if (!isRelWaitRel(i)) continue;
+        if (!model.IsCompressedGap(ActionStepUs(actions[i]))) continue;
         actions[i].timingUs = targetUs;
         actions[i].duration = targetUs / 1000000.0;
         actions[i].randomDuration = 0.0;
@@ -144,6 +149,99 @@ void RepairCompressedRelativeGaps(std::vector<ScriptAction>& actions) {
         out.push_back(std::move(a));
     }
     actions = std::move(out);
+}
+
+void SpreadRelativeMovePackets(std::vector<ScriptAction>& actions, int maxParts) {
+    if (maxParts < 2 || actions.size() < 2) return;
+
+    // 【为什么需要它】
+    // 游戏（GLFW/Minecraft 这类）是**每帧**把该帧内到达的鼠标位移求和后一次性应用
+    // （`yaw += Σdx * sens`）。录制时鼠标按固定报告周期发包，游戏每帧把落在该帧内的
+    // **整包**加起来；回放时若游戏帧边界与录制时不同相位，同一个包会落到不同的帧里，
+    // 于是「每帧累积量」与录制不同 ⇒ 视角曲线不同 ⇒ 走位轨迹不同。
+    // 这正是 `[回放保真]` 里「位移一致但偏差在目标侧」的那一半。
+    //
+    // 把每个包按它前面的等待窗口**再细分成若干份**铺满该窗口后，每帧拿到的是这段
+    // 位移的**积分**，而不是「整包进/整包出」——帧边界相位的影响被摊平，
+    // 回放结果变得与帧率/相位无关（可复现）。
+    //
+    // ⚠ 代价与边界：
+    //   1) 它改变的是**每帧累积量的分配方式**（更接近连续积分），所以与录制时
+    //      「整包求和」的量化结果**不完全相同**。默认**关闭**，供 A/B 对比。
+    //   2) 细分数按窗口长度自适应（≤2ms 一份），不按位移大小——位移为 0 的份会被
+    //      跳过，但等待照发，保证 Σ窗口 与 Σ位移 都与原脚本严格相等。
+    //   3) 只在「显式 Wait 紧跟一个相对移动」这种成对结构上动手，其余动作原样透传。
+    std::vector<ScriptAction> out;
+    out.reserve(actions.size() + actions.size() / 2 + 4);
+    for (size_t i = 0; i < actions.size(); ++i) {
+        const bool pairable =
+            actions[i].type == ActionType::Wait
+            && i + 1 < actions.size()
+            && actions[i + 1].type == ActionType::MoveMouseRelative
+            && actions[i].randomDuration <= kExpandDurationEps
+            && actions[i + 1].randomDuration <= kExpandDurationEps;
+        if (!pairable) {
+            out.push_back(std::move(actions[i]));
+            continue;
+        }
+        const uint64_t windowUs = ActionStepUs(actions[i]);
+        const int dx = actions[i + 1].x;
+        const int dy = actions[i + 1].y;
+        if (dx == 0 && dy == 0) {
+            out.push_back(std::move(actions[i]));
+            continue;
+        }
+        // 自适应细分数 = ceil(窗口 / 2ms)，上限 maxParts。
+        // 取 ceil 是为了**幂等**：每份都 ≤2ms，下次再跑不会继续细分
+        // （若按固定档位（<2ms→1、<4ms→2、否则 4），8000 会拆成 4×2000，
+        //   而 2000 又落进「<4ms→2」被再拆一次，不收敛）。
+        constexpr uint64_t kPartUs = 2000;
+        uint64_t want = (windowUs + kPartUs - 1) / kPartUs;
+        if (want < 1) want = 1;
+        if (want > static_cast<uint64_t>(maxParts)) want = static_cast<uint64_t>(maxParts);
+        const int parts = static_cast<int>(want);
+        if (parts < 2) {
+            out.push_back(std::move(actions[i]));
+            continue;
+        }
+        const ScriptAction& mv = actions[i + 1];
+        uint64_t remainUs = windowUs;
+        int rx = dx;
+        int ry = dy;
+        for (int k = 0; k < parts; ++k) {
+            const int left = parts - k;
+            const uint64_t partUs = remainUs / static_cast<uint64_t>(left);
+            remainUs -= partUs;
+            const int px = rx / left;   // 逐步消化余数，保证 Σ 严格等于原位移
+            const int py = ry / left;
+            rx -= px;
+            ry -= py;
+            out.push_back(MakeExplicitWaitUs(partUs, mv.indent));
+            if (px != 0 || py != 0) {
+                ScriptAction sub = mv;
+                sub.x = px;
+                sub.y = py;
+                sub.timingUs = 0;
+                sub.duration = 0.0;
+                sub.randomDuration = 0.0;
+                out.push_back(std::move(sub));
+            }
+        }
+        ++i;  // 原相对移动已被上面的子步替代
+    }
+    actions = std::move(out);
+}
+
+void PreparePlaybackTimeline(std::vector<ScriptAction>& actions, bool spreadRelativeMoves) {
+    RepairCompressedRelativeGaps(actions);
+    g_spreadBefore = CountRelativeMoves(actions);
+    if (spreadRelativeMoves) SpreadRelativeMovePackets(actions, 4);
+    g_spreadAfter = CountRelativeMoves(actions);
+}
+
+void LastSpreadPacketCounts(uint64_t& before, uint64_t& after) {
+    before = g_spreadBefore;
+    after = g_spreadAfter;
 }
 
 std::vector<ScriptAction> ExpandRecordingPreDelaysToExplicitWaits(
@@ -303,6 +401,17 @@ RecordingConversionResult ConvertRecordedEventsToActions(
             out.durationSeconds = timeline.back().deadlineUs / 1000000.0;
     }
     return out;
+}
+
+RelativeMoveTotals SumRelativeMoves(const std::vector<ScriptAction>& actions) {
+    RelativeMoveTotals t{};
+    for (const auto& a : actions) {
+        if (a.type != ActionType::MoveMouseRelative) continue;
+        t.dx += a.x;
+        t.dy += a.y;
+        ++t.packets;
+    }
+    return t;
 }
 
 std::vector<TimedInputEvent> CompileInputTimeline(

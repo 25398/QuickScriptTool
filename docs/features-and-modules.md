@@ -160,6 +160,13 @@ QuickScriptTool 是 Windows 上的键鼠脚本工具：主界面四页（连点 
 | 会话存储 | `agent_conversation_store.*` | 对话持久化 |
 | AI 宏动作 | `agent_ai_actions.*`、`ai_action_service.*`、`ai_action_runtime.*` | 宏内 AI 步骤运行时 |
 | 混合路由 | `ai_action_router.*` | Vision / 点击组合 / 多轮 tools 分类 |
+| **助手「动手」层** | `agent_desktop_task.*`（纯逻辑）+ `agent_tools.cpp` 的 `MakeRunDesktopTaskTool` | `runDesktopTask`：把目标写成**临时脚本**投给引擎正常回放 ⇒ 助手能自己截图/定位/点击把事做完。含危险目标确认闸、结果清洗、临时脚本作用域隔离 |
+| **MCP 客户端** | `agent_mcp.*` | 接**外部** MCP server（stdio JSON-RPC）：配置 `AppDir()\mcp_servers.json`、工具名 `mcp__<server>__<tool>`、附图落盘 + `[[AGENT_IMG:…]]` 闭环、孤儿防护（Job Object）、单通道串行 |
+| **助手 Skill 文件** | `skills/agent/*.md`（产品自有：`command`/`office`/`game`/`desktop`） | 助手能力的**可编辑说明**，`readAgentSkill` 按 section 读；缺文件时回落到 `agent_reference.cpp` 的内嵌文本 |
+
+> 用户向说明：[`agent-assistant-user-guide.md`](agent-assistant-user-guide.md)；
+> 能力差距与分期：[`agent-capability-expansion.md`](agent-capability-expansion.md)；
+> GenOffice 接入评估：[`genoffice-integration-eval.md`](genoffice-integration-eval.md)。
 
 API 配置：`app_settings.h` → `AiApiSettings` / `AiModelProfile`。
 

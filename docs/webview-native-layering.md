@@ -64,7 +64,7 @@
 | `src/hotkey_dialog.*`（`HotkeyCapture`） | `captureGlobalHotkey` / `captureScriptHotkey`；动作键产品走 Web `#ov-action-key` |
 | `src/macro_debug_window.*` | Gdi 原生后端；**产品**另开 WebView 顶层窗 `ui/debug.html`（`SetMacroDebugWebPoster`） |
 | `src/tray_menu.*` / `themed_popup_menu.*` | 系统托盘菜单 |
-| `src/desktop_tools/float_ball.*` / `float_ball_geom.h` | 桌面悬浮球（贴边半露 / 自由整圆、悬停面板、启停）；设置 `showFloatBall` |
+| `src/desktop_tools/float_ball.*` / `float_ball_geom.h` | 桌面悬浮球（贴边半露 / 自由整圆、悬停面板显示脚本名+当前状态、圆头点击启停、面板点击回主界面）；设置 `showFloatBall` |
 | `src/process_utils.*` | 准星取窗/进程路径 |
 | `src/ocr_install_dialog.*` | 历史 GDI 安装 UI；Web 主路径已走 `RunOcrInstall` 进度桥 | 安装逻辑可 Shared；对话框可 Legacy |
 | UAC `ShellExecute`（门面内） | `installDriver`（主程序 asInvoker；仅装驱动时提权。缺内核文件则先下载 HidDriver zip） |
@@ -136,7 +136,7 @@
 | `TestOcr(owner, params)` | `testOcr` | `mode=test\|offset` + text/offset |
 | `InstallDriver(owner, kind, onProgress)` | `installDriver` | ok + probed/suggestedBackend（探测可留 Shell） |
 | `RequestShowDebugWindow(fn)` | `showDebugWindow` | headless → Web `#debugFloat`；Gdi → `MacroDebug` 原生窗；`fn` 通常为 `ReloadSettings`/Apply |
-| `FloatBall::Instance()` | （设置 `other.showFloatBall`，无 bridge type） | 桌面悬浮球：贴边半露或自由整圆；启停走 Engine `RunScriptPath` / Stop |
+| `FloatBall::Instance()` | （设置 `other.showFloatBall`，无 bridge type） | 桌面悬浮球：贴边半露或自由整圆；展开面板第一行=脚本名、第二行=**脚本当前状态**（原「启动/停止」按钮位，按钮已删）；圆头图标点击=启停切换（走 Engine `RunScriptPath` / Stop），面板点击=显示主窗口 |
 | `BrowsePath` / `PickImageFile` | `browsePath` / `pickImageFile` | 系统文件对话框（可归 Tools） |
 
 Tray：`TrayMenu::Show` 仍属 DesktopTools；菜单项扩展（停宏等）在阶段 A3。

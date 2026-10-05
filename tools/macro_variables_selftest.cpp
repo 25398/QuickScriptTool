@@ -71,12 +71,24 @@ const selftest::CaseInfo kCases[] = {
         L"OCR 符号用 '+' / \"+\" 比较；裸写 + 是加法运算符"},
     {L"var_compute_split_string", L"default",
         L"split(s, sep) / [i] / count / toInt 按分隔符拆分字符串"},
+    {L"var_compute_ocr_paren_percent", L"default",
+        L"OCR「127723(74.27%)」→ split(hp,\"(\")[1]；空串/变量缺失/全角括号的失败语义与诊断"},
+    {L"var_compute_ocr_numbers_replace", L"default",
+        L"numbers()/replace()：不依赖括号全角半角的 OCR 后处理写法"},
     {L"collect_varcompute_return_names", L"default",
         L"CollectVarComputeReturnNames / BuildQuickInputVarItems 收集 return 导出名"},
     {L"resolve_match_list_index", L"default",
         L"{matchRet[0].x}/{matchRet.count}/{matchRet[n]} 多图匹配数组下标"},
     {L"build_quick_input_multimatch", L"default",
         L"BuildQuickInputVarItems 注册 matchRet[n] / [0].x / count"},
+    {L"resolve_ocr_search_var", L"default",
+        L"文字查找变量：.matchData 为匹配度；未找到给 0；文字模式没有 .matchData"},
+    {L"build_quick_input_ocr_search", L"default",
+        L"BuildQuickInputVarItems 为文字查找注册 .matchData，为获取文字只注册文字"},
+    {L"build_quick_input_color_and_ai_exec", L"default",
+        L"颜色动作（找色/取色/颜色匹配）与 aiActionExecute 也注册变量（过去两边都漏）"},
+    {L"quick_input_var_items_json", L"default",
+        L"Web 变量下拉的唯一来源：JSON 形状 {code,insert,tip} + 含固定变量"},
 };
 
 void CaseResolveMatchVar() {
@@ -611,6 +623,138 @@ void CaseVarComputeSplitString() {
     Emit(L"var_compute_split_string", ok, ok ? L"" : detail.c_str());
 }
 
+// 现场复现：OCR「127723(74.27%)」→ split(hp,"(")[1] → split(...,"%")[0]。
+// 同时验证三种 hp 形态下的失败语义（真值 / 空串 / 变量不存在）与新诊断信息。
+void CaseVarComputeOcrParenPercent() {
+    const wchar_t* kCode =
+        L"string hp_have = split(hp,\"(\")\n"
+        L"a = split(hp_have[1],\"%\")\n"
+        L"result = a[0]\n"
+        L"return result\n";
+
+    auto runWithHp = [&](const wchar_t* hp, bool present) -> VarComputeResult {
+        std::unordered_map<std::wstring, OcrVarResult> ocr;
+        if (present) ocr[L"hp"] = OcrVarResult{OcrVarMode::Text, hp};
+        MacroVariableContext ctx;
+        ctx.ocrVars = &ocr;
+        return RunVarCompute(kCode, ctx);
+    };
+
+    const auto rFull = runWithHp(L"127723(74.27%)", true);
+    const auto rEmpty = runWithHp(L"", true);
+    const auto rMissing = runWithHp(L"", false);
+
+    const bool fullOk = rFull.ok && Exported(rFull, L"result") == L"74.27";
+    const bool emptyFails = !rEmpty.ok && rEmpty.error.find(L"下标") != std::wstring::npos;
+    const bool missingFails = !rMissing.ok && rMissing.error.find(L"下标") != std::wstring::npos;
+
+    // 全角括号（U+FF08）必须拆不开，且报错要能让人看出字符不是 ASCII "("
+    const auto rFancy = runWithHp(L"127723\uFF0874.27%\uFF09", true);
+    const bool fancyFails = !rFancy.ok
+        && rFancy.error.find(L"\\uFF08") != std::wstring::npos;
+    // 空值/未定义要在报错或警告里点名 hp
+    const bool emptyHint = rEmpty.error.find(L"值=\"0\"") != std::wstring::npos
+        || rEmpty.error.find(L"文本=\"0\"") != std::wstring::npos;
+    const bool missingWarns = !rMissing.warnings.empty()
+        && rMissing.warnings[0].find(L"hp") != std::wstring::npos;
+
+    const bool ok = fullOk && emptyFails && missingFails && fancyFails && emptyHint && missingWarns;
+    std::wstring detail = L"full=[" + rFull.error + L"|" + Exported(rFull, L"result")
+        + L"] empty=[" + rEmpty.error + L"] missing=[" + rMissing.error
+        + L"|warn=" + (rMissing.warnings.empty() ? L"" : rMissing.warnings[0])
+        + L"] fancy=[" + rFancy.error + L"]";
+    Emit(L"var_compute_ocr_paren_percent", ok, ok ? L"" : detail.c_str());
+}
+
+// numbers() / replace()：不依赖括号是全角还是半角的 OCR 后处理写法
+void CaseVarComputeOcrNumbersReplace() {
+    MacroVariableContext ctx;
+    auto run = [&](const std::wstring& src) { return RunVarCompute(src, ctx); };
+
+    const auto rNums = run(L"v = numbers('127723(74.27%)')\n"
+        L"a = v[0]\nb = v[1]\nn = v.count\n"
+        L"return a, b, n\n");
+    const bool numsOk = rNums.ok
+        && Exported(rNums, L"a") == L"127723"
+        && Exported(rNums, L"b") == L"74.27"
+        && Exported(rNums, L"n") == L"2";
+
+    // 全角括号 + 全角百分号：numbers 一样能抠出 74.27
+    const auto rFancy = run(L"v = numbers('127723\uFF0874.27%\uFF09')\n"
+        L"result = v[1]\nreturn result\n");
+    const bool fancyOk = rFancy.ok && Exported(rFancy, L"result") == L"74.27";
+
+    const auto rEmpty = run(L"v = numbers(hp)\n"
+        L"result = 100\n"
+        L"if (v.count >= 2) { result = v[1] }\n"
+        L"return result\n");
+    const bool emptyOk = rEmpty.ok && Exported(rEmpty, L"result") == L"100";
+
+    const auto rRep = run(L"t = replace('1,234', ',', '')\n"
+        L"n = toInt(t)\nreturn n\n");
+    const bool repOk = rRep.ok && Exported(rRep, L"n") == L"1234";
+
+    // 推荐给用户的「稳」写法：numbers() 抠数字 + count 兜底 + 取最后一个。
+    // 要点三条，缺一不可：
+    //   1) numbers() 不依赖括号/百分号是全角还是半角（老写法 split(hp,"(") 会直接拆不开）；
+    //   2) nums[...] 是**数字**，所以 `result <= 60` 是数值比较 —— 老写法 split 出来的
+    //      a[0] 是**字符串**，比较退化成字典序："9.5" > "60"（漏判）、"100" < "60"（满血误触发）；
+    //   3) 变量缺失时 hp 是数字 0 ⇒ numbers(0) = [0]，count=1，故阈值取 >= 2 才不会被假数据骗过。
+    std::unordered_map<std::wstring, std::wstring> hpVars;
+    hpVars[L"hp"] = L"127723\uFF0874.27\uFF05\uFF09";  // 127723（74.27％）全角
+    MacroVariableContext ctxFull;
+    ctxFull.userVars = &hpVars;
+    const wchar_t* kStableCode =
+        L"nums = numbers(hp)\n"
+        L"result = 100\n"
+        L"if (nums.count >= 2) { result = nums[-1] }\n"
+        L"return result\n";
+    const auto rLast = RunVarCompute(kStableCode, ctxFull);
+    const bool lastOk = rLast.ok && Exported(rLast, L"result") == L"74.27";
+
+    // 同一段代码在 hp 缺失时也不能抛错，且必须走兜底值（100 = 视为满血，不误按回血键）
+    MacroVariableContext ctxMissing;
+    const auto rLastMissing = RunVarCompute(kStableCode, ctxMissing);
+    const bool lastMissingOk = rLastMissing.ok
+        && Exported(rLastMissing, L"result") == L"100";
+
+    // 数值比较：nums[-1] 是数字 ⇒ 9.5% 能正确判定为「低于 60」
+    std::unordered_map<std::wstring, std::wstring> hp95;
+    hp95[L"hp"] = L"127723(9.5%)";
+    MacroVariableContext ctx95;
+    ctx95.userVars = &hp95;
+    const auto rNumCmp = RunVarCompute(
+        L"nums = numbers(hp)\n"
+        L"result = nums[-1]\n"
+        L"flag = 0\n"
+        L"if (result <= 60) { flag = 1 }\n"
+        L"return result, flag\n", ctx95);
+    const bool numCmpOk = rNumCmp.ok
+        && Exported(rNumCmp, L"result") == L"9.5"
+        && Exported(rNumCmp, L"flag") == L"1";
+
+    // 反例（老写法的坑）：字符串与数字比较走字典序，"9.5" > "60" ⇒ 漏判。
+    // 这是**当前既有语义**（不是本次改动引入的）；将来若改成自动数值比较，请更新本用例。
+    const auto rStrCmp = RunVarCompute(
+        L"s = '9.5'\n"
+        L"flag = 0\n"
+        L"if (s <= 60) { flag = 1 }\n"
+        L"return flag\n", MacroVariableContext{});
+    const bool strCmpOk = rStrCmp.ok && Exported(rStrCmp, L"flag") == L"0";
+
+    const bool ok = numsOk && fancyOk && emptyOk && repOk
+        && lastOk && lastMissingOk && numCmpOk && strCmpOk;
+    std::wstring detail = rNums.error + L" b=" + Exported(rNums, L"b")
+        + L" fancy=" + rFancy.error + L"/" + Exported(rFancy, L"result")
+        + L" empty=" + rEmpty.error + L"/" + Exported(rEmpty, L"result")
+        + L" rep=" + rRep.error + L"/" + Exported(rRep, L"n")
+        + L" last=" + rLast.error + L"/" + Exported(rLast, L"result")
+        + L" lastMissing=" + rLastMissing.error + L"/" + Exported(rLastMissing, L"result")
+        + L" numCmp=" + rNumCmp.error + L"/" + Exported(rNumCmp, L"flag")
+        + L" strCmp=" + rStrCmp.error + L"/" + Exported(rStrCmp, L"flag");
+    Emit(L"var_compute_ocr_numbers_replace", ok, ok ? L"" : detail.c_str());
+}
+
 void CaseCollectVarComputeReturnNames() {
     const auto fromAst = CollectVarComputeReturnNames(L"int a = 1;\nint b = 2;\nreturn a, b;");
     const bool astOk = fromAst.size() == 2 && fromAst[0] == L"a" && fromAst[1] == L"b";
@@ -693,6 +837,132 @@ void CaseBuildQuickInputMultiMatch() {
         ok ? L"" : L"missing matchRet[n] / [0].x / count in quick-input list");
 }
 
+/// 文字查找变量：`.matchData` 是**匹配度**（0~100），不是 0/1；未找到给 0（不是空串，
+/// 否则 `if(a.matchData >= 65)` 拿到空值）。
+/// ⚠ 顺带钉住「获取文字**没有** .matchData」——两种模式存的东西不同，别互相冒充。
+void CaseResolveOcrSearchVar() {
+    OcrVarResult search{};
+    search.mode = OcrVarMode::Search;
+    search.found = 1;
+    search.matchData = 86;
+    search.topLeftX = 10;
+    search.topLeftY = 20;
+    search.bottomRightX = 30;
+    search.bottomRightY = 40;
+    OcrVarResult missing{};
+    missing.mode = OcrVarMode::Search;
+    missing.found = 0;
+    missing.matchData = 0;
+    OcrVarResult text{};
+    text.mode = OcrVarMode::Text;
+    text.text = L"开始游戏";
+    std::unordered_map<std::wstring, OcrVarResult> ocrVars{
+        {L"a", search}, {L"miss", missing}, {L"txt", text}};
+    MacroVariableContext ctx;
+    ctx.ocrVars = &ocrVars;
+
+    const std::wstring found = ResolveMacroVariables(L"{a}", ctx);
+    const std::wstring score = ResolveMacroVariables(L"{a.matchData}", ctx);
+    const std::wstring x = ResolveMacroVariables(L"{a.x}", ctx);
+    const std::wstring missScore = ResolveMacroVariables(L"{miss.matchData}", ctx);
+    const std::wstring missFound = ResolveMacroVariables(L"{miss}", ctx);
+    const std::wstring textVal = ResolveMacroVariables(L"{txt}", ctx);
+    const std::wstring textScore = ResolveMacroVariables(L"{txt.matchData}", ctx);
+    const bool ok = found == L"1" && score == L"86" && x == L"10"
+        && missScore == L"0" && missFound == L"0"
+        && textVal == L"开始游戏" && textScore.empty();
+    const std::wstring detail = L"found=" + found + L" score=" + score + L" x=" + x
+        + L" missScore=[" + missScore + L"] textScore=[" + textScore + L"]";
+    Emit(L"resolve_ocr_search_var", ok, ok ? L"" : detail.c_str());
+}
+
+void CaseBuildQuickInputOcrSearch() {
+    std::vector<ScriptAction> acts(2);
+    acts[0].type = ActionType::TextRecognition;
+    acts[0].ocrResultMode = 1;          // 文字查找
+    acts[0].matchVarName = L"find";
+    acts[1].type = ActionType::TextRecognition;
+    acts[1].ocrResultMode = 0;          // 获取文字
+    acts[1].matchVarName = L"txt";
+    const auto items = BuildQuickInputVarItems(acts);
+    bool hasScore = false, hasX1 = false, hasText = false, textHasScore = false;
+    for (const auto& it : items) {
+        if (it.display == L"find.matchData") hasScore = true;
+        if (it.display == L"find.x1") hasX1 = true;
+        if (it.display == L"txt") hasText = true;
+        if (it.display == L"txt.matchData") textHasScore = true;
+    }
+    const bool ok = hasScore && hasX1 && hasText && !textHasScore;
+    Emit(L"build_quick_input_ocr_search", ok,
+        ok ? L"" : (L"score=" + std::to_wstring(hasScore)
+            + L" x1=" + std::to_wstring(hasX1)
+            + L" txt=" + std::to_wstring(hasText)
+            + L" txtScore=" + std::to_wstring(textHasScore)).c_str());
+}
+
+/// 颜色动作 / AI 动作执行也要注册变量：这三类过去**两边都漏**（C++ 漏、JS 也漏），
+/// 现在规则只有 C++ 一份，所以这条用例就是那份规则的守门人。
+void CaseBuildQuickInputColorAndAiExec() {
+    std::vector<ScriptAction> acts(4);
+    acts[0].type = ActionType::FindColor;
+    acts[0].matchVarName = L"hit";
+    acts[1].type = ActionType::GetColor;
+    acts[1].matchVarName = L"px";
+    acts[2].type = ActionType::ColorMatch;
+    acts[2].matchVarName = L"same";
+    acts[3].type = ActionType::AiActionExecute;
+    acts[3].aiOutputVarName = L"aiOut";
+    const auto items = BuildQuickInputVarItems(acts);
+    bool hitScore = false, hitColor = false, pxColor = false, pxScore = false;
+    bool sameScore = false, aiOut = false;
+    for (const auto& it : items) {
+        if (it.display == L"hit.matchData") hitScore = true;
+        if (it.display == L"hit") hitColor = true;
+        if (it.display == L"px") pxColor = true;
+        // 获取颜色没有「匹配度」这个概念（读点成功就是真值）—— 不该凭空注册
+        if (it.display == L"px.matchData") pxScore = true;
+        if (it.display == L"same.matchData") sameScore = true;
+        if (it.display == L"aiOut") aiOut = true;
+    }
+    const bool ok = hitScore && hitColor && pxColor && sameScore && aiOut && !pxScore;
+    Emit(L"build_quick_input_color_and_ai_exec", ok,
+        ok ? L"" : (L"hitScore=" + std::to_wstring(hitScore)
+            + L" hitColor=" + std::to_wstring(hitColor)
+            + L" pxColor=" + std::to_wstring(pxColor)
+            + L" pxScore=" + std::to_wstring(pxScore)
+            + L" sameScore=" + std::to_wstring(sameScore)
+            + L" aiOut=" + std::to_wstring(aiOut)).c_str());
+}
+
+/// Web 编辑器的变量下拉**只认这一份 JSON**（规则不再在 JS 里另写一遍）：
+/// 形状必须是 {code,insert,tip}，且 insert 带花括号、code 与 insert 一一对应。
+void CaseQuickInputVarItemsJson() {
+    std::vector<ScriptAction> acts(2);
+    acts[0].type = ActionType::FindImage;
+    acts[0].findImageFollowUp = 2;
+    acts[0].matchVarName = L"btn";
+    acts[1].type = ActionType::TextRecognition;
+    acts[1].ocrResultMode = 1;
+    acts[1].matchVarName = L"find";
+    const std::wstring json = QuickInputVarItemsJson(acts);
+    const bool shapeOk = !json.empty() && json.front() == L'[' && json.back() == L']';
+    const bool hasFind = json.find(L"\"code\":\"btn.matchData\"") != std::wstring::npos;
+    const bool insertOk = json.find(L"\"insert\":\"{btn.matchData}\"") != std::wstring::npos;
+    const bool hasOcr = json.find(L"\"code\":\"find.matchData\"") != std::wstring::npos;
+    const bool hasTip = json.find(L"\"tip\":\"") != std::wstring::npos;
+    // 固定变量也在里面（ctrl:CurLoops() 等）—— Web 侧不另外补
+    const bool hasFixed = json.find(L"ctrl:CurLoops()") != std::wstring::npos;
+    const bool ok = shapeOk && hasFind && insertOk && hasOcr && hasTip && hasFixed;
+    Emit(L"quick_input_var_items_json", ok,
+        ok ? L"" : (L"shape=" + std::to_wstring(shapeOk)
+            + L" find=" + std::to_wstring(hasFind)
+            + L" insert=" + std::to_wstring(insertOk)
+            + L" ocr=" + std::to_wstring(hasOcr)
+            + L" tip=" + std::to_wstring(hasTip)
+            + L" fixed=" + std::to_wstring(hasFixed)
+            + L" json=" + json.substr(0, 200)).c_str());
+}
+
 void PrintHelp() {
     std::fwprintf(stderr,
         L"MacroVariablesSelfTest — 宏变量自检\n"
@@ -752,9 +1022,15 @@ int wmain(int argc, wchar_t** argv) {
     CaseVarComputeOptionalSemiNewline();
     CaseVarComputeStringCompareSign();
     CaseVarComputeSplitString();
+    CaseVarComputeOcrParenPercent();
+    CaseVarComputeOcrNumbersReplace();
     CaseCollectVarComputeReturnNames();
     CaseResolveMatchListIndex();
     CaseBuildQuickInputMultiMatch();
+    CaseResolveOcrSearchVar();
+    CaseBuildQuickInputOcrSearch();
+    CaseBuildQuickInputColorAndAiExec();
+    CaseQuickInputVarItemsJson();
 
     selftest::EmitSummary();
     return selftest::ExitCode();

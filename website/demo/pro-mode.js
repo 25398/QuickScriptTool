@@ -105,6 +105,9 @@
   }
   var _itemIndex = {}; // kind -> { id: item }
   var _folderCache = {}; // kind -> { roots, stamp }
+  var _previewCache = {}; // id -> { names, actionCount, stamp }
+  var _previewWait = {}; // reqId -> itemId
+  var _previewGen = 0;
   function listStamp(kind) {
     var n = 0;
     if (kind === "macro") n = (st().macros || []).length;
@@ -513,9 +516,11 @@
     if (!A.state) return;
     A.state._userPickedHomeTab = true;
     if (!window.qst) return;
+    // 脚本库/定时/设置页列出全部内容：专属热键不按 TAB 限定（用户明确要求的例外）。
+    var scopeAll = isIdleHotkeyPage(page);
     var setTabState = function (tab, eng, path) {
       A.state.tab = tab;
-      if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(eng);
+      if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(eng, scopeAll);
       if (typeof qst.setHomeSelection === "function") qst.setHomeSelection(eng, path || "");
       if (typeof A.syncEngineHomeSelection === "function") {
         // 与 dedupe 键对齐，避免随后 list* 再打一次
@@ -658,7 +663,8 @@
       A.state.tab = "macro";
       A.state._userPickedHomeTab = true;
       if (window.qst) {
-        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(2);
+        // 专业模式脚本库内选中条目：仍属「列出全部」的页面，不按 TAB 限定。
+        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(2, true);
         if (typeof qst.setHomeSelection === "function") {
           qst.setHomeSelection(2, mi >= 0 ? A.itemPath(macros[mi]) : "");
         }
@@ -674,7 +680,7 @@
       A.state.tab = "recorder";
       A.state._userPickedHomeTab = true;
       if (window.qst) {
-        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(1);
+        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(1, true);
         if (typeof qst.setHomeSelection === "function") {
           qst.setHomeSelection(1, ri >= 0 ? A.itemPath(recs[ri]) : "");
         }
@@ -858,17 +864,77 @@
       ? '<button class="act-btn" data-act="open">' + (it.type === "macro" ? "编辑" : "优化") + '</button>' : "";
     var renameBtn = (it.type === "macro" || it.type === "rec")
       ? '<button class="act-btn" data-act="rename">重命名</button>' : "";
+    var previewTitle = it.type === "ai" ? "对话" : it.type === "sched" ? "任务" : "动作预览";
     return '<div class="d-top"><div class="d-ico ' + it.type + '">' + TYPE[it.type].icon + '</div>' +
       '<div><div class="d-name">' + escHtml(it.name) + star + '</div>' +
       '<div class="d-sub">' + escHtml(it.meta) + '</div></div></div>' +
       '<div class="d-info">' + cells.map(function (c) { return '<div class="d-cell"><div class="k">' + c[0] + '</div><div class="v">' + c[1] + '</div></div>'; }).join("") + '</div>' +
       '<div class="d-actions">' + primary + openBtn + renameBtn +
         '<button class="act-btn danger" data-act="del">删除</button></div>' +
-      '<div class="d-preview"><div class="d-sec">' + (it.type === "ai" ? "对话" : "动作预览") + '</div>' +
-      (it.type === "ai"
-        ? '<div class="pv-row">你：' + escHtml(it.name) + '</div><div class="pv-row">AI：已生成脚本，等待确认…</div>'
-        : '<div class="pv-row">点击 (320, 240)</div><div class="pv-row">等待 500ms</div><div class="pv-row">移动 (480, 360)</div><div class="pv-row">点击 (520, 300)</div>') +
-      '</div>';
+      '<div class="d-preview"><div class="d-sec">' + previewTitle + '</div>' +
+      '<div class="pv-rows">' + previewRowsHtml(it) + '</div></div>';
+  }
+  function previewStamp(it) {
+    if (!it || !it.ref) return "";
+    return String(it.ref.actionCount != null ? it.ref.actionCount : "") + "|" + String(it.ref.recordTime || "");
+  }
+  function previewRowsHtml(it) {
+    if (it.type === "ai") {
+      return '<div class="pv-row">你：' + escHtml(it.name) + '</div><div class="pv-row">AI：已生成脚本，等待确认…</div>';
+    }
+    if (it.type === "sched") {
+      return '<div class="pv-row">' + escHtml(it.meta || "定时任务") + '</div>';
+    }
+    var cache = _previewCache[it.id];
+    if (cache && cache.stamp !== previewStamp(it)) cache = null;
+    if (!cache) return '<div class="pv-row pv-loading">正在读取动作…</div>';
+    if (cache.error) return '<div class="pv-row">' + escHtml(cache.error) + '</div>';
+    var names = cache.names || [];
+    if (!names.length) return '<div class="pv-row">暂无动作</div>';
+    var html = names.map(function (n, i) {
+      return '<div class="pv-row"><span class="pv-i">' + (i + 1) + '</span>' + escHtml(n) + '</div>';
+    }).join("");
+    var rest = (cache.actionCount | 0) - names.length;
+    if (rest > 0) html += '<div class="pv-row pv-more">其余 ' + rest + ' 步</div>';
+    return html;
+  }
+  function requestActionPreview(it) {
+    if (!it || (it.type !== "macro" && it.type !== "rec")) return;
+    var cache = _previewCache[it.id];
+    if (cache && cache.stamp === previewStamp(it)) return;
+    var path = (it.ref && (it.ref.path || it.ref.id)) || it.id;
+    if (!path || !window.qst || typeof qst.previewScriptActions !== "function") {
+      _previewCache[it.id] = { names: [], actionCount: 0, stamp: previewStamp(it), error: "无法读取脚本动作" };
+      var rowsEl = A.$("#proDetail") && A.$("#proDetail").querySelector(".pv-rows");
+      if (rowsEl) rowsEl.innerHTML = previewRowsHtml(it);
+      return;
+    }
+    var reqId = "pv-" + (++_previewGen) + "-" + Date.now().toString(16);
+    _previewWait[reqId] = it.id;
+    qst.previewScriptActions(path, reqId, 16);
+  }
+  function applyPreviewResult(msg) {
+    var reqId = String(msg.reqId || "");
+    var itemId = _previewWait[reqId];
+    delete _previewWait[reqId];
+    if (!itemId) return;
+    var it = findItemBySel(itemId);
+    var stamp = it ? previewStamp(it) : "";
+    if (!msg.ok) {
+      _previewCache[itemId] = { names: [], actionCount: 0, stamp: stamp, error: msg.detail || "读取失败" };
+    } else {
+      _previewCache[itemId] = {
+        names: Array.isArray(msg.names) ? msg.names : [],
+        actionCount: msg.actionCount | 0,
+        stamp: stamp,
+      };
+    }
+    if (!S.selected || S.selected.kind !== "item" || S.selected.id !== itemId) return;
+    var box = A.$("#proDetail");
+    if (!box) return;
+    var rows = box.querySelector(".pv-rows");
+    var fresh = findItemBySel(itemId);
+    if (rows && fresh) rows.innerHTML = previewRowsHtml(fresh);
   }
   function renderDetail() {
     var el = A.$("#proDetail");
@@ -876,6 +942,7 @@
     if (S.selected && S.selected.kind === "item") {
       var it = findItemBySel(S.selected.id);
       el.innerHTML = it ? detailHtml(it) : '<div class="d-summary"><div class="s-name">脚本库</div><div class="s-line">单击脚本查看详情</div></div>';
+      if (it) requestActionPreview(it);
       return;
     }
     if (S.view.kind === "folder") {
@@ -927,7 +994,7 @@
     }
     var tasks = A.state && Array.isArray(A.state.schedTasks) ? A.state.schedTasks : [];
     var gOn = !!(A.state && A.state.schedGlobalDisabled);
-    var FREQ = ["每小时", "每日", "每周", "自定义"];
+    var FREQ = ["每小时", "每日", "每周", "自定义", "间隔"];
     var head =
       '<div class="pro-sched-toolbar">' +
         '<h3>任务列表</h3>' +
@@ -943,7 +1010,8 @@
       return '<div class="tr" data-sched-id="' + escAttr(String(t.id || "")) + '">' +
         "<span>" + escHtml(t.name || "") + "</span><span>" + kind + "</span>" +
         "<span>" + escHtml(stripJsonExt(t.fileDisplayName || t.filePath || "")) + "</span>" +
-        "<span>" + freq + "</span><span>" + escHtml(t.timeLabel || "") + "</span><span>" + st + "</span>" +
+        "<span>" + freq + "</span><span>" + escHtml(t.timeLabel || "") + "</span>" +
+        '<span class="act" data-sched="status" title="点击切换启用/禁用">' + st + "</span>" +
         '<span class="act"><span data-sched="edit">编辑</span> <span data-sched="del">删除</span></span></div>';
     }).join("");
     tree.innerHTML = head + (rows || '<div class="tr empty-row"><span>暂无定时任务</span></div>') + "</div>";
@@ -978,6 +1046,8 @@
         });
         if (act.dataset.sched === "edit" && task && typeof A.openSchedEditor === "function") {
           A.openSchedEditor(task);
+        } else if (act.dataset.sched === "status" && task && typeof A.toggleSchedTaskStatus === "function") {
+          A.toggleSchedTaskStatus(task);
         } else if (act.dataset.sched === "del" && id) {
           A.askConfirm("确定删除该定时任务？", function () {
             if (window.qst) qst.deleteScheduledTask(id);
@@ -1508,7 +1578,7 @@
     else if (act === "open") openAction(item);
     else if (act === "setHk") setHotkey(item);
     else if (act === "import") { if (window.qst) qst.importScript(item.type); }
-    else if (act === "export") { if (window.qst) qst.exportScript(item.ref.path); }
+    else if (act === "export") { if (window.QstExport) window.QstExport.open(item.ref.path, item.name); else if (window.qst) qst.exportScript(item.ref.path); }
     else if (act === "rename") renameItem(item);
     else if (act === "del") delItem(item);
   }
@@ -1620,6 +1690,16 @@
   function onProBridge(ev) {
     var msg = ev.detail || {};
     var type = msg.type || "";
+    if (type === "saveEditor.result" || type === "deleteScript.result"
+      || type === "renameScript.result" || type === "importScript.result"
+      || type === "applyOptimizeRecording.result") {
+      _previewCache = {};
+      _previewWait = {};
+    }
+    if (type === "previewScriptActions.result") {
+      applyPreviewResult(msg);
+      return;
+    }
     if (type === "listLibraryFolders.result" && msg.ok) {
       var k = msg.kind === "scripts" ? "macro" : msg.kind === "recordings" ? "rec" : msg.kind;
       if (KINDS.indexOf(k) >= 0) {

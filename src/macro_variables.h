@@ -103,6 +103,16 @@ struct MacroVariableContext {
 // 构建编辑器变量提示列表 (从脚本动作中提取所有定义过的变量)
 std::vector<QuickInputVarItem> BuildQuickInputVarItems(const std::vector<ScriptAction>& actions);
 
+/// 变量清单 → JSON（**Web 编辑器变量下拉的唯一来源**；GDI 编辑器直接调上面那个函数）。
+///
+/// 为什么要有它（2026-09-30）：Web 侧过去**另抄了一份**「哪种动作产出哪些变量」的规则
+/// （ui/app.js 的 buildEditorVarItems），两份必然漂移 —— 实测找图漏 `.cx/.cy`、
+/// C++ 这份漏 `aiActionExecute`、颜色动作两边都没有。现在 Web 把动作 JSON 交给引擎，
+/// 用**构建宏时的同一份实现**算清单，规则只有一份。
+///
+/// 返回形如 `[{"code":"a.matchData","insert":"{a.matchData}","tip":"…"},…]` 的 JSON 文本。
+std::wstring QuickInputVarItemsJson(const std::vector<ScriptAction>& actions);
+
 // 将文本中的 {varName} 占位符替换为实际值
 std::wstring ResolveMacroVariables(const std::wstring& text, const MacroVariableContext& ctx);
 

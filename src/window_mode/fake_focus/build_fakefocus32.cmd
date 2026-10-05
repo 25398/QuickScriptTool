@@ -64,11 +64,21 @@ set "SRC1=%SRCROOT%\src\window_mode\fake_focus\fake_focus_dll.cpp"
 set "SRC2=%SRCROOT%\src\window_mode\fake_focus\fake_focus_hook.cpp"
 set "INC=%SRCROOT%\src\window_mode\fake_focus"
 
+REM MinHook (BSD-2-Clause, vendored under third_party\minhook): supplies the trampoline
+REM used by our inline hooks, so the target function head is patched once and never
+REM rewritten on every call (that rewrite raced across threads and killed Unity/UE
+REM targets with 0xC0000005). Must mirror the x64 target's source list.
+set "MHS=%SRCROOT%\third_party\minhook"
+set "MHI=%MHS%\include"
+set "MHSR=%MHS%\src"
+
 set "DEF=%INC%\fake_focus.def"
 
-cl /nologo /LD /O2 /W3 /EHsc /MT /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DFAKEFOCUS_EXPORTS ^
-  /I"%INC%" /I"%SRCROOT%\src" ^
+cl /nologo /LD /O2 /W3 /EHsc /MT /utf-8 /std:c++17 /DUNICODE /D_UNICODE /DNOMINMAX /DFAKEFOCUS_EXPORTS ^
+  /I"%INC%" /I"%SRCROOT%\src" /I"%MHI%" /I"%MHSR%" /I"%MHSR%\hde" ^
   "%SRC1%" "%SRC2%" ^
+  "%MHSR%\buffer.c" "%MHSR%\hook.c" "%MHSR%\trampoline.c" ^
+  "%MHSR%\hde\hde32.c" "%MHSR%\hde\hde64.c" ^
   /Fe"%OUTDIR%\FakeFocus32.dll" /Fo"%OUTDIR%\\" /Fd"%OUTDIR%\FakeFocus32.pdb" ^
   /link /DLL /DEF:"%DEF%" user32.lib dwmapi.lib
 

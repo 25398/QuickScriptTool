@@ -63,7 +63,7 @@ void WindowModePreview::Show(int x, int y, int w, int h) {
     RegisterPreviewClass();
     if (!hwnd_) {
         hwnd_ = CreateWindowExW(
-            WS_EX_TOOLWINDOW, kPreviewClass, L"窗口模式预览",
+            WS_EX_TOOLWINDOW, kPreviewClass, L"窗口/后台窗口模式预览",
             WS_POPUP | WS_BORDER | WS_VISIBLE,
             x, y, w, h, owner_, nullptr, GetModuleHandleW(nullptr), nullptr);
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));

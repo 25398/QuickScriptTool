@@ -34,12 +34,113 @@ struct AiImageEncodeResult {
     double effectiveScale = 1.0;
 };
 
+/// 「上一次点击落在哪」——把落点画进**观察帧**，让规划模型每轮都能顺手验收。
+///
+/// 为什么值得做（用户提醒的既有策略，本仓只在放大图上用过）：
+/// 本仓已有 `DrawPredictionCrossOnBitmap`（PrecisionCUA 红叉闭环），但只用在
+/// **Zoom 放大图**上 —— 那是识图子模型的事。真正每轮都在决策的是**规划模型**，
+/// 而它拿到的观察帧上**没有任何落点信息**：只能靠「点完之后界面变没变」间接推断，
+/// 于是实测出现「点错了三四格还在继续点」。
+///
+/// 坐标口径：调用方一律给**屏幕绝对像素**（与 mouseClick / OCR 索引同一套），
+/// 帧内换算由编码方按实际截图区域做 —— 调用方不需要也不应该自己换算。
+struct AiFrameClickMark {
+    /// 屏幕绝对像素坐标
+    int screenX = 0;
+    int screenY = 0;
+    /// 本次观察帧对应的屏幕区域
+    int capX1 = 0, capY1 = 0, capX2 = 0, capY2 = 0;
+    /// 标签（通常是「× 上一次点击：<目标短描述>」）；空则不画标签
+    std::wstring label;
+};
+
+// ── 「上一次点击落在哪」的两侧记账（引擎侧坐标 + 规划侧意图）────────────
+//
+// 分工：**坐标**由引擎在真正点下去的那一刻记（`MarkLastAiClickScreenPoint`），
+// **意图描述**由调用方在进入定位时记（`SetAiActionClickIntent`）—— 两者各在
+// 唯一知道自己那半信息的地方写，不互相猜。
+//
+// 状态机与坐标换算都是**纯函数**（`AiClickMarkState` 是宿主事实的显式载体），
+// 所以「同一次点击只标一帧」「落点跑到画面外就不标」这类判据能逐格自检，
+// 而不是埋在 GDI 编码流程里靠肉眼验。
+//
+// ⚠ 必须在「一次 AI 动作」开始时 `ResetAiActionClickMarks()`，否则上一条任务的
+//   落点会被画进下一条任务的第一帧（跨任务污染）。
+struct AiClickMarkState {
+    /// 坐标系原点：上游给的是**屏幕绝对像素**，下游要画进**帧内像素**。
+    /// 不标出来就必然有人把两套坐标混着用（本仓 §27 的死坐标、§29.1 的 (0,0)
+    /// 都是这一类错）。
+    enum class CoordSpace { ScreenPx, FramePx };
+    /// 原始落点（**恒为屏幕绝对像素**）—— 提示词要给模型看的、以及判「这一击画过没有」
+    /// 都用它。`AiClickMarkTake` 只动 `x/y`，不会把这里的口径改掉。
+    int screenX = -1;
+    int screenY = -1;
+    /// 本次要点的目标描述
+    std::wstring intent;
+    /// 上一次「真的画进了某一帧」的落点 —— 同一落点只标一次，不反复烙进后续每一帧
+    /// （重复标注会让模型以为「这里被点了很多次」）。
+    int drawnX = -1;
+    int drawnY = -1;
+
+    /// `AiClickMarkTake` 的工作坐标（可被就地换算成帧内像素）
+    CoordSpace space = CoordSpace::ScreenPx;
+    int x = -1;
+    int y = -1;
+
+    // ── 仅 `ScreenPx` 时使用：本次观察帧对应的屏幕区域与帧内尺寸 ──
+    int capX1 = 0, capY1 = 0, capX2 = 0, capY2 = 0;
+    int frameW = 0;
+    int frameH = 0;
+};
+
+/// 这次编码要不要画落点标注（纯函数，`st` 自足 —— 调用方把坐标系、
+/// 捕获区域、帧尺寸都填好，函数自己只回答「画不画、画在哪」）。
+///
+/// 三条判据：① 有落点；② 这个落点还没画过（同一击只标一帧）；
+/// ③ 落点落在画面内（画不出真实位置宁可不画 —— 画在边缘上是编造）。
+/// 通过时 `st.space` 置为 `FramePx`，`x/y` 就地换算成帧内像素。
+bool AiClickMarkTake(AiClickMarkState& st);
+/// 记一笔新落点（清掉「已画过」的记账，使同一点再点一次也能再标）
+void AiClickMarkRecord(AiClickMarkState& st, int x, int y);
+/// 把「屏幕坐标 + 捕获区域」换算成帧内像素；出界返回 false
+bool AiClickMarkToFramePoint(int screenX, int screenY, int capX1, int capY1, int capX2,
+    int capY2, int frameW, int frameH, int* fx, int* fy);
+
+/// 清空落点记账（`RunAiActionExecuteForAction` 入口调用）
+void ResetAiActionClickMarks();
+/// 记「本次要点的目标是什么」（locateAndClick / UIA 控件名 / 元素索引条目…）
+void SetAiActionClickIntent(const std::wstring& targetDesc);
+/// 记「刚刚真的点在了屏幕哪里」；sx/sy 为负表示这次没点成功（保持旧值不动）
+void MarkLastAiClickScreenPoint(int sx, int sy);
+/// 把落点清掉（这一击**没有真的点下去**，别让下一帧把它画出来）。
+/// 与 `MarkLastAiClickScreenPoint(<0,<0)` 的区别：那个是「没新信息，保持原样」，
+/// 这个是「确认要抹掉」（近点重复点击被拦时用）。
+void ClearAiActionClickMark();
+/// 取当前待标注的落点（屏幕坐标 + 标签）。没有有效落点时返回 false。
+bool GetAiActionClickMark(int* sx, int* sy, std::wstring* label);
+/// 当前落点的**完整标签**（「× 上一次点击：<目标描述>」），供引擎侧组观察帧标注用。
+///
+/// 存在的理由：标签口径只能有一处（`FormatFrameClickMarkLabel`），引擎不该自己拼
+/// 文案 —— 图上画的和提示词里说的必须是同一句话，否则模型会当成两条不相干的线索。
+std::wstring CurrentAiActionClickMarkLabel();
+/// 上一次编码是否**真的**把落点画进了帧里（落点在捕获区域外时为 false）。
+///
+/// 用途：prompt 侧必须和画面一致 —— 图上没有那个叉，就别说「图上有个叉」，
+/// 否则模型会去找一个不存在的东西（比不提示更糟）。
+bool AiFrameClickMarkDrawnInFrame();
+
 /// 宏 AI 图片分析专用编码（自动缩放 + 适中 JPEG 质量；scale≤1，不下采样以外的放大）
 /// maxLongEdge：观察帧可用 1024；locateAndClick 建议 1280 以保留小控件细节
 /// imeStatusText：非空则编码前把输入法状态文字画到图左上角（TSF 输入法候选框
 /// BitBlt/CAPTUREBLT 物理截不到，画上去让 Agent 从截图直接看到输入法状态）
+/// clickMark：非空则把「上一次点击落在哪」画成红色十字 + 标签（见 AiFrameClickMark）
 AiImageEncodeResult EncodeBitmapForAiAnalysis(HBITMAP hBitmap, double userScale = 0.5,
-    int maxLongEdge = 1024, const std::wstring* imeStatusText = nullptr);
+    int maxLongEdge = 1024, const std::wstring* imeStatusText = nullptr,
+    const AiFrameClickMark* clickMark = nullptr);
+
+/// 观察帧落点标注的文案口径（集中一处，避免 prompt 与图上的文字各说各话）。
+/// 返回空串表示这次没有可标注的落点。
+std::wstring FormatFrameClickMarkLabel(const std::wstring& targetDesc);
 
 /// 将剪贴板位图与其中的图片文件编成 JPEG base64，供 AI 图片分析/动作额外附图。
 std::vector<std::string> EncodeClipboardSnapshotImages(const MacroClipboardSnapshot& snap);
@@ -229,7 +330,7 @@ struct ZoomRefineLocateResult {
 
 /// 多级放大定位：粗框/粗点 → 裁剪放大 → 精点 → 屏幕坐标
 /// uiAnchors 可选：调用方（引擎）传入的 UIA 控件框（屏幕坐标），用于「UIA+视觉融合」——
-/// 视觉候选与控件框重合时直接用控件的精确矩形。窗口模式下前台往往不是目标窗口，
+/// 视觉候选与控件框重合时直接用控件的精确矩形。窗口/后台窗口模式下前台往往不是目标窗口，
 /// 调用方应传 nullptr（由引擎判断），避免张冠李戴。
 ZoomRefineLocateResult ExecuteZoomRefineLocate(
     AgentCore* core,

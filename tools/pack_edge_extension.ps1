@@ -35,6 +35,7 @@ $required = @(
     "offscreen.js",
     "wake.js",
     "README.txt",
+    "web_ai_providers.json",
     "icons\icon16.png",
     "icons\icon48.png",
     "icons\icon128.png"

@@ -116,6 +116,12 @@ InjectionSelfTest.exe --inject 12345 "build\Release\FakeFocus64.dll" manualmaphi
 InjectionSelfTest.exe --inject 12345 "build\Release\FakeFocus64.dll" imagemaphijack
 ```
 
+> ⚠ **这个驱动是唯一还直接注入 `build\Release` 里那份 DLL 的地方**（产品走的是
+> `fake_focus_stage.cpp` 的**副本**，见 [fakefocus-dll-lock.md](fakefocus-dll-lock.md)）。
+> 所以用它做完对抗测试后，目标进程会一直映射着 `build\Release\FakeFocus64.dll`：
+> 目标不退出，这个文件就删不掉/覆盖不了（`FakeFocus32.next.dll` 那个旁路槽就是当年为绕开它才有的）。
+> 测完记得**结束目标进程**，或者拿一份副本去注入。
+
 输出一行 JSON：
 
 ```json

@@ -36,6 +36,24 @@ namespace {
 constexpr size_t kMaxRawBody = 512 * 1024;   // 原始 HTML 读取上限
 constexpr int kDefaultMaxChars = 20000;      // 返回纯文本默认上限
 
+/// 找标签真正的 `>` —— **跳过引号里的内容**。
+/// ⚠ 实测踩过（抽出来的「正文」里出现 `t" href="data:text/css;base64,…`）：属性值里可以有 `>`，
+///   不跳引号就会把标签截成两半，后半截（一堆 data URI/base64）被当成正文输出。
+///   ⇒ HTML 相关的每一处「找标签结尾」都必须用这一个函数，别各处自己 `find(L'>')`。
+size_t FindTagEnd(const std::wstring& s, size_t lt) {
+    wchar_t quote = 0;
+    for (size_t i = lt + 1; i < s.size(); ++i) {
+        const wchar_t c = s[i];
+        if (quote) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == L'"' || c == L'\'') { quote = c; continue; }
+        if (c == L'>') return i;
+    }
+    return std::wstring::npos;
+}
+
 struct WebHttpHandle {
     HINTERNET h = nullptr;
     WebHttpHandle(HINTERNET hh = nullptr) : h(hh) {}
@@ -545,28 +563,34 @@ std::wstring HtmlToPlainText(const std::wstring& html) {
         }
     }
 
-    // 块级标签后换行
-    for (const wchar_t* tag : {L"<br", L"</p>", L"</div>", L"</h1>", L"</h2>",
-            L"</h3>", L"</h4>", L"</h5>", L"</h6>", L"</li>", L"</tr>", L"</table>"}) {
-        std::wstring t(tag);
-        for (;;) {
-            const size_t p = s.find(t);
-            if (p == std::wstring::npos) break;
-            s.replace(p, t.size(), L"\n");
-        }
-    }
-
-    // 去标签
+    // 去标签 + 块级标签后换行（**整只标签都替掉**：只替 `<br` 这种前缀会把 `/>` 留在正文里 —— 实测）
     std::wstring out;
     out.reserve(s.size());
-    bool inTag = false;
-    for (wchar_t ch : s) {
-        if (ch == L'<') { inTag = true; continue; }
-        if (ch == L'>') { inTag = false; out.push_back(L' '); continue; }
-        if (!inTag) out.push_back(ch);
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == L'<') {
+            const size_t te = FindTagEnd(s, i);
+            if (te == std::wstring::npos) break;   // 残缺标签：后面不再是可信正文
+            std::wstring nm;
+            for (size_t k = i + 1; k < te; ++k) {
+                const wchar_t c = s[k];
+                if (c == L'/' || iswspace(c)) continue;
+                if (!iswalnum(c) && c != L'-') break;
+                nm.push_back(static_cast<wchar_t>(towlower(c)));
+            }
+            static const wchar_t* kBlockTags[] = { L"br", L"p", L"div", L"h1", L"h2", L"h3",
+                L"h4", L"h5", L"h6", L"li", L"tr", L"table", L"ul", L"ol", L"section",
+                L"article", L"blockquote", L"dd", L"dt", L"td" };
+            bool block = false;
+            for (const wchar_t* bt : kBlockTags) if (nm == bt) { block = true; break; }
+            out.push_back(block ? L'\n' : L' ');
+            i = te + 1;
+            continue;
+        }
+        out.push_back(s[i]);
+        ++i;
     }
 
-    // 实体解码
+    // 实体解码（`&amp;` **放最后**：先解它会把 `&amp;lt;` 变成真的 `&lt;` 再解一次）
     auto replaceAll = [&](const std::wstring& from, const std::wstring& to) {
         for (;;) {
             const size_t p = out.find(from);
@@ -574,12 +598,28 @@ std::wstring HtmlToPlainText(const std::wstring& html) {
             out.replace(p, from.size(), to);
         }
     };
-    replaceAll(L"&amp;", L"&");
+    // 常见具名实体（实测搜索结果摘要里就有 `&ensp;·&ensp;` 这种，不解码直接喂给模型很难看）
+    replaceAll(L"&ensp;", L" ");
+    replaceAll(L"&emsp;", L" ");
+    replaceAll(L"&thinsp;", L" ");
+    replaceAll(L"&middot;", L"·");
+    replaceAll(L"&hellip;", L"…");
+    replaceAll(L"&mdash;", L"—");
+    replaceAll(L"&ndash;", L"–");
+    replaceAll(L"&ldquo;", L"“");
+    replaceAll(L"&rdquo;", L"”");
+    replaceAll(L"&lsquo;", L"‘");
+    replaceAll(L"&rsquo;", L"’");
+    replaceAll(L"&laquo;", L"《");
+    replaceAll(L"&raquo;", L"》");
+    replaceAll(L"&times;", L"×");
     replaceAll(L"&lt;", L"<");
     replaceAll(L"&gt;", L">");
     replaceAll(L"&quot;", L"\"");
+    replaceAll(L"&apos;", L"'");
     replaceAll(L"&#39;", L"'");
     replaceAll(L"&nbsp;", L" ");
+    replaceAll(L"&amp;", L"&");
     // 数字实体 &#NN; / &#xHH;
     for (;;) {
         const size_t p = out.find(L"&#");
@@ -628,14 +668,92 @@ std::wstring HtmlToPlainText(const std::wstring& html) {
     return Trim(result);
 }
 
+namespace {
+
+/// 「把一个 URL 读成**给模型看的文字**」——`fetchWebPage` 与 `webSearch(带读正文)` 共用**同一份实现**。
+/// ⚠ 一份实现是硬要求：两处各写一遍必然漂移（本仓 §33.1/§38.5 的教训），
+///   而漂移的表现是「同一句话在两个工具里口径不同」，模型只能自己猜哪个对。
+struct WebReadOutcome {
+    bool ok = false;
+    std::wstring text;      // 已抽取的正文（或整页纯文本/JSON）
+    std::wstring method;    // 如实回执用的路径名
+    std::wstring err;
+};
+
+WebReadOutcome ReadUrlAsText(const std::wstring& url, bool forceRender, int timeoutMs) {
+    WebReadOutcome out;
+    std::wstring lower;
+    lower.reserve(url.size());
+    for (const wchar_t c : url) lower.push_back(static_cast<wchar_t>(std::towlower(c)));
+
+    if (forceRender) {
+        out.ok = FetchWebPageRendered(url, out.text, out.err, timeoutMs);
+        out.method = L"渲染";
+        return out;
+    }
+    std::wstring body;
+    std::wstring err;
+    const bool got = FetchWebPage(url, body, err, timeoutMs);
+    const std::wstring trimmed = Trim(body);
+    const bool looksJson = (trimmed.size() >= 1 && (trimmed[0] == L'{' || trimmed[0] == L'}'
+            || trimmed[0] == L'['))
+        || lower.find(L"/api/") != std::wstring::npos
+        || lower.find(L".json") != std::wstring::npos;
+    if (got) {
+        if (looksJson) {
+            out.text = body;
+            out.method = L"JSON 接口";
+        } else {
+            // ★先做 readability 式主内容抽取；抽不出来**如实回退**整页纯文本
+            std::wstring title;
+            const std::wstring main = HtmlExtractMainText(body, &title);
+            if (!main.empty()) {
+                out.text = (title.empty() ? std::wstring() : (L"标题：" + title + L"\n\n")) + main;
+                out.method = L"正文抽取（readability 式）";
+            } else {
+                out.text = HtmlToPlainText(body);
+                out.method = L"整页纯文本（未抽到正文，已如实回退）";
+            }
+        }
+        out.ok = true;
+    }
+    // GET 失败，或页面疑似 JS 空壳 → WebView2 渲染兜底
+    if (!out.ok || (!looksJson && out.text.size() < 80)) {
+        std::wstring rendered;
+        std::wstring renderErr;
+        if (FetchWebPageRendered(url, rendered, renderErr, timeoutMs)) {
+            std::wstring title;
+            const std::wstring main = HtmlExtractMainText(rendered, &title);
+            out.text = main.empty() ? HtmlToPlainText(rendered) : main;
+            out.method = L"渲染";
+            out.ok = true;
+            out.err.clear();
+        } else if (!out.ok) {
+            out.err = renderErr;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
 AgentTool MakeFetchWebPageTool() {
     AgentTool tool;
     tool.name = L"fetchWebPage";
     tool.description =
-        L"抓取给人阅读的网页正文（官方文档/帮助/文章）。url 必填 http/https。"
-        L"禁止抓站点搜索/用户/动态 JSON API（api.*、/x/web-interface、/api/）——会触发风控。"
-        L"浏览站点请 openWebpage + observePage，不要用本工具代替点击。"
-        L"返回标题与正文（默认最多 20000 字符，maxChars 上限 50000）。"
+        L"抓取一个网页并**抽成正文**（已做 readability 式主内容抽取：剔导航/侧栏/页脚/相关阅读）。"
+        L"url 必填 http/https。"
+        // ★★这段措辞是**实测事故**的修复：旧文案写「禁止抓站点搜索/用户/动态 JSON API」，
+        //   模型把它读成了「禁止抓搜索」，于是**放弃 fetchWebPage**、去 openWebpage 开真浏览器
+        //   搜必应（抢走游戏前台 + 3 轮 + 拿到的是别的游戏的摘要）。实测本工具**能抓搜索页**
+        //   （只挡站点内部 API），而且找资料本来就该先 webSearch。措辞不能再有歧义。
+        L"**找资料请优先用 `webSearch`**（一步拿到 标题/URL/摘要，不用自己拼搜索地址）；"
+        L"已知具体网址时用本工具读它的正文。"
+        L"只禁**站点内部 API**（api.*、graphql.*、gateway.*、/api/、/ajax/、/x/web-interface、…json）"
+        L"—— 那类地址会触发风控；**搜索引擎的结果页不属于此列，可以抓**。"
+        L"需要**点击/登录/翻页**的交互站点才用 openWebpage + observePage"
+        L"（⚠ 它会抢走前台，一次性读资料不要用它）。"
+        L"返回正文（默认最多 20000 字符，maxChars 上限 50000）。"
         L"默认先走轻量 GET；GET 失败或页面疑似 JS 空壳时，自动用 App 内置 WebView2 "
         L"隐藏渲染后再取 DOM。也可传 render=true 强制走渲染。"
         L"禁止抓取本地地址/内部服务（localhost、127.0.0.1、内网 IP）。"
@@ -680,56 +798,716 @@ AgentTool MakeFetchWebPageTool() {
         if (AgentFetchUrlDestinationBlocked(url, blockErr))
             return L"[错误] " + blockErr;
         if (LooksLikeNonUserFacingWebUrl(url)) {
-            return L"[错误] 禁止抓站点 API（会触发风控，如 B 站 412）。"
-                L"请 openWebpage 打开给人看的页面，再用 observePage + clickRef/typeRef。"
-                L"fetchWebPage 只用于官方文档/帮助页。";
+            return L"[错误] 这是**站点内部 API**（会触发风控，如 B 站 412），不是给人看的页面。"
+                L"要找资料用 webSearch；要**点击/登录**某个站点用 openWebpage + observePage"
+                L"（⚠ 它会抢走前台）。";
         }
-        std::wstring lower;
-        lower.reserve(url.size());
-        for (wchar_t c : url) lower.push_back(static_cast<wchar_t>(std::towlower(c)));
-
-        std::wstring text;
-        std::wstring err;
-        bool ok = false;
-        std::wstring method;
-        if (forceRender) {
-            ok = FetchWebPageRendered(url, text, err, 30000);
-            method = L"渲染";
-        } else {
-            std::wstring body;
-            ok = FetchWebPage(url, body, err, 25000);
-            const std::wstring trimmed = Trim(body);
-            const bool looksJson = (trimmed.size() >= 1
-                    && (trimmed[0] == L'{' || trimmed[0] == L'['))
-                || lower.find(L"/api/") != std::wstring::npos
-                || lower.find(L".json") != std::wstring::npos;
-            if (ok) {
-                text = looksJson ? body : HtmlToPlainText(body);
-                method = looksJson ? L"JSON 接口" : L"网页正文";
-            }
-            // GET 失败，或页面疑似 JS 空壳 → WebView2 渲染兜底
-            if (!ok || (!looksJson && text.size() < 80)) {
-                std::wstring renderErr;
-                if (FetchWebPageRendered(url, text, renderErr, 30000)) {
-                    ok = true;
-                    method = L"渲染";
-                } else if (!ok) {
-                    err = renderErr;
-                }
-            }
-        }
-        if (!ok) {
-            return L"[错误] 抓取失败：" + err
+        const WebReadOutcome read = ReadUrlAsText(url, forceRender, 30000);
+        if (!read.ok) {
+            return L"[错误] 抓取失败：" + read.err
                 + L"。请确认 URL 可访问，或让用户提供内容。";
         }
         AiNoteWebFetchUntrusted();
+        std::wstring text = read.text;
         if (text.size() > static_cast<size_t>(maxChars)) {
             text.resize(static_cast<size_t>(maxChars));
             text += L"\n…(内容过长已截断)";
         }
         std::wstring result = L"✓ 已抓取（" + std::to_wstring(text.size())
-            + L" 字符，" + method + L"）\n来源：" + url + L"\n\n" + text;
+            + L" 字符，" + read.method + L"）\n来源：" + url + L"\n\n" + text;
         return result;
     };
     return tool;
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// ★正文抽取（readability 式）—— 让「抓下来的东西」是**正文**而不是整页导航
+//
+// 开源依据（详见 docs §52）：Mozilla Readability（Apache-2.0）、trafilatura（Apache-2.0）、
+// go-readability、postlight/parser、boilerpipe（Apache-2.0）都是同一条思路 ——
+// 先剔样板容器，再给候选块按「文本量 + 标点/段落数 − 链接密度」打分，取最高分容器。
+// 这里是**紧凑本地重写**（不引入依赖、不复制代码），关键词表只影响「抽哪块」，
+// 不影响任何动作决策。
+// ══════════════════════════════════════════════════════════════════════════
+namespace {
+
+struct HtmlElemSpan {
+    std::wstring tag;
+    std::wstring attrs;   // class/id 原文（小写），用于加减分
+    size_t start = 0;     // '<' 的位置
+    size_t end = 0;       // 闭合标签之后
+    int depth = 0;
+};
+
+bool HtmlTagIsVoid(const std::wstring& t) {
+    static const wchar_t* kVoid[] = { L"br", L"img", L"input", L"meta", L"link", L"hr",
+        L"source", L"area", L"base", L"col", L"embed", L"param", L"track", L"wbr" };
+    for (const wchar_t* v : kVoid) if (t == v) return true;
+    return false;
+}
+
+/// 扫描出块级元素的区间（含嵌套深度）。
+/// ⚠ 必须处理 HTML 的**隐式结束标签**：`<p>` 常常不写 `</p>`（合法 HTML），
+///   早期版本不处理 ⇒ 一个 `<p>` 的区间会一路延伸到文档末尾，把后面所有
+///   `<style>`/base64 内容都算进「这一段正文」（实测：抽出来的正文开头是
+///   `WIKI_BWIKI_哔哩哔哩"/ .smw.style%7Cext…` 和一串 base64 CSS）。
+std::vector<HtmlElemSpan> ScanBlockElements(const std::wstring& html) {
+    struct Open { std::wstring tag; std::wstring attrs; size_t start; int depth; };
+    std::vector<Open> stack;
+    std::vector<HtmlElemSpan> out;
+    /// 关闭栈顶最近的 tag（含其上方所有未闭合者），并记录区间。
+    auto closeUpTo = [&](const std::wstring& tag, size_t endPos) {
+        for (size_t s = stack.size(); s > 0; --s) {
+            if (stack[s - 1].tag != tag) continue;
+            HtmlElemSpan e;
+            e.tag = tag;
+            e.attrs = stack[s - 1].attrs;
+            e.start = stack[s - 1].start;
+            e.end = endPos;
+            e.depth = stack[s - 1].depth;
+            out.push_back(e);
+            stack.resize(s - 1);
+            return true;
+        }
+        return false;
+    };
+    size_t i = 0;
+    const size_t n = html.size();
+    while (i < n) {
+        const size_t lt = html.find(L'<', i);
+        if (lt == std::wstring::npos) break;
+        if (html.compare(lt, 4, L"<!--") == 0) {
+            const size_t e = html.find(L"-->", lt + 4);
+            i = (e == std::wstring::npos) ? n : e + 3;
+            continue;
+        }
+        const size_t gt = FindTagEnd(html, lt);
+        if (gt == std::wstring::npos) break;
+        std::wstring inner = html.substr(lt + 1, gt - lt - 1);
+        i = gt + 1;
+        if (inner.empty()) continue;
+        const bool closing = (inner[0] == L'/');
+        if (closing) inner = inner.substr(1);
+        size_t p = 0;
+        while (p < inner.size() && (iswspace(inner[p]) || inner[p] == L'/')) ++p;
+        size_t q = p;
+        while (q < inner.size() && (iswalnum(inner[q]) || inner[q] == L'-')) ++q;
+        if (q == p) continue;
+        std::wstring tag = inner.substr(p, q - p);
+        for (auto& c : tag) c = static_cast<wchar_t>(towlower(c));
+        // 只要块级候选（其余标签不影响打分）
+        const bool interesting = (tag == L"p" || tag == L"div" || tag == L"article"
+            || tag == L"section" || tag == L"td" || tag == L"li" || tag == L"main"
+            || tag == L"blockquote");
+        if (closing) {
+            closeUpTo(tag, gt + 1);
+            continue;
+        }
+        if (HtmlTagIsVoid(tag)) continue;
+        // 隐式结束标签（HTML5 的 implied end tag 规则里最常用的几条）
+        if (tag == L"p") {
+            closeUpTo(L"p", lt);
+        } else if (tag == L"li") {
+            closeUpTo(L"li", lt);
+        } else if (tag == L"td" || tag == L"th") {
+            closeUpTo(L"td", lt);
+            closeUpTo(L"th", lt);
+        } else if (tag == L"tr") {
+            closeUpTo(L"td", lt);
+            closeUpTo(L"th", lt);
+            closeUpTo(L"tr", lt);
+        } else if (tag == L"dd" || tag == L"dt") {
+            closeUpTo(L"dd", lt);
+            closeUpTo(L"dt", lt);
+        } else if (tag == L"div" || tag == L"section" || tag == L"article"
+            || tag == L"main" || tag == L"blockquote" || tag == L"table"
+            || tag == L"ul" || tag == L"ol" || tag == L"h1" || tag == L"h2"
+            || tag == L"h3" || tag == L"h4") {
+            closeUpTo(L"p", lt);        // <div> 会隐式结束 <p>
+            closeUpTo(L"li", lt);       // 列表项在遇到块级兄弟时也结束
+        }
+        if (!interesting) {
+            // 仍需跟踪嵌套（闭合时按名字弹栈），但只给少数常见容器记栈，避免栈无界增长
+            if (tag == L"table" || tag == L"ul" || tag == L"ol" || tag == L"a"
+                || tag == L"span" || tag == L"h1" || tag == L"h2" || tag == L"h3"
+                || tag == L"h4" || tag == L"dd" || tag == L"dt" || tag == L"th"
+                || tag == L"tr" || tag == L"nav" || tag == L"header" || tag == L"footer"
+                || tag == L"aside" || tag == L"form" || tag == L"script"
+                || tag == L"style") {
+                stack.push_back(Open{ tag, std::wstring(), lt, static_cast<int>(stack.size()) });
+            }
+            continue;
+        }
+        // 记 class/id（小写，限长）
+        std::wstring attrs;
+        {
+            std::wstring low = inner;
+            for (auto& c : low) c = static_cast<wchar_t>(towlower(c));
+            for (const wchar_t* key : { L"class=", L"id=" }) {
+                const size_t k = low.find(key);
+                if (k == std::wstring::npos) continue;
+                size_t v = k + wcslen(key);
+                wchar_t quote = (v < low.size() && (low[v] == L'"' || low[v] == L'\''))
+                    ? low[v] : 0;
+                if (quote) ++v;
+                const size_t ve = quote ? low.find(quote, v) : low.find_first_of(L" \t\r\n>", v);
+                if (ve != std::wstring::npos && ve > v) {
+                    attrs += low.substr(v, (std::min)(ve - v, static_cast<size_t>(120)));
+                    attrs += L" ";
+                }
+            }
+        }
+        stack.push_back(Open{ tag, attrs, lt, static_cast<int>(stack.size()) });
+        if (stack.size() > 400) stack.erase(stack.begin());   // 病态页面防爆
+    }
+    // 没收尾的（HTML 截断）按文档末补上
+    for (const auto& o : stack) {
+        if (o.tag == L"p" || o.tag == L"div" || o.tag == L"article" || o.tag == L"section"
+            || o.tag == L"td" || o.tag == L"li" || o.tag == L"main") {
+            HtmlElemSpan e;
+            e.tag = o.tag; e.attrs = o.attrs; e.start = o.start; e.end = html.size();
+            e.depth = o.depth;
+            out.push_back(e);
+        }
+    }
+    return out;
+}
+
+struct HtmlBlockStat {
+    size_t textChars = 0;
+    size_t linkChars = 0;
+    size_t punct = 0;
+    size_t paragraphs = 0;
+};
+
+HtmlBlockStat MeasureHtmlRange(const std::wstring& html, size_t from, size_t to) {
+    HtmlBlockStat st;
+    bool inTag = false;
+    int linkDepth = 0;
+    size_t i = from;
+    const size_t end = (std::min)(to, html.size());
+    while (i < end) {
+        const wchar_t c = html[i];
+        if (c == L'<') {
+            const size_t gt = FindTagEnd(html, i);
+            if (gt == std::wstring::npos || gt >= end) break;
+            // 只关心 <a> / </a> / <p
+            std::wstring t = html.substr(i + 1, (std::min)(gt - i - 1, static_cast<size_t>(12)));
+            for (auto& ch : t) ch = static_cast<wchar_t>(towlower(ch));
+            if (t.rfind(L"a", 0) == 0 && (t.size() == 1 || t[1] == L' ' || t[1] == L'>'))
+                ++linkDepth;
+            else if (t.rfind(L"/a", 0) == 0 && linkDepth > 0)
+                --linkDepth;
+            else if (t.rfind(L"p", 0) == 0 && (t.size() == 1 || t[1] == L' ' || t[1] == L'>'))
+                ++st.paragraphs;
+            i = gt + 1;
+            inTag = false;
+            continue;
+        }
+        if (!inTag) {
+            if (!iswspace(c)) {
+                ++st.textChars;
+                if (linkDepth > 0) ++st.linkChars;
+                if (c == L'，' || c == L'。' || c == L'！' || c == L'？' || c == L'；'
+                    || c == L',' || c == L'.' || c == L'!' || c == L'?' || c == L';')
+                    ++st.punct;
+            }
+        }
+        ++i;
+    }
+    return st;
+}
+
+/// 样板容器：整段删掉（导航/页脚/侧栏/表单…）。这些**不该**进入正文候选。
+bool HtmlTagIsBoilerplate(const std::wstring& tag) {
+    return tag == L"nav" || tag == L"header" || tag == L"footer" || tag == L"aside"
+        || tag == L"form" || tag == L"script" || tag == L"style" || tag == L"noscript"
+        || tag == L"svg" || tag == L"iframe";
+}
+
+/// 正文「文本块」标签：这些才是要输出给模型的最小单位（标题/段落/列表项/表格单元）。
+bool HtmlTagIsTextBlock(const std::wstring& t) {
+    return t == L"p" || t == L"h1" || t == L"h2" || t == L"h3" || t == L"h4"
+        || t == L"li" || t == L"td" || t == L"dd" || t == L"blockquote";
+}
+
+/// 文本块的轻量 Markdown 前缀（保留层级，几乎不花 token —— 这是 html→md 那一派的做法）。
+std::wstring HtmlBlockPrefix(const std::wstring& t) {
+    if (t == L"h1") return L"# ";
+    if (t == L"h2") return L"## ";
+    if (t == L"h3" || t == L"h4") return L"### ";
+    if (t == L"li") return L"- ";
+    return L"";
+}
+
+double HtmlRangeLinkDensity(const std::wstring& s, size_t from, size_t to) {
+    const HtmlBlockStat st = MeasureHtmlRange(s, from, to);
+    if (st.textChars == 0) return 1.0;
+    return static_cast<double>(st.linkChars) / static_cast<double>(st.textChars);
+}
+
+
+/// ⚠ 这一条**只用于「整块删」的判据**，而且要再 AND 上「块里没有 `<p>`」——
+///   理由：链接列表/导航栏**从来不会有 `<p>`**，而正文段落容器一定有。
+///   这是 Readability 的 unlikely-candidate 规则里最稳的那一半（另一半按长度阈值，
+///   在中文页面上阈值不好定，所以只留结构判据）。
+bool HtmlAttrLooksBoilerplate(const std::wstring& attrs) {
+    if (attrs.empty()) return false;
+    static const wchar_t* kNeg[] = { L"nav", L"menu", L"sidebar", L"side-bar", L"footer",
+        L"header", L"comment", L"share", L"related", L"recommend", L"advert", L"banner",
+        L"promo", L"cookie", L"login", L"subscribe", L"breadcrumb", L"toolbar",
+        L"pagination", L"copyright", L"search", L"tag-list", L"hot-list", L"catalog",
+        L"toc", L"mw-navigation", L"vector", L"portal", L"footer-info" };
+    for (const wchar_t* k : kNeg)
+        if (attrs.find(k) != std::wstring::npos) return true;
+    return false;
+}
+
+/// class/id 关键词打分（Readability 同款思路：正向是正文容器，负向是周边样板）。
+int HtmlAttrKeywordWeight(const std::wstring& attrs) {
+    if (attrs.empty()) return 0;
+    static const wchar_t* kPositive[] = { L"article", L"content", L"main", L"post",
+        L"entry", L"body", L"text", L"detail", L"markdown", L"mw-parser", L"rich_media" };
+    static const wchar_t* kNegative[] = { L"nav", L"menu", L"sidebar", L"side-bar",
+        L"footer", L"header", L"comment", L"share", L"related", L"recommend", L"advert",
+        L"banner", L"promo", L"cookie", L"login", L"subscribe", L"breadcrumb", L"toolbar",
+        L"pagination", L"copyright", L"search", L"meta", L"tag-list", L"hot-list" };
+    int w = 0;
+    for (const wchar_t* k : kPositive)
+        if (attrs.find(k) != std::wstring::npos) { w += 25; break; }
+    for (const wchar_t* k : kNegative)
+        if (attrs.find(k) != std::wstring::npos) { w -= 25; break; }
+    return w;
+}
+
+}  // namespace
+
+std::wstring HtmlExtractMainText(const std::wstring& html, std::wstring* outTitle) {
+    if (outTitle) outTitle->clear();
+    if (html.empty()) return {};
+    // ① 先剔掉不该进正文的整块（含嵌套内容）—— 直接在副本上删除标签区间
+    std::wstring s = html;
+    {
+        std::wstring low = s;
+        for (auto& c : low) c = static_cast<wchar_t>(towlower(c));
+        size_t i = 0;
+        while (i < low.size()) {
+            const size_t lt = low.find(L'<', i);
+            if (lt == std::wstring::npos) break;
+            size_t p = lt + 1;
+            if (p < low.size() && low[p] == L'/') ++p;
+            size_t q = p;
+            while (q < low.size() && (iswalnum(low[q]) || low[q] == L'-')) ++q;
+            const std::wstring tag = low.substr(p, q - p);
+            const size_t gt = FindTagEnd(low, lt);
+            if (gt == std::wstring::npos) break;
+            const bool closing = (lt + 1 < low.size() && low[lt + 1] == L'/');
+            if (!closing && HtmlTagIsBoilerplate(tag)) {
+                const std::wstring closeTag = L"</" + tag;
+                const size_t ce = low.find(closeTag, gt);
+                // 找不到闭合标签时**删到文档末**（`<style>` 没闭合时后面全是 CSS，
+                // 留着它就会把 CSS/base64 当正文 —— 实测踩过）。
+                const size_t cut = (ce == std::wstring::npos)
+                    ? low.size()
+                    : ((FindTagEnd(low, ce) == std::wstring::npos)
+                        ? low.size() : (FindTagEnd(low, ce) + 1));
+                s.erase(lt, cut - lt);
+                low.erase(lt, cut - lt);
+                i = lt;
+                continue;
+            }
+            i = gt + 1;
+        }
+    }
+    // ② 再删一遍「样板容器」：class/id 像导航/评论/相关阅读/搜索 **且块里没有 `<p>`** 的整块。
+    //    为什么必要（实测）：中文 Wiki 首页这类页面，正文很少而导航链接列表极长，
+    //    纯按文本量/链接密度打分时导航会赢；而「没有 <p> 的链接列表」这条结构判据能把它们清掉。
+    {
+        const std::vector<HtmlElemSpan> elems = ScanBlockElements(s);
+        std::vector<std::pair<size_t, size_t>> spans;
+        for (const auto& e : elems) {
+            if (e.end <= e.start) continue;
+            const size_t span = e.end - e.start;
+            if (span < 40 || span > 200 * 1024) continue;
+            if (!HtmlAttrLooksBoilerplate(e.attrs)) continue;
+            if (s.compare(e.start, (std::min)(span, static_cast<size_t>(2)), L"<p") == 0) continue;
+            if (s.find(L"<p", e.start) != std::wstring::npos
+                && s.find(L"<p", e.start) < e.end) continue;   // 有段落 ⇒ 可能是正文，留给打分
+            if (MeasureHtmlRange(s, e.start, e.end).textChars > 1200) continue;   // 太长不敢乱删
+            spans.push_back({ e.start, e.end });
+        }
+        // 去掉被别的区间包住的那些（父块删掉就够了，避免用过期偏移二次删除）
+        std::vector<std::pair<size_t, size_t>> keep;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            bool contained = false;
+            for (size_t j = 0; j < spans.size() && !contained; ++j) {
+                if (i == j) continue;
+                const bool covers = spans[j].first <= spans[i].first
+                    && spans[j].second >= spans[i].second
+                    && (spans[j].first < spans[i].first || spans[j].second > spans[i].second);
+                if (covers) contained = true;
+            }
+            if (!contained) keep.push_back(spans[i]);
+        }
+        std::sort(keep.begin(), keep.end(), [](const std::pair<size_t, size_t>& a,
+                                                const std::pair<size_t, size_t>& b) {
+            return a.first > b.first;   // 从后往前删，偏移才不失效
+        });
+        for (const auto& k : keep) s.erase(k.first, k.second - k.first);
+    }
+    // ③ 候选块打分
+    const std::vector<HtmlElemSpan> elems = ScanBlockElements(s);
+    double bestScore = 0.0;
+    HtmlElemSpan best;
+    bool hasBest = false;
+    for (const auto& e : elems) {
+        if (e.end <= e.start) continue;
+        const size_t span = e.end - e.start;
+        if (span < 40 || span > 400 * 1024) continue;
+        const HtmlBlockStat st = MeasureHtmlRange(s, e.start, e.end);
+        if (st.textChars < 100) continue;   // 太小，不可能是正文
+        const double linkDensity = static_cast<double>(st.linkChars)
+            / static_cast<double>((std::max)(static_cast<size_t>(1), st.textChars));
+        double score = static_cast<double>((std::min)(st.textChars, static_cast<size_t>(3000))) / 100.0;
+        score += 3.0 * static_cast<double>((std::min)(st.punct, static_cast<size_t>(50)));
+        score += 3.0 * static_cast<double>((std::min)(st.paragraphs, static_cast<size_t>(30)));
+        score += HtmlAttrKeywordWeight(e.attrs);
+        score += (std::min)(e.depth, 8) * 1.0;
+        if (linkDensity > 0.25) score *= (1.0 - (std::min)(linkDensity, 0.95));
+        // 同分时更深的那个赢（更贴近正文），所以这里用严格大于
+        if (score > bestScore) { bestScore = score; best = e; hasBest = true; }
+    }
+    // ④ 在选中的容器里**只输出优质文本块**（段落 / 标题 / 列表项 / 表格单元），
+    //    跳过落在负向子容器（导航/侧栏/相关阅读/公告）里的块。
+    //    为什么不能直接 dump 整个容器的文本（实测）：选中的容器常常是「正文 + 站点横幅」的
+    //    大 wrapper，直接输出会让模型先读一屏公告/导航（本机实测 wiki 页面开头就是
+    //    「本站为民间玩家交流站…」一串站点通知）。块级输出才是 trafilatura / go-readability
+    //    那一派真正干净的原因。
+    std::wstring main;
+    if (hasBest && bestScore >= 3.0) {
+        const size_t from = best.start;
+        const size_t to = best.end;
+        const std::vector<HtmlElemSpan> subs = ScanBlockElements(s.substr(from, to - from));
+        std::vector<std::pair<size_t, size_t>> skip;      // 要跳过的负向子容器（绝对偏移）
+        for (const auto& e : subs) {
+            if (e.end <= e.start) continue;
+            if (!HtmlAttrLooksBoilerplate(e.attrs)) continue;
+            const size_t span = e.end - e.start;
+            if (span > 120 * 1024) continue;              // 太大不敢整块跳（可能是外层壳）
+            skip.push_back({ from + e.start, from + e.end });
+        }
+        auto inSkip = [&](size_t a, size_t b) {
+            for (const auto& k : skip)
+                if (a >= k.first && b <= k.second) return true;
+            return false;
+        };
+        // 只留「叶子」文本块：包含别的文本块的块（如 <li><p>…</p></li>）交给内层输出，
+        // 否则同一段话会被打印两遍。
+        std::vector<size_t> blocks;
+        for (size_t i = 0; i < subs.size(); ++i) {
+            if (!HtmlTagIsTextBlock(subs[i].tag)) continue;
+            if (subs[i].end <= subs[i].start) continue;
+            // ⚠ subs 的偏移是**相对子串**的，必须先换算成 s 的绝对偏移再切片 ——
+            //   直接拿 subs[i].start 去切 s 会切到文档中间（实测抽出来的「正文」是
+            //   `ile-height="505" />` 这种属性残渣）。
+            const size_t a = from + subs[i].start;
+            const size_t b = from + subs[i].end;
+            // 块里混着 <style>/<script>/<link> ⇒ 这不是干净的文本块（多半是坏标签边界），跳过。
+            {
+                const std::wstring frag = s.substr(a, b - a);
+                bool dirty = false;
+                for (const wchar_t* bad : { L"<style", L"<script", L"<link", L"<meta" })
+                    if (frag.find(bad) != std::wstring::npos) { dirty = true; break; }
+                if (dirty) continue;
+            }
+            bool containsInner = false;
+            for (size_t j = 0; j < subs.size() && !containsInner; ++j) {
+                if (i == j) continue;
+                if (!HtmlTagIsTextBlock(subs[j].tag)) continue;
+                if (subs[j].start >= subs[i].start && subs[j].end <= subs[i].end
+                    && (subs[j].start > subs[i].start || subs[j].end < subs[i].end))
+                    containsInner = true;
+            }
+            if (containsInner) continue;
+            if (inSkip(a, b)) continue;
+            const std::wstring text = Trim(HtmlToPlainText(s.substr(a, b - a)));
+            const bool heading = subs[i].tag[0] == L'h';
+            if (text.size() < (heading ? 2u : 12u)) continue;
+            if (HtmlRangeLinkDensity(s, a, b) > 0.6) continue;   // 整块都是链接 ⇒ 导航
+            const std::wstring prefix = HtmlBlockPrefix(subs[i].tag);
+            if (!main.empty()) main += L"\n";
+            main += prefix + text;
+        }
+    }
+    if (main.size() < 80) return {};
+    if (outTitle) {
+        // 标题取**页面自己的 `<title>`**（比「正文第一行」可靠得多：正文第一行常常是横幅/公告，
+        // 长度还不一定落进窗口）。
+        const size_t a = s.find(L"<title");
+        if (a != std::wstring::npos) {
+            const size_t b = s.find(L'>', a);
+            const size_t c = (b == std::wstring::npos) ? std::wstring::npos
+                                                       : s.find(L"</title>", b);
+            if (b != std::wstring::npos && c != std::wstring::npos && c > b) {
+                *outTitle = Trim(HtmlToPlainText(s.substr(b + 1, c - b - 1)));
+                // HtmlToPlainText 会带上「标题：」前缀（它自己也提取了一次），这里剥掉
+                const std::wstring kPrefix = L"标题：";
+                if (outTitle->rfind(kPrefix, 0) == 0) *outTitle = outTitle->substr(kPrefix.size());
+                *outTitle = Trim(*outTitle);
+            }
+        }
+    }
+    return Trim(main);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ★webSearch：零 API key 的联网搜索（宿主 HTTP，不开浏览器、不抢前台）
+// ══════════════════════════════════════════════════════════════════════════
+namespace {
+
+/// Bing 的跳转包装（`/ck/a?...&u=a1<base64url>`）→ 还原真实 URL。
+/// 实测本机 cn 结果页给的是**直链**，这条只是兜底（别让模型看到一串 bing.com/ck/a）。
+std::wstring DecodeBingRedirect(const std::wstring& href) {
+    const size_t u = href.find(L"u=a1");
+    if (u == std::wstring::npos) return href;
+    std::wstring b64 = href.substr(u + 4);
+    const size_t amp = b64.find(L'&');
+    if (amp != std::wstring::npos) b64 = b64.substr(0, amp);
+    for (auto& c : b64) {
+        if (c == L'-') c = L'+';
+        else if (c == L'_') c = L'/';
+    }
+    while (b64.size() % 4 != 0) b64.push_back(L'=');
+    static const wchar_t* kTbl =
+        L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string bytes;
+    int acc = 0, bits = 0;
+    for (const wchar_t c : b64) {
+        const wchar_t* pos = wcschr(kTbl, c);
+        if (!pos) continue;
+        acc = (acc << 6) | static_cast<int>(pos - kTbl);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push_back(static_cast<char>((acc >> bits) & 0xFF));
+        }
+    }
+    if (bytes.empty()) return href;
+    return FromUtf8(bytes);
+}
+
+std::wstring FirstHrefInBlock(const std::wstring& block, size_t from) {
+    size_t i = from;
+    for (;;) {
+        const size_t a = block.find(L"<a", i);
+        if (a == std::wstring::npos) return {};
+        const size_t gt = block.find(L'>', a);
+        if (gt == std::wstring::npos) return {};
+        std::wstring tag = block.substr(a, gt - a);
+        std::wstring low = tag;
+        for (auto& c : low) c = static_cast<wchar_t>(towlower(c));
+        const size_t h = low.find(L"href=");
+        if (h != std::wstring::npos) {
+            size_t v = a + h + 5;
+            const wchar_t quote = (v < block.size() && (block[v] == L'"' || block[v] == L'\''))
+                ? block[v] : 0;
+            if (quote) ++v;
+            const size_t ve = quote ? block.find(quote, v)
+                                    : block.find_first_of(L" \t\r\n>", v);
+            if (ve != std::wstring::npos && ve > v) return block.substr(v, ve - v);
+        }
+        i = gt + 1;
+    }
+}
+
+std::wstring TagText(const std::wstring& frag) {
+    return Trim(HtmlToPlainText(frag));
+}
+
+}  // namespace
+
+std::vector<WebSearchResult> ParseSearchResultsHtml(const std::wstring& html) {
+    std::vector<WebSearchResult> out;
+    if (html.empty()) return out;
+    // 结果块分隔：Bing 用 <li class="b_algo">；也容忍属性顺序不同（class 不是第一个）
+    std::vector<size_t> starts;
+    {
+        size_t i = 0;
+        for (;;) {
+            const size_t p = html.find(L"b_algo", i);
+            if (p == std::wstring::npos) break;
+            const size_t lt = html.rfind(L'<', p);
+            starts.push_back(lt == std::wstring::npos ? p : lt);
+            i = p + 6;
+        }
+    }
+    for (size_t k = 0; k < starts.size() && out.size() < 20; ++k) {
+        const size_t from = starts[k];
+        const size_t to = (k + 1 < starts.size()) ? starts[k + 1]
+            : (std::min)(html.size(), from + 64 * 1024);
+        const std::wstring block = html.substr(from, to - from);
+        // 标题：第一个 <h2> 里的第一个 <a href>
+        WebSearchResult r;
+        size_t h2 = block.find(L"<h2");
+        if (h2 == std::wstring::npos) h2 = block.find(L"<H2");
+        if (h2 != std::wstring::npos) {
+            const std::wstring href = FirstHrefInBlock(block, h2);
+            const size_t gt = block.find(L'>', h2);
+            const size_t he = block.find(L"</h2", gt == std::wstring::npos ? h2 : gt);
+            if (gt != std::wstring::npos && he != std::wstring::npos && he > gt)
+                r.title = TagText(block.substr(gt + 1, he - gt - 1));
+            if (!href.empty()) {
+                r.url = (href.rfind(L"http", 0) == 0) ? DecodeBingRedirect(href) : std::wstring();
+            }
+        }
+        // 摘要：h2 之后的第一个 <p>
+        {
+            const size_t base = (h2 == std::wstring::npos) ? 0 : h2;
+            const size_t p = block.find(L"<p", base);
+            const size_t pe = (p == std::wstring::npos) ? std::wstring::npos
+                                                        : block.find(L"</p", p);
+            if (p != std::wstring::npos && pe != std::wstring::npos && pe > p) {
+                const size_t gt = block.find(L'>', p);
+                if (gt != std::wstring::npos && gt < pe)
+                    r.snippet = TagText(block.substr(gt + 1, pe - gt - 1));
+            }
+        }
+        if (r.title.empty() || r.url.empty()) continue;
+        if (r.snippet.size() > 400) r.snippet.resize(400);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::wstring BuildSearchUrl(const std::wstring& query) {
+    // 只保留可搜索的字符（去控制字符/换行），其余按 UTF-8 百分号转义
+    std::wstring q;
+    for (const wchar_t c : query) {
+        if (c == L'\r' || c == L'\n' || c == L'\t') { q.push_back(L' '); continue; }
+        if (c < 0x20) continue;
+        q.push_back(c);
+    }
+    q = Trim(q);
+    std::string utf8 = ToUtf8(q);
+    std::string enc;
+    static const char* kHex = "0123456789ABCDEF";
+    for (const unsigned char c : utf8) {
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || c == '-' || c == '_' || c == '.' || c == '~') {
+            enc.push_back(static_cast<char>(c));
+        } else if (c == ' ') {
+            enc += "%20";
+        } else {
+            enc.push_back('%');
+            enc.push_back(kHex[(c >> 4) & 0xF]);
+            enc.push_back(kHex[c & 0xF]);
+        }
+    }
+    return L"https://www.bing.com/search?q=" + FromUtf8(enc);
+}
+
+AgentTool MakeWebSearchTool() {
+    AgentTool tool;
+    tool.name = L"webSearch";
+    tool.description =
+        L"联网搜索（宿主直连搜索结果页，**不开浏览器、不抢前台**），返回 标题 / URL / 摘要 清单。"
+        L"查资料的第一步就该用它（游戏玩法、软件用法、报错原因、名词是什么…），"
+        L"拿到 URL 后再 fetchWebPage 读正文；也可以直接传 readTop=1~3 让它**同一轮**把前几条正文读回来。"
+        // 实测事实（本机 2026-09）：中文查询**用空格分词会显著变差** ——
+        // 「植物大战僵尸融合版 我是僵尸 攻略」只匹配到「植物」，
+        // 而「植物大战僵尸融合版」第一条就是对的 Wiki。这是搜索引擎的分词行为，不是我们的策略。
+        L"⚠ 实测：中文查询**别用空格堆多个词**（会把结果带偏），"
+        L"把关键短语连写（如 `植物大战僵尸融合版WIKI`）；要多个概念就分几次搜。"
+        L"只读公开网页；不碰需要登录的内容。";
+    tool.parameters_json = LR"({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "搜索词。中文建议连写关键短语，别用空格堆词"},
+            "maxResults": {"type": "integer", "description": "返回几条结果（默认 8，最多 15）"},
+            "readTop": {"type": "integer", "description": "同一轮顺带读前 N 条的正文（0=只给清单，默认 0，最多 3）"},
+            "maxChars": {"type": "integer", "description": "每条正文的字符上限（默认 8000，最多 20000）"}
+        },
+        "required": ["query"]
+    })";
+    tool.execute = [](const std::wstring& paramsJson) -> std::wstring {
+        std::wstring query;
+        int maxResults = 8;
+        int readTop = 0;
+        int maxChars = 8000;
+        try {
+            const json p = json::parse(ToUtf8(paramsJson));
+            if (p.contains("query") && p["query"].is_string())
+                query = Trim(FromUtf8(p["query"].get<std::string>()));
+            if (p.contains("maxResults") && p["maxResults"].is_number_integer())
+                maxResults = p["maxResults"].get<int>();
+            if (p.contains("readTop") && p["readTop"].is_number_integer())
+                readTop = p["readTop"].get<int>();
+            if (p.contains("maxChars") && p["maxChars"].is_number_integer())
+                maxChars = p["maxChars"].get<int>();
+        } catch (...) {
+            return L"[错误] 参数 JSON 解析失败。";
+        }
+        if (query.empty()) return L"[错误] 缺少 query 参数（搜索词）。";
+        maxResults = std::clamp(maxResults, 1, 15);
+        readTop = std::clamp(readTop, 0, 3);
+        maxChars = std::clamp(maxChars, 1000, 20000);
+
+        const std::wstring searchUrl = BuildSearchUrl(query);
+        std::wstring blockErr;
+        if (AgentFetchUrlDestinationBlocked(searchUrl, blockErr))
+            return L"[错误] " + blockErr;
+
+        std::wstring html;
+        std::wstring err;
+        if (!FetchWebPage(searchUrl, html, err, 25000))
+            return L"[错误] 搜索请求失败：" + err + L"（URL：" + searchUrl + L"）";
+        const std::vector<WebSearchResult> results = ParseSearchResultsHtml(html);
+        if (results.empty()) {
+            // 如实说明：解析不到 ≠ 没有结果（可能是反爬/改版）。绝不编造。
+            return L"[错误] 搜索结果页没能解析出条目（页面 "
+                + std::to_wstring(html.size()) + L" 字符）——可能是反爬或改版。"
+                L"可改用 openWebpage + observePage 看结果页（⚠ 会抢前台），"
+                L"或直接把已知网址交给 fetchWebPage。";
+        }
+
+        std::wstring out = L"✓ webSearch「" + query + L"」→ 解析到 "
+            + std::to_wstring(results.size()) + L" 条（来源：搜索结果页 "
+            + std::to_wstring(html.size()) + L" 字符，宿主 HTTP，未开浏览器）\n";
+        const int shown = (std::min)(static_cast<int>(results.size()), maxResults);
+        for (int i = 0; i < shown; ++i) {
+            const WebSearchResult& r = results[static_cast<size_t>(i)];
+            out += L"\n[" + std::to_wstring(i + 1) + L"] " + r.title + L"\n    " + r.url;
+            if (!r.snippet.empty()) out += L"\n    " + r.snippet;
+            out += L"\n";
+        }
+        if (readTop > 0) {
+            const int n = (std::min)(readTop, shown);
+            for (int i = 0; i < n; ++i) {
+                const WebSearchResult& r = results[static_cast<size_t>(i)];
+                std::wstring bErr;
+                if (AgentFetchUrlDestinationBlocked(r.url, bErr)) {
+                    out += L"\n── 正文[" + std::to_wstring(i + 1) + L"] 跳过：" + bErr + L"\n";
+                    continue;
+                }
+                const WebReadOutcome read = ReadUrlAsText(r.url, false, 25000);
+                if (!read.ok) {
+                    out += L"\n── 正文[" + std::to_wstring(i + 1) + L"] 读取失败：" + read.err
+                        + L"\n";
+                    continue;
+                }
+                std::wstring body = read.text;
+                if (body.size() > static_cast<size_t>(maxChars)) {
+                    body.resize(static_cast<size_t>(maxChars));
+                    body += L"\n…(已截断)";
+                }
+                out += L"\n──── 正文[" + std::to_wstring(i + 1) + L"] " + r.title
+                    + L"（" + read.method + L"，" + std::to_wstring(body.size())
+                    + L" 字符）\n" + body + L"\n";
+            }
+        }
+        AiNoteWebFetchUntrusted();
+        return out;
+    };
+    return tool;
+}
+

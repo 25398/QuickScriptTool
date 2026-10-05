@@ -1,0 +1,45 @@
+AI动作执行 [deepseek-flash]：动作 JSON 解析完成，共 2 步
+  [诊断] 本地判断 4 条：
+    [判断] game_foreground verdict=game_no_tree conf=0.88 why=前台自绘（子窗口≈0）：没有控件树，视觉是唯一手段 | sig page=- br=0 self=1 sheet=0 web=0 hooks=0 busy=0.412 changing=1
+    [判断] vision_gate verdict=allow conf=0.90 why=前台不是浏览器窗口：没有网页树可退，视觉是唯一手段 | sig page=- br=0 self=1 sheet=0 web=0 hooks=0 busy=0.412 changing=1
+    [判断] vision_gate verdict=allow conf=0.90 why=前台不是浏览器窗口：没有网页树可退，视觉是唯一手段 | sig page=- br=0 self=1 sheet=0 web=0 hooks=0 busy=0.180 changing=1
+    [判断] vision_gate verdict=allow conf=0.90 why=前台不是浏览器窗口：没有网页树可退，视觉是唯一手段 | sig page=- br=0 self=1 sheet=0 web=0 hooks=0 busy=0.055 changing=1
+  [诊断] locateAndClick refineLevels=1 targetLen=2（僵尸）
+  [诊断] 布局记忆命中：「僵尸」→ 屏幕(1200,700)（外观签名一致）
+  [诊断] UI settle：已反应 耗时420ms 差分18bp
+  [诊断] 布局记忆命中：「豌豆射手」→ 屏幕(320,120)（外观签名一致）
+  [诊断] UI settle：已反应 耗时380ms 差分22bp
+AI动作执行 [deepseek-flash]：动作 JSON 解析完成，共 1 步
+  [诊断] 本地判断 2 条：
+    [判断] game_foreground verdict=game_by_motion conf=0.55 why=画面持续重绘：疑似游戏/模拟器/视频前台（只有这条定量证据） | sig page=- br=0 self=0 sheet=0 web=0 hooks=0 busy=0.048 changing=1
+    [判断] vision_gate verdict=allow conf=0.90 why=前台不是浏览器窗口：没有网页树可退，视觉是唯一手段 | sig page=- br=0 self=0 sheet=0 web=0 hooks=0 busy=0.048 changing=1
+  [诊断] 疑似游戏前台但证据不足，settle 用交互档（未走短节拍）：画面持续重绘：疑似游戏/模拟器/视频前台（只有这条定量证据）
+  [诊断] locateAndClick refineLevels=1 targetLen=4
+  [诊断] 定位缓存作废：点击后画面无变化
+AI动作执行 [deepseek-flash]：动作 JSON 解析完成，共 3 步
+  [诊断] 本地判断 5 条：
+    [判断] vision_gate verdict=deny_busy_fallback conf=0.50 why=浏览器前台页型未知且画面高动态：先 observePage 拿树，别在动图上烧识图；且宿主没有 DOM 钩子，「先拿树」这条退路可能不存在 | sig page=- br=1 self=0 sheet=0 web=0 hooks=0 busy=0.315 changing=1
+    [判断] vision_gate verdict=deny_busy_fallback conf=0.55 why=浏览器前台页型未知且画面高动态：先 observePage 拿树，别在动图上烧识图 | sig page=- br=1 self=0 sheet=0 web=0 hooks=1 busy=0.288 changing=1
+    [判断] vision_gate verdict=deny_busy_fallback conf=0.55 why=浏览器前台页型未知且画面高动态：先 observePage 拿树，别在动图上烧识图 | sig page=- br=1 self=0 sheet=0 web=0 hooks=1 busy=0.201 changing=1
+    [判断] vision_gate verdict=allow conf=0.75 why=本次已是网页会话：视觉兜底可用 | sig page=- br=1 self=0 sheet=0 web=1 hooks=1 busy=0.160 changing=1
+    [判断] game_foreground verdict=not_game conf=0.85 why=前台是浏览器：有 DOM 可退，不判游戏 | sig page=- br=1 self=0 sheet=0 web=1 hooks=1 busy=0.160 changing=1
+  [诊断] 扩展 observePage pageKind=mixed nodes=42
+  [诊断] DOM 优先：树上命中「登录」[role=button]
+  [诊断] UIA 优先：命中「提交」[Button]
+  [诊断] 文字直点：本地 OCR 索引命中「保存」→ 屏幕(880,640)
+  [诊断] 布局记忆命中：「用户名」→ 屏幕(640,360)（外观签名一致）
+  [诊断] UI settle：已反应 耗时610ms 差分44bp
+AI动作执行：动作 JSON 解析完成，共 2 步
+  [诊断] 本地判断 3 条：
+    [判断] vision_gate verdict=allow conf=0.90 why=页型是 dom/mixed：有控件树可点，视觉仍可用（优先树） | sig page=dom br=1 self=0 sheet=0 web=0 hooks=1 busy=0.052 changing=0
+    [判断] game_foreground verdict=not_game conf=0.85 why=前台是浏览器：有 DOM 可退，不判游戏 | sig page=dom br=1 self=0 sheet=0 web=0 hooks=1 busy=0.052 changing=0
+    [判断] vision_gate verdict=allow conf=0.68 why=浏览器前台页型未知但画面安静：识图代价可控（无硬证据，属兜底放行） | sig page=- br=1 self=0 sheet=0 web=0 hooks=1 busy=0.012 changing=0
+  [诊断] locateAndClick freshCore targetLen=3
+  [诊断] 遮挡校验失败：定位点不属于前台窗口，已拦截点击
+  [诊断] locateAndClick 失败：未找到目标（识图 2 轮）
+AI动作执行：动作 JSON 解析完成，共 1 步
+  [诊断] 本地判断 2 条：
+    [判断] game_foreground verdict=game_canvas_page conf=0.90 why=画布页：DOM 无可用节点，视觉是唯一手段 | sig page=canvas br=1 self=0 sheet=0 web=0 hooks=1 busy=0.640 changing=1
+    [判断] vision_gate verdict=allow conf=0.90 why=画布页：DOM 没有可用节点，视觉是唯一手段 | sig page=canvas br=1 self=0 sheet=0 web=0 hooks=1 busy=0.640 changing=1
+  [诊断] 网格已建立：锚点(400,700) 周期 96×110
+  [诊断] 布局记忆记一笔未生效（连续 2 次才回退识图，本次不再识图）

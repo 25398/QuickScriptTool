@@ -144,7 +144,7 @@ bool RunScriptPath(const std::wstring& path, std::string& err) {
         err = "busy";
         return false;
     }
-    // WebView 桥在 UI 线程：同步启动，便于回传「无动作 / 窗口模式取消」等错误
+    // WebView 桥在 UI 线程：同步启动，便于回传「无动作 / 窗口/后台窗口模式取消」等错误
     std::wstring werr;
     if (!g_engine->EngineRunFromPath(path, werr)) {
         err = ToUtf8(werr);
@@ -161,6 +161,39 @@ void StopScript() {
 
 bool IsRunning() {
     return g_engine && g_engine->EngineIsRunning();
+}
+
+bool IsBusy() {
+    return g_engine && g_engine->EngineIsBusy();
+}
+
+bool RequestRunScriptAsync(const std::wstring& path, std::string& err) {
+    if (!g_engine) {
+        err = "engine not started";
+        return false;
+    }
+    std::wstring werr;
+    if (!g_engine->EngineRequestRunFromPathAsync(path, werr)) {
+        err = ToUtf8(werr);
+        if (err.empty()) err = "run request failed";
+        return false;
+    }
+    return true;
+}
+
+bool GetMacroVariable(const std::wstring& name, std::wstring& out) {
+    out.clear();
+    if (!g_engine) return false;
+    return g_engine->EngineGetMacroVariable(name, out);
+}
+
+void SetPlaybackPaused(bool paused) {
+    if (!g_engine) return;
+    g_engine->EngineSetPlaybackPaused(paused);
+}
+
+bool IsPlaybackPaused() {
+    return g_engine && g_engine->EngineIsPlaybackPaused();
 }
 
 bool DebugRunActions(const std::vector<ScriptAction>& actions, int startIndex,
@@ -413,6 +446,23 @@ bool HotkeyChordConflicts(UINT vk, UINT modifiers, const std::wstring& excludePa
     bool excludeGlobal, std::wstring& errOut) {
     if (!g_engine) return false;
     return g_engine->EngineHotkeyChordConflicts(vk, modifiers, excludePath, excludeGlobal, errOut);
+}
+
+void SetDedicatedHotkeyScopeAll(bool all) {
+    if (!g_engine) return;
+    g_engine->EngineSetDedicatedHotkeyScopeAll(all);
+}
+
+bool GlobalHotkeyConflicts(UINT vk, UINT modifiers) {
+    if (!g_engine) return false;
+    return g_engine->EngineGlobalHotkeyConflicts(vk, modifiers);
+}
+
+void CollectDedicatedHotkeyOwners(UINT vk, UINT modifiers,
+    const std::wstring& excludePath, std::vector<std::wstring>& out) {
+    out.clear();
+    if (!g_engine) return;
+    g_engine->EngineCollectDedicatedHotkeyOwners(vk, modifiers, excludePath, out);
 }
 
 }  // namespace qst::engine

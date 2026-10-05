@@ -21,6 +21,11 @@ AgentTool MakeSearchAgentFilesTool();
 /// 写入允许目录内的文本文件（UTF-8，自动记入撤销日志）
 AgentTool MakeWriteAgentFileTool();
 
+/// 写 Excel（.xlsx）：**不需要装 Office**（自研 `src/ooxml/`）。
+/// `mode=create` 新建（默认拒绝覆盖）；`mode=setCells` 改已有文件的指定单元格
+/// （**字节保留**：图表/公式/样式/别的表一字不动；改前落字节级备份）。
+AgentTool MakeWriteSpreadsheetTool();
+
 /// 复制文本到剪贴板
 AgentTool MakeCopyAgentTextToClipboardTool();
 

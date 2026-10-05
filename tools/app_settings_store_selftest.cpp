@@ -69,7 +69,8 @@ const selftest::CaseInfo kCases[] = {
     {L"save_load_float_ball", L"default",
         L"showFloatBall default true; docked/free + edge 0-3 + x/yRatio clamp"},
     {L"float_ball_geom_dock_expand", L"default",
-        L"docked peek on left/right; expanded panel inward; snap mid-line; yRatio clamp"},
+        L"docked peek on left/right; expanded panel inward; panel title/status rows; "
+        L"single-line centering; snap mid-line; yRatio clamp"},
     {L"save_load_ui_scale_factor", L"default",
         L"other.uiScaleFactor default 1.0; roundtrip; <=0/missing clamp to 1.0"},
     {L"save_load_editor_default_view", L"default",
@@ -108,6 +109,14 @@ const selftest::CaseInfo kCases[] = {
         L"custom/portable dir keeps WebView2UserData beside exe"},
     {L"webview_fetchdata_programfiles_roams", L"default",
         L"Program Files FetchData also roams to LocalAppData"},
+    {L"portable_settings_plaintext_key", L"default",
+        L"导出用的设置快照里 apiKey 必须是明文（不能是 dpapi:），否则换机器解不开"},
+    {L"portable_settings_roundtrip", L"default",
+        L"设置快照能被 LoadAppSettings 原样读回（含 savedModels）"},
+    {L"portable_settings_playback_roundtrip", L"default",
+        L"回放次数/间隔/倍速/低性能/GPU/AI加速/窗口/后台窗口模式全部往返 —— 导出效果必须与软件内一致"},
+    {L"portable_settings_escapes", L"default",
+        L"密钥里的引号/反斜杠/换行不破坏 JSON"},
     {L"extract_string_object_last_wins", L"default",
         L"ExtractString 只读根对象键且同名键 last-wins，不误读嵌套 apiKey"},
 };
@@ -574,7 +583,7 @@ void CaseFloatBallGeom() {
     m.neckPx = 32;
     m.gapPx = 0;
     m.padPx = 8;
-    m.buttonH = 26;
+    m.lineH = 26;
     m.snapPx = 28;
 
     const FloatBallFrame dockR = ComputeDockedFrame(work, FloatBallEdge::Right, 1.0, 0.5, m);
@@ -601,9 +610,9 @@ void CaseFloatBallGeom() {
         && (expR.window.right - expR.window.left) == expW
         && expR.local.ball.left == m.panelW - neck
         && expR.local.ball.left < expR.local.panel.right
-        && expR.local.button.bottom > expR.local.button.top
+        && expR.local.status.bottom > expR.local.status.top
         && expR.local.title.bottom > expR.local.title.top
-        && expR.local.title.bottom <= expR.local.button.top
+        && expR.local.title.bottom <= expR.local.status.top
         && (expR.window.bottom - expR.window.top) == m.ballPx;
 
     const FloatBallFrame expL = ComputeExpandedFrame(work, FloatBallEdge::Left, 0.0, 1.0, m);
@@ -616,7 +625,7 @@ void CaseFloatBallGeom() {
     const bool expTop = expT.window.top == work.top
         && (expT.window.bottom - expT.window.top) == m.ballPx
         && (expT.local.panel.bottom - expT.local.panel.top) == stemThick
-        && expT.local.button.right > expT.local.button.left;
+        && expT.local.status.right > expT.local.status.left;
 
     const FloatBallFrame freeBall = ComputeFreeFrame(work, 0.5, 0.5, m, false);
     const bool freeCircle = (freeBall.window.right - freeBall.window.left) == m.ballPx
@@ -688,6 +697,46 @@ void CaseFloatBallGeom() {
     const FloatBallSnap snapCursor = ResolveReleaseSnap(400, 400, work, m.ballPx, 56, 1910, 500);
     const bool snapByCursor = snapCursor.docked && snapCursor.edge == FloatBallEdge::Right;
 
+    // 面板第二行 = 脚本当前状态（原「启动/停止」按钮位）：两行都在时各就各位。
+    const bool panelTwoLines = expR.local.title.bottom <= expR.local.status.top
+        && expR.local.status.bottom <= expR.local.panel.bottom;
+
+    // 只有状态一行（录制中 / 连点中 / 未选择脚本）⇒ 状态行在两行的高度里垂直居中、另一行清空。
+    // 「居中」= 行心落在 title.top..status.bottom 的中线上；行高不变形（仍是一个 lineH）。
+    const auto midDelta = [](int a, int b) { return a > b ? a - b : b - a; };
+    const int twoRowMid = (expR.local.title.top + expR.local.status.bottom) / 2;
+    const int twoRowH = expR.local.status.bottom - expR.local.title.top;
+    const int rowH = expR.local.status.bottom - expR.local.status.top;
+    FloatBallLocal soloStatus = expR.local;
+    LayoutPanelLines(soloStatus, m, /*wantTitle=*/false, /*wantStatus=*/true);
+    const bool soloStatusCentered = soloStatus.title.bottom == soloStatus.title.top
+        && soloStatus.title.left == soloStatus.title.right
+        && (soloStatus.status.bottom - soloStatus.status.top) == rowH
+        && soloStatus.status.top > expR.local.title.top      // 确实上移去占第一行的位
+        && soloStatus.status.top < expR.local.status.top
+        && midDelta((soloStatus.status.top + soloStatus.status.bottom) / 2, twoRowMid) <= 1;
+
+    // 只有脚本名一行（调用方没给状态）⇒ 同一个居中规则作用在 title 上。
+    FloatBallLocal soloTitle = expR.local;
+    LayoutPanelLines(soloTitle, m, /*wantTitle=*/true, /*wantStatus=*/false);
+    const bool soloTitleCentered = soloTitle.status.bottom == soloTitle.status.top
+        && soloTitle.status.left == soloTitle.status.right
+        && (soloTitle.title.bottom - soloTitle.title.top) <= twoRowH
+        && soloTitle.title.top > expR.local.title.top
+        && midDelta((soloTitle.title.top + soloTitle.title.bottom) / 2, twoRowMid) <= 1;
+
+    // 两行都有内容（或都为空）⇒ 布局一格不动（这条钉住「单行特例不许影响常态」）。
+    FloatBallLocal bothRows = expR.local;
+    LayoutPanelLines(bothRows, m, true, true);
+    FloatBallLocal noRows = expR.local;
+    LayoutPanelLines(noRows, m, false, false);
+    const bool panelLinesStable = bothRows.title.top == expR.local.title.top
+        && bothRows.title.bottom == expR.local.title.bottom
+        && bothRows.status.top == expR.local.status.top
+        && bothRows.status.bottom == expR.local.status.bottom
+        && noRows.title.top == expR.local.title.top
+        && noRows.status.top == expR.local.status.top;
+
     RECT revealBox{0, 0, 180, 64};
     RECT revealBall{180 - 64, 0, 180, 64};
     const RECT rev0 = DockedRevealRect(FloatBallEdge::Right, revealBox, revealBall, 0.f);
@@ -700,7 +749,8 @@ void CaseFloatBallGeom() {
     const bool ok = dockRight && dockLeft && dockTop && expRight && expLeft && expTop
         && freeCircle && freeUpperHorizontal && freeRightExpandsRight && freeLeftExpandsLeft
         && snapLeft && snapToTop && staysFree && yClamp && inCircle && pinAnim && pinTopAnim
-        && snapByCursor && revealRight;
+        && snapByCursor && revealRight
+        && panelTwoLines && soloStatusCentered && soloTitleCentered && panelLinesStable;
     Emit(L"float_ball_geom_dock_expand", ok, ok ? L"" : L"float ball geom failed");
 }
 
@@ -1133,6 +1183,157 @@ void CaseExtractStringObjectLastWins() {
     Emit(L"extract_string_object_last_wins", ok, detail.c_str());
 }
 
+/// 便携 AI 设置：明文密钥 + 可被 LoadAppSettings 原样读回。
+void CasePortableSettingsPlaintextKey() {
+    quickscript::AiApiSettings ai;
+    ai.enabled = true;
+    ai.apiUrl = L"https://api.example.com/v1/chat/completions";
+    ai.apiKey = L"sk-abcdef123456";
+    ai.modelName = L"gpt-4o";
+    quickscript::AppSettings full{};
+    full.ai = ai;
+    const std::wstring json = SerializeAppSettings(full, /*portableSecrets=*/true);
+    const bool hasDpapi = json.find(L"dpapi:") != std::wstring::npos;
+    const bool hasPlain = json.find(L"sk-abcdef123456") != std::wstring::npos;
+    const bool hasAiSection = json.find(L"\"ai\"") != std::wstring::npos;
+    const bool ok = !hasDpapi && hasPlain && hasAiSection;
+    Emit(L"portable_settings_plaintext_key", ok,
+        ok ? L"" : (hasDpapi ? L"密钥被 DPAPI 加密了（换机器解不开）"
+                             : (hasPlain ? L"缺少 ai 段" : L"找不到明文密钥")));
+}
+
+void CasePortableSettingsRoundtrip(const std::wstring& dir) {
+    quickscript::AiApiSettings ai;
+    ai.enabled = true;
+    ai.apiUrl = L"https://api.example.com/v1/chat/completions";
+    ai.apiKey = L"sk-roundtrip-001";
+    ai.modelName = L"gpt-4o-mini";
+    ai.temperature = 0.25;
+    ai.maxTokens = 2048;
+    quickscript::AiModelProfile p1;
+    p1.apiUrl = L"https://api.other.com/v1/chat/completions";
+    p1.apiKey = L"sk-model-002";
+    p1.modelName = L"deepseek-chat";
+    p1.temperature = 0.7;
+    p1.maxTokens = 8192;
+    ai.savedModels.push_back(p1);
+
+    const std::wstring path = dir + L"\\portable_ai.json";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write("\xEF\xBB\xBF", 3);
+        quickscript::AppSettings full{};
+        full.ai = ai;
+        const auto utf8 = ToUtf8(SerializeAppSettings(full, /*portableSecrets=*/true));
+        out.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+    }
+
+    const std::wstring prev = AppSettingsFilePath();
+    SetAppSettingsFilePathForTest(path);
+    quickscript::AppSettings got{};
+    const bool loaded = LoadAppSettings(got);
+    SetAppSettingsFilePathForTest(prev);
+    DeleteFileW(path.c_str());
+
+    const bool ok = loaded
+        && got.ai.enabled
+        && got.ai.apiKey == L"sk-roundtrip-001"
+        && got.ai.modelName == L"gpt-4o-mini"
+        && got.ai.maxTokens == 2048
+        && got.ai.savedModels.size() == 1
+        && got.ai.savedModels[0].apiKey == L"sk-model-002"
+        && got.ai.savedModels[0].modelName == L"deepseek-chat";
+    Emit(L"portable_settings_roundtrip", ok,
+        ok ? L"" : (L"loaded=" + std::to_wstring(loaded ? 1 : 0)
+            + L" key=" + got.ai.apiKey
+            + L" models=" + std::to_wstring(got.ai.savedModels.size())).c_str());
+}
+
+/// 用户核心诉求：**导出时是什么设置，exe 里就是什么设置**。
+/// 所以逐字段锁住那些"会影响回放效果"的设置项，漏一个就是一处行为差异。
+void CasePortableSettingsPlaybackRoundtrip(const std::wstring& dir) {
+    quickscript::AppSettings s{};
+    // 回放次数：勾选 1 次 ⇒ exe 跑完 1 遍就停（引擎 worker 的 break 条件）
+    s.playback.enablePlaybackCount = true;
+    s.playback.playbackCount = 1;
+    // 回放间隔（随机区间）
+    s.playback.enablePlaybackInterval = true;
+    s.playback.playbackIntervalMinSeconds = 0.25;
+    s.playback.playbackIntervalMaxSeconds = 1.75;
+    // 倍速（录制回放用）
+    s.playback.enablePlaybackSpeed = true;
+    s.playback.playbackSpeed = 2.0;
+    // 性能相关开关
+    s.playback.lowPerformanceMode = true;
+    s.playback.aiFastPaths = false;
+    s.playback.findImageGpuAccel = true;
+    // 窗口/后台窗口模式（后台注入 / 变速）
+    s.windowMode.enableFakeFocusInjection = false;
+    s.windowMode.enableWindowTimeScale = false;
+    s.windowMode.hideInjectedModule = true;
+    s.windowMode.allowForegroundInputFallback = true;
+    s.windowMode.injectionTechnique = 6;
+
+    const std::wstring path = dir + L"\\portable_playback.selftest.json";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write("\xEF\xBB\xBF", 3);
+        const auto utf8 = ToUtf8(SerializeAppSettings(s, /*portableSecrets=*/true));
+        out.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+    }
+
+    const std::wstring prev = AppSettingsFilePath();
+    SetAppSettingsFilePathForTest(path);
+    quickscript::AppSettings got{};
+    const bool loaded = LoadAppSettings(got);
+    SetAppSettingsFilePathForTest(prev);
+    DeleteFileW(path.c_str());
+
+    bool ok = loaded;
+    const wchar_t* bad = L"";
+    auto chk = [&](bool cond, const wchar_t* name) {
+        if (!cond) { ok = false; if (!*bad) bad = name; }
+    };
+    chk(got.playback.enablePlaybackCount, L"enablePlaybackCount");
+    chk(got.playback.playbackCount == 1, L"playbackCount");
+    chk(got.playback.enablePlaybackInterval, L"enablePlaybackInterval");
+    chk(std::fabs(got.playback.playbackIntervalMinSeconds - 0.25) < 1e-6, L"intervalMin");
+    chk(std::fabs(got.playback.playbackIntervalMaxSeconds - 1.75) < 1e-6, L"intervalMax");
+    chk(got.playback.enablePlaybackSpeed, L"enablePlaybackSpeed");
+    chk(std::fabs(got.playback.playbackSpeed - 2.0) < 1e-6, L"playbackSpeed");
+    chk(got.playback.lowPerformanceMode, L"lowPerformanceMode");
+    chk(!got.playback.aiFastPaths, L"aiFastPaths");
+    chk(got.playback.findImageGpuAccel, L"findImageGpuAccel");
+    chk(!got.windowMode.enableFakeFocusInjection, L"enableFakeFocusInjection");
+    chk(!got.windowMode.enableWindowTimeScale, L"enableWindowTimeScale");
+    chk(got.windowMode.hideInjectedModule, L"hideInjectedModule");
+    chk(got.windowMode.allowForegroundInputFallback, L"allowForegroundInputFallback");
+    chk(got.windowMode.injectionTechnique == 6, L"injectionTechnique");
+
+    Emit(L"portable_settings_playback_roundtrip", ok,
+        ok ? L"" : (loaded ? (std::wstring(L"字段不一致：") + bad).c_str()
+                           : L"LoadAppSettings 失败"));
+}
+
+void CasePortableSettingsEscapes() {
+    quickscript::AiApiSettings ai;
+    ai.enabled = true;
+    ai.apiUrl = L"https://x/v1";
+    // 故意塞进 JSON 元字符：引号 / 反斜杠 / 换行
+    ai.apiKey = L"sk-\"quote\"-\\back\\-nl\nend";
+    ai.modelName = L"m1";
+    quickscript::AppSettings full{};
+    full.ai = ai;
+    const std::wstring json = SerializeAppSettings(full, /*portableSecrets=*/true);
+    // 原始换行必须被转义成 \n，否则 JSON 会被截断
+    const bool noRawNewline = json.find(L"nl\nend") == std::wstring::npos;
+    const bool hasEscaped = json.find(L"\\nend") != std::wstring::npos;
+    const bool hasEscQuote = json.find(L"\\\"quote\\\"") != std::wstring::npos;
+    const bool ok = noRawNewline && hasEscaped && hasEscQuote;
+    Emit(L"portable_settings_escapes", ok,
+        ok ? L"" : (noRawNewline ? L"引号/换行没被转义" : L"出现了未转义的原始换行"));
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -1208,6 +1409,10 @@ int wmain(int argc, wchar_t** argv) {
         CaseWebViewUserDataPortable();
         CaseWebViewFetchDataProgramFiles();
         CaseExtractStringObjectLastWins();
+        CasePortableSettingsPlaintextKey();
+        CasePortableSettingsRoundtrip(AppDir());
+        CasePortableSettingsEscapes();
+        CasePortableSettingsPlaybackRoundtrip(AppDir());
     }
     SetAppSettingsFilePathForTest(L"");
     DeleteFileW(testPath.c_str());

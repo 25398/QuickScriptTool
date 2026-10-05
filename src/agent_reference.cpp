@@ -35,7 +35,7 @@ const wchar_t* kRefFormat = LR"(【脚本文件格式】
 breakoutTimeSeconds（脱离时间，仅默认模式生效）：
   数字，单位秒。0 或未填写视为禁用。
   运行中若用户操作鼠标/键盘（非热键），宏会暂停并在该秒数后从当前步骤重试；
-  等待期间再有用户操作会重置计时。窗口模式/后台窗口模式忽略此字段。
+  等待期间再有用户操作会重置计时。独立桌面模式/后台窗口模式忽略此字段。
 
 coordMeta（坐标元数据）：
   顶层对象，记录录制/保存时的参考分辨率。AI 生成脚本时无需手写此字段，
@@ -168,6 +168,10 @@ type 必须为 "findImage"。
 
   变量名.y1         匹配区域右下角 Y
 
+  变量名.cx         匹配区域中心 X
+
+  变量名.cy         匹配区域中心 Y
+
 
 
 保存图片（followUp=3）临时变量：{变量名} → 运行期临时 BMP 绝对路径；宏结束自动删除。
@@ -257,7 +261,7 @@ ocrResultMode（识别模式）：
 
   0 = 获取文字 — 变量存 OCR 文本字符串
 
-  1 = 文字查找 — 变量存是否找到(0/1)及坐标
+  1 = 文字查找 — 变量存是否找到(0/1)、匹配度({变量}.matchData)及坐标
 
 
 
@@ -269,6 +273,10 @@ ocrFollowUp（后续操作，与找图同理）：
 
   2 = 保存到变量（只保存结果，不点击不移动）
 
+      · 获取文字 ⇒ 存**识别到的文字**
+
+      · 文字查找 ⇒ 存**匹配度**（{变量}.matchData，整数 0~100，与找图同一把尺）
+
 
 
 专用字段：
@@ -277,7 +285,7 @@ ocrFollowUp（后续操作，与找图同理）：
 
   ocrResultMode     0获取文字 / 1文字查找
 
-  ocrFollowUp       0点击 / 1移动 / 2保存变量
+  ocrFollowUp       0点击 / 1移动 / 2保存结果（见上：文字 / 匹配度）
 
   ocrSearchText     文字查找目标（mode=1 时必填，可含变量）
 
@@ -305,7 +313,11 @@ ocrFollowUp（后续操作，与找图同理）：
 
   获取文字(mode=0)：{变量名} 为识别文本字符串
 
-  文字查找(mode=1)：{变量名} 为 0/1；{变量名}.x/.y/.x1/.y1 为坐标
+  文字查找(mode=1)：{变量名} 为 0/1；{变量名}.matchData 为匹配度(0~100)；
+
+                    {变量名}.x/.y/.x1/.y1 为命中文字框坐标
+
+  ★「文字查找 + 保存」存的是**匹配度**，不是识别到的文字；要文字请用 mode=0。
 
 
 
@@ -320,7 +332,7 @@ const wchar_t* kRefWindowMode = LR"(【脚本模式 windowMode — 脚本头字�
 编辑界面三种模式对应关系：
 
   默认模式        windowMode.enabled = 0
-  窗口模式        enabled = 1, executionKind = "hiddenDesktop"
+  独立桌面模式    enabled = 1, executionKind = "hiddenDesktop"
   后台窗口模式    enabled = 1, executionKind = "backgroundWindow"
 
 createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow；
@@ -342,7 +354,7 @@ createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow
                                   （旧脚本 mousePositionOnStartup 读入后等同 selectOnStartup：启动时取当前聚焦窗）
   windowMode.targetPickX/Y        准星绑定坐标
   windowMode.coordSpace           windowClient（默认）| screenAbsolute
-  windowMode.windowRelativeCoordinates  1=动作坐标已是目标客户区（窗口模式录制）
+  windowMode.windowRelativeCoordinates  1=动作坐标已是目标客户区（后台窗口模式录制）
   windowMode.recordClientWidth/Height   录制时目标客户区像素；回放按当前窗口大小缩放。旧脚本可缺省（则用 coordMeta.capture）
   windowMode.autoLaunchTarget     1=运行前自动启动目标程序
   windowMode.launchArgs           启动参数
@@ -375,9 +387,9 @@ createMacroScript 可用 scriptMode 简写：default / window / backgroundWindow
   }
 
 注意：
-  · 窗口模式在独立宏桌面执行，用户桌面光标/焦点不受影响
+  · 独立桌面模式在独立宏桌面执行，用户桌面光标/焦点不受影响
   · 后台窗口模式在用户桌面操作已绑定窗口，不抢焦点
-  · 坐标 x/y 在窗口模式下为客户区坐标；searchX1..Y2 在窗口/后台窗口模式忽略（整窗搜索）
+  · 坐标 x/y 在独立桌面/后台窗口模式下为客户区坐标；searchX1..Y2 在两者均忽略（整窗搜索）
   · 「根据图片选取区域」在窗口内命中后再按 imageRegion 二次筛选
   · writeScript / createMacroScript 创建脚本宏时必须写入 windowMode（可为 enabled=0）
   · 默认模式脚本应写入 breakoutTimeSeconds（0 表示禁用）；未写视为 0
@@ -596,6 +608,20 @@ varCompute:
   split(s, "/", 2) 最多 2 段，最后一段保留剩余内容；split(s, "") 按字符拆
 
   toInt("123") / toString(x) / trim(s)
+
+  replace(s, "被替换", "替换为") / numbers(s)（抠出文本里所有数字，返回数组）
+
+  ⚠ 解析 OCR 文本优先用 numbers()：识别引擎换版本后括号/百分号可能是全角（U+FF08/U+FF05），
+    按 split(hp, "(") 会直接拆不开，取 [1] 就是「下标越界」。推荐写法：
+      nums = numbers(hp)
+      result = 100
+      if (nums.count >= 2) { result = nums[-1] }
+      return result
+    三点理由：① 括号/百分号全角半角都不影响；
+    ② nums[...] 是数字，`result <= 60` 才是数值比较 —— split 出来的 a[0] 是字符串，
+       比较会退化成字典序（"9.5" <= 60 为假 ⇒ 漏判；"100" <= 60 为真 ⇒ 满血误触发）；
+    ③ 变量缺失或 OCR 当轮没识别到时 hp 是数字 0 ⇒ numbers(0) = [0]，count 只有 1，
+       阈值取 >= 2 即可走兜底值 100（视为满血，不会乱按回血键）。
 
   局部变量默认销毁；末尾 return a, b 导出给后续动作
 
@@ -857,7 +883,7 @@ const wchar_t* kRefVariables = LR"(【变量系统汇总】
 
 找图变量（须 findImageFollowUp=2）：
 
-  .matchData .x .y .x1 .y1
+  .matchData .x .y .x1 .y1 .cx .cy
 
 
 
@@ -877,7 +903,7 @@ OCR 获取文字（ocrResultMode=0）：
 
 OCR 文字查找（ocrResultMode=1）：
 
-  {变量名} → 0/1；.x .y .x1 .y1 → 坐标
+  {变量名} → 0/1；.matchData → 匹配度(0~100)；.x .y .x1 .y1 → 命中文字框坐标
 
 
 
@@ -1248,7 +1274,8 @@ std::wstring AgentReferenceGet(const std::wstring& section) {
 
         return kRefTextRecognition;
 
-    if (key == L"windowMode" || key == L"windowmode" || key == L"窗口模式" || key == L"脚本模式")
+    if (key == L"windowMode" || key == L"windowmode" || key == L"窗口模式"
+        || key == L"独立桌面模式" || key == L"窗口/后台窗口模式" || key == L"脚本模式")
 
         return kRefWindowMode;
 
@@ -1302,10 +1329,20 @@ AgentTool MakeReadScriptReferenceTool() {
 
     tool.description =
 
-        L"读取脚本格式参考。section 必填：format|findImage|ocr|windowMode|breakoutTime|flow|ai|…"
-        L"省略只返回目录。openFile/runProgram/activateWindow 等系统动作参数在 system。"
-        L"禁止无必要传 all。动作 JSON 用 buildScriptActions / buildAi* 生成。";
+        // ★ 关键指令**必须排在描述最前面**（网页 AI 路径只发前 48 字节 ≈ 16 汉字，见 LESSONS §79）。
+        //   ⚠ 原来写的是「section 必填：format|findImage|…省略只返回目录」——
+        //     **自相矛盾**（必填 vs 省略也行），而且枚举在源码里就用 `…` 截断了，
+        //     模型既不知道有目录、也不知道有哪些取值 ⇒ 只能瞎猜（LESSONS §80）。
+        L"脚本参数查询：省略 section=目录；section 取动作名（findImage/ocr/windowMode…）。"
+        L"系统动作参数（openFile/runProgram/activateWindow）在 system。"
+        L"禁止无必要传 all；动作 JSON 用 buildScriptActions / buildAi* 生成。";
 
+    // ★ 加 `enum` 是**给目录渲染器看的**：`RenderToolCatalog` 会把短枚举印在参数名后面
+    //   （`readScriptReference(section:all|format|…)`）—— 描述会被截到 48 字节，
+    //   **取值只有靠这里才到得了模型眼前**（见 LESSONS §80）。
+    //   取值必须与 `AgentReferenceGet` 实际接受的一级 section 一致。
+    //   ⚠⚠ 注释**不能写进下面这段 raw string**：`agent_core.cpp:920` 对
+    //      `parameters_json` 做 `json::parse`，失败会**静默**回退成空 schema（工具还在、参数没了）。
     tool.parameters_json = LR"({
 
         "type": "object",
@@ -1316,7 +1353,11 @@ AgentTool MakeReadScriptReferenceTool() {
 
                 "type": "string",
 
-                "description": "all | format | actions | findImage | ocr | windowMode | breakoutTime | mouse | system | flow | ai | conditions | variables | patterns | mistakes"
+                "enum": ["all", "format", "actions", "findImage", "multiMatch", "ocr",
+                         "windowMode", "breakoutTime", "mouse", "system", "flow", "ai",
+                         "conditions", "variables", "patterns", "mistakes"],
+
+                "description": "可省略（省略=返回目录）。all 会一次给全部（长，非必要别用）"
 
             }
 
@@ -1350,6 +1391,21 @@ AgentTool MakeReadScriptReferenceTool() {
 
 const wchar_t* kSkillScriptStrategy = LR"(【脚本生成策略 — readAgentSkill section=scriptStrategy】
 
+★★★ createMacroScript 的**完整调用骨架**（照抄改值，一次就对）★★★
+⚠ 真机实证：模型为了下面三个字段**来回试了 4~5 轮**（"半天不能正确操作"）⇒ 照这个写。
+[{"action":"createMacroScript",
+  "fileName":"myScript.json",          // ★ 必填，**要带 .json**
+  "scriptName":"我的脚本",              // ★ 必填（缺省会自动取 fileName 去后缀，但写全最快）
+  "windowMode":{"enabled":0},          // 默认模式
+  "actions":[                          // ★ 必填，**数组**（不是对象！）
+    {"type":"findImage","imagePath":"images\\btn.bmp","followUp":"saveVar","matchVarName":"btn","remark":"找按钮"},
+    {"type":"if","conditionExpr":"btn.matchData > 0","children":[
+        {"type":"mouseClick","clickCount":2,"remark":"双击"}
+    ]},
+    {"type":"else","children":[{"type":"wait","duration":0.5}]}
+  ]}]
+
+
 【脚本生成规范（铁律，生成/修改脚本前必读）】
 
 1. 必须用工具生成，杜绝手写 JSON：含循环/条件时先 planScriptActions 核对动作树
@@ -1373,6 +1429,7 @@ const wchar_t* kSkillScriptStrategy = LR"(【脚本生成策略 — readAgentSki
      变量运算里 ctrl:Clipboard() 是文本或文件路径字符串，不是 0/1；
      字符串用 "+" 或 '+'（裸写 + 是加法，不能和 OCR 识别的加减号比较）；
      split(s, "/") 按分隔符拆分数组，parts[0] / parts.count；toInt / toString / trim；
+     replace(s, "a", "b") 与 numbers(s)（抠数字数组，OCR 取值用它最稳，避免全角括号拆不开）；
      手写 {clipboard} 仍只取纯文本；
    - 时间魔法（不下拉）：{Now}、{time:格式}、{date:格式}；条件用 ctrl:Hour()/ctrl:Minute()；
    - 宏运行次数：{ctrl:CurLoops()}（当前宏从头执行的第几次）；
@@ -1414,8 +1471,12 @@ section=system，需要时一次查完再构建，不要连环翻阅多个 secti
   wait 建议 3 秒以上（冷启动更久，可用 3~5 秒），不要用 0.5~1.5 秒短等待。
 
 获取关键信息：
-- 网页抓取：需要网页内容（文章/文档/新闻/天气/官方说明等）时用 fetchWebPage 工具，
-  url 传完整 http/https 地址，返回纯文本并注明来源；默认先轻量 GET，失败或疑似 JS 空壳时
+- 联网查资料 = **webSearch（先搜）→ fetchWebPage（再读正文）**，两步都是宿主 HTTP，
+  **不开浏览器、不抢前台**；webSearch 还可以 readTop=1~3 在同一轮把前几条正文读回来。
+  ⚠ 中文查询别用空格堆多个词（实测会被带偏）：关键短语连写，多概念分几次搜。
+  ⚠ 只有「需要点击/登录/翻页」的交互网页才走 openWebpage + observePage（它会抢走前台）。
+- 读某个具体网页：fetchWebPage，url 传完整 http/https 地址，返回**正文**（readability 式主内容抽取：
+  剔导航/侧栏/页脚/相关阅读）并注明来源与所用路径；默认先轻量 GET，失败或疑似 JS 空壳时
   自动用 App 内置 WebView2 隐藏渲染后再取 DOM（覆盖 JS 动态页面），强反爬仍可能失败；
   JSON 接口（/api/ 或 .json）返回原始 JSON 可直接提取结构化数据（如热搜榜）；
   失败时如实说明，不要编造内容；禁止抓取 localhost/127.0.0.1/内网地址。
@@ -1573,6 +1634,40 @@ copyAgentTextToClipboard、pasteAgentClipboardText。
 )";
 
 // 文件化 Skill 优先：AppDir()\skills\agent\<section>.md 或 AppDir()\skills\<section>.md
+// ★desktop 的兜底内嵌文本：产品文件 skills/agent/desktop.md。改一处必须同步另一处。
+const wchar_t* kSkillDesktop = LR"(【桌面动手 — readAgentSkill section=desktop】
+用途：「下达指令后自己去把这件事做完」—— 真的操作这台电脑，而不是只产出脚本/文件。
+
+先判断路线（能用文件做完的，绝不去点界面）：
+· 结果落在**文件/数据**里（建表、改配置、批量改名、算数、取数）→ runCommand / readDocument
+· 结果落在**界面状态**里（装软件、点按钮、填表单、在既有软件里操作、导出）→ runDesktopTask
+· 落在**网页**里 → observePage → clickRef/typeRef；树上没有再用 locateAndClick
+· 只是要一段文字/一个脚本 → planScriptActions / createMacroScript
+
+runDesktopTask（唯一的「动手」入口）：
+· 参数：goal（**必填**，写要达成的**结果**不是第一步点什么）、withImage（默认 true）、
+  maxSteps（默认 12，-1 不限）、confirmed
+· 执行期间：**用户**能看到一行实时状态；**你**只拿到最终结论
+· 安全闸（S1）：goal 含删除/卸载/关机/格式化/改注册表/发送/提交/上传/付款这类
+  **不可逆或对外**动作时，工具会**拒绝执行**并返回确认提示 ⇒ 把提示**原样转达**给用户，
+  拿到明确同意后再带 confirmed=true 重调。
+  ⚠ **不要自己加 confirmed=true 绕过去**，也别改写 goal 措辞骗过闸 —— 那是欺骗用户。
+· **不要**用它做：能落文件的事、只要生成脚本的事、需要可回放的多步界面操作
+  （那种先 planScriptActions 出动作树给用户改）、网页操作。
+
+观察与验收：readTaskMemo/updateTaskMemo 记事实；saveTaskData/readTaskData 存中间数据；
+readDocument 先读办公文件再动（禁止开软件截图识图抄数字）；产出办公文件后**读回来核一遍**
+（`readDocument` 取值，或按 lookupMacroAction section=office 的配方验）。
+
+外部工具（MCP）：名字形如 mcp__<server>__<tool> 的是**外部进程**提供的工具，
+**只有用户自己在 mcp_servers.json 里配了才会出现**（产品不主动探测、也不依赖任何第三方软件）。
+参数形态由对方定义，调之前先看它的说明；失败时把对方的错误**原样**带回来，别猜。
+结果里的 [[AGENT_IMG:路径]] 会在**下一轮**作为附图送到你眼前（前提：当前模型支持识图）。
+
+边界：助手**不直接**发键鼠（都经引擎线程，才受窗口/后台窗口模式/紧急停止/超时/断点保护约束）；
+只读动作可放心做；写/删/对外的动作要么走确认闸、要么落到用户可回放的脚本里。拿不准就问。
+)";
+
 static std::wstring ReadAgentSkillFile(const std::wstring& section) {
     const std::wstring dir = AppDir() + L"\\skills";
     const std::wstring candidates[] = {
@@ -1596,6 +1691,7 @@ std::wstring AgentSkillCatalog() {
         L"- conversation — 编辑已发送消息并重发\n"
         L"- revert — 撤销/恢复助手修改\n"
         L"- shell — 命令行（白名单）与文件操作\n"
+        L"- desktop — 桌面动手（runDesktopTask）、安全确认闸、外部 MCP 工具\n"
         L"调用：readAgentSkill({section:\"reply\"})";
 }
 
@@ -1630,6 +1726,8 @@ std::wstring AgentSkillGet(const std::wstring& section) {
         return kSkillRevert;
     if (key == L"shell" || key == L"command" || key == L"fileops" || key == L"file" || key == L"命令行")
         return kSkillShell;
+    if (key == L"desktop" || key == L"桌面" || key == L"动手" || key == L"rundesktoptask")
+        return kSkillDesktop;
 
     return L"[未知 section] " + section + L"\n\n" + AgentSkillCatalog();
 }
@@ -1638,14 +1736,21 @@ AgentTool MakeReadAgentSkillTool() {
     AgentTool tool;
     tool.name = L"readAgentSkill";
     tool.description =
-        L"读取操作 Skill。section 可选：reply|scriptStrategy|optimize|scheduledTasks|settings|"
-        L"conversation|revert|shell；省略则只返回目录。禁止无必要地传 all。";
+        // ★ 同 readScriptReference：关键指令必须落在前 48 字节（LESSONS §79/§80）。
+        L"操作 Skill 查询：省略 section=目录（先看目录再按名索取）。"
+        L"section 取值见参数枚举：scriptStrategy（生成/改脚本）、optimize（优化录制）、"
+        L"shell（命令行/文件）。禁止无必要地传 all。";
+    // ★ 加 `enum`：目录渲染器会把它印在参数名后（`readAgentSkill(section:reply|…)`），
+    //   这是**唯一**能把取值送到模型眼前的通道（描述只有 48 字节）。见 LESSONS §80。
+    //   ⚠⚠ 同上：注释不能写进 raw string（`json::parse` 失败会静默丢 schema）。
     tool.parameters_json = LR"({
         "type": "object",
         "properties": {
             "section": {
                 "type": "string",
-                "description": "reply | scriptStrategy | optimize | scheduledTasks | settings | conversation | revert | shell | catalog"
+                "enum": ["reply", "scriptStrategy", "optimize", "scheduledTasks", "settings",
+                         "conversation", "revert", "shell", "desktop"],
+                "description": "可省略（省略=返回目录）。all 会一次给全部（长，非必要别用）"
             }
         },
         "required": []

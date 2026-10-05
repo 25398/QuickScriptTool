@@ -4,8 +4,9 @@
 #include <windows.h>
 
 #include <algorithm>
-#include <cmath>
 #include <climits>
+#include <cmath>
+#include <string.h>
 
 namespace qst::desktop_tools {
 
@@ -41,7 +42,7 @@ struct FloatBallMetrics {
     int neckPx = 32;
     int gapPx = 0;
     int padPx = 8;
-    int buttonH = 28;
+    int lineH = 28;  // 面板文字行高（第一行脚本名 / 第二行脚本当前状态）
     int snapPx = kFloatBallSnapPx;
     int shadowPx = 6;
 };
@@ -55,10 +56,12 @@ inline int StemThickness(const FloatBallMetrics& m) {
     return (std::max)(16, (std::min)(m.panelH, m.ballPx));
 }
 
+// 面板文字：第一行 title = 脚本名，第二行 status = 脚本当前状态。
+// 2026-09-24 起第二行**不再是「启动/停止」按钮**（按钮已删，整块面板点击=显示主窗口，
+// 启停改由圆头图标承担）—— 这里保留的是它的位置，所以字段名就叫 status。
 struct FloatBallLocal {
     RECT ball{};
     RECT panel{};
-    RECT button{};
     RECT title{};
     RECT status{};
 };
@@ -178,7 +181,6 @@ inline FloatBallFrame PlaceThermometer(int ballLeft, int ballTop, FloatBallStem 
 inline void FillPanelTextRects(FloatBallLocal& loc, const FloatBallMetrics& m) {
     const RECT& p = loc.panel;
     if (p.right <= p.left || p.bottom <= p.top) {
-        loc.button = {};
         loc.title = {};
         loc.status = {};
         return;
@@ -195,27 +197,48 @@ inline void FillPanelTextRects(FloatBallLocal& loc, const FloatBallMetrics& m) {
     else if (p.top < ball.bottom && p.bottom > ball.bottom)
         body.top = (std::max)(body.top, ball.bottom - tuck);
 
-    loc.status = {};
     const int bodyH = body.bottom - body.top;
     const int bodyW = body.right - body.left;
     if (bodyH < 20 || bodyW < 20) {
-        loc.button = body;
+        // 面板太扁：只有一行位置（调用方按内容再居中）。
         loc.title = {};
+        loc.status = body;
         return;
     }
     const int titleH = (std::max)(16, (std::min)(22, bodyH * 34 / 100));
     const int gap = 3;
-    int btnH = (std::max)(m.buttonH, (bodyH - titleH - gap) * 55 / 100);
-    if (btnH + titleH + gap > bodyH) btnH = bodyH - titleH - gap;
-    if (btnH < 16) {
-        loc.button = body;
+    int lineH = (std::max)(m.lineH, (bodyH - titleH - gap) * 55 / 100);
+    if (lineH + titleH + gap > bodyH) lineH = bodyH - titleH - gap;
+    if (lineH < 16) {
         loc.title = {};
+        loc.status = body;
         return;
     }
     loc.title = {body.left, body.top, body.right, body.top + titleH};
-    int btnTop = body.bottom - btnH;
-    if (btnTop < loc.title.bottom + gap) btnTop = loc.title.bottom + gap;
-    loc.button = {body.left, btnTop, body.right, body.bottom};
+    int lineTop = body.bottom - lineH;
+    if (lineTop < loc.title.bottom + gap) lineTop = loc.title.bottom + gap;
+    loc.status = {body.left, lineTop, body.right, body.bottom};
+}
+
+// 面板两行文字的最终布局：哪一行没有内容，就把另一行放大到两行的高度并垂直居中。
+// wantTitle / wantStatus 由调用方给出（model 里对应文本是否为空）——
+// 抽成纯函数是为了自检能逐格断言，别把这段判断塞回绘制代码里。
+inline void LayoutPanelLines(FloatBallLocal& loc, const FloatBallMetrics& m,
+    bool wantTitle, bool wantStatus) {
+    if (wantTitle == wantStatus) return;
+    RECT& solo = wantTitle ? loc.title : loc.status;
+    RECT& blank = wantTitle ? loc.status : loc.title;
+    if (solo.right <= solo.left || solo.bottom <= solo.top) return;
+    RECT slot = solo;
+    if (blank.bottom > blank.top) {
+        slot.top = (std::min)(solo.top, blank.top);
+        slot.bottom = (std::max)(solo.bottom, blank.bottom);
+    }
+    const int slotH = static_cast<int>(slot.bottom - slot.top);
+    const int lh = (std::min)(m.lineH, (std::max)(16, slotH));
+    const int y = slot.top + (slotH - lh) / 2;
+    solo = {slot.left, y, slot.right, y + lh};
+    blank = {};
 }
 
 inline FloatBallFrame ComputeDockedFrame(const RECT& work, FloatBallEdge edge,
@@ -518,7 +541,6 @@ inline FloatBallFrame ComputeDockedAnimFrame(const RECT& work, FloatBallEdge edg
         f.local.ball = {sb.left - f.window.left, sb.top - f.window.top,
             sb.right - f.window.left, sb.bottom - f.window.top};
         f.local.panel = {};
-        f.local.button = {};
         f.local.title = {};
         f.local.status = {};
         return f;
@@ -560,7 +582,7 @@ inline RECT DockedRevealRect(FloatBallEdge edge, const RECT& content, const RECT
 inline bool PointHitsThermometer(int x, int y, const FloatBallLocal& local, bool panelOn) {
     if (PointInCircle(x, y, local.ball)) return true;
     if (!panelOn) return false;
-    if (PointInRect(x, y, local.button) || PointInRect(x, y, local.panel)) return true;
+    if (PointInRect(x, y, local.status) || PointInRect(x, y, local.panel)) return true;
     return false;
 }
 
@@ -568,6 +590,112 @@ inline bool PointHitsClientStadium(int x, int y, int winW, int winH) {
     if (winW <= 0 || winH <= 0) return false;
     const RECT client{0, 0, winW, winH};
     return PointInRoundRect(x, y, client, (std::min)(winW, winH) / 2);
+}
+
+// ── 全屏遮挡判定（纯几何，供悬浮球隐藏策略与自检共用）──────────────────
+// 口径对齐 360 悬浮球一类桌面伴侣：**只有前台窗口真的铺满整个显示器**才隐藏，
+// 且必须排除「带标题栏 + 可调整边框」的普通窗口。
+//   · 最大化窗口只铺到工作区（露出任务栏）⇒ 不隐藏（这是本文件要修的主症状）
+//   · UWP 宿主（ApplicationFrameWindow）GetWindowRect 铺满整屏，但带
+//     WS_CAPTION|WS_THICKFRAME ⇒ 不隐藏
+//   · F11 全屏 / 无边框窗口化全屏 / 独占全屏 ⇒ 隐藏
+inline constexpr int kFloatBallFullscreenTolerancePx = 1;
+
+struct FloatBallForegroundGeometry {
+    RECT monitor{};           // 前台窗口所在显示器的 rcMonitor（整屏，含任务栏）
+    RECT window{};            // 前台窗口 GetWindowRect
+    bool iconic = false;      // 已最小化
+    bool hasCaption = false;  // WS_CAPTION
+    bool thickFrame = false;  // WS_THICKFRAME
+};
+
+/// 前台窗口是否**完全覆盖**显示器（含任务栏区域）。1px 容差吸收 DWM 取整误差。
+inline bool FloatBallWindowCoversMonitor(const FloatBallForegroundGeometry& g) {
+    if (g.iconic) return false;
+    if (g.monitor.right <= g.monitor.left || g.monitor.bottom <= g.monitor.top) return false;
+    const int tol = kFloatBallFullscreenTolerancePx;
+    return g.window.left <= g.monitor.left + tol
+        && g.window.top <= g.monitor.top + tol
+        && g.window.right >= g.monitor.right - tol
+        && g.window.bottom >= g.monitor.bottom - tol;
+}
+
+/// 是否按「全屏」处理（悬浮球隐藏）。
+inline bool FloatBallForegroundIsFullscreen(const FloatBallForegroundGeometry& g) {
+    if (!FloatBallWindowCoversMonitor(g)) return false;
+    // 有标题栏且有可调整边框 = 普通窗口，不是全屏。
+    // 真全屏与无边框窗口化全屏都不带标题栏，仍会命中。
+    if (g.hasCaption && g.thickFrame) return false;
+    return true;
+}
+
+// ── 实机全屏判定（前台窗口采集 + 完整判据）────────────────────────────
+// 这是悬浮球隐藏策略的**唯一入口**：产品（float_ball.cpp）与诊断探针
+// （tools/float_ball_probe.cpp）共用同一份，避免判据漂移。
+//
+// SHQueryUserNotificationState 用 GetProcAddress 动态取（shell32 在所有 GUI
+// 进程里必然已加载）⇒ 本头文件既不需要 <shlobj.h>，也不需要链接 shell32。
+inline constexpr int kFbQunsNotPresent = 1;          // QUNS_NOT_PRESENT
+inline constexpr int kFbQunsBusy = 2;                // QUNS_BUSY
+inline constexpr int kFbQunsRunningD3dFullScreen = 3;  // QUNS_RUNNING_D3D_FULL_SCREEN
+inline constexpr int kFbQunsPresentationMode = 4;    // QUNS_PRESENTATION_MODE
+inline constexpr int kFbQunsAcceptsNotifications = 5;  // QUNS_ACCEPTS_NOTIFICATIONS
+inline constexpr int kFbQunsQuietTime = 6;           // QUNS_QUIET_TIME
+inline constexpr int kFbQunsApp = 7;                 // QUNS_APP
+
+/// 取 QUERY_USER_NOTIFICATION_STATE；取不到返回 0。
+inline int FloatBallQueryNotificationState() {
+    using Fn = HRESULT(WINAPI*)(int*);
+    static Fn fn = reinterpret_cast<Fn>(
+        GetProcAddress(GetModuleHandleW(L"shell32.dll"), "SHQueryUserNotificationState"));
+    if (!fn) return 0;
+    int st = 0;
+    if (FAILED(fn(&st))) return 0;
+    return st;
+}
+
+/// Windows 官方口径（Explorer 通知气泡用的同一套）：全屏 / 独占 D3D / 演示模式。
+/// 只在几何判据不成立时兜底，覆盖「矩形比整屏略小」的全屏播放器与演示。
+inline bool FloatBallShellReportsFullscreen() {
+    const int st = FloatBallQueryNotificationState();
+    return st == kFbQunsBusy || st == kFbQunsRunningD3dFullScreen
+        || st == kFbQunsPresentationMode;
+}
+
+inline bool FloatBallIsOwnProcessWindow(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+/// 桌面 / 任务栏本身不是"全屏应用"（切到桌面时不该隐藏悬浮球）。
+inline bool FloatBallIsShellDesktopWindow(HWND hwnd) {
+    wchar_t cls[64]{};
+    GetClassNameW(hwnd, cls, 64);
+    return _wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"WorkerW") == 0
+        || _wcsicmp(cls, L"Shell_TrayWnd") == 0
+        || _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+/// 采集前台窗口的矩形 / 样式，走完整判据。悬浮球据此决定是否隐藏。
+inline bool FloatBallIsForegroundFullscreen() {
+    HWND fg = GetForegroundWindow();
+    if (!fg || !IsWindow(fg) || FloatBallIsOwnProcessWindow(fg)) return false;
+    if (FloatBallIsShellDesktopWindow(fg)) return false;
+    if (IsIconic(fg)) return false;
+
+    FloatBallForegroundGeometry geo{};
+    const LONG style = GetWindowLongW(fg, GWL_STYLE);
+    geo.hasCaption = (style & WS_CAPTION) == WS_CAPTION;
+    geo.thickFrame = (style & WS_THICKFRAME) != 0;
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) geo.monitor = mi.rcMonitor;
+    if (!GetWindowRect(fg, &geo.window)) return false;
+
+    if (FloatBallForegroundIsFullscreen(geo)) return true;
+    return FloatBallShellReportsFullscreen();
 }
 
 }  // namespace qst::desktop_tools

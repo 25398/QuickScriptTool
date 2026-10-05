@@ -16,6 +16,7 @@
 #include "window_mode/injection/inject_peb_hide.h"
 #include "window_mode/injection/inject_technique.h"
 #include "window_mode/fake_focus/fake_focus_injector.h"
+#include "window_mode/fake_focus/fake_focus_soft_input_host.h"
 
 #include <windows.h>
 
@@ -59,6 +60,8 @@ const selftest::CaseInfo kCases[] = {
         L"经典注入 + PEB 链表摘除后模块不可见，恢复后可见且可 FreeLibrary"},
     {L"fakefocus_injector_technique", L"default",
         L"产品类 FakeFocusInjector：映像节映射+线程劫持入口+PEB 隐藏注入真实靶进程并安全卸载"},
+    {L"fakefocus_timescale_only", L"default",
+        L"仅变速注入（跨进程真实路径）：远程注入+远程调用导出→靶进程 IAT 真的被补上；全屏拆钩后时钟仍在"},
 };
 
 std::wstring ModuleDir() {
@@ -431,6 +434,116 @@ bool VerifyFakeFocusInjector(std::wstring& detail) {
     return true;
 }
 
+// 按 PID 找靶进程的窗口（消息专用窗口不进顶层枚举，得按线程枚举）。
+HWND FindTargetWindowByPid(DWORD pid) {
+    HWND hwnd = nullptr;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return nullptr;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            HWND found = nullptr;
+            EnumThreadWindows(te.th32ThreadID,
+                [](HWND w, LPARAM lp) -> BOOL {
+                    *reinterpret_cast<HWND*>(lp) = w;
+                    return FALSE;
+                }, reinterpret_cast<LPARAM>(&found));
+            if (found) {
+                hwnd = found;
+                break;
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return hwnd;
+}
+
+// ── 仅变速注入的**跨进程**验证（产品真实路径）──────────────────────────────
+// 为什么必须单独做：`WindowModeSelfTest / window_time_scale_only_iat` 是在自检进程里
+// LoadLibrary 再直接调导出，**覆盖不到产品的真实路径** —— 远程注入 + 远程调用导出。
+// 这里复刻真实路径：起靶进程 → ClassicRemoteThread 注入 → 宿主写倍率 → 远程查诊断。
+// 断言靶进程里的 DLL 自报「已安装 + 仅变速 + 倍率 2000 + 真的补到了 IAT 槽」——
+// 「补到槽」这条最关键：倍率对但槽为 0 就说明补丁打偏了（历史上真踩过）。
+bool VerifyFakeFocusTimeScaleOnly(std::wstring& detail) {
+    TargetProc t;
+    std::wstring err;
+    if (!SpawnTarget(t, err)) {
+        detail = L"靶进程启动失败: " + err;
+        return false;
+    }
+    DWORD targetPid = 0;
+    if (!WaitReadyPid(t, 10000, targetPid)) {
+        detail = L"靶进程 READY 超时";
+        KillTarget(t);
+        return false;
+    }
+    HWND hwnd = FindTargetWindowByPid(targetPid);
+    if (!hwnd) {
+        detail = L"未找到靶窗口";
+        KillTarget(t);
+        return false;
+    }
+
+    windowmode::FakeFocusInjector injector;
+    // 与产品里 Unity/3D 目标的实际路径一致（配置若为 setwindowshook 也会被降级成 classic）。
+    injector.SetInjectionTechnique(windowmode::inject::Technique::ClassicRemoteThread);
+    injector.SetTimeScaleOnly(true);
+    std::wstring injErr;
+    if (!injector.InjectAndInstall(targetPid, hwnd, injErr)) {
+        detail = L"仅变速注入失败: " + injErr;
+        KillTarget(t);
+        return false;
+    }
+
+    // 宿主侧下发 2 倍速（共享内存按 targetPid 命名，注入时已 Attach）。
+    const bool wrote = windowmode::FakeFocusSoftInput_SetTimeScale(2.0);
+    Sleep(500);  // 等 DLL 轮询线程（20ms 周期）读到并补 IAT
+    DWORD diag = 0;
+    std::wstring qErr;
+    const bool queried = injector.QueryTimeScaleDiag(diag, qErr);
+    if (!queried) {
+        injector.Unload();
+        KillTarget(t);
+        detail = L"远程查询 TimeScaleDiag 失败: " + qErr;
+        return false;
+    }
+
+    // 全屏游戏会走「拆钩保时钟」：钩必须被拆掉（否则冻 DXGI），但 DLL 与时钟补丁必须还在
+    // （否则变速会跟着一起没 —— 这正是用户实测踩到的坑）。
+    std::wstring demoteErr;
+    const bool demoted = injector.DisableFakeFocusKeepTimeScale(demoteErr);
+    Sleep(200);
+    DWORD diagDemoted = 0;
+    std::wstring qErr2;
+    const bool queriedDemoted = injector.QueryTimeScaleDiag(diagDemoted, qErr2);
+    const bool inputBackToFallback = !injector.fake_focus_active();
+    injector.Unload();
+    KillTarget(t);
+
+    const uint32_t scale = (diag >> 16) & 0xFFFFu;
+    const uint32_t hooks = (diag >> 8) & 0xFFu;
+    const bool installed = (diag & 1u) != 0;
+    const bool tsOnly = (diag & 4u) != 0;
+    const bool demotedBit = (diagDemoted & 8u) != 0;
+    const bool clockKept = queriedDemoted && (diagDemoted & 1u) != 0
+        && ((diagDemoted >> 16) & 0xFFFFu) == 2000u
+        && ((diagDemoted >> 8) & 0xFFu) > 0u;
+    const bool ok = wrote && installed && tsOnly && scale == 2000u && hooks > 0u
+        && demoted && demotedBit && clockKept && inputBackToFallback;
+    wchar_t buf[520]{};
+    swprintf_s(buf,
+        L"wrote=%d diag=0x%08x（装=%d 仅变速=%d 倍率=%u 时间钩=%u）"
+        L" 拆钩=%d 拆后diag=0x%08x（钩已拆=%d 时钟仍在=%d） 输入回退=%d",
+        wrote ? 1 : 0, static_cast<unsigned>(diag), installed ? 1 : 0,
+        tsOnly ? 1 : 0, scale, hooks, demoted ? 1 : 0,
+        static_cast<unsigned>(diagDemoted), demotedBit ? 1 : 0, clockKept ? 1 : 0,
+        inputBackToFallback ? 1 : 0);
+    if (!ok) detail = buf;
+    return ok;
+}
+
 void RunSelfTest() {
     struct Case {
         const wchar_t* name;
@@ -460,6 +573,9 @@ void RunSelfTest() {
     std::wstring detail;
     const bool ffOk = VerifyFakeFocusInjector(detail);
     Emit(L"fakefocus_injector_technique", ffOk, detail.c_str());
+    detail.clear();
+    const bool ffTsOk = VerifyFakeFocusTimeScaleOnly(detail);
+    Emit(L"fakefocus_timescale_only", ffTsOk, detail.c_str());
 }
 
 void PrintHelp() {

@@ -19,7 +19,7 @@ void WindowModeLogVerbosef(const wchar_t* fmt, ...);
 
 /// 持久化生命周期事件：除 DebugString/宏调试窗外，追加写入
 /// `<exe 目录>\window_mode_debug.log`（跨运行留存，用于排查「宏桌面」何时被创建）。
-/// 低频调用（桌面创建/复用、窗口模式起止），勿用于逐帧日志。
+/// 低频调用（桌面创建/复用、窗口/后台窗口模式起止），勿用于逐帧日志。
 void WindowModeLogEvent(const std::wstring& line);
 void WindowModeLogEventf(const wchar_t* fmt, ...);
 

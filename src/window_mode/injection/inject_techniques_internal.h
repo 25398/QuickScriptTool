@@ -46,9 +46,13 @@ bool InjectManualMapBytes(HANDLE process, DWORD pid,
     const std::vector<uint8_t>& peBytes, void*& outBase,
     void*& outEntryRegion, bool useHijack, std::wstring& err);
 
+// SetWindowsHook 注入。⚠ 成功时 `outHookModule` / `outHookHandle` **必须**由调用方
+// 保管到卸载：钩子在装着的期间 user32 会把这个 DLL 钉在目标进程里，光远程 FreeLibrary
+// 归不了零 ⇒ 目标进程活着，DLL 文件就一直被锁（见 inject_technique.h 的字段注释）。
 bool InjectSetWindowsHook(HANDLE process, DWORD pid,
     const std::wstring& dllPath, const InjectOptions& opts,
-    HMODULE& outModule, std::wstring& err);
+    HMODULE& outModule, HMODULE& outHookModule, void*& outHookHandle,
+    std::wstring& err);
 
 }  // namespace inject
 }  // namespace windowmode

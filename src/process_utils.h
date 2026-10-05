@@ -40,6 +40,37 @@ const std::wstring& LastLaunchProgramError();
 /// 解析后的路径是否像可 ShellExecute 的本地文件（排除 URL）
 bool ProgramLaunchPathExists(const std::wstring& path);
 
+// ── 「按显示名启动应用」的确定性解析（不碰键盘、不碰开始菜单搜索）────────
+//
+// 为什么要这条：`openAppViaSearch` 原先靠 Win+S 输入显示名 + Enter。两处不可靠 ——
+//   ① Win10/11 的「搜索」默认会走网页结果，输入「植物大战僵尸融合版」回车**打开的是
+//      浏览器里的 Bing 搜索**，而不是游戏（真实事故：游戏被误关后想重启，结果打开了
+//      一个搜索网页，然后在「怎么读命令输出」上白烧十几轮）；
+//   ② Win+S 抢焦点/被输入法拦截，全都不可控。
+//
+// 所以先做**纯本地解析**：桌面快捷方式 → 开始菜单快捷方式 → App Paths → 启动夹 exe。
+// 命中就走 openFile（ShellExecute 交给 shell 解释 .lnk），失败就明确报「没找到」，
+// 绝不悄悄退化成「搜索一下」。
+struct AppLaunchTarget {
+    /// 可直接 ShellExecute 的路径（.lnk 或 .exe）
+    std::wstring path;
+    /// 解析来源，供日志/工具回执解释「为什么找到它」：
+    /// desktop-lnk / startmenu-lnk / app-paths / startmenu-exe / where
+    std::wstring source;
+    /// 命中的名字（快捷方式名或 exe 名），解释用
+    std::wstring matchedName;
+    bool ok() const { return !path.empty(); }
+};
+
+/// 用应用**显示名**（如「植物大战僵尸融合版」「Microsoft Edge」「Excel」）找启动目标。
+/// 找不到返回 ok()==false —— 调用方据此明确报错，不要退化成搜索。
+AppLaunchTarget ResolveAppLaunchTarget(const std::wstring& displayName);
+
+/// 解析结果是不是「非 .exe」的可执行入口（.lnk 快捷方式等）。
+/// 用途：模型给的名字本来就该由 shell 解释（游戏快捷方式几乎都是 .lnk），
+/// 这类目标不该被「必须是 exe」的校验挡掉。
+bool LooksLikeShellLaunchTarget(const std::wstring& path);
+
 /// 关闭匹配 target 的进程；matchFileNameOnly 为 true 时仅匹配文件名
 bool CloseProgramsByTarget(const std::wstring& target, bool matchFileNameOnly);
 

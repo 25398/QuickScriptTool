@@ -516,9 +516,11 @@
     if (!A.state) return;
     A.state._userPickedHomeTab = true;
     if (!window.qst) return;
+    // 脚本库/定时/设置页列出全部内容：专属热键不按 TAB 限定（用户明确要求的例外）。
+    var scopeAll = isIdleHotkeyPage(page);
     var setTabState = function (tab, eng, path) {
       A.state.tab = tab;
-      if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(eng);
+      if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(eng, scopeAll);
       if (typeof qst.setHomeSelection === "function") qst.setHomeSelection(eng, path || "");
       if (typeof A.syncEngineHomeSelection === "function") {
         // 与 dedupe 键对齐，避免随后 list* 再打一次
@@ -661,7 +663,8 @@
       A.state.tab = "macro";
       A.state._userPickedHomeTab = true;
       if (window.qst) {
-        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(2);
+        // 专业模式脚本库内选中条目：仍属「列出全部」的页面，不按 TAB 限定。
+        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(2, true);
         if (typeof qst.setHomeSelection === "function") {
           qst.setHomeSelection(2, mi >= 0 ? A.itemPath(macros[mi]) : "");
         }
@@ -677,7 +680,7 @@
       A.state.tab = "recorder";
       A.state._userPickedHomeTab = true;
       if (window.qst) {
-        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(1);
+        if (typeof qst.setActiveHomeTab === "function") qst.setActiveHomeTab(1, true);
         if (typeof qst.setHomeSelection === "function") {
           qst.setHomeSelection(1, ri >= 0 ? A.itemPath(recs[ri]) : "");
         }
@@ -1575,7 +1578,7 @@
     else if (act === "open") openAction(item);
     else if (act === "setHk") setHotkey(item);
     else if (act === "import") { if (window.qst) qst.importScript(item.type); }
-    else if (act === "export") { if (window.qst) qst.exportScript(item.ref.path); }
+    else if (act === "export") { if (window.QstExport) window.QstExport.open(item.ref.path, item.name); else if (window.qst) qst.exportScript(item.ref.path); }
     else if (act === "rename") renameItem(item);
     else if (act === "del") delItem(item);
   }

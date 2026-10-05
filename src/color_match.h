@@ -24,6 +24,20 @@ std::wstring FormatColorHex(int r, int g, int b);
 /// 单通道最大差（0~255）
 int ColorChannelDistance(int r1, int g1, int b1, int r2, int g2, int b2);
 
+/// 色差（`ColorChannelDistance`，0~255）→ **匹配度百分比 0~100**（越大越像）。
+///
+/// ★为什么要有这一个函数：找色/颜色匹配过去写的是 `score = 100 - distance`，而 distance
+/// 是单通道最大差（可到 255）⇒ 匹配度**会变成负数**，与「匹配度 0~100」的说法（和找图的
+/// `.matchData`）就不是同一把尺了。这里统一钳到 [0,100]：
+///   100 = 完全同色；`100 - 色差`；色差 ≥ 100 记 0（此时必然超出常见容差，属于「不像」）。
+/// ⚠ 命中判定仍然只看 `colorTolerance`（容差是闸，匹配度只是质量分）—— 别拿这个分数当闸。
+inline int ColorMatchScorePercent(int distance) {
+    int score = 100 - distance;
+    if (score < 0) score = 0;
+    if (score > 100) score = 100;
+    return score;
+}
+
 bool ColorsMatch(int r1, int g1, int b1, int r2, int g2, int b2, int tolerance);
 
 /// 点击效果取样：5×5、步长 8px（约 ±16px 邻域），避免只打在数字/透明像素上漏检。
@@ -52,8 +66,11 @@ ColorMatchHit FindColorInScreenRegion(
     int stepPx = 2,
     const std::atomic_bool* cancelFlag = nullptr);
 
-/// 判定 (x,y) 处颜色是否匹配目标
+/// 判定 (x,y) 处颜色是否匹配目标。
+/// `outReadOk`（可选）区分**两种 false**：取点失败（outReadOk=false，outR/G/B 不可信）
+/// vs 取点成功但颜色不匹配（outReadOk=true）——调用方据此决定「变量写 0」还是「写实际颜色」。
 bool MatchColorAtScreenPoint(int x, int y,
     int targetR, int targetG, int targetB, int tolerance,
     int* outR = nullptr, int* outG = nullptr, int* outB = nullptr, int* outDist = nullptr,
-    HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0);
+    HBITMAP frozenScreen = nullptr, int frozenVirtX = 0, int frozenVirtY = 0,
+    bool* outReadOk = nullptr);

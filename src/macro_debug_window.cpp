@@ -13,7 +13,7 @@
 
 namespace {
 
-// 长跑窗口模式会持续灌日志；不设上限会撑爆 EDIT 与 pending 队列。
+// 长跑窗口/后台窗口模式会持续灌日志；不设上限会撑爆 EDIT 与 pending 队列。
 constexpr size_t kMaxPendingLogs = 2000;
 constexpr int kMaxEditChars = 400000; // ~800KB wchar，超则截掉头部
 
@@ -108,7 +108,7 @@ std::wstring FormatFindImageDebug(const ScriptAction& action, const ImageMatchRe
 }
 
 std::wstring FormatOcrDebug(const ScriptAction& action, const std::wstring& textContent,
-                            bool searchFound, const MacroVariableContext& ctx) {
+                            bool searchFound, int matchData, const MacroVariableContext& ctx) {
     const std::wstring prefix = BracketIndex(action) + L"文字识别，";
     const std::wstring varName = action.matchVarName.empty() ? L"a" : action.matchVarName;
 
@@ -126,8 +126,14 @@ std::wstring FormatOcrDebug(const ScriptAction& action, const std::wstring& text
     const std::wstring target = ResolveMacroVariables(action.ocrSearchText, ctx);
     std::wstring line = prefix + L"文字查找：" + target;
     if (action.ocrFollowUp == 2) {
+        // 文字查找存进变量的是**匹配度**（0~100，与找图 .matchData 同一把尺）：
+        // 调试行必须把它打出来，否则「这个变量为什么是 0」只能靠猜。
+        line += L"，匹配度" + std::to_wstring(matchData) + L"%";
+        if (!searchFound) line += L"（未找到）";
         line += L"，保存到变量" + varName;
     } else if (searchFound) {
+        // 点击/移动到：匹配度也一并留痕（它同样是「找得准不准」的证据）
+        line += L"，匹配度" + std::to_wstring(matchData) + L"%";
         const wchar_t* follow = OcrFollowText(action.ocrFollowUp);
         if (follow[0]) line += L"，" + std::wstring(follow);
     } else {
@@ -187,7 +193,16 @@ void MacroDebugWindow::Create(HFONT bodyFont, HFONT titleFont, HFONT closeFont,
 
 void MacroDebugWindow::Show() {
     if (!hwnd_) return;
-    ShowWindow(hwnd_, SW_SHOW);
+    // ★★ **显示自己的窗口时绝不抢前台**（2026-09-30 实测事故）。
+    //
+    //   原因：AI 动作执行的**观察帧是整屏截图**，而本窗口一旦成为前台，
+    //   截图里就是"我们自己的调试窗口" ⇒ 模型看不到任务界面、只能凭记忆猜坐标
+    //   （实测连续 11 轮 `观察帧画面主体：前台 = QuickScriptTool.exe 「调试信息输出窗口」`，
+    //    整轮白跑 ≈ 3~4 分钟）。
+    //   ⇒ `SW_SHOWNOACTIVATE`：窗口照常出现，但**不激活、不抢前台**。
+    //   ⚠ 刻意**不加** `WS_EX_NOACTIVATE`：那会让用户点它也聚焦不了、没法选中复制日志；
+    //     用户**主动**点它取得的焦点是用户的选择，不在我们禁止的范围。
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd_);
 }
 
