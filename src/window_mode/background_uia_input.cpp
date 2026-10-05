@@ -192,7 +192,7 @@ bool UiaSupportsInvokeOrToggle(IUIAutomationElement* element) {
 
 }  // namespace
 
-bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
+bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     if (!topLevel || !IsWindow(topLevel)) return false;
     EnsureThreadComApartment();
 
@@ -361,6 +361,46 @@ bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
 
     // 扫描仅检查模式支持；末尾只对「最终最佳」执行一次 Invoke。
     return UiaInvokeOrToggle(best.Get());
+}
+
+/// UWP 的**内容窗**句柄（`Windows.UI.Core.CoreWindow` / `InputSite`）。
+/// ⚠ 为什么需要它：UIA 的 `ElementFromHandle(壳窗)` + `FindAll(Descendants)` 对 UWP
+///   **有时拿不到内容**（内容在**另一个进程**的 CoreWindow 下）⇒ 用内容窗句柄再试
+///   往往就能拿到。跨进程 `EnumChildWindows` 是内核侧枚举，不需要目标进程配合。
+HWND FindUwpContentChildForUia(HWND top) {
+    if (!top || !IsWindow(top)) return nullptr;
+    struct Ctx { HWND found = nullptr; } ctx;
+    EnumChildWindows(top, [](HWND w, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        wchar_t cls[128]{};
+        GetClassNameW(w, cls, 128);
+        if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0
+            || _wcsicmp(cls, L"Windows.UI.Input.InputSite.WindowClass") == 0) {
+            c->found = w;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
+    if (TryUiaInvokeAtScreenPointOn(topLevel, sx, sy)) return true;
+    // ⚠⚠ 2026-10-05 回退：UWP 的 UIA 内容**有时不挂在壳窗下** ——
+    //   用户实测 `ApplicationFrameWindow` 的树里「该点下没有可 Invoke 的元素」。
+    //   而系统已经识别出内容窗（日志里的
+    //   `后台输入子窗 … class=Windows.UI.Core.CoreWindow`）⇒ 换**内容窗句柄**再试一次。
+    HWND content = FindUwpContentChildForUia(topLevel);
+    if (content && content != topLevel) {
+        wchar_t cls[128]{};
+        GetClassNameW(content, cls, 128);
+        WindowModeLogEventf(
+            L"[窗口/后台窗口模式] UIA 在壳窗下没找到可点的元素，改用**内容子窗**重试"
+            L"（class=%s hwnd=0x%p）",
+            cls[0] ? cls : L"(无类名)", reinterpret_cast<void*>(content));
+        if (TryUiaInvokeAtScreenPointOn(content, sx, sy)) return true;
+    }
+    return false;
 }
 
 }  // namespace windowmode
