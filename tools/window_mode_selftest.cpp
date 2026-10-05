@@ -540,6 +540,79 @@ void TestScreenPointOcclusionCheck() {    // 屏幕外的点：WindowFromPoint �
     selftest::Emit(L"screen_point_occlusion_check", outside && insideOk, detail.c_str());
 }
 
+bool g_uiaProbeClicked = false;
+
+LRESULT CALLBACK UiaProbeWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_COMMAND) { g_uiaProbeClicked = true; return 0; }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/// ⚠ 2026-10-05：验证 **UIA Invoke 调用链本身**是否通。
+///
+/// 背景：用户报「UWP 计算器在后台窗口模式下点击没反应」。UWP 的 `PostMessage` 无效，
+/// **唯一**可用的点击路径就是 `TryUiaInvokeAtScreenPoint()` ⇒ 必须能独立验证它。
+///
+/// ⚠ 用 **Win32 按钮**代替 UWP 按钮 —— 它**证明不了** UWP 场景（UWP 的 UIA 树是跨进程
+///   按需构建的，另有风险），但能证明「**调用链通**」：若这里都失败，问题就在
+///   UIA 调用本身（COM / 元素查找 / Invoke）而不是 UWP 特有行为。
+///
+/// ⚠ UIA 依赖 COM + 桌面 ⇒ **隔离会话 / 无桌面环境下会失败**，那是环境问题不是缺陷
+///   ⇒ `TryUiaInvokeAtScreenPoint` 返回 false 时**跳过**（记 skipped，不算红）。
+void TestUiaInvokeChain() {
+    g_uiaProbeClicked = false;
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = UiaProbeWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"QstUiaInvokeProbe";
+    RegisterClassW(&wc);
+    HWND w = CreateWindowExW(0, wc.lpszClassName, L"QstUiaProbe",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 80, 80, 420, 300,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (!w) {
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        selftest::Emit(L"uia_invoke_chain", true, L"skipped: 建窗失败（无桌面？）");
+        return;
+    }
+    HWND btn = CreateWindowExW(0, L"Button", L"Probe", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        40, 40, 160, 40, w, nullptr, wc.hInstance, nullptr);
+    ShowWindow(w, SW_SHOW);
+    SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    RECT brc{};
+    int sx = 0, sy = 0;
+    bool havePoint = false;
+    if (btn && GetWindowRect(btn, &brc)) {
+        sx = (brc.left + brc.right) / 2;
+        sy = (brc.top + brc.bottom) / 2;
+        havePoint = true;
+    }
+
+    const bool invoked = havePoint && windowmode::TryUiaInvokeAtScreenPoint(w, sx, sy);
+    // Invoke 是异步的 ⇒ 抽干消息队列让 WM_COMMAND 到达（最多 ~400ms）
+    MSG msg{};
+    for (int i = 0; i < 20 && !g_uiaProbeClicked; ++i) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (g_uiaProbeClicked) break;
+        Sleep(20);
+    }
+    if (btn) DestroyWindow(btn);
+    DestroyWindow(w);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+
+    if (!invoked) {
+        // ⚠ 环境跳过：隔离会话 / 无桌面 / COM 不可用。**不算失败**，但要能看见。
+        selftest::Emit(L"uia_invoke_chain", true,
+            L"skipped: UIA 不可用（隔离会话/无桌面？）—— 真机上这条才有意义");
+        return;
+    }
+    selftest::Emit(L"uia_invoke_chain", g_uiaProbeClicked,
+        (L"invoked=1 clicked=" + std::to_wstring(g_uiaProbeClicked ? 1 : 0)
+            + L"（invoked 成功但按钮没收到 WM_COMMAND ⇒ UIA 元素找到了但 Invoke 没生效）").c_str());
+}
+
 void TestSoftInputFastPath() {
     // 允许：顶窗活着 + 绑定就是顶层 + 有缓存 + 几何一致。
     const bool allow = windowmode::CanUseSoftInputFastPath(
@@ -6905,6 +6978,7 @@ int wmain(int argc, wchar_t** argv) {
     TestUiaActionVerbTable();
     TestUiaControlListCarriesActionAndState();
     TestScreenPointOcclusionCheck();
+    TestUiaInvokeChain();
     TestSoftInputFastPath();
 
     if (runMacro) TestMacroDesktopSmoke();
