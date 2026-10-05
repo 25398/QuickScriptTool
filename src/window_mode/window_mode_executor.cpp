@@ -2869,14 +2869,42 @@ void WindowModeExecutor::PostMouseButtonAtClient(int cx, int cy, MouseButtonType
     }
 }
 
+namespace {
+
+/// ⚠ 2026-10-05：UIA 兜底**没被执行**的原因，只在首次打一条（点击可能很频繁）。
+/// 与 `background_uia_input.cpp` 的 `LogUiaFailOnce`（UIA **内部**失败）配对 ——
+/// 两者合起来覆盖「**没走到 UIA**」与「**UIA 走了但失败**」两种情形，
+/// 用户报「点击没反应」时能一次定位到是哪一层。
+bool g_uiaSkipLogged = false;
+void LogUiaSkipOnce(const wchar_t* why) {
+    if (g_uiaSkipLogged) return;
+    g_uiaSkipLogged = true;
+    WindowModeLogEventf(L"[窗口/后台窗口模式] UIA 兜底未执行：%s", why);
+}
+
+}  // namespace
+
 bool WindowModeExecutor::TryUiaClickAtClient(int cx, int cy) {
-    if (PreferHardwareInput()) return false;
+    // ⚠ 2026-10-05：**每条早退都补日志** —— 用户报「UWP 点击没反应」时，
+    //   必须一眼看出死在哪一层：是**没走到 UIA**，还是 UIA 内部失败。
+    //   （UIA 内部的失败日志在 `background_uia_input.cpp` 的 `LogUiaFailOnce`。）
+    //   限流：只在首次失败打一条（点击可能很频繁）。
+    if (PreferHardwareInput()) {
+        LogUiaSkipOnce(L"PreferHardwareInput()=true（会走假前台/硬件输入，不试 UIA）");
+        return false;
+    }
     HWND input = TargetHwnd();
     HWND top = TopLevelTargetWindow(input);
-    if (!top || !IsWindow(top)) return false;
+    if (!top || !IsWindow(top)) {
+        LogUiaSkipOnce(L"目标窗口无效");
+        return false;
+    }
     int sx = cx, sy = cy;
     if (!ClientToScreenPoint(input ? input : top, sx, sy, sx, sy)) {
-        if (!ClientToScreenPoint(top, cx, cy, sx, sy)) return false;
+        if (!ClientToScreenPoint(top, cx, cy, sx, sy)) {
+            LogUiaSkipOnce(L"ClientToScreenPoint 失败（拿不到屏幕坐标）");
+            return false;
+        }
     }
     // UIA Invoke 对部分应用（UWP 计算器等）会把目标窗口唤到前台：
     // 记住点击前的前台窗口，点击后若目标被唤出则立即还原，保持后台不抢焦点。
