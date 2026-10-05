@@ -76,9 +76,12 @@ void LogMapleHookHits(const wchar_t* when) {
     DWORD gfw = 0;
     DWORD focus = 0;
     if (FakeFocusSoftInput_ReadMapleHits(gaks, diState, diData, lastCb, hitReady, gfw, focus)) {
+        // ⚠ 2026-10-05 改名：原来叫「冒险岛钩命中」，但**对任何目标都会打**
+        //   （10-04 为了给 Unity/UE/GLFW 也出数据而放开了条件）⇒ 用户看到
+        //   「冒险岛…」会以为日志写错了。改成通用名，并**标出哪几个字段只对冒险岛有效**。
         WindowModeLogEventf(
-            L"[窗口/后台窗口模式] 冒险岛钩命中 %s hitReady=%lu gfw=%lu focus=%lu "
-            L"gaks=%lu diState=%lu diData=%lu lastCb=%lu",
+            L"[窗口/后台窗口模式] 假焦点钩命中 %s hitReady=%lu "
+            L"[仅冒险岛有效: gfw=%lu focus=%lu gaks=%lu diState=%lu diData=%lu] lastCb=%lu",
             when ? when : L"",
             static_cast<unsigned long>(hitReady),
             static_cast<unsigned long>(gfw),
@@ -112,7 +115,7 @@ void LogMapleHookHits(const wchar_t* when) {
                 path = L"泵在被调但没有键/输入消息（键态另走入口）";
             }
             WindowModeLogEventf(
-                L"[窗口/后台窗口模式] 冒险岛输入体检 %s 泵=%lu WM_INPUT=%lu WM_KEY=%lu "
+                L"[窗口/后台窗口模式] 假焦点输入体检 %s 泵=%lu WM_INPUT=%lu WM_KEY=%lu "
                 L"WM_ACTIVATE=%lu（吞=%lu）软键按下=%d rescan=%lu轮/+%lu槽 ⇒ %s",
                 when ? when : L"",
                 static_cast<unsigned long>(pump),
@@ -132,7 +135,7 @@ void LogMapleHookHits(const wchar_t* when) {
             if (FakeFocusSoftInput_ReadSoftCursor(softCx, softCy,
                     softCursorValid, softPostKeyEvents)) {
                 WindowModeLogEventf(
-                    L"[窗口/后台窗口模式] 冒险岛软光标 %s 假光标=(%d,%d) cursorValid=%d postKeyEvents=%d"
+                    L"[窗口/后台窗口模式] 假焦点软光标 %s 假光标=(%d,%d) cursorValid=%d postKeyEvents=%d"
                     L"（cursorValid=0 ⇒ 宿主没喂光标，GetCursorPos 钩子会回退真光标）",
                     when ? when : L"", softCx, softCy,
                     softCursorValid ? 1 : 0, softPostKeyEvents ? 1 : 0);
@@ -145,7 +148,7 @@ void LogMapleHookHits(const wchar_t* when) {
     if (!FakeFocusSoftInput_ReadMapleInstall(diag, iatPoll, diVt)) return;
     const std::wstring pollHit = MaplePollHitSummary(diag);
     WindowModeLogEventf(
-        L"[窗口/后台窗口模式] 冒险岛钩安装 %s iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu heapVt=%lu "
+        L"[窗口/后台窗口模式] 假焦点钩安装 %s iatPoll=%lu diag=0x%08X foundVt=%lu patchedSlot=%lu heapVt=%lu "
         L"pwPoll=%lu | pollHit=%s gpaIat=%d dinputIat=%d stage=%d fault=%d",
         when ? when : L"",
         static_cast<unsigned long>(iatPoll),
@@ -1477,7 +1480,7 @@ void WindowModeExecutor::TryInstallFakeFocus() {
     //   下面**每一条**早退（未登记游戏 / 不需要假焦点 / 内核反作弊 / 仅时钟补丁 / 远程桌面 …）
     //   原来都只走 `WindowModeLog`（非 Event ⇒ **不落盘**）⇒ 用户导出的诊断里
     //   「压根没尝试注入」和「尝试了但失败」长得**一模一样**（都只剩 BeginRun/EndRun）。
-    //   现场前科：用户的 10-02 构建从「每轮都有 `冒险岛钩命中 注入后`」变成「一行都没有」，
+    //   现场前科：用户的 10-02 构建从「每轮都有 `假焦点钩命中 注入后`」变成「一行都没有」，
     //   而三行注入诊断**只在 `lite && mapleStory` 分支里打** ⇒ 必须先能区分这几种情况，
     //   否则只能靠读源码猜（这次就是这么耗掉的）。
     WindowModeLogEventf(
@@ -1762,7 +1765,7 @@ void WindowModeExecutor::TryInstallFakeFocus() {
         WindowModeLogEvent(
             L"[窗口/后台窗口模式] 冒险岛假焦点已注入（仅 IAT 前景/键态 + DI 虚表；"
             L"禁止假 WM_INPUT / dinput8 可写节 / 注入线程协作级别 / 运行中远程线程计数）"
-            L" —— 若后面**没有**紧跟「冒险岛钩命中/钩安装」行，说明目标进程里的 DLL "
+            L" —— 若后面**没有**紧跟「假焦点钩命中/钩安装」行，说明目标进程里的 DLL "
             L"没往共享内存写（多为进程内挂着**旧版** DLL，请完全退出游戏再运行）");
         g_mapleSoftKeyLogs = 0;
         g_mapleSoftClickLogs = 0;
@@ -1783,9 +1786,9 @@ void WindowModeExecutor::TryInstallFakeFocus() {
         //   ⚠ 文案里的「冒险岛」是**历史名称**（被 skills/LESSONS/历次日志引用，不能改），
         //     实际已是通用假焦点诊断 —— 所以这里补一句前缀消除歧义。
         // ⚠ 必须是 **Event（落盘）** —— `WindowModeLog` 不落盘，用户导出的日志里会只剩
-        //   「冒险岛钩命中」却没有这句说明，反而更容易被误读成「那是冒险岛专属的」。
+        //   「假焦点钩命中」却没有这句说明，反而更容易被误读成「那是冒险岛专属的」。
         WindowModeLogEvent(
-            L"[窗口/后台窗口模式] 下列「冒险岛钩命中 / 输入体检 / 钩安装」为**通用假焦点诊断**"
+            L"[窗口/后台窗口模式] 下列「假焦点钩命中 / 输入体检 / 钩安装」为**通用假焦点诊断**"
             L"（名称沿用历史；Unity / UE / GLFW / 桌面模拟器同样适用）：用来判定游戏走哪条输入路径。"
             L"⚠ 若后面**没有**紧跟这三行，说明目标进程里的 DLL 没往共享内存写 —— 多为进程内挂着"
             L"**旧版** FakeFocus，请**完全退出游戏进程**再运行");

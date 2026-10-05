@@ -68,7 +68,7 @@
 //      失焦即停轮询（靠 WM_ACTIVATE，不逐帧查前台）。IAT 吞失活只拦得住注入之后的失活，
 //      所以若点运行时游戏已经不在前台，必须在注入后补一次**真激活**（`WakeMapleStoryInputPolling`，
 //      不能用假 WM_ACTIVATE——给冒险岛灌假激活会冻客户端），等 `diState>0` 再把前台还给用户。
-//      诊断：`冒险岛钩命中 … diState=0 lastCb=0` + 全程 `gaks=0 gfw=0` ⇒ 客户端根本没在轮询。
+//      诊断：`假焦点钩命中 … diState=0 lastCb=0` + 全程 `gaks=0 gfw=0` ⇒ 客户端根本没在轮询。
 //    - 对应用例：`lca_arrow_key_lparam` / `maplestory_bg_fake_focus`（WindowModeSelfTest）。
 //
 // 10) 冒险岛诊断契约：必须能区分「钩子没装上」和「客户端根本不调这些 API」
@@ -78,7 +78,7 @@
 //      0x20000 GetKeyState 被调用过 / 0x40000 GetKeyboardState / 0x80000 GetCursorPos /
 //      0x100000 GetProcAddress / 0x200000 GetProcAddress 的 IAT 槽已补 /
 //      0x400000 dinput8|dinput 的 user32 IAT 补到过槽。
-//    - 宿主在 `冒险岛钩安装` 行尾输出 `pollHit=` 人话摘要 + `gpaIat=` + `dinputIat=`。
+//    - 宿主在 `假焦点钩安装` 行尾输出 `pollHit=` 人话摘要 + `gpaIat=` + `dinputIat=`。
 //    - 判读：`pollHit=无` 且 `gaks=0 diState=0` ⇒ 客户端不走任何被拦的 API（**不是**钩子没装上），
 //      别再往「补钩子」方向使劲；`pollHit=GetCursorPos` 但无键态项 ⇒ 客户端确实在轮询 Win32，
 //      键态走的是别的入口（打包器手搓导出解析时只能上方法体 JMP，而冒险岛明令禁止）。
@@ -91,7 +91,7 @@
 //
 // 10.1) 输入路径体检（2026-09-24 加）：`gaks/gfw/diState` 全 0 只能说明「不走这些入口」，
 //    回答不了「那走哪条」—— 于是只能继续补钩子（§10 已警告别这么干）。现在 DLL 额外数
-//    消息泵调用与消息类别，宿主打一行 `冒险岛输入体检`：
+//    消息泵调用与消息类别，宿主打一行 `假焦点输入体检`：
 //      泵     = Peek/Get/Dispatch/CallWindowProc 命中次数（=0 ⇒ 客户端连消息都不经我们的钩子，
 //               属「晚解析/缓存指针」，靠下面 10.2 的周期补挂兜）；
 //      WM_INPUT > 0   ⇒ Raw Input：**后台天生收不到**（真后台走不了路，只能前台/假前台）；
@@ -109,7 +109,7 @@
 //      这几个钩子吞的，它们没被补上时「客户端失焦后永远不再轮询」就无解。
 //
 // 10.3) 进程级指针扫描的覆盖面：**只读数据页也要扫**（2026-09-27 扩；宿主日志仍看 `pwPoll=`/`+M槽`）
-//    - 判据来源：`冒险岛输入体检 泵=0 … rescan=3轮/+0槽` ⇒ 客户端既不走我们补过的 IAT，
+//    - 判据来源：`假焦点输入体检 泵=0 … rescan=3轮/+0槽` ⇒ 客户端既不走我们补过的 IAT，
 //      也没有「晚出现」的可写缓存点。而打包器/保护壳的典型形态是「解析出 API 地址 → 写进
 //      缓冲区 → `VirtualProtect(PAGE_READONLY)`」（或直接落在只读段）⇒ **只扫可写区的扫描
 //      永远看不到这些指针**。现在两个 API 组都扫 `PAGE_READONLY`。
@@ -275,7 +275,7 @@
 //      ① **计数夹顶**：`MapleBumpHit` 历史写法 `if (v > 255) InterlockedExchange(c, 255)`
 //         ⇒ `gaks` 一到 255 就**永远不再变**。而 `EvaluateKeyStatePhase` 用
 //         `nowGaks != prevGaks` 判「客户端还在不在查键态」⇒ 夹顶后**每轮看门狗都判停摆**。
-//         日志铁证：`冒险岛钩命中 结束前 … gaks=255`（两次独立运行都恰好 255 = 钳位值）。
+//         日志铁证：`假焦点钩命中 结束前 … gaks=255`（两次独立运行都恰好 255 = 钳位值）。
 //      ② **清理误伤脚本意图**：判停摆后 `ClearStaleArrowSoftKeys()` 清掉**所有**按下中的方向键。
 //         原注释的前提是「客户端此刻不轮询 ⇒ 清掉不影响任何生效输入」—— 前提在误判时**不成立**。
 //         日志铁证：`持键 2 个` 而 `已清方向键陈旧位（1 个）`。录制宏在 t=2.03s 按下 →
@@ -382,7 +382,7 @@
 //      （「还是」= §16 / §18 同症状的第三次报障。）
 //    - 现场（**决定性**：同一份导出文件里就有 A/B 对照）：`先前台在后台diagnose_report.txt` 里
 //      10-02 21:44–21:46 用的是 `QuickScriptTool.exe=7452672@10-01 23:58`，
-//      **每轮都有** `冒险岛钩命中 注入后` / `冒险岛输入体检 注入后` / `冒险岛钩安装 注入后`；
+//      **每轮都有** `假焦点钩命中 注入后` / `假焦点输入体检 注入后` / `假焦点钩安装 注入后`；
 //      10-03 22:33–22:36 用的是 `7519232@10-02 23:41`，**每轮一行都没有**（只剩
 //      `BeginRun：窗口模式启用` / `BeginRun：生效` / `构建指纹` / `EndRun`）。
 //      同一台机器、同一个游戏、同一批脚本 ⇒ **唯一变量是构建**。⚠ 别只看一个构建的日志。
@@ -419,7 +419,7 @@
 //      ⑥ 用例 `injected_module_stale_detection`（6 格，含 3 个负对照：0 值 / 相等）。
 //      ⑦ **「假焦点决策」落盘**（`TryInstallFakeFocus` 开头，`WindowModeLogEventf`）：
 //         打印 `mapleStory=? fakeFocusNeeded=? timeScaleWanted=? timeScaleOnly=? class=? targetExe=?`。
-//         ⚠ 这一条是本次**最有价值**的补充：那三行注入诊断（`冒险岛钩命中`/`钩安装`/`输入体检`）
+//         ⚠ 这一条是本次**最有价值**的补充：那三行注入诊断（`假焦点钩命中`/`钩安装`/`输入体检`）
 //         **只在 `lite && mapleStory` 分支里打**，而该分支前面有 **6 条会静默早退**的路径
 //         （未登记游戏走 LCA / 不需要假焦点 / 内核反作弊 / 仅时钟补丁 / 远程桌面 / 关掉了假焦点注入）
 //         —— 它们原来全是 `WindowModeLog`（非 Event）⇒ 用户导出的日志里
@@ -478,7 +478,7 @@
 //        都只是拿当前窗口位置去猜，会把「看起来能跑」变成「静默错位」。
 //
 //    - 诊断（同批改动，**通用假焦点目标此前完全没诊断**）：
-//      那三行（`冒险岛钩命中`/`钩安装`/`输入体检`）原来**只在 `lite && mapleStory`
+//      那三行（`假焦点钩命中`/`钩安装`/`输入体检`）原来**只在 `lite && mapleStory`
 //      分支打** ⇒ Unity/UE/GLFW/模拟器目标日志里**一条命中数据都没有**，
 //      「后台鼠标不动」只能靠猜。本次：
 //      ① `native3d` 分支也调 `LogMapleHookHits(L"注入后")`（文案沿用历史名称，
@@ -486,7 +486,7 @@
 //      ② DLL `MapleNotePumpMessage` 去掉 `if (!g_mapleSafe) return;` 门闩，
 //         通用泵钩子 `HookPeekMessage` 补 `MapleNotePumpMessage(lpMsg->message)`
 //         ⇒ 非冒险岛目标的 `hitPump/msgInput/msgKey` 不再恒 0。
-//      ③ 新增 `FakeFocusSoftInput_ReadSoftCursor()` + 一行 `冒险岛软光标 …`：
+//      ③ 新增 `FakeFocusSoftInput_ReadSoftCursor()` + 一行 `假焦点软光标 …`：
 //         回答「**宿主有没有把光标喂进去**」。
 //         ★ 这一条最关键 —— `SyncFakeFocusCursor()` 在共享内存没挂时是**静默 return**，
 //           光看「假焦点已注入」永远发现不了（`cursorValid=0` ⇒ GetCursorPos 钩子
@@ -517,7 +517,7 @@
 //           补了调用也读不到东西 ⇒ **两层门闩必须一起查**）
 //      ③ **落盘**：走的是 `WindowModeLogEvent*` 吗？
 //         （前科：消歧义说明用了 `WindowModeLog` ⇒ 不落盘 ⇒ 用户日志里**只剩
-//           「冒险岛钩命中」却没有那句说明**。⚠ `WindowModeLogf` **不是**落盘）
+//           「假焦点钩命中」却没有那句说明**。⚠ `WindowModeLogf` **不是**落盘）
 //      ④ **导出**：在导出脚本的抓取窗口内吗？
 //         （前科：`tools/diagnose_start.cmd` 只抓 `-Tail 120`，而诊断行分布在**每轮开头**、
 //           一轮约 80 行 ⇒ 跑两轮以上就被截掉。已放宽到 600）

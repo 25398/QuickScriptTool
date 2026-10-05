@@ -137,11 +137,11 @@ Get-Content ".\build\Release\window_mode_debug.log" -Tail 80
 | `permission_mismatch_no_autolaunch` | 目标完整性更高时仍自动打开 MapleStoryt.exe，已开着的游戏闪退 | `ShouldAbortAutoLaunchOnBindFailure`；`BeginRun` 禁止把 PermissionMismatch 当成未找到 |
 | `maplestory_bg_fake_focus` | 冒险岛后台绑上后立刻 EndRun；或注入后字母键也不动；或切走前台只会 A 不会走；或**点运行时游戏不在前台 → 全程原地 A**；或**游戏已在前台、`gaks=0 gfw=0 diState=0 lastCb=0` 全零却仍不走** | `LooksLikeMapleStory*`；`UsesFakeFocus`=0 仍 PostMessage；**须 mapleSafe InstallLite** 吞失活+DI；`UsesMapleStoryFakeFocusInput` 恒 false；`WakeMapleStoryInputPolling()` 注入后真激活一次（**禁止**假 WM_ACTIVATE，会冻客户端）。全零时先看 `pollHit=` 判读（见 [reference.md](reference.md) `maplestory_bg_fake_focus`），**别再盲补钩子** |
 | `background_fake_focus_not_degraded` | **后台模式却是「假后台」：跑脚本时鼠标/键盘被抢走**（MC / GLFW30 实测）；日志有「假焦点未生效（未注入 / 仅时钟补丁 / 钩已拆），回退假前台 SendInput（绝对坐标；会占键鼠）」 | 用户关掉「启用假焦点注入」+ 开着变速 ⇒ 只注入时钟补丁 ⇒ 没有假焦点钩 ⇒ 回退假前台 SendInput。修法：`ShouldInjectTimeScaleOnly` 判据**不得**带「关了注入」；`BackgroundTargetRequiresFakeFocus` 让后台+3D 目标忽略该设置（同微信/冒险岛）。**边界**：仅 `BackgroundWindow`，`HiddenDesktop` 不变 |
-| （诊断）`冒险岛输入体检` / `rescan=N轮/+M槽` | 冒险岛后台只原地平A、走路时灵时不灵（全零计数却仍不走） | 体检行判路径：泵=0 ⇒ 消息都不经钩子（晚解析/缓存指针，靠周期补挂）；**WM_INPUT>0 ⇒ Raw Input（后台天生收不到，禁止灌假 WM_INPUT——闪退）**；WM_KEYDOWN>0 ⇒ 消息驱动 + 激活态门控；软键按下=0 ⇒ 宿主没喂键。规则 `window_mode_requirements.h` §10.1/§10.2，实现 `StartMapleRescanThread`/`MapleIatFillPollPairs` |
+| （诊断）`假焦点输入体检` / `rescan=N轮/+M槽` | 冒险岛后台只原地平A、走路时灵时不灵（全零计数却仍不走） | 体检行判路径：泵=0 ⇒ 消息都不经钩子（晚解析/缓存指针，靠周期补挂）；**WM_INPUT>0 ⇒ Raw Input（后台天生收不到，禁止灌假 WM_INPUT——闪退）**；WM_KEYDOWN>0 ⇒ 消息驱动 + 激活态门控；软键按下=0 ⇒ 宿主没喂键。规则 `window_mode_requirements.h` §10.1/§10.2，实现 `StartMapleRescanThread`/`MapleIatFillPollPairs` |
 | （诊断）`目标主循环节拍：N 次/秒` | 变速「时钟改了、游戏却没变快」 | 节拍**不随倍率涨** ⇒ 帧率被 vsync/固定帧/Sleep 封顶，时钟补丁天生改不动（LESSONS §3）；**禁止**为此放宽 IAT 扫描（宽扫会虚拟化网络栈时钟 ⇒ 心跳错乱掉线，用户实测） |
 | `fake_focus_uses_bound_hwnd_class` | **后台+软输入全程卡顿**：日志出现「回退假前台 SendInput」或每一步都付 `PrepareSoftInput()` 全套代价 | 判「要不要假焦点」**必须传 hwnd**：`UsesFakeFocus(config, hwnd = nullptr)`。配置类名常为空（拖拽拾取后类名**只在 HWND 上**），只看 `config.windowClassName` 会漏判 GLFW30/SDL_app ⇒ 假焦点不装 ⇒ `PreferHardwareInput()` 里 `if (FakeFocusActive()) return false;` 不成立 ⇒ 全程软输入。**纯类名判断放头里**（底层头不能依赖 cdp 的 `QueryHwndProcessImagePath`，进程路径那步留在 cpp） |
 | `soft_input_fast_path` | 「后台 + 软输入」卡顿的结构性开销 = `PrepareSoftInput` **每拍一次全树枚举** | **所有「每拍一次」的输入路径都必须走 `PrepareSoftInputFast`**，判据是纯函数 `CanUseSoftInputFastPathClass`（`window_mode_types.h`）—— ① 顶层窗有效 ② 绑定**就是顶层自身**（子窗绑定不适用）③ 客户区几何未变 ④ **顶层窗类名与缓存一致**（HWND 会被系统复用：旧窗关了开新窗可能拿到同值句柄、尺寸还恰好相同 ⇒ 前三条全成立却投递到**错误目标**且不报错）。失效点：`RefreshTarget()`、`EndRun()`。⚠ **键盘 `PostKeyToTarget` 曾漏改**（第一轮只改相对移动 ⇒ 大尖峰紧跟键盘动作）；4 组调用点曾**各调两遍** `PrepareSoftInput`，已删 |
-| `fakefocus_stale_module_crash` | **注入后游戏立刻闪退**；日志里 `pid`/`hwnd` 跨小时甚至跨天完全不变（用户一直没重启游戏）；`冒险岛钩命中 … hitReady=1` 但 `iatPoll=0 diag=0x00000000 foundVt=0` | 同一进程反复注入 = 双重挂钩（IAT 被两套 detour 覆盖、DI 方法体 JMP 叠加）。`fake_focus_injector.cpp` `TargetHasStaleFakeFocusModule()` 注入前按模块名查残留并警告；`InstallMapleIatHooksGuarded()` 用 SEH 兜底保游戏；看 `stage=`/`fault=` 定位死亡点。**先完全退出 MapleStoryt.exe 再跑** |
+| `fakefocus_stale_module_crash` | **注入后游戏立刻闪退**；日志里 `pid`/`hwnd` 跨小时甚至跨天完全不变（用户一直没重启游戏）；`假焦点钩命中 … hitReady=1` 但 `iatPoll=0 diag=0x00000000 foundVt=0` | 同一进程反复注入 = 双重挂钩（IAT 被两套 detour 覆盖、DI 方法体 JMP 叠加）。`fake_focus_injector.cpp` `TargetHasStaleFakeFocusModule()` 注入前按模块名查残留并警告；`InstallMapleIatHooksGuarded()` 用 SEH 兜底保游戏；看 `stage=`/`fault=` 定位死亡点。**先完全退出 MapleStoryt.exe 再跑** |
 | `background_post_wrapped_container` | **后台按键完全没反应**（按 A 打不进目标应用，用户原话「按 A 打不到其他应用的后台里面」），日志 `后台输入子窗 kind=renderSurface class=NotepadTextBox`（现代记事本 / WinUI3） | `PostMessage` **不向子窗转发** ⇒ 投给只作容器的父窗 = **完全没投**。实测树 `Notepad` └ `NotepadTextBox`(755x553) └ `RichEditD2DPT`(755x553)，父子客户区**一样大**，而 `EnumChildWindows` 父先于子 ⇒「严格大于」的最大子窗启发式取到**包装层**。修法：`FindBackgroundInputChild` 用 `TextInputInsideSurface`（判据 **`IsChild(surface, input)`**）让位给真控件；`ResolveSoftInputHwnd` 对**已绑子窗**不得再用无 config 重解析覆盖（唯一例外：绑到的就是包装层）。⚠ **别改成「窗口里有没有输入框」**——会把投递目标从主区域挪到别处的小搜索框 |
 | `background_self_translate_double_char` | 修好上一条之后**一次按键进两个字**（按 A 出 `aa`）；`class=RichEditD2DPT` / WinUI 文本控件 | 该控件**自己**把 `WM_KEYDOWN` 译成字符，宿主再补 `WM_CHAR` 就双发（实测 `KEYDOWN(A)+WM_CHAR('a')` → `'aa'`）。修法：`ClassSelfTranslatesPostedKeys`（类名白名单）+ `SelfTranslateKeyUsesWmChar`（`ch >= 0x20`）——**可打印字符只发 `WM_CHAR`**（由宿主用软修饰键态译好：控件自译只看**真实键态**，看不见脚本按住的 Shift，否则 `Shift+A` 退化成 `a`）、**其余只发 `KEYDOWN`**（实测 `WM_CHAR` 对 `\r`/`\t` 不换行/不制表）。⚠ 只发过 `WM_CHAR` 的键**不得**再补 KEYUP |
 | `recorded_window_title_locks_rebind` | **后台窗口模式「不操作后台」**：录制回放时按键/点击到不了目标（用户原话「窗口模式自动识别，录制回放，不操作后台」）。⚠ **不是投递坏了，是根本没绑上** | 录制保存把**录制瞬间的标题**写进 `windowName`（`wm.windowName = wmTgt.windowTitle`），回放端 `BuildTargetQuery` 把它按 `" - "` 截成 stem 当 `titleContains`，而 `EnumWindowsOnDesktopProc` 里标题匹配是**硬门**（在类名匹配**之前**）。标题易变（换文档/换标签页/游戏换场景/存档改名）⇒ 枚举**零命中** ⇒ 绑不到。修法：录制端置 `windowNameIsHintOnly = true`；`BuildTargetQuery` hint-only 下**不产生** `titleContains`；`DoesTopWindowMatchConfig` 也**不拿标题**判「没绑到」——身份退化为 **进程路径 + 顶层类名(+子窗类名)**。⚠ 字段默认 `false` ⇒ 旧脚本/用户手配（标题关键词是**真意图**）行为不变。复现：`tools/verify/probe_record_playback_bind.py`（同窗同类名，仅标题变 ⇒ 命中 0；摘掉标题过滤 ⇒ 命中 1）；用例 `background_recorded_title_is_hint_only` |
@@ -261,8 +261,8 @@ BeginRun：生效 kind=BackgroundWindow targetExe=…\MapleStoryt.exe
 EndRun：窗口模式会话结束
 ```
 
-一轮里**只有这四行、没有任何 `假焦点已注入` / `冒险岛钩命中` / `冒险岛钩安装` /
-`冒险岛输入体检`** ⇒ **诊断根本没产生 = 注入没成功**。别去读注入之后的代码。
+一轮里**只有这四行、没有任何 `假焦点已注入` / `假焦点钩命中` / `假焦点钩安装` /
+`假焦点输入体检`** ⇒ **诊断根本没产生 = 注入没成功**。别去读注入之后的代码。
 
 **为什么会「看不到失败原因」**（2026-10-03 已修，但旧版日志就是长这样）：
 ① 注入期失败原来只走 `WindowModeLogf`（**非 Event ⇒ 不落盘**），
@@ -279,9 +279,9 @@ EndRun：窗口模式会话结束
 |---|---|---|
 | `假焦点决策：mapleStory=? …` + 某条早退行（`未注入假焦点，键鼠走 PostMessage` / `未登记游戏：跳过假焦点注入` / `仅注入时钟补丁` / `假焦点跳过：内核反作弊…`） | **没尝试注入** | 看 `mapleStory=` 是不是 0 ⇒ 目标没被识别（`targetExe`/类名/标题） |
 | `⛔ 假焦点注入失败…: <原因>` | **尝试了但失败** | 看冒号后的原因 |
-| `冒险岛假焦点已注入…` 有，但**没有**紧跟「冒险岛钩命中/钩安装」 | **注入成功、进程内 DLL 没往共享内存写** | 进程里挂着**旧版** DLL ⇒ **完全退出游戏再运行** |
+| `冒险岛假焦点已注入…` 有，但**没有**紧跟「假焦点钩命中/钩安装」 | **注入成功、进程内 DLL 没往共享内存写** | 进程里挂着**旧版** DLL ⇒ **完全退出游戏再运行** |
 
-⚠ 那三行诊断（`冒险岛钩命中`/`钩安装`/`输入体检`）在冒险岛目标上走 `lite && mapleStory`
+⚠ 那三行诊断（`假焦点钩命中`/`钩安装`/`输入体检`）在冒险岛目标上走 `lite && mapleStory`
 分支，该分支前面有 **6 条会静默早退**的路径，所以「三行全消失」有 **三种**完全不同的原因。
 2026-10-03 之前这些早退全是非 Event 日志 ⇒ 现场**区分不了**（这也是那次查很久的原因）。
 
@@ -290,7 +290,7 @@ EndRun：窗口模式会话结束
 鼠标不移动到指定位置」）日志里**一条命中数据都没有**，只能靠猜。配套改动：
 - DLL 侧 `MapleNotePumpMessage` 去掉 `if (!g_mapleSafe) return;` 门闩，通用泵钩子
   （`HookPeekMessage`）现在也计数 ⇒ 非冒险岛目标的 `hitPump/msgInput/msgKey` 不再恒 0。
-- 新增一行 `冒险岛软光标 <when> 假光标=(x,y) cursorValid=N postKeyEvents=N`，回答
+- 新增一行 `假焦点软光标 <when> 假光标=(x,y) cursorValid=N postKeyEvents=N`，回答
   「**宿主到底有没有把光标喂进去**」——`SyncFakeFocusCursor()` 在共享内存没挂时是
   **静默 return**，光看「假焦点已注入」永远发现不了。`cursorValid=0` ⇒ 宿主没喂光标
   ⇒ `GetCursorPos` 钩子会回退到真光标 ⇒ 后台移动必然无效。
@@ -301,8 +301,8 @@ EndRun：窗口模式会话结束
 |---|---|
 | `假焦点决策：mapleStory=… fakeFocusNeeded=… timeScaleWanted=… timeScaleOnly=… class=… targetExe=…` | **决策输入**（每轮一条）。`mapleStory=0` ⇒ 目标没被识别，先查 `targetExe`/类名 |
 | `坐标语义 窗口客户区相对 / 屏幕绝对（coordSpace=… 录制客户区=WxH）` | 脚本的**坐标系**（`BeginRun` 一条，2026-10-04 加）。选到「屏幕绝对」时紧跟一条 `⚠ 本脚本按屏幕绝对坐标回放…` ⇒ 回放用**当前**窗口位置换算，**窗口一动全部坐标动作整体偏移**。用户症状原话：「点不到指定位置 / 鼠标像没动」、「窗口移动后就不能用了」。修法：用后台窗口模式**重录**，或改「窗口模式」 |
-| `冒险岛软光标 <when> 假光标=(x,y) cursorValid=N postKeyEvents=N` | **宿主到底有没有把光标喂进去**（2026-10-04 加）。`cursorValid=0` ⇒ 宿主没喂 ⇒ `GetCursorPos` 钩子回退真光标 ⇒ **后台移动必然无效**（这是宿主侧缺陷，不是游戏的事） |
-| `冒险岛钩命中 … gfw=0 gaks=0 diState=0`（**Unity/UE/GLFW 目标**） | ⚠ **别读成「游戏不走这些入口」** —— 这几个位是**冒险岛专用**（`MapleBumpHit` 只在 `g_mapleSafe` 时递增，**故意没放开**：`gaks` 还被 `EvaluateKeyStatePhase` 当「客户端在不在查键态」的判据）。对通用目标恒 0 = **没人在数**。真正有效的是 `输入体检` 行的 `泵/WM_INPUT/WM_KEY` |
+| `假焦点软光标 <when> 假光标=(x,y) cursorValid=N postKeyEvents=N` | **宿主到底有没有把光标喂进去**（2026-10-04 加）。`cursorValid=0` ⇒ 宿主没喂 ⇒ `GetCursorPos` 钩子回退真光标 ⇒ **后台移动必然无效**（这是宿主侧缺陷，不是游戏的事） |
+| `假焦点钩命中 … gfw=0 gaks=0 diState=0`（**Unity/UE/GLFW 目标**） | ⚠ **别读成「游戏不走这些入口」** —— 这几个位是**冒险岛专用**（`MapleBumpHit` 只在 `g_mapleSafe` 时递增，**故意没放开**：`gaks` 还被 `EvaluateKeyStatePhase` 当「客户端在不在查键态」的判据）。对通用目标恒 0 = **没人在数**。真正有效的是 `输入体检` 行的 `泵/WM_INPUT/WM_KEY` |
 | `输入体检 … 泵=0` | ⚠ **先看「假焦点注入技术=… lite=?」**：`lite=1`（UE5 精简）**本就不钩 PeekMessage**（`InstallRawInputHooks` 里 `if (lite) return;`）⇒ 恒 0 属正常。`lite=0` 时泵=0 才是「游戏不走我们的钩子」 |
 | `⛔ 假焦点注入失败（精简/…）: <原因>` | 注入失败 —— **看冒号后的原因**（旧版这一行不落盘） |
 | `⛔ 假焦点注入中止：软输入共享内存创建失败 pid=…` | 共享内存 `CreateFileMapping`/`MapViewOfFile` 失败（权限/SDDL） |

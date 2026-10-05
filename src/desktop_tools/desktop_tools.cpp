@@ -783,13 +783,47 @@ namespace {
 /// ⚠ 判据与引擎侧 `ResolveWindowModeSelectMethod` 的 `windowNameIsHintOnly` 语义保持一致 ——
 ///   标题易变（换文档 / 换标签页 / 游戏换场景），当硬匹配门会枚举不到窗口。
 /// 返回 nullptr = 没找到（调用方必须**降级为屏幕坐标并说明**，不许静默）。
+/// 取**这个窗口自己**的进程路径。
+/// ⚠⚠ 与 `GetProcessPathFromPoint` **不是一回事**：后者取的是「**某个屏幕点上那个窗口**」
+/// 的进程 —— 用于「取鼠标下的程序」那种场景是对的，但**不能用来判「这个窗口属于谁」**：
+///   · 窗口被别的窗口遮挡时（实测：UWP 计算器被 Chrome 盖着）⇒ 拿到 `chrome.exe`
+///   · UWP 的中心点上是内容窗 `CoreWindow`（属于 `CalculatorApp.exe`）⇒ 拿到它
+/// ⇒ 拿它做「按 exe 路径找窗口」的判据必然失败。
+std::wstring GetProcessPathByHwnd(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return std::wstring();
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return std::wstring();
+    // ⚠ 用 QUERY_LIMITED_INFORMATION：对**系统进程**（ApplicationFrameHost.exe 等）
+    //   普通权限下只有这个权限级别能打开；PROCESS_QUERY_INFORMATION 会被拒。
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return std::wstring();
+    wchar_t buf[MAX_PATH * 2]{};
+    DWORD n = static_cast<DWORD>(std::size(buf));
+    std::wstring out;
+    if (QueryFullProcessImageNameW(h, 0, buf, &n)) out.assign(buf, n);
+    CloseHandle(h);
+    return out;
+}
+
+/// 取路径里的**文件名**（小写），用于「完整路径拿不到时的降级匹配」。
+std::wstring ExeFileNameLower(const std::wstring& path) {
+    if (path.empty()) return std::wstring();
+    const size_t slash = path.find_last_of(L"\\/");
+    std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    for (auto& ch : name) ch = static_cast<wchar_t>(towlower(ch));
+    return name;
+}
+
 HWND FindWindowByIdentity(const std::wstring& className, const std::wstring& exePath) {
     if (className.empty() && exePath.empty()) return nullptr;
     struct Ctx {
         const std::wstring* cls;
         const std::wstring* exe;
+        std::wstring wantExeName;   // exePath 的文件名（小写），用于降级匹配
         HWND found;
-    } ctx{&className, &exePath, nullptr};
+        HWND weakFound;             // 降级命中（类名对、但路径拿不到）
+    } ctx{&className, &exePath, ExeFileNameLower(exePath), nullptr, nullptr};
 
     EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
         auto* c = reinterpret_cast<Ctx*>(lp);
@@ -801,16 +835,25 @@ HWND FindWindowByIdentity(const std::wstring& className, const std::wstring& exe
             if (_wcsicmp(buf, c->cls->c_str()) != 0) return TRUE;
         }
         if (!c->exe->empty()) {
-            RECT rc{};
-            if (!GetWindowRect(hwnd, &rc)) return TRUE;
-            const std::wstring p = GetProcessPathFromPoint(
-                (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
-            if (p.empty() || _wcsicmp(p.c_str(), c->exe->c_str()) != 0) return TRUE;
+            // ⚠⚠ 2026-10-05：改用**按句柄**取路径（原来用窗口中心点的
+            //   `GetProcessPathFromPoint` ⇒ 被遮挡/UWP 内容窗时必然拿错，见函数注释）。
+            const std::wstring p = GetProcessPathByHwnd(hwnd);
+            if (p.empty()) {
+                // 路径**拿不到**（系统进程权限不足等）⇒ 记一个**降级命中**，
+                // 只有在没有任何强命中时才用它 —— 否则「UWP 计算器」这类目标永远找不到。
+                if (!c->weakFound) c->weakFound = hwnd;
+                return TRUE;
+            }
+            const bool fullMatch = _wcsicmp(p.c_str(), c->exe->c_str()) == 0;
+            const bool nameMatch = !c->wantExeName.empty()
+                && ExeFileNameLower(p) == c->wantExeName;
+            if (!fullMatch && !nameMatch) return TRUE;
         }
         c->found = hwnd;
         return FALSE;  // 找到第一个就停
     }, reinterpret_cast<LPARAM>(&ctx));
-    return ctx.found;
+    // ⚠ 降级命中要**放在最后**：强命中优先，避免「类名相同但 exe 不同」的窗口抢先。
+    return ctx.found ? ctx.found : ctx.weakFound;
 }
 
 }  // namespace

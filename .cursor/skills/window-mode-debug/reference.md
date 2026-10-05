@@ -338,7 +338,7 @@
 ### `injected_module_stale_detection`（2026-10-03 新增）
 
 - **测什么**：`InjectedModuleLooksStale(dllWrite, procStart)` 的真值表（6 格）—— ① 磁盘 DLL 写入时间 **晚于**目标进程启动时间 ⇒ **必须判旧**（`newerIsStale`）；② 早于 ⇒ 不许报警；③ 相等 ⇒ 保守判「不旧」；④⑤⑥ 负对照：`dllWrite=0` / `procStart=0` / 两者皆 0 ⇒ **一律不报警**（宁可漏报，不误报）。  
-- **用户症状**：冒险岛后台「**原地不动的平A，不能走A**」——升级了软件但**游戏进程没重启** ⇒ `LoadLibrary` 同路径**只加引用计数、不重跑 DllMain** ⇒ 进程里跑的还是旧 `FakeFocus32/64.dll` ⇒ 共享内存 `kSoftInputVersion`（7→10）不匹配 ⇒ `SoftInputStateLooksValid` 假 ⇒ 软键态 / DirectInput 全失效（只剩 PostMessage 的攻击键）。日志形态：一轮只有 `BeginRun`/`EndRun`，`假焦点已注入`/`冒险岛钩命中` 整段消失。  
+- **用户症状**：冒险岛后台「**原地不动的平A，不能走A**」——升级了软件但**游戏进程没重启** ⇒ `LoadLibrary` 同路径**只加引用计数、不重跑 DllMain** ⇒ 进程里跑的还是旧 `FakeFocus32/64.dll` ⇒ 共享内存 `kSoftInputVersion`（7→10）不匹配 ⇒ `SoftInputStateLooksValid` 假 ⇒ 软键态 / DirectInput 全失效（只剩 PostMessage 的攻击键）。日志形态：一轮只有 `BeginRun`/`EndRun`，`假焦点已注入`/`假焦点钩命中` 整段消失。  
 - **代码**：`window_mode_types.h` `InjectedModuleLooksStale`；`fake_focus_injector.cpp` `InjectAndInstall`（同路径分支打 `⚠ 目标进程 … 里挂的是**旧版** FakeFocus`，**只报警不阻断**）  
 
 ### `fake_focus_maplestory_focus_only`
@@ -383,7 +383,7 @@
 - **用户症状**：游戏必须前台才会走，切走后原地 A；或**在桌面/浏览器前台时点运行**，全程原地 A（切走只会 A 不会走）。技能键走 WndProc/PostMessage；走路走 DirectInput，失焦后停轮询。  
 - **「点运行时游戏已不在前台」根因**：2009 dinput8 靠 WM_ACTIVATE 停轮询（不逐帧查前台），客户端早在注入前就停了 → DI 虚表钩子/软键态全不被读。IAT 吞失活只能拦「以后」的失活。修法：`WakeMapleStoryInputPolling()`（注入后真激活一次、等 `diState>0`、还前台）；**禁止**假 WM_ACTIVATE（会冻客户端）。同时方向键兜底 SendInput 只在目标为前台时补，否则会打进用户正在看的浏览器（B 站视频跳进度/调音量）。  
 - **「游戏已在前台、诊断却全零」根因（第二轮，仍未收敛）**：日志里 `gaks=0 gfw=0 diState=0 lastCb=0` 且 `diag=0x00014FE3`（钩子装好了）——说明**客户端根本不调这些 API**，而不是没装上。此时不要盲目继续补钩子，先看 `pollHit=`（见下）。可能的真实入口：打包器手搓 PE 导出解析（绕过 `GetProcAddress`，只能方法体 JMP，而冒险岛**明令禁止** user32 方法体 JMP）；或客户端是纯消息驱动、走路靠别的键态源。  
-- **诊断契约（本轮新增，务必先读再动手）**：`mapleDiag` 高位是运行期命中位，宿主在 `冒险岛钩安装` 行尾解成 `pollHit=` + `gpaIat=` + `dinputIat=`：
+- **诊断契约（本轮新增，务必先读再动手）**：`mapleDiag` 高位是运行期命中位，宿主在 `假焦点钩安装` 行尾解成 `pollHit=` + `gpaIat=` + `dinputIat=`：
   - `0x20000` GetKeyState 被调用过 / `0x40000` GetKeyboardState / `0x80000` GetCursorPos / `0x100000` GetProcAddress / `0x200000` GetProcAddress 的 IAT 槽已补 / `0x400000` dinput user32 IAT 补到过槽。
   - 判读：`pollHit=无` + `gaks=0 diState=0` ⇒ 客户端不走任何被拦 API（**不是**钩子没装上）；`pollHit=GetCursorPos` 但无键态项 ⇒ 客户端确实在轮询 Win32，键态走了别的入口。
   - **`iatPoll=2` 是异常值**：本地 dinput8 存在时应 ≥4。成因是 dinput8/dinput **懒加载**，PEB 那轮还没进进程；`InstallMapleIatHooks` 末尾已在 DI 虚表阶段之后补走一次 `MapleIatWalkGameDirDinputUser32()`。
@@ -424,7 +424,7 @@
 ### `fakefocus_stale_module_crash`
 
 - **测什么**：`TargetHasStaleFakeFocusModule(pid)` 能按模块名发现目标进程里已加载的 `FakeFocus32.dll`/`FakeFocus64.dll`；`InstallMapleIatHooksGuarded()` 的 SEH 兜底不改变正常路径行为。  
-- **用户症状**：**注入后游戏立刻闪退**。日志特征：`冒险岛钩命中 … hitReady=1` 但 `冒险岛钩安装 … iatPoll=0 diag=0x00000000 foundVt=0 patchedSlot=0`（什么都没装上），紧接着 `目标窗口已消失（进程退出/闪退）`。  
+- **用户症状**：**注入后游戏立刻闪退**。日志特征：`假焦点钩命中 … hitReady=1` 但 `假焦点钩安装 … iatPoll=0 diag=0x00000000 foundVt=0 patchedSlot=0`（什么都没装上），紧接着 `目标窗口已消失（进程退出/闪退）`。  
 - **根因**：**同一个游戏进程反复注入**。第二次注入时 IAT 槽被两套 detour 覆盖、DirectInput 方法体 JMP 叠加、卸载时各按自己保存的原始字节回写 → 访问违例。现场最好认的证据是**日志里 `pid`/`hwnd` 跨小时甚至跨天完全不变**（实测 `pid=2489124 hwnd=0x0D06E6` 从 09-18 20:32 一直用到 09-19 16:24），说明用户一直没重启游戏。  
 - **修法**：注入前 `TargetHasStaleFakeFocusModule()`（Toolhelp，回传 **`szExePath` 完整路径**，只看模块名区分不出「两份不同路径」这种最危险的情况）警告「请先完全退出 MapleStoryt.exe」；`InstallMapleIatHooksGuarded()` 用 `__try/__except` 兜住安装期异常并置 `kMapleInstallFault`，先保游戏。  
 - **诊断读数全 0 的另一种成因（2026-09-20 补）**：日志出现 `iatPoll=0 diag=0x00000000 stage=0 hitReady=0` 但注入本身报成功 ⇒ 目标进程里已有一份**同一路径**的 FakeFocus，`InstallCommon` 走**早退路径**（`g_installed` 已为真）。此时 DLL 若不再往宿主新建的共享内存里写，宿主读到的就全是 0 —— 看着像「注入没生效」。已修：早退路径重新 `OpenSoftInputView` + `MaplePublishHits()`。**看到全 0 先排这一条，别急着怀疑钩子。**
