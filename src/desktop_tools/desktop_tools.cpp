@@ -820,20 +820,24 @@ std::wstring ExeFileNameLower(const std::wstring& path) {
 /// 「类名没匹配」/「路径不匹配」/「路径拿不到」⇒ 把扫描过程留下来给调用方拼提示。
 std::wstring g_lastFindWindowDiag;
 
-HWND FindWindowByIdentity(const std::wstring& className, const std::wstring& exePath) {
+HWND FindWindowByIdentity(const std::wstring& className, const std::wstring& exePath,
+    const std::wstring& titleHint) {
     if (className.empty() && exePath.empty()) return nullptr;
     struct Ctx {
         const std::wstring* cls;
         const std::wstring* exe;
+        const std::wstring* title;  // 可选：**优先条件**（不是硬门）
         std::wstring wantExeName;   // exePath 的文件名（小写），用于降级匹配
-        HWND found;
+        HWND found;                 // 强命中（第一个）
+        HWND titleFound;            // 强命中且标题匹配 ⇒ **优先返回**
         HWND weakFound;             // 降级命中（类名对、但路径拿不到）
         // ⚠⚠ 2026-10-05 诊断：找不到时把**扫描过程**记下来 —— 用户报「未找到目标窗口」
         //   时，光知道「没找到」无法区分「类名没匹配」/「路径不匹配」/「路径拿不到」。
         int scanned = 0;
         int clsMatched = 0;
         std::wstring clsMatchedDetail;   // 前几个类名匹配窗口的「路径 or (拿不到)」
-    } ctx{&className, &exePath, ExeFileNameLower(exePath), nullptr, nullptr, 0, 0, {}};
+    } ctx{&className, &exePath, &titleHint, ExeFileNameLower(exePath),
+        nullptr, nullptr, nullptr, 0, 0, {}};
 
     EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
         auto* c = reinterpret_cast<Ctx*>(lp);
@@ -865,13 +869,25 @@ HWND FindWindowByIdentity(const std::wstring& className, const std::wstring& exe
                 && ExeFileNameLower(p) == c->wantExeName;
             if (!fullMatch && !nameMatch) return TRUE;
         }
-        c->found = hwnd;
-        return FALSE;  // 找到第一个就停
+        // ⚠ 标题只作**优先条件**（不是硬门 —— 标题会变，UWP 标题常是文档名/应用名）：
+        //   多个候选时优先选标题含 `titleHint` 的那个，避免「机器上开着多个 UWP 应用
+        //   ⇒ 抓错窗口」。
+        if (!c->title->empty()) {
+            wchar_t tbuf[512]{};
+            if (GetWindowTextW(hwnd, tbuf, 512) != 0
+                && wcsstr(tbuf, c->title->c_str()) != nullptr) {
+                c->titleFound = hwnd;
+                return FALSE;   // 标题命中 ⇒ 就是它，不必再扫
+            }
+        }
+        if (!c->found) c->found = hwnd;
+        return TRUE;            // 继续扫，看有没有标题更匹配的
     }, reinterpret_cast<LPARAM>(&ctx));
-    // ⚠ 降级命中要**放在最后**：强命中优先，避免「类名相同但 exe 不同」的窗口抢先。
+    // ⚠ 优先级：标题匹配 > 普通强命中 > 降级命中（类名对但路径拿不到）
+    if (ctx.titleFound) return ctx.titleFound;
     if (ctx.found) return ctx.found;
     if (ctx.weakFound) return ctx.weakFound;
-    // 都没找到 ⇒ 把扫描结果挂到调用方能拿到的地方（见 FindWindowByIdentityDiag）
+    // 都没找到 ⇒ 把扫描结果挂到调用方能拿到的地方（见 g_lastFindWindowDiag）
     g_lastFindWindowDiag = L"扫过 " + std::to_wstring(ctx.scanned) + L" 个可见顶层窗，"
         L"类名「" + className + L"」匹配 " + std::to_wstring(ctx.clsMatched) + L" 个"
         + (ctx.clsMatched > 0
@@ -1063,7 +1079,8 @@ CrosshairPickResult CrosshairPick(HWND owner, const std::string& modeUtf8,
     bool outside = false;
     std::wstring coordNote;
     if (opts && opts->windowClient && mode == CrosshairDragMode::Coordinates) {
-        const HWND basis = FindWindowByIdentity(opts->windowClassName, opts->exePath);
+        const HWND basis = FindWindowByIdentity(
+            opts->windowClassName, opts->exePath, opts->title);
         if (!basis || !IsWindow(basis)) {
             // ⚠ 带上扫描诊断 —— 「没找到」本身无法定位，必须说清**卡在哪一步**
             coordNote = L"未找到目标窗口（按路径+类名），已回退屏幕坐标";
