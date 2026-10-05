@@ -278,6 +278,11 @@ const selftest::CaseInfo kCases[] = {
         L"★桌面/资源管理器图标判据（外壳视图宿主类）——它决定「打开」要不要双击"},
     {L"screen_point_occlusion_check", L"default",
         L"IsScreenPointOnForegroundWindow：屏幕外点必须判「不属于前台」；抢到前台时窗口内点必须判「属于前台」"},
+    {L"uia_invoke_chain", L"default",
+        L"UIA Invoke 调用链（同进程）：建窗+按钮 → UIA 查找 → Invoke → 确认 WM_COMMAND 到达"},
+    {L"uia_invoke_cross_process", L"default",
+        L"UIA Invoke 调用链（跨进程）：UWP 的核心特征就是跨进程；若这条不通，"
+        L"「UWP 走 UIA」这条路就不成立"},
     {L"soft_input_fast_path", L"default",
         L"每拍输入快速路径：几何/绑定/顶窗类名全未变才放行；顶窗失效、子窗绑定、尺寸变化、"
         L"无缓存、HWND 复用（类名变）一律退回完整路径"},
@@ -611,6 +616,89 @@ void TestUiaInvokeChain() {
     selftest::Emit(L"uia_invoke_chain", g_uiaProbeClicked,
         (L"invoked=1 clicked=" + std::to_wstring(g_uiaProbeClicked ? 1 : 0)
             + L"（invoked 成功但按钮没收到 WM_COMMAND ⇒ UIA 元素找到了但 Invoke 没生效）").c_str());
+}
+
+/// `--uia-child`：建一个带按钮的窗口并泵消息 10 秒，供父进程做**跨进程** UIA 验证。
+/// ⚠ 类名与同进程用例的 `QstUiaInvokeProbe` **刻意不同**，避免 `FindWindowW` 抓错。
+int RunUiaChildWindow() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"QstUiaXProcProbe";
+    RegisterClassW(&wc);
+    HWND w = CreateWindowExW(0, wc.lpszClassName, L"QstUiaXProc",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 140, 140, 420, 300,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (!w) return 1;
+    CreateWindowExW(0, L"Button", L"XProbe", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        40, 40, 160, 40, w, nullptr, wc.hInstance, nullptr);
+    ShowWindow(w, SW_SHOW);
+    SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    const DWORD until = GetTickCount() + 10000;
+    MSG msg{};
+    while (GetTickCount() < until) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(20);
+    }
+    DestroyWindow(w);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    return 0;
+}
+
+/// ⚠⚠ 2026-10-05：验证**跨进程** UIA 是否工作。
+///
+/// 为什么单独一条：UWP 的**核心特征就是跨进程** —— 壳窗 `ApplicationFrameWindow` 在
+/// `ApplicationFrameHost.exe`，内容窗 `CoreWindow` 在**另一个进程**（如 `CalculatorApp`）。
+/// 同进程的 `uia_invoke_chain` **证明不了**跨进程行为。
+/// ★ 若跨进程 UIA 本身不工作，那「UWP 走 UIA」这条路**根本不成立**（要换方案）——
+///   所以这条用例能一次排除一整条路线。
+void TestUiaInvokeCrossProcess() {
+    wchar_t exe[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+        selftest::Emit(L"uia_invoke_cross_process", true, L"skipped: 取不到自身路径");
+        return;
+    }
+    std::wstring cmd = std::wstring(L"\"") + exe + L"\" --uia-child";
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        selftest::Emit(L"uia_invoke_cross_process", true, L"skipped: 起不了子进程");
+        return;
+    }
+    HWND w = nullptr;
+    for (int i = 0; i < 60 && !w; ++i) {
+        Sleep(100);
+        w = FindWindowW(L"QstUiaXProcProbe", nullptr);
+    }
+    bool ok = false;
+    std::wstring detail = L"子进程窗口未出现";
+    if (w) {
+        HWND btn = FindWindowExW(w, nullptr, L"Button", nullptr);
+        RECT brc{};
+        if (btn && GetWindowRect(btn, &brc)) {
+            const int sx = (brc.left + brc.right) / 2;
+            const int sy = (brc.top + brc.bottom) / 2;
+            ok = windowmode::TryUiaInvokeAtScreenPoint(w, sx, sy);
+            detail = ok
+                ? L"跨进程 UIA 找到并 Invoke 成功"
+                : L"跨进程 UIA 失败（同进程能成功 ⇒ 问题出在跨进程这一层）";
+        } else {
+            detail = L"子进程里没找到按钮";
+        }
+    }
+    if (pi.hProcess) {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+    }
+    if (pi.hThread) CloseHandle(pi.hThread);
+    selftest::Emit(L"uia_invoke_cross_process", ok, detail.c_str());
 }
 
 void TestSoftInputFastPath() {
@@ -6833,11 +6921,13 @@ int wmain(int argc, wchar_t** argv) {
     // 这里不再重复；对应回归用例见 `selftest_refuses_foreign_launcher`。
     bool runMacro = false;
     bool listOnly = false;
+    bool uiaChild = false;
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--json") == 0) {
             selftest::gJson = true;
             selftest::InitUtf8Stdout();
         } else if (_wcsicmp(argv[i], L"--macro") == 0) runMacro = true;
+        else if (_wcsicmp(argv[i], L"--uia-child") == 0) uiaChild = true;
         else if (_wcsicmp(argv[i], L"--list") == 0) {
             listOnly = true;
             selftest::InitUtf8Stdout();
@@ -6846,6 +6936,15 @@ int wmain(int argc, wchar_t** argv) {
             PrintHelp();
             return 0;
         }
+    }
+
+    // ⚠⚠ 2026-10-05：`--uia-child` 子进程模式 —— 只为 `uia_invoke_cross_process` 服务。
+    //   跨进程 UIA 是 UWP 场景的**核心特征**（壳窗在 `ApplicationFrameHost.exe`、
+    //   内容在**另一个进程**），而同进程用例**证明不了**它。
+    //   子进程只做一件事：建窗 + 按钮 + 泵消息 10 秒，然后退出。
+    if (uiaChild) {
+        RunUiaChildWindow();
+        return 0;
     }
 
     if (listOnly) {
@@ -6979,6 +7078,7 @@ int wmain(int argc, wchar_t** argv) {
     TestUiaControlListCarriesActionAndState();
     TestScreenPointOcclusionCheck();
     TestUiaInvokeChain();
+    TestUiaInvokeCrossProcess();
     TestSoftInputFastPath();
 
     if (runMacro) TestMacroDesktopSmoke();
