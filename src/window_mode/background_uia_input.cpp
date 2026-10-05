@@ -217,13 +217,31 @@ bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
         return false;
     }
     const HRESULT hrFind = root->FindAll(TreeScope_Descendants, allCond.Get(), &arr);
-    if (FAILED(hrFind) || !arr) {
-        LogUiaFailOnce(L"FindAll(Descendants)", static_cast<long>(hrFind), sx, sy);
-        return false;
-    }
     int count = 0;
-    if (FAILED(arr->get_Length(&count)) || count <= 0) {
-        LogUiaFailOnce(L"FindAll 返回 0 个元素（UWP 的 UIA 树为空？）", 0, sx, sy);
+    if (SUCCEEDED(hrFind) && arr) arr->get_Length(&count);
+    // ⚠⚠ UWP 的 UIA 树是**按需构建**的（跨进程 + 元素虚拟化）⇒ 首次 `FindAll` 常返回
+    //   0 个元素，紧接着再查就有了。用户报「UWP 计算器点击没反应」时，日志显示
+    //   UIA 兜底**确实被调用但失败了** —— 这是最可能的原因之一。
+    //   ⇒ 短暂重试（**只在拿到 0 个时**，最多 3 次 × 60ms）；仍为空才回退
+    //     `TreeScope_Children`（个别 UWP 的 Descendants 不穿透）。
+    //   ⚠ 代价：最坏 +180ms，且发生在**输入线程** ⇒ 只在**首次**点击时才可能付这个代价
+    //     （之后 UIA 树已就绪，一次就拿到）。
+    if (count <= 0) {
+        for (int attempt = 0; attempt < 3 && count <= 0; ++attempt) {
+            Sleep(60);
+            arr.Reset();
+            if (FAILED(root->FindAll(TreeScope_Descendants, allCond.Get(), &arr)) || !arr) break;
+            if (FAILED(arr->get_Length(&count))) count = 0;
+        }
+    }
+    if (count <= 0) {
+        arr.Reset();
+        if (SUCCEEDED(root->FindAll(TreeScope_Children, allCond.Get(), &arr)) && arr) {
+            if (FAILED(arr->get_Length(&count))) count = 0;
+        }
+    }
+    if (count <= 0) {
+        LogUiaFailOnce(L"FindAll 返回 0 个元素（重试 + Children 回退后仍为空）", 0, sx, sy);
         return false;
     }
 
