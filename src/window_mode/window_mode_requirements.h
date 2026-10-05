@@ -527,3 +527,43 @@
 //      ⇒ ①②是「写了但没数据」，③④是「有数据但传不到」，⑤是「失败没痕迹」。
 //        缺任何一关，结果都是「日志里什么都没有 / 看不出问题」。
 // =============================================================================
+//
+// §24 UWP 目标（计算器 / 商店应用）在「后台窗口模式」下的现状与排查路径
+// =============================================================================
+//   目标特征：`class=ApplicationFrameWindow`、`targetExe=...\ApplicationFrameHost.exe`，
+//   内容窗是 `class=Windows.UI.Core.CoreWindow`（**另一个进程**，如 CalculatorApp）。
+//
+//   - ★★ **禁止注入假焦点**（2026-10-05 用户实测崩溃后加的护栏）
+//     `ApplicationFrameHost.exe` 是**系统壳进程**，一个进程托管**所有** UWP 应用
+//     ⇒ 注入影响面远超单个应用；实测「会话结束后目标窗口崩溃」。
+//     判据：`LooksLikeUwpShellWindowClass()` / `LooksLikeUwpShellExecutable()`。
+//     ★ **不影响功能**：UWP 的 `PostMessage` 本来就无效，它靠 **UIA Invoke**。
+//     ⚠ 跳过后**不能**再报「★ 未拿到假焦点 …… 请放行 DLL」那条告警
+//       （会把用户引向折腾安全中心）—— 已用 `uwpSkippedFakeFocus_` 区分
+//       「主动跳过」与「注入失败」。
+//
+//   - **输入路径**：`PostMessage` **无效**（UWP 不响应）⇒ 点击必须走
+//     `TryUiaInvokeAtScreenPoint()`（`background_uia_input.cpp`）。
+//     ⚠ **移动**（`PostMouseMoveToWindow`）对 UWP **同样无效**，但
+//       **UIA 点击不需要先移动** ⇒ 「移动无效」不影响点击，排查时别被它误导。
+//
+//   - **「点击没反应」的排查顺序**（2026-10-05 起每层都有日志）：
+//     ① `UIA 兜底未执行：<原因>`（`window_mode_executor.cpp` 的 `LogUiaSkipOnce`）
+//        ⇒ 没走到 UIA。原因：`PreferHardwareInput()` 为真 / 目标窗口无效 /
+//          `ClientToScreenPoint` 失败。
+//     ② `⚠ UIA 兜底失败于「<stage>」hr=…`（`background_uia_input.cpp` 的 `LogUiaFailOnce`）
+//        ⇒ UIA 走了但失败，stage 直接指出哪一步：
+//          · `CoCreateInstance(CUIAutomation)` ⇒ COM 线程模型
+//          · `ElementFromHandle` ⇒ 句柄无效
+//          · `FindAll(Descendants)` ⇒ 接口报错（看 hr）
+//          · `FindAll 返回 0 个元素（重试 + Children 回退后仍为空）` ⇒ UIA 树为空
+//          · `该点下没有支持 Invoke/Toggle 的 UIA 元素` ⇒ 坐标不在控件上，或该控件
+//            不走 Invoke（需补 `LegacyIAccessible` / `SelectionItem` 等模式）
+//     ③ `UIA 点击 屏幕(x,y) 客户区(x,y)` ⇒ **成功**（原来只有这一条，所以失败时
+//        日志里连「试过 UIA」都看不出来）。
+//     ⚠ `FindAll` 拿到 0 个时会**重试 3×60ms + 回退 `TreeScope_Children`** ——
+//       UWP 的 UIA 树是**按需构建**的（跨进程 + 元素虚拟化），首次常为空。
+//
+//   - **临时替代方案**：改用「**窗口模式**」（非后台）—— 那种模式允许占键鼠，
+//     走假前台 `SendInput`，**能驱动 UWP**，代价是运行时会抢占鼠标键盘。
+// =============================================================================
