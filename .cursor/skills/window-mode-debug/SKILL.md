@@ -394,6 +394,75 @@ Raw Input 游戏可能无响应）。用户看到的是"没反应 + 一条解释
 ⚠ 同类还有一处：`GetRawInputData` 吞真鼠标时原来把 `usButtonFlags/usButtonData` **整条清零**，
 连用户自己手动滚的轮也一起吞了。现在只清非滚轮位。
 
+## 「UWP 目标（计算器/商店应用）后台点了没反应」怎么判读（2026-10-05 真机）
+
+**目标特征**：`class=ApplicationFrameWindow`、`targetExe=...\ApplicationFrameHost.exe`，
+内容窗 `class=Windows.UI.Core.CoreWindow`（**另一个进程**，如 `CalculatorApp`）。
+
+### 一、先确认「走到了哪一层」（三层日志，每层都要有）
+
+```
+UIA 兜底未执行：<原因>              ← 没走到 UIA（PreferHardwareInput / 窗口无效 / 坐标转换失败）
+⚠ UIA 兜底失败于「<stage>」hr=…    ← 走了但失败，stage 直接指明哪一步
+UIA 点击 屏幕(x,y) 客户区(x,y)      ← 成功（**只有这条是原来就有的** ⇒ 失败时看不出试过 UIA）
+```
+
+### 二、★ 最坑的一条：**动作坐标 `(0,0)` 是哨兵**（「用当前鼠标位置」）
+
+**症状**：`UIA 兜底失败于「该点下没有支持 Invoke/Toggle 的 UIA 元素」`，
+且日志里 `查询点屏幕` **恰好等于** `客户区原点(屏幕)`。
+
+**含义**：传给 UIA 的客户区坐标是 `(0,0)` ⇒ `ClientToScreen` 得到**客户区原点**
+⇒ UIA 跑到**窗口左上角**找元素 ⇒ 必然找不到。
+
+**根因**：`ResolveClickClientPos()`（把 `(0,0)` 换成真实客户区坐标）**排在 UIA 分支之后**。
+
+**修法**：把 `ResolveClickClientPos(cx, cy)` **上移到 UIA 分支之前**。
+⚠ **所有**走 UIA 的目标都受影响（UWP / WinUI / `DesktopChildSiteBridge` / `Xaml_WindowedPopup`），
+不只是 UWP。
+
+⚠ **改这类问题时必须 grep `ResolveClickClientPos` 的 4 个调用点逐个核对**
+（2026-10-05 实测：`MoveMouseClient`/`PostScrollWheelAtClient` 是对的，
+`PostMouseButtonAtClient`/`PostMouseClickAtClient` **两处都漏了**）。
+
+### 三、UIA 树为空 vs 没有可 Invoke 的元素
+
+| 日志 stage | 含义 | 修法方向 |
+|---|---|---|
+| `FindAll 返回 0 个元素（重试 + Children 回退后仍为空）` | UIA 树是空的 | 已内置重试 3×60ms + `TreeScope_Children` 回退；仍空 ⇒ 换内容窗句柄 |
+| `该点下没有支持 Invoke/Toggle 的 UIA 元素` | 点在元素外，或该控件不走 Invoke | **先看诊断行**：`包含该点的=0` ⇒ 坐标问题；`>0` ⇒ 控件类型问题 |
+
+诊断行（`⚠ UIA 元素诊断`）会打出：树内矩形元素数 / **包含该点的数** / 其中可 Invoke 的数 /
+最近元素矩形 + 名字 / **该点窗口类** / **窗口矩形 + 客户区尺寸 + 客户区原点(屏幕)**。
+⚠ 最后三个是**验证坐标换算的唯一直接证据** —— 只看「查询点屏幕」判断不了对错。
+
+### 四、⚠ `该点窗口类=Chrome_RenderWidgetHostHWND` **不是**问题
+
+后台模式下目标本来就不在前台 ⇒ `WindowFromPoint` 返回**最顶层**的窗口（可能是浏览器）
+是**正常的**。UIA 走 `ElementFromHandle`，与 z-order **无关**。
+
+### 五、已验证的事实（别重复怀疑）
+
+- ✅ **UIA 调用链通**（自检 `uia_invoke_chain` + `uia_invoke_cross_process`，含**跨进程**）
+- ✅ **DPI 没问题**（产品设了 `PER_MONITOR_AWARE_V2` ⇒ `ClientToScreen` 返回物理坐标）
+- ✅ **UWP 不能注入假焦点**（`ApplicationFrameHost.exe` 是系统壳进程，实测**会崩**）
+  ⇒ 已加护栏，且**跳过后不再报**「未拿到假焦点…请放行 DLL」那条误导告警
+
+### 六、准星取点报「未找到目标窗口（按路径+类名）」
+
+**根因**：`FindWindowByIdentity` 原来用 `GetProcessPathFromPoint(窗口中心点)`
+—— 那是「**中心点上那个窗口**」的进程，不是「**这个窗口**」的进程：
+- 窗口被遮挡（实测：计算器被 Chrome 盖着）⇒ 拿到 `chrome.exe`
+- UWP 中心点上是内容窗 ⇒ 拿到 `CalculatorApp.exe`
+⇒ 都匹配不上 `ApplicationFrameHost.exe`。
+
+**修法**：改用 `GetProcessPathByHwnd`（`GetWindowThreadProcessId` +
+`OpenProcess(**PROCESS_QUERY_LIMITED_INFORMATION**)`）；**两级匹配**（完整路径 → 进程文件名）；
+**降级命中放最后**；标题作**优先条件**（不是硬门）。
+
+⚠ 失败时提示会带**扫描诊断**（`扫过 N 个可见顶层窗，类名匹配 M 个（它们的进程：…）`）
+⇒ 一眼区分「类名没匹配 / 路径不匹配 / 路径拿不到」。
+
 ## 推荐迭代循环（复制即用）
 
 ```text
