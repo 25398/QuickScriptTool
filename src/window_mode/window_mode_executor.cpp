@@ -1181,6 +1181,7 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
     hardwareFallback_ = false;
     // 每次运行重新告警一次：换了个脚本/重开一局之后，用户仍需要看到"为什么没反应"。
     backgroundNoFakeFocusWarned_ = false;
+    uwpSkippedFakeFocus_ = false;
     g_softKeyPacingOff = false;  // 每次运行重新尝试「软键屏障」等待
     SetLcaBackgroundMessageMode(false);
     active_ = true;
@@ -1460,6 +1461,7 @@ void WindowModeExecutor::TryInstallFakeFocus() {
     const bool fakeFocusNeeded = !uwpShell
         && (UsesFakeFocusForTarget(session_.Config(), top) || mapleStory);
     if (uwpShell) {
+        uwpSkippedFakeFocus_ = true;
         WindowModeLogEvent(
             L"[窗口/后台窗口模式] UWP 壳进程（ApplicationFrameHost）：**跳过假焦点注入**"
             L"（系统进程、影响面大且实测会崩；UWP 走 UIA Invoke 兜底，不依赖假焦点）");
@@ -1841,7 +1843,10 @@ bool WindowModeExecutor::PreferHardwareInput() const {
     //      从而放弃整个功能。
     if (UsesBackgroundWindow()) {
         if (FakeFocusActive()) return false;
-        if (!backgroundNoFakeFocusWarned_) {
+        // ⚠⚠ 2026-10-05：UWP 是**我们主动跳过**注入的（不是「没拿到」）
+        //   ⇒ 绝不能报下面那条「未拿到假焦点 / 请放行 DLL」的告警 ——
+        //   实测用户看到它就去折腾安全中心放行，而真正该做的是「UWP 走 UIA」。
+        if (!uwpSkippedFakeFocus_ && !backgroundNoFakeFocusWarned_) {
             backgroundNoFakeFocusWarned_ = true;
             WindowModeLog(
                 L"[窗口/后台窗口模式] ★ 后台模式未拿到假焦点：已按「真后台」处理 —— "

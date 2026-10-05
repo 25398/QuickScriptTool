@@ -299,6 +299,11 @@ private:
     ///   （它在热路径上被反复调用，不该要非 const 访问），而"告警一次"是**观测副作用**，
     ///   不改变输入决策本身 —— 与 `mutable std::mutex` 同一性质。
     mutable bool backgroundNoFakeFocusWarned_ = false;
+    /// ⚠ 2026-10-05：本会话是否**主动跳过**了 UWP 壳进程的假焦点注入。
+    /// 用途：让「★ 后台模式未拿到假焦点 …… 请放行 DLL」那条告警**不要**在
+    /// 「我们主动跳过」时误报 —— 用户看到「请放行 DLL」会去折腾安全中心，
+    /// 而 UWP 真正该走的是 **UIA Invoke**（不依赖假焦点）。
+    bool uwpSkippedFakeFocus_ = false;
 };
 
 }  // namespace windowmode
