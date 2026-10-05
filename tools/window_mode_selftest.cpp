@@ -2763,8 +2763,20 @@ void TestFakeFocusAirFocusOnly() {
     const BOOL updated = updateTarget(hwnd);
     HWND hooked = GetForegroundWindow();
     const LONG_PTR procAfter = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-    const int warpX = orig.x + 37;
-    const int warpY = orig.y + 19;
+    // ⚠⚠ 2026-10-05：原来固定 `+37/+19` —— 光标**恰好在屏幕右/下边缘**时，
+    //   目标点超出虚拟屏 ⇒ 被系统**钳制** ⇒ `after != want` ⇒ **误报失败**。
+    //   实测（光标停在 y=959 的屏幕底部）：`after=(1055,959) want=(1055,978) warpOk=0`
+    //   —— X 成功了、Y 没动，一眼就能看出不是「被吞」而是「钳制」。
+    //   ⇒ 改成**朝屏幕内部**偏移：先看虚拟屏范围，`+` 会超界就改用 `-`。
+    const int vsX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vsY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vsW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vsH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int dx = 37, dy = 19;
+    if (vsW > 0 && orig.x + dx >= vsX + vsW) dx = -37;
+    if (vsH > 0 && orig.y + dy >= vsY + vsH) dy = -19;
+    const int warpX = orig.x + dx;
+    const int warpY = orig.y + dy;
     SetCursorPos(warpX, warpY);
     POINT after{};
     GetCursorPos(&after);
@@ -2781,10 +2793,13 @@ void TestFakeFocusAirFocusOnly() {
     const bool procOk = procBefore == procAfter;
     const bool warpOk = std::abs(after.x - warpX) <= 2 && std::abs(after.y - warpY) <= 2;
     const bool ok = installed && updated && hooked == hwnd && procOk && warpOk && peekEmpty;
-    wchar_t detail[200]{};
-    swprintf_s(detail, L"install=%d update=%d fg=%d proc=%d warp=(%ld,%ld) peekOk=%d",
+    wchar_t detail[240]{};
+    // ⚠ 2026-10-05：原来只打 `after`，**没打期望值 warpX/warpY、也没打 warpOk**
+    //   ⇒ 失败时无法区分「SetCursorPos 被吞（after==orig）」和「移动失败（after 是别的值）」。
+    swprintf_s(detail, L"install=%d update=%d fg=%d proc=%d after=(%ld,%ld) want=(%d,%d) "
+        L"warpOk=%d orig=(%ld,%ld) peekOk=%d",
         installed ? 1 : 0, updated ? 1 : 0, hooked == hwnd ? 1 : 0, procOk ? 1 : 0,
-        after.x, after.y, peekEmpty ? 1 : 0);
+        after.x, after.y, warpX, warpY, warpOk ? 1 : 0, orig.x, orig.y, peekEmpty ? 1 : 0);
     Emit(L"fake_focus_air_focus_only", ok, ok ? L"" : detail);
 }
 
