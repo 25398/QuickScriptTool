@@ -265,6 +265,62 @@ bool TryUiaInvokeAtScreenPoint(HWND topLevel, int sx, int sy) {
         bestArea = area;
     }
     if (!best) {
+        // ⚠⚠ 2026-10-05：用户实测 UWP 计算器失败在这一步。**只知道「没有可 Invoke 的元素」
+        //   无法区分两种根因**，必须把现场打出来：
+        //     ① **坐标系不一致**（DPI 缩放 / 客户区原点算错）⇒ 该点根本不在任何元素里
+        //        ⇒ 「包含该点的元素数 = 0」
+        //     ② **控件不走 Invoke** ⇒ 点在元素里，但那个元素没有 Invoke/Toggle 模式
+        //        ⇒ 「包含该点的元素数 > 0」
+        //   另外打出**离该点最近的元素**的矩形与名字 —— 若是 ①，从偏移量能直接看出差多少。
+        int totalEls = 0, covering = 0, coveringInvokable = 0;
+        long long bestDist = -1;
+        RECT nearRc{};
+        std::wstring nearName;
+        for (int i = 0; i < count; ++i) {
+            ComPtr<IUIAutomationElement> el;
+            if (FAILED(arr->GetElement(i, &el)) || !el) continue;
+            RECT rc{};
+            if (FAILED(el->get_CurrentBoundingRectangle(&rc)) || rc.right <= rc.left
+                || rc.bottom <= rc.top) {
+                continue;
+            }
+            ++totalEls;
+            const bool covers = (sx >= rc.left && sx < rc.right && sy >= rc.top && sy < rc.bottom);
+            if (covers) {
+                ++covering;
+                if (UiaSupportsInvokeOrToggle(el.Get())) ++coveringInvokable;
+            }
+            // 到矩形中心的曼哈顿距离（只用于「最近的那个」诊断）
+            const long long dx = sx - (rc.left + rc.right) / 2;
+            const long long dy = sy - (rc.top + rc.bottom) / 2;
+            const long long d = dx * dx + dy * dy;
+            if (bestDist < 0 || d < bestDist) {
+                bestDist = d;
+                nearRc = rc;
+                BSTR nm = nullptr;
+                if (SUCCEEDED(el->get_CurrentName(&nm)) && nm) {
+                    nearName.assign(nm, SysStringLen(nm));
+                    SysFreeString(nm);
+                }
+            }
+        }
+        // 该点上「窗口管理器认为」是什么窗口 —— 判断点是否落在 UWP 的内容窗上
+        // （期望是 `Windows.UI.Core.CoreWindow`；若是别的，说明点被遮挡或坐标偏了）
+        wchar_t atCls[128]{};
+        POINT atPt{sx, sy};
+        HWND at = WindowFromPoint(atPt);
+        if (at) GetClassNameW(at, atCls, 128);
+        WindowModeLogEventf(
+            L"[窗口/后台窗口模式] ⚠ UIA 元素诊断：树内矩形元素=%d 包含该点的=%d "
+            L"其中可 Invoke/Toggle 的=%d | 最近元素矩形=(%ld,%ld)-(%ld,%ld) 名字=「%s」 "
+            L"| 查询点屏幕(%d,%d) 该点窗口类=%s ⇒ %s",
+            totalEls, covering, coveringInvokable,
+            nearRc.left, nearRc.top, nearRc.right, nearRc.bottom,
+            nearName.empty() ? L"(无)" : nearName.c_str(), sx, sy,
+            atCls[0] ? atCls : L"(null)",
+            covering == 0
+                ? L"该点**不在任何元素内** ⇒ 多半是**坐标系不一致**（DPI 缩放/客户区原点）"
+                : L"该点在元素内但没有 Invoke/Toggle 模式 ⇒ 该控件不走 Invoke");
         LogUiaFailOnce(
             L"该点下没有支持 Invoke/Toggle 的 UIA 元素（坐标不对？或该控件不走 UIA）",
             0, sx, sy);
