@@ -2825,6 +2825,16 @@ void WindowModeExecutor::PostMouseButtonAtClient(int cx, int cy, MouseButtonType
     // UWP/WinUI：PostMessage 不生效，走 UIA Invoke 兜底（与是否窗口相对录制无关；
     // WindowUsesUiaClickFallback 已排除 Win32/Unity，避免误抢前台）。
     // Down 成功调用 Invoke 后，配对 Up 直接跳过，避免重复触发。
+    // ⚠⚠ 2026-10-05：**必须在 UIA 分支之前**解析坐标 —— 动作坐标 `(0,0)` 是
+    //   「用**当前鼠标位置**」的特殊值，由 `ResolveClickClientPos` 换成真实客户区坐标。
+    //   原来 UIA 分支排在它**之前** ⇒ 拿到 `(0,0)` ⇒ `ClientToScreen` 得到
+    //   **客户区原点** ⇒ UIA 跑到窗口左上角找元素 ⇒ 「该点下没有可 Invoke 的元素」。
+    //   用户实测（UWP 计算器）：动作 `@0,0`，UIA 查询点 = 客户区原点 `(1678,428)`，
+    //   而正确值应是 `(1858,1023)`。
+    //   ⚠ 这条对**所有**走 UIA 的目标都成立（不只 UWP）：动作写 `(0,0)` 时，
+    //     非 UIA 路径会被 `ResolveClickClientPos` 修正，UIA 路径却漏了。
+    ResolveClickClientPos(cx, cy);
+
     if (!IsCdpInputMode() && down
         && WindowUsesUiaClickFallback(TopLevelTargetWindow(TargetHwnd()))) {
         if (TryUiaClickAtClient(cx, cy)) {
@@ -2836,7 +2846,6 @@ void WindowModeExecutor::PostMouseButtonAtClient(int cx, int cy, MouseButtonType
         uiaInvokePending_ = false;
         return;
     }
-    ResolveClickClientPos(cx, cy);
 
     std::wstring err;
     if (UsesCdpInput(session_.Config())) {
