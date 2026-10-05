@@ -304,6 +304,14 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
                 }
             }
         }
+        // ⚠⚠ 2026-10-05：把**窗口几何**也打出来 —— 这是验证「客户区 → 屏幕」换算
+        //   是否正确的**唯一直接证据**。用户实测反推的客户区原点是 `(1497, -171)`
+        //   （y 为负 ⇒ 窗口顶部在屏幕上方之外），这不像正常摆法 ⇒ 高度怀疑换算有偏。
+        RECT wr{}, cr{};
+        GetWindowRect(topLevel, &wr);
+        GetClientRect(topLevel, &cr);
+        POINT clientOrg{0, 0};
+        ClientToScreen(topLevel, &clientOrg);
         // 该点上「窗口管理器认为」是什么窗口 —— 判断点是否落在 UWP 的内容窗上
         // （期望是 `Windows.UI.Core.CoreWindow`；若是别的，说明点被遮挡或坐标偏了）
         wchar_t atCls[128]{};
@@ -313,13 +321,16 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         WindowModeLogEventf(
             L"[窗口/后台窗口模式] ⚠ UIA 元素诊断：树内矩形元素=%d 包含该点的=%d "
             L"其中可 Invoke/Toggle 的=%d | 最近元素矩形=(%ld,%ld)-(%ld,%ld) 名字=「%s」 "
-            L"| 查询点屏幕(%d,%d) 该点窗口类=%s ⇒ %s",
+            L"| 查询点屏幕(%d,%d) 该点窗口类=%s | 窗口矩形=(%ld,%ld)-(%ld,%ld) "
+            L"客户区尺寸=%ldx%ld 客户区原点(屏幕)=(%ld,%ld) ⇒ %s",
             totalEls, covering, coveringInvokable,
             nearRc.left, nearRc.top, nearRc.right, nearRc.bottom,
             nearName.empty() ? L"(无)" : nearName.c_str(), sx, sy,
             atCls[0] ? atCls : L"(null)",
+            wr.left, wr.top, wr.right, wr.bottom,
+            cr.right - cr.left, cr.bottom - cr.top, clientOrg.x, clientOrg.y,
             covering == 0
-                ? L"该点**不在任何元素内** ⇒ 多半是**坐标系不一致**（DPI 缩放/客户区原点）"
+                ? L"该点**不在任何元素内** ⇒ 多半是**坐标系不一致**（看上面窗口几何对不对）"
                 : L"该点在元素内但没有 Invoke/Toggle 模式 ⇒ 该控件不走 Invoke");
         LogUiaFailOnce(
             L"该点下没有支持 Invoke/Toggle 的 UIA 元素（坐标不对？或该控件不走 UIA）",
