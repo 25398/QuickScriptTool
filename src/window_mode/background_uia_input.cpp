@@ -7,6 +7,7 @@
 #include <oleacc.h>      // ⚠ 2026-10-06：MSAA 的 AccessibleObjectFromPoint（UIA 快路径的备选）
 #include <wrl/client.h>
 
+#include <mutex>         // ⚠ 2026-10-06：UIA 元素复用缓存的串行化
 #include <vector>
 
 #ifndef LSFW_LOCK
@@ -188,6 +189,75 @@ void LogUiaHitWrongWindowOnce(HWND got, HWND want) {
         L"目标是 0x%p）⇒ 丢弃、走回退（**后台模式下目标被遮挡时快路径天然不适用**，"
         L"不是失败、也换不了 API）",
         reinterpret_cast<void*>(got), reinterpret_cast<void*>(want));
+}
+
+/// ⚠ 前置声明：`UiaInvokeOrToggle` 定义在本文件靠后处，而复用缓存（下面）要用它。
+bool UiaInvokeOrToggle(IUIAutomationElement* element);
+
+/// ⚠ 2026-10-06：**同位置复用缓存** —— 重复点击同一位置时不用再跑一遍 `FindAll`。
+///
+/// 为什么值得做：用户的动作是 `鼠标点击左键@0,0[**重复1次**间隔0.010]` ⇒ **点两下**，
+/// 而**每一下**都要 `FindAll`（实测 **78ms**）⇒ 一次动作白付 **156ms**。
+/// 两下之间只隔 **10ms**，界面不可能变 ⇒ **第二下完全可以复用第一下找到的元素**。
+///
+/// ⚠ 失效条件（三者都要满足才复用，任一不满足就走完整路径）：
+///   同一目标窗口 + **同一坐标** + 距上次 **< 500ms**。
+/// ⚠ 复用失败（元素已失效，如界面在间隔内变了）⇒ **清缓存、走完整路径**，不吞错。
+/// ⚠ 用 `mutex` 保护：`TryUiaInvokeAtScreenPoint` 可能在**不同线程**被调
+///   （软输入线程 / 定时器），`ComPtr` 跨线程共享必须串行化。
+struct UiaElemCache {
+    HWND top = nullptr;
+    int x = 0;
+    int y = 0;
+    DWORD tick = 0;
+    Microsoft::WRL::ComPtr<IUIAutomationElement> el;
+};
+UiaElemCache g_uiaElemCache;
+std::mutex g_uiaElemCacheMtx;
+
+void LogUiaCacheHitOnce() {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEvent(
+        L"[窗口/后台窗口模式] UIA 复用缓存命中（同窗口同坐标 <500ms）⇒ 跳过 FindAll");
+}
+
+/// 清缓存（复用失败 / 换窗口时调）。
+void ClearUiaElemCache() {
+    std::lock_guard<std::mutex> lk(g_uiaElemCacheMtx);
+    g_uiaElemCache.el.Reset();
+    g_uiaElemCache.top = nullptr;
+}
+
+/// 存缓存（成功 Invoke 之后调）。
+void StoreUiaElemCache(HWND top, int x, int y, IUIAutomationElement* el) {
+    std::lock_guard<std::mutex> lk(g_uiaElemCacheMtx);
+    g_uiaElemCache.top = top;
+    g_uiaElemCache.x = x;
+    g_uiaElemCache.y = y;
+    g_uiaElemCache.tick = GetTickCount();
+    g_uiaElemCache.el = el;
+}
+
+/// 试着用缓存直接 Invoke。成功返回 true。
+bool TryInvokeFromCache(HWND top, int x, int y) {
+    Microsoft::WRL::ComPtr<IUIAutomationElement> el;
+    {
+        std::lock_guard<std::mutex> lk(g_uiaElemCacheMtx);
+        if (!g_uiaElemCache.el || g_uiaElemCache.top != top
+            || g_uiaElemCache.x != x || g_uiaElemCache.y != y) {
+            return false;
+        }
+        if (GetTickCount() - g_uiaElemCache.tick >= 500) return false;   // TTL
+        el = g_uiaElemCache.el;
+    }
+    if (UiaInvokeOrToggle(el.Get())) {
+        LogUiaCacheHitOnce();
+        return true;
+    }
+    ClearUiaElemCache();   // 元素已失效 ⇒ 清掉，别反复用坏的
+    return false;
 }
 
 enum class UiaPath { Fast, Fallback };
@@ -433,6 +503,13 @@ bool UiaSupportsInvokeOrToggle(IUIAutomationElement* element) {
 bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     // ⚠ 2026-10-06：分段计时用（见 LogUiaTimingOnce）。只用于回退路径的诊断。
     const DWORD uiaT0 = GetTickCount();
+    // ⚠⚠ 2026-10-06：**先试复用缓存** —— 用户的「重复点击」动作（`@0,0[重复1次间隔0.010]`）
+    //   会连点两下，而每下都要 `FindAll`（实测 78ms）⇒ 白付 156ms。
+    //   两下间隔只 10ms ⇒ 界面不可能变 ⇒ 直接复用第一下找到的元素。
+    //   ⚠ 命中即返回；未命中（不同窗口/坐标/超 500ms）继续走完整路径，**行为不退化**。
+    if (topLevel && TryInvokeFromCache(topLevel, sx, sy)) {
+        return true;
+    }
     if (!topLevel || !IsWindow(topLevel)) return false;
     EnsureThreadComApartment();
 
@@ -581,7 +658,11 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         // ⚠ 2026-10-06：记一行**限流的**路径标记 —— 否则跑完日志里分不清
         //   到底走了快路径还是回退路径，而「性能没改善」时这正是第一个要回答的问题。
         LogUiaPathOnce(UiaPath::Fast);
-        return UiaInvokeOrToggle(best.Get());
+        if (UiaInvokeOrToggle(best.Get())) {
+            StoreUiaElemCache(topLevel, sx, sy, best.Get());   // 供「重复点击」复用
+            return true;
+        }
+        return false;
     }
     LogUiaPathOnce(UiaPath::Fallback, hitHrForLog, msaaForLog);
 
@@ -819,7 +900,11 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
 
     // 扫描仅检查模式支持；末尾只对「最终最佳」执行一次 Invoke。
     LogUiaTimingOnce(uiaT1 - uiaT0, GetTickCount() - uiaT1, count);
-    return UiaInvokeOrToggle(best.Get());
+    if (UiaInvokeOrToggle(best.Get())) {
+        StoreUiaElemCache(topLevel, sx, sy, best.Get());   // 供「重复点击」复用
+        return true;
+    }
+    return false;
 }
 
 /// UWP 的**内容窗**句柄（`Windows.UI.Core.CoreWindow` / `InputSite`）。
