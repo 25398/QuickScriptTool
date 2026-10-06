@@ -1450,8 +1450,14 @@ void WindowModeExecutor::TryInstallFakeFocus() {
     //     （setwindowshook 未装入 → classic 失败 → 才勉强成功）。
     //   ★ 为什么**不影响功能**：UWP/WinUI 的 `PostMessage` 本来就无效，它走
     //     `background_uia_input` 的 **UIA Invoke** 兜底，**不依赖假焦点**。
-    //   ⇒ 只把 `fakeFocusNeeded` 置否：变速仍会走「仅时钟补丁」（那条只改时钟函数，
-    //     不装任何假焦点钩），键鼠路径一字节不变。
+    //   ⇒ **禁止一切注入**（不只假焦点钩，**连时钟补丁也不行**）。
+    //   ⚠⚠ 2026-10-06 更正：这里原来写的是「变速仍会走『仅时钟补丁』（那条只改时钟
+    //     函数，不装任何假焦点钩）」—— **这个认知是错的**。用户实测：
+    //     「时钟补丁」虽然不装假焦点钩，但**同样是把 DLL 塞进壳进程**（走 setwindowshook）
+    //     ⇒ 注入后目标**自己退出**（日志 `目标窗口已消失 … exit=0x00000000`），
+    //       紧接着下一轮注入报 `VirtualAllocEx 失败: Win32=5（目标已退出）`。
+    //   ⇒ 代价（刻意权衡）：**UWP 目标不再支持窗口变速** —— 变速是可选增强，
+    //     把目标带走是硬故障；而且壳进程是**共享**的，带走它会影响**所有** UWP 应用。
     const bool uwpShell = LooksLikeUwpShellWindowClass(cls)
         || LooksLikeUwpShellWindowClass(session_.Config().windowClassName)
         || LooksLikeUwpShellWindowClass(session_.Config().childWindowClassName)
