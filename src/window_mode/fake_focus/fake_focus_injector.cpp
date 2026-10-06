@@ -360,6 +360,40 @@ bool FakeFocusInjector::InjectOne(DWORD pid, HWND targetTop, const std::wstring&
         return false;
     }
 
+    // ⚠⚠⚠ 2026-10-06：**同一份 DLL 已在目标进程里 ⇒ 直接复用，不再注入**。
+    //
+    //   为什么必须在**注入前**就拦：嵌套「后台窗口模式」（外层宏 + 内层「运行录制回放」
+    //   都选后台模式）会在**同一个进程**里再走一次 `InjectOne`。此时：
+    //   · `setwindowshook` 靠「钩子把 DLL 带进去」，而 DLL **已经在**了 ⇒ **必然失败**
+    //     （而且 `SetWindowsHookEx` 本身**成功**、DLL 没进 ⇒ **hook 句柄残留**，
+     //       user32 会钉住 DLL ⇒ 卸载时归不了零 ⇒ **文件锁**）
+    //   · 失败后降级 `classic(CreateRemoteThread)` ⇒ **在已有钩子的进程里再注入**
+     //     （IAT 覆盖两次、DI 方法体 JMP 叠加）⇒ **实测把目标打崩**
+     //     （用户报障：`CreateRemoteThread 期间目标进程已退出`）
+    //
+    //   ⇒ 有同一份模块就**不注入**，让上层回退 LCA 窗口消息。
+    //   ⚠ 代价必须说清：这一轮**不会重新 Install**，假焦点沿用**外层已装好的**实例
+    //     （同进程同 DLL，本来就是同一个实例）。若外层也只是「仅时钟补丁」，
+    //     那内层同样没有假焦点 —— 与外层保持一致，不会更差。
+    //   ⚠ 与下面（`Attach` 里 §11 那段）的分工：那里管「不同文件 ⇒ 硬阻断」，
+    //     这里管「同一份 ⇒ 也别重复注入」，两处都要有。
+    {
+        std::wstring stalePath;
+        if (TargetHasStaleFakeFocusModule(pid, stalePath)) {
+            const bool sameFile = _wcsicmp(stalePath.c_str(), path.c_str()) == 0;
+            if (sameFile) {
+                WindowModeLogEventf(
+                    L"[窗口/后台窗口模式] ⚠ 目标进程 pid=%lu 已有同一份 FakeFocus（%s）"
+                    L"⇒ 复用已装实例，**不再注入**（重复注入会双重挂钩把目标打崩；"
+                    L"嵌套运行/重复 BeginRun 的常见形态）",
+                    static_cast<unsigned long>(pid), stalePath.c_str());
+                err = L"目标进程已有同一份 FakeFocus，复用已装实例（不再重复注入）";
+                CloseHandle(t.process);
+                return false;
+            }
+        }
+    }
+
     inject::InjectOptions opts;
     opts.hideModule = hideModule_;
     opts.targetTop = targetTop;
