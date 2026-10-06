@@ -39,6 +39,28 @@ void LogUiaFailOnce(const wchar_t* stage, long hr, int sx, int sy) {
 /// ⚠ **两种路径分别限流** —— 否则首次走了快路径之后，后面偶尔回退就再也看不到，
 ///   而「**有时快有时慢**」正是最难查的形态。
 /// ⚠ 用 `Event`（落盘）—— 用户导出的诊断里要能看到。
+/// ⚠ 2026-10-06：**快路径为什么没命中** —— 记下 `ElementFromPoint` 的失败 hr（限流一次）。
+/// 实测 UWP 计算器上快路径**未命中**，但「未命中」本身分不清根因：
+///   · `E_ACCESSDENIED`(0x80070005) / `UIA_E_ELEMENTNOTAVAILABLE`(0x80040201)
+///     ⇒ **AppContainer 拦截**（业界同类工具 pywinauto 就是栽在这条：
+///       「依赖 ElementFromPoint()，在 AppContainer 进程中因 UIAccess=FALSE 被系统拦截」）
+///   · `E_INVALIDARG` / `E_FAIL` ⇒ 参数或实现问题
+///   · `S_OK` 但元素为空 ⇒ 该点确实没有元素
+/// ⇒ 三者修法完全不同（拦截要换 API，参数问题要改调用）⇒ **必须能区分**。
+void LogUiaHitOnce(HRESULT hr) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    const wchar_t* guess = L"未知";
+    if (hr == static_cast<HRESULT>(0x80070005L)) guess = L"E_ACCESSDENIED ⇒ 像是被 AppContainer 拦截";
+    else if (hr == UIA_E_ELEMENTNOTAVAILABLE) guess = L"UIA_E_ELEMENTNOTAVAILABLE ⇒ 元素已移除（可重试）";
+    else if (hr == static_cast<HRESULT>(0x80070057L)) guess = L"E_INVALIDARG ⇒ 参数问题";
+    else if (SUCCEEDED(hr)) guess = L"S_OK 但元素为空 ⇒ 该点确实没有元素";
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] UIA 快路径未命中原因：ElementFromPoint hr=0x%08lX（%s）",
+        static_cast<unsigned long>(hr), guess);
+}
+
 enum class UiaPath { Fast, Fallback };
 void LogUiaPathOnce(UiaPath p) {
     static bool fastLogged = false;
@@ -272,6 +294,17 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
             hit.Reset();
             if (hrHit == UIA_E_ELEMENTNOTAVAILABLE) Sleep(20);   // 只在「元素已移除」时短暂等
             else break;                                          // 其它错误不必重试
+        }
+        // ⚠⚠ 2026-10-06：**记下 `ElementFromPoint` 的失败 hr** —— 这是判断
+        //   「快路径为什么没命中」的唯一依据。实测（UWP 计算器）快路径**未命中**，
+        //   但光知道「未命中」分不清是：
+        //     · `E_ACCESSDENIED` / `UIA_E_ELEMENTNOTAVAILABLE` ⇒ AppContainer 拦截
+        //       （业界同类工具 pywinauto 就是栽在这条，`UIAccess=FALSE` 被系统拦）
+        //     · `E_INVALIDARG` / `E_FAIL` ⇒ 参数或实现问题
+        //     · `S_OK` 但 `hit` 为空 ⇒ 该点确实没有元素
+        //   ⇒ 三者的修法完全不同（拦截要换 API，参数问题要改调用）。
+        if (!(SUCCEEDED(hrHit) && hit)) {
+            LogUiaHitOnce(hrHit);
         }
         if (SUCCEEDED(hrHit) && hit) {
             ComPtr<IUIAutomationTreeWalker> walker;
