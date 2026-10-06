@@ -242,7 +242,19 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     {
         ComPtr<IUIAutomationElement> hit;
         POINT hitPt{sx, sy};
-        if (SUCCEEDED(uia->ElementFromPoint(hitPt, &hit)) && hit) {
+        // ⚠⚠ 2026-10-06：`ElementFromPoint` **官方文档明确说**
+        //   「返回 `UIA_E_ELEMENTNOTAVAILABLE`，前提是该点下的元素在方法返回时已被移除；
+        //     客户端应该优雅地处理这个错误，例如**再次尝试调用**」
+        //   ⇒ 所以这里**重试一次**（UWP 的界面更新频繁，元素随时可能被重建）。
+        HRESULT hrHit = E_FAIL;
+        for (int attempt = 0; attempt < 2 && !hit; ++attempt) {
+            hrHit = uia->ElementFromPoint(hitPt, &hit);
+            if (SUCCEEDED(hrHit) && hit) break;
+            hit.Reset();
+            if (hrHit == UIA_E_ELEMENTNOTAVAILABLE) Sleep(20);   // 只在「元素已移除」时短暂等
+            else break;                                          // 其它错误不必重试
+        }
+        if (SUCCEEDED(hrHit) && hit) {
             ComPtr<IUIAutomationTreeWalker> walker;
             if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
                 ComPtr<IUIAutomationElement> cur = hit;

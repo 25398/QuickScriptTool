@@ -576,10 +576,21 @@
 //        再沿**父链**（`get_ControlViewWalker`）向上找可 Invoke/Toggle 的（通常 3~5 层）
 //        ⇒ 调用数 ~49 → ~5；**命中就完全不遍历全树**。
 //        ⚠ 父链设上限 16 层（防 Walker 返回环这类异常实现把这里挂死）。
+//        ⚠⚠ **官方文档**：`ElementFromPoint` 在「该点下的元素已被移除」时返回
+//           `UIA_E_ELEMENTNOTAVAILABLE`，**客户端应当重试** ⇒ 已加**一次重试**
+//           （只在 `UIA_E_ELEMENTNOTAVAILABLE` 时等 20ms 重试，其它错误不重试）。
+//        ⚠⚠⚠ **已知风险**：`ElementFromPoint` 在 **AppContainer（UWP）** 进程上
+//           **可能因 `UIAccess=FALSE` 被系统拦截**（业界同类工具 pywinauto 的
+//           uia backend 就是栽在这一条）⇒ **UWP 目标上快路径可能不命中**，
+//           会落到下面的回退路径。⚠ **所以回退路径的优化同样必要，不是冗余**。
 //     ② **回退路径 `FindAllBuildCache`** —— 快路径没命中时才走；
 //        用 `IUIAutomationCacheRequest` 把 `BoundingRectangle`/`Name` **随查找一并取回**，
 //        后续走 `get_CachedBoundingRectangle`（**本地读**，不跨进程）。
 //        ⚠ 部分提供程序不支持缓存请求 ⇒ `useCache` 标志 + **失败回退**逐个取。
+//
+//     ⚠ **可观测性**：`UIA 路径：快路径 … 命中` / `… 回退全树遍历` ——
+//       **两种路径分别限流**（否则首次走了快路径后，后面偶尔回退就再也看不到，
+//       而「有时快有时慢」正是最难查的形态）。用 `Event` 落盘。
 //
 //     ⚠ **刻意没做**的两个「看似合理」的优化：
 //       · **短 TTL 缓存 UIA 树** —— 点完界面就变，缓存有**失效风险**（会点错元素）；
