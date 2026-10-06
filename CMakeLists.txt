@@ -103,6 +103,13 @@ target_link_libraries(window_mode_core PUBLIC
     ole32
     oleaut32
     UIAutomationCore
+    # ⚠⚠ 2026-10-06：`oleacc` 必须挂在 **PUBLIC** 上（而不是只挂产品 + 某个自检）。
+    #   原因：`background_uia_input.cpp`（MSAA 的 `AccessibleObjectFromPoint`）属于
+    #   `window_mode_core`，而**任何**链接它的目标都会带上那个 obj ⇒ 都需要 oleacc。
+    #   我先只在 `QST_COMMON_LINK_LIBS` 和 `WindowModeSelfTest` 各加了一处，
+    #   结果 **CI 在 `InjectionSelfTest` 上炸了 LNK2019**（本机不编那个目标，看不见）。
+    #   ⇒ 挂在 PUBLIC 上，依赖者自动继承，**不会再漏第四个目标**。
+    oleacc
     urlmon
     d3d11
     dxgi
