@@ -1519,6 +1519,22 @@ void WindowModeExecutor::TryInstallFakeFocus() {
                 L"（方向键/DirectInput 类目标会表现为「能平A、不能走」）", cls);
         }
         if (!timeScaleWanted) return;
+        // ⚠⚠⚠ 2026-10-06：**UWP 壳进程连时钟补丁也不注入** ——
+        //   用户实测（嵌套「后台窗口模式」）：注入到 `ApplicationFrameHost.exe` 后，
+        //   目标**自己退出**（日志 `目标窗口已消失 … exit=0x00000000`），
+        //   紧接着下一轮注入报 `VirtualAllocEx 失败: Win32=5（目标已退出）`。
+        //   ⇒ 「时钟补丁」虽然**不装假焦点钩**，但**同样是把 DLL 塞进壳进程**
+        //     （走 `setwindowshook`）—— 对 `ApplicationFrameHost.exe` 这种
+        //     **系统壳进程**一样危险（它托管着**所有** UWP 应用）。
+        //   ⇒ 明确告知「UWP 目标不支持窗口变速」，而不是偷偷注入把目标带走。
+        if (LooksLikeUwpShellWindowClass(cls)
+            || LooksLikeUwpShellExecutable(cfg.targetExePath)) {
+            WindowModeLogEvent(
+                L"[窗口/后台窗口模式] ⛔ UWP 壳进程：**连时钟补丁也不注入**"
+                L"（往 ApplicationFrameHost.exe 里塞 DLL 会把目标带走；"
+                L"UWP 目标不支持窗口变速，键鼠走 UIA/PostMessage）");
+            return;
+        }
         WindowModeLogEvent(
             L"[窗口/后台窗口模式] 该目标不需要假焦点，但开着窗口变速 → 仅注入时钟补丁");
     }
