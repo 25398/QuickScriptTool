@@ -249,9 +249,37 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         LogUiaFailOnce(L"CreateTrueCondition", 0, sx, sy);
         return false;
     }
-    const HRESULT hrFind = root->FindAll(TreeScope_Descendants, allCond.Get(), &arr);
+    // ⚠⚠ 2026-10-06 性能：用 **`FindAllBuildCache`** 一次把 `BoundingRectangle` / `Name`
+    //   **随查找批量取回**，而不是 `FindAll` 之后再逐个 `get_CurrentBoundingRectangle`
+    //   —— 后者是 **N 次跨进程调用**（UWP 计算器 49 个元素 ⇒ 累计 100ms+）。
+    //   缓存请求下走 `get_CachedBoundingRectangle`（**本地读**，不跨进程）。
+    //   ⚠ 部分 UIA 提供程序不支持缓存请求 ⇒ **失败就回退**原来的逐个取（`useCache=false`）。
+    ComPtr<IUIAutomationCacheRequest> cacheReq;
+    if (SUCCEEDED(uia->CreateCacheRequest(&cacheReq)) && cacheReq) {
+        cacheReq->AddProperty(UIA_BoundingRectanglePropertyId);
+        cacheReq->AddProperty(UIA_NamePropertyId);
+        cacheReq->put_AutomationElementMode(AutomationElementMode_Full);
+    } else {
+        cacheReq.Reset();
+    }
+    bool useCache = false;
+    // 统一入口：优先 BuildCache，不支持则回退普通 FindAll。⚠ 两者都失败才返回 false。
+    auto findAllInto = [&](TreeScope scope) -> bool {
+        arr.Reset();
+        useCache = false;
+        if (cacheReq) {
+            if (SUCCEEDED(root->FindAllBuildCache(scope, allCond.Get(), cacheReq.Get(), &arr))
+                && arr) {
+                useCache = true;
+                return true;
+            }
+            arr.Reset();
+        }
+        return SUCCEEDED(root->FindAll(scope, allCond.Get(), &arr)) && arr != nullptr;
+    };
+    bool found = findAllInto(TreeScope_Descendants);
     int count = 0;
-    if (SUCCEEDED(hrFind) && arr) arr->get_Length(&count);
+    if (found && FAILED(arr->get_Length(&count))) count = 0;
     // ⚠⚠ UWP 的 UIA 树是**按需构建**的（跨进程 + 元素虚拟化）⇒ 首次 `FindAll` 常返回
     //   0 个元素，紧接着再查就有了。用户报「UWP 计算器点击没反应」时，日志显示
     //   UIA 兜底**确实被调用但失败了** —— 这是最可能的原因之一。
@@ -262,14 +290,12 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     if (count <= 0) {
         for (int attempt = 0; attempt < 3 && count <= 0; ++attempt) {
             Sleep(60);
-            arr.Reset();
-            if (FAILED(root->FindAll(TreeScope_Descendants, allCond.Get(), &arr)) || !arr) break;
+            if (!findAllInto(TreeScope_Descendants)) break;
             if (FAILED(arr->get_Length(&count))) count = 0;
         }
     }
     if (count <= 0) {
-        arr.Reset();
-        if (SUCCEEDED(root->FindAll(TreeScope_Children, allCond.Get(), &arr)) && arr) {
+        if (findAllInto(TreeScope_Children)) {
             if (FAILED(arr->get_Length(&count))) count = 0;
         }
     }
@@ -285,8 +311,11 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         ComPtr<IUIAutomationElement> el;
         if (FAILED(arr->GetElement(i, &el)) || !el) continue;
         RECT rc{};
-        if (FAILED(el->get_CurrentBoundingRectangle(&rc)) || rc.right <= rc.left
-            || rc.bottom <= rc.top) {
+        // ⚠ 缓存路径下 `get_CachedBoundingRectangle` 是**本地读**（属性随 FindAllBuildCache
+        //   一并取回）；非缓存路径才走跨进程的 `get_CurrentBoundingRectangle`。
+        const HRESULT hrRc = useCache ? el->get_CachedBoundingRectangle(&rc)
+                                      : el->get_CurrentBoundingRectangle(&rc);
+        if (FAILED(hrRc) || rc.right <= rc.left || rc.bottom <= rc.top) {
             continue;
         }
         if (sx < rc.left || sx >= rc.right || sy < rc.top || sy >= rc.bottom) continue;
