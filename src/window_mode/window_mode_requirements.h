@@ -572,21 +572,31 @@
 //     ⇒ **跨进程调用次数**才是性能杀手，不是元素多少。
 //
 //     **两道优化**（`background_uia_input.cpp` 的 `TryUiaInvokeAtScreenPointOn`）：
+//     ⚠⚠⚠ **先看结论（2026-10-06 实测终结）**：`ElementFromPoint` **不认目标窗口** ——
+//       它返回的是「**该点 z-order 最顶层的窗口**」的元素。用户实测（后台模式，计算器被
+//       编辑器盖着）拿到的是**编辑器的**元素（`class=Chrome_RenderWidgetHostHWND
+//       name=「WorkBuddy」`）。
+//       ⇒ **后台模式 + 目标被遮挡 ⇒ 快路径必然拿错窗口**（不是权限问题，也换不了 API）。
+//       ⇒ 所以下面 ① 加了**归属校验**（元素所属顶层窗口 != 目标 ⇒ 丢弃走回退）；
+//         而 **`FindAll` 的 63~78ms 是这类场景的固有成本**（② 已让遍历段降到 0ms）。
 //     ① **快路径 `ElementFromPoint`** —— 一次调用拿到该点**最深**的元素，
-//        再沿**父链**（`get_ControlViewWalker`）向上找可 Invoke/Toggle 的（通常 3~5 层）
+//        再沿**父链**向上找可 Invoke/Toggle 的（通常 3~5 层）
 //        ⇒ 调用数 ~49 → ~5；**命中就完全不遍历全树**。
-//        ⚠ 父链设上限 16 层（防 Walker 返回环这类异常实现把这里挂死）。
+//        ⚠ **归属校验**（必须）：沿 `RawView` 父链找第一个带 `NativeWindowHandle` 的元素
+//          与目标 `topLevel` 比较，不同则丢弃 —— 否则会去 Invoke **别的窗口**的元素。
+//        ⚠ 父链设上限 16 层（防 Walker 返回环这类异常实现把这里挂死）；
+//          依次试 `ControlView` → `RawView`（`ControlView` 会跳过「非控件」元素，
+//          UWP 的 XAML 树常有这类中间层 ⇒ 父链可能断）。
 //        ⚠⚠ **官方文档**：`ElementFromPoint` 在「该点下的元素已被移除」时返回
-//           `UIA_E_ELEMENTNOTAVAILABLE`，**客户端应当重试** ⇒ 已加**一次重试**
-//           （只在 `UIA_E_ELEMENTNOTAVAILABLE` 时等 20ms 重试，其它错误不重试）。
-//        ⚠⚠⚠ **已知风险**：`ElementFromPoint` 在 **AppContainer（UWP）** 进程上
-//           **可能因 `UIAccess=FALSE` 被系统拦截**（业界同类工具 pywinauto 的
-//           uia backend 就是栽在这一条）⇒ **UWP 目标上快路径可能不命中**，
-//           会落到下面的回退路径。⚠ **所以回退路径的优化同样必要，不是冗余**。
+//           `UIA_E_ELEMENTNOTAVAILABLE`，**客户端应当重试** ⇒ 已加一次重试。
+//        ⚠ **别再走这些弯路**（都试过、都不是根因）：AppContainer 拦截
+//          （hr 是 S_OK 不是 E_ACCESSDENIED）/ MSAA 备选 / 属性判据 / 多 Walker。
+//          改动本身无害、对前台场景仍有价值，**保留**，但别以为它们是根因。
 //     ② **回退路径 `FindAllBuildCache`** —— 快路径没命中时才走；
 //        用 `IUIAutomationCacheRequest` 把 `BoundingRectangle`/`Name` **随查找一并取回**，
 //        后续走 `get_CachedBoundingRectangle`（**本地读**，不跨进程）。
 //        ⚠ 部分提供程序不支持缓存请求 ⇒ `useCache` 标志 + **失败回退**逐个取。
+//        ★ 实测「**遍历=0ms**」证明它生效。
 //     ③ **「先窄后宽」**（2026-10-06 实测后加）—— 用户实测回退路径里
 //        **`FindAll` 独占 62ms、遍历=0ms**（说明 ② 生效：矩形确实是本地读）
 //        ⇒ 62ms 全在「跨进程枚举整棵树」上。而**真正可能被点的只有可点击类控件**
