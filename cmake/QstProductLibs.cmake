@@ -125,6 +125,9 @@ set(QST_COMMON_LINK_LIBS
     ${OpenCV_LIBS}
     user32 gdi32 gdiplus dwmapi d2d1 dwrite comdlg32 shell32 comctl32 imm32 msimg32
     uxtheme ole32 oleaut32 propsys UIAutomationCore urlmon winhttp crypt32
+    # ⚠ 2026-10-06：oleacc 用于 MSAA 的 AccessibleObjectFromPoint —— UIA 的
+    #   ElementFromPoint 在 AppContainer（UWP）上可能被拦截，MSAA 是备选定位路径。
+    oleacc
     d3d11 dxgi windowsapp winmm
 )
 

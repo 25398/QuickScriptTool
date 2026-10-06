@@ -370,6 +370,11 @@ qst_add_selftest(WindowModeSelfTest
         script_core_common
         ${OpenCV_LIBS}
         user32 gdi32 dwmapi shell32 ole32 oleaut32 UIAutomationCore urlmon d3d11 dxgi windowsapp
+        # ⚠ 2026-10-06：oleacc 用于 MSAA 的 AccessibleObjectFromPoint
+        #   （`background_uia_input.cpp` 的 TryHitTestViaMsaa）。
+        #   ⚠ 自检**不用** QST_COMMON_LINK_LIBS，所以这里必须单独列 ——
+        #     漏了就是 LNK2019（已踩一次）。
+        oleacc
 )
 add_dependencies(WindowModeSelfTest FakeFocus)
 if(TARGET FakeFocus32)

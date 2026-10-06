@@ -4,6 +4,7 @@
 #include "window_mode_log.h"
 
 #include <UIAutomation.h>
+#include <oleacc.h>      // ⚠ 2026-10-06：MSAA 的 AccessibleObjectFromPoint（UIA 快路径的备选）
 #include <wrl/client.h>
 
 #include <vector>
@@ -61,7 +62,50 @@ void LogUiaHitOnce(HRESULT hr) {
         static_cast<unsigned long>(hr), guess);
 }
 
+/// ⚠⚠ 2026-10-06：**MSAA 备选定位** —— 用 `AccessibleObjectFromPoint` 拿该点的元素，
+/// 再经 `ElementFromIAccessible` 转成 UIA 元素。
+///
+/// 为什么要有这条：实测 UWP 计算器上 **UIA 的 `ElementFromPoint` 未命中**
+/// （业界同类工具 pywinauto 的 `uia` backend 就是栽在「`ElementFromPoint()` 在
+/// AppContainer 进程中因 `UIAccess=FALSE` 被系统拦截」这一条）。
+/// **MSAA 是一条独立于 UIA AppContainer 支持的路径**（老 API，走 OLEACC 的
+/// 桥接层）⇒ 值得一试；**失败就返回 false**，不影响后面的全树遍历回退。
+///
+/// ⚠ `varChild` 必须 `VariantClear` —— 它可能带 BSTR/接口，不释放会泄漏。
+bool TryHitTestViaMsaa(IUIAutomation* uia, int sx, int sy,
+    Microsoft::WRL::ComPtr<IUIAutomationElement>& out) {
+    if (!uia) return false;
+    POINT pt{sx, sy};
+    VARIANT varChild{};
+    IAccessible* pacc = nullptr;
+    const HRESULT hrAcc = AccessibleObjectFromPoint(pt, &pacc, &varChild);
+    if (FAILED(hrAcc) || !pacc) {
+        VariantClear(&varChild);
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IAccessible> acc;
+    acc.Attach(pacc);   // 接管引用计数（AccessibleObjectFromPoint 已 AddRef）
+    const long childId = (varChild.vt == VT_I4) ? varChild.lVal : 0;
+    VariantClear(&varChild);
+    Microsoft::WRL::ComPtr<IUIAutomationElement> el;
+    const HRESULT hrEl = uia->ElementFromIAccessible(acc.Get(), childId, &el);
+    if (FAILED(hrEl) || !el) return false;
+    out = el;
+    return true;
+}
+
 enum class UiaPath { Fast, Fallback };
+
+/// ⚠ 2026-10-06：**MSAA 备选路径是否奏效**（限流一次）—— 用来确认
+/// 「MSAA 能否绕过 UIA 在 AppContainer 上的限制」这个假设。
+void LogUiaMsaaOnce(bool ok) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEventf(
+        ok ? L"[窗口/后台窗口模式] UIA 快路径备选：**MSAA 命中**（ElementFromPoint 被拦但 MSAA 可用）"
+           : L"[窗口/后台窗口模式] UIA 快路径备选：MSAA 也没拿到 ⇒ 只能走全树遍历");
+}
 void LogUiaPathOnce(UiaPath p) {
     static bool fastLogged = false;
     static bool fallbackLogged = false;
@@ -305,6 +349,15 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         //   ⇒ 三者的修法完全不同（拦截要换 API，参数问题要改调用）。
         if (!(SUCCEEDED(hrHit) && hit)) {
             LogUiaHitOnce(hrHit);
+            // ⚠⚠ UIA 的 ElementFromPoint 没拿到 ⇒ **再试 MSAA**（独立路径，
+            //   不依赖 UIA 的 AppContainer 支持）。拿到就同样沿父链找可 Invoke 的。
+            Microsoft::WRL::ComPtr<IUIAutomationElement> msaaHit;
+            if (TryHitTestViaMsaa(uia.Get(), sx, sy, msaaHit) && msaaHit) {
+                LogUiaMsaaOnce(true);
+                hit = msaaHit;
+            } else {
+                LogUiaMsaaOnce(false);
+            }
         }
         if (SUCCEEDED(hrHit) && hit) {
             ComPtr<IUIAutomationTreeWalker> walker;
