@@ -341,6 +341,31 @@ bool UiaInvokeOrToggle(IUIAutomationElement* element) {
 
 bool UiaSupportsInvokeOrToggle(IUIAutomationElement* element) {
     if (!element) return false;
+    // ⚠⚠ 2026-10-06：**先查「模式可用」属性**，再试 `GetCurrentPatternAs`。
+    //
+    //   为什么加这一层：用户实测「`ElementFromPoint` 拿到了元素、但父链上没找到可
+    //   Invoke/Toggle 的」。而 `GetCurrentPatternAs` 是**跨进程调用**，
+    //   对 **UWP 的虚拟化/异步元素**可能返回 `UIA_E_ELEMENTNOTAVAILABLE`
+    //   （元素在查询瞬间还没实体化）⇒ 明明可点却被判成「不可点」。
+    //   而 `IsXxxPatternAvailable` 是**基础属性**，拿到的概率高得多、也更便宜。
+    //   ⚠ 两者是**或**关系：属性说可用就可用；属性拿不到再退回模式查询 ——
+    //     不会因为新判据而漏掉老路径能识别的元素。
+    struct PropProbe { PROPERTYID id; };
+    const PropProbe probes[] = {
+        { UIA_IsInvokePatternAvailablePropertyId },
+        { UIA_IsTogglePatternAvailablePropertyId },
+    };
+    for (const auto& p : probes) {
+        VARIANT v{};
+        VariantInit(&v);
+        if (SUCCEEDED(element->GetCurrentPropertyValue(p.id, &v))) {
+            const bool yes = (v.vt == VT_BOOL && v.boolVal == VARIANT_TRUE);
+            VariantClear(&v);
+            if (yes) return true;
+        } else {
+            VariantClear(&v);
+        }
+    }
     ComPtr<IUIAutomationInvokePattern> invoke;
     if (SUCCEEDED(element->GetCurrentPatternAs(UIA_InvokePatternId,
             IID_PPV_ARGS(&invoke))) && invoke) {
