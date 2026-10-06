@@ -94,6 +94,16 @@ bool TryHitTestViaMsaa(IUIAutomation* uia, int sx, int sy,
     return true;
 }
 
+/// ⚠ 2026-10-06：**窄条件（可点击类型）没捞到** ⇒ 退回全树（限流一次）。
+/// 用来确认「先窄后宽」的窄条件够不够用 —— 若经常走到这里，说明类型清单要补。
+void LogUiaNarrowMissOnce() {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEvent(
+        L"[窗口/后台窗口模式] UIA 窄条件（可点击类型）没捞到元素 ⇒ 退回全树遍历");
+}
+
 enum class UiaPath { Fast, Fallback };
 
 /// ⚠ 2026-10-06：**MSAA 备选路径是否奏效**（限流一次）—— 用来确认
@@ -404,22 +414,64 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     }
     bool useCache = false;
     // 统一入口：优先 BuildCache，不支持则回退普通 FindAll。⚠ 两者都失败才返回 false。
-    auto findAllInto = [&](TreeScope scope) -> bool {
+    // ⚠ 2026-10-06：加 `cond` 参数 —— 支持「先窄后宽」（见下面 clickableCond）。
+    auto findAllInto = [&](IUIAutomationCondition* cond, TreeScope scope) -> bool {
         arr.Reset();
         useCache = false;
+        if (!cond) return false;
         if (cacheReq) {
-            if (SUCCEEDED(root->FindAllBuildCache(scope, allCond.Get(), cacheReq.Get(), &arr))
+            if (SUCCEEDED(root->FindAllBuildCache(scope, cond, cacheReq.Get(), &arr))
                 && arr) {
                 useCache = true;
                 return true;
             }
             arr.Reset();
         }
-        return SUCCEEDED(root->FindAll(scope, allCond.Get(), &arr)) && arr != nullptr;
+        return SUCCEEDED(root->FindAll(scope, cond, &arr)) && arr != nullptr;
     };
-    bool found = findAllInto(TreeScope_Descendants);
+    // ⚠⚠ 2026-10-06 性能（**先窄后宽**）：实测 UWP 计算器 `FindAll` 一次 **62ms**
+    //   （跨进程枚举 53 个元素 + 批量取属性）。而真正可能被点的**只有可点击类控件**
+    //   （按钮/列表项/单选/复选/菜单项/选项卡/超链接/树项/拆分按钮）。
+    //   ⇒ **第一轮只找这些类型**（元素数少一个量级 ⇒ 快）；**找不到才退回全树**（不退化）。
+    //   ⚠ 为什么不能用「`IsInvokePatternAvailable` 条件」代替：该属性**不是所有元素
+    //     都暴露** ⇒ 会**漏元素** ⇒ 表现成「点不到」（比慢更糟）。
+    //   ⚠ 为什么按 ControlType 是安全的：它是 UIA 的**基础属性**（所有元素都有），
+    //     漏的只是「自定义控件」——而那种第二轮的全树兜底会捞回来。
+    ComPtr<IUIAutomationCondition> clickableCond;
+    {
+        static const long kClickable[] = {
+            UIA_ButtonControlTypeId, UIA_ListItemControlTypeId, UIA_RadioButtonControlTypeId,
+            UIA_CheckBoxControlTypeId, UIA_MenuItemControlTypeId, UIA_TabItemControlTypeId,
+            UIA_HyperlinkControlTypeId, UIA_TreeItemControlTypeId, UIA_SplitButtonControlTypeId,
+            UIA_DataItemControlTypeId,
+        };
+        ComPtr<IUIAutomationCondition> orCond;
+        for (long ct : kClickable) {
+            VARIANT v{};
+            v.vt = VT_I4;
+            v.lVal = ct;
+            ComPtr<IUIAutomationCondition> one;
+            if (FAILED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &one))
+                || !one) {
+                continue;
+            }
+            if (!orCond) { orCond = one; continue; }
+            ComPtr<IUIAutomationCondition> merged;
+            if (SUCCEEDED(uia->CreateOrCondition(orCond.Get(), one.Get(), &merged)) && merged) {
+                orCond = merged;
+            }
+        }
+        clickableCond = orCond;
+    }
+    bool found = clickableCond && findAllInto(clickableCond.Get(), TreeScope_Descendants);
     int count = 0;
     if (found && FAILED(arr->get_Length(&count))) count = 0;
+    if (count <= 0) {
+        // 窄条件没捞到 ⇒ 退回全树（原行为，**不退化**）。
+        LogUiaNarrowMissOnce();
+        found = findAllInto(allCond.Get(), TreeScope_Descendants);
+        if (found && FAILED(arr->get_Length(&count))) count = 0;
+    }
     // ⚠⚠ UWP 的 UIA 树是**按需构建**的（跨进程 + 元素虚拟化）⇒ 首次 `FindAll` 常返回
     //   0 个元素，紧接着再查就有了。用户报「UWP 计算器点击没反应」时，日志显示
     //   UIA 兜底**确实被调用但失败了** —— 这是最可能的原因之一。
@@ -430,12 +482,12 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     if (count <= 0) {
         for (int attempt = 0; attempt < 3 && count <= 0; ++attempt) {
             Sleep(60);
-            if (!findAllInto(TreeScope_Descendants)) break;
+            if (!findAllInto(allCond.Get(), TreeScope_Descendants)) break;
             if (FAILED(arr->get_Length(&count))) count = 0;
         }
     }
     if (count <= 0) {
-        if (findAllInto(TreeScope_Children)) {
+        if (findAllInto(allCond.Get(), TreeScope_Children)) {
             if (FAILED(arr->get_Length(&count))) count = 0;
         }
     }
