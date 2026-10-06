@@ -210,6 +210,39 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         return false;
     }
 
+    // ⚠⚠⚠ 2026-10-06 **性能快路径：先试 `ElementFromPoint`**，别一上来就遍历全树。
+    //
+    //   用户实测（UWP 计算器）：树里有 **49 个**带矩形的元素，而每个
+    //   `get_CurrentBoundingRectangle` 都是**跨进程调用** ⇒ 一次点击 **185ms**
+    //   ⇒ 时间轴被拖慢 17 倍（日志：`预期=250ms 实际=4274ms`，`max=185413us`）。
+    //
+    //   `ElementFromPoint` **一次调用**就能拿到该点**最深**的元素，再沿**父链**向上找
+    //   可 Invoke/Toggle 的（通常 3~5 层）⇒ 跨进程调用数从 ~49 降到 ~5。
+    //   ⚠ 找不到（点不在 UIA 树上 / 该实现不支持）就**回退**下面的全树遍历 —— 行为不退化。
+    ComPtr<IUIAutomationElement> best;
+    {
+        ComPtr<IUIAutomationElement> hit;
+        POINT hitPt{sx, sy};
+        if (SUCCEEDED(uia->ElementFromPoint(hitPt, &hit)) && hit) {
+            ComPtr<IUIAutomationTreeWalker> walker;
+            if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
+                ComPtr<IUIAutomationElement> cur = hit;
+                // ⚠ 父链设上限（16 层）：UWP 的树不深，正常 3~5 层就够；
+                //   设上限是防「Walker 返回环」这类异常实现把这里挂死。
+                for (int depth = 0; depth < 16 && cur; ++depth) {
+                    if (UiaSupportsInvokeOrToggle(cur.Get())) { best = cur; break; }
+                    ComPtr<IUIAutomationElement> parent;
+                    if (FAILED(walker->GetParentElement(cur.Get(), &parent)) || !parent) break;
+                    cur = parent;
+                }
+            }
+        }
+    }
+    if (best) {
+        // 快路径命中 ⇒ **完全不遍历全树**（这是 185ms → 几 ms 的关键）。
+        return UiaInvokeOrToggle(best.Get());
+    }
+
     ComPtr<IUIAutomationElementArray> arr;
     ComPtr<IUIAutomationCondition> allCond;
     if (FAILED(uia->CreateTrueCondition(&allCond)) || !allCond) {
@@ -246,7 +279,7 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     }
 
     // 找包含该点、面积最小（最深）且支持 Invoke/Toggle 的元素。
-    ComPtr<IUIAutomationElement> best;
+    // ⚠ 上面 `ElementFromPoint` 快路径没命中才会走到这里（全树遍历 + 诊断）。
     double bestArea = 1e18;
     for (int i = 0; i < count; ++i) {
         ComPtr<IUIAutomationElement> el;
