@@ -141,6 +141,17 @@ std::wstring CurrentNameOf(IUIAutomationElement* el) {
     return out;
 }
 
+/// ⚠ 2026-10-06：**父链是用哪个 Walker 找到的**（限流一次）。
+/// `ControlView` 会跳过「非控件」元素（UWP 的 XAML 树常有这类中间层）⇒ 父链可能断；
+/// `RawView` 看完整树。记下来才知道到底哪条路work（以及要不要长期保留 RawView）。
+void LogUiaWalkerOnce(const wchar_t* which) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] UIA 快路径父链命中（Walker=%s）", which ? which : L"(未知)");
+}
+
 enum class UiaPath { Fast, Fallback };
 
 /// ⚠ 2026-10-06：**MSAA 备选路径是否奏效**（限流一次）—— 用来确认
@@ -463,16 +474,35 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
                 static_cast<unsigned long>(hrHit), hit ? L"非空" : L"空");
         }
         if (SUCCEEDED(hrHit) && hit) {
-            ComPtr<IUIAutomationTreeWalker> walker;
-            if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
+            // ⚠⚠ 2026-10-06：**父链要走两种 Walker** —— 实测「拿到了元素但父链没找到
+            //   可 Invoke 的」。原因很可能是 **`ControlView` 会跳过「非控件」元素**
+            //   （UWP 的 XAML 树常有这类中间层）⇒ **父链在中间断掉**，
+            //   走不到真正的按钮。`RawView` 看的是**完整树**，能补上。
+            //   ⇒ 依次试 ControlView → RawView，哪个找到算哪个（**不改老路径的行为**：
+            //     ControlView 找到就用它，找不到才换）。
+            const wchar_t* usedWalker = L"ControlView";
+            auto climbToInvokable = [&](IUIAutomationTreeWalker* w) -> ComPtr<IUIAutomationElement> {
+                if (!w) return nullptr;
                 ComPtr<IUIAutomationElement> cur = hit;
                 // ⚠ 父链设上限（16 层）：UWP 的树不深，正常 3~5 层就够；
                 //   设上限是防「Walker 返回环」这类异常实现把这里挂死。
                 for (int depth = 0; depth < 16 && cur; ++depth) {
-                    if (UiaSupportsInvokeOrToggle(cur.Get())) { best = cur; break; }
+                    if (UiaSupportsInvokeOrToggle(cur.Get())) return cur;
                     ComPtr<IUIAutomationElement> parent;
-                    if (FAILED(walker->GetParentElement(cur.Get(), &parent)) || !parent) break;
+                    if (FAILED(w->GetParentElement(cur.Get(), &parent)) || !parent) break;
                     cur = parent;
+                }
+                return nullptr;
+            };
+            ComPtr<IUIAutomationTreeWalker> walker;
+            if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
+                best = climbToInvokable(walker.Get());
+            }
+            if (!best) {
+                ComPtr<IUIAutomationTreeWalker> rawWalker;
+                if (SUCCEEDED(uia->get_RawViewWalker(&rawWalker)) && rawWalker) {
+                    best = climbToInvokable(rawWalker.Get());
+                    if (best) usedWalker = L"RawView";
                 }
             }
             // ⚠⚠⚠ 2026-10-06：**`ElementFromPoint` 拿到了元素、但父链没找到可 Invoke 的**
@@ -483,6 +513,8 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
                 wchar_t clsBuf[128]{};
                 GetClassNameIfAny(hit.Get(), clsBuf, 128);
                 LogUiaHitFoundNoInvokeOnce(clsBuf, CurrentNameOf(hit.Get()));
+            } else {
+                LogUiaWalkerOnce(usedWalker);
             }
         }
     }
