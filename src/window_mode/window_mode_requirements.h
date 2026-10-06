@@ -587,6 +587,30 @@
 //        用 `IUIAutomationCacheRequest` 把 `BoundingRectangle`/`Name` **随查找一并取回**，
 //        后续走 `get_CachedBoundingRectangle`（**本地读**，不跨进程）。
 //        ⚠ 部分提供程序不支持缓存请求 ⇒ `useCache` 标志 + **失败回退**逐个取。
+//     ③ **「先窄后宽」**（2026-10-06 实测后加）—— 用户实测回退路径里
+//        **`FindAll` 独占 62ms、遍历=0ms**（说明 ② 生效：矩形确实是本地读）
+//        ⇒ 62ms 全在「跨进程枚举整棵树」上。而**真正可能被点的只有可点击类控件**
+//        ⇒ 第一轮用 `CreateOrCondition` 组一个「常见可点击类型」条件
+//          （Button / ListItem / RadioButton / CheckBox / MenuItem / TabItem /
+//            Hyperlink / TreeItem / SplitButton / DataItem）；
+//          找不到才退回**全树**（原行为，**不退化**）+ 记 `LogUiaNarrowMissOnce`。
+//        ⚠ 为什么**不用**「`IsInvokePatternAvailable` 条件」代替：该属性**不是所有
+//          元素都暴露** ⇒ 会**漏元素** ⇒ 表现成「点不到」（比慢更糟）。
+//        ⚠ 为什么按 `ControlType` **安全**：它是 UIA 的**基础属性**（所有元素都有），
+//          漏的只是「自定义控件」—— 那种第二轮的全树兜底会捞回来。
+//     ④ **MSAA 备选定位**（`TryHitTestViaMsaa`）—— UIA 的 `ElementFromPoint` 拿不到时，
+//        用 `AccessibleObjectFromPoint` + `ElementFromIAccessible` 再试一次。
+//        ⚠ **MSAA 独立于 UIA 的 AppContainer 支持**（老 API，走 OLEACC 桥接层）
+//          ⇒ 是唯一有可能在 UWP 上「一次调用定位」的备选；失败就 false，不影响 ③ 的回退。
+//        ⚠ `varChild` 必须 `VariantClear`（可能带 BSTR/接口，不释放会泄漏）。
+//        ⚠ 链接 `oleacc` 要加**两处**：`QST_COMMON_LINK_LIBS`（产品）**和**
+//          `WindowModeSelfTest` 的 `LIBS`（**自检不用前者**）⇒ 只加一处就是 `LNK2019`。
+//
+//     **实测数据（2026-10-06，UWP 计算器）**：
+//       · 优化前：`[时间轴统计] max=185413us`（185ms）⇒ 时间轴拖慢 17 倍
+//       · 优化后：`max=4us`；回退路径 `FindAll=62ms 遍历=0ms（元素 53 个）`
+//       · 快路径 **未命中**（AppContainer 限制，见 ① 的 ⚠⚠⚠）⇒ 走 ②③
+//       ⇒ **`max` 那个 185ms 已消掉**；剩余 `FindAll` 的 62ms 由 ③④ 解决。
 //
 //     ⚠ **可观测性**：`UIA 路径：快路径 … 命中` / `… 回退全树遍历` ——
 //       **两种路径分别限流**（否则首次走了快路径后，后面偶尔回退就再也看不到，
