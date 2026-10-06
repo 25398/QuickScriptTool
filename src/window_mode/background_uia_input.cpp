@@ -210,6 +210,7 @@ struct UiaElemCache {
     int x = 0;
     int y = 0;
     DWORD tick = 0;
+    RECT winRect{};   // ⚠ 缓存时的窗口矩形 —— 窗口动过就失效（见下）
     Microsoft::WRL::ComPtr<IUIAutomationElement> el;
 };
 UiaElemCache g_uiaElemCache;
@@ -221,6 +222,14 @@ void LogUiaCacheHitOnce() {
     logged = true;
     WindowModeLogEvent(
         L"[窗口/后台窗口模式] UIA 复用缓存命中（同窗口同坐标 <500ms）⇒ 跳过 FindAll");
+}
+
+void LogUiaCacheStaleOnce() {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEvent(
+        L"[窗口/后台窗口模式] UIA 复用缓存失效（窗口移动/尺寸变化）⇒ 走完整路径");
 }
 
 /// 清缓存（复用失败 / 换窗口时调）。
@@ -237,6 +246,8 @@ void StoreUiaElemCache(HWND top, int x, int y, IUIAutomationElement* el) {
     g_uiaElemCache.x = x;
     g_uiaElemCache.y = y;
     g_uiaElemCache.tick = GetTickCount();
+    g_uiaElemCache.winRect = RECT{};
+    if (top && IsWindow(top)) GetWindowRect(top, &g_uiaElemCache.winRect);
     g_uiaElemCache.el = el;
 }
 
@@ -250,6 +261,17 @@ bool TryInvokeFromCache(HWND top, int x, int y) {
             return false;
         }
         if (GetTickCount() - g_uiaElemCache.tick >= 500) return false;   // TTL
+        // ⚠⚠ 2026-10-06：**窗口矩形校验** —— 缓存的是**屏幕坐标**，若窗口在间隔内
+        //   移动/改尺寸，同一屏幕坐标会对应**不同的客户区位置** ⇒ 会**点错元素**。
+        //   （500ms 内移动窗口罕见，但「点一下把窗口带出来」这类副作用是有的。）
+        RECT now{};
+        if (!top || !IsWindow(top) || !GetWindowRect(top, &now)) return false;
+        if (now.left != g_uiaElemCache.winRect.left || now.top != g_uiaElemCache.winRect.top
+            || now.right != g_uiaElemCache.winRect.right
+            || now.bottom != g_uiaElemCache.winRect.bottom) {
+            LogUiaCacheStaleOnce();
+            return false;
+        }
         el = g_uiaElemCache.el;
     }
     if (UiaInvokeOrToggle(el.Get())) {
