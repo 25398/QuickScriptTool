@@ -1637,6 +1637,19 @@ void WindowModeExecutor::TryInstallFakeFocus() {
         || LooksLikeUnrealEngineWindowClass(cfg.childWindowClassName);
     const bool emulator = LooksLikeEmulatorTarget(cfg, top);
     std::wstring ffErr;
+    // ⚠⚠⚠ 2026-10-06：**UWP 壳进程的总闸** —— 到真正的注入点前**无条件**拦一次。
+    //
+    //   上面虽然有几条早退（未登记游戏 / 不需要假焦点 / 仅时钟补丁），但那些都是
+    //   **条件性**的：只要 `fakeFocusNeeded` 被判成 true（或将来有人改动那段决策），
+    //   就会**绕过**它们直接落到这里注入 ⇒ 目标被带走。
+    //   ⇒ 在注入点前再放一道**不依赖任何决策变量**的闸，保证「UWP 绝不注入」这条
+    //     不变量不靠「上面几条路都记得加判据」来维持。
+    if (uwpShell) {
+        WindowModeLogEvent(
+            L"[窗口/后台窗口模式] ⛔ UWP 壳进程：**禁止一切注入**（含时钟补丁）—— "
+            L"往 ApplicationFrameHost.exe 里塞 DLL 会把目标带走；键鼠走 UIA/PostMessage");
+        return;
+    }
     // Chromium 壳 / 原生 3D（GLFW/Unity/SDL）：只注入窗口 PID。
     // Minecraft javaw 的 helper 子进程没有消息泵，先注入它们会把主进程误记成「跳过」。
     // 仅变速注入时只碰窗口自己的进程：变速只需要游戏循环所在的那个进程。
