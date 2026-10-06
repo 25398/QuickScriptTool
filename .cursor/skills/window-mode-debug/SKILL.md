@@ -511,7 +511,56 @@ UIA 点击 屏幕(x,y) 客户区(x,y)      ← 成功（**只有这条是原来�
 - ⚠ `Unload()` 里那三个 `FakeFocusSoftInput_*`（`ClearKeys`/`Reset`/`Detach`）是
   **共享内存级**操作，会清掉软键态 —— 但嵌套时外层**已先 EndRun**，顺序安全
 
+## 「嵌套运行的窗口模式」判读矩阵（2026-10-06 真机）
+
+**场景**：宏里放「运行宏 / 运行录制回放」，这些动作各有 `useMode`
+（`0 默认` / `1 窗口` / `2 后台窗口` / `3 继承`，缺省 `3`）。
+
+### 语义（`engine_script_run.cpp` 的 `runNestedLibrary`）
+
+```cpp
+if (i == 0 && useMode != kNestedUseModeInherit) {
+    pushNestedUseMode(...);          // 切换：EndRun 外层会话 → BeginRun 内层会话
+    switched = true;
+} else if (switched && useMode != kNestedUseModeDefault) {
+    MergeNestedWindowRelative(...);  // 默认模式**不合并**窗口相对配置
+}
+```
+
+| `useMode` | 行为 | 日志形态 |
+|---|---|---|
+| **3 继承** | **不切换** —— 沿用外层会话 | 内层**没有** `BeginRun`/`EndRun` |
+| **0 默认** | 切换；**不**合并窗口相对配置 | 有 `EndRun` + `BeginRun` |
+| **1/2 窗口/后台窗口** | 切换 + 合并 | 有 `EndRun` + `BeginRun` |
+
+### ★ 嵌套「切换」的正常日志形态（不是 bug）
+
+```
+[窗口/后台窗口模式] EndRun：窗口模式会话结束          ← 外层会话先收掉
+[窗口/后台窗口模式] BeginRun：窗口模式启用 kind=…      ← 内层会话开始
+… 内层跑完 …
+[窗口/后台窗口模式] EndRun：窗口模式会话结束          ← 内层收掉
+[窗口/后台窗口模式] BeginRun：窗口模式启用 kind=…      ← 恢复外层会话
+```
+
+⚠ **看到「外层 EndRun 在内层 BeginRun 之前」不要当成异常** —— 那就是「切换模式」的实现方式
+（一个会话不能同时服务两种模式）。
+
+⚠ **不同类型窗口**（外层绑 A、内层绑 B）也走同一条路：`pushNestedUseMode` 负责换绑定。
+
+### ⚠ 已知代价：`UIA 点击` 会阻塞时间轴
+
+UWP 目标的点击走 UIA Invoke，**是同步的**。实测每次 **185ms**
+（遍历 49 个元素 × 跨进程 `get_CurrentBoundingRectangle`）⇒ 时间轴被拖慢 17 倍。
+
+⇒ 已加 **`ElementFromPoint` 快路径**（一次调用拿最深元素 + 沿父链找可 Invoke 的，
+调用数 ~49 → ~5），命中就不遍历全树；找不到才回退全树遍历 + 诊断。
+
+⚠ 判读要点：`[时间轴统计] … max=` 这个值就是**单次 UIA 点击的阻塞耗时**。
+若它到了几百 ms，先看这里，别去怀疑时间轴本身。
+
 ## 推荐迭代循环（复制即用）
+
 
 ```text
 loop:
