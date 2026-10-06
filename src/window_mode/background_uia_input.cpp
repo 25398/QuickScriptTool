@@ -52,6 +52,23 @@ void LogUiaPathOnce(UiaPath p) {
             : L"快路径未命中 ⇒ 回退全树遍历（FindAllBuildCache）");
 }
 
+/// ⚠ 2026-10-06：**回退路径的分段计时**（限流打一次）。
+/// 用户日志的 `[时间轴统计] … max=` 只给了**总耗时**，而回退路径有两段开销完全不同：
+///   · `FindAll`（1 次跨进程调用，但要跨进程枚举整棵树）
+///   · 遍历取属性（`GetElement` × N；矩形走缓存是**本地读**）
+/// ⇒ 不分开测就无法知道该优化哪一段（前科：拿着总耗时猜，猜错方向白改一轮）。
+/// ⚠ 只在**总耗时 ≥ 50ms** 时记 —— 正常情况（几 ms）不值得刷日志。
+void LogUiaTimingOnce(DWORD findAllMs, DWORD scanMs, int elems) {
+    static bool logged = false;
+    if (logged) return;
+    if (findAllMs + scanMs < 50) return;
+    logged = true;
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] UIA 回退路径耗时：FindAll=%lums 遍历=%lums（元素 %d 个）"
+        L" ⇒ 慢在哪段看这两个数",
+        static_cast<unsigned long>(findAllMs), static_cast<unsigned long>(scanMs), elems);
+}
+
 bool TryValuePatternSet(IUIAutomationElement* element, const std::wstring& text) {
     if (!element) return false;
 
@@ -212,6 +229,8 @@ bool UiaSupportsInvokeOrToggle(IUIAutomationElement* element) {
 }  // namespace
 
 bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
+    // ⚠ 2026-10-06：分段计时用（见 LogUiaTimingOnce）。只用于回退路径的诊断。
+    const DWORD uiaT0 = GetTickCount();
     if (!topLevel || !IsWindow(topLevel)) return false;
     EnsureThreadComApartment();
 
@@ -338,6 +357,7 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         LogUiaFailOnce(L"FindAll 返回 0 个元素（重试 + Children 回退后仍为空）", 0, sx, sy);
         return false;
     }
+    const DWORD uiaT1 = GetTickCount();   // FindAll 段结束
 
     // 找包含该点、面积最小（最深）且支持 Invoke/Toggle 的元素。
     // ⚠ 上面 `ElementFromPoint` 快路径没命中才会走到这里（全树遍历 + 诊断）。
@@ -468,6 +488,7 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     } guard(topLevel);
 
     // 扫描仅检查模式支持；末尾只对「最终最佳」执行一次 Invoke。
+    LogUiaTimingOnce(uiaT1 - uiaT0, GetTickCount() - uiaT1, count);
     return UiaInvokeOrToggle(best.Get());
 }
 
