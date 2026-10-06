@@ -603,6 +603,24 @@ void TestUiaInvokeChain() {
         if (g_uiaProbeClicked) break;
         Sleep(20);
     }
+    // ⚠⚠ 2026-10-06：**连点第二次** —— 覆盖「同位置复用缓存」这条新路径。
+    //   用户的动作常是 `鼠标点击@0,0[重复1次间隔0.010]`（点两下），而第二下应走缓存。
+    //   这里只验证「第二次**同样成功**」（缓存命中且 Invoke 有效）；
+    //   ⚠「是否真的跳过了 FindAll」无法从外部断言 —— 那由日志的
+    //     `UIA 复用缓存命中` 那行确认（**限流**，只在首次打）。
+    bool secondOk = true;
+    if (invoked) {
+        g_uiaProbeClicked = false;
+        secondOk = windowmode::TryUiaInvokeAtScreenPoint(w, sx, sy);
+        for (int i = 0; i < 20 && !g_uiaProbeClicked; ++i) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (g_uiaProbeClicked) break;
+            Sleep(20);
+        }
+    }
     if (btn) DestroyWindow(btn);
     DestroyWindow(w);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
@@ -613,9 +631,11 @@ void TestUiaInvokeChain() {
             L"skipped: UIA 不可用（隔离会话/无桌面？）—— 真机上这条才有意义");
         return;
     }
-    selftest::Emit(L"uia_invoke_chain", g_uiaProbeClicked,
+    selftest::Emit(L"uia_invoke_chain", g_uiaProbeClicked && secondOk,
         (L"invoked=1 clicked=" + std::to_wstring(g_uiaProbeClicked ? 1 : 0)
-            + L"（invoked 成功但按钮没收到 WM_COMMAND ⇒ UIA 元素找到了但 Invoke 没生效）").c_str());
+            + L" second=" + std::to_wstring(secondOk ? 1 : 0)
+            + L"（invoked 成功但按钮没收到 WM_COMMAND ⇒ UIA 元素找到了但 Invoke 没生效；"
+              L"second=第二次连点（走复用缓存）是否也成功）").c_str());
 }
 
 /// `--uia-child`：建一个带按钮的窗口并泵消息 10 秒，供父进程做**跨进程** UIA 验证。
