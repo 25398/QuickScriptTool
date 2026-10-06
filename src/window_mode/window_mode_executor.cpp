@@ -1028,6 +1028,11 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
     WindowModeLogEventf(L"[窗口/后台窗口模式] BeginRun：窗口模式启用 kind=%s，开始准备宏桌面/绑窗",
         config.executionKind == WindowModeExecutionKind::HiddenDesktop
             ? L"HiddenDesktop" : L"BackgroundWindow");
+    // ⚠ 2026-10-06：**启动分段计时**。用户报「回放被拖慢」（`实际=876ms` vs `预期=550ms`），
+    //   而 UIA 只占 78ms ⇒ 剩下的 ~248ms 来源不明。不分开测就只能猜。
+    //   ⚠ 限流：只在总耗时 ≥100ms 时记一次（正常启动几百 ms，但别刷屏）。
+    const DWORD beginT0 = GetTickCount();
+    DWORD beginT1 = 0;
     ResetSoftMouseState();
     extLayoutFresh_ = false;
     cancelFlag_ = options.cancelFlag;
@@ -1322,6 +1327,9 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
             }
         }
     }
+    // ⚠ 分段锚点：**绑窗阶段到此结束**（见 beginT0 的注释）——
+    //   下面是 `TryInstallFakeFocus()`（注入），它才是「注入+收尾」段的开始。
+    beginT1 = GetTickCount();
     TryInstallFakeFocus();
     // 假焦点未注入时的本机 SendInput：RDP / 独占全屏 / Electron 失败 / 游戏 Raw Input。
     rdpSavedForeground_ = nullptr;
@@ -1418,6 +1426,19 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
         mapleWokeOnce_ = true;
     }
     DebugLog(L"[WindowMode] Executor::BeginRun OK");
+    // ⚠ 启动分段汇总（见上面 beginT0 的注释）。分两段：**绑窗** / **注入+收尾**。
+    {
+        const DWORD total = GetTickCount() - beginT0;
+        if (total >= 100) {
+            const DWORD t1 = beginT1 ? beginT1 : total;
+            WindowModeLogEventf(
+                L"[窗口/后台窗口模式] BeginRun 耗时：绑窗段=%lums 注入+收尾=%lums（合计 %lums）"
+                L" ⇒ 慢在哪段看这两个数",
+                static_cast<unsigned long>(t1),
+                static_cast<unsigned long>(total > t1 ? total - t1 : 0),
+                static_cast<unsigned long>(total));
+        }
+    }
     return true;
 }
 
