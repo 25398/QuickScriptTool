@@ -33,6 +33,25 @@ void LogUiaFailOnce(const wchar_t* stage, long hr, int sx, int sy) {
         stage, static_cast<unsigned long>(hr), sx, sy);
 }
 
+/// ⚠ 2026-10-06：**走的是快路径还是回退路径** —— 限流记一次。
+/// 两条路径最终都只表现为 `UIA 点击 屏幕(x,y) 客户区(x,y)` 那一行，
+/// 而「性能没改善」时第一个要回答的就是「快路径到底命中没有」。
+/// ⚠ **两种路径分别限流** —— 否则首次走了快路径之后，后面偶尔回退就再也看不到，
+///   而「**有时快有时慢**」正是最难查的形态。
+/// ⚠ 用 `Event`（落盘）—— 用户导出的诊断里要能看到。
+enum class UiaPath { Fast, Fallback };
+void LogUiaPathOnce(UiaPath p) {
+    static bool fastLogged = false;
+    static bool fallbackLogged = false;
+    bool& slot = (p == UiaPath::Fast) ? fastLogged : fallbackLogged;
+    if (slot) return;
+    slot = true;
+    WindowModeLogEventf(L"[窗口/后台窗口模式] UIA 路径：%s",
+        p == UiaPath::Fast
+            ? L"快路径 ElementFromPoint 命中（**未遍历全树**）"
+            : L"快路径未命中 ⇒ 回退全树遍历（FindAllBuildCache）");
+}
+
 bool TryValuePatternSet(IUIAutomationElement* element, const std::wstring& text) {
     if (!element) return false;
 
@@ -240,8 +259,12 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     }
     if (best) {
         // 快路径命中 ⇒ **完全不遍历全树**（这是 185ms → 几 ms 的关键）。
+        // ⚠ 2026-10-06：记一行**限流的**路径标记 —— 否则跑完日志里分不清
+        //   到底走了快路径还是回退路径，而「性能没改善」时这正是第一个要回答的问题。
+        LogUiaPathOnce(UiaPath::Fast);
         return UiaInvokeOrToggle(best.Get());
     }
+    LogUiaPathOnce(UiaPath::Fallback);
 
     ComPtr<IUIAutomationElementArray> arr;
     ComPtr<IUIAutomationCondition> allCond;
