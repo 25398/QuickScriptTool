@@ -664,30 +664,61 @@ void TestUiaInvokeCrossProcess() {
     std::wstring cmd = std::wstring(L"\"") + exe + L"\" --uia-child";
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(L'\0');
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
+    // ⚠ 2026-10-06：**最多试 2 次** —— 机器忙/并行构建时子进程可能起得慢或起不来，
+    //   会出现「子进程窗口未出现」的**假失败**（实测偶发；逻辑本身是对的）。
+    HWND w = nullptr;
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
-            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    for (int attempt = 0; attempt < 2 && !w; ++attempt) {
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            continue;
+        }
+        for (int i = 0; i < 150 && !w; ++i) {
+            Sleep(100);
+            w = FindWindowW(L"QstUiaXProcProbe", nullptr);
+            // 子进程若已退出（起不来/秒退），不必再等
+            if (!w && pi.hProcess
+                && WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+                break;
+            }
+        }
+        if (!w) {   // 这一轮没成 ⇒ 收掉子进程再试
+            if (pi.hProcess) {
+                TerminateProcess(pi.hProcess, 0);
+                CloseHandle(pi.hProcess);
+                pi.hProcess = nullptr;
+            }
+            if (pi.hThread) { CloseHandle(pi.hThread); pi.hThread = nullptr; }
+        }
+    }
+    if (!pi.hProcess) {
         selftest::Emit(L"uia_invoke_cross_process", true, L"skipped: 起不了子进程");
         return;
     }
-    HWND w = nullptr;
-    // ⚠ 2026-10-05：原来只等 6 秒（60×100ms）—— 机器忙/并行构建时子进程可能起得慢，
-    //   会偶发「子进程窗口未出现」的**假失败**。放宽到 15 秒。
-    for (int i = 0; i < 150 && !w; ++i) {
-        Sleep(100);
-        w = FindWindowW(L"QstUiaXProcProbe", nullptr);
-        // 子进程若已退出（起不来/秒退），不必再等
-        if (!w && pi.hProcess
-            && WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
-            break;
-        }
-    }
     bool ok = false;
     std::wstring detail = L"子进程窗口未出现";
+    if (!w) {
+        // ⚠ 2026-10-06 诊断：子进程起了但没建窗口 ⇒ 把**退出码**打出来，
+        //   区分「子进程秒退（参数没解析到/被护栏拦/建窗失败）」与「只是慢」。
+        DWORD code = 0xFFFFFFFF;
+        if (pi.hProcess && GetExitCodeProcess(pi.hProcess, &code)) {
+            detail = L"子进程窗口未出现（子进程已退出，exit=0x"
+                + std::to_wstring(code) + L"；0x0=正常走完/被护栏 ExitProcess(0)，"
+                L"其它值=崩在启动阶段）";
+        }
+    }
     if (w) {
-        HWND btn = FindWindowExW(w, nullptr, L"Button", nullptr);
+        // ⚠⚠ 2026-10-06：**窗口出现 ≠ 按钮已创建** —— 子进程是「先建窗口、再建按钮」，
+        //   父进程若在两者之间找到窗口就会报「子进程里没找到按钮」（实测 5/5 稳定复现，
+        //   而 `--json` 才看得出是这句而不是「窗口未出现」）。
+        //   ⇒ 找到窗口后再等按钮，最多 3 秒。
+        HWND btn = nullptr;
+        for (int i = 0; i < 30 && !btn; ++i) {
+            btn = FindWindowExW(w, nullptr, L"Button", nullptr);
+            if (!btn) Sleep(100);
+        }
         RECT brc{};
         if (btn && GetWindowRect(btn, &brc)) {
             const int sx = (brc.left + brc.right) / 2;
@@ -697,7 +728,7 @@ void TestUiaInvokeCrossProcess() {
                 ? L"跨进程 UIA 找到并 Invoke 成功"
                 : L"跨进程 UIA 失败（同进程能成功 ⇒ 问题出在跨进程这一层）";
         } else {
-            detail = L"子进程里没找到按钮";
+            detail = L"子进程里没找到按钮（窗口已出现但按钮迟迟没建出来）";
         }
     }
     if (pi.hProcess) {

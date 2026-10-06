@@ -371,6 +371,35 @@ bool FakeFocusInjector::InjectOne(DWORD pid, HWND targetTop, const std::wstring&
         bool recovered = false;
         // GLFW/Minecraft 等失焦后不泵消息：setwindowshook 等不到 DLL，改走远程线程。
         if (technique_ == inject::Technique::SetWindowsHook) {
+            // ⚠⚠⚠ 2026-10-05：**降级前必须先查「目标进程里是不是已经有我们的模块」**。
+            //
+            //   用户报障：嵌套「后台窗口模式」（外层宏 + 内层「运行录制回放」都选了后台模式）
+            //   ⇒ 第二次 BeginRun 又注入一遍 ⇒ 日志：
+            //     `setwindowshook 未装入 DLL（…）` ⇒ `改试 classic`
+            //     ⇒ `⛔ 假焦点注入失败: CreateRemoteThread 期间目标进程已退出` ⇒ **目标闪退**
+            //
+            //   机理：进程里**已有**我们的模块时，`setwindowshook` 失败的原因是
+            //   **重复挂钩**（同一进程同一 hook 只能挂一次），**不是**「目标不泵消息」——
+            //   而 GLFW/Minecraft 那条降级理由（目标不泵消息）**不成立**。
+            //   ⇒ 此时降级到 `classic(CreateRemoteThread)` 等于**在已有钩子的进程里再注入一遍**
+            //     （IAT 覆盖两次、DI 方法体 JMP 叠加）⇒ **把目标带走**。
+            //   ⇒ 有残留就**不降级**，直接失败，让上层回退到 LCA 窗口消息（不注入更安全）。
+            std::wstring stalePath;
+            if (TargetHasStaleFakeFocusModule(pid, stalePath)) {
+                WindowModeLogf(
+                    L"[窗口/后台窗口模式] 目标进程 %lu 里已有 FakeFocus（%s）⇒ "
+                    L"setwindowshook 失败是**重复挂钩**，不降级注入（classic 会双重挂钩把目标打崩）",
+                    static_cast<unsigned long>(pid), stalePath.c_str());
+                WindowModeLogEventf(
+                    L"[窗口/后台窗口模式] ⚠ 拒绝降级注入：目标进程 pid=%lu 已有 %s"
+                    L"（嵌套运行/重复 BeginRun 的常见形态）⇒ 回退 LCA 窗口消息，不注入",
+                    static_cast<unsigned long>(pid), stalePath.c_str());
+                err = firstErr.empty()
+                    ? L"目标进程已有本模块，拒绝降级注入（避免双重挂钩）"
+                    : (firstErr + L"（目标已有本模块 ⇒ 拒绝降级注入，避免双重挂钩）");
+                CloseHandle(t.process);
+                return false;
+            }
             WindowModeLogf(
                 L"[窗口/后台窗口模式] setwindowshook 未装入 DLL（%s），改试 classic",
                 firstErr.c_str());
