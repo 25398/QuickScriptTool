@@ -40,7 +40,7 @@ void LogUiaFailOnce(const wchar_t* stage, long hr, int sx, int sy) {
 /// ⚠ **两种路径分别限流** —— 否则首次走了快路径之后，后面偶尔回退就再也看不到，
 ///   而「**有时快有时慢**」正是最难查的形态。
 /// ⚠ 用 `Event`（落盘）—— 用户导出的诊断里要能看到。
-/// ⚠ 2026-10-06：**快路径为什么没命中** —— 记下 `ElementFromPoint` 的失败 hr（限流一次）。
+/// ⚠ 2026-10-06：**快路径为什么没命中** —— 记下 `ElementFromPoint` 的失败 hr。
 /// 实测 UWP 计算器上快路径**未命中**，但「未命中」本身分不清根因：
 ///   · `E_ACCESSDENIED`(0x80070005) / `UIA_E_ELEMENTNOTAVAILABLE`(0x80040201)
 ///     ⇒ **AppContainer 拦截**（业界同类工具 pywinauto 就是栽在这条：
@@ -48,18 +48,16 @@ void LogUiaFailOnce(const wchar_t* stage, long hr, int sx, int sy) {
 ///   · `E_INVALIDARG` / `E_FAIL` ⇒ 参数或实现问题
 ///   · `S_OK` 但元素为空 ⇒ 该点确实没有元素
 /// ⇒ 三者修法完全不同（拦截要换 API，参数问题要改调用）⇒ **必须能区分**。
-void LogUiaHitOnce(HRESULT hr) {
-    static bool logged = false;
-    if (logged) return;
-    logged = true;
-    const wchar_t* guess = L"未知";
-    if (hr == static_cast<HRESULT>(0x80070005L)) guess = L"E_ACCESSDENIED ⇒ 像是被 AppContainer 拦截";
-    else if (hr == UIA_E_ELEMENTNOTAVAILABLE) guess = L"UIA_E_ELEMENTNOTAVAILABLE ⇒ 元素已移除（可重试）";
-    else if (hr == static_cast<HRESULT>(0x80070057L)) guess = L"E_INVALIDARG ⇒ 参数问题";
-    else if (SUCCEEDED(hr)) guess = L"S_OK 但元素为空 ⇒ 该点确实没有元素";
-    WindowModeLogEventf(
-        L"[窗口/后台窗口模式] UIA 快路径未命中原因：ElementFromPoint hr=0x%08lX（%s）",
-        static_cast<unsigned long>(hr), guess);
+///
+/// ⚠⚠ 2026-10-06 改：**不再单独打一行**，而是把结果**并进「UIA 路径」那行** ——
+///   实测用户日志里**单独那行没出现**（可能被「调试日志有上限」截掉，也可能没贴全），
+///   而「UIA 路径」那行是**一定会打**的（它是路径判据）。⇒ 信息合并到一定会到的地方。
+const wchar_t* DescribeElementFromPointHr(HRESULT hr) {
+    if (hr == static_cast<HRESULT>(0x80070005L)) return L"E_ACCESSDENIED(像是被 AppContainer 拦截)";
+    if (hr == UIA_E_ELEMENTNOTAVAILABLE) return L"UIA_E_ELEMENTNOTAVAILABLE(元素已移除)";
+    if (hr == static_cast<HRESULT>(0x80070057L)) return L"E_INVALIDARG(参数问题)";
+    if (SUCCEEDED(hr)) return L"S_OK 但元素为空(该点确实没有元素)";
+    return L"未知";
 }
 
 /// ⚠⚠ 2026-10-06：**MSAA 备选定位** —— 用 `AccessibleObjectFromPoint` 拿该点的元素，
@@ -116,16 +114,31 @@ void LogUiaMsaaOnce(bool ok) {
         ok ? L"[窗口/后台窗口模式] UIA 快路径备选：**MSAA 命中**（ElementFromPoint 被拦但 MSAA 可用）"
            : L"[窗口/后台窗口模式] UIA 快路径备选：MSAA 也没拿到 ⇒ 只能走全树遍历");
 }
-void LogUiaPathOnce(UiaPath p) {
+/// ⚠ 2026-10-06：**走的是快路径还是回退路径** —— 限流记一次。
+/// 两条路径最终都只表现为 `UIA 点击 屏幕(x,y) 客户区(x,y)` 那一行，
+/// 而「性能没改善」时第一个要回答的就是「快路径到底命中没有」。
+/// ⚠ **两种路径分别限流** —— 否则首次走了快路径之后，后面偶尔回退就再也看不到，
+///   而「**有时快有时慢**」正是最难查的形态。
+/// ⚠ 用 `Event`（落盘）—— 用户导出的诊断里要能看到。
+/// ⚠⚠ **回退那一行顺带带上 `ElementFromPoint` 的 hr 和 MSAA 结果** ——
+///   它们是「快路径为什么没命中」的唯一依据；合并到**一定会打**的这一行里，
+///   免得单独那行被「调试日志有上限」截掉（实测就丢过一次）。
+void LogUiaPathOnce(UiaPath p, HRESULT hitHr = S_OK, int msaa = -1) {
     static bool fastLogged = false;
     static bool fallbackLogged = false;
     bool& slot = (p == UiaPath::Fast) ? fastLogged : fallbackLogged;
     if (slot) return;
     slot = true;
-    WindowModeLogEventf(L"[窗口/后台窗口模式] UIA 路径：%s",
-        p == UiaPath::Fast
-            ? L"快路径 ElementFromPoint 命中（**未遍历全树**）"
-            : L"快路径未命中 ⇒ 回退全树遍历（FindAllBuildCache）");
+    if (p == UiaPath::Fast) {
+        WindowModeLogEvent(
+            L"[窗口/后台窗口模式] UIA 路径：快路径 ElementFromPoint 命中（**未遍历全树**）");
+        return;
+    }
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] UIA 路径：快路径未命中（ElementFromPoint hr=0x%08lX %s；"
+        L"MSAA=%s）⇒ 回退全树遍历（FindAllBuildCache）",
+        static_cast<unsigned long>(hitHr), DescribeElementFromPointHr(hitHr),
+        msaa == 1 ? L"命中" : (msaa == 0 ? L"也没拿到" : L"未试"));
 }
 
 /// ⚠ 2026-10-06：**回退路径的分段计时**（限流打一次）。
@@ -334,6 +347,8 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
     //   可 Invoke/Toggle 的（通常 3~5 层）⇒ 跨进程调用数从 ~49 降到 ~5。
     //   ⚠ 找不到（点不在 UIA 树上 / 该实现不支持）就**回退**下面的全树遍历 —— 行为不退化。
     ComPtr<IUIAutomationElement> best;
+    HRESULT hitHrForLog = S_OK;   // ⚠ 供下面「UIA 路径」那行一起打（见 LogUiaPathOnce）
+    int msaaForLog = -1;
     {
         ComPtr<IUIAutomationElement> hit;
         POINT hitPt{sx, sy};
@@ -357,18 +372,22 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         //     · `E_INVALIDARG` / `E_FAIL` ⇒ 参数或实现问题
         //     · `S_OK` 但 `hit` 为空 ⇒ 该点确实没有元素
         //   ⇒ 三者的修法完全不同（拦截要换 API，参数问题要改调用）。
+        // ⚠ 2026-10-06：hr 与 MSAA 结果**不单独打日志**了，改成随「UIA 路径」那行一起出
+        //   （实测单独那行没落到用户日志里；合并到一定会打的地方）。
+        int msaaResult = -1;   // -1 未试 / 0 没拿到 / 1 命中
         if (!(SUCCEEDED(hrHit) && hit)) {
-            LogUiaHitOnce(hrHit);
             // ⚠⚠ UIA 的 ElementFromPoint 没拿到 ⇒ **再试 MSAA**（独立路径，
             //   不依赖 UIA 的 AppContainer 支持）。拿到就同样沿父链找可 Invoke 的。
             Microsoft::WRL::ComPtr<IUIAutomationElement> msaaHit;
             if (TryHitTestViaMsaa(uia.Get(), sx, sy, msaaHit) && msaaHit) {
-                LogUiaMsaaOnce(true);
+                msaaResult = 1;
                 hit = msaaHit;
             } else {
-                LogUiaMsaaOnce(false);
+                msaaResult = 0;
             }
         }
+        hitHrForLog = hrHit;
+        msaaForLog = msaaResult;
         if (SUCCEEDED(hrHit) && hit) {
             ComPtr<IUIAutomationTreeWalker> walker;
             if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
@@ -391,7 +410,7 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         LogUiaPathOnce(UiaPath::Fast);
         return UiaInvokeOrToggle(best.Get());
     }
-    LogUiaPathOnce(UiaPath::Fallback);
+    LogUiaPathOnce(UiaPath::Fallback, hitHrForLog, msaaForLog);
 
     ComPtr<IUIAutomationElementArray> arr;
     ComPtr<IUIAutomationCondition> allCond;
