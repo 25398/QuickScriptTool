@@ -1427,9 +1427,12 @@ bool WindowModeExecutor::BeginRun(const WindowModeScriptConfig& config, std::wst
     }
     DebugLog(L"[WindowMode] Executor::BeginRun OK");
     // ⚠ 启动分段汇总（见上面 beginT0 的注释）。分两段：**绑窗** / **注入+收尾**。
+    //   ⚠⚠ 2026-10-06 降阈值：原来 ≥100ms 才打，结果**用户日志里一次都没出现** ——
+    //     而「回放被拖慢」（实际 882ms vs 预期 550ms）正需要知道启动占了多少。
+    //     ≥20ms 就打：能看见真实开销，又不至于每次刷屏。
     {
         const DWORD total = GetTickCount() - beginT0;
-        if (total >= 100) {
+        if (total >= 20) {
             const DWORD t1 = beginT1 ? beginT1 : total;
             WindowModeLogEventf(
                 L"[窗口/后台窗口模式] BeginRun 耗时：绑窗段=%lums 注入+收尾=%lums（合计 %lums）"
