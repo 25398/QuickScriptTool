@@ -480,6 +480,61 @@ bool LooksLikeUwpShellExecutable(const std::wstring& exePath) {
     return ToLowerCopy(name) == L"applicationframehost.exe";
 }
 
+/// ⚠⚠⚠ 2026-10-06：**共享宿主进程** —— 往里注入 DLL 会**连坐崩一大片**，一律不注入。
+///
+/// 为什么单独有这条：`ApplicationFrameHost.exe`（UWP 壳）之所以危险，**本质不是「它是 UWP」，
+/// 而是「它是共享宿主」** —— 一个进程托管**所有** UWP 应用。同类进程还有一堆，
+/// 之前只挡了 UWP 那一个，其余的**完全没有保护**（grep 确认过）：
+///   · `explorer.exe`        —— 桌面 + 任务栏 + **所有**文件管理器窗口
+///   · `dllhost.exe`         —— **所有** COM 对象共享（COM 宿主）
+///   · `RuntimeBroker.exe`   —— UWP 权限代理，**所有** UWP 应用共用
+///   · `svchost.exe` / `lsass.exe` / `csrss.exe` / `winlogon.exe` / `services.exe`
+///                            —— 系统关键进程，注入**可能直接蓝屏**
+///   · `ShellExperienceHost` / `SearchHost` / `StartMenuExperienceHost` / `LockApp`
+///                            —— 开始菜单 / 搜索 / 任务栏 / 锁屏
+///   · `sihost.exe` / `ctfmon.exe`（输入法框架）/ `TextInputHost.exe`
+///
+/// 判据用 **exe 文件名**（不按目录 —— `C:\Windows\System32` 下也有可以正常绑定的程序）。
+/// ⚠ 取「宁可误判不注入」这一侧：误判的代价只是**该目标不能变速**（可选增强），
+///   漏判的代价是**把用户桌面/系统带走**。与 §11「游戏闪退比没装上严重得多」同一把尺。
+bool LooksLikeSharedHostProcess(const std::wstring& exePath) {
+    if (exePath.empty()) return false;
+    const size_t slash = exePath.find_last_of(L"\\/");
+    const std::wstring name = ToLowerCopy(
+        (slash == std::wstring::npos) ? exePath : exePath.substr(slash + 1));
+    static const wchar_t* kSharedHosts[] = {
+        // 共享外壳 / 宿主
+        L"explorer.exe",
+        L"dllhost.exe",
+        L"runtimebroker.exe",
+        L"sihost.exe",
+        L"shellhost.exe",
+        L"applicationframehost.exe",
+        // 开始菜单 / 搜索 / 任务栏 / 锁屏
+        L"shellexperiencehost.exe",
+        L"startmenuexperiencehost.exe",
+        L"searchhost.exe",
+        L"searchui.exe",
+        L"lockapp.exe",
+        // 输入法框架（所有应用共用）
+        L"ctfmon.exe",
+        L"textinputhost.exe",
+        // 系统关键进程（注入可能蓝屏）
+        L"svchost.exe",
+        L"lsass.exe",
+        L"csrss.exe",
+        L"winlogon.exe",
+        L"services.exe",
+        L"smss.exe",
+        L"wininit.exe",
+        L"dwm.exe",
+    };
+    for (const wchar_t* h : kSharedHosts) {
+        if (name == h) return true;
+    }
+    return false;
+}
+
 bool LooksLikeKernelAntiCheatToken(const std::wstring& text) {
     if (text.empty()) return false;
     const std::wstring lower = ToLowerCopy(text);

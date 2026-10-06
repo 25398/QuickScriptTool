@@ -1650,10 +1650,25 @@ void WindowModeExecutor::TryInstallFakeFocus() {
     //   就会**绕过**它们直接落到这里注入 ⇒ 目标被带走。
     //   ⇒ 在注入点前再放一道**不依赖任何决策变量**的闸，保证「UWP 绝不注入」这条
     //     不变量不靠「上面几条路都记得加判据」来维持。
+    //
+    //   ⚠⚠⚠ 2026-10-06 扩展：**不只 UWP** —— `ApplicationFrameHost.exe` 危险的**本质**
+    //     是「它是**共享宿主**」（一个进程托管**所有** UWP 应用）。同类进程还有一堆，
+    //     之前**完全没有保护**（grep 确认）：`explorer.exe`（桌面+任务栏+所有文件管理器）、
+    //     `dllhost.exe`（所有 COM 对象）、`RuntimeBroker.exe`（所有 UWP 的权限代理）、
+    //     以及 `svchost/lsass/csrss/winlogon` 这类**注入可能蓝屏**的系统关键进程。
+    //     ⇒ 一并挡在这里，判据见 `LooksLikeSharedHostProcess`。
     if (uwpShell) {
         WindowModeLogEvent(
             L"[窗口/后台窗口模式] ⛔ UWP 壳进程：**禁止一切注入**（含时钟补丁）—— "
             L"往 ApplicationFrameHost.exe 里塞 DLL 会把目标带走；键鼠走 UIA/PostMessage");
+        return;
+    }
+    if (LooksLikeSharedHostProcess(cfg.targetExePath)) {
+        WindowModeLogEventf(
+            L"[窗口/后台窗口模式] ⛔ 共享宿主进程（%s）：**禁止一切注入**（含时钟补丁）—— "
+            L"它托管着一大批窗口/对象（桌面、任务栏、文件管理器、COM 宿主、所有 UWP 应用…），"
+            L"注入会把它们一起带走；键鼠走 UIA/PostMessage",
+            cfg.targetExePath.empty() ? L"(空)" : cfg.targetExePath.c_str());
         return;
     }
     // Chromium 壳 / 原生 3D（GLFW/Unity/SDL）：只注入窗口 PID。

@@ -201,6 +201,11 @@ bool LooksLikeGameWindowClass(const std::wstring& className);
 ///   UIA Invoke 兜底）⇒ 跳过假焦点注入**功能不受影响**，只去掉崩溃风险。
 bool LooksLikeUwpShellWindowClass(const std::wstring& className);
 bool LooksLikeUwpShellExecutable(const std::wstring& exePath);
+
+/// ⚠⚠⚠ 2026-10-06：共享宿主进程（`explorer.exe` / `dllhost.exe` / `RuntimeBroker.exe` /
+/// 系统关键进程 …）—— 注入会**连坐崩一大片**，一律不注入。判据是 exe 文件名。
+/// ⚠ 取「宁可误判不注入」这一侧（误判只是该目标不能变速）。
+bool LooksLikeSharedHostProcess(const std::wstring& exePath);
 /// 新天龙八部：类名 `TianLongBaBuHJ WndClass`（含空格）。PostMessage 鼠标不够，须精简假焦点钩光标/键态。
 bool LooksLikeTianLongBaBuWindowClass(const std::wstring& className);
 bool LooksLikeTianLongBaBuExecutable(const std::wstring& exePath);
