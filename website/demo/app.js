@@ -13374,6 +13374,18 @@
               a.y = py | 0;
             }
             a.windowRelative = !!useClient;
+            if (useClient && pick.clientW > 0 && pick.clientH > 0) {
+              // ⚠⚠ 必须**同时**记下取点时的客户区尺寸（2026-10-05）。
+              //   回放端 `RecordedClientSize()` 在 recordClientWidth/Height 为 0 时
+              //   会回退到 `coordMeta.capture`（**屏幕分辨率** 2560x1440）当「录制客户区」
+              //   ⇒ 把**已经是客户区的坐标**再缩一次 ⇒ 点错位置。
+              //   用户实测（UWP 计算器，客户区 480x799）：动作 (181,599) 被缩成 (34,332)
+              //   ⇒ 表现就是「鼠标移动了但点击没反应」。
+              //   记下真实尺寸后缩放比 = 1；窗口**被改变大小**时才按比例缩放（这是期望行为）。
+              state.windowMode = state.windowMode || {};
+              state.windowMode.recordClientWidth = pick.clientW | 0;
+              state.windowMode.recordClientHeight = pick.clientH | 0;
+            }
             renderParamPanel(a);
             const tag = useClient ? "窗口相对坐标" : "屏幕坐标";
             const out = (useClient && pick.outside) ? "（此点在窗口外）" : "";
