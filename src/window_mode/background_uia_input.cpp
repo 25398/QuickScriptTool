@@ -152,6 +152,44 @@ void LogUiaWalkerOnce(const wchar_t* which) {
         L"[窗口/后台窗口模式] UIA 快路径父链命中（Walker=%s）", which ? which : L"(未知)");
 }
 
+/// ⚠ 2026-10-06：**`ElementFromPoint` 拿到的元素属于「哪个顶层窗口」**。
+/// 为什么需要：它返回的是**该点 z-order 最顶层的窗口**的元素，**不认目标窗口** ——
+/// 用户实测（后台模式，计算器被编辑器盖着）拿到的是编辑器的元素
+/// （`class=Chrome_RenderWidgetHostHWND name=「WorkBuddy」`）。
+/// ⇒ 用它沿 `RawView` 父链向上找第一个有 `NativeWindowHandle` 的元素（= 顶层窗口）。
+/// ⚠ 用 `RawView` 而不是 `ControlView`：顶层窗口元素不一定是「控件」。
+HWND ElementTopLevelHwnd(IUIAutomationElement* el, IUIAutomation* uia) {
+    if (!el || !uia) return nullptr;
+    Microsoft::WRL::ComPtr<IUIAutomationTreeWalker> raw;
+    if (FAILED(uia->get_RawViewWalker(&raw)) || !raw) return nullptr;
+    Microsoft::WRL::ComPtr<IUIAutomationElement> cur;
+    cur = el;
+    for (int depth = 0; depth < 64 && cur; ++depth) {
+        UIA_HWND h = nullptr;
+        if (SUCCEEDED(cur->get_CurrentNativeWindowHandle(&h)) && h) {
+            return static_cast<HWND>(h);
+        }
+        Microsoft::WRL::ComPtr<IUIAutomationElement> parent;
+        if (FAILED(raw->GetParentElement(cur.Get(), &parent)) || !parent) break;
+        cur = parent;
+    }
+    return nullptr;
+}
+
+/// ⚠ 2026-10-06：**`ElementFromPoint` 拿到了「别的窗口」的元素**（限流一次）。
+/// 这是后台模式的**本质限制**（目标被遮挡 ⇒ 该点上是最顶层的别的窗口），
+/// 不是 bug、也换不了 API 绕过 ⇒ 必须明确记下来，免得后面又当成「定位失败」去查。
+void LogUiaHitWrongWindowOnce(HWND got, HWND want) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] UIA 快路径拿到的是**别的窗口**的元素（该点 z-order 最顶层 = 0x%p，"
+        L"目标是 0x%p）⇒ 丢弃、走回退（**后台模式下目标被遮挡时快路径天然不适用**，"
+        L"不是失败、也换不了 API）",
+        reinterpret_cast<void*>(got), reinterpret_cast<void*>(want));
+}
+
 enum class UiaPath { Fast, Fallback };
 
 /// ⚠ 2026-10-06：**MSAA 备选路径是否奏效**（限流一次）—— 用来确认
@@ -472,6 +510,26 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
             WindowModeLogEventf(
                 L"[窗口/后台窗口模式] ⚠ UIA 快路径分支异常：hr=0x%08lX hit=%s ⇒ msaaResult 仍为 -1",
                 static_cast<unsigned long>(hrHit), hit ? L"非空" : L"空");
+        }
+        if (SUCCEEDED(hrHit) && hit) {
+            // ⚠⚠⚠ 2026-10-06 **关键修正**：`ElementFromPoint` 返回的是**该点 z-order 最顶层的
+            //   窗口**的元素 —— **它不认「我要的是哪个窗口」**！
+            //
+            //   用户实测（后台模式，计算器在编辑器后面）：
+            //     `class=Chrome_RenderWidgetHostHWND name=「WorkBuddy」`
+            //   ⇒ 拿到的是**编辑器**的元素，不是计算器的。
+            //   ⇒ 这也是之前误读成「S_OK 但元素为空」的原因 —— 元素并不空，是**拿错了窗口**。
+            //
+            //   ⇒ **必须校验归属**：元素的顶层窗口 != 目标窗口 ⇒ 丢弃，走回退。
+            //     （后台模式下目标被遮挡时，快路径**天然不适用** —— 这是它的本质限制，
+            //      不是能靠换 API 绕过的；前台场景仍然有效。）
+            if (hit) {
+                HWND elTop = ElementTopLevelHwnd(hit.Get(), uia.Get());
+                if (elTop && topLevel && elTop != topLevel) {
+                    LogUiaHitWrongWindowOnce(elTop, topLevel);
+                    hit.Reset();
+                }
+            }
         }
         if (SUCCEEDED(hrHit) && hit) {
             // ⚠⚠ 2026-10-06：**父链要走两种 Walker** —— 实测「拿到了元素但父链没找到
