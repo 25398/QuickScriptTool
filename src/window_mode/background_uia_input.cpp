@@ -102,6 +102,45 @@ void LogUiaNarrowMissOnce() {
         L"[窗口/后台窗口模式] UIA 窄条件（可点击类型）没捞到元素 ⇒ 退回全树遍历");
 }
 
+/// ⚠ 2026-10-06：**`ElementFromPoint` 拿到了元素、但父链没找到可 Invoke 的**（限流一次）。
+/// 这条路径**看起来像「ElementFromPoint 失败」**（日志都是「未命中」），
+/// 但实际它**成功了** —— ★ 我第一眼就误判成「被 AppContainer 拦截」，方向全错。
+/// ⇒ 把拿到的是什么（类名/名字）打出来，才能判断是「父链走错」还是「元素本身不可点」。
+void LogUiaHitFoundNoInvokeOnce(const wchar_t* cls, const std::wstring& name) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    WindowModeLogEventf(
+        L"[窗口/后台窗口模式] UIA 快路径**拿到了元素**（class=%s name=「%s」）"
+        L"但父链上没找到可 Invoke/Toggle 的 ⇒ 回退全树遍历"
+        L"（⚠ 这不是「ElementFromPoint 失败」，别去查权限/拦截）",
+        (cls && *cls) ? cls : L"(无)", name.empty() ? L"(无)" : name.c_str());
+}
+
+/// 取元素的 `ClassName`（拿不到就留空串）。
+void GetClassNameIfAny(IUIAutomationElement* el, wchar_t* out, size_t outCount) {
+    if (!out || outCount == 0) return;
+    out[0] = 0;
+    if (!el) return;
+    BSTR b = nullptr;
+    if (SUCCEEDED(el->get_CurrentClassName(&b)) && b) {
+        wcsncpy_s(out, outCount, b, _TRUNCATE);
+        SysFreeString(b);
+    }
+}
+
+/// 取元素的 `Name`（拿不到就返回空串）。
+std::wstring CurrentNameOf(IUIAutomationElement* el) {
+    if (!el) return std::wstring();
+    BSTR b = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(el->get_CurrentName(&b)) && b) {
+        out.assign(b, SysStringLen(b));
+        SysFreeString(b);
+    }
+    return out;
+}
+
 enum class UiaPath { Fast, Fallback };
 
 /// ⚠ 2026-10-06：**MSAA 备选路径是否奏效**（限流一次）—— 用来确认
@@ -375,7 +414,11 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         // ⚠ 2026-10-06：hr 与 MSAA 结果**不单独打日志**了，改成随「UIA 路径」那行一起出
         //   （实测单独那行没落到用户日志里；合并到一定会打的地方）。
         int msaaResult = -1;   // -1 未试 / 0 没拿到 / 1 命中
-        if (!(SUCCEEDED(hrHit) && hit)) {
+        // ⚠⚠ 2026-10-06：实测日志出现「hr=S_OK 但元素为空」+「MSAA=未试」**并存** ——
+        //   按上面的逻辑两者不该同时成立（进了 if 就会置 msaaResult）。
+        //   ⇒ 说明这里的分支没按预期走。把**进入条件的两项**都打出来，别再靠推。
+        const bool hitOk = SUCCEEDED(hrHit) && hit != nullptr;
+        if (!hitOk) {
             // ⚠⚠ UIA 的 ElementFromPoint 没拿到 ⇒ **再试 MSAA**（独立路径，
             //   不依赖 UIA 的 AppContainer 支持）。拿到就同样沿父链找可 Invoke 的。
             Microsoft::WRL::ComPtr<IUIAutomationElement> msaaHit;
@@ -388,6 +431,12 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
         }
         hitHrForLog = hrHit;
         msaaForLog = msaaResult;
+        if (msaaResult < 0) {
+            // 不该发生（进了分支就会置 0/1）⇒ 留痕，便于下次定位。
+            WindowModeLogEventf(
+                L"[窗口/后台窗口模式] ⚠ UIA 快路径分支异常：hr=0x%08lX hit=%s ⇒ msaaResult 仍为 -1",
+                static_cast<unsigned long>(hrHit), hit ? L"非空" : L"空");
+        }
         if (SUCCEEDED(hrHit) && hit) {
             ComPtr<IUIAutomationTreeWalker> walker;
             if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
@@ -400,6 +449,15 @@ bool TryUiaInvokeAtScreenPointOn(HWND topLevel, int sx, int sy) {
                     if (FAILED(walker->GetParentElement(cur.Get(), &parent)) || !parent) break;
                     cur = parent;
                 }
+            }
+            // ⚠⚠⚠ 2026-10-06：**`ElementFromPoint` 拿到了元素、但父链没找到可 Invoke 的**
+            //   ⇒ `best` 为空 ⇒ 走回退 ⇒ 日志显示「未命中」，**看起来像 ElementFromPoint 失败**。
+            //   ★ 实际它**成功了**（`hit` 非空）—— 我第一眼就误判成了「被拦截」，方向全错。
+            //   ⇒ 这条路径**必须单独标出来**，否则会一直查错方向。
+            if (!best) {
+                wchar_t clsBuf[128]{};
+                GetClassNameIfAny(hit.Get(), clsBuf, 128);
+                LogUiaHitFoundNoInvokeOnce(clsBuf, CurrentNameOf(hit.Get()));
             }
         }
     }
